@@ -31,7 +31,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.freebuff-desktop]
 allow = [
     # Codebuff account + model backend (Freebuff is CodebuffAI's free tier). The login page, the
     # device-code flow and the model traffic all target codebuff.com; the app POSTs, so all verbs.
@@ -88,7 +87,7 @@ mute = [
 # wildcard says what the sentence already said.
 shared_credential = [["*.codebuff.com"]]
 
-[bundle.freebuff-desktop.packages]
+[packages]
 # The Freebuff desktop app, auto-upgraded through the resolver below. The package name is
 # `freebuff`, so it binds to the `[…appimage.freebuff]` table and is wrapped as `bin/freebuff`.
 freebuff = "appimage:resolve"
@@ -101,7 +100,7 @@ chromium = "nix:chromium"
 # prints. `-w '%{redirect_url}'` takes the FIRST hop only — the clean release URL, not the
 # time-limited storage URL a full `-L` follow would end at. `-fsS` fails closed on an HTTP error,
 # and the printed URL is re-validated as an `.AppImage` URL before it is fetched.
-[bundle.freebuff-desktop.appimage.freebuff]
+[appimage.freebuff]
 resolve = ["sh", "-c", '''
 curl -fsS -o /dev/null -w '%{redirect_url}' "https://freebuff.com/api/desktop/download/linux"
 ''']

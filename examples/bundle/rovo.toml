@@ -35,7 +35,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.rovo]
 allow = [
     # The API the agent calls, and the three hosts its token exchange and account login span. The
     # CLI download host is NOT here: the package is provisioned host-side by nix.
@@ -60,7 +59,7 @@ mute = [
     "go.atlassian.com",
 ]
 
-[bundle.rovo.packages]
+[packages]
 # The Atlassian CLI from nixpkgs, built host-side and seeded — proprietary (an `unfree` attribute),
 # which a `[packages]` declaration is trusted-only for. `.unwrapped` skips the FHS wrapper that
 # cannot start inside a cage; see the note above.

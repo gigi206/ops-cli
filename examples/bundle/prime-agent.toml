@@ -34,7 +34,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.prime-agent]
 # The vendor installer, run once inside the cage. `pipefail` surfaces a failed `curl … | bash` as a
 # clean install error rather than later as `prime-agent: not found`. Node and uv are already on PATH
 # from `[packages]`, so the installer's interactive offers to install them are never reached; it
@@ -91,7 +90,7 @@ allow = [
     "@pypi",
 ]
 
-[bundle.prime-agent.packages]
+[packages]
 # The runtime the installer and the agent need, and the two tools the agent looks up on PATH
 # before falling back to a download. The agent itself arrives through the profile's `cmd`.
 nodejs = "nix:nodejs"
@@ -100,7 +99,7 @@ git = "nix:git"      # called directly for repository state
 ripgrep = "nix:ripgrep"
 fd = "nix:fd"
 
-[bundle.prime-agent.env]
+[env]
 # The agent's Node runtime reaches its endpoints through Node's built-in fetch (undici), which
 # ignores http_proxy/https_proxy unless this is set — and in the empty netns a bypassed fetch
 # dies with `EAI_AGAIN` before the proxy is ever consulted.

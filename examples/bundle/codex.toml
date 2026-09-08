@@ -17,7 +17,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.codex]
 allow = [
     "{*} https://api.openai.com",
     "{*} https://auth.openai.com",
@@ -27,5 +26,5 @@ allow = [
     "{WS} https://chatgpt.com",
 ]
 
-[bundle.codex.packages]
+[packages]
 codex = "mise:aqua:openai/codex"

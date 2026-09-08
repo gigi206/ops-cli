@@ -39,7 +39,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.claude-desktop]
 allow = [
     # Claude API — model completions, the Code-tab engine, the WebFetch domain-safety preflight, and
     # the voice speech-to-text WebSocket.
@@ -110,14 +109,14 @@ mute = [
 # this token may travel to.
 shared_credential = [["claude.ai", "api.anthropic.com"]]
 
-[bundle.claude-desktop.packages]
+[packages]
 # Anthropic's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron, no source build).
 claude-desktop = "deb:apt:https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages"
 # An in-cage Chromium for the Google Sign-In flow. HEAVY — a large nixpkgs closure on first launch,
 # shared with every other Chromium profile in your store. Not needed for an EMAIL login.
 chromium = "nix:chromium"
 
-[bundle.claude-desktop.env]
+[env]
 # Cut Claude Code's non-essential / telemetry / error-reporting traffic at the source (these apply
 # to the Code-tab engine), so the tool never even generates it. The umbrella var covers all
 # non-essential background traffic except the WebFetch host-safety check, which keeps its own

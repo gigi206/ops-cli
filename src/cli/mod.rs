@@ -177,60 +177,74 @@ pub(crate) fn one_name<'a>(
     }
 }
 
-/// What parsing a `<verb> <file> [switch]` command line yielded: the path with the switch's state,
-/// or the refusal as the lines to print in order. An unknown flag prints the synopsis under itself
-/// because the fix is to read the verb's options; the other two refusals say enough on their own.
-#[derive(Debug, PartialEq)]
-pub(crate) enum OneFile {
-    Run { file: PathBuf, switch: bool },
-    Error(Vec<String>),
+/// The arguments an import verb takes: the file to read, the name to file it under, and whether an
+/// existing entry may be replaced.
+pub(crate) struct ImportArgs {
+    /// The file being imported.
+    pub(crate) file: PathBuf,
+    /// The name from `--as`, when the file's own stem is not the one wanted.
+    pub(crate) as_name: Option<String>,
+    /// Whether `--force` was given.
+    pub(crate) force: bool,
 }
 
-/// Parse the grammar the fragment-importing verbs share (`sbx bundle import`,
-/// `sbx net groups import`): exactly one file, one optional boolean switch under any of its
-/// spellings. Pure, so the grammar is unit-tested without writing to anyone's config.
-///
-/// The file is taken as raw bytes rather than through `to_str`, so a path that is not valid UTF-8
-/// still names the file the user meant; that is the opposite of [`parse_one_name`], where the
-/// argument has to match something sbx knows by name. A second file is refused rather than
-/// overwriting the first, since importing the wrong fragment writes to the global config.
-pub(crate) fn parse_one_file(args: &[OsString], path: &[&str], switches: &[&str]) -> OneFile {
-    let verb = path.join(" ");
-    let usage = format!("sbx: usage: {}", crate::help::synopsis_of(path));
-    let mut switch = false;
+/// Parse `<file> [--as <name>] [-f|--force]` — the shape `sbx bundle import` and `sbx net groups
+/// import` share, reported with `path`'s synopsis. `--as` exists because an entry is named by its
+/// file: a fragment downloaded under another name is filed under the name it is given here.
+pub(crate) fn import_args(args: &[OsString], path: &[&str]) -> Result<ImportArgs, ExitCode> {
     let mut file: Option<PathBuf> = None;
-    for arg in args {
+    let mut as_name: Option<String> = None;
+    let mut force = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
         match arg.to_str() {
-            Some(s) if switches.contains(&s) => switch = true,
-            Some(flag) if flag.starts_with('-') => {
-                return OneFile::Error(vec![format!("sbx: {verb}: unknown flag `{flag}`"), usage]);
-            }
-            _ => {
-                if file.is_some() {
-                    return OneFile::Error(vec![format!("sbx: {verb}: expected exactly one file")]);
+            Some("-f") | Some("--force") => force = true,
+            Some("--as") => match it.next().and_then(|v| v.to_str()) {
+                Some(n) => as_name = Some(n.to_string()),
+                None => {
+                    diag::error(&format!("sbx: {}: `--as` needs a name", path.join(" ")));
+                    return Err(ExitCode::from(2));
                 }
-                file = Some(PathBuf::from(arg));
+            },
+            Some(flag) if flag.starts_with('-') => {
+                diag::error(&format!("sbx: {}: unknown flag `{flag}`", path.join(" ")));
+                diag::error(&format!("sbx: usage: {}", crate::help::synopsis_of(path)));
+                return Err(ExitCode::from(2));
+            }
+            _ if file.is_none() => file = Some(PathBuf::from(arg)),
+            _ => {
+                diag::error(&format!("sbx: {} takes a single file", path.join(" ")));
+                return Err(ExitCode::from(2));
             }
         }
     }
     match file {
-        Some(file) => OneFile::Run { file, switch },
-        None => OneFile::Error(vec![usage]),
+        Some(file) => Ok(ImportArgs {
+            file,
+            as_name,
+            force,
+        }),
+        None => {
+            diag::error(&format!("sbx: usage: {}", crate::help::synopsis_of(path)));
+            Err(ExitCode::from(2))
+        }
     }
 }
 
-/// [`parse_one_file`] plus the reporting, the way [`one_name`] pairs with [`parse_one_name`].
-pub(crate) fn one_file(
-    args: &[OsString],
-    path: &[&str],
-    switches: &[&str],
-) -> Result<(PathBuf, bool), ExitCode> {
-    match parse_one_file(args, path, switches) {
-        OneFile::Run { file, switch } => Ok((file, switch)),
-        OneFile::Error(lines) => {
-            for line in lines {
-                diag::error(&line);
-            }
+/// The name an imported file is filed under: `--as`, else the source file's stem. It keys an
+/// on-disk file, so a stem that is not usable UTF-8 is refused rather than guessed at.
+pub(crate) fn imported_name(args: &ImportArgs, path: &[&str]) -> Result<String, ExitCode> {
+    if let Some(name) = &args.as_name {
+        return Ok(name.clone());
+    }
+    match args.file.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => Ok(s.to_string()),
+        None => {
+            diag::error(&format!(
+                "sbx: {}: cannot derive a name from {} — pass --as <name>",
+                path.join(" "),
+                args.file.display()
+            ));
             Err(ExitCode::from(2))
         }
     }
@@ -258,6 +272,82 @@ pub(crate) fn keep_replaced_file(dest: &Path, bytes: &[u8]) -> std::io::Result<(
     crate::sandbox::atomicfile::write_atomic_mode(dest, bytes, Some(0o600))
 }
 
+/// One imported config file that a forced import replaced: the bytes that were there, and where
+/// they were kept.
+pub(crate) struct ReplacedFile {
+    /// What the file held before the write, for the caller to say what the new one no longer sets.
+    pub(crate) previous: Vec<u8>,
+    /// The copy beside it, `<name>.toml.replaced`.
+    pub(crate) kept: PathBuf,
+}
+
+/// What [`install_named_file`] wrote: where it landed, and what it replaced.
+pub(crate) struct Installed {
+    /// The file written, `<dir>/<name>.toml`.
+    pub(crate) dest: PathBuf,
+    /// The previous file, when one was replaced and its bytes differed.
+    pub(crate) replaced: Option<ReplacedFile>,
+}
+
+/// Install `bytes` as `<dir>/<name>.toml` — the write behind `sbx app import`, `sbx bundle import`
+/// and `sbx net groups import`. The three differ only in the directory they write to and in what a
+/// message calls the file, so the write itself has one definition; `noun` is that word.
+///
+/// An existing file is refused unless `force`. With `force`, the previous bytes are kept beside it
+/// as `<name>.toml.replaced` BEFORE the write, so a per-machine setting the incoming file no longer
+/// carries survives the overwrite; identical bytes keep nothing, since a re-import that changes
+/// nothing has nothing to keep. Every failure refuses before writing — including a previous file
+/// that cannot be READ, because dropping what sbx could not look at is the one outcome the copy
+/// exists to prevent.
+pub(crate) fn install_named_file(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    force: bool,
+    noun: &str,
+) -> Result<Installed, ExitCode> {
+    let dest = dir.join(format!("{name}.toml"));
+    if dest.exists() && !force {
+        diag::error(&format!(
+            "sbx: a {noun} '{name}' already exists at {} (use --force to overwrite)",
+            dest.display()
+        ));
+        return Err(ExitCode::FAILURE);
+    }
+    let replaced = match std::fs::read(&dest) {
+        Ok(previous) if previous != bytes => {
+            let kept = dir.join(format!("{name}.toml.replaced"));
+            match keep_replaced_file(&kept, &previous) {
+                Ok(()) => Some(ReplacedFile { previous, kept }),
+                Err(e) => {
+                    diag::error(&format!(
+                        "sbx: cannot keep the {noun} being replaced at {}: {e} — nothing was \
+                         overwritten",
+                        kept.display()
+                    ));
+                    return Err(ExitCode::FAILURE);
+                }
+            }
+        }
+        // Same bytes: a re-import that changes nothing has nothing to keep.
+        Ok(_) => None,
+        // No previous file: this is an import, not an overwrite.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: cannot read the {noun} being replaced at {}: {e} — nothing was overwritten",
+                dest.display()
+            ));
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    if let Err(e) = crate::sandbox::atomicfile::write_atomic_mode(&dest, bytes, Some(0o600)) {
+        diag::error(&format!("sbx: cannot write {}: {e}", dest.display()));
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(Installed { dest, replaced })
+}
+
 /// The settings a replaced file carried that the incoming one does not — what a `--force` import
 /// drops, whether the file is an app profile or a bundle fragment.
 ///
@@ -278,65 +368,6 @@ pub(crate) fn settings_dropped_by(previous: &str, incoming: &str) -> Vec<String>
         }
     }
     out
-}
-
-/// Keep every fragment a forced import is about to replace, and say what the incoming one no longer
-/// declares — one warning per replaced entry, for the caller to surface once the write succeeded.
-///
-/// A bundle and an egress group are both entries *inside* the shared global config rather than files
-/// of their own, so what stands in for a per-file copy is the portable fragment the family's export
-/// verb already emits: the replaced entry is written back out beside the config as
-/// `<name>.<suffix>.replaced`, and re-declaring it is that family's `import` on the file. The name
-/// ends in neither `.toml` nor a profile path, so nothing reads it as configuration.
-///
-/// Only an entry whose declaration actually CHANGES is kept: re-importing an identical fragment
-/// leaves no copy and reports nothing. An error here fails the import closed, before the write, so
-/// an entry is never overwritten with no way back.
-///
-/// `noun` names the entry in the warning (`bundle`, `egress group`) and `suffix` names it both in
-/// the kept file and in the refusal; `declared` is read only once there is something to compare
-/// against, and `export_one` renders one entry in its family's portable form.
-pub(crate) fn keep_replaced_fragments<T>(
-    config_path: &Path,
-    incoming: &std::collections::BTreeMap<String, T>,
-    declared: impl FnOnce() -> std::collections::BTreeMap<String, T>,
-    force: bool,
-    noun: &str,
-    suffix: &str,
-    export_one: impl Fn(&str, &T) -> Result<String, String>,
-) -> Result<Vec<String>, String> {
-    if !force {
-        return Ok(Vec::new());
-    }
-    let Some(dir) = config_path.parent() else {
-        return Ok(Vec::new());
-    };
-    let declared = declared();
-    let mut notes = Vec::new();
-    for (name, new) in incoming {
-        let Some(old) = declared.get(name) else {
-            continue; // added, not replaced
-        };
-        let (before, after) = (export_one(name, old)?, export_one(name, new)?);
-        if before == after {
-            continue;
-        }
-        let kept = dir.join(format!("{name}.{suffix}.replaced"));
-        keep_replaced_file(&kept, before.as_bytes()).map_err(|e| {
-            format!(
-                "cannot keep the {suffix} being replaced at {}: {e}",
-                kept.display()
-            )
-        })?;
-        notes.push(render_replaced_fragment(
-            noun,
-            name,
-            &settings_dropped_by(&before, &after),
-            &settings_dropped_by(&after, &before),
-            &kept,
-        ));
-    }
-    Ok(notes)
 }
 
 /// The overwrite warning for one replaced fragment: what its replacement no longer declares, what
@@ -695,8 +726,7 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        OneFile, OneName, dedupe_names, keep_replaced_file, one_name, parse_one_file,
-        parse_one_name, parse_run_launch,
+        OneName, dedupe_names, keep_replaced_file, one_name, parse_one_name, parse_run_launch,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1086,99 +1116,52 @@ mod tests {
         }
     }
 
-    /// `sbx bundle import`'s grammar, spelled out literally the same way.
-    fn import(args: &[OsString]) -> OneFile {
-        parse_one_file(args, &["bundle", "import"], &["-f", "--force"])
-    }
-
-    #[test]
-    fn a_file_parses_with_either_spelling_of_the_switch() {
-        assert_eq!(
-            import(&os(&["frag.toml"])),
-            OneFile::Run {
-                file: PathBuf::from("frag.toml"),
-                switch: false
-            }
-        );
-        for line in [
-            vec!["frag.toml", "-f"],
-            vec!["frag.toml", "--force"],
-            vec!["--force", "frag.toml"],
-        ] {
-            assert_eq!(
-                import(&os(&line)),
-                OneFile::Run {
-                    file: PathBuf::from("frag.toml"),
-                    switch: true
-                },
-                "{line:?}"
-            );
-        }
-    }
-
     /// The deliberate difference from [`parse_one_name`]: a path is bytes, so one that is not valid
-    /// UTF-8 still names the file the user meant instead of being refused.
+    /// UTF-8 still names the file the user meant instead of being refused. It is the *name* it
+    /// would be filed under that cannot be derived from it, which [`imported_name`] says with the
+    /// flag that resolves it.
     #[test]
     fn a_file_whose_name_is_not_utf8_is_still_the_file() {
         use std::os::unix::ffi::OsStringExt;
         let raw = OsString::from_vec(vec![0x66, 0xff, 0x2e, 0x74, 0x6f, 0x6d, 0x6c]);
-        assert_eq!(
-            parse_one_file(
-                std::slice::from_ref(&raw),
-                &["bundle", "import"],
-                &["-f", "--force"]
-            ),
-            OneFile::Run {
-                file: PathBuf::from(&raw),
-                switch: false
-            }
+        let parsed = super::import_args(std::slice::from_ref(&raw), &["bundle", "import"])
+            .unwrap_or_else(|_| panic!("a non-UTF-8 path is still a file"));
+        assert_eq!(parsed.file, PathBuf::from(&raw));
+        assert!(!parsed.force);
+        assert!(parsed.as_name.is_none());
+        assert!(
+            super::imported_name(&parsed, &["bundle", "import"]).is_err(),
+            "no name can be derived from those bytes"
         );
     }
 
+    /// `--as` and `--force` in either order, and the name `--as` gives wins over the file's stem.
     #[test]
-    fn refusing_a_file_says_what_to_do_next() {
-        assert_eq!(
-            import(&os(&["--bogus"])),
-            OneFile::Error(vec![
-                "sbx: bundle import: unknown flag `--bogus`".to_string(),
-                "sbx: usage: sbx bundle import <file> [-f|--force]".to_string(),
-            ])
-        );
-        // A second file is refused rather than overwriting the first, which would import the wrong
-        // fragment into the global config.
-        assert_eq!(
-            import(&os(&["one.toml", "two.toml"])),
-            OneFile::Error(vec![
-                "sbx: bundle import: expected exactly one file".to_string()
-            ])
-        );
-        for line in [vec![], vec!["-f"]] {
+    fn an_import_takes_a_name_and_a_force_in_any_order() {
+        for spelling in [
+            vec!["--force", "--as", "other", "frag.toml"],
+            vec!["frag.toml", "--as", "other", "-f"],
+        ] {
+            let parsed = super::import_args(&os(&spelling), &["bundle", "import"])
+                .unwrap_or_else(|_| panic!("{spelling:?} parses"));
+            assert_eq!(parsed.file, PathBuf::from("frag.toml"));
+            assert!(parsed.force, "{spelling:?}");
             assert_eq!(
-                import(&os(&line)),
-                OneFile::Error(vec![
-                    "sbx: usage: sbx bundle import <file> [-f|--force]".to_string()
-                ]),
-                "{line:?}"
+                super::imported_name(&parsed, &["bundle", "import"]).ok(),
+                Some("other".to_string()),
+                "{spelling:?}"
             );
         }
     }
 
-    /// The second verb sharing the grammar, asserted whole for the same reason as the one below.
+    /// With no `--as`, the file's own stem is the name — the rule that keeps one name in one place.
     #[test]
-    fn the_file_refusals_name_the_verb_that_was_run() {
-        let path = ["net", "groups", "import"];
+    fn an_import_without_as_is_named_by_its_file() {
+        let parsed = super::import_args(&os(&["/tmp/demo.toml"]), &["bundle", "import"])
+            .unwrap_or_else(|_| panic!("a bare path parses"));
         assert_eq!(
-            parse_one_file(&os(&["--bogus"]), &path, &["-f", "--force"]),
-            OneFile::Error(vec![
-                "sbx: net groups import: unknown flag `--bogus`".to_string(),
-                "sbx: usage: sbx net groups import <file> [-f|--force]".to_string(),
-            ])
-        );
-        assert_eq!(
-            parse_one_file(&os(&["a", "b"]), &path, &["-f", "--force"]),
-            OneFile::Error(vec![
-                "sbx: net groups import: expected exactly one file".to_string()
-            ])
+            super::imported_name(&parsed, &["bundle", "import"]).ok(),
+            Some("demo".to_string())
         );
     }
 

@@ -1095,7 +1095,6 @@ fn no_message_literal_runs_its_indentation_through_a_sentence() {
 /// shrink. Keyed by `(file under `src/`, item name)` rather than by line so it survives every edit
 /// that does not change what is documented.
 const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
-    ("cli/app.rs", "merged"),
     ("cli/app.rs", "nothing_written"),
     ("cli/app.rs", "parse_app_rm"),
     ("cli/gc.rs", "run"),

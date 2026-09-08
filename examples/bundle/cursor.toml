@@ -32,7 +32,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.cursor]
 allow = [
     # Cursor's agent + API + auth backends. Cursor's own network-config doc recommends the
     # `*.cursor.sh` wildcard — it covers api2 (most API), api5 + `agent.*`/regional (agent
@@ -103,14 +102,14 @@ mute = [
 # narrow as what it names.
 shared_credential = [["*.cursor.com", "*.cursor.sh", "api.workos.com"]]
 
-[bundle.cursor.packages]
+[packages]
 # Cursor's prebuilt `.deb`, auto-upgraded through the resolver below.
 cursor = "deb:resolve"
 # In-cage Chromium for the account sign-in flow. Drop it (and the consuming app's wrapper) if you
 # only ever sign in with EMAIL, which stays in the app webview and needs no external browser.
 chromium = "nix:chromium"
 
-[bundle.cursor.env]
+[env]
 # If Cursor's Node backend reaches its endpoints through Node's built-in fetch (undici), undici
 # ignores http_proxy/https_proxy unless this is set, and in the empty netns a bypassed fetch dies
 # with `EAI_AGAIN` before the proxy is ever consulted. Harmless if the backend uses a proxy-aware
@@ -122,7 +121,7 @@ NODE_USE_ENV_PROXY = "1"
 # `.deb` URL embeds a version and build hash with no `…/latest/…` alias, so a direct `deb:<url>`
 # would freeze; this queries the download API for the CURRENT `debUrl` instead. `curl -fsSL` fails
 # closed on an HTTP error; the printed URL is re-validated as a `.deb` URL before it is fetched.
-[bundle.cursor.deb.cursor]
+[deb.cursor]
 resolve = ["sh", "-c", '''
 curl -fsSL "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable" | sed -n 's/.*"debUrl":"\([^"]*\)".*/\1/p'
 ''']

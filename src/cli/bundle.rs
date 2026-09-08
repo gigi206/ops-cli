@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::cli::import_remedy;
-use crate::{config, config_cwd, diag, help, style};
+use crate::{config, diag, help, style};
 
 /// `sbx bundle` — dispatch. `export`/`import` are reserved subcommand verbs, so a bundle named
 /// `export` is listable and usable in a `use` list but not resolvable by bare name here (use the
@@ -487,11 +487,17 @@ fn grants_of(b: &config::RawBundle) -> Vec<String> {
     parts
 }
 
-/// `sbx bundle export [<name>…] [--out <file>]`: write the bundles as a portable
-/// `[bundle.<name>]` TOML fragment — every one, or the named subset — to stdout (the default:
-/// composable and clobber-safe) or to `--out <file>`. The inverse of `import`.
+/// `sbx bundle export [<name>…] [-o|--out <file>] [--out-dir <dir>]`: write declared bundles out in
+/// the portable form `sbx bundle import` reads.
+///
+/// One bundle goes to stdout (composable and clobber-safe — `sbx bundle export demo > demo.toml`)
+/// or to `--out <file>`. Several go to `--out-dir <dir>`, one `<name>.toml` per bundle: a bundle
+/// file *is* one bundle, so there is no concatenated form to write them all into. With no name at
+/// all, every declared bundle is exported, which is the shape that copies a machine's set
+/// elsewhere.
 fn bundle_export(args: &[OsString]) -> ExitCode {
     let mut out_file: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
     let mut names: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -500,6 +506,13 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
                 Some(p) => out_file = Some(PathBuf::from(p)),
                 None => {
                     diag::error("sbx: bundle export: `--out` needs a file path");
+                    return ExitCode::from(2);
+                }
+            },
+            Some("--out-dir") => match it.next() {
+                Some(p) => out_dir = Some(PathBuf::from(p)),
+                None => {
+                    diag::error("sbx: bundle export: `--out-dir` needs a directory path");
                     return ExitCode::from(2);
                 }
             },
@@ -517,6 +530,10 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+    if out_file.is_some() && out_dir.is_some() {
+        diag::error("sbx: bundle export: `--out` and `--out-dir` name two destinations; pick one");
+        return ExitCode::from(2);
     }
 
     let (bundles, warnings) = config::bundles();
@@ -537,163 +554,147 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
     };
     if selected.is_empty() {
         diag::error(
-            "sbx: bundle export: no bundles to export (none are declared under [bundle.<name>] \
-             in the global config)",
+            "sbx: bundle export: no bundles to export (none are declared under bundles/<name>.toml)",
         );
         return ExitCode::from(1);
     }
+    // A single stream carries one bundle, so more than one needs a directory to land in. Said
+    // before anything is written, naming the flag that resolves it.
+    if selected.len() > 1 && out_dir.is_none() {
+        diag::error(&format!(
+            "sbx: bundle export: {} bundles selected and a file holds one — pass `--out-dir <dir>`, \
+             or name a single bundle",
+            selected.len()
+        ));
+        return ExitCode::from(2);
+    }
 
-    let fragment = match config::manage::export_bundles(&selected) {
-        Ok(f) => f,
-        Err(e) => {
-            diag::error(&format!("sbx: bundle export: {e}"));
-            return ExitCode::FAILURE;
+    let mut rendered: Vec<(String, String)> = Vec::new();
+    for (name, bundle) in &selected {
+        match config::serialize_bundle(bundle) {
+            Ok(text) => rendered.push((name.clone(), text)),
+            Err(e) => {
+                diag::error(&format!("sbx: bundle export: {name}: {e}"));
+                return ExitCode::FAILURE;
+            }
         }
-    };
-    match out_file {
-        Some(path) => {
-            // No mode of sbx's own: `sbx bundle export > bundles.toml` and `--out <file>` are
-            // the same command spelled two ways, and a fragment is an artifact to hand on.
-            if let Err(e) = config::manage::write_text(&path, &fragment, None) {
+    }
+    match (out_dir, out_file) {
+        (Some(dir), _) => {
+            for (name, text) in &rendered {
+                let path = dir.join(format!("{name}.toml"));
+                if let Err(e) = config::manage::write_text(&path, text, None) {
+                    diag::error(&format!(
+                        "sbx: bundle export: cannot write {}: {e}",
+                        path.display()
+                    ));
+                    return ExitCode::FAILURE;
+                }
+            }
+            println!("exported {} bundle(s) to {}", rendered.len(), dir.display());
+        }
+        (None, Some(path)) => {
+            // No mode of sbx's own: `sbx bundle export demo > demo.toml` and `--out <file>` are
+            // the same command spelled two ways, and a bundle file is an artifact to hand on.
+            if let Err(e) = config::manage::write_text(&path, &rendered[0].1, None) {
                 diag::error(&format!(
                     "sbx: bundle export: cannot write {}: {e}",
                     path.display()
                 ));
                 return ExitCode::FAILURE;
             }
-            println!(
-                "exported {} bundle(s) to {}",
-                selected.len(),
-                path.display()
-            );
+            println!("exported bundle `{}` to {}", rendered[0].0, path.display());
         }
-        None => print!("{fragment}"),
+        (None, None) => crate::cli::print_document(&rendered[0].1),
     }
     ExitCode::SUCCESS
 }
 
-/// Keep every bundle a forced import is about to replace, and say what the incoming fragment no
-/// longer declares — [`super::keep_replaced_fragments`] with this family's nouns and exporter.
+/// `sbx bundle import <file> [--as <name>] [--force]`: file a portable bundle under
+/// `bundles/<name>.toml`, where the loader reads it. Bundles are global-only, so the target is
+/// always that directory; the deliberate command is the consent (an agent in the cage cannot run
+/// it), and the directory is trusted by location, so there is no prompt. An existing bundle of the
+/// same name is refused unless `--force`. An imported bundle is **inert** until an app names it in
+/// `use`.
 ///
-/// A bundle is a table inside the shared global config, not a file of its own, so the copy an app
-/// profile gets (`<name>.toml.replaced`, beside it) has no equivalent here. What stands in for it is
-/// the fragment `sbx bundle export` already emits: the replaced bundle is written back out in the
-/// same portable form, as `<name>.bundle.replaced` beside the config, so re-declaring it is
-/// `sbx bundle import` on that file.
-fn keep_replaced_bundles(
-    config_path: &Path,
-    incoming: &std::collections::BTreeMap<String, config::RawBundle>,
-    force: bool,
-) -> Result<Vec<String>, String> {
-    super::keep_replaced_fragments(
-        config_path,
-        incoming,
-        || config::bundles().0,
-        force,
-        "bundle",
-        "bundle",
-        |name, bundle| {
-            config::manage::export_bundles(&std::collections::BTreeMap::from([(
-                name.to_string(),
-                bundle.clone(),
-            )]))
-        },
-    )
-}
-
-/// `sbx bundle import <file> [--force]`: merge a portable `[bundle.<name>]` fragment into the
-/// global config, preserving every existing bundle and comment. Bundles are global-only, so the
-/// target is always the global config; the deliberate command is the consent (an agent in the cage
-/// cannot run it), and the global config is trusted by location, so there is no prompt. A name that
-/// already exists is refused unless `--force` overwrites it. An imported bundle is **inert** until
-/// an app names it in `use`.
+/// The bytes are copied verbatim, like an app profile: the author's comments and layout survive the
+/// round-trip through a catalogue, and the name comes from the file rather than from the contents.
 fn bundle_import(args: &[OsString]) -> ExitCode {
-    let (file, force) = match crate::cli::one_file(args, &["bundle", "import"], &["-f", "--force"])
-    {
-        Ok(parsed) => parsed,
+    const PATH: &[&str] = &["bundle", "import"];
+    let parsed = match crate::cli::import_args(args, PATH) {
+        Ok(a) => a,
         Err(code) => return code,
     };
-
-    let bundles = match config::read_bundle_fragment(&file) {
-        Ok(b) => b,
-        Err(e) => {
-            diag::error(&format!("sbx: bundle import: {e}"));
-            return ExitCode::from(2);
-        }
+    let name = match crate::cli::imported_name(&parsed, PATH) {
+        Ok(n) => n,
+        Err(code) => return code,
     };
-    // Validate every name before writing — an invalid one would be dropped at load, leaving an app
-    // that names it silently short of its tool. Fail closed, naming the offender.
-    if let Some(bad) = bundles.keys().find(|n| !config::is_valid_bundle_name(n)) {
+    // A name keys an on-disk file and a `use` reference; an invalid one would be dropped at load,
+    // leaving an app that names it silently short of its tool. Fail closed, naming the offender.
+    if !config::is_valid_bundle_name(&name) {
         diag::error(&format!(
-            "sbx: bundle import: invalid bundle name `{bad}` (1–64 of [A-Za-z0-9._-]); nothing \
+            "sbx: bundle import: invalid bundle name `{name}` (1–64 of [A-Za-z0-9._-]); nothing \
              imported"
         ));
         return ExitCode::from(2);
     }
-
-    let cwd = match config_cwd() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-    let path = match config::manage::scope_path(&config::manage::Scope::Global, &cwd) {
-        Ok(p) => p,
+    // Read through the same safety gate every config file passes, then validate it is a bundle
+    // before writing — the wrong file (an app profile) is refused rather than filed as a toolless
+    // bundle.
+    let bytes = match config::safety::read_safe_bytes(&parsed.file) {
+        Ok(b) => b,
         Err(e) => {
-            diag::error(&format!("sbx: bundle import: {e}"));
-            return ExitCode::from(1);
-        }
-    };
-    // `--force` replaces bundles that are already declared, and one may carry a rule or a package
-    // added by hand on this machine. Keep each replaced bundle beside the config BEFORE the write,
-    // and report what the incoming fragment no longer declares.
-    let replaced = match keep_replaced_bundles(&path, &bundles, force) {
-        Ok(kept) => kept,
-        Err(e) => {
-            diag::error(&format!(
-                "sbx: bundle import: {e} — nothing was overwritten"
-            ));
+            diag::error(&format!("sbx: bundle import: cannot read {e}"));
             return ExitCode::FAILURE;
         }
     };
-    match config::manage::import_bundles(&path, &bundles, force) {
-        Ok(outcome) => {
-            for note in &replaced {
-                diag::warn(note);
-            }
-            let mut parts = Vec::new();
-            if !outcome.added.is_empty() {
-                parts.push(format!("added {}", outcome.added.join(", ")));
-            }
-            if !outcome.overwritten.is_empty() {
-                parts.push(format!("overwrote {}", outcome.overwritten.join(", ")));
-            }
-            let summary = if parts.is_empty() {
-                "nothing to do".to_string()
-            } else {
-                parts.join("; ")
-            };
-            println!(
-                "imported {} bundle(s) into {} — {summary}",
-                bundles.len(),
-                path.display()
-            );
-            if let Some(note) = granting_note(&bundles) {
-                diag::warn(&note);
-            }
-            // A bundle's egress list may reference a group, and a group is global-only: undefined,
-            // its entries are dropped at the fold and the consuming app reaches LESS than the
-            // bundle names. This is where the majority of them surface — an app profile resolves
-            // nothing from disk, so `sbx app import` cannot see into the bundle its `use` names,
-            // and without this the reference is silent until a launch that quietly falls short.
-            if let Some(note) = undefined_groups_note(&bundles, &file) {
-                diag::warn(&note);
-            }
-            ExitCode::SUCCESS
-        }
+    let bundle = match config::validate_bundle(&bytes) {
+        Ok(b) => b,
         Err(e) => {
-            diag::error(&format!("sbx: bundle import: {e}"));
-            ExitCode::from(1)
+            diag::error(&format!(
+                "sbx: bundle import: {} is not a valid bundle: {e}",
+                parsed.file.display()
+            ));
+            return ExitCode::from(2);
         }
+    };
+    let Some(dir) = config::bundles_dir() else {
+        diag::error("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let installed =
+        match crate::cli::install_named_file(&dir, &name, &bytes, parsed.force, "bundle") {
+            Ok(i) => i,
+            Err(code) => return code,
+        };
+    println!("imported bundle `{name}` into {}", installed.dest.display());
+    // An overwrite is the one import that can LOSE something — a rule or a package added by hand on
+    // this machine. Both sides are named: a fragment that only ADDS widens what an app that uses it
+    // reaches, which is exactly as worth saying as a drop.
+    if let Some(replaced) = &installed.replaced {
+        let before = String::from_utf8_lossy(&replaced.previous).to_string();
+        let after = String::from_utf8_lossy(&bytes).to_string();
+        diag::warn(&crate::cli::render_replaced_fragment(
+            "bundle",
+            &name,
+            &crate::cli::settings_dropped_by(&before, &after),
+            &crate::cli::settings_dropped_by(&after, &before),
+            &replaced.kept,
+        ));
     }
+    let imported = std::collections::BTreeMap::from([(name, bundle)]);
+    if let Some(note) = granting_note(&imported) {
+        diag::warn(&note);
+    }
+    // A bundle's egress list may reference a group, and a group is global-only: undefined, its
+    // entries are dropped at the fold and the consuming app reaches LESS than the bundle names.
+    // This is where the majority of them surface — an app profile resolves nothing from disk, so
+    // `sbx app import` cannot see into the bundle its `use` names, and without this the reference
+    // is silent until a launch that quietly falls short.
+    if let Some(note) = undefined_groups_note(&imported, &parsed.file) {
+        diag::warn(&note);
+    }
+    ExitCode::SUCCESS
 }
 
 /// What naming these bundles from an app would grant, or `None` when they carry nothing to warn
@@ -987,15 +988,17 @@ mod tests {
         let set: std::collections::BTreeMap<String, config::RawBundle> =
             [("demo".to_string(), b.clone())].into_iter().collect();
 
-        let fragment = config::manage::export_bundles(&set).expect("export serializes");
+        let fragment = config::serialize_bundle(&b).expect("export serializes");
         assert!(
-            fragment.contains("[bundle.demo]"),
-            "the fragment is keyed under `bundle`: {fragment}"
+            !fragment.contains("[bundle."),
+            "a bundle file carries its fields at the top level, not under a wrapper: {fragment}"
         );
         let tmp = crate::testutil::TmpDir::new();
-        let path = tmp.path().join("bundles.toml");
+        // The file name is the bundle name, so the round-trip has to go through a file called
+        // `demo.toml` — that is where the name comes from.
+        let path = tmp.path().join("demo.toml");
         std::fs::write(&path, &fragment).unwrap();
-        let parsed = config::read_bundle_fragment(&path).expect("the fragment re-parses");
+        let parsed = config::read_bundle_fragment(&path).expect("the bundle file re-parses");
         assert_eq!(parsed, set, "export → import is lossless");
     }
 

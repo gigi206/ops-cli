@@ -20,7 +20,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.openfox]
 # The install step mise's `--ignore-scripts` leaves undone, and the reason this bundle is complete
 # rather than a package a consuming app cannot start. OpenFox depends on two NATIVE node addons —
 # `better-sqlite3` (its session DB), whose compiled `.node` binary is placed by a package install
@@ -82,6 +81,6 @@ fi
 ''',
 ]
 
-[bundle.openfox.packages]
+[packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 openfox = "mise:npm:openfox"

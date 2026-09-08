@@ -37,7 +37,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.deepagents-code]
 allow = [
     # Install-time (mise's pipx backend runs `uv tool install deepagents-code`): the Python
     # wheels and the package index, resolved from PyPI on first launch — the shared `@pypi`
@@ -46,7 +45,7 @@ allow = [
     "@pypi",
 ]
 
-[bundle.deepagents-code.packages]
+[packages]
 deepagents-code = "mise:pipx:deepagents-code"  # the tool itself, from PyPI via uv (binary: `dcode`)
 uv = "nix:uv"                                  # mise's pipx backend runs `uv tool install`
 python = "nix:python312"                       # puts an interpreter uv can use on PATH (the project asks for `>=3.11,<4.0`)

@@ -17,7 +17,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.claude-code]
 allow = [
     # The Claude API: the account/connectivity check plus the `/voice` speech-to-text WebSocket
     # (`api.anthropic.com/api/ws/speech_to_text/voice_stream`). `{*,WS}` = all HTTP verbs AND the
@@ -31,10 +30,10 @@ allow = [
     "{GET} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 
-[bundle.claude-code.packages]
+[packages]
 claude-code = "mise:aqua:anthropics/claude-code"
 
-[bundle.claude-code.env]
+[env]
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 DISABLE_TELEMETRY = "1"
 DISABLE_ERROR_REPORTING = "1"

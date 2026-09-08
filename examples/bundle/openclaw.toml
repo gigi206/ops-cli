@@ -20,7 +20,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.openclaw]
 allow = [
     "{*} https://api.openai.com",
     "@npm-registry",
@@ -29,9 +28,9 @@ mute = [
     "@npm-audit",
 ]
 
-[bundle.openclaw.packages]
+[packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 openclaw = "mise:npm:openclaw"
 
-[bundle.openclaw.env]
+[env]
 NODE_USE_ENV_PROXY = "1"

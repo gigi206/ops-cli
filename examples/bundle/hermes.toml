@@ -25,7 +25,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.hermes]
 allow = [
     # The agent's OWN product hosts. The OpenRouter BYOK provider (openrouter.ai) is NOT here —
     # it lives in the shared `openrouter` egress group, which the consuming app MAY reference
@@ -45,9 +44,9 @@ mute = [
     "@npm-audit",
 ]
 
-[bundle.hermes.packages]
+[packages]
 hermes = "flake:github:NousResearch/hermes-agent#default"
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 
-[bundle.hermes.env]
+[env]
 AGENT_BROWSER_ARGS = "--no-sandbox,--disable-dev-shm-usage"

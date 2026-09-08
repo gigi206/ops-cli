@@ -23,7 +23,6 @@
 # header as belonging to that table, so an `allow` written below `[…packages]` would silently become
 # `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.sigit]
 allow = [
     "@npm-registry",
     "{GET} https://huggingface.co",
@@ -43,11 +42,11 @@ mute = [
     "sigit.si",
 ]
 
-[bundle.sigit.packages]
+[packages]
 nodejs = "nix:nodejs"                # the npm entry point is a JS shim
 sigit = "mise:npm:@smbcloud/sigit"   # upstream's documented npm package
 
-[bundle.sigit.env]
+[env]
 # mise picks the client that performs an `npm:` install itself (`npm.package_manager = "auto"`), and
 # the one it picks refuses this package: the install ends in
 # `aube install failed: user aborted `mise add @smbcloud/sigit``, with no prompt a caller could answer,

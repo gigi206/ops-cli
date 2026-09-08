@@ -2248,7 +2248,7 @@ pub(super) const PAGES: &[Page] = &[
             ),
             ("--json", "emit the bundles as JSON"),
         ],
-        details: "A `[bundle.<name>]` bundle is everything one tool needs to be INSTALLED and to REACH its\n\
+        details: "A bundle is everything one tool needs to be INSTALLED and to REACH its\n\
             own services: its `packages`, the `env` it reads, its `allow`/`deny`/`mute` egress rules,\n\
             and its `[secret]` credential. An app names one with `use = [\"<name>\"]` and it is folded\n\
             in before resolution — so an orchestrator that drives another agent's CLI states that\n\
@@ -2258,52 +2258,64 @@ pub(super) const PAGES: &[Page] = &[
             `gui`, `gpu`,\n\
             `audio`, `dbus`, `proc`, `home_scope`) — using one can add a tool, its environment, its\n\
             egress and its credential, never widen what the cage exposes of the host. Bundles are\n\
-            global-only (like `[network.groups]`), so this command has no scope flag. Read-only (except\n\
-            `import`), no launch, no nix.",
+            global-only (like egress groups), so this command has no scope flag: each bundle is a file\n\
+            under `bundles/<name>.toml` beside the global config, named by that file. Read-only\n\
+            (except `import`), no launch, no nix.",
     },
     Page {
         path: &["bundle", "export"],
-        synopsis: "sbx bundle export [<name>…] [-o|--out <file>]",
-        summary: "write tool bundles as a portable [bundle.<name>] fragment",
+        synopsis: "sbx bundle export [<name>…] [-o|--out <file>] [--out-dir <dir>]",
+        summary: "write tool bundles as portable bundle files",
         options: &[
             (
                 "<name>…",
                 "export only the named bundle(s) (default: every bundle)",
             ),
-            ("-o, --out <file>", "write to <file> instead of stdout"),
+            (
+                "-o, --out <file>",
+                "write the single selected bundle to <file> instead of stdout",
+            ),
+            (
+                "--out-dir <dir>",
+                "write one <name>.toml per bundle into <dir>",
+            ),
         ],
-        details: "Emits the bundles as a portable `[bundle.<name>]` TOML fragment — to stdout by default\n\
-            (`sbx bundle export > bundles.toml`), or to `--out <file>`. The inverse of `import`.\n\
-            Source comments are not carried (a bundle is data). Read-only, no launch.",
+        details: "Emits each bundle in the portable form `sbx bundle import` reads: its fields at the top\n\
+            level, its name carried by the file. One bundle goes to stdout by default\n\
+            (`sbx bundle export demo > demo.toml`) or to `--out <file>`; several need\n\
+            `--out-dir <dir>`, which writes one `<name>.toml` per bundle, because a bundle file holds\n\
+            one bundle. The inverse of `import`. Source comments are not carried (a bundle is data).\n\
+            Read-only, no launch.",
     },
     Page {
         path: &["bundle", "import"],
-        synopsis: "sbx bundle import <file> [-f|--force]",
-        summary: "merge a [bundle.<name>] fragment into the global config",
+        synopsis: "sbx bundle import <file> [--as <name>] [-f|--force]",
+        summary: "file a bundle under bundles/<name>.toml",
         options: &[
+            ("<file>", "a bundle file (e.g. from `sbx bundle export`)"),
             (
-                "<file>",
-                "a `[bundle.<name>]` fragment (e.g. from `sbx bundle export`)",
+                "--as <name>",
+                "file it under <name> instead of the source file's name",
             ),
             (
                 "-f, --force",
                 "overwrite a bundle whose name already exists (default: refuse)",
             ),
         ],
-        details: "Merges the fragment's bundles into the global config, preserving every existing bundle and\n\
-            comment (`toml_edit`). Bundles are global-only, so the target is always the global config,\n\
-            which is trusted by location — the deliberate command is the consent (an agent in the cage\n\
-            cannot run it), so there is no prompt. A name that already exists is refused unless\n\
-            `--force`; the merge is all-or-nothing. A bundle that would grant egress or a credential is\n\
-            named after the import — inspect it with `sbx bundle <name>` before an app uses it. An\n\
-            imported bundle is INERT until an app names it in `use`. An app *profile* is a different\n\
-            artifact: import that with `sbx app import`.\n\
+        details: "Copies the file into `bundles/<name>.toml` beside the global config, where the loader\n\
+            reads it. The name comes from the file — its own stem, or `--as <name>` — so one name\n\
+            lives in one place; the bytes are copied verbatim, so the author's comments survive.\n\
+            Bundles are global-only, and that directory is trusted by location — the deliberate\n\
+            command is the consent (an agent in the cage cannot run it), so there is no prompt. A\n\
+            name that already exists is refused unless `--force`. A bundle that would grant egress or\n\
+            a credential is named after the import — inspect it with `sbx bundle <name>` before an app\n\
+            uses it. An imported bundle is INERT until an app names it in `use`. An app *profile* is a\n\
+            different artifact, and one handed here is refused: import it with `sbx app import`.\n\
             \n\
-            A forced overwrite names the entries the incoming fragment no longer declares, and\n\
-            keeps the bundle it replaced beside the config as `<name>.bundle.replaced` — the same\n\
-            portable form `sbx bundle export` writes, so a per-machine entry is read back by\n\
-            importing that file. A bundle lives in a table of the shared config rather than a file\n\
-            of its own, so that copy is the only way back to what was overwritten.",
+            A forced overwrite keeps the file it replaced beside it as `<name>.toml.replaced`, and\n\
+            names both what the incoming bundle no longer declares and what it declares on top — a\n\
+            widening is as worth reading as a loss. Re-import that copy to put the previous bundle\n\
+            back.",
     },
     Page {
         path: &["net", "groups"],
@@ -2316,57 +2328,65 @@ pub(super) const PAGES: &[Page] = &[
             ),
             ("--json", "emit the groups and their entries as JSON"),
         ],
-        details: "A `[network.groups]` group is a named set of egress entries declared once in the global\n\
-            config and referenced from a `[network]` allow/deny list with `@<name>`, so a set of hosts\n\
-            is shared across apps instead of rewritten per profile. Groups are global-only, so this\n\
-            command has no scope flag — it always reads the global config. `sbx net groups` lists the\n\
+        details: "A group is a named set of egress entries declared once beside the global config and\n\
+            referenced from a `[network]` allow/deny list with `@<name>`, so a set of hosts is shared\n\
+            across apps instead of rewritten per profile. Each group is a file under\n\
+            `net-groups/<name>.toml`, named by that file. Groups are global-only, so this command has\n\
+            no scope flag. `sbx net groups` lists the\n\
             groups; `sbx net groups <name>` shows what `@<name>` expands to; `export`/`import` move\n\
             groups between machines. A malformed or nested entry is flagged. Add a reference with\n\
             `sbx net allow @<name>`. Read-only (except `import`), no launch.",
     },
     Page {
         path: &["net", "groups", "export"],
-        synopsis: "sbx net groups export [<name>…] [-o|--out <file>]",
-        summary: "write egress groups as a portable [network.groups] fragment",
+        synopsis: "sbx net groups export [<name>…] [-o|--out <file>] [--out-dir <dir>]",
+        summary: "write egress groups as portable group files",
         options: &[
             (
                 "<name>…",
                 "export only the named group(s) (default: every group)",
             ),
-            ("-o, --out <file>", "write to <file> instead of stdout"),
+            (
+                "-o, --out <file>",
+                "write the single selected group to <file> instead of stdout",
+            ),
+            (
+                "--out-dir <dir>",
+                "write one <name>.toml per group into <dir>",
+            ),
         ],
-        details: "Emits the reusable egress groups as a portable `[network.groups]` TOML fragment — to stdout\n\
-            by default (`sbx net groups export > groups.toml`), or to `--out <file>`. The inverse of\n\
-            `import`. Source comments are not carried (a group is data). Read-only, no launch.",
+        details: "Emits each group in the portable form `sbx net groups import` reads: its entries under\n\
+            `entries`, its name carried by the file. One group goes to stdout by default\n\
+            (`sbx net groups export ci > ci.toml`) or to `--out <file>`; several need\n\
+            `--out-dir <dir>`, which writes one `<name>.toml` per group. The inverse of `import`.\n\
+            Source comments are not carried (a group is data). Read-only, no launch.",
     },
     Page {
         path: &["net", "groups", "import"],
-        synopsis: "sbx net groups import <file> [-f|--force]",
-        summary: "merge a [network.groups] fragment into the global config",
+        synopsis: "sbx net groups import <file> [--as <name>] [-f|--force]",
+        summary: "file an egress group under net-groups/<name>.toml",
         options: &[
+            ("<file>", "a group file (e.g. from `sbx net groups export`)"),
             (
-                "<file>",
-                "a `[network.groups]` fragment (e.g. from `sbx net groups export`)",
+                "--as <name>",
+                "file it under <name> instead of the source file's name",
             ),
             (
                 "-f, --force",
                 "overwrite a group whose name already exists (default: refuse)",
             ),
         ],
-        details: "Merges the fragment's groups into the global config, preserving every existing group and\n\
-            comment (`toml_edit`). Groups are global-only, so the target is always the global config,\n\
-            which is trusted by location — the deliberate command is the consent (an agent in the cage\n\
-            cannot run it), so there is no prompt. A name that already exists is refused unless\n\
-            `--force`; the merge is all-or-nothing. A group carrying an entry that will not resolve (a\n\
-            malformed or nested one) is flagged after the import — inspect it with `sbx net groups\n\
-            <name>`. Imported groups are inert until referenced by a `[network]` allow/deny with\n\
-            `@<name>`.\n\
+        details: "Copies the file into `net-groups/<name>.toml` beside the global config, where the loader\n\
+            reads it. The name comes from the file — its own stem, or `--as <name>` — and the bytes\n\
+            are copied verbatim, so the author's comments survive. Groups are global-only, and that\n\
+            directory is trusted by location — the deliberate command is the consent (an agent in the\n\
+            cage cannot run it), so there is no prompt. A name that already exists is refused unless\n\
+            `--force`. A group carrying an entry that will not resolve (a malformed or nested one) is\n\
+            flagged after the import — inspect it with `sbx net groups <name>`. Imported groups are\n\
+            inert until referenced by a `[network]` allow/deny with `@<name>`.\n\
             \n\
-            A forced overwrite names the entries the incoming fragment no longer declares, and\n\
-            keeps the group it replaced beside the config as `<name>.group.replaced` — the same\n\
-            portable form `sbx net groups export` writes, so a per-machine entry is read back by\n\
-            importing that file. A group lives in a key of the shared config rather than a file of\n\
-            its own, so that copy is the only way back to what was overwritten.",
+            A forced overwrite keeps the file it replaced beside it as `<name>.toml.replaced`, and\n\
+            names both what the incoming group no longer declares and what it declares on top.",
     },
     Page {
         path: &["net", "allow"],

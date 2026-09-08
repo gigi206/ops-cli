@@ -27,7 +27,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.autohand]
 allow = [
     # First-party Autohand API — auth, account, the `code.autohand.ai` agent loop, the
     # `api.autohand.ai` backend.
@@ -42,6 +41,6 @@ allow = [
     "@github-install",
 ]
 
-[bundle.autohand.packages]
+[packages]
 nodejs = "nix:nodejs"              # Autohand Code requires `node >= 22` per its `engines` field
 autohand-cli = "mise:npm:autohand-cli"  # the vendor's own npm scope (bin `autohand`)

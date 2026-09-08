@@ -27,7 +27,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.mimo]
 allow = [
     # Xiaomi MiMo Open Platform API — OpenAI-compatible, base /v1: all model traffic
     # (completions POSTs plus the built-in web search, which POSTs /chat/completions to the
@@ -47,6 +46,6 @@ allow = [
     "{GET} https://mimocode.cnbj1.mi-fds.com",
 ]
 
-[bundle.mimo.packages]
+[packages]
 nodejs = "nix:nodejs"           # the `bin/mimo` Node shim is what launches — needed at RUNTIME
 mimo = "mise:npm:@mimo-ai/cli"  # the vendor's own npm scope

@@ -25,7 +25,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.amp]
 allow = [
     # Install: the packument (version resolution, also used by `sbx upgrade mise`), the wrapper
     # tarball, and the platform binary published at its own top-level path — the shared
@@ -49,11 +48,11 @@ mute = [
 # at which point the delay clears on its own and the exemption becomes dead weight.
 accepts_fresh_releases = ["amp"]
 
-[bundle.amp.packages]
+[packages]
 amp = "mise:npm:@ampcode/cli"  # the tool itself, from npm
 nodejs = "nix:nodejs"          # mise's npm backend needs a node runtime, and the wrapper runs the package's JS fallback
 
-[bundle.amp.env]
+[env]
 # sbx owns upgrades (`sbx upgrade mise`), so tell Amp not to check for a newer version of itself on
 # every start — the pinned install is the one sbx equips.
 AMP_SKIP_UPDATE_CHECK = "1"

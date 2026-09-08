@@ -36,7 +36,7 @@ cage of its own, and returns the exit status and the output.
 
 Trusted-only, like `[binds]`/`[seccomp]`/`[devices]`: an untrusted project may neither declare a task
 nor loosen one. Declarable in the global config, a project's `.sbx.toml`, an app profile
-(`[app.<name>.task.<task>]`) and a bundle (`[bundle.<name>.task.<task>]`). The name
+(`[app.<name>.task.<task>]`) and a bundle (its own `[task.<task>]`). The name
 `defaults` is reserved for the settings table and is not a task name. Per-task ceilings
 default from `[task.defaults]`: `timeout = "30s"`, `max_output = "64KiB"`; a `timeout`
 may never be zero (no indefinite operation).

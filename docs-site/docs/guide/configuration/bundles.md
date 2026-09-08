@@ -1,17 +1,19 @@
 ---
-sidebar_label: "[bundle.<name>]"
-description: "Everything one tool needs to be installed and to reach its services, declared once and named with `use`."
+sidebar_label: "Tool bundles"
+description: "Everything one tool needs to be installed and to reach its services, declared once in its own file and named with `use`."
 ---
 
-# `[bundle.<name>]`: reusable tool bundles
+# Tool bundles
 
 A bundle is **everything one tool needs to be installed and to reach its own
-services**, declared once in the **global** config and folded into any app that names
+services**, declared once beside the global config and folded into any app that names
 it in `use`.
 
+Each bundle is a file under `bundles/`, and **the file name is the bundle name**: the
+same rule an [app profile](apps) follows.
+
 ```toml
-# ~/.config/sbx/sbx.toml
-[bundle.claude-code]
+# ~/.config/sbx/bundles/claude-code.toml
 packages = { claude-code = "mise:aqua:anthropics/claude-code" }
 env      = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
 allow    = [
@@ -31,7 +33,7 @@ mode  = "deny"
 allow = ["{*} https://orchestrator.example.com"]
 ```
 
-See also: [Apps](apps) · [`[packages]`](packages) · [`[network.groups]`](../networking/groups) · [`sbx bundle`](../cli/bundle).
+See also: [Apps](apps) · [`[packages]`](packages) · [Egress groups](../networking/groups) · [`sbx bundle`](../cli/bundle).
 
 ## What it is for
 
@@ -42,8 +44,9 @@ profile already states. Copied by hand, the two drift: the copy misses a host th
 original added, and the sub-agent fails at runtime in a way that looks like a sandbox
 bug.
 
-A bundle is the one declaration both read. `[network.groups]` already does this for
-egress entries, which are list items a `@<name>` reference can expand into;
+A bundle is the one declaration both read. An [egress group](../networking/groups)
+already does this for egress entries, which are list items a `@<name>` reference can
+expand into;
 `packages` and `env` are **maps**, with no slot for such a reference: so a bundle is
 the map-side companion, and it carries the egress along.
 
@@ -56,10 +59,10 @@ the map-side companion, and it carries the egress along.
 | `allow`, `deny`, `mute` | `network` mode, `gui`, `gpu`, `audio`, `dbus`, `proc`, `home_scope` |
 | `secret` | another bundle (`use`) |
 | `shared_credential` (the hosts of this tool that are one service) | |
-| `task` (declared operations, `[bundle.<name>.task.<task>]`) | |
-| `service` (an auxiliary process run beside the app, `[bundle.<name>.service.<svc>]`) | |
+| `task` (declared operations, `[task.<task>]`) | |
+| `service` (an auxiliary process run beside the app, `[service.<svc>]`) | |
 | `flakes`, `tarball`, `deb`, `appimage`, `binary` (the resolver tables that pair with a package) | |
-| `open` (the `<tool>://` callback a sign-in redirects to, `[bundle.<name>.open]`) | |
+| `open` (the `<tool>://` callback a sign-in redirects to, `[open]`) | |
 | `provision` (the one-time step that finishes an install) | |
 | `accepts_fresh_releases` (the freshness delay lifted for a package it names) | |
 
@@ -84,7 +87,7 @@ command, which left a consuming app with a package it cannot start and an instal
 to hand-copy. Declared as an argv, like `cmd`:
 
 ```toml
-[bundle.demo]
+# ~/.config/sbx/bundles/demo.toml
 packages  = { demo = "mise:npm:demo" }
 provision = ["bash", "-c", "npm rebuild demo-addon"]
 ```
@@ -220,7 +223,7 @@ Each folded operation is stamped with the bundle it came from, so the origin rea
 in [`sbx task show`](../cli/task)): the fold makes the entry look like the app's
 own, and the bundle is where a reader would go to change it.
 
-A bundle cannot name another bundle. There is no `use` field on a bundle, so nesting, and with it any cycle: is impossible by construction, exactly as a `[network.groups]`
+A bundle cannot name another bundle. There is no `use` field on a bundle, so nesting, and with it any cycle: is impossible by construction, exactly as an egress-group
 entry may not be a `@other` reference. A bundle's `allow`/`deny`/`mute` entries **may**
 be `@group` references: those are reference sites like an app's own lists, and the
 bundle is folded in before classification, so group expansion still runs once.
@@ -240,8 +243,9 @@ profile can adopt a bundle wholesale and still pin one of its packages.
 
 ## Global-only, and `use` is a security field
 
-Bundles are honored **only from the global config** (trusted by its location), like
-`[network.groups]`. A project's `[bundle]` is ignored with a warning.
+Bundles are honored **only from the `bundles/` directory beside the global config**
+(trusted by its location), like egress groups. A project's `[bundle]` is ignored with a
+warning, and so is an inline `[bundle.<name>]` in `sbx.toml` (one name, one file).
 
 `use` is a **security field**. A bundle carries egress rules and credentials, so an
 untrusted project naming one would be choosing which trusted reach to graft onto an
@@ -391,10 +395,11 @@ launch to put that prefix back on PATH, and anything the cage rebuilds per launc
 ## Managing bundles
 
 ```sh
-sbx bundle                        # list every bundle and what it contributes
-sbx bundle claude-code            # show one in full
-sbx bundle export > bundles.toml  # write a portable fragment
-sbx bundle import bundles.toml    # merge one into the global config
+sbx bundle                              # list every bundle and what it contributes
+sbx bundle claude-code                  # show one in full
+sbx bundle export claude-code > c.toml  # write one out, in its portable form
+sbx bundle export --out-dir ./bundles   # every bundle, one file each
+sbx bundle import c.toml                # file it under bundles/c.toml
 ```
 
 An imported bundle is **inert** until an app names it in `use`. See
@@ -402,8 +407,8 @@ An imported bundle is **inert** until an app names it in `use`. See
 
 ## Portability
 
-A bundle lives in the global config, so a profile that names one is **not
-self-contained**: sharing that profile means sharing the bundle too
+A bundle is a file of its own, so a profile that names one is **not
+self-contained**: sharing that profile means sharing the bundle file too
 (`sbx bundle export` / `sbx bundle import`), the same two-step
 [`sbx net groups`](../cli/net) uses. A profile that states everything itself stays
 one portable file, the trade is fewer copies against fewer moving parts, and it is

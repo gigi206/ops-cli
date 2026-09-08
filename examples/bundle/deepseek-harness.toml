@@ -38,7 +38,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.deepseek-harness]
 # The one install step the script-free npm install leaves undone, and the reason this bundle is
 # complete rather than a package whose loader dies at boot. `node-pty` ships no Linux prebuild and
 # builds from source, so `--ignore-scripts` leaves `pty.node` absent — and the web profile loads
@@ -92,14 +91,14 @@ mute = [
 # which for a package still on `-rc` tags most likely means its first stable release.
 accepts_fresh_releases = ["dsh"]
 
-[bundle.deepseek-harness.packages]
+[packages]
 dsh = "mise:npm:@deepseek-ai/dsh"  # the harness itself, from npm
 nodejs = "nix:nodejs"              # runs dsh, installs it, and supplies the headers the addon build reads
 python3 = "nix:python3"            # node-gyp's interpreter, for the node-pty build
 gnumake = "nix:gnumake"            # node-gyp's make
 gcc = "nix:gcc"                    # the C++ compiler that build needs
 
-[bundle.deepseek-harness.env]
+[env]
 # mise picks the client that performs an `npm:` install itself (`npm.package_manager = "auto"`), and
 # the one it picks refuses this package: the install ends in `aube install failed: user aborted
 # `mise add @deepseek-ai/dsh``, with no prompt a caller could answer. The reference client installs

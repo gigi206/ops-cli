@@ -111,7 +111,7 @@ WRAP
 done
 # The vector store (ChromaDB) it talks to is already up: the bundle declares it as a service, and
 # sbx started it and waited for its port before this command ran. See
-# `[bundle.odysseus.service.chroma]` and `~/.sbx-service-chroma.log`.
+# the `[service.chroma]` of `examples/bundle/odysseus.toml`, and `~/.sbx-service-chroma.log`.
 #
 # Serve on the cage loopback; `forward` below bridges host 127.0.0.1:7000 -> cage.
 exec uvicorn app:app --host 127.0.0.1 --port 7000 "$@"

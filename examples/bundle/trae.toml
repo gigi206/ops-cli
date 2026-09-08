@@ -27,7 +27,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.trae]
 # The install step itself: Trae Agent is published as a source repository rather than a package, so
 # what "installed" means here is a clone plus an isolated `uv tool install`, which puts `trae-cli`
 # on PATH. That is why this bundle is complete where a package declaration alone could not be — and
@@ -73,7 +72,7 @@ allow = [
     "@pypi",
 ]
 
-[bundle.trae.packages]
+[packages]
 # The install substrate; the CLI itself arrives through the profile's `cmd`.
 uv = "nix:uv"             # `uv tool install .` from the checkout
 python = "nix:python312"  # the interpreter the project requires

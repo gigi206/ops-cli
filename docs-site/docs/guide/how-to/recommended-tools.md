@@ -127,6 +127,6 @@ tools above are the line where the base stops and an agent starts to benefit.
   declared here, and rolling it forward deliberately.
 - [`packages`](../configuration/packages): the backend prefixes, and what attests each
   provisioned artefact.
-- [`[bundle.<name>]`](../configuration/bundles): declaring a tool's requirements once and
+- [Tool bundles](../configuration/bundles): declaring a tool's requirements once and
   naming them from every profile that needs them.
 

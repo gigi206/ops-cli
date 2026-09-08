@@ -26,7 +26,6 @@
 # header as belonging to that table, so an `allow` written below `[…packages]` would silently become
 # `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.nova]
 allow = [
     "@npm-registry",
     "{*} https://api.compassap.ai",
@@ -37,6 +36,6 @@ mute = [
     "*.trycloudflare.com",
 ]
 
-[bundle.nova.packages]
+[packages]
 nodejs = "nix:nodejs"               # Nova is a node CLI
 nova = "mise:npm:@compass-ai/nova"  # the vendor's own npm scope (NOT the bare `nova` registry name)

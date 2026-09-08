@@ -25,7 +25,6 @@
 # header as belonging to that table, so an `allow` written below `[…packages]` would silently become
 # `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.codebuddy]
 allow = [
     "@npm-registry",
     "{*} https://www.codebuddy.ai",
@@ -35,10 +34,10 @@ mute = [
     "@npm-audit",
 ]
 
-[bundle.codebuddy.env]
+[env]
 DISABLE_AUTOUPDATER = "1"  # sbx owns upgrades (`sbx upgrade mise`)
 DISABLE_TELEMETRY = "1"    # cut the telemetry at the source, not only at the allowlist
 
-[bundle.codebuddy.packages]
+[packages]
 nodejs = "nix:nodejs"  # the CLI is a node program, and mise's npm backend needs a node runtime
 codebuddy = "mise:npm:@tencent-ai/codebuddy-code"

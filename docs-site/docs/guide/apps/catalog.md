@@ -153,7 +153,7 @@ ships **67 reusable tool bundles**: a named set of packages and egress rules tha
 profiles pull in with `use = [...]` instead of restating it: the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as
-`[network.groups]` fragments under
+egress-group files under
 `examples/net-groups/`,
 referenced with `@name` from an app's or bundle's allow list. See
 [Bundles](../configuration/bundles) and [`sbx bundle`](../cli/bundle).

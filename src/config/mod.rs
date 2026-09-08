@@ -34,12 +34,12 @@ pub(crate) use types::*;
 pub(crate) use apps::{AppHomeScope, ResolvedApp, is_valid_app_name};
 pub(crate) use gate::{is_trust_drop, untrusted_reason};
 pub(crate) use load::{
-    Source, bundles, control_plane_pins, export_profile, is_valid_bundle_name, load, load_scoped,
-    net_groups, profile_path, profiles_dir, read_bundle_fragment, read_net_groups_fragment,
-    sbx_control_plane_roots, validate_profile,
+    Source, bundles, bundles_dir, control_plane_pins, export_profile, is_valid_bundle_name, load,
+    load_scoped, net_groups, net_groups_dir, profile_path, profiles_dir, read_bundle_fragment,
+    read_net_groups_fragment, sbx_control_plane_roots, validate_bundle, validate_group_file,
+    validate_profile,
 };
 pub(crate) use overrides::{CliOverrides, Override};
-pub(crate) use schema::RawBundle;
 /// The command form a bundle's install step is written in. Named here only where a test
 /// constructs one; the renderer reaches it through [`schema::RawCmd::into_argv`].
 #[cfg(test)]
@@ -48,6 +48,7 @@ pub(crate) use schema::RawCmd;
 /// attributes a build patches against, or both. Reached by name from the `bundle` renderer, which
 /// reports the two halves apart because a table may carry either.
 pub(crate) use schema::RawResolve;
+pub(crate) use schema::{RawBundle, serialize_bundle, serialize_group};
 // The locator grammar, reached from the fetching backends and the store as `crate::config::…`:
 // every URL a backend derives is re-validated through the same predicate the declaration passed.
 pub(crate) use tools::{
@@ -141,6 +142,17 @@ const OVERRIDE_SOURCE: &str = "override";
 /// layer. (Note: under the *config* root this `apps` directory holds profiles, while under the
 /// *data* root an `apps` directory holds each app's persistent home — two distinct trees.)
 const PROFILES_DIR: &str = "apps";
+
+/// The directory of imported tool bundles, beside the global config (`…/sbx/bundles/`). One file
+/// per bundle, holding the portable `[bundle.<name>]` fragment `sbx bundle export` writes, whose
+/// *filename* names the bundle it must declare; it is trusted by location, exactly like the global
+/// config. An inline `[bundle.<name>]` in `sbx.toml` is ignored.
+const BUNDLES_DIR: &str = "bundles";
+/// The directory of imported egress groups, beside the global config (`…/sbx/net-groups/`). One
+/// file per group, holding the portable `[network.groups]` fragment `sbx net groups export` writes,
+/// whose *filename* names the group it must declare. An inline `[network.groups]` entry in
+/// `sbx.toml` is ignored, exactly like an inline bundle.
+const NET_GROUPS_DIR: &str = "net-groups";
 
 /// Environment keys an *untrusted or changed* project may not set. The point is
 /// not to contain the agent — in Mode B it already runs arbitrary code inside the
@@ -992,6 +1004,9 @@ impl Resolved {
             task: _,
             app: _,
             bundle: _,
+            // Read from the `net-groups/` directory by the config reader, never carried by a parsed
+            // layer: an override shapes one launch, and a group is a global-config affordance.
+            net_group_files: _,
             // `[plugin.*]` joins them, and for the sharpest version of the same reason: it can
             // trigger a build and set the environment of a binary that runs host-side on the
             // plaintext path. That is declared in a config someone reads, not assembled on a
@@ -1764,7 +1779,13 @@ fn resolve(
     // ignored. Both are *taken* out of the raw layer: the only `groups` table that may be read is
     // this one, so every table that still carries one when it reaches validation is declared at a
     // layer that cannot define groups, and is reported there.
-    let net_groups = build_net_groups(&mut warnings, take_net_groups(&mut global.network));
+    // The groups themselves come from the `net-groups/` directory, one file per group; the table is
+    // still *taken* from every raw layer, because taking is what makes "a group is declared in one
+    // place" enforceable — a `groups` table that survives to validation is one a layer wrote where
+    // it may not, and is reported there.
+    let mut declared = take_net_groups(&mut global.network);
+    declared.append(&mut global.net_group_files);
+    let net_groups = build_net_groups(&mut warnings, declared);
     if let Some((proj, _)) = &mut project
         && !take_net_groups(&mut proj.network).is_empty()
     {

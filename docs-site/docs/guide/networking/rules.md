@@ -44,7 +44,7 @@ third list, [`mute`](observability#muting-noisy-refusals-network-mute-selinux-do
 | **regex** | `re:^https://api\.github\.com/v3/` | the whole reconstructed URL, unanchored |
 | **cleartext HTTP** | `http://legacy.example.com` | the same inspected policy, on a *plaintext* connection (port 80) |
 | **raw L4 tunnel** | `tcp://ssh.example.com:22` | a byte-spliced (uninspected) stream to host:port |
-| **group reference** | `@ci-hosts` | expands to a named [`[network.groups]`](groups) set |
+| **group reference** | `@ci-hosts` | expands to a named [egress group](groups) |
 
 Any of these (except `tcp://`) can carry a leading [`{VERB}` method prefix](#method-scoping)
 and any host-level kind can carry a [`:port` suffix](#ports). The details follow.

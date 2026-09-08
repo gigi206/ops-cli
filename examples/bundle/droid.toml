@@ -20,7 +20,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.droid]
 allow = [
     "@npm-registry",
     "{*} https://app.factory.ai",
@@ -35,6 +34,6 @@ mute = [
     "@npm-audit",
 ]
 
-[bundle.droid.packages]
+[packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 droid = "mise:npm:droid"

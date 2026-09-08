@@ -25,7 +25,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.cortex]
 allow = [
     # The vendor's own service — model traffic and account.
     "{*} https://api.cortex.foundation",
@@ -41,7 +40,7 @@ mute = [
     "mcp.exa.ai",
 ]
 
-[bundle.cortex.packages]
+[packages]
 # Upstream's own release binary, attestation- and SLSA-verified by mise at install time.
 cortex = "mise:github:CortexLM/cortex-code"
 # The one library that binary needs and the cage lacks. Declared as a package so it is

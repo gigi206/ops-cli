@@ -29,7 +29,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.kiro-desktop]
 allow = [
     # Auth / token exchange + the sign-in page (rendered in the in-cage browser). The IDE POSTs
     # back after the IdP, so all verbs.
@@ -110,14 +109,14 @@ shared_credential = [[
     "q.eu-central-1.amazonaws.com",
 ]]
 
-[bundle.kiro-desktop.packages]
+[packages]
 # Kiro's prebuilt `.tar.gz`, auto-upgraded through the resolver below.
 kiro = "tarball:resolve"
 # In-cage Chromium for the account sign-in flow. A large closure on first launch, seeded and
 # offline-reusable after, and shared with every other Chromium profile in your store.
 chromium = "nix:chromium"
 
-[bundle.kiro-desktop.env]
+[env]
 # If Kiro's Node backend (the extension host / agent that makes model calls) reaches its endpoints
 # through Node's built-in fetch (undici), undici ignores http_proxy/https_proxy unless this is set,
 # and in the empty netns a bypassed fetch dies with `EAI_AGAIN` before the proxy is ever consulted.
@@ -129,7 +128,7 @@ NODE_USE_ENV_PROXY = "1"
 # release metadata JSON lists the signed `.tar.gz` under `releases[].url`, and the command extracts
 # that URL directly rather than reconstructing a path. `curl -fsSL` fails closed on an HTTP error,
 # `head -1` keeps a single URL, and sbx re-validates that it is an https `.tar.gz` before fetching.
-[bundle.kiro-desktop.tarball.kiro]
+[tarball.kiro]
 resolve = ["sh", "-c", '''
 curl -fsSL "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json" | grep -oE 'https://[^"]*kiro-ide-[^"]*-linux-x64\.tar\.gz' | head -1
 ''']

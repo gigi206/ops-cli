@@ -19,7 +19,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.qwen-code]
 allow = [
     "{*} https://dashscope.aliyuncs.com",
     "@npm-registry",
@@ -28,6 +27,6 @@ mute = [
     "*.rum.aliyuncs.com",
 ]
 
-[bundle.qwen-code.packages]
+[packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 qwen = "mise:npm:@qwen-code/qwen-code"

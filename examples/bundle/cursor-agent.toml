@@ -31,7 +31,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.cursor-agent]
 allow = [
     # The vendor site the CLI itself carries as its `websiteUrl`, then the agent's own backends
     # (`api2`/`api3`/`repo42` all sit under `*.cursor.sh`). The DOWNLOAD host is deliberately not
@@ -46,11 +45,11 @@ allow = [
     "{*} https://mcp.notion.com",
 ]
 
-[bundle.cursor-agent.packages]
+[packages]
 # The agent itself, pinned on first use and rolled by `sbx upgrade tarball`.
 cursor-agent = "tarball:resolve"
 
-[bundle.cursor-agent.env]
+[env]
 # The CLI's Node runtime reaches its endpoints through Node's built-in fetch (undici), which
 # ignores http_proxy/https_proxy unless this is set — and in the empty netns a bypassed fetch
 # dies with `EAI_AGAIN` before the proxy is ever consulted.
@@ -65,7 +64,7 @@ NODE_USE_ENV_PROXY = "1"
 # `cursor.com/install`, spelled once in the download URL that script composes. Reading it back names
 # an immutable artifact, which is what a content-hash pin needs — a constant alias would break the
 # next launch with a hash mismatch the moment upstream ships a new build.
-[bundle.cursor-agent.tarball.cursor-agent]
+[tarball.cursor-agent]
 resolve = [
     "sh",
     "-c",

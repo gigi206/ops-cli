@@ -20,7 +20,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.kimi]
 allow = [
     "{*} https://api.kimi.com",
     "{*} https://auth.kimi.com",
@@ -33,6 +32,6 @@ mute = [
     "telemetry-logs.kimi.com",
 ]
 
-[bundle.kimi.packages]
+[packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 kimi = "mise:npm:@moonshot-ai/kimi-code"

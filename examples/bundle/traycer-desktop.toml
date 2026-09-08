@@ -40,7 +40,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.traycer-desktop]
 allow = [
     # Sign-in and the account, both opened to every verb: the shell POSTs the device-code request
     # and then polls for the token, and the platform host carries the account and subscription
@@ -58,7 +57,7 @@ allow = [
     "{GET} https://objects.githubusercontent.com",
 ]
 
-[bundle.traycer-desktop.packages]
+[packages]
 # The desktop's own linux-amd64 `.deb`, resolved from the `desktop-v*` track — see the header for
 # why the `deb:github:` shorthand cannot serve a repository that publishes three tracks.
 traycer-desktop = "deb:resolve"
@@ -68,7 +67,7 @@ traycer-desktop = "deb:resolve"
 #
 # This runs host-side in sbx's hermetic resolve cage, not in the app's cage, so it uses the host
 # network rather than the `allow` list above — that list governs the app's own egress at runtime.
-[bundle.traycer-desktop.deb.traycer-desktop]
+[deb.traycer-desktop]
 resolve = [
     "sh",
     "-c",

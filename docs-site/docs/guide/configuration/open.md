@@ -30,7 +30,7 @@ application rather than at your host desktop.
 an untrusted one. A handler runs a program every time a link is opened, including a sign-in link a
 person clicked, so a project that could declare one could answer that click with a page of its own.
 
-See also: [`dbus`](dbus) · [`gui`](gui) · [`[network]`](network) · [`[bundle.<name>]`](bundles) ·
+See also: [`dbus`](dbus) · [`gui`](gui) · [`[network]`](network) · [Tool bundles](bundles) ·
 [The trust gate](../concepts/trust)
 
 ## The shape of an entry
@@ -151,8 +151,8 @@ https = ["chromium", "--no-sandbox", "--ozone-platform=wayland"]
 ```
 
 ```toml
-# the tool's bundle: its callback, carried with the tool
-[bundle.cursor.open]
+# ~/.config/sbx/bundles/cursor.toml: its callback, carried with the tool
+[open]
 cursor = { cmd = ["cursor", "--open-url"], mode = "detach" }
 ```
 

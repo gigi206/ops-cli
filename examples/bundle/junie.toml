@@ -30,7 +30,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.junie]
 # The vendor install step mise's `--ignore-scripts` leaves undone, and the reason this bundle is
 # complete rather than a shim a consuming app cannot start. The npm package is only a SHIM: its
 # `postinstall` downloads the real JVM build and installs a launcher at `~/.local/bin/junie`. mise
@@ -97,7 +96,7 @@ mute = [
     "youtrack.jetbrains.com",  # the issue tracker the app references; no session needs it
 ]
 
-[bundle.junie.env]
+[env]
 # The vendor's postinstall downloads the real build with Node's built-in `fetch` (undici), which
 # does NOT honour the http_proxy/https_proxy variables sbx injects unless this is set. In the cage's
 # empty network namespace an unproxied fetch resolves the host itself and dies with
@@ -105,6 +104,6 @@ mute = [
 # this was set.
 NODE_USE_ENV_PROXY = "1"
 
-[bundle.junie.packages]
+[packages]
 junie = "mise:npm:@jetbrains/junie"  # the shim package, from JetBrains' own npm scope
 nodejs = "nix:nodejs"                # installs the shim and runs the vendor postinstall; the downloaded build carries its own JVM

@@ -26,7 +26,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.reasonix]
 allow = [
     # Install: the shim's packument and tarball plus the platform binary optional dep — npm
     # spreads these across sibling paths, so the registry host is opened read-only as a whole,
@@ -42,11 +41,11 @@ mute = [
     "@npm-audit",  # npm audit (noisy)
 ]
 
-[bundle.reasonix.packages]
+[packages]
 nodejs = "nix:nodejs"      # the `bin/reasonix.js` shim is what launches — needed at RUNTIME
 reasonix = "mise:npm:reasonix"  # upstream's own npm scope; binary via the platform optional dep
 
-[bundle.reasonix.env]
+[env]
 # mise picks the client that performs an `npm:` install itself (`npm.package_manager = "auto"`), and
 # the one it picks refuses this package: the install ends in
 # `aube install failed: failed to resolve dependencies`, with no prompt a caller could answer,

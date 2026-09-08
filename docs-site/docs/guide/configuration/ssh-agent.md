@@ -311,7 +311,7 @@ $ sbx config show --app deployer
   ssh-agent: deploy@example, work@example (keys the cage may sign with) (app:global)
 ```
 
-A bundle cannot carry one. A `[bundle.<name>]` deliberately holds only what a *tool* needs, its packages, environment, egress and credential, and never anything that widens what the
+A bundle cannot carry one. A bundle deliberately holds only what a *tool* needs, its packages, environment, egress and credential, and never anything that widens what the
 cage exposes of the host; `ssh_agent`, `binds`, `devices` and `seccomp` are all excluded by
 the same rule, so using a bundle can never quietly grant a key.
 

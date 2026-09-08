@@ -17,14 +17,13 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.goose]
 allow = [
     "{*} https://*.sigstore.dev",
 ]
 
-[bundle.goose.packages]
+[packages]
 goose = "mise:aqua:block/goose"
 
-[bundle.goose.env]
+[env]
 GOOSE_DISABLE_KEYRING = "1"
 GOOSE_TELEMETRY_OFF = "1"

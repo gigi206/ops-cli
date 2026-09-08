@@ -372,6 +372,15 @@ pub(crate) struct RawConfig {
     /// config (trusted by location); a project's `[bundle]` is ignored.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) bundle: BTreeMap<String, RawBundle>,
+    /// The egress groups declared under `net-groups/`, one file per group, keyed by file name.
+    ///
+    /// Not a TOML field — it is filled after the parse, by the one reader that walks that directory
+    /// — because a group is declared in its own file and an inline `[network.groups]` in the global
+    /// config is ignored. It is a field of its own rather than an injection into `[network]`:
+    /// synthesizing that table to carry them would move the global posture's provenance off the
+    /// built-in default, and a directory of groups says nothing about the posture.
+    #[serde(skip)]
+    pub(crate) net_group_files: BTreeMap<String, Vec<String>>,
     /// Every top-level key sbx does not know. Unknown keys stay **ignored** — that is what lets a
     /// config written for a newer sbx load on an older one — but a misspelled `memory_maxx` and a
     /// field from next year's release are indistinguishable in silence, and only one of them is
@@ -2346,6 +2355,59 @@ pub(crate) fn serialize_app(app: &RawApp) -> Result<String, String> {
 pub(crate) fn parse_app(bytes: &[u8]) -> Result<RawApp, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
     toml::from_str(text).map_err(|e| with_location::<RawApp>(text, e.to_string()))
+}
+
+/// Parse bytes as a single tool bundle — a top-level [`RawBundle`]. A bundle file *is* one bundle
+/// (its fields at the top level, no `[bundle.<name>]` wrapper), and its name comes from the file
+/// rather than from the contents, exactly like an app profile: one name, in one place, so a file
+/// and the entry it declares can never disagree.
+///
+/// A file written in the inline `[bundle.<name>]` shape parses here as an empty bundle (the wrapper
+/// lands in [`RawBundle::rest`], the unknown-key trap this table already has), so the wrong shape
+/// is reported as a stray key rather than imported as an empty tool.
+pub(crate) fn parse_bundle(bytes: &[u8]) -> Result<RawBundle, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
+    toml::from_str(text).map_err(|e| with_location::<RawBundle>(text, e.to_string()))
+}
+
+/// Serialize a bundle as a top-level fragment — the inverse of [`parse_bundle`], producing the
+/// portable file `sbx bundle export` writes and `sbx bundle import` copies. Empty collections are
+/// skipped (the field attributes), so the output is the minimal faithful bundle.
+pub(crate) fn serialize_bundle(bundle: &RawBundle) -> Result<String, String> {
+    toml::to_string(bundle).map_err(|e| e.to_string())
+}
+
+/// One reusable egress group as its own file (`net-groups/<name>.toml`) — the portable form
+/// `sbx net groups export` writes.
+///
+/// The entries live under a key because TOML has no top-level array: a group is a `Vec<String>`,
+/// not a struct, so `entries` is what stands in for the bare list. The group's *name* is not here
+/// at all — it is the file name, the same rule an app profile and a bundle follow.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawGroupFile {
+    /// The group's egress entries, in the grammar of an app's `allow`/`deny`/`mute` list. A `@other`
+    /// reference is not one of them: a group may not name a group, so nesting is impossible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) entries: Vec<String>,
+    /// Every key of this file sbx does not know, kept so a misspelling is reported rather than
+    /// silently leaving the group empty — the `allow = [...]` someone writes here out of habit.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// Parse bytes as a single egress group file — a top-level [`RawGroupFile`].
+pub(crate) fn parse_group(bytes: &[u8]) -> Result<RawGroupFile, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
+    toml::from_str(text).map_err(|e| with_location::<RawGroupFile>(text, e.to_string()))
+}
+
+/// Serialize a group's entries as its own file — the inverse of [`parse_group`].
+pub(crate) fn serialize_group(entries: &[String]) -> Result<String, String> {
+    toml::to_string(&RawGroupFile {
+        entries: entries.to_vec(),
+        rest: BTreeMap::new(),
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -25,7 +25,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.crush]
 allow = [
     # First-party Hyper — Charm's subscription model API, the default provider when no other
     # `*_API_KEY` is set.
@@ -40,9 +39,9 @@ allow = [
     "{*} https://api.githubcopilot.com",
 ]
 
-[bundle.crush.env]
+[env]
 CRUSH_DISABLE_METRICS = "1"  # vendor-recommended opt-out for the in-binary pseudonymous metrics
 DO_NOT_TRACK = "1"           # the universal "respect the convention" knob
 
-[bundle.crush.packages]
+[packages]
 crush = "mise:github:charmbracelet/crush"  # the static-pie Go release binary; no runtime deps

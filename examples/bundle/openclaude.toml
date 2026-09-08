@@ -30,7 +30,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.openclaude]
 allow = [
     # Install: mise's npm backend fetches the packument and the tarball in-cage, so the
     # registry is subject to this policy — opened read-only as a whole, like the other
@@ -38,6 +37,6 @@ allow = [
     "@npm-registry",
 ]
 
-[bundle.openclaude.packages]
+[packages]
 nodejs = "nix:nodejs"                    # Node ≥ 22 from nixpkgs — the fork's runtime
 openclaude = "mise:npm:@gitlawb/openclaude"  # the vendor's own npm scope; no postinstall scripts

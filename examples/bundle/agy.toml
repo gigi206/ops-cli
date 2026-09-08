@@ -23,7 +23,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.agy]
 allow = [
     # The agent's OWN product hosts. The Google account sign-in hosts (accounts.google.com,
     # oauth2.googleapis.com, www.googleapis.com/oauth2/*, lh3.googleusercontent.com) live in the
@@ -41,5 +40,5 @@ mute = [
     "playwright-verizon.azureedge.net",
 ]
 
-[bundle.agy.packages]
+[packages]
 agy = "mise:aqua:google-antigravity/antigravity-cli"

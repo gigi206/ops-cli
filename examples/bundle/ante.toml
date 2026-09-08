@@ -24,7 +24,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.ante]
 allow = [
     # In-cage self-update — `ante update` re-queries the signed manifest at
     # `download.ante.run/channels/stable/manifest.json` and pulls the new tarball from the
@@ -39,5 +38,5 @@ allow = [
     "{GET} https://github.com",
 ]
 
-[bundle.ante.packages]
+[packages]
 ante = "mise:github:AntigmaLabs/ante-preview"  # the static-pie musl release binary; no runtime deps

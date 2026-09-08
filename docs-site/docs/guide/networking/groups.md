@@ -1,21 +1,30 @@
 ---
 sidebar_label: "Egress groups"
-description: "Named sets of egress entries, declared once in the global config and referenced from any list with `@name`."
+description: "Named sets of egress entries, one file per group, referenced from any list with `@name`."
 ---
 
-# Egress groups (`[network.groups]`)
+# Egress groups
 
-A `[network.groups]` group is a **named set of egress entries**, declared once and
-referenced from any [`allow`/`deny` list](rules) with `@name`. Instead of
-copying the same hosts into every app profile, you declare them in one place and
-share them:
+A group is a **named set of egress entries**, declared once and referenced from any
+[`allow`/`deny` list](rules) with `@name`. Instead of copying the same hosts into every
+app profile, you declare them in one place and share them.
+
+Each group is a file under `net-groups/`, beside the global config, and **the file name
+is the group name**:
 
 ```toml
-# global sbx.toml
-[network.groups]
-ci-hosts   = ["github.com", "api.github.com", "codeload.github.com"]
-anthropic  = ["api.anthropic.com"]
-telemetry  = ["*.doubleclick.net", "telemetry.example.com"]
+# ~/.config/sbx/net-groups/ci-hosts.toml
+entries = ["github.com", "api.github.com", "codeload.github.com"]
+```
+
+```toml
+# ~/.config/sbx/net-groups/anthropic.toml
+entries = ["api.anthropic.com"]
+```
+
+```toml
+# ~/.config/sbx/net-groups/telemetry.toml
+entries = ["*.doubleclick.net", "telemetry.example.com"]
 ```
 
 Then reference a group by `@name` in a `[network]` list:
@@ -34,40 +43,31 @@ prefix. (See the [rule grammar](rules).)
 
 ---
 
-## Groups live under the posture, and commit it to its table form
+## One group, one file
 
 A group is a **vocabulary**: it says what a name stands for, and grants nothing on its
-own. It sits under the same `[network]` as the posture that references it, so one
-namespace answers "where may this cage go" and there is no second place to look.
+own. It lives in its own file, so there is one place to look for what `@name` means, and
+the name lives in exactly one place: the file name. The entries go under `entries`,
+because TOML has no top-level array; nothing else belongs in the file, and a key sbx does
+not know there is refused rather than filed as an empty group.
 
-That nesting has one consequence worth knowing before you write the file. TOML cannot
-extend a string with a sub-table, so a config that declares groups writes its posture in
-the [table form](../configuration/network#the-two-forms):
+That is also why your posture stays where it is. A group used to be a sub-table of
+`[network]`, which forced any config defining one into the table form of the posture;
+now `network = "deny"` and a directory of groups coexist, in every layer.
 
-```toml
-# global sbx.toml
-[network]
-mode = "deny"
-
-[network.groups]
-ci-hosts = ["github.com", "api.github.com"]
-```
-
-Writing `network = "deny"` above a `[network.groups]` table is not valid TOML, and a
-config file that does not parse is **ignored in full**, with a warning naming the line.
-Every other layer, a project config, an app profile, a `--config` blob, is free to keep
-the bare-string form: only the file that defines groups has to spell out its posture.
+An inline `[network.groups]` in `sbx.toml` is **ignored**, with a warning naming each
+group it carries, so two declaration sites for one name cannot disagree.
 
 ---
 
 ## Global-only
 
 Groups are a security-relevant input, they expand into egress rules, so they are
-honored **only from the top-level `[network]` of the global config** (trusted by its
-location). A project's `[network.groups]` is **ignored** with a warning; a project may
-*reference* a global group with `@name`, but it cannot *define* one. This is why the
-[`sbx net groups`](../cli/net#sbx-net-groups) command has no scope flag: it always reads the
-global config.
+honored **only from the `net-groups/` directory beside the global config** (trusted by
+its location). A project's `[network.groups]` is **ignored** with a warning; a project may
+*reference* a group with `@name`, but it cannot *define* one. This is why the
+[`sbx net groups`](../cli/net#sbx-net-groups) command has no scope flag: it always reads
+that directory.
 
 The same holds for every other layer that has a `[network]` of its own. An
 `[app.<name>.network]` and a `--config` blob are postures, not vocabularies: a `groups`
@@ -117,36 +117,34 @@ its `@name` origin.
 Export and import let you share a curated group set:
 
 ```bash
-sbx net groups export > groups.toml        # every group, as a [network.groups] fragment
-sbx net groups export ci-hosts anthropic   # only these groups
-sbx net groups export -o groups.toml       # to a file
+sbx net groups export ci-hosts > ci-hosts.toml   # one group, to stdout
+sbx net groups export ci-hosts -o ci-hosts.toml  # to a file
+sbx net groups export --out-dir ./groups         # every group, one file each
 ```
 
-`export` emits a portable `[network.groups]` TOML fragment (a group is data, so source
-comments are not carried).
+`export` emits each group in the portable form `import` reads: its entries under
+`entries`, its name carried by the file (a group is data, so source comments are not
+carried). A file holds one group, which is why several need `--out-dir`.
 
 ```bash
-sbx net groups import groups.toml          # merge into the global config
-sbx net groups import groups.toml --force  # overwrite a name that already exists
+sbx net groups import ci-hosts.toml            # file it under net-groups/ci-hosts.toml
+sbx net groups import frag.toml --as ci-hosts  # …under a name of your choosing
+sbx net groups import ci-hosts.toml --force    # overwrite a name that already exists
 ```
 
-`import` merges the fragment's groups into the global config, preserving every
-existing group and its comments. The global config is trusted by location, so the
-deliberate command *is* the consent, an agent inside a cage cannot run it, and
+`import` copies the file into `net-groups/<name>.toml`, where the loader reads it. The
+name comes from the file: its own stem, or `--as`. That directory is trusted by location,
+so the deliberate command *is* the consent, an agent inside a cage cannot run it, and
 there is no interactive prompt. A name that already exists is **refused** unless
-`--force`, and the merge is all-or-nothing. A group carrying an entry that will not
-resolve (malformed or nested) is flagged after the import; inspect it with
-`sbx net groups <name>`.
+`--force`. A group carrying an entry that will not resolve (malformed or nested) is
+flagged after the import; inspect it with `sbx net groups <name>`.
 
 A forced overwrite is the one import that can lose work, since a declared group may carry
 an entry added by hand on this machine, and a group is policy: dropping an entry narrows
-what an app may reach, adding one widens it. So it names what the incoming fragment no
-longer declares, and keeps the group it replaced beside the config as
-`<name>.group.replaced`. That copy is the same portable form `sbx net groups export`
-writes, so putting the entry back is `sbx net groups import --force` on it. A group lives
-in a key of the shared config rather than a file of its own, which is why the copy exists:
-there is no per-group file to keep. A re-import that declares exactly what is already there
-keeps no copy and reports no loss.
+what an app may reach, adding one widens it. So it keeps the file it replaced beside it as
+`<name>.toml.replaced`, and names both what the incoming group no longer declares and what
+it declares on top. Re-import that copy to put the previous group back. A re-import that
+changes nothing keeps no copy and reports no loss.
 
 Imported groups are **inert** until a `[network]` `allow`/`deny` list references them
 with `@name`.

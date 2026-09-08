@@ -26,16 +26,15 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.goose-desktop]
 
-[bundle.goose-desktop.packages]
+[packages]
 # Goose's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron plus an embedded Rust
 # CLI, no source build). The repo ships both a plain `…_amd64.deb` and a `…_amd64-vulkan.deb` GPU
 # variant; the plain build is selected. On arm64 the same form selects the aarch64 build when
 # upstream ships one.
 goose-desktop = "deb:github:aaif-goose/goose"
 
-[bundle.goose-desktop.env]
+[env]
 # Provider-neutral: disable the parts that have no business in a cage, whatever provider you use.
 # The cage's private portal exposes no host keyring, so tell Goose to fall back to a file under the
 # isolated home instead of hanging on Secret Service.

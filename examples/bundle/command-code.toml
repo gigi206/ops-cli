@@ -26,7 +26,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.command-code]
 allow = [
     # Install: mise's npm backend fetches the packument and the tarball in-cage, so the
     # registry is subject to this policy — opened read-only as a whole, like the other
@@ -50,6 +49,6 @@ mute = [
     "commandcode.ai",                 # marketing / docs site
 ]
 
-[bundle.command-code.packages]
+[packages]
 nodejs = "nix:nodejs"            # Command Code requires `node >= 22` per its `engines` field
 command-code = "mise:npm:command-code"  # the vendor's own npm scope (bins `cmd` / `command-code`)

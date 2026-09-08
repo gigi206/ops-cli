@@ -16,14 +16,15 @@ The config schema is split by the trust gate, not by two schemas:
 
 | | Free | Closing | Security |
 |---|---|---|---|
-| Fields | `env`, `timezone` | `[fs]` | every other field: `binds`, `packages`, `network`, `[secret]`, `[proc]`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[broker.<name>]`, `[service]`, `[notify]`, `[open]`, `gui`, `gpu`, `audio`, `dbus`, `forward`, `nixpkgs`, `[task.<name>]`, `[app.<name>]`, `[plugin.<name>]`, `[network.groups]`, `[bundle.<name>]`, and the rest of [the field map](../configuration/#the-fields) |
+| Fields | `env`, `timezone` | `[fs]` | every other field: `binds`, `packages`, `network`, `[secret]`, `[proc]`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[broker.<name>]`, `[service]`, `[notify]`, `[open]`, `gui`, `gpu`, `audio`, `dbus`, `forward`, `nixpkgs`, `[task.<name>]`, `[app.<name>]`, `[plugin.<name>]`, and the rest of [the field map](../configuration/#the-fields) |
 | From an untrusted project | applied (minus a reserved-key denylist) | applied | **dropped**, with a warning |
 | From the global config | applied | applied | applied (trusted by location) |
 | From a trusted project | applied | applied | applied¹ |
 
-¹ Two are **global-only** rather than merely trusted-only: `[network.groups]` and
-`[bundle.<name>]` are ignored from *any* project, trusted or not. They are declared once
-where the user owns them, and referenced (`@group`, `use`) from anywhere.
+¹ Two are **global-only** rather than merely trusted-only: egress groups and tool
+bundles are ignored from *any* project, trusted or not. Each is declared once in a file
+of its own beside the global config, where the user owns it, and referenced (`@group`,
+`use`) from anywhere.
 
 The two *free* fields are free for the same reason: neither reads anything from the host,
 and neither reaches past the cage the project declares. [`timezone`](../configuration/timezone)

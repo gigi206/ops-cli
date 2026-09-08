@@ -20,7 +20,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.freebuff]
 allow = [
     "@npm-registry",
     "{GET} https://www.codebuff.com",
@@ -34,6 +33,6 @@ mute = [
     "@npm-audit",
 ]
 
-[bundle.freebuff.packages]
+[packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 freebuff = "mise:npm:freebuff"

@@ -112,8 +112,9 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[task.<name>]` | security | [task](task), and [Declared operations](../tasks/) |
 | `[app.<name>]` | security overlay | [apps](apps) |
 | `[plugin.<name>]` | security | [`[plugin.<name>]`](../plugins/configuring) |
-| `[network.groups]` | security (global-only) | [Egress groups](../networking/groups) |
-| `[bundle.<name>]` | security (global-only) | [bundles](bundles) |
+| egress groups, one file per group under `net-groups/` | security (global-only) | [Egress groups](../networking/groups) |
+| tool bundles, one file per bundle under `bundles/` | security (global-only) | [bundles](bundles) |
+| `[bundle.<name>]` written inline here | ignored, with a warning naming it | [bundles](bundles) |
 | `use` | security | [bundles](bundles) |
 
 A project's mise files (`[tools]`, `.tool-versions`) are a related input: see

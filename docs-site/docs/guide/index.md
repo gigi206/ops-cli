@@ -70,7 +70,7 @@ Task-oriented walkthroughs, commands in order, from nothing to a working setup: 
 - [Architecture: Model B](networking/architecture): how a filtering posture works under the hood.
 - [Network modes](networking/modes): `none` / `shared` / `deny` / `allow` / `ask`.
 - [Rule grammar](networking/rules): hosts, `*.domain`, URLs, `re:`, `tcp://`, ports, `{VERB}`.
-- [Egress groups](networking/groups): reusable `[network.groups]` referenced by `@name`.
+- [Egress groups](networking/groups): reusable sets of egress entries referenced by `@name`.
 - [Ask mode](networking/ask): park-and-confirm requests with `sbx net pending`.
 - [Inbound forwarding](networking/forward): `forward`, host loopback ports into the cage.
 - [Observability](networking/observability): `sbx net rules` / `stats` / `logs` / `live`, `sbx test net`.
@@ -155,8 +155,8 @@ navbar entry: they are for looking things up, not reading through.
   trusted-only (links to [Declared operations](tasks/)).
 - [`[app.<name>]`](configuration/apps): named launch profiles (links to [Apps](apps/)).
 - [`[plugin.<name>]`](plugins/configuring): what this machine supplies to an installed plugin.
-- [`[network.groups]`](networking/groups): reusable egress groups.
-- [`[bundle.<name>]`](configuration/bundles): reusable tool bundles an app names with `use`.
+- [Egress groups](networking/groups): reusable sets of egress entries.
+- [Tool bundles](configuration/bundles): reusable tool bundles an app names with `use`.
 - [One-shot overrides](configuration/overrides): `--config`/`--env`/`--net`/… and `SBX_*`.
 
 ## Command reference

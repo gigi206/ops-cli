@@ -22,7 +22,6 @@
 # header as belonging to that table, so an `allow` written below `[…packages]` would silently become
 # `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.copilot]
 allow = [
     # The agent's OWN product hosts. The GitHub account sign-in hosts (github.com/login/*,
     # api.github.com for the device-flow polling and entitlement lookups) live in the consuming
@@ -37,5 +36,5 @@ mute = [
     "default.exp-tas.com",
 ]
 
-[bundle.copilot.packages]
+[packages]
 copilot = "mise:aqua:github/copilot-cli"  # the official GitHub release binary; no node runtime

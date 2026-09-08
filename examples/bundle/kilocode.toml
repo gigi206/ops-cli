@@ -19,7 +19,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.kilocode]
 allow = [
     "@models-catalog",
     "{*} https://api.kilo.ai",
@@ -29,5 +28,5 @@ mute = [
     "*.i.posthog.com",
 ]
 
-[bundle.kilocode.packages]
+[packages]
 kilo = "mise:github:Kilo-Org/kilocode"

@@ -9,7 +9,6 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::config_cwd;
 use crate::{allowlist, config, diag, help, style};
 
 /// `sbx net groups [<name>…] [--json]`: list the reusable egress groups declared in the global
@@ -98,12 +97,16 @@ pub(super) fn net_groups_list(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `sbx net groups export [<name>…] [--out <file>]`: write the reusable egress groups as a portable
-/// `[network.groups]` TOML fragment — every group, or the named subset — to stdout (the default,
-/// composable and clobber-safe: `sbx net groups export > groups.toml`) or to `--out <file>`. The
-/// inverse of `import`. Read-only on the config; no launch, no nix.
+/// `sbx net groups export [<name>…] [-o|--out <file>] [--out-dir <dir>]`: write reusable egress
+/// groups out in the portable form `sbx net groups import` reads.
+///
+/// One group goes to stdout (composable and clobber-safe: `sbx net groups export ci > ci.toml`) or
+/// to `--out <file>`. Several go to `--out-dir <dir>`, one `<name>.toml` per group: a group file
+/// carries one group, so there is no combined form to write them all into. Read-only on the config;
+/// no launch, no nix.
 pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
     let mut out: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
     let mut names: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -114,6 +117,13 @@ pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 out = Some(PathBuf::from(v));
+            }
+            Some("--out-dir") => {
+                let Some(v) = it.next() else {
+                    diag::error("sbx: net groups export: `--out-dir` needs a directory path");
+                    return ExitCode::from(2);
+                };
+                out_dir = Some(PathBuf::from(v));
             }
             Some(s) if s.starts_with('-') => {
                 diag::error(&format!("sbx: net groups export: unknown flag `{s}`"));
@@ -129,6 +139,12 @@ pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+    if out.is_some() && out_dir.is_some() {
+        diag::error(
+            "sbx: net groups export: `--out` and `--out-dir` name two destinations; pick one",
+        );
+        return ExitCode::from(2);
     }
 
     let (groups, warnings) = config::net_groups();
@@ -160,39 +176,70 @@ pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
     if selected.is_empty() {
         diag::error(
             "sbx: net groups export: no egress groups to export (none are defined under \
-             [network.groups] in the global config)",
+             net-groups/<name>.toml)",
         );
         return ExitCode::from(2);
     }
+    // A single stream carries one group, so more than one needs a directory to land in.
+    if selected.len() > 1 && out_dir.is_none() {
+        diag::error(&format!(
+            "sbx: net groups export: {} groups selected and a file holds one — pass `--out-dir \
+             <dir>`, or name a single group",
+            selected.len()
+        ));
+        return ExitCode::from(2);
+    }
 
-    let fragment = config::manage::export_net_groups(&selected);
-    match &out {
-        None => {
-            print!("{fragment}");
+    let mut rendered: Vec<(String, String)> = Vec::new();
+    for (name, entries) in &selected {
+        match config::serialize_group(entries) {
+            Ok(text) => rendered.push((name.clone(), text)),
+            Err(e) => {
+                diag::error(&format!("sbx: net groups export: {name}: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    match (out_dir, out) {
+        (Some(dir), _) => {
+            for (name, text) in &rendered {
+                let path = dir.join(format!("{name}.toml"));
+                if let Err(e) = config::manage::write_text(&path, text, None) {
+                    diag::error(&format!("sbx: net groups export: {e}"));
+                    return ExitCode::FAILURE;
+                }
+            }
+            println!(
+                "exported {} egress group(s) to {}",
+                rendered.len(),
+                dir.display()
+            );
             ExitCode::SUCCESS
         }
-        Some(path) => write_groups_fragment(path, &fragment, selected.len()),
+        (None, Some(path)) => write_group_file(&path, &rendered[0].0, &rendered[0].1),
+        (None, None) => {
+            crate::cli::print_document(&rendered[0].1);
+            ExitCode::SUCCESS
+        }
     }
 }
 
-/// Write an exported `[network.groups]` fragment to the `--out` destination, and report what
-/// landed there. `count` is the number of groups the fragment carries, for the success line.
+/// Write one exported group file to the `--out` destination, and report what landed there.
 ///
 /// The write goes through [`config::manage::write_text`] — the writer `sbx bundle export --out`
-/// already uses for the same job — rather than straight through. A fragment exists to be handed
+/// already uses for the same job — rather than straight through. A group file exists to be handed
 /// back to `sbx net groups import`, so a write cut short (a full filesystem) would leave a
-/// truncated group list at exactly the path someone later imports as though it were complete; the
+/// truncated entry list at exactly the path someone later imports as though it were complete; the
 /// shared writer renames a finished temp file into place, and creates the destination's parent
 /// directory so a path into a not-yet-existing backup directory is written rather than refused.
 ///
 /// With no mode of sbx's own, for the reason `sbx bundle export` gives: `--out <file>` and a shell
 /// redirect are one command spelled two ways, so the destination takes the umask. The owner-only
 /// rule is for what sbx writes unasked into its own directories.
-fn write_groups_fragment(path: &Path, fragment: &str, count: usize) -> ExitCode {
-    match config::manage::write_text(path, fragment, None) {
+fn write_group_file(path: &Path, name: &str, text: &str) -> ExitCode {
+    match config::manage::write_text(path, text, None) {
         Ok(()) => {
-            let s = if count == 1 { "" } else { "s" };
-            println!("exported {count} egress group{s} to {}", path.display());
+            println!("exported egress group `{name}` to {}", path.display());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -203,140 +250,86 @@ fn write_groups_fragment(path: &Path, fragment: &str, count: usize) -> ExitCode 
     }
 }
 
-/// Keep every egress group a forced import is about to replace, and say what the incoming fragment
-/// no longer declares — [`crate::cli::keep_replaced_fragments`] with this family's nouns and its
-/// exporter.
+/// `sbx net groups import <file> [--as <name>] [--force]`: file a portable egress group under
+/// `net-groups/<name>.toml`, where the loader reads it. Groups are global-only, so the target is
+/// always that directory; the deliberate command is the consent (an agent in the cage cannot run
+/// it), and the directory is trusted by location, so there is no prompt. An existing group of the
+/// same name is refused unless `--force`. An imported group is inert until an app's or a bundle's
+/// `allow`/`deny`/`mute` references it with `@<name>`.
 ///
-/// A group is a key inside the shared global config, not a file of its own, so what stands in for a
-/// per-file copy is the fragment `sbx net groups export` already emits: the replaced group is
-/// written back out in the same portable form, as `<name>.group.replaced` beside the config, so
-/// re-declaring it is `sbx net groups import` on that file. The name is read as configuration by
-/// nothing (the loader reads `sbx.toml` and `apps/*.toml`).
-fn keep_replaced_groups(
-    config_path: &std::path::Path,
-    incoming: &std::collections::BTreeMap<String, Vec<String>>,
-    force: bool,
-) -> Result<Vec<String>, String> {
-    crate::cli::keep_replaced_fragments(
-        config_path,
-        incoming,
-        || config::net_groups().0,
-        force,
-        "egress group",
-        "group",
-        |name, entries| {
-            Ok(config::manage::export_net_groups(
-                &std::collections::BTreeMap::from([(name.to_string(), entries.clone())]),
-            ))
-        },
-    )
-}
-
-/// `sbx net groups import <file> [--force]`: merge a portable `[network.groups]` fragment into the
-/// global config, preserving every existing group and comment (`toml_edit`). Groups are global-only,
-/// so the target is always the global config; the deliberate command is the consent (an agent in the
-/// cage cannot run it), and the global config is trusted by location, so there is no prompt. A name
-/// that already exists is refused unless `--force` overwrites it. The imported groups are inert until
-/// referenced by a `[network]` `allow`/`deny` with `@<name>`.
+/// The bytes are copied verbatim, like a bundle and an app profile: the name comes from the file,
+/// and the author's comments survive the round-trip.
 pub(super) fn net_groups_import(args: &[OsString]) -> ExitCode {
-    let (file, force) =
-        match crate::cli::one_file(args, &["net", "groups", "import"], &["-f", "--force"]) {
-            Ok(parsed) => parsed,
-            Err(code) => return code,
-        };
-
-    let groups = match config::read_net_groups_fragment(&file) {
-        Ok(g) => g,
-        Err(e) => {
-            diag::error(&format!("sbx: net groups import: {e}"));
-            return ExitCode::from(2);
-        }
+    const PATH: &[&str] = &["net", "groups", "import"];
+    let parsed = match crate::cli::import_args(args, PATH) {
+        Ok(a) => a,
+        Err(code) => return code,
     };
-    // Validate every name before writing (a name keys a referenceable identifier and, if invalid,
-    // would be dropped at load) — fail closed, naming the offender.
-    if let Some(bad) = groups.keys().find(|n| !config::is_valid_group_name(n)) {
+    let name = match crate::cli::imported_name(&parsed, PATH) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    // A name keys an on-disk file and a `@<name>` reference; an invalid one is dropped at load, the
+    // silent shortfall this path exists to remove. Fail closed, naming the offender.
+    if !config::is_valid_group_name(&name) {
         diag::error(&format!(
-            "sbx: net groups import: invalid group name `{bad}` (1–64 of [A-Za-z0-9._-]); nothing imported"
+            "sbx: net groups import: invalid group name `{name}` (1–64 of [A-Za-z0-9._-]); nothing \
+             imported"
         ));
         return ExitCode::from(2);
     }
-
-    let cwd = match config_cwd() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-    let path = match config::manage::scope_path(&config::manage::Scope::Global, &cwd) {
-        Ok(p) => p,
+    let bytes = match config::safety::read_safe_bytes(&parsed.file) {
+        Ok(b) => b,
         Err(e) => {
-            diag::error(&format!("sbx: net groups import: {e}"));
-            return ExitCode::from(1);
-        }
-    };
-    // `--force` replaces groups that are already declared, and one may carry an entry added by hand
-    // on this machine — an egress group is policy, so a silent drop widens or narrows what an app
-    // may reach. Keep each replaced group beside the config BEFORE the write, and report what the
-    // incoming fragment no longer declares.
-    let replaced = match keep_replaced_groups(&path, &groups, force) {
-        Ok(kept) => kept,
-        Err(e) => {
-            diag::error(&format!(
-                "sbx: net groups import: {e} — nothing was overwritten"
-            ));
+            diag::error(&format!("sbx: net groups import: cannot read {e}"));
             return ExitCode::FAILURE;
         }
     };
-    match config::manage::import_net_groups(&path, &groups, force) {
-        Ok(outcome) => {
-            for note in &replaced {
-                diag::warn(note);
-            }
-            let mut parts = Vec::new();
-            if !outcome.added.is_empty() {
-                parts.push(format!("added {}", outcome.added.join(", ")));
-            }
-            if !outcome.overwritten.is_empty() {
-                parts.push(format!("overwrote {}", outcome.overwritten.join(", ")));
-            }
-            let summary = if parts.is_empty() {
-                "nothing to do".to_string()
-            } else {
-                parts.join("; ")
-            };
-            println!(
-                "imported {} egress group(s) into {} — {summary}",
-                groups.len(),
-                path.display()
-            );
-            // Import is the one moment the user consciously brings in someone else's data, so flag any
-            // entry that will not resolve (a malformed or nested one) right here — the same inspect-time
-            // check `sbx net groups <name>` applies — rather than let it surface only at the next launch.
-            let dead: Vec<String> = groups
-                .iter()
-                .filter(|(_, entries)| entries.iter().any(|e| net_group_entry_issue(e).is_some()))
-                .map(|(name, _)| name.clone())
-                .collect();
-            if !dead.is_empty() {
-                diag::warn(&format!(
-                    "some entries will not resolve in: {} — inspect with `sbx net groups <name>`",
-                    dead.join(", ")
-                ));
-            }
-            ExitCode::SUCCESS
-        }
-        Err(config::manage::ManageError::GroupCollision(names)) => {
-            diag::error(&format!(
-                "sbx: net groups import: {} already defined: {} — re-run with --force to overwrite, \
-                 or rename in the fragment (nothing was written)",
-                if names.len() == 1 { "group" } else { "groups" },
-                names.join(", ")
-            ));
-            ExitCode::from(2)
-        }
+    let entries = match config::validate_group_file(&bytes) {
+        Ok(e) => e,
         Err(e) => {
-            diag::error(&format!("sbx: net groups import: {e}"));
-            ExitCode::FAILURE
+            diag::error(&format!(
+                "sbx: net groups import: {} is not a valid group file: {e}",
+                parsed.file.display()
+            ));
+            return ExitCode::from(2);
         }
+    };
+    let Some(dir) = config::net_groups_dir() else {
+        diag::error("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let installed =
+        match crate::cli::install_named_file(&dir, &name, &bytes, parsed.force, "egress group") {
+            Ok(i) => i,
+            Err(code) => return code,
+        };
+    println!(
+        "imported egress group `{name}` into {}",
+        installed.dest.display()
+    );
+    // An egress group is policy, so a silent drop widens or narrows what an app may reach. Both
+    // sides of the replacement are named, for the reason `sbx bundle import` gives.
+    if let Some(replaced) = &installed.replaced {
+        let before = String::from_utf8_lossy(&replaced.previous).to_string();
+        let after = String::from_utf8_lossy(&bytes).to_string();
+        diag::warn(&crate::cli::render_replaced_fragment(
+            "egress group",
+            &name,
+            &crate::cli::settings_dropped_by(&before, &after),
+            &crate::cli::settings_dropped_by(&after, &before),
+            &replaced.kept,
+        ));
     }
+    // Import is the one moment the user consciously brings in someone else's data, so flag any
+    // entry that will not resolve (a malformed or nested one) right here — the same inspect-time
+    // check `sbx net groups <name>` applies — rather than let it surface only at the next launch.
+    if entries.iter().any(|e| net_group_entry_issue(e).is_some()) {
+        diag::warn(&format!(
+            "some entries will not resolve in `{name}` — inspect with `sbx net groups {name}`"
+        ));
+    }
+    ExitCode::SUCCESS
 }
 
 /// Why a group entry is not a usable rule, or `None` if it is fine. Mirrors what `build_net_groups`
@@ -526,9 +519,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let dir = base.join("2026-08");
         let path = dir.join("groups.toml");
-        let fragment = "[network.groups]\nci = [\"api.test\"]\n";
+        let fragment = "entries = [\"api.test\"]\n";
 
-        let _ = write_groups_fragment(&path, fragment, 1);
+        let _ = write_group_file(&path, "ci", fragment);
 
         let written = std::fs::read_to_string(&path);
         // What the destination directory holds afterwards: the export and nothing else — the

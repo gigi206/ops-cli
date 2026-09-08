@@ -27,7 +27,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.odysseus]
 # The install step itself: Odysseus is published as a source repository, so what "installed" means
 # here is a clone, a venv, its dependencies and the project's own setup — which is why this bundle
 # names a toolchain rather than an agent, and why it is complete all the same.
@@ -35,7 +34,7 @@
 # What stays with the consuming app is everything that is not installation and cannot be declared:
 # the library path its native wheels need and the browser wrapper its MCP reads, both discovered from
 # store paths whose hashes are not knowable when authoring a profile. The vector store it talks to is
-# neither — it is `[bundle.odysseus.service.chroma]` below.
+# neither — it is the `[service.chroma]` below.
 #
 # The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
 # remember that one succeeded. It is keyed on the CHECKED-OUT COMMIT rather than on a bare marker,
@@ -127,7 +126,7 @@ mute = [
     "@npm-audit",  # npm's audit POST during the front-end install
 ]
 
-[bundle.odysseus.packages]
+[packages]
 # The build and runtime substrate; the workspace itself arrives through the profile's `cmd`.
 git = "nix:git"          # clones the repo on first launch
 python = "nix:python312" # the venv interpreter (Python 3.11+ required)
@@ -136,7 +135,7 @@ libstdc = "nix:gcc.cc"   # the C++ runtime the native wheels link against
 node = "nix:nodejs"      # the front-end build
 chromium = "nix:chromium" # the browser the workspace drives
 
-[bundle.odysseus.env]
+[env]
 # The in-cage browser cannot bring up its own SUID/userns sandbox (sbx's seccomp denylist blocks
 # `clone(CLONE_NEWUSER)`), and the cage IS the boundary, so the workspace is told to launch it
 # without one — otherwise every browser action aborts at startup.
@@ -145,7 +144,7 @@ ODYSSEUS_BROWSER_NO_SANDBOX = "1"
 CHROMADB_HOST = "127.0.0.1"
 CHROMADB_PORT = "8100"
 
-[bundle.odysseus.service.chroma]
+[service.chroma]
 # The vector store the workspace talks to. Odysseus expects it beside the app on :8100 and degrades
 # without it, logging "DEGRADED"/"MemoryVectorStore" and losing the persistence a real store gives.
 # It lives with the tool rather than with the app for the reason the whole bundle does: it is

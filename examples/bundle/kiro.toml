@@ -36,7 +36,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.kiro]
 allow = [
     # Inference / chat (POST completions).
     "{*} https://runtime.us-east-1.kiro.dev",
@@ -143,7 +142,7 @@ shared_credential = [[
     "q.eu-central-1.amazonaws.com",
 ]]
 
-[bundle.kiro.packages]
+[packages]
 # Kiro CLI from nixpkgs (host-side, durable, offline-reusable after the first build). The
 # derivation fetches the official AWS `.tar.gz`, patchelfs the native binaries, and puts
 # kiro-cli / kiro-cli-chat / kiro-cli-term on PATH. It is proprietary (an `unfree` nixpkgs

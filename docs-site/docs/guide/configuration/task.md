@@ -27,7 +27,7 @@ PGPASSWORD = "sops://secrets.enc.yaml#db.password"
 
 Trusted-only, like `[binds]`/`[seccomp]`/`[devices]`: an untrusted project may neither declare a task
 nor loosen one. Declarable in the global config, a project's `.sbx.toml`, an app profile
-(`[app.<name>.task.<task>]`) and a bundle (`[bundle.<name>.task.<task>]`).
+(`[app.<name>.task.<task>]`) and a bundle (its own `[task.<task>]`).
 
 See also: [Declared operations](../tasks/) · [`sbx task`](../cli/task) · [`[secret]`](secret) ·
 [Secrets](../secrets/).
@@ -177,13 +177,18 @@ spawn = ["gpg"]               # ssh may run gpg
 The same table works in four places, so an operation follows whatever it belongs to:
 
 ```toml
-[task.fmt-check]              # a project .sbx.toml, or the global config
+# a project .sbx.toml, or the global config
+[task.fmt-check]
 cmd = ["cargo", "fmt", "--check"]
 
-[app.reviewer.task.fmt-check] # …only for that app's launches
+# …only for that app's launches
+[app.reviewer.task.fmt-check]
 cmd = ["cargo", "fmt", "--check"]
+```
 
-[bundle.rust.task.fmt-check]  # …for every app that names the bundle in `use`
+```toml
+# ~/.config/sbx/bundles/rust.toml: for every app that names the bundle in `use`
+[task.fmt-check]
 cmd = ["cargo", "fmt", "--check"]
 ```
 

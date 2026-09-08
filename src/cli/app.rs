@@ -631,67 +631,29 @@ fn app_import(args: &[OsString]) -> ExitCode {
         None
     };
 
-    let dest = dir.join(format!("{name}.toml"));
-    if dest.exists() && !force {
-        diag::error(&format!(
-            "sbx: a profile '{name}' already exists at {} (use --force to overwrite)",
-            dest.display()
-        ));
-        return ExitCode::FAILURE;
-    }
     // `--force` replaces a file the user may have edited: a per-machine allow rule, a `[secret]`
-    // block, a package they swapped. Keep the previous bytes beside the profile BEFORE the write,
-    // so the settings survive the overwrite that is about to drop them, and report what went.
-    let replaced = match std::fs::read(&dest) {
-        Ok(previous) if previous != bytes => {
-            let kept = dir.join(format!("{name}.toml.replaced"));
-            match crate::cli::keep_replaced_file(&kept, &previous) {
-                Ok(()) => Some((previous, kept)),
-                Err(e) => {
-                    diag::error(&format!(
-                        "sbx: cannot keep the profile being replaced at {}: {e} — nothing was \
-                         overwritten",
-                        kept.display()
-                    ));
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        // Same bytes: a re-import that changes nothing has nothing to keep.
-        Ok(_) => None,
-        // No previous file: this is an import, not an overwrite.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        // The file is there and could not be read. Refused, on the same terms as a copy that could
-        // not be written: the whole point of the copy is that the overwrite is about to drop
-        // whatever this file held, and dropping it because sbx could not look at it is the one
-        // outcome this branch exists to prevent. It was swallowed with the two cases above.
-        Err(e) => {
-            diag::error(&format!(
-                "sbx: cannot read the profile being replaced at {}: {e} — nothing was overwritten",
-                dest.display()
-            ));
-            return ExitCode::FAILURE;
-        }
+    // block, a package they swapped. The write, the refusal and the copy kept beside it are the
+    // same for all three imported kinds, so they have one definition.
+    let installed = match crate::cli::install_named_file(&dir, &name, &bytes, force, "profile") {
+        Ok(i) => i,
+        Err(code) => return code,
     };
-    if let Err(e) = write_profile_file(&dir, &dest, &bytes) {
-        diag::error(&format!("sbx: cannot write {}: {e}", dest.display()));
-        return ExitCode::FAILURE;
-    }
+    let dest = &installed.dest;
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     println!(
         "{}",
-        render_app_imported(&name, &dest, &preview.summary, &pal)
+        render_app_imported(&name, dest, &preview.summary, &pal)
     );
     // An overwrite is the one import that can LOSE something. Name what the incoming profile no
     // longer carries — a diff of the two files would bury it in prose, and the settings are what a
     // reader stands to lose — and point at the copy kept beside it.
-    if let Some((previous, kept)) = replaced {
+    if let Some(replaced) = &installed.replaced {
         let dropped = super::settings_dropped_by(
-            &String::from_utf8_lossy(&previous),
+            &String::from_utf8_lossy(&replaced.previous),
             &String::from_utf8_lossy(&bytes),
         );
-        diag::warn(&render_replaced_profile(&dropped, &kept));
+        diag::warn(&render_replaced_profile(&dropped, &replaced.kept));
     }
     // A profile is NOT self-contained, and what it is short of is not only a bundle. Both kinds of
     // reference resolve against the global config, both are silent at launch in the way that matters
@@ -714,8 +676,20 @@ fn app_import(args: &[OsString]) -> ExitCode {
 /// writing the rest would widen the import past what the reference asked for, which is the whole
 /// reason this is opt-in.
 struct DepPlan {
-    bundles: std::collections::BTreeMap<String, config::RawBundle>,
-    groups: std::collections::BTreeMap<String, Vec<String>>,
+    bundles: Vec<DepEntry<config::RawBundle>>,
+    groups: Vec<DepEntry<Vec<String>>>,
+}
+
+/// One dependency the plan will install: the name it is filed under, the bytes to copy, and the
+/// value they parsed to.
+///
+/// The bytes ride along because an import is a **copy** — the author's comments and layout survive
+/// — while the parsed value is what the announcements read: what naming this bundle would grant,
+/// and which groups it references.
+struct DepEntry<T> {
+    name: String,
+    bytes: Vec<u8>,
+    value: T,
 }
 
 /// Read and validate everything `--with-deps` would write, or say why it cannot. Called before the
@@ -732,7 +706,7 @@ fn dep_plan(
     declared_groups: &std::collections::BTreeMap<String, Vec<String>>,
     src: &Path,
 ) -> Result<DepPlan, String> {
-    let mut bundles = std::collections::BTreeMap::new();
+    let mut bundles = Vec::new();
     for m in missing_bundles {
         let Some(file) = m.file.as_ref() else {
             return Err(unresolvable("bundle", &m.name, src));
@@ -745,24 +719,24 @@ fn dep_plan(
                 m.name
             ));
         }
-        let mut fragment = config::read_bundle_fragment(file).map_err(|e| nothing_written(&e))?;
-        let Some(bundle) = fragment.remove(&m.name) else {
-            return Err(format!(
-                "{} no longer declares `{}`; nothing was written",
-                file.display(),
-                m.name
-            ));
-        };
-        bundles.insert(m.name.clone(), bundle);
+        let bytes = config::safety::read_safe_bytes(file)
+            .map_err(|e| nothing_written(&format!("cannot read {e}")))?;
+        let value = config::validate_bundle(&bytes)
+            .map_err(|e| nothing_written(&format!("{}: {e}", file.display())))?;
+        bundles.push(DepEntry {
+            name: m.name.clone(),
+            bytes,
+            value,
+        });
     }
 
     let mut wanted: Vec<super::MissingRef> = missing_groups.to_vec();
-    for m in super::bundle::undefined_groups(&bundles, src, declared_groups) {
+    for m in super::bundle::undefined_groups(&bundle_values(&bundles), src, declared_groups) {
         if !wanted.iter().any(|w| w.name == m.name) {
             wanted.push(m);
         }
     }
-    let mut groups = std::collections::BTreeMap::new();
+    let mut groups = Vec::new();
     for m in &wanted {
         let Some(file) = m.file.as_ref() else {
             return Err(unresolvable("egress group", &m.name, src));
@@ -773,16 +747,15 @@ fn dep_plan(
                 m.name
             ));
         }
-        let mut fragment =
-            config::read_net_groups_fragment(file).map_err(|e| nothing_written(&e))?;
-        let Some(entries) = fragment.remove(&m.name) else {
-            return Err(format!(
-                "{} no longer declares `{}`; nothing was written",
-                file.display(),
-                m.name
-            ));
-        };
-        groups.insert(m.name.clone(), entries);
+        let bytes = config::safety::read_safe_bytes(file)
+            .map_err(|e| nothing_written(&format!("cannot read {e}")))?;
+        let value = config::validate_group_file(&bytes)
+            .map_err(|e| nothing_written(&format!("{}: {e}", file.display())))?;
+        groups.push(DepEntry {
+            name: m.name.clone(),
+            bytes,
+            value,
+        });
     }
     Ok(DepPlan { bundles, groups })
 }
@@ -808,67 +781,76 @@ fn unresolvable(kind: &str, name: &str, src: &Path) -> String {
     )
 }
 
-/// Merge a resolved [`DepPlan`] into the global config. Never overwrites: the plan holds only names
-/// nothing declared when it was built, so a collision here means the config gained one in between
-/// (or holds one that is dropped at load, and so invisible to the reader that built the plan).
+/// The parsed bundles of a plan, keyed by name — what the announcements read.
+fn bundle_values(
+    entries: &[DepEntry<config::RawBundle>],
+) -> std::collections::BTreeMap<String, config::RawBundle> {
+    entries
+        .iter()
+        .map(|e| (e.name.clone(), e.value.clone()))
+        .collect()
+}
+
+/// Install everything the plan holds: one file per bundle under `bundles/`, one per group under
+/// `net-groups/`.
 ///
-/// Refusing by name beats replacing a declaration the user did not offer up.
+/// **All-or-nothing across both kinds.** Every destination is checked free before the first byte is
+/// written, because `--with-deps` promises one act where there are now many writes: a collision
+/// found halfway would leave a profile beside some of the dependencies it needs and not the others,
+/// which is the half-installed state the flag exists to avoid. Only I/O can fail after that point.
 fn write_deps(plan: &DepPlan) -> Result<(), ExitCode> {
     if plan.bundles.is_empty() && plan.groups.is_empty() {
         return Ok(());
     }
-    let cwd = config_cwd()?;
-    let path = config::manage::scope_path(&config::manage::Scope::Global, &cwd).map_err(|e| {
-        diag::error(&format!("sbx: app import --with-deps: {e}"));
-        ExitCode::from(1)
-    })?;
-    if !plan.bundles.is_empty() {
-        merged(
-            config::manage::import_bundles(&path, &plan.bundles, false),
-            "bundle",
-            &path,
-        )?;
+    let (Some(bundles_dir), Some(groups_dir)) = (config::bundles_dir(), config::net_groups_dir())
+    else {
+        diag::error("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        return Err(ExitCode::from(1));
+    };
+    let planned: Vec<(&Path, &str, &str, &[u8])> = plan
+        .bundles
+        .iter()
+        .map(|e| {
+            (
+                bundles_dir.as_path(),
+                "bundle",
+                e.name.as_str(),
+                e.bytes.as_slice(),
+            )
+        })
+        .chain(plan.groups.iter().map(|e| {
+            (
+                groups_dir.as_path(),
+                "egress group",
+                e.name.as_str(),
+                e.bytes.as_slice(),
+            )
+        }))
+        .collect();
+    for (dir, noun, name, _) in &planned {
+        let dest = dir.join(format!("{name}.toml"));
+        if dest.exists() {
+            diag::error(&format!(
+                "sbx: app import --with-deps: a {noun} '{name}' already exists at {} — nothing was \
+                 written",
+                dest.display()
+            ));
+            return Err(ExitCode::from(1));
+        }
     }
-    if !plan.groups.is_empty() {
-        merged(
-            config::manage::import_net_groups(&path, &plan.groups, false),
-            "egress group",
-            &path,
-        )?;
+    for (dir, noun, name, bytes) in &planned {
+        // Never `--force`: the plan holds only names nothing declares, and the pre-check above
+        // proved each destination free.
+        let installed = crate::cli::install_named_file(dir, name, bytes, false, noun)?;
+        println!("imported {noun} `{name}` into {}", installed.dest.display());
     }
     // The grant belongs to the bytes, not to the verb that wrote them: this is the one import where
     // a reader did not name the bundle themselves, so it is the one where an unannounced credential
     // or egress rule would be least expected.
-    if let Some(note) = super::bundle::granting_note(&plan.bundles) {
+    if let Some(note) = super::bundle::granting_note(&bundle_values(&plan.bundles)) {
         diag::warn(&note);
     }
     Ok(())
-}
-
-fn merged(
-    outcome: Result<config::manage::ImportOutcome, config::manage::ManageError>,
-    kind: &str,
-    path: &Path,
-) -> Result<(), ExitCode> {
-    match outcome {
-        Ok(outcome) => {
-            // Only `added` is reported, unlike `sbx bundle import`, which reports both halves: the
-            // plan holds nothing that was already declared and the merge is called without `force`,
-            // so `overwritten` cannot be non-empty here. A caller that ever passes `force` would
-            // have to say what it replaced.
-            println!(
-                "imported {} {kind}(s) into {} — added {}",
-                outcome.added.len(),
-                path.display(),
-                outcome.added.join(", ")
-            );
-            Ok(())
-        }
-        Err(e) => {
-            diag::error(&format!("sbx: app import --with-deps: {e}"));
-            Err(ExitCode::from(1))
-        }
-    }
 }
 
 /// Name what the profile still references and nothing declares — the plain import's half of the
@@ -924,21 +906,6 @@ fn drop_replaced_copy(name: &str) {
     if let Some(dir) = config::profiles_dir() {
         let _ = std::fs::remove_file(dir.join(format!("{name}.toml.replaced")));
     }
-}
-
-/// Write a profile's bytes to `dest`, owner-only, creating the profiles directory owner-only if
-/// it is missing. The bytes go to a sibling temp file (owner-only from creation, so a later read
-/// passes the safety gate) and are then renamed into place — atomic, like every other on-disk
-/// placement sbx makes: a failed or interrupted write never leaves a partial profile at the real
-/// name, and a `--force` overwrite keeps the previous profile until the new one is fully written.
-///
-/// The staging is [`crate::sandbox::atomicfile::write_atomic_mode`]'s. It was a second, hand-rolled
-/// copy of it until the two were compared: the copy named its temp `.import-<pid>.tmp`, which every
-/// profile in the directory shared, and it renamed without flushing, so a machine that lost power
-/// just after the rename could come back with a profile that was present and held zeros.
-fn write_profile_file(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    debug_assert_eq!(dest.parent(), Some(dir));
-    crate::sandbox::atomicfile::write_atomic_mode(dest, bytes, Some(0o600))
 }
 
 /// The overwrite warning: what the replacement no longer carries, and where the previous bytes are.

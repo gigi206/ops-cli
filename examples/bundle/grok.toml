@@ -22,7 +22,6 @@
 # header as belonging to that table, so an `allow` written below `[…packages]` would silently become
 # `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.grok]
 allow = [
     "{GET} https://storage.googleapis.com/grok-build-public-artifacts/*",
     "{*} https://api.x.ai",
@@ -31,10 +30,10 @@ mute = [
     "api.mixpanel.com",
 ]
 
-[bundle.grok.env]
+[env]
 GROK_DISABLE_AUTOUPDATER = "1"  # sbx owns upgrades; the CLI must not replace its pinned install
 
-[bundle.grok.packages]
+[packages]
 # xAI's own release binary, taken from its artifact bucket host-side.
 #
 # NOT `mise:aqua:`, and the reason is worth stating because it looks like the obvious choice. The
@@ -62,7 +61,7 @@ grok = "binary:resolve"
 #
 # This runs host-side in sbx's hermetic resolve cage, not in the agent's cage, so it uses the host
 # network rather than the `allow` list above — that list governs the agent's own egress at runtime.
-[bundle.grok.binary.grok]
+[binary.grok]
 resolve = [
     "sh",
     "-c",

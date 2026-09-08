@@ -20,7 +20,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.auggie]
 allow = [
     "@npm-registry",
     "{*} https://*.api.augmentcode.com",
@@ -32,9 +31,9 @@ mute = [
     "{POST} https://*.ingest.us.sentry.io",
 ]
 
-[bundle.auggie.packages]
+[packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 auggie = "mise:npm:@augmentcode/auggie"
 
-[bundle.auggie.env]
+[env]
 NODE_USE_ENV_PROXY = "1"

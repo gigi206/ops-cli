@@ -26,7 +26,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.antigravity]
 allow = [
     # Model / agent traffic — Google's Cloud Code (Gemini Code Assist) backend, the host the caged
     # agent and the native language server POST completions to. `daily-` is the same backend's
@@ -86,7 +85,7 @@ mute = [
     "www.googletagmanager.com",
 ]
 
-[bundle.antigravity.packages]
+[packages]
 # Google's official prebuilt IDE tarball, tracked automatically through the resolver below.
 # Provisioned and autoPatchelf'd HOST-SIDE (Electron, no source build).
 antigravity-ide = "tarball:resolve"
@@ -101,7 +100,7 @@ chromium = "nix:chromium"
 # `version` and `execution_id` from element [0] with base tools (no jq), and builds the download
 # URL on Google's official Edge CDN. `printf` rather than `echo`, so the URL carries no trailing
 # newline.
-[bundle.antigravity.tarball.antigravity-ide]
+[tarball.antigravity-ide]
 resolve = ["sh", "-c", '''
 api="https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases"
 data=$(curl -fsS "$api")

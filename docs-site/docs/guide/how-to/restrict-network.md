@@ -39,7 +39,7 @@ allow = [
 ```
 
 The full grammar: [Rule grammar](../networking/rules). Sets reused across projects
-belong in `[network.groups]`, referenced as `@name`:
+belong in an [egress group](../networking/groups), referenced as `@name`:
 [Egress groups](../networking/groups).
 
 ## 3. Learn the set from a live session instead of guessing

@@ -28,7 +28,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.nanobot]
 allow = [
     # Install-time (mise's pipx backend runs `uv tool install nanobot-ai`): the Python
     # wheels and the package index, resolved from PyPI on first launch — the shared
@@ -41,7 +40,7 @@ allow = [
 mute = [
 ]
 
-[bundle.nanobot.packages]
+[packages]
 nanobot = "mise:pipx:nanobot-ai"  # the tool itself, from PyPI via uv (pure `py3-none-any` wheel, Python >= 3.11)
 uv = "nix:uv"                     # mise's pipx backend runs `uv tool install`
 python = "nix:python312"          # an interpreter in nanobot's `>=3.11` range

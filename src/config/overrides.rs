@@ -600,6 +600,9 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         // override never carries them, so there is nothing here for an ambient value to have set.
         app: _,
         bundle: _,
+        // Read from the `net-groups/` directory by the config reader, never carried by a parsed
+        // layer: an override shapes one launch, and a group is a global-config affordance.
+        net_group_files: _,
         // The engine that installs every `mise:` tool: global-only by construction,
         // so neither a project layer nor a one-shot override redirects it.
         mise: _,
@@ -701,6 +704,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         fs,
         redact,
         bundle,
+        // Read from the `net-groups/` directory by the config reader, never carried by a parsed
+        // layer: an override shapes one launch, and a group is a global-config affordance.
+        net_group_files: _,
         open,
         service,
         // Carried no further on purpose: `apply_override` refuses each of these outright, so folding
@@ -3066,8 +3072,10 @@ mod tests {
     /// four package-table backends, which it drops. So the two lists are compared here rather than
     /// kept in step by hand.
     ///
-    /// `rest` is the exception, and the only one: it is the unknown-key bag, reported per blob
-    /// against the blob that wrote it before this merge runs at all.
+    /// Two fields are exceptions, and only two. `rest` is the unknown-key bag, reported per blob
+    /// against the blob that wrote it before this merge runs at all. `net_group_files` is not a
+    /// TOML field at all — the config reader fills it from the `net-groups/` directory — so no
+    /// author can have written it into an override, and there is nobody to tell.
     #[test]
     fn the_dropped_tables_are_exactly_the_fields_the_fold_lets_go() {
         let source = include_str!("overrides.rs");
@@ -3081,7 +3089,7 @@ mod tests {
         let let_go: Vec<&str> = fold
             .lines()
             .filter_map(|l| l.trim().strip_suffix(": _,"))
-            .filter(|name| *name != "rest")
+            .filter(|name| *name != "rest" && *name != "net_group_files")
             .collect();
 
         let table = source

@@ -13,7 +13,7 @@ mode does, the rule grammar, ask mode, and observability, see the
 project, ignored from an untrusted one: since narrowing or widening the network is a
 confidentiality choice an untrusted project may not make.
 
-See also: [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [`[network.groups]`](../networking/groups) · [`[secret]`](secret).
+See also: [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Egress groups](../networking/groups) · [`[secret]`](secret).
 
 ## Why choose a posture
 
@@ -42,10 +42,10 @@ allow = ["api.github.com", "*.nixos.org", "@ci-hosts"]
 deny  = ["evil.example.com"]
 ```
 
-The two forms are interchangeable wherever a posture is written, with one exception: a
-config that also declares [egress groups](../networking/groups) must use the table form,
-since TOML cannot extend the bare string with a `[network.groups]` sub-table. That
-applies to the global config, the only layer where a group may be defined.
+The two forms are interchangeable wherever a posture is written. [Egress
+groups](../networking/groups) impose nothing here: each lives in a file of its own under
+`net-groups/`, so a config that references one with `@<name>` is free to keep the bare
+string.
 
 A key `[network]` does not know is **ignored and named** in the launch warnings, the same
 contract every table follows: a config written for a newer sbx still loads, and a
@@ -97,7 +97,7 @@ host, unfiltered".
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"`; above the ceiling it is clamped, not refused |
 | `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel): see below |
 | `shared_credential` | groups of hosts that are one service, so a credential the cage obtained by its own sign-in may travel among them: see below |
-| `groups` | reusable `[network.groups]` sets of egress entries, referenced as `@<name>`: see [Egress groups](../networking/groups) |
+| `groups` | **ignored, with a warning**: an egress group lives in its own file under `net-groups/`, and a list references it as `@<name>`: see [Egress groups](../networking/groups) |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 Every duration field (`ask_timeout`, `idle_timeout`, a task's `timeout`, a service's
@@ -110,7 +110,7 @@ other malformed value.
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules): a host,
 `*.domain`, `host/path`, an IP, `re:<regex>`, `http://host` (inspected cleartext),
 `tcp://host:port` (raw), an optional `{GET,POST}` verb prefix, or `@<group>`
-referencing a [`[network.groups]`](../networking/groups).
+referencing an [egress group](../networking/groups).
 
 ## Seeing the traffic (`capture`)
 

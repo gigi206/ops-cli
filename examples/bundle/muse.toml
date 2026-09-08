@@ -30,7 +30,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…env]` would
 # silently become `env.allow` — an unknown key, dropped without a word.
 
-[bundle.muse]
 # Meta's official installer, run once inside the cage, so the per-project build that `mise:`
 # backends automate is instead carried by the vendor's own script. `MUSE_INSTALL_DIR` pins the
 # launcher to ~/.local/bin; `MUSE_NO_MODIFY_PATH=1` stops the installer from editing shell rc files
@@ -82,6 +81,6 @@ allow = [
     "{*}   https://auth.meta.com",
 ]
 
-[bundle.muse.env]
+[env]
 # sbx owns upgrades, so tell the CLI not to replace itself behind the pin.
 MUSE_NO_AUTO_UPDATE = "1"

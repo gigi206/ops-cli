@@ -10,6 +10,17 @@
 use super::schema;
 use crate::testutil::TmpDir;
 
+/// One shipped bundle, read the way `sbx bundle import` reads it: the file's fields at the top
+/// level, its name carried by the file name.
+///
+/// Every guard below parses through sbx's own reader, so a file this test accepts is one the verb
+/// accepts — and a field written in the wrong TOML place (an `allow` under `[packages]`, which
+/// parses as an unknown key and vanishes) fails here rather than passing unnoticed.
+fn shipped_bundle(path: &std::path::Path) -> schema::RawBundle {
+    let bytes = std::fs::read(path).expect("read the bundle");
+    super::validate_bundle(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
 #[test]
 fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
     // The catalogue is the population the new app-scoped unknown-key report is loudest on: 71
@@ -42,17 +53,18 @@ fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle"))
+        // Parsed but NOT validated here: `validate_bundle` refuses an unknown key itself, so going
+        // through it would make the assertion below unfailable and this guard decorative. The
+        // stray key has to be the thing this test reports.
+        let bundle = schema::parse_bundle(&std::fs::read(&path).expect("read the bundle"))
             .expect("the bundle parses");
-        for (name, bundle) in &raw.bundle {
-            assert!(
-                bundle.rest.is_empty(),
-                "{} (`{name}`): unknown key(s) {:?}",
-                path.display(),
-                bundle.rest.keys().collect::<Vec<_>>()
-            );
-            bundles += 1;
-        }
+        assert!(
+            bundle.rest.is_empty(),
+            "{}: unknown key(s) {:?}",
+            path.display(),
+            bundle.rest.keys().collect::<Vec<_>>()
+        );
+        bundles += 1;
     }
     // The guard asserts its own precondition: a `read_dir` that found nothing would pass in silence.
     assert!(checked >= 60, "only {checked} profiles were read");
@@ -402,9 +414,11 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        // Parsed with sbx's own parser, so a fragment this test accepts is one `sbx net groups
-        // import` accepts.
-        schema::parse(&std::fs::read(&path).expect("read the group fragment")).unwrap();
+        // Parsed with sbx's own reader, so a file this test accepts is one `sbx net groups import`
+        // accepts — a key written where `entries` belongs names no hosts, and is refused here
+        // rather than shipped as an empty group.
+        super::validate_group_file(&std::fs::read(&path).expect("read the group file"))
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         shipped_groups.insert(path.file_stem().unwrap().to_str().unwrap().to_string());
     }
 
@@ -421,10 +435,7 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
         // accepts — and a field written in the wrong TOML place (an `allow` under `[…packages]`,
         // which parses as an unknown key and vanishes) fails the checks below rather than passing
         // unnoticed.
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-        let bundle = raw.bundle.get(&name).unwrap_or_else(|| {
-            panic!("{name}.toml must declare `[bundle.{name}]` (keyed by its file stem)")
-        });
+        let bundle = &shipped_bundle(&path);
 
         let profile_path = root.join(format!("examples/app/{name}.toml"));
         let profile = schema::parse_app(
@@ -538,17 +549,16 @@ fn every_shipped_exemption_names_a_mise_package_its_own_layer_declares() {
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-            let raw = schema::parse(&std::fs::read(&path).expect("read the profile")).unwrap();
-            let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-            // A bundle file carries its declarations under `[bundle.<name>]`; an app profile
-            // carries them at the root. Both are checked against the packages of the same layer.
+            // Both kinds carry their declarations at the root of their own file, and each is read
+            // by its own parser. Both are checked against the packages of the same layer.
             let layers: Vec<(Vec<String>, std::collections::BTreeMap<String, String>)> =
-                match raw.bundle.get(&name) {
-                    Some(bundle) => vec![(
-                        bundle.accepts_fresh_releases.clone(),
-                        bundle.packages.clone(),
-                    )],
-                    None => vec![(raw.accepts_fresh_releases.clone(), raw.packages.clone())],
+                if dir == "examples/bundle" {
+                    let bundle = shipped_bundle(&path);
+                    vec![(bundle.accepts_fresh_releases, bundle.packages)]
+                } else {
+                    let raw = schema::parse_app(&std::fs::read(&path).expect("read the profile"))
+                        .unwrap();
+                    vec![(raw.accepts_fresh_releases, raw.packages)]
                 };
             for (named, packages) in layers {
                 for pkg_name in named {
@@ -604,12 +614,7 @@ fn every_shipped_install_step_yields_to_the_upgrade_signal() {
             continue;
         }
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-        let Some(provision) = raw
-            .bundle
-            .get(&name)
-            .and_then(|bundle| bundle.provision.clone())
-        else {
+        let Some(provision) = shipped_bundle(&path).provision else {
             continue;
         };
         let script: String = provision
@@ -661,13 +666,9 @@ fn every_shipped_freshness_exemption_is_named_in_the_bundles_table() {
             continue;
         }
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
         // Read with sbx's own parser, like the step above: a name written under a sub-table folds
         // into it and never reaches the launch, and grepping the file would not tell.
-        let declared = raw
-            .bundle
-            .get(&name)
-            .is_some_and(|bundle| !bundle.accepts_fresh_releases.is_empty());
+        let declared = !shipped_bundle(&path).accepts_fresh_releases.is_empty();
         if declared {
             carriers += 1;
         }
@@ -728,11 +729,7 @@ fn every_shipped_install_step_is_named_in_the_bundles_table() {
             continue;
         }
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-        let declared = raw
-            .bundle
-            .get(&name)
-            .is_some_and(|bundle| bundle.provision.is_some());
+        let declared = shipped_bundle(&path).provision.is_some();
         if declared {
             carriers += 1;
         }
@@ -794,12 +791,7 @@ fn every_shipped_bundle_declares_the_packages_its_row_names() {
             continue;
         }
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-        let packages = raw
-            .bundle
-            .get(&name)
-            .map(|bundle| bundle.packages.clone())
-            .unwrap_or_default();
+        let packages = shipped_bundle(&path).packages;
         let want = if packages.is_empty() {
             "none".to_string()
         } else {
@@ -872,10 +864,7 @@ fn every_shipped_resolver_table_is_named_in_the_bundles_table() {
             continue;
         }
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-        let Some(bundle) = raw.bundle.get(&name) else {
-            continue;
-        };
+        let bundle = shipped_bundle(&path);
         // Read as tables rather than as `<name> = "<backend>:resolve"` package values: the sentinel
         // and the table are two halves of one declaration, and it is the table that carries the
         // command a roll runs.
@@ -963,10 +952,7 @@ fn every_shipped_bundle_carries_the_counts_its_row_states() {
             continue;
         }
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-        let Some(bundle) = raw.bundle.get(&name) else {
-            continue;
-        };
+        let bundle = shipped_bundle(&path);
         let egress = bundle.allow.len() + bundle.mute.len() + bundle.deny.len();
         let vars = bundle.env.len();
         let carries = page
@@ -1060,10 +1046,7 @@ fn every_shipped_service_is_named_in_the_bundles_table() {
             continue;
         }
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-        let Some(bundle) = raw.bundle.get(&name) else {
-            continue;
-        };
+        let bundle = shipped_bundle(&path);
         let declared = !bundle.service.is_empty();
         if declared {
             carriers += 1;
@@ -1100,11 +1083,8 @@ fn shipped_install_step(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/bundle")
         .join(format!("{name}.toml"));
-    let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-    let argv = raw
-        .bundle
-        .get(name)
-        .and_then(|bundle| bundle.provision.clone())
+    let argv = shipped_bundle(&path)
+        .provision
         .unwrap_or_else(|| panic!("`examples/bundle/{name}.toml` ships a provision step"))
         .into_argv();
     argv.last()
@@ -1365,14 +1345,11 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
         }
         for used in &profile.uses {
             let bundle_path = root.join(format!("examples/bundle/{used}.toml"));
-            let raw = schema::parse(&std::fs::read(&bundle_path).unwrap_or_else(|e| {
-                panic!("`examples/app/{name}.toml` names the bundle `{used}`: {e}")
-            }))
-            .unwrap();
-            let bundle = raw
-                .bundle
-                .get(used)
-                .unwrap_or_else(|| panic!("`{used}.toml` must declare `[bundle.{used}]`"));
+            assert!(
+                bundle_path.exists(),
+                "`examples/app/{name}.toml` names the bundle `{used}`, which ships no file"
+            );
+            let bundle = shipped_bundle(&bundle_path);
             for list in [&bundle.allow, &bundle.deny, &bundle.mute] {
                 for rule in list {
                     if let Some(group) = rule.strip_prefix('@') {

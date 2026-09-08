@@ -27,7 +27,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.aider]
 allow = [
     # Install-time (mise's pipx backend runs `uv tool install aider-chat`): the Python
     # wheels and the package index, resolved from PyPI on first launch — the shared
@@ -38,7 +37,7 @@ mute = [
     "us.i.posthog.com",  # aider's analytics (refused by the allowlist; it disables PostHog itself on the failure)
 ]
 
-[bundle.aider.packages]
+[packages]
 aider = "mise:pipx:aider-chat"  # the tool itself, from PyPI via uv
 uv = "nix:uv"                   # mise's pipx backend runs `uv tool install`
 python = "nix:python312"        # an interpreter in aider's `>=3.10,<3.15` range

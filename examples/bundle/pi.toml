@@ -17,10 +17,9 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.pi]
 allow = [
     "{GET} https://pi.dev",
 ]
 
-[bundle.pi.packages]
+[packages]
 pi = "mise:aqua:earendil-works/pi"

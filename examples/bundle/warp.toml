@@ -25,7 +25,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.warp]
 allow = [
     # Login + API + artifact endpoint. The device-code login (the CLI prints a verification link
     # and a code, then polls until you approve in any browser) and the account portal both live
@@ -56,7 +55,7 @@ mute = [
     "warpianwzlfqdq.dataplane.rudderstack.com",  # product analytics (dataplane baked into the binary)
 ]
 
-[bundle.warp.packages]
+[packages]
 # The agent itself, auto-upgraded through the resolver below.
 warp = "tarball:resolve"
 
@@ -65,7 +64,7 @@ warp = "tarball:resolve"
 # URL it prints, validates it is an https `.tar.gz`, and pins it with its content hash. The vendor
 # exposes a stable artifact endpoint that 302s to the current versioned tarball, so the resolver
 # asks curl for the redirect TARGET (first hop only) rather than following it.
-[bundle.warp.tarball.warp]
+[tarball.warp]
 resolve = [
     "sh",
     "-c",

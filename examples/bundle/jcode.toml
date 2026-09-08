@@ -27,14 +27,13 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.jcode]
 mute = [
     "telemetry.jcode.sh",  # install/session/feedback events (denied); see `sbx net log --all`
 ]
 
-[bundle.jcode.env]
+[env]
 JCODE_NO_TELEMETRY = "1"  # telemetry opt-out (upstream also honors DO_NOT_TRACK and ~/.jcode/no_telemetry)
 JCODE_NO_BROWSER = "1"    # no browser in the empty netns: fall back to the paste/device login flow
 
-[bundle.jcode.packages]
+[packages]
 jcode = "mise:github:1jehuang/jcode"  # upstream's own Rust release binary

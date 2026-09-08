@@ -37,7 +37,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.hermes-desktop]
 allow = [
     # `agent-browser`, fetched from npm at launch (mise's npm backend installs in-cage, unlike the
     # host-side `flake:` build). Its audit POST is noisy and non-essential, so it is muted below.
@@ -126,7 +125,7 @@ fi
 # domains on the wire.
 shared_credential = [["*.nousresearch.com", "*.privy.io"]]
 
-[bundle.hermes-desktop.packages]
+[packages]
 # Hermes Desktop via the flake's `#desktop` output, built host-side — so `sbx upgrade flake` rolls
 # it forward.
 hermes-desktop = "flake:github:NousResearch/hermes-agent#desktop"
@@ -141,7 +140,7 @@ chromium = "nix:chromium"
 nodejs = "nix:nodejs"
 agent-browser = "mise:npm:agent-browser"
 
-[bundle.hermes-desktop.env]
+[env]
 # Flags agent-browser passes to the Chromium it launches for the browser tools. `--no-sandbox` is
 # MANDATORY: Chromium's own SUID/userns sandbox cannot come up in the cage (sbx's seccomp denylist
 # blocks `clone(CLONE_NEWUSER)`), so without it the browser aborts at startup and every browser tool

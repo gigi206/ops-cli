@@ -21,7 +21,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.cline]
 allow = [
     "@npm-registry",
     "{*} https://api.cline.bot",
@@ -34,7 +33,7 @@ mute = [
     "@npm-audit",
 ]
 
-[bundle.cline.packages]
+[packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 cline = "mise:npm:cline"
 hostname = "nix:hostname"  # the CLI shells out to `hostname` at startup

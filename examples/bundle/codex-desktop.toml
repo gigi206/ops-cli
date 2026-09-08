@@ -51,7 +51,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.codex-desktop]
 allow = [
     # The backend the whole app is built on — Chat, Work and Codex all talk to it — and the
     # WebSocket its responses stream over.
@@ -97,7 +96,7 @@ mute = [
     "@chromium-background",
 ]
 
-[bundle.codex-desktop.packages]
+[packages]
 # OpenAI's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron, no source build). The
 # apt pool publishes one package, `chatgpt`, whose payload is the Codex desktop app.
 codex-desktop = "deb:apt:https://persistent.oaistatic.com/codex-app-prod/linux/deb/dists/stable/main/binary-amd64/Packages"
@@ -116,7 +115,7 @@ chromium = "nix:chromium"
 #     refuses the build over the two of them. The `.out` output is named rather than the package,
 #     because nixpkgs' Qt setup hooks refuse a derivation that pulls Qt 5 and Qt 6 together
 #     ("detected mismatched Qt dependencies") and those hooks ride the `dev` output.
-[bundle.codex-desktop.deb.codex-desktop]
+[deb.codex-desktop]
 libs = [
     "libusb1",
     "qt5.qtbase.out",

@@ -58,7 +58,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.openwork]
 allow = [
     # OpenWork Den — the account, org and capability control plane. Sign-in, the Den API and the
     # Den-hosted MCP all live under this host, and the app POSTs to them, so all verbs. The public
@@ -102,7 +101,7 @@ mute = [
     "*.posthog.com",
 ]
 
-[bundle.openwork.packages]
+[packages]
 # The OpenWork desktop app, auto-upgraded through the resolver below. The package name is
 # `openwork`, so it binds to the `[…appimage.openwork]` table and is wrapped as `bin/openwork` —
 # the executable name upstream's own electron-builder config gives the public build.
@@ -113,7 +112,7 @@ openwork = "appimage:resolve"
 # an HTTP error; the jq filter keeps only the PUBLIC linux x86_64 asset and prints a URL only when
 # exactly one matches, so an ambiguous release resolves to nothing rather than to a guess. The
 # printed URL is re-validated as an `.AppImage` URL before sbx fetches it.
-[bundle.openwork.appimage.openwork]
+[appimage.openwork]
 resolve = ["sh", "-c", '''
 curl -fsSL "https://api.github.com/repos/different-ai/openwork/releases/latest" \
   | jq -r '[.assets[] | select(.name | test("^openwork-linux-x86_64-[0-9][0-9.]*\\.AppImage$")) | .browser_download_url] | if length == 1 then .[0] else empty end'

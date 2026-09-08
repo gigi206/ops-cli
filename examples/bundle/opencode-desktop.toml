@@ -31,7 +31,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.opencode-desktop]
 allow = [
     # The read-only model catalogue, and the npm package opencode pulls at startup
     # (`@opencode-ai/plugin`) — both shared lanes rather than per-agent copies.
@@ -46,7 +45,7 @@ mute = [
     "*.sentry.io",
 ]
 
-[bundle.opencode-desktop.packages]
+[packages]
 # Track the latest GitHub release's linux-amd64 `.deb` automatically — the pin is the release's
 # version-stamped asset, rolled by `sbx upgrade deb`.
 opencode-desktop = "deb:github:anomalyco/opencode"

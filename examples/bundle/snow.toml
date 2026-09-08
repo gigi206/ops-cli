@@ -23,7 +23,6 @@
 # header as belonging to that table, so an `allow` written below `[…packages]` would silently become
 # `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.snow]
 allow = [
     "@npm-registry",
 ]
@@ -31,6 +30,6 @@ mute = [
     "@npm-audit",
 ]
 
-[bundle.snow.packages]
+[packages]
 nodejs = "nix:nodejs"     # Snow is a node CLI
 snow = "mise:npm:snow-ai" # the author's own npm package

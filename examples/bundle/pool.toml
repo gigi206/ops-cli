@@ -29,14 +29,13 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.pool]
 allow = [
     # The account and model backends behind one first-party wildcard. The download host is NOT
     # here: the resolver and the fetch run host-side, outside any cage allowlist.
     "{*} https://*.poolside.ai",
 ]
 
-[bundle.pool.packages]
+[packages]
 # The agent itself, auto-upgraded through the resolver below.
 pool = "tarball:resolve"
 
@@ -45,7 +44,7 @@ pool = "tarball:resolve"
 # URL it prints, validates it is an https `.tar.gz`, and pins it with its content hash. The vendor
 # publishes the current version as a bare text file — the same one their installer reads — and the
 # archive path is composed from it. A warm launch reuses the pin offline and never re-runs this.
-[bundle.pool.tarball.pool]
+[tarball.pool]
 resolve = [
     "sh",
     "-c",

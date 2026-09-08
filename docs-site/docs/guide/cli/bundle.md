@@ -6,28 +6,28 @@ description: "List, export and import the reusable tool bundles an app names wit
 
 ```
 sbx bundle [<name>...] [--json]
-sbx bundle export [<name>...] [-o|--out <file>]
-sbx bundle import <file> [-f|--force]
+sbx bundle export [<name>...] [-o|--out <file>] [--out-dir <dir>]
+sbx bundle import <file> [--as <name>] [-f|--force]
 ```
 
 The reusable-tool-bundle surface. Host-side: no launch, no nix, and read-only except
 `import`.
 
-A `[bundle.<name>]` is everything one tool needs to be installed and to reach its own
+A bundle is everything one tool needs to be installed and to reach its own
 services: its `packages`, the `env` it reads, its `allow`/`deny`/`mute` egress rules and
 its `[secret]` credential. An app names one with `use = ["<name>"]`. Bundles are
 **global-only**, so these commands have no scope flag: they always read the global
 config.
 
-See also: [`[bundle.<name>]` configuration](../configuration/bundles) · [Apps](../configuration/apps) · [`sbx net groups`](net#sbx-net-groups).
+See also: [Tool bundles](../configuration/bundles) · [Apps](../configuration/apps) · [`sbx net groups`](net#sbx-net-groups).
 
 ## Subcommands
 
 | Subcommand | Purpose |
 |---|---|
 | [(none)](#sbx-bundle-1) | list every bundle, or show named ones in full |
-| [`export`](#sbx-bundle-export) | write bundles as a portable TOML fragment |
-| [`import`](#sbx-bundle-import) | merge a fragment into the global config |
+| [`export`](#sbx-bundle-export) | write bundles out as portable files |
+| [`import`](#sbx-bundle-import) | file a bundle under `bundles/<name>.toml` |
 
 ## `sbx bundle`
 
@@ -57,46 +57,49 @@ success. `export` and `import` are reserved subcommand verbs, so a bundle named
 ## `sbx bundle export`
 
 ```sh
-sbx bundle export > bundles.toml       # every bundle, to stdout
-sbx bundle export claude-code codex    # only the named ones
-sbx bundle export --out bundles.toml
+sbx bundle export claude-code            # one bundle, to stdout
+sbx bundle export claude-code -o cc.toml # to a file
+sbx bundle export --out-dir ./bundles    # every bundle, one file each
 ```
 
-Writes a portable `[bundle.<name>]` TOML fragment. Stdout is the default: composable
-and clobber-safe. Source comments are not carried (a bundle is data). The inverse of
-`import`.
+Writes each bundle in the portable form `import` reads: its fields at the top level,
+its name carried by the file. Stdout is the default for a single bundle: composable and
+clobber-safe. A file holds one bundle, so exporting several needs `--out-dir <dir>`.
+Source comments are not carried (a bundle is data). The inverse of `import`.
 
 ## `sbx bundle import`
 
 ```sh
-sbx bundle import bundles.toml
-sbx bundle import bundles.toml --force
+sbx bundle import claude-code.toml
+sbx bundle import frag.toml --as claude-code
+sbx bundle import claude-code.toml --force
 ```
 
-Merges the fragment's bundles into the global config, preserving every existing bundle
-and comment. Bundles are global-only, so the target is always the global config, which
-is trusted by its location: the deliberate command **is** the consent (an agent inside
-the cage cannot run it), so there is no prompt.
+Copies the file into `bundles/<name>.toml`, where the loader reads it. The name comes
+from the file: its own stem, or `--as <name>`. The bytes are copied verbatim, so the
+author's comments survive. Bundles are global-only, and that directory is trusted by its
+location: the deliberate command **is** the consent (an agent inside the cage cannot run
+it), so there is no prompt.
 
-A name that already exists is refused unless `--force`, and the merge is
-**all-or-nothing**: a refused import writes nothing.
+A name that already exists is refused unless `--force`, and nothing is written when it
+is. An app *profile* handed here is refused too: a bundle carries no `cmd`, so the wrong
+file is named rather than filed as a toolless bundle.
 
 A forced overwrite is the one import that can lose work, since a declared bundle may carry
-an entry added by hand on this machine. So it names what the incoming fragment no longer
-declares, and keeps the bundle it replaced beside the config as `<name>.bundle.replaced`:
+an entry added by hand on this machine. So it keeps the file it replaced beside it as
+`<name>.toml.replaced`, and names both sides of the change: what the incoming bundle no
+longer declares, and what it declares on top (a widening is as worth reading as a loss).
 
 ```
 sbx: warning: replaced bundle `demo`, which declared 1 line the new one does not:
-     `allow = ["{GET} https://example.com", "{GET} https://local.example.org"]` — the
-     previous fragment is kept at ~/.config/sbx/demo.bundle.replaced, so a per-machine
-     entry can be read back and re-imported
+     `allow = ["{GET} https://example.com", "{GET} https://local.example.org"]`, and
+     declares 1 line the previous one did not: `allow = ["{GET} https://example.com"]`
+     — the previous fragment is kept at ~/.config/sbx/bundles/demo.toml.replaced, so a
+     per-machine entry can be read back and re-imported
 ```
 
-That copy is the same portable form `sbx bundle export` writes, so putting the entry back is
-`sbx bundle import --force ~/.config/sbx/demo.bundle.replaced`. A bundle lives in a table of
-the shared config rather than a file of its own, which is why the copy exists at all: there
-is no per-bundle file to keep. A re-import that declares exactly what is already there keeps
-no copy and reports no loss.
+Putting the entry back is `sbx bundle import --force ~/.config/sbx/bundles/demo.toml.replaced`.
+A re-import that changes nothing keeps no copy and reports no loss.
 
 Because an import is the one moment you consciously take in another author's data, a
 bundle that would grant **egress, a credential or an install step** is named right after
@@ -159,4 +162,4 @@ is the moment to run `sbx bundle <name>` before wiring it into an app.
 |---|---|
 | 0 | success |
 | 1 | the write failed, or there was nothing to export |
-| 2 | usage error, an unknown bundle name, an invalid name in a fragment, or a file that is not a bundle fragment |
+| 2 | usage error, an unknown bundle name, an invalid name, or a file that is not a bundle |

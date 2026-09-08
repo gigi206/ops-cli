@@ -440,7 +440,12 @@ pub(super) fn read_global(warnings: &mut Vec<String>) -> RawConfig {
     let Some(path) = global_path() else {
         return RawConfig::default();
     };
-    read_layer(&path, warnings).unwrap_or_default()
+    let mut global = read_layer(&path, warnings).unwrap_or_default();
+    // Here rather than in `load_scoped`, unlike the profile merge: `sbx bundle` and `sbx net
+    // groups` read the global layer through this function without going through a resolution, so a
+    // merge one level up would leave the inventory verbs describing a config nobody launches.
+    merge_config_dirs(&mut global, warnings);
+    global
 }
 
 /// The reusable egress groups declared in the global config (`[network.groups]`), as their raw
@@ -456,7 +461,7 @@ pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     // listing verbs read this map, and a group whose name no policy will ever accept was shown as
     // defined, answered for by name, and re-exported — while `net rules --expand` and every launch
     // ignored it. Two truths about one file, and the raw name printed to a terminal besides.
-    let mut groups = groups_of(global.network);
+    let mut groups = global.net_group_files;
     groups.retain(|name, _| {
         let ok = super::is_valid_group_name(name);
         if !ok {
@@ -465,15 +470,6 @@ pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
         ok
     });
     (groups, warnings)
-}
-
-/// The `groups` table a raw `network` field carries, or an empty map when the field is absent or
-/// written in its bare-string form (which has no room for a sub-table).
-fn groups_of(field: Option<schema::NetworkField>) -> BTreeMap<String, Vec<String>> {
-    match field {
-        Some(schema::NetworkField::Table(table)) => table.groups,
-        _ => BTreeMap::new(),
-    }
 }
 
 /// The tool bundles declared in the global config (`[bundle.<name>]`), plus any load warnings.
@@ -506,45 +502,84 @@ pub(crate) fn unknown_bundle_key(name: &str, key: &str) -> String {
     )
 }
 
-/// Read a portable `[bundle.<name>]` fragment from `path` (the file `sbx bundle import` is given),
-/// returning its bundles. The file goes through the same safety gate as any config (owner-owned,
-/// non-world-writable, a plain regular file). An error names why: unsafe/unreadable, not valid
-/// TOML, or carrying no `[bundle]` table (the tell-tale of the wrong file — an app *profile*, say,
-/// which is imported with `sbx app import` instead).
+/// Read a bundle file from `path` (the file `sbx bundle import` is given, or a sibling a reference
+/// points at), returning it keyed by the file's own stem — a bundle file *is* one bundle, and its
+/// name is its file name.
+///
+/// The file goes through the same safety gate as any config (owner-owned, non-world-writable, a
+/// plain regular file). An error names why: unsafe/unreadable, not valid TOML, an unusable name, or
+/// carrying a key a bundle does not have. That last one is what tells the wrong file apart: a
+/// bundle deliberately has no `cmd` and no posture, so an app *profile* handed to `sbx bundle
+/// import` — or found under a `bundle/` directory — is refused rather than imported as a toolless
+/// bundle.
 pub(crate) fn read_bundle_fragment(path: &Path) -> Result<BTreeMap<String, RawBundle>, String> {
-    let bytes = safety::read_safe_bytes(path).map_err(|e| e.to_string())?;
-    let raw = schema::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    if raw.bundle.is_empty() {
-        return Err(format!(
-            "{} has no `[bundle.<name>]` table to import (is it an export of `sbx bundle export`? \
-             an app profile is imported with `sbx app import`)",
-            path.display()
-        ));
-    }
-    Ok(raw.bundle)
+    let (name, bytes) = read_named_config(path, &BUNDLE_FILES)?;
+    let bundle = validate_bundle(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(BTreeMap::from([(name, bundle)]))
 }
 
-/// Read a portable `[network.groups]` fragment from `path` (the file `sbx net groups import` is
-/// given), returning its groups. The file goes through the same safety gate as any config
-/// (owner-owned, non-world-writable, a plain regular file). An error names why: unsafe/unreadable,
-/// not valid TOML, or carrying no `[network.groups]` (the tell-tale of the wrong file). The entries
-/// are returned verbatim — the caller validates the group names before writing them, and a malformed
-/// entry is flagged at load like any other, so the import is deliberately not a second validation
-/// surface.
+/// Validate bytes as a bundle file — the shape `sbx bundle import` accepts and the directory reader
+/// stores. A key a bundle does not have is the refusal that tells the wrong file apart: a bundle
+/// deliberately carries no `cmd` and no posture, so an app profile handed to the bundle verb is
+/// refused rather than filed as a toolless bundle.
+pub(crate) fn validate_bundle(bytes: &[u8]) -> Result<RawBundle, String> {
+    let bundle = schema::parse_bundle(bytes)?;
+    if let Some(key) = bundle.rest.keys().next() {
+        return Err(format!(
+            "`{key}` is not a field of a bundle (a bundle carries no `cmd` and no posture; is this \
+             an app profile, imported with `sbx app import`?)"
+        ));
+    }
+    Ok(bundle)
+}
+
+/// Read an egress-group file from `path`, returning its entries keyed by the file's own stem. The
+/// group counterpart of [`read_bundle_fragment`], with the same safety gate and the same refusal of
+/// a key the file's shape does not have — `allow = [...]` written out of habit names no entries and
+/// would otherwise import an empty group.
+///
+/// The entries themselves are returned verbatim: a malformed one is flagged at load like any other,
+/// so the import is deliberately not a second validation surface.
 pub(crate) fn read_net_groups_fragment(
     path: &Path,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
-    let bytes = safety::read_safe_bytes(path).map_err(|e| e.to_string())?;
-    let raw = schema::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let groups = groups_of(raw.network);
-    if groups.is_empty() {
+    let (name, bytes) = read_named_config(path, &GROUP_FILES)?;
+    let entries = validate_group_file(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(BTreeMap::from([(name, entries)]))
+}
+
+/// Validate bytes as an egress-group file, returning its entries. The group counterpart of
+/// [`validate_bundle`], refusing a key the shape does not have for the same reason: `allow = [...]`
+/// written out of habit names no entries and would file an empty group.
+pub(crate) fn validate_group_file(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let group = schema::parse_group(bytes)?;
+    if let Some(key) = group.rest.keys().next() {
         return Err(format!(
-            "{} has no `[network.groups]` table to import (is it an export of \
-             `sbx net groups export`?)",
-            path.display()
+            "`{key}` is not a field of a group file (its entries go under `entries`, and its name \
+             is the file name)"
         ));
     }
-    Ok(groups)
+    Ok(group.entries)
+}
+
+/// The name and bytes of a config file addressed by its path: the stem names the entry, and the
+/// bytes pass the safety gate every config file passes. Shared by the two fragment readers, which
+/// differ only in what they parse afterwards.
+fn read_named_config(path: &Path, kind: &FileKind) -> Result<(String, Vec<u8>), String> {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("cannot derive a {} from {}", kind.name_kind, path.display()))?;
+    if !(kind.name_ok)(&name) {
+        return Err(format!(
+            "{}: `{name}` is not a usable {} (1–64 of [A-Za-z0-9._-])",
+            path.display(),
+            kind.name_kind
+        ));
+    }
+    let bytes = safety::read_safe_bytes(path).map_err(|e| e.to_string())?;
+    Ok((name, bytes))
 }
 
 /// Read the project config and decide its trust on the *same bytes* it parses, so
@@ -719,6 +754,20 @@ pub(crate) fn profiles_dir() -> Option<PathBuf> {
 /// global write (`sbx net allow -a <name> --save -g`, `sbx config … --app <name> -g`) reaches.
 pub(crate) fn profile_path(name: &str) -> Option<PathBuf> {
     profiles_dir().map(|d| d.join(format!("{name}.toml")))
+}
+
+/// The imported-bundles directory (`…/sbx/bundles/`), a sibling of the global config. `None` when
+/// no config base resolves, like [`profiles_dir`], whose role it plays for bundles: one file per
+/// bundle, read by [`read_global`] and written by `sbx bundle import`, so the location has a single
+/// definition here.
+pub(crate) fn bundles_dir() -> Option<PathBuf> {
+    global_path().and_then(|p| p.parent().map(|d| d.join(BUNDLES_DIR)))
+}
+
+/// The imported-groups directory (`…/sbx/net-groups/`), a sibling of the global config. The
+/// egress-group counterpart of [`bundles_dir`].
+pub(crate) fn net_groups_dir() -> Option<PathBuf> {
+    global_path().and_then(|p| p.parent().map(|d| d.join(NET_GROUPS_DIR)))
 }
 
 /// The posture an importable app profile would grant, in human-readable lines — shown so the
@@ -1084,42 +1133,7 @@ fn read_profile_apps(warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
 /// sorted order so warnings are deterministic.
 fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
     let mut out = BTreeMap::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return out,
-        Err(e) => {
-            warnings.push(format!(
-                "ignoring profiles directory {}: {e}",
-                dir.display()
-            ));
-            return out;
-        }
-    };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    paths.sort();
-    for path in paths {
-        // Only `*.toml` files are profiles; anything else under the directory is ignored silently.
-        if path.extension().and_then(|x| x.to_str()) != Some("toml") {
-            continue;
-        }
-        let Some(name) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
-            warnings.push(format!(
-                "ignoring profile {}: its file name is not valid UTF-8",
-                path.display()
-            ));
-            continue;
-        };
-        if !is_valid_app_name(&name) {
-            warnings.push(format!(
-                "ignoring profile {}: `{name}` is not a usable app name",
-                path.display()
-            ));
-            continue;
-        }
+    for (name, path) in named_toml_files(dir, &APP_FILES, warnings) {
         let bytes = match safety::read_safe_bytes(&path) {
             Ok(b) => b,
             Err(e) => {
@@ -1135,6 +1149,215 @@ fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<St
         }
     }
     out
+}
+
+/// One family of config files kept in a directory beside the global config. The three families
+/// (app profiles, tool bundles, egress groups) differ only in what a warning calls them and which
+/// names they accept, so the directory walk itself has one definition — [`named_toml_files`].
+struct FileKind {
+    /// What one file is called in a warning: `profile`, `bundle`, `group`.
+    one: &'static str,
+    /// What the directory is called in a warning: `profiles`, `bundles`, `groups`.
+    many: &'static str,
+    /// What an unusable file-name stem is called: `app name`, `bundle name`, `group name`.
+    name_kind: &'static str,
+    /// Whether a file-name stem may key an entry of this family. The same predicate the writing
+    /// verbs apply, so a name refused at import cannot appear from the directory either.
+    name_ok: fn(&str) -> bool,
+}
+
+/// The imported app profiles under `apps/`.
+const APP_FILES: FileKind = FileKind {
+    one: "profile",
+    many: "profiles",
+    name_kind: "app name",
+    name_ok: is_valid_app_name,
+};
+
+/// The imported tool bundles under `bundles/`.
+const BUNDLE_FILES: FileKind = FileKind {
+    one: "bundle",
+    many: "bundles",
+    name_kind: "bundle name",
+    name_ok: is_valid_bundle_name,
+};
+
+/// The imported egress groups under `net-groups/`.
+const GROUP_FILES: FileKind = FileKind {
+    one: "group",
+    many: "groups",
+    name_kind: "group name",
+    name_ok: super::is_valid_group_name,
+};
+
+/// Every `<name>.toml` under `dir` whose stem is a usable name for `kind`, paired with its path and
+/// returned in sorted order so warnings are deterministic.
+///
+/// The one definition of what counts as a file in a config directory, shared by the three families:
+/// an absent directory yields nothing (it is simply not populated), an unreadable one warns once,
+/// a non-`*.toml` entry is skipped silently (a `.replaced` copy, an editor swap file), and a stem
+/// that is not a usable name is dropped with a warning rather than keyed under a name no reference
+/// could ever resolve.
+fn named_toml_files(
+    dir: &Path,
+    kind: &FileKind,
+    warnings: &mut Vec<String>,
+) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            warnings.push(format!(
+                "ignoring {} directory {}: {e}",
+                kind.many,
+                dir.display()
+            ));
+            return out;
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        // Only `*.toml` files are read; anything else under the directory is ignored silently.
+        if path.extension().and_then(|x| x.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(name) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            warnings.push(format!(
+                "ignoring {} {}: its file name is not valid UTF-8",
+                kind.one,
+                path.display()
+            ));
+            continue;
+        };
+        if !(kind.name_ok)(&name) {
+            warnings.push(format!(
+                "ignoring {} {}: `{name}` is not a usable {}",
+                kind.one,
+                path.display(),
+                kind.name_kind
+            ));
+            continue;
+        }
+        out.push((name, path));
+    }
+    out
+}
+
+/// Read every bundle from the bundles directory, keyed by its filename stem (the bundle name).
+///
+/// Delegates to [`read_dir_bundles_from`] with the resolved [`bundles_dir`], the split
+/// [`read_profile_apps`] makes for the same reason: the directory walk stays unit-testable against
+/// an arbitrary directory, without depending on the process environment.
+fn read_dir_bundles(warnings: &mut Vec<String>) -> BTreeMap<String, RawBundle> {
+    match bundles_dir() {
+        Some(dir) => read_dir_bundles_from(&dir, warnings),
+        None => BTreeMap::new(),
+    }
+}
+
+/// Read every `<name>.toml` bundle under `dir`, keyed by its filename stem. Each file is a
+/// standalone top-level [`RawBundle`] — the same shape an app profile has, minus the fields a
+/// bundle may not carry — trusted by location. Infallible like the rest of [`mod@load`]: an unsafe,
+/// unparseable or unusably-named file is dropped with a warning, never aborting the load.
+fn read_dir_bundles_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<String, RawBundle> {
+    let mut out = BTreeMap::new();
+    for (name, path) in named_toml_files(dir, &BUNDLE_FILES, warnings) {
+        let bytes = match safety::read_safe_bytes(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                warnings.push(format!("ignoring bundle {e}"));
+                continue;
+            }
+        };
+        match schema::parse_bundle(&bytes) {
+            Ok(bundle) => {
+                out.insert(name, bundle);
+            }
+            Err(e) => warnings.push(format!("ignoring bundle {}: {e}", path.display())),
+        }
+    }
+    out
+}
+
+/// Read every egress group from the groups directory, keyed by its filename stem (the group name).
+fn read_dir_net_groups(warnings: &mut Vec<String>) -> BTreeMap<String, Vec<String>> {
+    match net_groups_dir() {
+        Some(dir) => read_dir_net_groups_from(&dir, warnings),
+        None => BTreeMap::new(),
+    }
+}
+
+/// Read every `<name>.toml` egress group under `dir`, keyed by its filename stem. Each file is a
+/// standalone [`schema::RawGroupFile`] — its entries under `entries`, its name in the file name.
+///
+/// An unknown key is named rather than left to make the group look empty: `allow = [...]`, written
+/// out of habit from the `[network]` table this factors out of, would otherwise yield a group that
+/// resolves to nothing and says nothing.
+fn read_dir_net_groups_from(
+    dir: &Path,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for (name, path) in named_toml_files(dir, &GROUP_FILES, warnings) {
+        let bytes = match safety::read_safe_bytes(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                warnings.push(format!("ignoring group {e}"));
+                continue;
+            }
+        };
+        match schema::parse_group(&bytes) {
+            Ok(group) => {
+                for key in group.rest.keys() {
+                    warnings.push(unknown_group_key(&name, key));
+                }
+                out.insert(name, group.entries);
+            }
+            Err(e) => warnings.push(format!("ignoring group {}: {e}", path.display())),
+        }
+    }
+    out
+}
+
+/// What an unknown key on an egress group file earns, written once for the reason
+/// [`unknown_bundle_key`] gives: the reader and the inventory verbs must describe one file the same
+/// way.
+pub(crate) fn unknown_group_key(name: &str, key: &str) -> String {
+    format!(
+        "group `{name}`: ignoring unknown key `{key}` — a group file carries its egress entries \
+         under `entries` and nothing else (its name is the file name)"
+    )
+}
+
+/// Make the `bundles/` and `net-groups/` directories the sole source of their layers, the way
+/// [`merge_profile_apps`] does for apps.
+///
+/// A bundle and an egress group each live in a file of their own; an inline `[bundle.<name>]` or
+/// `[network.groups]` in the global config is ignored, with one warning per entry so a config that
+/// still carries them says which. The inline table is *cleared* rather than merged: two declaration
+/// sites for one name would resolve to whichever the merge favored, and the file is the one a verb
+/// writes.
+fn merge_config_dirs(global: &mut RawConfig, warnings: &mut Vec<String>) {
+    for name in global.bundle.keys() {
+        warnings.push(format!(
+            "bundle `{name}`: an inline [bundle.{name}] in {GLOBAL_CONFIG} is ignored — a bundle \
+             lives as a file under {BUNDLES_DIR}/<name>.toml"
+        ));
+    }
+    global.bundle = read_dir_bundles(warnings);
+    for name in take_net_groups(&mut global.network).keys() {
+        warnings.push(format!(
+            "group `{name}`: an inline [network.groups] entry in {GLOBAL_CONFIG} is ignored — a \
+             group lives as a file under {NET_GROUPS_DIR}/<name>.toml"
+        ));
+    }
+    global.net_group_files = read_dir_net_groups(warnings);
 }
 
 /// Fold every `use = [<bundle>, …]` reference in `apps` into the app that names it, in place and

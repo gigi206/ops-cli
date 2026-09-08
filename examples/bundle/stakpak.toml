@@ -19,7 +19,6 @@
 # header as belonging to that table, so an `allow` written below `[…packages]` would silently become
 # `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.stakpak]
 allow = [
     "{*} https://apiv2.stakpak.dev",
 ]
@@ -29,5 +28,5 @@ mute = [
     "api.telegram.org",
 ]
 
-[bundle.stakpak.packages]
+[packages]
 stakpak = "mise:github:stakpak/agent"  # upstream's own static Rust release binary

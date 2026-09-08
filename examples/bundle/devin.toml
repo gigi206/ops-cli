@@ -31,7 +31,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.devin]
 allow = [
     # The agent's API and app backends.
     "{*} https://api.devin.ai",
@@ -46,7 +45,7 @@ mute = [
     "o4507463137361920.ingest.us.sentry.io",  # the vendor's crash reporter, refused by construction
 ]
 
-[bundle.devin.packages]
+[packages]
 # The agent itself, auto-upgraded through the resolver below.
 devin = "tarball:resolve"
 
@@ -54,7 +53,7 @@ devin = "tarball:resolve"
 # `jq` are both in the base toolset; the HOST network, because provisioning is host-side and an
 # allowlist governs runtime egress), captures the URL it prints, validates it is an https `.tar.gz`,
 # and pins it with its content hash. A warm launch reuses the pin offline and never re-runs this.
-[bundle.devin.tarball.devin]
+[tarball.devin]
 resolve = [
     "sh",
     "-c",

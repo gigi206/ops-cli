@@ -25,7 +25,6 @@
 # header as belonging to that table, so an `allow` written below `[…packages]` would silently become
 # `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.qoder]
 allow = [
     "@npm-registry",
     "{*} https://api2.qoder.sh",
@@ -37,7 +36,7 @@ mute = [
     "download.qoder.com",
 ]
 
-[bundle.qoder.packages]
+[packages]
 nodejs = "nix:nodejs"                  # the CLI is a JS bundle
 qodercli = "mise:npm:@qoder-ai/qodercli"  # the vendor's own npm scope; the command is `qodercli`
 ripgrep = "nix:ripgrep"                # its content search, resolved from PATH

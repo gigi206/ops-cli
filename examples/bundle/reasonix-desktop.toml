@@ -30,7 +30,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.reasonix-desktop]
 allow = [
     # The provider host the shell POSTs completions to. The `deb:resolve` command and the build both
     # run HOST-SIDE, on the host network, so neither needs an entry.
@@ -40,10 +39,10 @@ mute = [
     "crash.reasonix.io",  # the vendor's crash reporter, refused by construction
 ]
 
-[bundle.reasonix-desktop.packages]
+[packages]
 reasonix-desktop = "deb:resolve"
 
-[bundle.reasonix-desktop.env]
+[env]
 GDK_BACKEND = "wayland"
 WEBKIT_DISABLE_COMPOSITING_MODE = "1"
 WEBKIT_DISABLE_DMABUF_RENDERER = "1"
@@ -58,7 +57,7 @@ WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS = "1"
 # icons, the desktop schemas GTK reads, and `gnome-themes-extra` for the `Adwaita-dark` theme the
 # portal names when your desktop is in dark mode — GTK ships only the light Adwaita itself, so
 # without it the shell stays light on a dark desktop.
-[bundle.reasonix-desktop.deb.reasonix-desktop]
+[deb.reasonix-desktop]
 resolve = [
     "sh",
     "-c",

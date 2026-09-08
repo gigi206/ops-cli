@@ -42,7 +42,6 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
-[bundle.traycer]
 allow = [
     # The npm registry, because a `mise:npm:` package is installed inside the cage.
     "@npm-registry",
@@ -63,7 +62,7 @@ mute = [
     "@npm-audit",
 ]
 
-[bundle.traycer.packages]
+[packages]
 # mise's npm backend needs a node runtime inside the cage.
 nodejs = "nix:nodejs"
 traycer = "mise:npm:@traycerai/cli"

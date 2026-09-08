@@ -83,6 +83,7 @@ fn validate_network(
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
         accepts_fresh_releases: Default::default(),
+        net_group_files: Default::default(),
         timezone: None,
         distro: None,
         plugin: Default::default(),
@@ -869,23 +870,28 @@ fn a_bare_group_entry_inherits_the_apps_read_by_default_posture() {
 }
 
 #[test]
-fn read_net_groups_fragment_reads_groups_and_rejects_a_groupless_file() {
+fn a_group_file_is_named_by_its_file_and_refuses_a_key_it_does_not_have() {
     let tmp = TmpDir::new();
-    let good = tmp.path().join("frag.toml");
-    std::fs::write(
-        &good,
-        "[network.groups]\nmcp = [\"{*} a.example.com:443\"]\n",
-    )
-    .unwrap();
-    let g = read_net_groups_fragment(&good).expect("a `[network.groups]` fragment reads");
-    assert_eq!(g.get("mcp").map(|v| v.len()), Some(1));
+    let good = tmp.path().join("mcp.toml");
+    std::fs::write(&good, "entries = [\"{*} a.example.com:443\"]\n").unwrap();
+    let g = read_net_groups_fragment(&good).expect("a group file reads");
+    assert_eq!(
+        g.get("mcp").map(|v| v.len()),
+        Some(1),
+        "the group is keyed by the file name, not by anything inside it"
+    );
 
-    // A file with no `[network.groups]` is the tell-tale of the wrong file — refused, not a silent
-    // empty import.
-    let bad = tmp.path().join("nope.toml");
-    std::fs::write(&bad, "[env]\nFOO = \"bar\"\n").unwrap();
-    let err = read_net_groups_fragment(&bad).unwrap_err();
-    assert!(err.contains("no `[network.groups]`"), "{err}");
+    // A file naming its entries any other way — the `[network.groups]` table this factors out of,
+    // or the `allow` of the list it expands into — names no hosts. Refused, not imported empty.
+    for (name, text) in [
+        ("nope.toml", "[network.groups]\nmcp = [\"a.example.com\"]\n"),
+        ("also-nope.toml", "allow = [\"a.example.com\"]\n"),
+    ] {
+        let bad = tmp.path().join(name);
+        std::fs::write(&bad, text).unwrap();
+        let err = read_net_groups_fragment(&bad).unwrap_err();
+        assert!(err.contains("is not a field of a group file"), "{err}");
+    }
 }
 
 /// A resolved read-only bind at `path` (what `resolve` produces from a bare-string bind,

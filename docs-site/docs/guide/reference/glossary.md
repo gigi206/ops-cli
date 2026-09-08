@@ -23,7 +23,7 @@ with (all namespaces, `no_new_privs`, all capabilities dropped). See
 
 **Bundle**, everything one tool needs to be installed and to reach its own services,
 declared once in the global config and folded into any app that names it in `use`. See
-[`[bundle.<name>]`](../configuration/bundles).
+[a bundle](../configuration/bundles).
 
 **Cage**, the sandbox instance a launch creates: a bubblewrap namespace with a hermetic
 FHS, a synthetic identity, and the enforcement stack.

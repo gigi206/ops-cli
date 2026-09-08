@@ -198,7 +198,7 @@ from a re-install:
 
 | Variable | Meaning |
 |---|---|
-| `SBX_UPGRADE=1` | the launch is re-running the install steps deliberately. A step whose "already installed" guard would otherwise skip the work reads this and installs anyway; see [`[bundle.<name>]`](../configuration/bundles) |
+| `SBX_UPGRADE=1` | the launch is re-running the install steps deliberately. A step whose "already installed" guard would otherwise skip the work reads this and installs anyway; see [Tool bundles](../configuration/bundles) |
 
 Inside a **task** cage (the ephemeral sibling an invocation runs in) the set is different:
 
