@@ -9,9 +9,11 @@ use std::process::ExitCode;
 
 use crate::{diag, help, sandbox, style};
 
-/// `sbx projects` — manage the per-project runtime trees under `<data>/projects/`: `list` (the
-/// default) and `rm`. The reaping primitives it drives are shared with `sbx gc` (which keeps the
-/// nix-store side); this is the discoverable front-end over the project-tree lifecycle.
+/// `sbx projects` — manage the per-project runtime trees under `<data>/projects/`: `list`, `show`
+/// and `rm`. There is no default subcommand: the bare verb prints the page, so its subcommand list
+/// guides rather than one of them being picked silently. The reaping primitives it drives are
+/// shared with `sbx gc` (which keeps the nix-store side); this is the discoverable front-end over
+/// the project-tree lifecycle.
 pub(crate) fn projects_cmd(args: &[OsString]) -> ExitCode {
     if let Some(code) = help::maybe_help("projects", args) {
         return code;
@@ -99,7 +101,7 @@ fn projects_rm_cmd(args: &[OsString]) -> ExitCode {
     if ids.is_empty() && !dead && !markerless {
         diag::error(
             "sbx: projects rm: name a project id, or use --dead / --markerless. \
-             Run `sbx projects` to list them.",
+             Run `sbx projects list` to list them.",
         );
         return ExitCode::from(2);
     }
