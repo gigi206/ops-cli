@@ -122,7 +122,7 @@ sit where they will stay; it goes stale visibly (the exec waits for a decision) 
 than widening quietly.
 
 **The write sets the posture.** An `allow` list does nothing under any mode but `ask`,
-which is why [`sbx proc allow`](proc#allow) refuses to write one elsewhere, so a learning
+which is why [`sbx proc allow`](proc#allow--deny) refuses to write one elsewhere, so a learning
 write sets `[proc] mode = "ask"` together with the rules and says so. That is the strict
 direction: under `enforce` anything not denied runs, under `ask` anything not allowed
 waits for [`sbx proc allow`/`deny`](proc#pending). A `deny` list already in the file is
