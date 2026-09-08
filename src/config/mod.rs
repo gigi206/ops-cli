@@ -422,10 +422,17 @@ pub(crate) enum BrokerTarget {
 
 impl BrokerTarget {
     /// How the target is shown in a note, a warning, or `sbx config`.
+    ///
+    /// An IPv6 host is bracketed, through the one function every `host:port` producer composes
+    /// with: `::1` with a port reads as the host `::` on port `1`, so an unbracketed rendering
+    /// would name an address other than the one brokered — and the rule an operator copies out of
+    /// the warning would admit that other address.
     pub(crate) fn describe(&self) -> String {
         match self {
             BrokerTarget::Unix(path) => path.display().to_string(),
-            BrokerTarget::Tcp { host, port } => format!("tcp://{host}:{port}"),
+            BrokerTarget::Tcp { host, port } => {
+                format!("tcp://{}:{port}", crate::allowlist::display_host(host))
+            }
         }
     }
 }
@@ -737,6 +744,15 @@ pub(crate) struct Resolved {
     pub(crate) apps: BTreeMap<String, ResolvedApp>,
     /// Human-readable notes about what was dropped or ignored and why.
     pub(crate) warnings: Vec<String>,
+    /// Why the global layer could not be read, when it exists and could not be.
+    ///
+    /// A launch is refused on this, rather than proceeding: the global config is where `[proc]`,
+    /// `[network]` and `[fs]` are trusted by location, and the built-in default of each is the
+    /// permissive end — an unreadable layer would silently turn `mode = "enforce"` back into
+    /// `off`. A read-only verb keeps working and shows what it has, because the command that
+    /// diagnoses the problem must not be the one the problem disables. `None` when the file is
+    /// merely absent, which is a configured state and not a failure.
+    pub(crate) refused: Option<String>,
 }
 
 /// One bundle's install step, as the fold hands it to a launch: the step itself and the bundle
@@ -2813,6 +2829,7 @@ fn resolve(
         tasks,
         apps,
         warnings,
+        refused: None,
     };
     #[cfg(debug_assertions)]
     debug_dump_resolved(&resolved);
@@ -3414,7 +3431,7 @@ pub(crate) fn global_config_path() -> Option<std::path::PathBuf> {
 /// is sbx's own machinery rather than a project's, so the host's table is the one that bounds it.
 pub(crate) fn global_limits() -> crate::sandbox::cgroup::Limits {
     let mut warnings = Vec::new();
-    let global = read_global(&mut warnings);
+    let (global, _refused) = read_global(&mut warnings);
     validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits)
 }
 
@@ -3569,23 +3586,15 @@ fn apply_binds(
 
 /// Parse a `tcp://host:port` endpoint. The port is required: a broker stands in front of one
 /// service, and guessing a default would put it in front of something nobody named.
+///
+/// The grammar is [`crate::allowlist::parse_tcp_target`]'s, not a second one: whether the cage may
+/// reach an endpoint is the allowlist's answer, asked at launch through the same `l4_decision` the
+/// proxy uses, so a host spelled differently on the two sides matches nothing. That is what a
+/// private parser cost — a bracketed IPv6 literal was kept as `[::1]`, the canonical rule stored
+/// `::1`, and admission refused the broker while naming the rule the config already carried.
 fn parse_tcp_endpoint(endpoint: &str) -> Result<BrokerTarget, String> {
-    let (host, port) = endpoint
-        .rsplit_once(':')
-        .ok_or("needs a port, e.g. `tcp://localhost:5432`")?;
-    if host.is_empty() {
-        return Err("needs a host".to_string());
-    }
-    let port: u16 = port
-        .parse()
-        .map_err(|_| format!("has `{port}` where a port number belongs"))?;
-    if port == 0 {
-        return Err("has port 0, which names no service".to_string());
-    }
-    Ok(BrokerTarget::Tcp {
-        host: host.to_string(),
-        port,
-    })
+    let (host, port) = crate::allowlist::parse_tcp_target(&format!("tcp://{endpoint}"))?;
+    Ok(BrokerTarget::Tcp { host, port })
 }
 
 /// Turn the layered `[broker.<name>]` tables into the bindings a launch acts on.
@@ -3640,8 +3649,7 @@ fn resolve_brokers(
                 Ok(target) => target,
                 Err(why) => {
                     warnings.push(format!(
-                        "`[broker.{name}] socket` is `{raw}`, which {why} — the broker is not \
-                         started"
+                        "`[broker.{name}] socket`: {why} — the broker is not started"
                     ));
                     continue;
                 }

@@ -2991,6 +2991,48 @@ fn a_broker_target_may_be_a_tcp_endpoint() {
     );
 }
 
+/// A bracketed IPv6 endpoint is stored as the address, not as the URL syntax that carried it.
+///
+/// The brackets are how a `host:port` string stays unambiguous, never part of the host: `getaddrinfo`
+/// answers `EAI_NONAME` for `[::1]`, so a target keeping them could not be connected to. It would not
+/// even get that far — admission asks the allowlist through the same `l4_decision` the proxy uses,
+/// and a rule written `tcp://[::1]:5432` is stored canonically as `::1`. A bracketed target therefore
+/// matched nothing, and the broker was refused with a warning naming the very rule already in the
+/// config. One spelling of the grammar, [`crate::allowlist::parse_tcp_target`], answers for both.
+#[test]
+fn a_bracketed_ipv6_endpoint_is_stored_as_the_bare_address() {
+    let global = with_broker(
+        raw(&[], &[]),
+        "pg",
+        raw_broker(Some("tcp://[::1]:5432"), &[]),
+    );
+    let r = resolve_no_plugins(global, None);
+    assert_eq!(
+        r.brokers[0].socket,
+        crate::config::BrokerTarget::Tcp {
+            host: "::1".to_string(),
+            port: 5432
+        }
+    );
+    // The stored form is the one the allowlist matches, which is what admission asks.
+    let crate::config::BrokerTarget::Tcp { host, port } = &r.brokers[0].socket else {
+        panic!("a tcp:// socket resolves to a Tcp target");
+    };
+    let policy = crate::allowlist::EgressPolicy::new(
+        vec![crate::allowlist::classify("tcp://[::1]:5432").unwrap()],
+        vec![],
+    );
+    assert!(
+        matches!(
+            policy.l4_decision(host, *port),
+            crate::allowlist::L4Decision::Splice(_)
+        ),
+        "the resolved target must match the rule an operator writes for it"
+    );
+    // And the display form brackets it again, so a `host:port` rendering stays unambiguous.
+    assert_eq!(r.brokers[0].socket.describe(), "tcp://[::1]:5432");
+}
+
 /// A malformed endpoint is refused rather than half-read: a missing port would leave sbx guessing
 /// which service a broker stands in front of.
 #[test]

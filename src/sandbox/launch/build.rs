@@ -1395,9 +1395,13 @@ fn broker_plugins(prep: &Prepared) -> Result<BrokersUp, ExitCode> {
                         _ => false,
                     };
                     if !admitted {
+                        // Bracketed for display, because the sentence offers a rule to copy: an
+                        // IPv6 host written bare beside a port names a different address, so the
+                        // suggestion would admit something other than the broker's own target.
+                        let shown = crate::allowlist::display_host(host);
                         crate::diag::warn_config(&format!(
-                            "`[broker.{name}] socket` names tcp://{host}:{port}, which the \
-                             network allowlist does not admit — add `tcp://{host}:{port}` to \
+                            "`[broker.{name}] socket` names tcp://{shown}:{port}, which the \
+                             network allowlist does not admit — add `tcp://{shown}:{port}` to \
                              `[network] allow`, or the cage gets no broker"
                         ));
                         continue;

@@ -1359,8 +1359,12 @@ fn serve_conn(
             Box::new(stream)
         }
         crate::config::BrokerTarget::Tcp { host, port } => {
-            let stream = std::net::TcpStream::connect((host.as_str(), *port))
-                .map_err(|e| format!("cannot reach tcp://{host}:{port}: {e}"))?;
+            let stream = std::net::TcpStream::connect((host.as_str(), *port)).map_err(|e| {
+                format!(
+                    "cannot reach tcp://{}:{port}: {e}",
+                    crate::allowlist::display_host(host)
+                )
+            })?;
             let _ = stream.set_read_timeout(Some(spec.host_deadline));
             let _ = stream.set_write_timeout(Some(spec.host_deadline));
             // Nagle would hold a small frame back waiting for more, which on a request/response
