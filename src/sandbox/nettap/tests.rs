@@ -734,7 +734,9 @@ fn only_the_address_with_no_name_is_reported_to_the_record() {
     }
     .report(&reporter);
     assert_eq!(
-        lines.recv_timeout(Duration::from_secs(5)).expect("reported"),
+        lines
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reported"),
         "BYPASSED 93.184.216.34 443"
     );
 }

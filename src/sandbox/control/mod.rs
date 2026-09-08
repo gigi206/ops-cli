@@ -1502,7 +1502,10 @@ fn dispatch(
             // a log line. The refusal is the tap's own — the connection never reached the proxy, so
             // without this the one thing transparent capture makes visible would be visible only in
             // the session's stderr.
-            let Some(addr) = parts.next().and_then(|a| a.parse::<std::net::Ipv4Addr>().ok()) else {
+            let Some(addr) = parts
+                .next()
+                .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
+            else {
                 return "err bad-request\n".to_string();
             };
             let Some(port) = parts.next().and_then(|p| p.parse::<u16>().ok()) else {
