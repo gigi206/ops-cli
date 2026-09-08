@@ -3533,83 +3533,101 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
 
 /// A descriptor the caller really holds is a refusal of something real, not a `PATH` walk's miss.
 ///
-/// `execve("/proc/self/fd/<n>")` runs what a descriptor points at, and `self` is answered with the
-/// number of whoever performs the lookup. Asked without spelling the caller out, the probe reads
-/// the *supervisor's* descriptor table: whether it happens to hold that number decides the errno,
-/// so the same refusal is filed as `deny` on one host and as `absent` -- the heading kept for the
-/// names a `PATH` walk passes through, neither announced nor read -- on the next.
+/// `refusal_errno` chooses between two headings: `ENOENT` files the refusal as a name a `PATH`
+/// walk passed through, neither announced nor read, and anything else files it as a refusal of
+/// something that was there. `/proc/self/fd/<n>` -- the spelling that runs a `#!` line straight
+/// out of a `memfd` -- decides that between them, because the kernel answers `self` with the
+/// number of whoever performs the lookup, and the lookup is performed by the supervisor. Asked
+/// without spelling the caller out, the probe reads the *supervisor's* descriptor table: whether
+/// it happens to hold that number decides the heading, so the same refusal is recorded as `deny`
+/// on one host and `absent` on the next.
 ///
-/// The oracle is a number the supervisor does not hold and the caller does. Both arms are asked,
-/// because an answer of `EPERM` to everything would satisfy the first on its own.
+/// The oracle is a number the caller holds and the supervisor does not. That precondition is
+/// **measured, before and after**, rather than assumed of a number picked for looking unlikely:
+/// this process opens and closes descriptors on other threads while the test runs, and a run that
+/// lost the number to one of them is discarded rather than reported. A second arm asks about a
+/// number the caller never opened, because an answer of `EPERM` to everything would satisfy the
+/// first alone.
 #[test]
 fn a_descriptor_the_caller_holds_is_refused_as_something_that_is_there() {
-    /// A descriptor number the child is made to hold, and one it never opens: two digits, so
-    /// neither collides with what a test harness leaves open around this process.
-    const HELD: libc::c_int = 33;
-    const NEVER: libc::c_int = 34;
     use std::os::unix::process::CommandExt;
 
-    // The whole discriminator: were this open here, the reading that asks about the supervisor
-    // would answer about it and agree with the right one by accident.
+    /// Whether this process holds that descriptor number.
     // SAFETY: `F_GETFD` reads a flag word for a descriptor number and touches no memory.
-    assert!(
-        unsafe { libc::fcntl(HELD, libc::F_GETFD) } < 0,
-        "this test needs descriptor {HELD} closed in the test process, and it is not"
-    );
-
-    let mut cmd = std::process::Command::new("sleep");
-    cmd.arg("30");
-    // SAFETY: the closure runs in the forked child before `execve`, where only async-signal-safe
-    // calls are allowed. `open`, `dup2` and `close` are; nothing is allocated and no lock is
-    // taken. `dup2` clears close-on-exec on the new descriptor, so it survives into `sleep`.
-    unsafe {
-        cmd.pre_exec(|| {
-            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-            if fd < 0 || libc::dup2(fd, HELD) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::close(fd);
-            Ok(())
-        });
+    fn held_here(n: libc::c_int) -> bool {
+        let flags = unsafe { libc::fcntl(n, libc::F_GETFD) };
+        flags >= 0
     }
-    let Ok(mut child) = cmd.spawn() else {
-        return;
-    };
-    let pid = child.id();
 
-    // Waited for through the child's own `/proc` entry rather than through the answer under test:
-    // the descriptor is set up between fork and exec, so it appears a moment after `spawn`
-    // returns, and a wait that stopped on the assertion's own verdict could not tell a fix from a
-    // race.
-    let held = std::path::PathBuf::from(format!("/proc/{pid}/fd/{HELD}"));
-    for _ in 0..200 {
-        if std::fs::read_link(&held).is_ok() {
+    for _ in 0..8 {
+        // Two numbers this process does not hold: one the child is made to hold, one nobody does.
+        let mut free = (200..400).filter(|n| !held_here(*n));
+        let (Some(held), Some(never)) = (free.next(), free.next()) else {
             break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let ready = std::fs::read_link(&held).is_ok();
-    // Both answers are taken before the child is torn down, so a failing assertion cannot leave a
-    // `sleep` behind.
-    let answers = (
-        refusal_errno(pid, &format!("/proc/self/fd/{HELD}")),
-        refusal_errno(pid, &format!("/proc/self/fd/{NEVER}")),
-    );
-    let _ = child.kill();
-    let _ = child.wait();
+        };
 
-    assert!(ready, "the child never came up holding descriptor {HELD}");
-    assert_eq!(
-        answers.0,
-        libc::EPERM,
-        "a descriptor the caller holds is there, whatever the supervisor's own table holds"
-    );
-    assert_eq!(
-        answers.1,
-        libc::ENOENT,
-        "and a number the caller never opened is still absent, or the answer above would be one \
-         given to everything"
-    );
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // SAFETY: the closure runs in the forked child before `execve`, where only
+        // async-signal-safe calls are allowed. `open`, `dup2` and `close` are; nothing is
+        // allocated and no lock is taken. `dup2` clears close-on-exec on the new descriptor, so it
+        // survives into `sleep`.
+        unsafe {
+            cmd.pre_exec(move || {
+                let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                if fd < 0 || libc::dup2(fd, held) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(fd);
+                Ok(())
+            });
+        }
+        let Ok(mut child) = cmd.spawn() else {
+            return;
+        };
+        let pid = child.id();
+
+        // Waited for through the child's own `/proc` entry rather than through the answer under
+        // test: the descriptor is set up between fork and exec, so it appears a moment after
+        // `spawn` returns, and a wait that stopped on the assertion's own verdict could not tell a
+        // fix from a race.
+        let link = std::path::PathBuf::from(format!("/proc/{pid}/fd/{held}"));
+        for _ in 0..200 {
+            if std::fs::read_link(&link).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let ready = std::fs::read_link(&link).is_ok();
+        // Both answers are taken before the child is torn down, so a failing assertion cannot
+        // leave a `sleep` behind.
+        let answers = (
+            refusal_errno(pid, &format!("/proc/self/fd/{held}")),
+            refusal_errno(pid, &format!("/proc/self/fd/{never}")),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // The precondition again: if either number was opened here while the child ran, this
+        // measurement says nothing and another is taken.
+        if held_here(held) || held_here(never) {
+            continue;
+        }
+        assert!(ready, "the child never came up holding descriptor {held}");
+        assert_eq!(
+            answers.0,
+            libc::EPERM,
+            "a descriptor the caller holds is there, whatever the supervisor's own table holds"
+        );
+        assert_eq!(
+            answers.1,
+            libc::ENOENT,
+            "and a number the caller never opened is still absent, or the answer above would be \
+             one given to everything"
+        );
+        return;
+    }
+    panic!("no pair of descriptor numbers stayed closed in this process long enough to measure");
 }
 
 #[test]
