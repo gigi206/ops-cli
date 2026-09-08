@@ -2599,7 +2599,7 @@ pub(super) const PAGES: &[Page] = &[
             `--session deny` cuts an allowed one; deny wins). It is the proactive sibling of `sbx net\n\
             pending allow <id> --session`, which decides a request that already parked. It writes no\n\
             file — so, unlike a config write, it never re-trusts the project — and dies with the session.\n\
-            The config-scope flags (`-l`/`-g`/`-c`) do not apply with `--session`; scope the sessions\n\
+            The config-scope flags (`-l`/`-g`) do not apply with `--session`; scope the sessions\n\
             with `-a <app>`/`--all`. Only a filtering posture runs the proxy, so a `shared`/`none`\n\
             session has nothing to load into.",
     },
@@ -2658,7 +2658,7 @@ pub(super) const PAGES: &[Page] = &[
             `--session` instead loads the rule into the **live overlay** of the running session(s), which\n\
             the proxy folds into its effective policy — so a `--session deny` cuts a host immediately on\n\
             an allowlist or denylist session as well as `ask` (deny wins over any allow). It writes no\n\
-            file and dies with the session. The config-scope flags (`-l`/`-g`/`-c`) do not apply with\n\
+            file and dies with the session. The config-scope flags (`-l`/`-g`) do not apply with\n\
             `--session`; scope the sessions with `-a <app>`/`--all`.",
     },
     Page {

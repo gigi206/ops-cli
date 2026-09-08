@@ -85,7 +85,7 @@ proactive sibling of [`sbx net pending allow <id> --session`](../networking/ask)
 decides a request that already parked. It writes no file (so it never re-trusts the project)
 and dies with the session. By default it scopes to the current project's session(s); `-a
 <app>` narrows to one app, `--all` widens to every reachable session. The config-scope flags
-(`-l`/`-g`/`-c`) do not apply with `--session`; only a filtering posture runs the proxy, so a
+(`-l`/`-g`) do not apply with `--session`; only a filtering posture runs the proxy, so a
 `shared`/`none` session has nothing to load into.
 
 ```sh
