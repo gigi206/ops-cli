@@ -497,10 +497,10 @@ mod tests {
         const HASHES_THE_PATH: &[(&str, usize)] =
             &[("src/cli/trust.rs", 1), ("src/cli/config/edit.rs", 1)];
         /// The files that re-trust what they composed, and how many such calls each holds: the
-        /// egress and proc add paths, the shared removal path, and the tail of the four
-        /// key-writing `sbx config` verbs.
+        /// egress and proc add paths, the proc-learn write, the shared removal path, and the tail
+        /// of the four key-writing `sbx config` verbs.
         const HASHES_ITS_OWN_TEXT: &[(&str, usize)] =
-            &[("src/main.rs", 3), ("src/cli/config/edit.rs", 1)];
+            &[("src/main.rs", 4), ("src/cli/config/edit.rs", 1)];
 
         let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
         let mut reread: Vec<(String, usize)> = Vec::new();
