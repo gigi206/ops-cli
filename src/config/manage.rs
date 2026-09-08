@@ -2108,6 +2108,25 @@ mod tests {
             "the deny list must survive the posture change:\n{body}"
         );
 
+        // The written shape is one the loader's own deserializer reads back. Asserting on the text
+        // ("contains mode = ask") is satisfiable by a document the resolver would drop, which is
+        // exactly how a write path ends up reporting a posture that never takes effect.
+        let parsed: crate::config::schema::RawConfig =
+            toml::from_str(&std::fs::read_to_string(&existing).unwrap())
+                .expect("the learning write must produce a config the loader parses");
+        match parsed.proc.expect("a `[proc]` field") {
+            crate::config::schema::ProcField::Table(t) => {
+                assert_eq!(t.mode.as_deref(), Some("ask"));
+                assert!(
+                    t.allow.contains(&"git".to_string()) && t.allow.contains(&"node".to_string()),
+                    "the learned rules must read back: {:?}",
+                    t.allow
+                );
+                assert_eq!(t.deny, vec!["curl".to_string()], "the deny list survives");
+            }
+            other => panic!("the learning write must produce the table form, got {other:?}"),
+        }
+
         // Nothing new and already on `ask`: no write, so nothing is attested to either.
         let sub = tmp.path().join("settled");
         std::fs::create_dir_all(&sub).unwrap();
