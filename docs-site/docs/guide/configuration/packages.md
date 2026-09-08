@@ -587,6 +587,20 @@ backends do not, and each stops at a different place:
 | `deb:`, `appimage:`, `tarball:`, `binary:` | the URL charset, then a hash **recorded on the first fetch** and re-checked on every later one | the artefact has not changed since `sbx` first saw it. It does **not** prove that first fetch was the publisher's: the hash is whatever the download returned, and `sbx upgrade` re-resolves from the same place |
 | `deb:apt:` | the above, plus the `Packages` index checked against the repository's signed `InRelease`, under a signing key pinned on first use | the index is the one the holder of that key published. The **first** pin is trust on first use and proves nothing on its own; from then on a re-keyed repository, or an index served by someone else, is refused |
 
+**How much a prebuilt may unpack to.** Nothing bounds it. `tarball:` runs `tar -xz`, `deb:` pipes
+`dpkg-deb --fsys-tarfile` into `tar`, and `appimage:` extracts a squashfs, each inside the nix
+builder that fetches it, so an archive whose contents expand to far more than its download fills
+the host's store while the build runs. The [distro](distro#how-much-an-image-may-unpack-to) path
+does bound its unpacking, and the difference is where the bytes pass: `sbx` streams an image's
+layers itself and can count them, while these three hand the archive to a program in a builder and
+see only the result.
+
+What limits the exposure is who gets to name the URL, not the archive: `[packages]` is
+trusted-only, so the publisher is one an approved config chose, and after the first fetch the
+recorded hash refuses anything that changed. The first fetch of a compromised or simply broken
+artefact is the case that is open, and it costs disk rather than reaching the cage. If a build
+fills the store, [`sbx gc`](../cli/gc) reclaims it.
+
 **Why the revision is checked.** Pinning `github:NixOS/nixpkgs/<rev>` reads like a guarantee that the
 revision belongs to nixpkgs, and on its own it is not one. GitHub keeps pull request heads in the
 upstream repository's own ref namespace, so a revision pushed to a fork and never merged is served in
