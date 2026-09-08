@@ -42,7 +42,10 @@ const MEMORY_MAX: &str = "90%";
 /// parallel `make -j` with threaded linkers on a many-core host. This is the
 /// clearest anti-DoS win of the set: any finite bound defeats a fork-bomb, while
 /// the cost of setting it too high is negligible.
-const TASKS_MAX: u32 = 16384;
+///
+/// It is also the deepest *chain* a cage can build, one process per level, which is what
+/// [`crate::observe::MAX_DEPTH`] is measured against.
+pub(crate) const TASKS_MAX: u32 = 16384;
 
 /// Overrides for the cage's resource limits, supplied by a trusted `[limits]` config table.
 ///

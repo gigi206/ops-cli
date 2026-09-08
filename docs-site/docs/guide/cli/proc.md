@@ -66,6 +66,13 @@ sbx proc ls                    # only one session live → no id needed
 sbx proc ls --json 12345 | jq .tree   # machine-readable
 ```
 
+The view stops at **256 levels deep**, and says so on a last line when it does, with the number
+of processes it is not showing (`--json` carries the same number as `deeper`, `0` for any real
+tree). A process tree is as deep as the chain of `fork`s that made it, and the cage chooses that
+chain — a depth in the thousands is a way to make the walk that reads it run out of stack, which
+would turn a command you run into something the session you are watching can end. No real tree
+comes near the ceiling: a shell running `make` running `cc` running `ld` is under ten.
+
 Reading `/proc` needs **no privilege**: unlike kernel-tracing observability it requires no
 `CAP_BPF` or root. `ls` is a **snapshot**; for a continuously updating view use
 [`live`](#live). The pids shown are host-side.

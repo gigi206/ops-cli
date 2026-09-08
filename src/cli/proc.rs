@@ -543,7 +543,10 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
                 "label": target.label(),
                 "project": target.project.display().to_string(),
             },
-            "tree": observe::to_json(&tree),
+            "tree": observe::to_json(&tree.root),
+            // Zero for every tree that fits, which is every real one. It is here so a consumer
+            // counting processes can tell a small tree from a truncated one.
+            "deeper": tree.deeper,
         });
         println!("{obj}");
         return ExitCode::SUCCESS;
@@ -647,7 +650,8 @@ fn proc_live(args: &[OsString]) -> ExitCode {
                         "label": label.as_str(),
                         "project": project.display().to_string(),
                     },
-                    "tree": observe::to_json(tree),
+                    "tree": observe::to_json(&tree.root),
+                    "deeper": tree.deeper,
                 });
                 writeln!(out, "{obj}").and_then(|_| out.flush())
             }

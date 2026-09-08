@@ -32,11 +32,38 @@ pub(crate) struct ProcInfo {
     pub(crate) args: Vec<String>,
 }
 
+/// A built tree, and what did not fit in it.
+///
+/// The two travel together because the second is only known while the first is being built, and
+/// a snapshot that quietly dropped part of a process tree would read exactly like one taken of a
+/// smaller tree. Every consumer of the tree therefore also holds the number it is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcTree {
+    pub(crate) root: ProcNode,
+    /// Processes that sit below [`MAX_DEPTH`] and are not placed.
+    pub(crate) deeper: usize,
+}
+
+/// How deep a chain of processes is placed before the walk stops descending.
+///
+/// The walk is recursive, and its depth is the cage's to choose: a process tree is as deep as the
+/// chain of `fork`s that made it, bounded only by the cgroup's `pids.max` (16384). Measured on this
+/// host, `build_tree` followed by `render_human` and `to_json` overflows between 4000 and 8000 on
+/// the 8 MiB stack a main thread gets, and between 1000 and 1500 on the 2 MiB a spawned thread
+/// gets. A ceiling well under the lower of the two is what keeps `sbx proc ls` from being a way for
+/// the thing it observes to end it.
+///
+/// 256 is far above any real tree — a shell running `make` running `cc` running `ld` is under ten —
+/// and roughly a quarter of the smallest measured limit, so the margin holds on a host with a
+/// tighter `ulimit -s` than this one. What is cut is reported rather than dropped.
+pub(crate) const MAX_DEPTH: usize = 256;
+
 /// Build the tree rooted at `root` from a flat table. Pure. Children are ordered
 /// by pid for a stable render; a `visited` set makes a malformed parent graph
 /// (a self-parent or a cycle from a `/proc` read race) terminate rather than
-/// recurse forever. Returns `None` if `root` is not in the table (it exited).
-pub(crate) fn build_tree(table: &BTreeMap<u32, ProcInfo>, root: u32) -> Option<ProcNode> {
+/// recurse forever, and [`MAX_DEPTH`] stops a chain deep enough to exhaust the stack.
+/// Returns `None` if `root` is not in the table (it exited).
+pub(crate) fn build_tree(table: &BTreeMap<u32, ProcInfo>, root: u32) -> Option<ProcTree> {
     let mut kids: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for (&pid, info) in table {
         if pid != info.ppid {
@@ -44,14 +71,22 @@ pub(crate) fn build_tree(table: &BTreeMap<u32, ProcInfo>, root: u32) -> Option<P
         }
     }
     let mut visited = BTreeSet::new();
-    node(root, table, &kids, &mut visited)
+    let mut deeper = 0usize;
+    let root = node(root, table, &kids, &mut visited, 0, &mut deeper)?;
+    Some(ProcTree { root, deeper })
 }
 
+/// One node and its descendants, to a depth of [`MAX_DEPTH`].
+///
+/// At the ceiling the walk stops and counts what it did not place — the whole subtree, not just
+/// its first row, so the number the caller reports is the number of processes it is not showing.
 fn node(
     pid: u32,
     table: &BTreeMap<u32, ProcInfo>,
     kids: &BTreeMap<u32, Vec<u32>>,
     visited: &mut BTreeSet<u32>,
+    depth: usize,
+    deeper: &mut usize,
 ) -> Option<ProcNode> {
     let info = table.get(&pid)?;
     if !visited.insert(pid) {
@@ -60,7 +95,11 @@ fn node(
     let mut children = Vec::new();
     if let Some(cs) = kids.get(&pid) {
         for &c in cs {
-            if let Some(n) = node(c, table, kids, visited) {
+            if depth + 1 >= MAX_DEPTH {
+                *deeper += count_below(c, kids, visited);
+                continue;
+            }
+            if let Some(n) = node(c, table, kids, visited, depth + 1, deeper) {
                 children.push(n);
             }
         }
@@ -71,6 +110,27 @@ fn node(
         args: info.args.clone(),
         children,
     })
+}
+
+/// How many processes hang off `pid`, itself included, without building any of them.
+///
+/// An explicit stack: this is reached exactly when the recursion has been stopped for being too
+/// deep, so counting recursively would spend the stack the ceiling exists to protect. `visited`
+/// is shared with the walk, which keeps a cycle finite here as it does there and keeps a process
+/// from being counted after it was placed.
+fn count_below(pid: u32, kids: &BTreeMap<u32, Vec<u32>>, visited: &mut BTreeSet<u32>) -> usize {
+    let mut n = 0usize;
+    let mut stack = vec![pid];
+    while let Some(p) = stack.pop() {
+        if !visited.insert(p) {
+            continue;
+        }
+        n += 1;
+        if let Some(cs) = kids.get(&p) {
+            stack.extend(cs.iter().copied());
+        }
+    }
+    n
 }
 
 /// Read `/proc` into a flat process table (host pid-space). Best-effort: an
@@ -104,7 +164,7 @@ pub(crate) fn read_proc_table() -> BTreeMap<u32, ProcInfo> {
 }
 
 /// The process tree of the cage rooted at `root_pid`, read live from `/proc`.
-pub(crate) fn tree(root_pid: u32) -> Option<ProcNode> {
+pub(crate) fn tree(root_pid: u32) -> Option<ProcTree> {
     build_tree(&read_proc_table(), root_pid)
 }
 
@@ -131,9 +191,18 @@ fn read_cmdline(pid: u32) -> Vec<String> {
 
 /// Render the tree as an indented human view (does not include a header line —
 /// the caller prints the session context). Root at the shallowest indent.
-pub(crate) fn render_human(root: &ProcNode) -> String {
+///
+/// A tree that hit [`MAX_DEPTH`] ends with the count it is not showing, rather than ending as
+/// though the last line it printed were a leaf.
+pub(crate) fn render_human(tree: &ProcTree) -> String {
     let mut out = String::new();
-    render_node(root, 0, &mut out);
+    render_node(&tree.root, 0, &mut out);
+    if tree.deeper > 0 {
+        out.push_str(&format!(
+            "  … {} process(es) deeper than {MAX_DEPTH} are not shown\n",
+            tree.deeper
+        ));
+    }
     out
 }
 
@@ -160,6 +229,10 @@ fn render_node(n: &ProcNode, depth: usize, out: &mut String) {
 }
 
 /// Serialise the tree for `--json` consumers.
+///
+/// Takes the node rather than the [`ProcTree`] so the shape under `.tree` is the one already
+/// published: the count of what did not fit is a sibling of that key, written by the caller, and
+/// adding it here would have moved every field a consumer reads one level down.
 pub(crate) fn to_json(n: &ProcNode) -> serde_json::Value {
     serde_json::json!({
         "pid": n.pid,
@@ -205,7 +278,8 @@ mod tests {
             (301, info(200, "git", &["git", "commit"])),
             (999, info(1, "other", &["other"])),
         ]);
-        let root = build_tree(&t, 100).expect("root present");
+        let tree = build_tree(&t, 100).expect("root present");
+        let root = &tree.root;
         assert_eq!(root.pid, 100);
         assert_eq!(root.children.len(), 1);
         let agent = &root.children[0];
@@ -214,7 +288,48 @@ mod tests {
         let kids: Vec<u32> = agent.children.iter().map(|c| c.pid).collect();
         assert_eq!(kids, vec![300, 301]);
         // 999 is not under 100
-        assert!(!render_human(&root).contains("other"));
+        assert!(!render_human(&tree).contains("other"));
+    }
+
+    #[test]
+    fn a_chain_deeper_than_the_ceiling_is_cut_and_counted() {
+        // The depth of a process tree is the cage's to choose — one `fork` per level, up to the
+        // cgroup's `pids.max` — while the walk that reads it is recursive and runs in sbx. Measured
+        // on this host before the ceiling: 4000 levels overflow an 8 MiB stack and 1500 overflow a
+        // 2 MiB one, so a cage could end `sbx proc ls` by being deep.
+        //
+        // The fixture is the cgroup's own `pids.max`, which is the deepest chain a cage can build
+        // and the number the measurement above says the walk does not survive. So this is the
+        // remedy under the case it exists for, not a scaled-down stand-in for it.
+        let depth = crate::sandbox::cgroup::TASKS_MAX as usize;
+        let rows: Vec<(u32, ProcInfo)> = (1..=depth as u32)
+            .map(|pid| (pid, info(pid.saturating_sub(1), "p", &["p"])))
+            .collect();
+        let t = table(&rows);
+
+        let tree = build_tree(&t, 1).expect("root present");
+        let mut n = &tree.root;
+        let mut placed = 1usize;
+        while let Some(c) = n.children.first() {
+            placed += 1;
+            n = c;
+        }
+        assert_eq!(
+            placed, MAX_DEPTH,
+            "the walk places exactly the ceiling's worth of levels"
+        );
+        assert_eq!(
+            tree.deeper,
+            depth - MAX_DEPTH,
+            "every process below the ceiling is counted, not just the first"
+        );
+        assert!(
+            render_human(&tree).ends_with(&format!(
+                "… {} process(es) deeper than {MAX_DEPTH} are not shown\n",
+                depth - MAX_DEPTH
+            )),
+            "the human view says what it is not showing"
+        );
     }
 
     #[test]
@@ -227,7 +342,8 @@ mod tests {
     fn build_tree_terminates_on_a_cycle() {
         // A malformed graph from a /proc read race: 5 is its own ancestor.
         let t = table(&[(5, info(6, "a", &["a"])), (6, info(5, "b", &["b"]))]);
-        let root = build_tree(&t, 5).expect("root present");
+        let tree = build_tree(&t, 5).expect("root present");
+        let root = &tree.root;
         // 6 appears once as a child; the back-edge to 5 is broken by `visited`.
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].pid, 6);
@@ -288,7 +404,7 @@ mod tests {
             (1, info(0, "root", &["root"])),
             (2, info(1, "kid", &["kid", "arg"])),
         ]);
-        let j = to_json(&build_tree(&t, 1).unwrap());
+        let j = to_json(&build_tree(&t, 1).unwrap().root);
         assert_eq!(j["pid"], 1);
         assert_eq!(j["children"][0]["pid"], 2);
         assert_eq!(j["children"][0]["args"][1], "arg");
@@ -330,17 +446,17 @@ mod tests {
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         let found = loop {
-            if let Some(node) = tree(root_pid)
-                && execed(&node)
+            if let Some(t) = tree(root_pid)
+                && execed(&t.root)
             {
-                break Some(node);
+                break Some(t);
             }
             if Instant::now() >= deadline {
                 break tree(root_pid);
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        let node = found.expect("the shell must be in /proc");
+        let node = &found.expect("the shell must be in /proc").root;
         assert_eq!(node.pid, root_pid);
         assert_eq!(node.children.len(), 1, "the shell should have one child");
         assert!(
