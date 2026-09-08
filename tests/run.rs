@@ -3609,6 +3609,101 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
     );
 }
 
+#[test]
+fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under() {
+    // `sbx app <name> --proc-learn` end to end through the real binary. The app runs two programs;
+    // the launch stands the seccomp user-notification supervisor up under a denylist with nothing on
+    // it, so both run and both are decided; proc-learn snapshots the decided targets after the run
+    // and synthesizes the `allow` rules that would admit them under `ask`.
+    //
+    // Teeth: `curl` is a program the run actually execed and no rule named, so it must appear in the
+    // dry run; and the real write must carry `mode = "ask"` beside it, because an allow list is inert
+    // under every other posture — the whole reason the write sets one. Skips (never fails) when the
+    // host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::prefixed("r", "proclearn-proj");
+    let data = TmpDir::prefixed("r", "proclearn-data");
+    let state = TmpDir::prefixed("r", "proclearn-state");
+    // No `[proc]` table at all: the common case this feature exists for is a project with no exec
+    // policy yet, and the learning run supplies the empty denylist itself.
+    let original_config = "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
+         [app.probe]\ncmd = [\"sh\", \"-c\", \"curl --version >/dev/null 2>&1; true\"]\n";
+    std::fs::write(project.path().join(".sbx.toml"), original_config).unwrap();
+
+    probe_or_skip!(
+        "proc-learn e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping proc-learn e2e: the binary cache is unreachable"
+    );
+
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // DRY RUN: the programs are synthesized into basename rules and only printed.
+    let dry = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "probe", "--proc-learn", "--dry-run"],
+    );
+    let dry_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        dry.status.success(),
+        "proc-learn --dry-run should succeed regardless of the agent's exit: {dry_out}"
+    );
+    assert!(
+        dry_out.contains("allow curl"),
+        "proc-learn --dry-run must name a program the run execed: {dry_out}"
+    );
+    let cfg_after_dry = std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap();
+    assert_eq!(
+        cfg_after_dry, original_config,
+        "a dry run must not modify the config"
+    );
+
+    // REAL WRITE (local scope): the rules land under the app, together with the posture that makes
+    // them live, and the project is re-trusted.
+    let write = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "probe", "--proc-learn", "--local"],
+    );
+    let write_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&write.stdout),
+        String::from_utf8_lossy(&write.stderr)
+    );
+    assert!(
+        write.status.success(),
+        "proc-learn write should succeed: {write_out}"
+    );
+    let cfg_after = std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap();
+    assert!(
+        cfg_after.contains("mode = \"ask\""),
+        "the write must set the posture the learned rules are live under: {cfg_after}"
+    );
+    assert!(
+        cfg_after.contains("curl"),
+        "the learned rule must be written: {cfg_after}"
+    );
+}
+
 /// Poll `127.0.0.1:<port>` from the host until a read returns a body containing `marker`, or time
 /// out. Returns the matching body, or `None` on timeout (a refused connect, or the marker never
 /// arriving). Used by the forward e2e to wait for the in-cage server to come up and the forwarder

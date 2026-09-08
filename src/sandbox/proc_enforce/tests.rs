@@ -100,6 +100,7 @@ fn run_with_open_lens(
                     mounts: lens.mounts(),
                     binfmt: &[],
                     undecidable: &Undecidable::default(),
+                    learn: None,
                 },
             );
         }
@@ -2366,6 +2367,7 @@ fn run_under_supervisor_binfmt(
                     mounts: &CageMounts::default(),
                     binfmt,
                     undecidable: &Undecidable::default(),
+                    learn: None,
                 },
             );
         }
@@ -3233,6 +3235,7 @@ impl DecidingParts {
             mounts: &self.mounts,
             binfmt: &self.binfmt,
             undecidable: &self.undecidable,
+            learn: None,
         }
     }
 }

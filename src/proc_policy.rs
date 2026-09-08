@@ -657,7 +657,7 @@ pub(crate) fn binfmt_interpreters<'a>(
 /// already-folded path ([`lexical_path`]), which carries no trailing slash and no `.` of its own, so
 /// the component this returns is the file the target names. Total for any other input too: a string
 /// ending in `/` yields an empty basename, which matches no non-empty rule.
-fn basename(path: &str) -> &str {
+pub(crate) fn basename(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[i + 1..],
         None => path,

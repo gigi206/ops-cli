@@ -1244,6 +1244,109 @@ fn commit_rule(
     }
 }
 
+/// What a `--proc-learn` write did: the rules it added, how many were already there, and the mode it
+/// found before setting `ask`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LearnedProcWrite {
+    pub(crate) added: Vec<String>,
+    pub(crate) already_present: usize,
+    /// The `[proc] mode` as the file had it, or `None` when the file declared no `[proc]` at all.
+    /// Reported by the caller, because moving a cage from `enforce` to `ask` changes what happens to
+    /// a program nobody has spoken about — it waits instead of running — and that is not a thing to
+    /// do quietly.
+    pub(crate) previous_mode: Option<String>,
+}
+
+impl LearnedProcWrite {
+    /// Whether this write changed the file, which is what decides whether the caller owes a
+    /// re-trust. Same contract as [`AddOutcome::wrote_anything`]: the mode counts, because a run
+    /// that only had to set the posture still changed the document.
+    pub(crate) fn wrote_anything(&self) -> bool {
+        !self.added.is_empty() || self.previous_mode.as_deref() != Some(LEARNED_PROC_MODE)
+    }
+}
+
+/// The posture a learned `allow` list is live under, and therefore the one a learning write sets.
+const LEARNED_PROC_MODE: &str = "ask";
+
+/// Write the rules a `--proc-learn` run synthesized, together with the posture that makes them live.
+///
+/// One act, not one per rule: the mode is set and every rule unioned into `allow` in a single
+/// document write, so a project config is re-trusted once for the whole learned list rather than
+/// once per rule.
+///
+/// Setting the mode is the operation, not a side effect of it. An `allow` list does nothing under
+/// any posture but `ask` — which is exactly why [`guard_proc_mode`] refuses a lone `sbx proc allow`
+/// elsewhere — and the reason to learn one is to reach the posture where an *un*learned program
+/// stops for a person instead of running unremarked. The direction is the strict one: under
+/// `enforce` everything not denied runs, under `ask` everything not allowed waits, so this write
+/// narrows what the cage may exec. It never touches `deny`, which stays whatever its author made it.
+pub(crate) fn add_learned_proc_rules(
+    path: &Path,
+    app: Option<&str>,
+    rules: &[String],
+) -> Result<Written<LearnedProcWrite>, ManageError> {
+    let mut doc = read_or_empty(path)?;
+    let parent = layer_parent(&mut doc, app)?;
+    let previous_mode = match parent.get("proc") {
+        None => None,
+        Some(Item::Value(v)) if v.is_str() => Some(v.as_str().unwrap_or_default().to_string()),
+        Some(Item::Table(t)) => t.get("mode").and_then(Item::as_str).map(str::to_string),
+        Some(Item::Value(v)) if v.is_inline_table() => v
+            .as_inline_table()
+            .and_then(|it| it.get("mode"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Some(_) => {
+            return Err(ManageError::MalformedProc(
+                "not a mode string or table".into(),
+            ));
+        }
+    };
+    // Every shape is normalised to the table form, which is the one that can carry a list. A bare
+    // `proc = "enforce"` and an inline table both become `[proc]` with the learned posture; whatever
+    // else they held is carried over, so a `deny` list written by hand survives the promotion.
+    let existing = match parent.get("proc") {
+        Some(Item::Value(v)) if v.is_inline_table() => v
+            .as_inline_table()
+            .map(|it| it.clone().into_table())
+            .unwrap_or_default(),
+        Some(Item::Table(t)) => t.clone(),
+        _ => Table::new(),
+    };
+    let mut table = existing;
+    table.insert("mode", value(LEARNED_PROC_MODE));
+    let arr = table
+        .entry(ProcList::Allow.key())
+        .or_insert_with(|| value(Array::new()))
+        .as_array_mut()
+        .ok_or_else(|| {
+            ManageError::MalformedProc(format!("`{}` is not an array", ProcList::Allow.key()))
+        })?;
+    let mut added = Vec::new();
+    let mut already_present = 0usize;
+    for rule in rules {
+        match push_outcome(arr, rule) {
+            AddOutcome::Added { .. } => added.push(rule.clone()),
+            AddOutcome::AlreadyPresent => already_present += 1,
+        }
+    }
+    parent.insert("proc", Item::Table(table));
+    let outcome = LearnedProcWrite {
+        added,
+        already_present,
+        previous_mode,
+    };
+    // Written only when something changed, for the reason `commit_rule` states: attesting to a
+    // document that was never written records a hash of bytes the file does not hold.
+    let text = if outcome.wrote_anything() {
+        write_doc(path, &doc)?
+    } else {
+        doc.to_string()
+    };
+    Ok(Written { outcome, text })
+}
+
 /// Guard the `mode` of a `[proc]` table/bare-string before appending an allow/deny rule to it. A
 /// `deny` is live under an enforcing mode (`enforce`/`ask`) and inert under `off`/`observe`; an
 /// `allow` is live **only** under `ask` (under `enforce` everything not denied already runs, so an
@@ -1967,6 +2070,56 @@ pub(crate) fn import_net_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_learning_write_sets_the_posture_its_rules_are_live_under() {
+        let tmp = crate::testutil::TmpDir::new();
+        let rules = ["git".to_string(), "node".to_string()];
+
+        // A file with no `[proc]` at all: the table is created with the posture and the list. A
+        // single `sbx proc allow` is refused here (`ProcAllowNeedsPosture`) precisely because an
+        // allow alone would be inert; the learning write is the act that brings both.
+        let fresh = doc_at(tmp.path(), "");
+        let w = add_learned_proc_rules(&fresh, None, &rules).expect("a fresh file takes the list");
+        assert_eq!(w.outcome.added, rules);
+        assert_eq!(w.outcome.previous_mode, None);
+        assert!(w.outcome.wrote_anything());
+        let body = std::fs::read_to_string(&fresh).unwrap();
+        assert!(
+            body.contains("mode = \"ask\"") && body.contains("git") && body.contains("node"),
+            "{body}"
+        );
+
+        // An enforcing posture with a hand-written deny: the mode moves to `ask` and the deny list
+        // survives the promotion — a learning run adds what may run, it never edits what may not.
+        let sub = tmp.path().join("enforcing");
+        std::fs::create_dir_all(&sub).unwrap();
+        let existing = doc_at(
+            &sub,
+            "[proc]\nmode = \"enforce\"\ndeny = [\"curl\"]\nallow = [\"git\"]\n",
+        );
+        let w = add_learned_proc_rules(&existing, None, &rules).expect("the table takes the list");
+        assert_eq!(w.outcome.added, vec!["node".to_string()]);
+        assert_eq!(w.outcome.already_present, 1);
+        assert_eq!(w.outcome.previous_mode.as_deref(), Some("enforce"));
+        let body = std::fs::read_to_string(&existing).unwrap();
+        assert!(
+            body.contains("mode = \"ask\"") && body.contains("curl"),
+            "the deny list must survive the posture change:\n{body}"
+        );
+
+        // Nothing new and already on `ask`: no write, so nothing is attested to either.
+        let sub = tmp.path().join("settled");
+        std::fs::create_dir_all(&sub).unwrap();
+        let settled = doc_at(
+            &sub,
+            "[proc]\nmode = \"ask\"\nallow = [\"git\", \"node\"]\n",
+        );
+        let before = std::fs::read_to_string(&settled).unwrap();
+        let w = add_learned_proc_rules(&settled, None, &rules).expect("a no-op is not an error");
+        assert!(w.outcome.added.is_empty() && !w.outcome.wrote_anything());
+        assert_eq!(std::fs::read_to_string(&settled).unwrap(), before);
+    }
 
     fn doc_at(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join(".sbx.toml");

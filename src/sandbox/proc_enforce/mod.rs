@@ -209,12 +209,24 @@ pub(crate) struct ProcEnforce {
     ring: Arc<ExecRing>,
     /// Shared with the supervisor thread; read here once that thread has been joined.
     undecidable: Arc<Undecidable>,
+    /// Shared with the supervisor thread on a `--proc-learn` run, absent otherwise.
+    learned: Option<Arc<crate::sandbox::proclearn::Learned>>,
     /// What this policy's mode does with a decision that had nothing to match, in the words the
     /// teardown report needs. Captured at start-up because the policy itself moves into the thread.
     unmatched: &'static str,
 }
 
 impl ProcEnforce {
+    /// The distinct exec targets this run decided against, and whether the record was cut short —
+    /// `None` when this launch was not a learning one.
+    ///
+    /// Read once the workload has exited and before the guard is dropped, exactly like
+    /// [`refusals`](ProcEnforce::refusals): nothing execs after the command returns, so the set is
+    /// the run's whole account of what it ran.
+    pub(crate) fn learned(&self) -> Option<crate::sandbox::proclearn::Record> {
+        self.learned.as_ref().map(|l| l.snapshot())
+    }
+
     /// The exec targets this supervisor refused, in order, deduplicated.
     ///
     /// A refusal is invisible from the outside: the `execve` returns an error to a process that
@@ -288,8 +300,20 @@ pub(crate) fn start(
     policy: ProcPolicy,
     open: Option<(crate::open_policy::OpenPolicy, PathBuf)>,
     notifier: Arc<crate::sandbox::notify_sink::Notifier>,
+    learn: bool,
 ) -> io::Result<(ProcEnforce, Wiring)> {
-    start_inner(data_dir, shim_bin, policy, open, "", true, notifier)
+    start_inner(
+        data_dir,
+        shim_bin,
+        policy,
+        open,
+        notifier,
+        StartOpts {
+            instance: "",
+            control: true,
+            learn,
+        },
+    )
 }
 
 /// The same supervisor for **one task invocation**, which differs from a session's in two ways.
@@ -315,10 +339,22 @@ pub(crate) fn start_for_task(
         shim_bin,
         policy,
         open,
-        &format!(".t{invocation}"),
-        false,
         notifier,
+        StartOpts {
+            instance: &format!(".t{invocation}"),
+            control: false,
+            // A task declares the programs it may run, so there is nothing about it to discover.
+            learn: false,
+        },
     )
+}
+
+/// What one supervisor is stood up for, beside the policy it enforces: which instance of a session's
+/// sockets it owns, whether it serves a control socket, and whether it keeps a learning record.
+struct StartOpts<'a> {
+    instance: &'a str,
+    control: bool,
+    learn: bool,
 }
 
 fn start_inner(
@@ -326,10 +362,14 @@ fn start_inner(
     shim_bin: &Path,
     policy: ProcPolicy,
     open: Option<(crate::open_policy::OpenPolicy, PathBuf)>,
-    instance: &str,
-    control: bool,
     notifier: Arc<crate::sandbox::notify_sink::Notifier>,
+    opts: StartOpts<'_>,
 ) -> io::Result<(ProcEnforce, Wiring)> {
+    let StartOpts {
+        instance,
+        control,
+        learn,
+    } = opts;
     let dir = super::proc_control::proc_control_dir(data_dir);
     // Unlike the observing path, this directory holds the notification socket enforcement itself
     // runs on, not only the reader's — so a failure here is the launch's, not a lens going quiet.
@@ -379,6 +419,8 @@ fn start_inner(
     let unmatched = unmatched_word(&policy);
     let undecidable = Arc::new(Undecidable::default());
     let counted = undecidable.clone();
+    let learned = learn.then(|| Arc::new(crate::sandbox::proclearn::Learned::default()));
+    let recording = learned.clone();
     let lens = open.map(|(policy, root)| OpenLens::new(policy, root));
     let exec_mounts = CageMounts::default();
     let binfmt = read_binfmt_rules();
@@ -398,6 +440,7 @@ fn start_inner(
                 mounts: lens.as_ref().map_or(&exec_mounts, |l| l.mounts()),
                 binfmt: &binfmt,
                 undecidable: &counted,
+                learn: recording.as_deref(),
             },
         );
     });
@@ -422,6 +465,7 @@ fn start_inner(
             control_socket,
             ring: kept,
             undecidable,
+            learned,
             unmatched,
         },
         Wiring {
@@ -500,7 +544,7 @@ fn exec_verdict(
         let path = crate::proc_policy::lexical_path(&path).into_owned();
         // Decide against the config policy folded with the live `--session` overlay (deny wins
         // across both). The overlay read-lock is held only for this decision.
-        let mut verdict = cx.overlay.decide(cx.policy, caller, &path);
+        let mut verdict = decide_target(cx, caller, pid, &path);
         // A dynamic loader named on the command line runs the program its own arguments name,
         // inside this one syscall and with no notification of its own, so the rule the cage is
         // reaching around is the one about *that* program. Read only for a loader: an ordinary exec
@@ -521,7 +565,7 @@ fn exec_verdict(
                 };
             };
             for program in &named {
-                verdict = verdict.stricter(cx.overlay.decide(cx.policy, caller, program));
+                verdict = verdict.stricter(decide_target(cx, caller, pid, program));
             }
             if !named.is_empty() {
                 // The record is the loader's own command line, because that is what was run and
@@ -558,7 +602,7 @@ fn exec_verdict(
                             crate::proc_policy::binfmt_interpreters(cx.binfmt, &head, &path);
                         let mut with = verdict;
                         for interpreter in &named {
-                            with = with.stricter(cx.overlay.decide(cx.policy, caller, interpreter));
+                            with = with.stricter(decide_target(cx, caller, pid, interpreter));
                         }
                         if with != verdict {
                             return Decided {
@@ -570,7 +614,7 @@ fn exec_verdict(
                         }
                     }
                     crate::proc_policy::ScriptHead::Interpreter(interp) => {
-                        let with = cx.overlay.decide(cx.policy, caller, &interp);
+                        let with = decide_target(cx, caller, pid, &interp);
                         let stricter = verdict.stricter(with);
                         // Named in the record only where it changed the answer, which is the
                         // difference from a loader: there the notified path (`ld.so`) says nothing
@@ -641,6 +685,33 @@ fn exec_verdict(
         probed: "<unreadable>".to_string(),
         because: Because::Policy,
     }
+}
+
+/// Decide one exec target against the policy folded with the live overlay — and, on a learning run,
+/// record the target.
+///
+/// Every target a decision is taken against goes through here, which is what makes the learned set
+/// the same set the policy was asked about: a script's interpreter and the program a dynamic loader
+/// names are decided here too, and neither appears in the `execve` the kernel reported. Learning
+/// from the syscall's own path would produce an allowlist that admits the script and parks its
+/// interpreter.
+///
+/// Only a target that is **there** is recorded. A name lookup is one `execve` per `PATH` entry, so a
+/// program found in the fourth directory is decided against three paths that hold nothing; learning
+/// those would write rules about files the cage never ran — harmless under `name` granularity, where
+/// they fold into the same basename, and pure noise under `path`. The probe is the same one a
+/// refusal picks its errno with.
+fn decide_target(cx: &Deciding<'_>, caller: &[String], pid: u32, target: &str) -> Verdict {
+    let verdict = cx.overlay.decide(cx.policy, caller, target);
+    if let Some(learn) = cx.learn
+        && let Ok(fd) = open_lens::probe_in_cage_root(pid, Path::new(target))
+    {
+        // SAFETY: fd is this call's own descriptor, returned by the probe and closed once. Nothing
+        // is read through it — the question was whether it could be opened at all.
+        unsafe { libc::close(fd) };
+        learn.record(target);
+    }
+    verdict
 }
 
 /// What one notified exec was decided to be, and the two names that decision is spoken about.
@@ -822,6 +893,10 @@ struct Deciding<'a> {
     /// Shared with the [`ProcEnforce`] that owns this supervisor, which reports the totals once the
     /// thread has been joined.
     undecidable: &'a Undecidable,
+    /// The learning record, on a `--proc-learn` run. Present only there: it costs one existence
+    /// probe per decided target, which is the price of not learning a rule about a file that was
+    /// never there, and which an ordinary launch has no reason to pay.
+    learn: Option<&'a crate::sandbox::proclearn::Learned>,
 }
 
 /// The supervisor thread: wait (with a stop-checking poll) for the shim's one connection, receive the

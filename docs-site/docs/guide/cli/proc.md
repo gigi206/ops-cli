@@ -224,6 +224,11 @@ sbx proc deny ssh -a claude-code   # under that app's [app.claude-code.proc]
 sbx proc allow git                 # only valid once mode = "ask"
 ```
 
+Writing that allow list one rule at a time is not the only way to reach it:
+[`sbx app run <name> --proc-learn`](app#learning-what-an-app-runs---proc-learn) runs the
+app once, records every program it execs, and writes the list together with the
+`mode = "ask"` that makes it live.
+
 Writing the project `.sbx.toml` **re-trusts** it (it must be absent or already trusted first), so the
 rule takes effect on the next launch; the global config and app profiles are trusted by location.
 Removing a rule is done with [`unallow` / `undeny`](#unallow--undeny) (or, generically,

@@ -75,9 +75,11 @@ pub(crate) mod control;
 pub(crate) mod egress;
 pub(crate) mod egress_stats;
 mod forward;
+pub(crate) mod learn;
 pub(crate) mod netlearn;
 mod netns;
 mod nettap;
+pub(crate) mod proclearn;
 mod proxy;
 pub(crate) mod redact;
 
@@ -149,12 +151,13 @@ pub(crate) use gc::{
     purge_app_homes, tree_size, tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{
-    SessionHeader, app, attach, detach_log_path, distro_lock_path, effective_lock_target, gc,
-    parse_session_header, run, run_mise, stop, superseded_reclaimable_hint, upgrade_mise_packages,
-    upgrade_provision_steps,
+    AppOutcome, SessionHeader, app, attach, detach_log_path, distro_lock_path,
+    effective_lock_target, gc, parse_session_header, run, run_mise, stop,
+    superseded_reclaimable_hint, upgrade_mise_packages, upgrade_provision_steps,
 };
+pub(crate) use learn::Synthesis;
 pub(crate) use naming::cage_name;
-pub(crate) use netlearn::{Granularity, Synthesis};
+pub(crate) use netlearn::Granularity as NetGranularity;
 pub(crate) use netns::{run_holder, run_probe};
 pub(crate) use nettap::{CaptureSupport, probe_capture, run_tap};
 pub(crate) use nixhub::{ToolUpgrade, current_system, parse_nix_tools, upgrade_tools};
@@ -175,6 +178,7 @@ pub(crate) use packages::mise_packages;
 /// aliases of it, so a caller matching on outcomes names the variants through this — a `use` path
 /// resolves through modules, and an alias is not one.
 pub(crate) use prebuilt::Upgrade as PrebuiltUpgrade;
+pub(crate) use proclearn::Granularity as ProcGranularity;
 pub(crate) use projects::{
     projects_list, projects_rm, projects_show, rm_apply as projects_rm_apply,
 };

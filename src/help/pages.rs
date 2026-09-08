@@ -249,8 +249,9 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "run"],
-        synopsis: "sbx app run <name> [--detach] [--observe] [--net-learn[=level] [--global|--local] \
-                   [--dry-run]] [override flags] [-- <args>...]",
+        synopsis: "sbx app run <name> [--detach] [--observe] [--net-learn[=level]] \
+                   [--proc-learn[=level]] [[--global|--local] [--dry-run]] [override flags] \
+                   [-- <args>...]",
         summary: "launch a named application profile in the project sandbox",
         options: &[
             (
@@ -270,13 +271,21 @@ pub(super) const PAGES: &[Page] = &[
                  lack of one to the app's profile (default level `domain`)",
             ),
             (
+                "--proc-learn[=name|path]",
+                "run under the app's real posture, then add the programs it ran to the app's \
+                 `[proc] allow` list and set `mode = \"ask\"`, so a program it did not run waits \
+                 for a decision (default level `name`, the basename; refused under `ask`, which \
+                 already puts an unmatched exec to a person)",
+            ),
+            (
                 "-g, --global / -l, --local",
-                "with --net-learn, write the learned rules to the global app profile / the project \
-                 config (default local)",
+                "with --net-learn/--proc-learn, write the learned rules to the global app profile \
+                 / the project config (default local)",
             ),
             (
                 "--dry-run",
-                "with --net-learn, print the rules that would be added without writing them",
+                "with --net-learn/--proc-learn, print the rules that would be added without \
+                 writing them",
             ),
             (
                 "<name>",

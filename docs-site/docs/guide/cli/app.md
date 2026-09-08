@@ -5,7 +5,7 @@ description: "Launch, import, export and inspect the named application profiles.
 # `sbx app`
 
 ```
-sbx app run <name> [--detach] [--observe] [--net-learn[=level] [-g|--global|-l|--local] [--dry-run]] [override flags] [-- <args>...]
+sbx app run <name> [--detach] [--observe] [--net-learn[=level]] [--proc-learn[=level]] [[-g|--global|-l|--local] [--dry-run]] [override flags] [-- <args>...]
 sbx app upgrade <name>
 sbx app import <file> [--as <new-name>] [--force] [--with-deps]
 sbx app export <name> [--out <file>]
@@ -28,8 +28,9 @@ See also: [The app framework](../apps/) · [`[app.<name>]`](../configuration/app
 | `--detach` | launch in the background as a session [`sbx session`](session) can see |
 | `--observe` | record what the app does, its processes ([`sbx proc logs`](proc#logs), also streamed inline to stderr on a non-interactive foreground run under a non-enforcing `[proc]` mode) and its file writes ([`sbx fs logs`](fs#logs)); works for interactive and detached launches too, see [`sbx run`](run#observing-a-run---observe) |
 | `--net-learn[=domain\|path\|exact]` | run under the app's real posture, then add the egress rules it was refused for lack of one to the app's profile (default level `domain`); see [Learning an app's egress](#learning-an-apps-egress---net-learn) |
-| `-g, --global` / `-l, --local` | with `--net-learn`: write the learned rules to the global app profile / the project config (default local); refused without `--net-learn` |
-| `--dry-run` | with `--net-learn`: print the rules that would be added without writing them; refused without `--net-learn` |
+| `--proc-learn[=name\|path]` | run under the app's real posture, then add the programs it ran to the app's `[proc] allow` list and set `mode = "ask"` (default level `name`); see [Learning what an app runs](#learning-what-an-app-runs---proc-learn) |
+| `-g, --global` / `-l, --local` | with `--net-learn`/`--proc-learn`: write the learned rules to the global app profile / the project config (default local); refused without a learning flag |
+| `--dry-run` | with `--net-learn`/`--proc-learn`: print the rules that would be added without writing them; refused without a learning flag |
 | `--config` / `--env` / `--net` / `--gui` / `--proc` / `--notify` / `--nixpkgs` / `--bind` / `--forward` / `--limit` / `--package` / `--seccomp` / `--device` / `--gpu` / `--audio` / `--dbus` | typed one-shot [overrides](../configuration/overrides), applied **after** the app's overlay (the final word); value-taking flags also accept `--flag=value` |
 | `-- <args>...` | appended to the app's declared command |
 
@@ -82,6 +83,58 @@ The rules land in the project config by default (`--local`), or in the app's glo
 profile with `-g`, which, for an app defined only inline in a project `sbx.toml`, writes
 a partial `apps/<name>.toml` the inline table then shadows on load; prefer `-g` for an
 app that is already an imported profile. It is foreground-only (not with `--detach`).
+
+### Learning what an app runs (`--proc-learn`)
+
+`--proc-learn` is the exec half of the same idea, and it reads the opposite half of a
+run. Egress learning reads what was **refused**: a denied connection leaves the program
+running, so one pass collects every host it wanted. A denied `execve` usually ends the
+run, so learning what to allow from refusals would learn exactly one program. This
+learns from what the app **ran**.
+
+To see every exec, the run stands up the seccomp user-notification supervisor under a
+denylist with nothing on it: every `execve` is notified and every one is allowed, so the
+app behaves exactly as it would have. The cheap `/proc` poll behind
+[`--observe`](run#observing-a-run---observe) cannot serve here. It samples, so a command
+shorter than a tick is missed, and an allowlist learned from a sample parks the agent on
+the first program the sample did not see.
+
+The level sets how wide each rule is:
+
+| Level | Rule written |
+|---|---|
+| `name` (default) | the program's basename, e.g. `git` |
+| `path` | the whole in-cage path, e.g. `/nix/store/<hash>-git-2.51.0/bin/git` |
+
+`name` is the default because an in-cage program does not live at a stable path. A nix
+closure spells `git` as `/nix/store/<hash>-git-2.51.0/bin/git`, and that hash changes at
+the next [`sbx upgrade`](upgrade), so a rule written against the path stops naming the
+program the day its channel rolls. The price is stated plainly: a name rule admits that
+basename wherever it is found. `path` is the strict reading, for a cage whose programs
+sit where they will stay; it goes stale visibly (the exec waits for a decision) rather
+than widening quietly.
+
+**The write sets the posture.** An `allow` list does nothing under any mode but `ask`,
+which is why [`sbx proc allow`](proc#allow) refuses to write one elsewhere, so a learning
+write sets `[proc] mode = "ask"` together with the rules and says so. That is the strict
+direction: under `enforce` anything not denied runs, under `ask` anything not allowed
+waits for [`sbx proc allow`/`deny`](proc#pending). A `deny` list already in the file is
+left exactly as its author wrote it, and a program a `deny` rule names is never turned
+into an allow: the rule would be inert beside it, and writing one would read as undoing
+a refusal that was meant.
+
+Every posture is learnable except `ask` itself, which is refused: under `ask` an
+unmatched exec is already put to a person, and a run cannot pre-answer a question that
+is theirs. Under `off` or `observe` the app's config declares no exec policy, and the
+run supplies the empty denylist itself.
+
+```bash
+sbx app run claude-code --proc-learn --dry-run   # what would be allowed, nothing written
+sbx app run claude-code --proc-learn             # write the list, and move to `ask`
+```
+
+Both learning flags compose. `sbx app run <name> --net-learn --proc-learn` learns an
+app's egress and its programs in one launch, writing both to the same profile.
 
 ## Advancing an app
 
@@ -339,6 +392,7 @@ sbx app run claude-code -- -c          # resume the previous session
 sbx app run claude-code --net none     # one run with no network
 sbx app run claude-code --net-learn    # learn the egress rules it actually needs
 sbx app run claude-code --net-learn=exact --dry-run   # preview its exact endpoints
+sbx app run claude-code --proc-learn   # learn the programs it runs, and move to `ask`
 sbx app list                           # imported profiles + installed homes
 sbx app show claude-code               # what this app has actually installed on disk
 sbx app prune hermes                    # preview undeclared mise tools in hermes' home

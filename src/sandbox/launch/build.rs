@@ -187,6 +187,13 @@ impl LaunchGuard {
             .map(|e| e.observed_events())
             .unwrap_or_default()
     }
+
+    /// The distinct exec targets this launch decided against, and whether that record was cut short
+    /// — `None` unless the launch was started for `--proc-learn`. Snapshotted after the run, the
+    /// exec sibling of [`observed_events`](LaunchGuard::observed_events).
+    pub(super) fn learned_execs(&self) -> Option<crate::sandbox::proclearn::Record> {
+        self.proc_enforce.as_ref().and_then(|p| p.learned())
+    }
 }
 
 impl Drop for LaunchGuard {
@@ -962,7 +969,7 @@ fn proc_lens<'a>(
             }
         }
     };
-    if prep.cfg.proc.enforcing() || content_lens.is_some() {
+    if prep.cfg.proc.enforcing() || content_lens.is_some() || prep.learn_exec {
         // The shim is sbx's own embedded binary, laid down under the data directory. Refusing when
         // it cannot be placed is the point: the alternative would be binding some other executable
         // into the cage, which is the exposure the dedicated shim exists to remove.
@@ -984,6 +991,7 @@ fn proc_lens<'a>(
             exec_policy,
             content_lens,
             Arc::clone(&notify_wiring.notifier),
+            prep.learn_exec,
         )
         .map_err(|e| {
             crate::diag::error(&format!("sbx: cannot start exec enforcement: {e}"));

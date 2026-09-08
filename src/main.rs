@@ -1271,6 +1271,77 @@ fn persist_proc_rule(
     })
 }
 
+/// Write the whole set of rules a `--proc-learn` run synthesized, in one act — the learning sibling
+/// of [`persist_proc_rule`]. Same scope vocabulary, trust gate and exit codes as the single-rule
+/// path; what differs is that one call carries the list, so a gated project write is re-trusted once
+/// instead of once per rule.
+///
+/// The returned line says the posture as well as the rules, because the write sets `[proc] mode` to
+/// the one an `allow` list is live under. See [`config::manage::add_learned_proc_rules`].
+fn persist_learned_proc_rules(
+    rules: &[String],
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+    base: &Path,
+) -> Result<String, (u8, String)> {
+    use config::manage;
+    let RuleWrite {
+        path,
+        app_key,
+        target,
+        store,
+    } = open_rule_write("proc", "learn", NO_TRUST_STORE_ON_ADD, scope, app, base)?;
+    let gated = store.is_some();
+
+    let written =
+        manage::add_learned_proc_rules(&path, app_key, rules).map_err(|e| (2, e.to_string()))?;
+
+    if let Some(store) = &store
+        && written.outcome.wrote_anything()
+    {
+        trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
+            (
+                1,
+                format!(
+                    "wrote the rules but could not re-trust {e} — run `sbx trust {}` so they \
+                     take effect",
+                    config::PROJECT_CONFIG
+                ),
+            )
+        })?;
+    }
+
+    let manage::LearnedProcWrite {
+        added,
+        already_present,
+        previous_mode,
+    } = written.outcome;
+    let mut msg = match (added.len(), already_present) {
+        (0, 0) => format!("no exec rules to add to {target}"),
+        (0, n) => format!("all {n} learned exec rule(s) were already in {target} — no change"),
+        (n, 0) => format!("added {n} exec rule(s) to {target}"),
+        (n, already) => {
+            format!("added {n} exec rule(s) to {target} ({already} already present)")
+        }
+    };
+    // The posture, whenever this write is what put the cage on it. Said before the re-trust line
+    // because it is the part that changes what the next launch does with a program nobody named.
+    if previous_mode.as_deref() != Some("ask") {
+        let from = match &previous_mode {
+            Some(m) => format!("`{m}`"),
+            None => "no declared posture".to_string(),
+        };
+        msg.push_str(&format!(
+            "\nset proc mode `ask` (was {from}) — an exec no rule names now waits for \
+             `sbx proc allow`/`deny` instead of running"
+        ));
+    }
+    if gated && !added.is_empty() {
+        msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
+    }
+    Ok(msg)
+}
+
 /// Remove a rule from the scoped config file, trust-gating a project write and re-trusting it after
 /// — the shared writer behind `sbx net unallow|undeny|unmute` and `sbx proc unallow|undeny`. A rule
 /// that is not present is a reported no-op: no write, no re-trust. `family` names the command

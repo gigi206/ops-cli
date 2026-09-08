@@ -118,6 +118,13 @@ struct Prepared {
     /// host-side `[env]` driver.
     engine_ref: String,
     userland: Userland,
+    /// Whether this launch is a `--proc-learn` run, which is the one thing that makes it stand up
+    /// the exec supervisor for a reason other than a policy: it needs the complete exec record only
+    /// the seccomp lens produces, under a denylist with nothing on it so the workload is unaffected.
+    ///
+    /// Kept beside the config rather than inside it because it is not a posture the project
+    /// declared: it is what this invocation was asked to find out.
+    learn_exec: bool,
     /// Whether this launch is one cage of a batch — set on the `sbx upgrade` rolls, which build one
     /// cage per app, and left `false` for an ordinary launch.
     ///
@@ -414,6 +421,10 @@ fn launch_foreground(
 pub(crate) struct AppOutcome {
     pub(crate) code: ExitCode,
     pub(crate) learned: Option<super::Synthesis>,
+    /// The `[proc] allow` rules a `--proc-learn` run synthesized, written by the same caller through
+    /// the same path. Separate from `learned` rather than one field of a sum: the two flags are
+    /// independent, a run may carry both, and each lands in its own list.
+    pub(crate) proc_learned: Option<super::Synthesis>,
 }
 
 impl AppOutcome {
@@ -421,6 +432,7 @@ impl AppOutcome {
         AppOutcome {
             code,
             learned: None,
+            proc_learned: None,
         }
     }
 }
@@ -463,7 +475,8 @@ pub(crate) fn app(
     observe: bool,
     extra: Vec<OsString>,
     ov: crate::config::Override,
-    net_learn: Option<super::Granularity>,
+    net_learn: Option<super::NetGranularity>,
+    proc_learn: Option<super::ProcGranularity>,
 ) -> AppOutcome {
     // The configuration is read before the engines are probed, because both refusals below are
     // answers about the *project*, not about the host: an app the project does not declare is
@@ -535,14 +548,17 @@ pub(crate) fn app(
     let interactive = !detach && unsafe { libc::isatty(0) } == 1;
     warn_observe_feed_absent(observe, interactive, &prep.cfg.proc);
 
-    // `--net-learn`: run the app under its real (unchanged) posture, capture the egress it was
-    // refused for lack of a rule, and hand the synthesized rules back for the caller to write. It is
-    // foreground-only (the parser refuses `--detach`) and needs a filtering posture — a `shared` or
-    // `none` app has no proxy logging egress, so there is nothing to learn.
-    if let Some(gran) = net_learn {
-        let policy = match &prep.cfg.network {
-            crate::config::NetworkPolicy::Allowlist(p) => p.clone(),
-            other => {
+    // A learning run: launch the app under its real (unchanged) posture, capture what it was not
+    // declared for, and hand the synthesized rules back for the caller to write. Foreground-only
+    // (the parser refuses `--detach`), and each flag has its own prerequisite, checked before the
+    // cage is built so a refusal costs nothing.
+    if net_learn.is_some() || proc_learn.is_some() {
+        // `--net-learn` needs a filtering posture: a `shared` or `none` app has no proxy logging
+        // egress, so there is nothing to learn.
+        let policy = match (net_learn, &prep.cfg.network) {
+            (None, _) => None,
+            (Some(_), crate::config::NetworkPolicy::Allowlist(p)) => Some(p.clone()),
+            (Some(_), other) => {
                 crate::diag::error(&format!(
                     "sbx: --net-learn needs a filtering network posture (mode allow/deny/ask); \
                      app `{name}` has `{}` — nothing logs egress to learn from.",
@@ -551,22 +567,46 @@ pub(crate) fn app(
                 return AppOutcome::plain(ExitCode::from(2));
             }
         };
+        // `--proc-learn` refuses only one posture, and for the reason `--net-learn` refuses to learn
+        // from a parked request: under `ask` an unmatched exec is put to a person, and a run cannot
+        // pre-answer a question that is theirs. Every other posture is learnable — `off`/`observe`
+        // stand the exec supervisor up under a denylist with nothing on it, and `enforce` is already
+        // one, so in both the workload runs exactly as it would have.
+        if proc_learn.is_some() && prep.cfg.proc.mode == crate::proc_policy::ProcMode::Ask {
+            crate::diag::error(&format!(
+                "sbx: --proc-learn cannot learn under `[proc] mode = \"ask\"`; app `{name}` parks \
+                 an unmatched exec for a live `sbx proc allow`/`deny` decision, which is yours to \
+                 make — run it under `off`, `observe` or `enforce` to learn what it reaches for."
+            ));
+            return AppOutcome::plain(ExitCode::from(2));
+        }
+        // The exec supervisor is what produces a complete record; the poll observer samples, and an
+        // allowlist learned from a sample parks the agent on the first thing the sample missed.
+        prep.learn_exec = proc_learn.is_some();
         // A build failure (a provisioning error, a host that cannot sandbox) must NOT be reported as
         // "nothing to learn": return it as a plain failure so its code propagates and the caller
         // never enters the write path. Only a cage that actually ran yields events to learn from —
         // an empty log from a real run (the app was refused nothing) is a genuine "no new rules".
-        let (code, events) =
+        let (code, run) =
             match launch_foreground_learning(&prep, runtime, Kind::Run, cmd, interactive) {
                 Ok(v) => v,
                 Err(code) => return AppOutcome::plain(code),
             };
         // Subsume against the SAME effective policy the proxy enforced — the config allowlist unioned
         // with the always-on built-in allow-set — so a built-in-allowed host is never re-proposed.
-        let effective = super::union_with_builtin((*policy).clone());
-        let learned = super::netlearn::synthesize(&events, &effective, gran);
+        let learned = net_learn.zip(policy).map(|(gran, policy)| {
+            let effective = super::union_with_builtin((*policy).clone());
+            super::netlearn::synthesize(&run.events, &effective, gran)
+        });
+        // Subsumed against the project's own `[proc]` rules, read as rules rather than as a posture:
+        // what a learned rule has to add to is the list, whatever mode the run happened to be in.
+        let proc_learned = proc_learn
+            .zip(run.execs)
+            .map(|(gran, record)| super::proclearn::synthesize(&record, &prep.cfg.proc, gran));
         return AppOutcome {
             code,
-            learned: Some(learned),
+            learned,
+            proc_learned,
         };
     }
 
@@ -605,7 +645,7 @@ fn launch_foreground_learning(
     kind: Kind,
     cmd: Vec<OsString>,
     interactive: bool,
-) -> Result<(ExitCode, Vec<super::control::LogEvent>), ExitCode> {
+) -> Result<(ExitCode, LearningRun), ExitCode> {
     let (spec, guard) = match build(prep, runtime, cmd) {
         Ok((s, g)) if interactive => (s.with_private_tty(), g),
         Ok((s, g)) => (s, g),
@@ -630,12 +670,24 @@ fn launch_foreground_learning(
         run_supervised(&prep.bwrap, &spec, &prep.cfg.limits)
     };
 
-    let events = guard
-        .as_ref()
-        .map(LaunchGuard::observed_events)
-        .unwrap_or_default();
+    let run = LearningRun {
+        events: guard
+            .as_ref()
+            .map(LaunchGuard::observed_events)
+            .unwrap_or_default(),
+        execs: guard.as_ref().and_then(LaunchGuard::learned_execs),
+    };
     drop(guard);
-    Ok((code, events))
+    Ok((code, run))
+}
+
+/// What one learning launch recorded, snapshotted from the guard before it is dropped: the egress
+/// decisions for `--net-learn`, and the exec record for `--proc-learn`. Both are read whichever flag
+/// asked for the run — an absent lens simply yields nothing — so the two flags compose in one launch
+/// instead of forcing the app to be run twice.
+struct LearningRun {
+    events: Vec<super::control::LogEvent>,
+    execs: Option<super::proclearn::Record>,
 }
 
 /// A suffix for the "no such app" error: " (available: a, b)" listing the configured app
@@ -1029,6 +1081,7 @@ fn prepare_engines(
         userland,
         in_batch: false,
         unresolved_secret: crate::sandbox::egress::Unresolved::Abort,
+        learn_exec: false,
     })
 }
 

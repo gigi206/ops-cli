@@ -67,96 +67,183 @@ fn app_run(args: &[OsString]) -> ExitCode {
                 launch.observe,
                 launch.tail,
                 ov,
-                launch.net_learn.as_ref().map(|nl| nl.gran),
+                launch.learn.as_ref().and_then(|l| l.net),
+                launch.learn.as_ref().and_then(|l| l.proc),
             );
-            match (outcome.learned, launch.net_learn) {
-                (Some(synth), Some(nl)) => finish_net_learn(&launch.name, &synth, &nl),
-                _ => outcome.code,
+            match &launch.learn {
+                Some(learn) => finish_learning(&launch.name, &outcome, learn),
+                None => outcome.code,
             }
         }
         Err(code) => code,
     }
 }
 
-/// Apply the rules `sbx app <name> --net-learn` synthesized from the run: surface the notes (nothing
-/// is dropped silently), then either preview the diff (`--dry-run`) or write each rule to the chosen
-/// profile. The exit code reflects the *learning* outcome, not the agent's exit — a `--net-learn` run
-/// is expected to fail hosts it lacks rules for, so its non-zero exit is not this command's failure;
-/// only a write error is.
-fn finish_net_learn(name: &str, synth: &sandbox::Synthesis, nl: &NetLearn) -> ExitCode {
+/// Apply what a learning run synthesized: the egress rules, the exec rules, or both, each through
+/// the same review-then-write path. The exit code reflects the *learning* outcome, not the agent's —
+/// a learning run is expected to hit things it has no rule for, so its non-zero exit is not this
+/// command's failure; only a write error is.
+fn finish_learning(name: &str, outcome: &sandbox::AppOutcome, learn: &Learning) -> ExitCode {
     use config::manage::EgressList;
+    let cwd = match config_cwd() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let mut code = ExitCode::SUCCESS;
+    if let Some((synth, gran)) = outcome.learned.as_ref().zip(learn.net) {
+        // Written one rule at a time: each re-trusts a gated project write, and the messages are
+        // joined so the whole list is reported in one place.
+        let persist = |rules: &[String]| {
+            let mut lines: Vec<String> = Vec::new();
+            let mut errs: Vec<String> = Vec::new();
+            for rule in rules {
+                match persist_egress_rule(EgressList::Allow, rule, &learn.scope, Some(name), &cwd) {
+                    Ok(msg) => lines.push(msg),
+                    Err((_, msg)) => errs.push(msg),
+                }
+            }
+            if errs.is_empty() {
+                Ok(lines.join("\n"))
+            } else {
+                Err((1, errs.join("\n")))
+            }
+        };
+        let target = match egress_write_target(&learn.scope, Some(name), &cwd) {
+            Ok((_, _, target)) => target,
+            Err((c, msg)) => {
+                diag::error(&format!("sbx net-learn: {msg}"));
+                return ExitCode::from(c);
+            }
+        };
+        code = finish_learn(
+            name,
+            synth,
+            &LearnWrite {
+                label: "net-learn",
+                refused: "was refused nothing it lacked a rule for",
+                noun: "egress",
+                gran: gran.as_str(),
+                dry_run: learn.dry_run,
+                target,
+                also: None,
+                persist: &persist,
+            },
+        );
+    }
+    if let Some((synth, gran)) = outcome.proc_learned.as_ref().zip(learn.proc) {
+        let persist = |rules: &[String]| {
+            crate::persist_learned_proc_rules(rules, &learn.scope, Some(name), &cwd)
+        };
+        let target = match egress_write_target(&learn.scope, Some(name), &cwd) {
+            Ok((_, _, target)) => target,
+            Err((c, msg)) => {
+                diag::error(&format!("sbx proc-learn: {msg}"));
+                return ExitCode::from(c);
+            }
+        };
+        let proc_code = finish_learn(
+            name,
+            synth,
+            &LearnWrite {
+                label: "proc-learn",
+                refused: "ran nothing its `[proc]` rules did not already name",
+                noun: "exec",
+                gran: gran.as_str(),
+                dry_run: learn.dry_run,
+                target,
+                also: Some(
+                    "the write also sets `[proc] mode = \"ask\"`, the posture an allow list is live \
+                     under",
+                ),
+                persist: &persist,
+            },
+        );
+        if proc_code != ExitCode::SUCCESS {
+            code = proc_code;
+        }
+    }
+    code
+}
+
+/// How one lens's learned rules are reviewed and written. The parts the two lenses genuinely differ
+/// in — what they are called, what they write, and where — and nothing else: the order (notes, then
+/// the empty case, then preview or write) is the same for both, so it is written once.
+struct LearnWrite<'a> {
+    /// The flag's own name, which prefixes every line this prints.
+    label: &'a str,
+    /// How a run that learned nothing is described, after "app `x` ".
+    refused: &'a str,
+    /// What the rules are about, for the count line.
+    noun: &'a str,
+    gran: &'a str,
+    dry_run: bool,
+    /// The file the rules land in, resolved once so the preview and the write cannot disagree.
+    target: String,
+    /// A second thing this write does, said in the preview as well as before it happens.
+    also: Option<&'a str>,
+    persist: &'a Persist<'a>,
+}
+
+/// How a lens writes the whole list it learned, returning the line to print or the refusal to
+/// report. Taking the list rather than one rule lets a lens that can write in one act do so, and one
+/// that cannot loop inside its own closure.
+type Persist<'a> = dyn Fn(&[String]) -> Result<String, (u8, String)> + 'a;
+
+/// Surface the notes (nothing is dropped silently), then either preview the diff (`--dry-run`) or
+/// write the rules.
+fn finish_learn(name: &str, synth: &sandbox::Synthesis, w: &LearnWrite) -> ExitCode {
     for note in &synth.notes {
         diag::warn(note);
     }
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     if synth.rules.is_empty() {
-        let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
         println!(
             "{}",
             style::prose(
                 &format!(
-                    "sbx net-learn: no new egress rules — app `{name}` was refused nothing it lacked a rule for."
+                    "sbx {}: no new {} rules — app `{name}` {}.",
+                    w.label, w.noun, w.refused
                 ),
                 &pal
             )
         );
         return ExitCode::SUCCESS;
     }
-    let cwd = match config_cwd() {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
-    // Resolve the human target once (the file the rules land in), shared by the preview and the write
-    // messages so they cannot disagree about where the rules go.
-    let target = match egress_write_target(&nl.scope, Some(name), &cwd) {
-        Ok((_, _, target)) => target,
-        Err((code, msg)) => {
-            diag::error(&format!("sbx net-learn: {msg}"));
-            return ExitCode::from(code);
-        }
-    };
-    if nl.dry_run {
+    if w.dry_run {
         println!(
-            "sbx net-learn ({}): {} rule(s) would be added to {target} (dry run — nothing written):",
-            nl.gran.as_str(),
-            synth.rules.len()
+            "sbx {} ({}): {} {} rule(s) would be added to {} (dry run — nothing written):",
+            w.label,
+            w.gran,
+            synth.rules.len(),
+            w.noun,
+            w.target
         );
         for rule in &synth.rules {
-            // The preview is the only per-rule review `--net-learn` offers, and a learned rule's
-            // path is built from a request the cage chose. The synthesizer already refuses a rule
-            // its classifier rejects, so nothing reaches here carrying a control byte; sanitising
-            // anyway is what keeps that true of this line rather than of the gate behind it.
+            // The preview is the only per-rule review a learning run offers, and a learned rule is
+            // built from something the cage chose. The synthesizers already refuse a rule their own
+            // gate rejects, so nothing reaches here carrying a control byte; sanitising anyway is
+            // what keeps that true of this line rather than of the gate behind it.
             println!("  allow {}", crate::sandbox::sanitize(rule));
+        }
+        if let Some(also) = w.also {
+            println!("{}", style::prose(&format!("  ({also})"), &pal));
         }
         return ExitCode::SUCCESS;
     }
-    // Write each rule through the shared persister, so a project write is trust-gated and re-trusted
-    // exactly like `sbx net allow`. One rule per call (each re-trusts a gated project write); a batch
-    // writer is a future refinement.
-    let mut failed = false;
-    for rule in &synth.rules {
-        match persist_egress_rule(EgressList::Allow, rule, &nl.scope, Some(name), &cwd) {
-            Ok(msg) => println!(
-                "{}",
-                style::prose(
-                    &msg,
-                    &style::Palette::for_stream(std::io::stdout().is_terminal())
-                )
-            ),
-            Err((_, msg)) => {
-                diag::error(&format!("sbx net-learn: {msg}"));
-                failed = true;
-            }
+    match (w.persist)(&synth.rules) {
+        Ok(msg) => {
+            println!("{}", style::prose(&msg, &pal));
+            ExitCode::SUCCESS
         }
-    }
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+        Err((_, msg)) => {
+            diag::error(&format!("sbx {}: {msg}", w.label));
+            ExitCode::FAILURE
+        }
     }
 }
 
 /// The pure booleans `sbx app run` reads before the app name, which therefore take no `=value`.
-/// `--net-learn` is not among them: it reads its own optional `=granularity` suffix.
+/// The two learning flags are not among them: each reads its own optional `=granularity` suffix.
 const APP_LAUNCH_VALUELESS_FLAGS: &[&str] = &[
     "--detach",
     "--observe",
@@ -194,9 +281,11 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
     let mut observe = false;
     let mut name: Option<String> = None;
     let mut cli = config::CliOverrides::default();
-    // `--net-learn` state: the granularity (once seen), the write scope, and whether to only preview.
-    // The scope/`--dry-run` flags are meaningful only with `--net-learn`, enforced after the loop.
-    let mut learn_gran: Option<sandbox::Granularity> = None;
+    // Learning state: each lens's granularity (once its flag is seen), the write scope, and whether
+    // to only preview. The scope/`--dry-run` flags are meaningful only with a learning flag, enforced
+    // after the loop.
+    let mut learn_gran: Option<sandbox::NetGranularity> = None;
+    let mut proc_gran: Option<sandbox::ProcGranularity> = None;
     let mut scope = Scope::Local;
     let mut scope_seen = false;
     let mut dry_run = false;
@@ -236,7 +325,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                         let Some(value) = inline.to_str() else {
                             return Err(crate::refuse_nontext_value("app", &flag, inline));
                         };
-                        match sandbox::Granularity::parse(value) {
+                        match sandbox::NetGranularity::parse(value) {
                             Ok(g) => g,
                             Err(e) => {
                                 diag::error(&format!("sbx: {e}"));
@@ -244,9 +333,30 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                             }
                         }
                     }
-                    None => sandbox::Granularity::default(),
+                    None => sandbox::NetGranularity::default(),
                 };
                 learn_gran = Some(gran);
+                head.remove(0);
+            }
+            // `--proc-learn[=name|path]`: the value after `=` picks the granularity; a bare flag is
+            // `name`, the one that survives a channel roll.
+            "--proc-learn" => {
+                let gran = match crate::flag_inline(&head[0]) {
+                    Some(inline) => {
+                        let Some(value) = inline.to_str() else {
+                            return Err(crate::refuse_nontext_value("app", &flag, inline));
+                        };
+                        match sandbox::ProcGranularity::parse(value) {
+                            Ok(g) => g,
+                            Err(e) => {
+                                diag::error(&format!("sbx: {e}"));
+                                return Err(ExitCode::from(2));
+                            }
+                        }
+                    }
+                    None => sandbox::ProcGranularity::default(),
+                };
+                proc_gran = Some(gran);
                 head.remove(0);
             }
             "--dry-run" => {
@@ -303,21 +413,24 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         eprint!("{}", help::page_usage(&["app", "run"]).unwrap_or_default());
         return Err(ExitCode::from(2));
     };
-    // `--net-learn` reviews and writes rules in the foreground; `--detach` has no session to observe.
-    if learn_gran.is_some() && detach {
+    let learning = learn_gran.is_some() || proc_gran.is_some();
+    // A learning run reviews and writes rules in the foreground; `--detach` has no session to watch.
+    if learning && detach {
         diag::error(
-            "sbx: --net-learn cannot be combined with --detach (it observes a foreground run).",
+            "sbx: --net-learn/--proc-learn cannot be combined with --detach (they observe a \
+             foreground run).",
         );
         return Err(ExitCode::from(2));
     }
-    // The write scope and `--dry-run` only shape where `--net-learn` puts its rules; refuse them on a
-    // plain launch rather than silently ignoring a flag the user expected to matter.
-    if learn_gran.is_none() && (scope_seen || dry_run) {
-        diag::error("sbx: --global/--local/--dry-run apply only with --net-learn.");
+    // The write scope and `--dry-run` only shape where a learning run puts its rules; refuse them on
+    // a plain launch rather than silently ignoring a flag the user expected to matter.
+    if !learning && (scope_seen || dry_run) {
+        diag::error("sbx: --global/--local/--dry-run apply only with --net-learn/--proc-learn.");
         return Err(ExitCode::from(2));
     }
-    let net_learn = learn_gran.map(|gran| NetLearn {
-        gran,
+    let learn = learning.then_some(Learning {
+        net: learn_gran,
+        proc: proc_gran,
         scope,
         dry_run,
     });
@@ -327,7 +440,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         observe,
         tail,
         cli,
-        net_learn,
+        learn,
     })
 }
 
@@ -339,13 +452,18 @@ struct AppLaunch {
     observe: bool,
     tail: Vec<OsString>,
     cli: config::CliOverrides,
-    net_learn: Option<NetLearn>,
+    learn: Option<Learning>,
 }
 
-/// The `--net-learn` intent: how wide to synthesize rules, which profile to write them to, and
-/// whether to only preview the diff.
-struct NetLearn {
-    gran: sandbox::Granularity,
+/// The learning intent of one launch: which lenses were asked to learn and how wide, which profile
+/// the rules land in, and whether to only preview the diff.
+///
+/// One struct for both flags because the scope and the preview are the *run's*, not the lens's: a
+/// launch that learns both its egress and its execs writes them to the same profile, in the same
+/// act, and previewing one while writing the other would be a surprise.
+struct Learning {
+    net: Option<sandbox::NetGranularity>,
+    proc: Option<sandbox::ProcGranularity>,
     scope: config::manage::Scope,
     dry_run: bool,
 }
@@ -2226,7 +2344,7 @@ mod tests {
         let a = parse_app_launch(&v(&["demo-app"])).unwrap();
         assert_eq!((a.name.as_str(), a.detach), ("demo-app", false));
         assert!(a.tail.is_empty() && a.cli.config.is_empty() && a.cli.env.is_empty());
-        assert!(a.net_learn.is_none());
+        assert!(a.learn.is_none());
 
         // `--detach` before the (absent) `--` sets the flag.
         let a = parse_app_launch(&v(&["demo-app", "--detach"])).unwrap();
@@ -2285,13 +2403,13 @@ mod tests {
 
         // `--net-learn`: bare is `domain` (the default), the local scope, no dry-run.
         let a = parse_app_launch(&v(&["demo-app", "--net-learn"])).unwrap();
-        let nl = a.net_learn.expect("net-learn set");
-        assert_eq!(nl.gran, sandbox::Granularity::Domain);
+        let nl = a.learn.expect("net-learn set");
+        assert_eq!(nl.net, Some(sandbox::NetGranularity::Domain));
         assert!(matches!(nl.scope, config::manage::Scope::Local) && !nl.dry_run);
         // `=level`, `--dry-run`, and `-g` compose, in any order with the name.
         let a = parse_app_launch(&v(&["--net-learn=path", "demo-app", "--dry-run", "-g"])).unwrap();
-        let nl = a.net_learn.expect("net-learn set");
-        assert_eq!(nl.gran, sandbox::Granularity::Path);
+        let nl = a.learn.expect("net-learn set");
+        assert_eq!(nl.net, Some(sandbox::NetGranularity::Path));
         assert!(matches!(nl.scope, config::manage::Scope::Global) && nl.dry_run);
         // A bad granularity, `--net-learn` with `--detach`, and a scope/`--dry-run` without
         // `--net-learn` are each usage errors (never a silently-ignored flag).
@@ -2299,6 +2417,29 @@ mod tests {
         assert!(parse_app_launch(&v(&["demo-app", "--net-learn", "--detach"])).is_err());
         assert!(parse_app_launch(&v(&["demo-app", "--dry-run"])).is_err());
         assert!(parse_app_launch(&v(&["demo-app", "-g"])).is_err());
+
+        // `--proc-learn` reads its own granularity and shares the scope and the preview with its
+        // egress twin: one launch can learn both, and both land in the same place.
+        let a = parse_app_launch(&v(&["demo-app", "--proc-learn"])).unwrap();
+        let l = a.learn.expect("proc-learn set");
+        assert_eq!(l.proc, Some(sandbox::ProcGranularity::Name));
+        assert_eq!(l.net, None);
+        let a = parse_app_launch(&v(&[
+            "--proc-learn=path",
+            "demo-app",
+            "--net-learn=exact",
+            "--dry-run",
+        ]))
+        .unwrap();
+        let l = a.learn.expect("both flags set");
+        assert_eq!(l.proc, Some(sandbox::ProcGranularity::Path));
+        assert_eq!(l.net, Some(sandbox::NetGranularity::Exact));
+        assert!(l.dry_run);
+        // The same three usage errors, in its own vocabulary — and the scope flags are no longer a
+        // usage error once *either* learning flag is present.
+        assert!(parse_app_launch(&v(&["demo-app", "--proc-learn=basename"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--proc-learn", "--detach"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--proc-learn", "-g"])).is_ok());
 
         // The typed security flags are collected into their own fields, in any order with the name.
         let a = parse_app_launch(&v(&[
@@ -2392,8 +2533,11 @@ mod tests {
         let a = parse_app_launch(&v(&["demo-app", "--gpu=false", "--net-learn=path"])).unwrap();
         assert_eq!(a.cli.gpu, vec!["false".to_string()]);
         assert_eq!(
-            a.net_learn.expect("net-learn set").gran,
-            sandbox::Granularity::Path
+            a.learn
+                .expect("net-learn set")
+                .net
+                .expect("net granularity"),
+            sandbox::NetGranularity::Path
         );
     }
 

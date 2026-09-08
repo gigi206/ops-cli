@@ -56,6 +56,7 @@
 use std::collections::BTreeSet;
 
 use super::control::{LogEvent, Plane, Proto};
+use super::learn::Synthesis;
 use crate::allowlist::{Decision, EgressPolicy, canonical_segments, classify};
 
 /// The refusal reasons that mean "this destination is simply not in the allowlist yet" — the only
@@ -95,14 +96,6 @@ impl Granularity {
             Self::Exact => "exact",
         }
     }
-}
-
-/// The result of turning a run's egress log into rules: the rule strings to add (sorted, deduped, each
-/// classifier-valid), and human notes about anything worth the user seeing — a refusal that produced
-/// no rule, or a host whose verb scope was widened.
-pub(crate) struct Synthesis {
-    pub(crate) rules: Vec<String>,
-    pub(crate) notes: Vec<String>,
 }
 
 /// Turn the refusals in `events` into the allowlist rules that would admit them at the requested
