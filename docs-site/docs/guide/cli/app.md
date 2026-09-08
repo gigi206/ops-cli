@@ -99,6 +99,13 @@ app behaves exactly as it would have. The cheap `/proc` poll behind
 shorter than a tick is missed, and an allowlist learned from a sample parks the agent on
 the first program the sample did not see.
 
+What counts as a program the app ran is what the policy was **asked about**, which is
+more than the command lines show. A `#!` script is decided against both itself and the
+interpreter its first line names, and a program started through an explicitly invoked
+dynamic loader is decided against what the loader would load, so running `./build.sh`
+learns `build.sh` and the `sh` that runs it. Both are rules the cage needs under `ask`;
+a list holding only the script would park on its interpreter.
+
 The level sets how wide each rule is:
 
 | Level | Rule written |
