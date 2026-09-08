@@ -2344,6 +2344,9 @@ pub(super) fn build(
     // transparent-capture tap dials it from *outside* the cage, so it needs the real path, not the
     // bind's in-cage name. `None` under any posture that stands no proxy up.
     let mut proxy_host_uds: Option<std::path::PathBuf> = None;
+    // The same, for the proxy's control socket: the tap reports the names the cage resolves through
+    // it, so they land in the record `sbx net logs` reads rather than in a second place.
+    let mut proxy_control_uds: Option<std::path::PathBuf> = None;
 
     // The declared loopback forwarders, bridged into the cage.
     let forward_up = forward_ports(prep, &mut wraps)?;
@@ -2452,6 +2455,7 @@ pub(super) fn build(
         egress_binds = wiring.binds;
         egress_env = wiring.env;
         proxy_host_uds = Some(wiring.host_uds);
+        proxy_control_uds = wiring.control_uds;
         egress_guard = Some(guard);
     }
 
@@ -2684,6 +2688,7 @@ pub(super) fn build(
         false,
         prep.cfg.gui.renders(),
         proxy_host_uds.as_deref(),
+        proxy_control_uds.as_deref(),
     );
     let capture_resolver = holder.as_ref().is_some_and(|h| h.tap.is_some());
     let spec = binds::build_spec(
@@ -2879,6 +2884,7 @@ pub(super) fn holder_plan(
     as_root: bool,
     gui_renders: bool,
     proxy_host_uds: Option<&std::path::Path>,
+    proxy_control_uds: Option<&std::path::Path>,
 ) -> Option<crate::sandbox::spec::NetnsDummy> {
     if net != NetPolicy::Isolated || as_root {
         return None;
@@ -2887,6 +2893,7 @@ pub(super) fn holder_plan(
         crate::pathfind::find_on_path("nft").map(|nft| crate::sandbox::spec::TapWiring {
             uds: uds.to_path_buf(),
             nft,
+            control: proxy_control_uds.map(std::path::Path::to_path_buf),
         })
     });
     if !gui_renders && tap.is_none() {

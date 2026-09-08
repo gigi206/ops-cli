@@ -187,6 +187,10 @@ pub(crate) struct Wiring {
     /// transparent-capture tap ([`super::nettap`]) dials it by this real path, from outside the
     /// cage's mount namespace, so the launcher has to carry it out of here.
     pub(crate) host_uds: PathBuf,
+    /// This proxy's control socket, or `None` under a posture that stands no control plane. The tap
+    /// reports each name the cage resolves through it, so the resolutions land in the same record
+    /// `sbx net logs` reads — the alternative being a second place to look.
+    pub(crate) control_uds: Option<PathBuf>,
 }
 
 /// Wrap `cmd` so the cage starts the forwarder before running it: a static bash that
@@ -1067,7 +1071,7 @@ pub(crate) fn start(
         Egress {
             host_uds: host_uds.clone(),
             ca_file,
-            control_uds,
+            control_uds: control_uds.clone(),
             stats,
             log,
             stop,
@@ -1076,6 +1080,7 @@ pub(crate) fn start(
             binds,
             env,
             host_uds,
+            control_uds: control_uds.clone(),
         },
     ))
 }

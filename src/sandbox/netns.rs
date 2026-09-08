@@ -58,6 +58,10 @@ pub(crate) fn holder_wrap(
                 argv.push(tap.uds.as_os_str().to_owned());
                 argv.push(OsString::from("--nft"));
                 argv.push(tap.nft.as_os_str().to_owned());
+                if let Some(control) = &tap.control {
+                    argv.push(OsString::from("--control"));
+                    argv.push(control.as_os_str().to_owned());
+                }
             }
             // Always emitted, tap or no tap: it is what makes the command unambiguous to parse, so
             // a bwrap argument that happens to spell `--tap` can never be read as the holder's own.
@@ -79,18 +83,21 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
     let rest = &rest[1..];
     let mut uds = None;
     let mut nft = None;
+    let mut control = None;
     let mut i = 0;
     while i < opts.len() {
         match opts[i].to_str() {
             Some("--tap") => uds = opts.get(i + 1).map(PathBuf::from),
             Some("--nft") => nft = opts.get(i + 1).map(PathBuf::from),
+            Some("--control") => control = opts.get(i + 1).map(PathBuf::from),
             _ => return None,
         }
         i += 2;
     }
     let tap = match (uds, nft) {
-        (Some(uds), Some(nft)) => Some(TapWiring { uds, nft }),
-        // Half a wiring is not one: the launcher emits both or neither.
+        (Some(uds), Some(nft)) => Some(TapWiring { uds, nft, control }),
+        // Half a wiring is not one: the launcher emits both or neither. The control socket is not
+        // part of that pair: without it the tap still captures, it just reports no resolutions.
         _ => None,
     };
     Some((tap, rest))
@@ -218,9 +225,12 @@ fn wire_tap(tap: &TapWiring) {
         Ok(exe) => exe,
         Err(e) => return degraded(&format!("cannot locate sbx's own binary ({e})")),
     };
-    let mut child = match std::process::Command::new(exe)
-        .arg("__net-tap")
-        .arg(&tap.uds)
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__net-tap").arg(&tap.uds);
+    if let Some(control) = &tap.control {
+        cmd.arg("--control").arg(control);
+    }
+    let mut child = match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .pre_exec_pdeathsig()
@@ -741,6 +751,7 @@ mod tests {
             tap: Some(TapWiring {
                 uds: PathBuf::from("/run/sbx/proxy.sock"),
                 nft: PathBuf::from("/usr/sbin/nft"),
+                control: Some(PathBuf::from("/run/sbx/control.sock")),
             }),
         }
     }
@@ -760,6 +771,8 @@ mod tests {
                 OsString::from("/run/sbx/proxy.sock"),
                 OsString::from("--nft"),
                 OsString::from("/usr/sbin/nft"),
+                OsString::from("--control"),
+                OsString::from("/run/sbx/control.sock"),
                 OsString::from("--"),
                 OsString::from("/usr/bin/bwrap"),
                 OsString::from("--cap-drop"),

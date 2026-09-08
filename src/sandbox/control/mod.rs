@@ -373,6 +373,13 @@ pub(crate) enum LogVerdict {
     /// The request was allowed but did not complete: the name did not resolve, the host was
     /// unreachable, or its certificate was rejected. Not a refusal — a downstream failure.
     Error,
+    /// A **name the cage asked for**, recorded by the transparent-capture tap when it answered the
+    /// query. Deliberately not [`Allow`](Self::Allow): the tap answers every name without consulting
+    /// the allowlist, because the policy decision belongs to the connection that may follow. Reading
+    /// this as a permission would be wrong in exactly the case that matters — a name resolved and
+    /// never dialed, which is what enumeration and DNS-shaped exfiltration look like, and which no
+    /// other record in this system can see.
+    Resolved,
 }
 
 impl LogVerdict {
@@ -383,18 +390,52 @@ impl LogVerdict {
             LogVerdict::Deny => "deny",
             LogVerdict::Blocked => "blocked",
             LogVerdict::Error => "error",
+            LogVerdict::Resolved => "resolved",
         }
     }
 
-    /// Parse a verdict token back, or `None` if it is not one of the four.
+    /// Parse a verdict token back, or `None` if it is not one of them.
+    ///
+    /// The inverse of [`Self::as_str`], and the two are a pair a test proves total: this side has a
+    /// `_` arm, so the compiler cannot catch a variant added to the other alone, and a verdict that
+    /// fails to parse here is an event **silently dropped** on the reader's side of the wire.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "allow" => Some(LogVerdict::Allow),
             "deny" => Some(LogVerdict::Deny),
             "blocked" => Some(LogVerdict::Blocked),
             "error" => Some(LogVerdict::Error),
+            "resolved" => Some(LogVerdict::Resolved),
             _ => None,
         }
+    }
+
+    /// Every verdict, for the round-trip guard. Built by a match on `self` so a new variant fails to
+    /// compile here rather than going missing from the guard that would have caught it.
+    #[cfg(test)]
+    const ALL: [Self; 5] = [
+        LogVerdict::Allow,
+        LogVerdict::Deny,
+        LogVerdict::Blocked,
+        LogVerdict::Error,
+        LogVerdict::Resolved,
+    ];
+
+    /// Exhaustive by construction: adding a variant breaks this match, which is what makes
+    /// [`Self::ALL`] trustworthy.
+    #[cfg(test)]
+    fn assert_all_listed(self) {
+        let listed = match self {
+            LogVerdict::Allow
+            | LogVerdict::Deny
+            | LogVerdict::Blocked
+            | LogVerdict::Error
+            | LogVerdict::Resolved => true,
+        };
+        assert!(
+            listed && Self::ALL.contains(&self),
+            "{self:?} is not in ALL"
+        );
     }
 }
 
@@ -446,6 +487,10 @@ pub(crate) enum Proto {
     /// The transport was not yet known when the request was refused (a malformed `CONNECT`, a
     /// non-routable request). Rendered as `-`.
     Other,
+    /// A name resolution answered by the transparent-capture tap. Not a transport the proxy used:
+    /// it is the *question* a client asked before choosing one, and it is recorded because the tap
+    /// is the only place in the system that sees it.
+    Dns,
 }
 
 impl Proto {
@@ -456,18 +501,45 @@ impl Proto {
             Proto::Http => "http",
             Proto::Tcp => "tcp",
             Proto::Other => "-",
+            Proto::Dns => "dns",
         }
     }
 
     /// Parse a proto token back, defaulting to [`Other`](Self::Other) for an absent or unknown token
     /// (an older persisted log line carries no `proto=`, so it reads as `-` rather than failing).
+    ///
+    /// That default is also what makes this side unable to fail loudly, so the same round-trip guard
+    /// [`LogVerdict::parse`] carries applies here: a transport missing an arm reads as `-` forever.
     pub(crate) fn parse(s: &str) -> Self {
         match s {
             "https" => Proto::Https,
             "http" => Proto::Http,
             "tcp" => Proto::Tcp,
+            "dns" => Proto::Dns,
             _ => Proto::Other,
         }
+    }
+
+    /// Every transport, for the round-trip guard. See [`LogVerdict::ALL`].
+    #[cfg(test)]
+    const ALL: [Self; 5] = [
+        Proto::Https,
+        Proto::Http,
+        Proto::Tcp,
+        Proto::Other,
+        Proto::Dns,
+    ];
+
+    /// Exhaustive by construction; see [`LogVerdict::assert_all_listed`].
+    #[cfg(test)]
+    fn assert_all_listed(self) {
+        let listed = match self {
+            Proto::Https | Proto::Http | Proto::Tcp | Proto::Other | Proto::Dns => true,
+        };
+        assert!(
+            listed && Self::ALL.contains(&self),
+            "{self:?} is not in ALL"
+        );
     }
 }
 
@@ -1358,6 +1430,36 @@ fn dispatch(
             out.push_str("ok\n");
             out
         }
+        // The transparent-capture tap reporting a name the cage asked for. It is a *write* on a
+        // socket whose other verbs already answer parked requests and remember policy, so it adds
+        // no authority: anything that can reach this socket could already decide egress, and the
+        // socket is bound under the 0700 data directory and never bound into a cage.
+        //
+        // One line per name, not per query: the tap sends this when it first hands a name an
+        // address, so a build resolving one host a thousand times leaves one entry, and what the
+        // record answers is "which names did this cage ask for" rather than "how often".
+        Some("RESOLVED") => {
+            let Some(host) = parts.next() else {
+                return "err bad-request\n".to_string();
+            };
+            // The host is cage-chosen text. It arrives already restricted to name bytes by the
+            // tap's own parser, and `push` sanitises every free-form value again on the way in —
+            // the second layer being the one that holds if this verb ever gains another caller.
+            log.push(
+                false,
+                host,
+                53,
+                None,
+                None,
+                LogVerdict::Resolved,
+                "resolved",
+                Proto::Dns,
+                HttpVer::Unknown,
+                RpcKind::None,
+                Plane::Agent,
+            );
+            "ok\n".to_string()
+        }
         Some("LOG") => {
             // An optional `after=<seq>` makes this a follow read (events past the cursor, with the
             // eviction gap reported); absent, it is a tail read of the whole retained window. An
@@ -1575,6 +1677,39 @@ fn format_event_line(ev: &LogEvent) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `as_str` and `parse` are a pair, and only one of them is checked by the compiler: `parse`
+    /// matches on `&str` with a fallback, so a variant added to `as_str` alone compiles and then
+    /// **silently drops the event** on the reader's side of the control wire. That is not a
+    /// hypothetical: `resolved` and `dns` were added to `as_str` first, and the resolutions the tap
+    /// reported never reached `sbx net logs` until this guard was written.
+    #[test]
+    fn every_verdict_and_transport_survives_the_control_wire() {
+        for v in LogVerdict::ALL {
+            v.assert_all_listed();
+            assert_eq!(
+                LogVerdict::parse(v.as_str()),
+                Some(v),
+                "the verdict `{}` does not survive the wire",
+                v.as_str()
+            );
+        }
+        for p in Proto::ALL {
+            p.assert_all_listed();
+            // `Other` is the token an absent/unknown transport reads as, so it is the one variant
+            // whose round trip is a fixed point rather than a name.
+            if p != Proto::Other {
+                assert_eq!(
+                    Proto::parse(p.as_str()),
+                    p,
+                    "the transport `{}` does not survive the wire",
+                    p.as_str()
+                );
+            }
+        }
+        assert_eq!(Proto::parse("-"), Proto::Other);
+        assert_eq!(Proto::parse("something else"), Proto::Other);
+    }
+
     use super::*;
     use std::thread;
 

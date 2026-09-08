@@ -1288,4 +1288,36 @@ mod tests {
                 .unwrap_or_else(|e| panic!("`{token}` must be a rule: {e}"));
         }
     }
+
+    /// A resolution is not a refusal, and `--net-learn` must never turn one into a rule. The tap
+    /// answers **every** name without consulting the allowlist, so learning from these would write
+    /// an allow for each host the cage merely asked about — including the ones it asked about
+    /// precisely because they were not allowed. The gate is the reason, not the verdict, and this
+    /// pins that it holds for the verdict the tap writes.
+    #[test]
+    fn a_resolved_name_is_never_learned_into_the_allowlist() {
+        let ev = LogEvent {
+            seq: 1,
+            at_epoch_ms: 0,
+            host: "exfiltration.test".to_string(),
+            port: 53,
+            method: None,
+            path: None,
+            verdict: LogVerdict::Resolved,
+            reason: "resolved".to_string(),
+            proto: Proto::Dns,
+            http_ver: crate::sandbox::control::HttpVer::Unknown,
+            rpc: crate::sandbox::control::RpcKind::None,
+            muted: false,
+            status: None,
+            plane: crate::sandbox::control::Plane::Agent,
+            amend_seq: None,
+            awaiting_capture: false,
+            secrets_seen: Vec::new(),
+        };
+        assert!(
+            rules(&[ev], Granularity::Domain).is_empty(),
+            "a name the cage merely resolved must never become an allow rule"
+        );
+    }
 }

@@ -218,6 +218,20 @@ same proxy, so the request meets the **same** policy as any other: host, path, m
 anti-fronting check, credential injection, the SSRF guard. Nothing is loosened; a name the allowlist
 does not permit is refused exactly as it would be through the proxy.
 
+Every name the cage asks for is recorded. A resolution appears in
+[`sbx net logs`](../cli/net) on its own line, once per name:
+
+```
+  3786263  07:56:46  dns    example.com:53   resolved
+  3786263  07:56:46  https/h1  example.com:443  GET /  allow
+```
+
+That is the one thing no other record can show: a name the cage resolved and then **never
+connected to** leaves the first line without the second. Nothing else in the system sees that
+question being asked, and a `resolved` line is deliberately not an `allow`: the tap answers every
+name without consulting the allowlist, because the decision belongs to the connection that may
+follow. `--net-learn` therefore never turns one into a rule.
+
 Two consequences worth knowing:
 
 - A client that connects to a **literal IP address** (or to one it cached before the cage started)

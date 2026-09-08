@@ -508,7 +508,8 @@ fn an_as_root_cage_never_runs_behind_the_holder() {
             NetPolicy::Isolated,
             true,
             true,
-            Some(std::path::Path::new("/x.sock"))
+            Some(std::path::Path::new("/x.sock")),
+            None
         )
         .is_none(),
         "an as_root cage must not be given the holder"
@@ -522,7 +523,8 @@ fn a_shared_network_posture_needs_no_holder() {
             NetPolicy::Shared,
             false,
             true,
-            Some(std::path::Path::new("/x.sock"))
+            Some(std::path::Path::new("/x.sock")),
+            None
         )
         .is_none(),
         "there is nothing to capture and no empty namespace to reassure a browser about"
@@ -531,7 +533,7 @@ fn a_shared_network_posture_needs_no_holder() {
 
 #[test]
 fn an_isolated_cage_with_neither_a_browser_nor_a_proxy_needs_no_holder() {
-    assert!(super::build::holder_plan(NetPolicy::Isolated, false, false, None).is_none());
+    assert!(super::build::holder_plan(NetPolicy::Isolated, false, false, None, None).is_none());
 }
 
 /// `holder_plan` reads `as_root` as a parameter because the spec that would carry it does not

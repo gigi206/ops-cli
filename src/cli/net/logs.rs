@@ -451,13 +451,16 @@ fn flush_stream(s: &str) -> std::io::Result<()> {
 }
 
 /// The ANSI span for a verdict: green for `allow`, red for a refusal (`deny`/`blocked`), yellow for
-/// `error` (allowed but failed) — so a scan of the log reads at a glance.
+/// `error` (allowed but failed) — so a scan of the log reads at a glance. `resolved` is dim: it is
+/// an observation, not a decision, and colouring it like an allow would say the allowlist had
+/// permitted something it was never asked about.
 fn verdict_color(verdict: sandbox::control::LogVerdict, pal: &style::Palette) -> &str {
     use sandbox::control::LogVerdict::*;
     match verdict {
         Allow => pal.ok,
         Deny | Blocked => pal.err,
         Error => pal.warn,
+        Resolved => pal.dim,
     }
 }
 
@@ -474,9 +477,9 @@ fn status_color(code: u16, pal: &style::Palette) -> &str {
 /// Render the live egress log — a pure presenter (its colored layout is asserted in a test): a
 /// header, then per session a context line and one line per event
 /// (`time · host:port · method path · verdict · reason`), oldest first. The `reason` is dropped for a
-/// plain `allow` (it would just repeat "allowed"). An empty result explains the log is live-only.
-/// `footer` appends the live-only note — on for the one-shot listing, off for the `--follow` seed
-/// (where events append below it, so the note would land mid-stream).
+/// plain `allow` or a `resolved` (each would just repeat its own verdict). An empty result explains
+/// the log is live-only. `footer` appends that note — on for the one-shot listing, off for the seed
+/// of a `--follow` (where events append below it, so the note would land mid-stream).
 fn render_logs(
     sessions: &[sandbox::control::SessionLog],
     context: &[(u32, PathBuf, String)],
@@ -562,7 +565,8 @@ fn render_logs(
 /// One event's display line (indented, no trailing newline): `session-id · time · host:port ·
 /// method path · verdict · reason`. The `pid` is the session id (the one `sbx session ls`/`attach`/`stop`
 /// use), led so a line is self-contained when scanned or piped. The `reason` is dropped for a plain
-/// `allow` (it would just repeat "allowed"); a blank host (a malformed handshake) shows `-`. Shared
+/// `allow` or a `resolved` (each would just repeat its own verdict); a blank host (a malformed
+/// handshake) shows `-`. Shared
 /// by the one-shot render and the `--follow` stream so a line looks identical in both.
 fn render_log_line(
     e: &sandbox::control::LogEvent,
@@ -601,7 +605,12 @@ fn render_log_line(
         format!("  {n}{}{r}", e.rpc.as_str())
     };
     let vc = verdict_color(e.verdict, pal);
-    let reason = if e.verdict == sandbox::control::LogVerdict::Allow {
+    // `allow` and `resolved` carry no parenthetical: the first has nothing to explain, and the
+    // second's reason is its own verdict spelled twice.
+    let reason = if matches!(
+        e.verdict,
+        sandbox::control::LogVerdict::Allow | sandbox::control::LogVerdict::Resolved
+    ) {
         String::new()
     } else {
         format!("  {dim}({}){r}", e.reason)

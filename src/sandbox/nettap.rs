@@ -52,6 +52,21 @@
 //!   past a checked bound, or trusts a length it read.
 //! - **Never block without end.** Reads are bounded and time-limited, and the tables are capped.
 //!
+//! ## Where things live
+//!
+//! Four concerns, in this order, and the first is not part of the tap at all:
+//!
+//! - **What the launcher installs** — [`resolv_conf`], [`redirect_ruleset`], [`install_redirect`],
+//!   and [`probe_capture`] with [`CaptureSupport`]. Called by the netns holder and by `sbx doctor`,
+//!   in *their* processes; the tap itself never runs any of it.
+//! - **The resolver** — [`FakeIps`] and the DNS codec ([`parse_question`], [`build_answer`],
+//!   [`answer_query`]), plus the [`Reporter`] that puts each new name in the egress record.
+//! - **The capture** — [`original_dst`], [`synthesize_connect`], [`serve_capture`] and the
+//!   [`Capture`] outcome: one connection, turned back into a name and handed to the proxy.
+//! - **The process** — [`run_tap`] and the three accept loops, which own the sockets and nothing
+//!   else. Every decision above is a pure function or a method, so the loops are the only part that
+//!   needs a running namespace to exercise.
+//!
 //! ## Degraded mode
 //!
 //! Nothing here is required for egress. Where the redirect rules cannot be installed — a kernel
@@ -318,9 +333,9 @@ impl FakeIps {
     /// The address for `name`, allocating one on first sight. `None` when the table is full of
     /// names that are all pinned — the caller answers `SERVFAIL`, which is the honest reply: the
     /// tap cannot promise an address it would have to take back.
-    pub(crate) fn alloc(&mut self, name: &str) -> Option<Ipv4Addr> {
+    pub(crate) fn alloc(&mut self, name: &str) -> Option<(Ipv4Addr, bool)> {
         if let Some(ip) = self.by_name.get(name) {
-            return Some(*ip);
+            return Some((*ip, false));
         }
         if self.by_ip.len() >= FAKE_IP_CAP && !self.evict_one() {
             return None;
@@ -333,7 +348,7 @@ impl FakeIps {
         self.by_name.insert(name.to_string(), ip);
         self.by_ip.insert(ip, name.to_string());
         self.order.push_back(ip);
-        Some(ip)
+        Some((ip, true))
     }
 
     /// Drop the oldest never-connected name. `false` when every held name is pinned.
@@ -374,6 +389,45 @@ impl FakeIps {
         self.by_ip.len()
     }
 }
+
+/// Where the tap reports the names the cage asked for.
+///
+/// The report goes to the proxy's control socket, so a resolution lands in the same record
+/// `sbx net logs` reads rather than in a second place with its own reader. A report is never a
+/// prerequisite: every failure is swallowed, because a cage whose egress works must not lose it
+/// because a log line could not be delivered.
+///
+/// Sent **once per name**, when it is first given an address, not once per query: a build resolving
+/// one host a thousand times leaves one entry, and the question the record answers is "which names
+/// did this cage ask for" rather than "how often".
+#[derive(Debug, Default)]
+pub(crate) struct Reporter {
+    control: Option<PathBuf>,
+}
+
+impl Reporter {
+    pub(crate) fn new(control: Option<PathBuf>) -> Self {
+        Self { control }
+    }
+
+    /// Report one newly resolved name. Best-effort and non-blocking beyond a short write: the
+    /// control plane answers `ok`, which is not read back, because nothing here would do anything
+    /// differently on a refusal.
+    pub(crate) fn resolved(&self, host: &str) {
+        let Some(control) = &self.control else {
+            return;
+        };
+        if let Ok(mut sock) = UnixStream::connect(control) {
+            let _ = sock.set_write_timeout(Some(REPORT_TIMEOUT));
+            let _ = sock.write_all(format!("RESOLVED {host}\n").as_bytes());
+            let _ = sock.flush();
+        }
+    }
+}
+
+/// How long a resolution report may take before it is abandoned. Short: the cage is waiting on the
+/// DNS answer behind it, and a report is worth none of that latency.
+const REPORT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A parsed DNS question: the name asked for, its type, and how many bytes the question section
 /// occupies after the 12-byte header (so a reply can echo it back verbatim).
@@ -423,7 +477,16 @@ pub(crate) fn parse_question(buf: &[u8]) -> Option<Question> {
         }
         let end = off.checked_add(1)?.checked_add(len)?;
         let label = buf.get(off + 1..end)?;
-        if !label.is_ascii() {
+        // Letters, digits, `-` and `_`, and nothing else. `is_ascii()` would not be enough: it
+        // admits spaces and control characters, and this name is about to be **written into the
+        // egress record**, where a byte that ends a line or splits a token lets a caged workload
+        // forge an entry beside the real ones. The restriction costs nothing real — an
+        // international name reaches the wire as punycode, which is LDH — and it is applied at the
+        // parse, so no later consumer has to remember.
+        if !label
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+        {
             return None;
         }
         labels.push(std::str::from_utf8(label).ok()?);
@@ -479,15 +542,28 @@ pub(crate) fn build_answer(query: &[u8], q: &Question, addr: Option<Ipv4Addr>) -
 /// Serve one query end to end: parse, allocate, encode. `None` when the query is not one this tap
 /// answers, in which case the caller drops it without replying — a resolver that says nothing is
 /// what a client already knows how to survive.
-pub(crate) fn answer_query(query: &[u8], table: &Mutex<FakeIps>) -> Option<Vec<u8>> {
+pub(crate) fn answer_query(
+    query: &[u8],
+    table: &Mutex<FakeIps>,
+    reporter: &Reporter,
+) -> Option<Vec<u8>> {
     let q = parse_question(query)?;
+    let mut allocated = None;
     let addr = if q.qtype == QTYPE_A {
         // A poisoned lock means another thread panicked mid-update. The tap answers nothing rather
         // than reading a table whose invariants may be half-applied.
-        table.lock().ok()?.alloc(&q.name)
+        allocated = table.lock().ok()?.alloc(&q.name);
+        allocated.map(|(ip, _)| ip)
     } else {
         None
     };
+    // Reported after the lock is released: the report dials a socket, and holding the table across
+    // that would serialise every other resolution behind one report's round trip.
+    if let Some((_, fresh)) = allocated
+        && fresh
+    {
+        reporter.resolved(&q.name);
+    }
     build_answer(query, &q, addr)
 }
 
@@ -689,13 +765,14 @@ pub(crate) fn serve_capture(
 /// Never returns: it serves until the cage exits, at which point the parent-death signal set by the
 /// holder takes it down with `bwrap`.
 pub(crate) fn run_tap(argv: &[OsString]) -> ! {
-    let Some(uds) = argv.first().map(PathBuf::from) else {
-        eprintln!("__net-tap: no egress socket given");
+    let Some((uds, control)) = parse_tap_args(argv) else {
+        eprintln!("__net-tap: usage: __net-tap <egress socket> [--control <socket>]");
         std::process::exit(2);
     };
     let table = Arc::new(Mutex::new(FakeIps::new()));
+    let reporter = Arc::new(Reporter::new(control));
 
-    match serve(&uds, &table) {
+    match serve(&uds, &table, &reporter) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("__net-tap: {e}");
@@ -704,8 +781,28 @@ pub(crate) fn run_tap(argv: &[OsString]) -> ! {
     }
 }
 
+/// The tap's own arguments: the egress socket, then optional flags.
+///
+/// Strict, like the holder's own parse and for the same reason: an argument list this process does
+/// not fully understand is one it was not given by the launcher, and guessing at it would leave a
+/// tap serving with a wiring nobody chose. `--control` is the one option, and its absence costs the
+/// cage nothing but the record — the tap still answers DNS and still captures.
+fn parse_tap_args(argv: &[OsString]) -> Option<(PathBuf, Option<PathBuf>)> {
+    let uds = PathBuf::from(argv.first()?);
+    let mut control = None;
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].to_str() {
+            Some("--control") => control = Some(PathBuf::from(argv.get(i + 1)?)),
+            _ => return None,
+        }
+        i += 2;
+    }
+    Some((uds, control))
+}
+
 /// Bind the three listeners and serve them until the process is taken down.
-fn serve(uds: &Path, table: &Arc<Mutex<FakeIps>>) -> io::Result<()> {
+fn serve(uds: &Path, table: &Arc<Mutex<FakeIps>>, reporter: &Arc<Reporter>) -> io::Result<()> {
     let dns_udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, TAP_DNS_PORT))?;
     let dns_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, TAP_DNS_PORT))?;
     let captured = TcpListener::bind((Ipv4Addr::LOCALHOST, TAP_PORT))?;
@@ -716,11 +813,13 @@ fn serve(uds: &Path, table: &Arc<Mutex<FakeIps>>) -> io::Result<()> {
 
     {
         let table = Arc::clone(table);
-        std::thread::spawn(move || serve_dns_udp(&dns_udp, &table));
+        let reporter = Arc::clone(reporter);
+        std::thread::spawn(move || serve_dns_udp(&dns_udp, &table, &reporter));
     }
     {
         let table = Arc::clone(table);
-        std::thread::spawn(move || serve_dns_tcp(&dns_tcp, &table));
+        let reporter = Arc::clone(reporter);
+        std::thread::spawn(move || serve_dns_tcp(&dns_tcp, &table, &reporter));
     }
     serve_captured(&captured, table, uds);
     Ok(())
@@ -730,13 +829,13 @@ fn serve(uds: &Path, table: &Arc<Mutex<FakeIps>>) -> io::Result<()> {
 /// destination to `127.0.0.1`, and replying from that same address is what makes the conntrack
 /// entry translate the source back to the address the client sent to. A reply from any other local
 /// address would be dropped by the client as coming from the wrong server.
-fn serve_dns_udp(sock: &std::net::UdpSocket, table: &Mutex<FakeIps>) {
+fn serve_dns_udp(sock: &std::net::UdpSocket, table: &Mutex<FakeIps>, reporter: &Reporter) {
     let mut buf = [0u8; DNS_MAX];
     loop {
         let Ok((n, peer)) = sock.recv_from(&mut buf) else {
             continue;
         };
-        if let Some(reply) = answer_query(&buf[..n], table) {
+        if let Some(reply) = answer_query(&buf[..n], table, reporter) {
             let _ = sock.send_to(&reply, peer);
         }
     }
@@ -745,7 +844,7 @@ fn serve_dns_udp(sock: &std::net::UdpSocket, table: &Mutex<FakeIps>) {
 /// The TCP resolver, for clients configured with `options use-vc` and for any answer a client
 /// retries over TCP. One connection carries **several** queries (RFC 7766), so each is served until
 /// the peer closes; serving only the first is a hang for every client that reuses the connection.
-fn serve_dns_tcp(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>) {
+fn serve_dns_tcp(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>, reporter: &Arc<Reporter>) {
     let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     loop {
         let Ok((stream, _)) = listener.accept() else {
@@ -755,9 +854,10 @@ fn serve_dns_tcp(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>) {
         // is a client that hangs, and the client's own retry is the better wait.
         let Some(slot) = cap.take() else { continue };
         let table = Arc::clone(table);
+        let reporter = Arc::clone(reporter);
         super::conncap::spawn_conn("net-tap-dns", move || {
             let _slot = slot;
-            let _ = serve_dns_stream(stream, &table);
+            let _ = serve_dns_stream(stream, &table, &reporter);
         });
     }
 }
@@ -765,7 +865,11 @@ fn serve_dns_tcp(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>) {
 /// Serve one DNS-over-TCP connection: length-prefixed queries, answered in order, until the peer
 /// closes. A message the tap does not answer is dropped and the loop continues — a workload cannot
 /// take its own resolver down (and with it the cage's egress) by writing rubbish at it.
-fn serve_dns_stream(mut stream: TcpStream, table: &Mutex<FakeIps>) -> io::Result<()> {
+fn serve_dns_stream(
+    mut stream: TcpStream,
+    table: &Mutex<FakeIps>,
+    reporter: &Reporter,
+) -> io::Result<()> {
     let _ = stream.set_read_timeout(Some(CONNECT_TIMEOUT));
     let mut len = [0u8; 2];
     loop {
@@ -781,7 +885,7 @@ fn serve_dns_stream(mut stream: TcpStream, table: &Mutex<FakeIps>) -> io::Result
         if stream.read_exact(&mut buf).is_err() {
             return Ok(());
         }
-        if let Some(reply) = answer_query(&buf, table) {
+        if let Some(reply) = answer_query(&buf, table, reporter) {
             let framed = u16::try_from(reply.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "reply too long to frame")
             })?;
@@ -824,7 +928,14 @@ fn serve_captured(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>, uds: &Pat
         super::conncap::spawn_conn("net-tap", move || {
             let _slot = slot;
             let outcome = serve_capture(stream, dest, &table, &uds);
-            eprintln!("__net-tap: {}", outcome.describe());
+            // Only what the proxy cannot see. A proxied capture already has a line in the egress
+            // record — the synthesized `CONNECT` is an ordinary request there — so repeating it
+            // here would put every connection of a proxy-blind client twice in front of the reader,
+            // once in each of two places. The other three outcomes never reach the proxy at all,
+            // and are the whole reason a refusal is now a line instead of a silent `ENETUNREACH`.
+            if !matches!(outcome, Capture::Proxied { .. }) {
+                eprintln!("__net-tap: {}", outcome.describe());
+            }
         });
     }
 }

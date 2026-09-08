@@ -97,6 +97,28 @@ fn a_malformed_question_is_refused_not_parsed() {
     utf8[13] = 0xff;
     assert!(parse_question(&utf8).is_none(), "non-ascii label");
 
+    // Bytes that are ASCII but not name bytes. The name is written into the egress record, so a
+    // byte that ends a line or splits a token would let a caged workload forge an entry beside the
+    // real ones — `is_ascii()` alone admits every one of these.
+    for (byte, what) in [
+        (b'\n', "newline"),
+        (b'\r', "carriage return"),
+        (b' ', "space"),
+        (b'\t', "tab"),
+        (
+            b'=',
+            "an equals sign, which the record's fields are keyed by",
+        ),
+        (0x00, "a NUL"),
+    ] {
+        let mut forged = good.clone();
+        forged[13] = byte;
+        assert!(
+            parse_question(&forged).is_none(),
+            "a label carrying {what} must be refused"
+        );
+    }
+
     // Longer than any query this tap answers.
     assert!(
         parse_question(&vec![0u8; DNS_MAX + 1]).is_none(),
@@ -108,7 +130,7 @@ fn a_malformed_question_is_refused_not_parsed() {
 fn an_a_question_is_answered_with_the_synthetic_address() {
     let table = Mutex::new(FakeIps::new());
     let q = query("github.com", QTYPE_A);
-    let reply = answer_query(&q, &table).expect("answered");
+    let reply = answer_query(&q, &table, &Reporter::default()).expect("answered");
 
     assert_eq!(reply[0..2], q[0..2], "the query's id is echoed");
     assert_eq!(rcode(&reply), 0, "NOERROR");
@@ -135,7 +157,8 @@ fn a_non_a_question_is_answered_noerror_and_empty() {
         65,    /* HTTPS */
         33,    /* SRV */
     ] {
-        let reply = answer_query(&query("github.com", qtype), &table).expect("answered");
+        let reply = answer_query(&query("github.com", qtype), &table, &Reporter::default())
+            .expect("answered");
         assert_eq!(rcode(&reply), 0, "qtype {qtype} must be NOERROR");
         assert_eq!(ancount(&reply), 0, "qtype {qtype} must carry no answer");
     }
@@ -149,9 +172,16 @@ fn a_non_a_question_is_answered_noerror_and_empty() {
 #[test]
 fn the_same_name_keeps_its_address_and_a_second_name_gets_another() {
     let table = Mutex::new(FakeIps::new());
-    let first = answer_query(&query("github.com", QTYPE_A), &table).expect("answered");
-    let again = answer_query(&query("github.com", QTYPE_A), &table).expect("answered");
-    let other = answer_query(&query("cache.nixos.org", QTYPE_A), &table).expect("answered");
+    let first = answer_query(&query("github.com", QTYPE_A), &table, &Reporter::default())
+        .expect("answered");
+    let again = answer_query(&query("github.com", QTYPE_A), &table, &Reporter::default())
+        .expect("answered");
+    let other = answer_query(
+        &query("cache.nixos.org", QTYPE_A),
+        &table,
+        &Reporter::default(),
+    )
+    .expect("answered");
 
     assert_eq!(first[first.len() - 4..], again[again.len() - 4..]);
     assert_ne!(first[first.len() - 4..], other[other.len() - 4..]);
@@ -160,7 +190,7 @@ fn the_same_name_keeps_its_address_and_a_second_name_gets_another() {
 #[test]
 fn a_claimed_address_names_its_host() {
     let mut t = FakeIps::new();
-    let ip = t.alloc("api.anthropic.com").expect("allocated");
+    let ip = t.alloc("api.anthropic.com").expect("allocated").0;
     assert_eq!(t.claim(ip).as_deref(), Some("api.anthropic.com"));
     assert_eq!(
         t.claim(Ipv4Addr::new(198, 18, 200, 200)),
@@ -175,9 +205,9 @@ fn a_claimed_address_names_its_host() {
 #[test]
 fn eviction_reclaims_an_unused_name_and_never_a_connected_one() {
     let mut t = FakeIps::new();
-    let pinned = t.alloc("pinned.test").expect("allocated");
+    let pinned = t.alloc("pinned.test").expect("allocated").0;
     t.claim(pinned);
-    let doomed = t.alloc("unused.test").expect("allocated");
+    let doomed = t.alloc("unused.test").expect("allocated").0;
     for i in 0..FAKE_IP_CAP - 2 {
         t.alloc(&format!("filler{i}.test")).expect("allocated");
     }
@@ -197,13 +227,13 @@ fn eviction_reclaims_an_unused_name_and_never_a_connected_one() {
 #[test]
 fn a_reclaimed_address_is_not_handed_out_again() {
     let mut t = FakeIps::new();
-    let first = t.alloc("first.test").expect("allocated");
+    let first = t.alloc("first.test").expect("allocated").0;
     for i in 0..FAKE_IP_CAP {
         t.alloc(&format!("filler{i}.test"));
     }
     assert_eq!(t.peek(first), None, "reclaimed");
     let seen: std::collections::HashSet<_> = (0..64)
-        .filter_map(|i| t.alloc(&format!("later{i}.test")))
+        .filter_map(|i| t.alloc(&format!("later{i}.test")).map(|(ip, _)| ip))
         .collect();
     assert!(
         !seen.contains(&first),
@@ -219,11 +249,16 @@ fn a_table_full_of_connected_names_answers_servfail() {
     {
         let mut t = table.lock().expect("lock");
         for i in 0..FAKE_IP_CAP {
-            let ip = t.alloc(&format!("held{i}.test")).expect("allocated");
+            let (ip, _) = t.alloc(&format!("held{i}.test")).expect("allocated");
             t.claim(ip);
         }
     }
-    let reply = answer_query(&query("overflow.test", QTYPE_A), &table).expect("answered");
+    let reply = answer_query(
+        &query("overflow.test", QTYPE_A),
+        &table,
+        &Reporter::default(),
+    )
+    .expect("answered");
     assert_eq!(rcode(&reply), 2, "SERVFAIL");
     assert_eq!(ancount(&reply), 0);
 }
@@ -325,7 +360,8 @@ fn a_named_address_reaches_the_proxy_as_a_connect_and_then_pumps() {
         .lock()
         .expect("lock")
         .alloc("github.com")
-        .expect("allocated");
+        .expect("allocated")
+        .0;
 
     let (outcome, echoed) = capture_through(ip, &table, &uds, b"hello");
     assert_eq!(
@@ -356,7 +392,8 @@ fn a_refused_request_closes_the_captured_connection() {
         .lock()
         .expect("lock")
         .alloc("blocked.test")
-        .expect("allocated");
+        .expect("allocated")
+        .0;
 
     let (outcome, echoed) = capture_through(ip, &table, &uds, b"hello");
     assert_eq!(
@@ -424,7 +461,8 @@ fn a_proxy_that_is_not_there_is_reported_not_hung() {
         .lock()
         .expect("lock")
         .alloc("github.com")
-        .expect("allocated");
+        .expect("allocated")
+        .0;
 
     let (outcome, _) = capture_through(ip, &table, &uds, b"x");
     assert_eq!(
@@ -447,7 +485,7 @@ fn one_dns_connection_serves_several_queries() {
     let served = Arc::clone(&table);
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        let _ = serve_dns_stream(stream, &served);
+        let _ = serve_dns_stream(stream, &served, &Reporter::default());
     });
 
     let mut c = TcpStream::connect(addr).expect("connect");
@@ -487,7 +525,7 @@ fn rubbish_on_the_dns_connection_does_not_end_the_service() {
     let served = Arc::clone(&table);
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
-        let _ = serve_dns_stream(stream, &served);
+        let _ = serve_dns_stream(stream, &served, &Reporter::default());
     });
 
     let mut c = TcpStream::connect(addr).expect("connect");
@@ -584,5 +622,122 @@ fn the_cage_resolver_file_names_an_address_the_redirect_catches() {
     assert!(
         body.lines().any(|l| l.starts_with("nameserver ")),
         "glibc needs a nameserver line: {body}"
+    );
+}
+
+/// A stand-in control plane: collects the lines the tap reports, and answers `ok` like the real one.
+fn stand_in_control(uds: &Path) -> std::sync::mpsc::Receiver<String> {
+    let listener = UnixListener::bind(uds).expect("bind the stand-in control plane");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut line = String::new();
+            if BufReader::new(stream.try_clone().expect("clone"))
+                .read_line(&mut line)
+                .is_ok()
+            {
+                let _ = stream.write_all(b"ok\n");
+                if tx.send(line.trim().to_string()).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// A name is reported when it is first given an address, and **not** on the queries that follow.
+/// A build resolving one host thousands of times must leave one entry: the record answers "which
+/// names did this cage ask for", and repeating it would drown that answer in its own noise.
+#[test]
+fn a_name_is_reported_once_however_often_it_is_asked_for() {
+    let dir = TmpDir::new();
+    let control = dir.join("control.sock");
+    let lines = stand_in_control(&control);
+    let reporter = Reporter::new(Some(control));
+    let table = Mutex::new(FakeIps::new());
+
+    for _ in 0..3 {
+        answer_query(&query("github.com", QTYPE_A), &table, &reporter).expect("answered");
+    }
+    answer_query(&query("cache.nixos.org", QTYPE_A), &table, &reporter).expect("answered");
+
+    assert_eq!(
+        lines.recv_timeout(Duration::from_secs(5)).expect("first"),
+        "RESOLVED github.com"
+    );
+    assert_eq!(
+        lines.recv_timeout(Duration::from_secs(5)).expect("second"),
+        "RESOLVED cache.nixos.org"
+    );
+    assert!(
+        lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a repeated query must not repeat the report"
+    );
+}
+
+/// A question the tap cannot route consumes no address, so there is nothing to report either: the
+/// record would otherwise name hosts the cage never got an answer for.
+#[test]
+fn a_question_that_gets_no_address_is_not_reported() {
+    let dir = TmpDir::new();
+    let control = dir.join("control.sock");
+    let lines = stand_in_control(&control);
+    let reporter = Reporter::new(Some(control));
+    let table = Mutex::new(FakeIps::new());
+
+    answer_query(&query("github.com", 28 /* AAAA */), &table, &reporter).expect("answered");
+    assert!(lines.recv_timeout(Duration::from_millis(300)).is_err());
+}
+
+/// Reporting is never a prerequisite: a tap wired without a control plane, or pointed at a socket
+/// nothing serves, must answer DNS exactly the same. A cage whose egress works must not lose it
+/// because a log line could not be delivered.
+#[test]
+fn a_reporter_with_nowhere_to_report_still_answers() {
+    let dir = TmpDir::new();
+    let table = Mutex::new(FakeIps::new());
+    for reporter in [
+        Reporter::default(),
+        Reporter::new(Some(dir.join("nothing-listens-here.sock"))),
+    ] {
+        let reply = answer_query(&query("github.com", QTYPE_A), &table, &reporter)
+            .expect("the answer does not depend on the report");
+        assert_eq!(ancount(&reply), 1);
+    }
+}
+
+/// The tap's argument list is parsed strictly, like the holder's: a list this process does not
+/// fully understand is one the launcher did not give it, and serving with a guessed wiring is worse
+/// than refusing to start.
+#[test]
+fn the_taps_arguments_are_parsed_strictly() {
+    let sock = OsString::from("/run/sbx/egress.sock");
+    let control = OsString::from("/run/sbx/control.sock");
+
+    let (uds, reported) =
+        parse_tap_args(std::slice::from_ref(&sock)).expect("the socket alone is enough");
+    assert_eq!(uds, PathBuf::from("/run/sbx/egress.sock"));
+    assert_eq!(
+        reported, None,
+        "no control socket is a tap that reports nothing"
+    );
+
+    let (_, reported) =
+        parse_tap_args(&[sock.clone(), OsString::from("--control"), control.clone()])
+            .expect("with a control socket");
+    assert_eq!(reported, Some(PathBuf::from("/run/sbx/control.sock")));
+
+    assert_eq!(parse_tap_args(&[]), None, "no socket at all");
+    assert_eq!(
+        parse_tap_args(&[sock.clone(), OsString::from("--control")]),
+        None,
+        "a flag with no value"
+    );
+    assert_eq!(
+        parse_tap_args(&[sock, OsString::from("--unknown"), control]),
+        None,
+        "an option this process does not understand"
     );
 }
