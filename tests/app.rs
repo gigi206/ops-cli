@@ -462,10 +462,9 @@ fn prune_previews_the_undeclared_tool_by_provider_and_removes_nothing() {
 /// entries and interpreters live in `installs/`, so a build in flight loses its tool mid-command.
 /// The applying form is refused while such a session exists; the preview stays safe and stays
 /// available.
-#[test]
-fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
-    let fx = fixture_with_a_leftover();
-    // A registry record for *this* process, which is alive, so it survives the liveness pruning.
+/// Register a live session of `app` in the fixture's registry: a record for *this* process, which
+/// is alive, so it survives the liveness pruning the registry does on every read.
+fn register_live_session(fx: &Project, app: &str) {
     let sessions = fx.data_home.path().join("sbx/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let pid = std::process::id();
@@ -482,11 +481,17 @@ fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
     std::fs::write(
         sessions.join(format!("{pid}-{start}")),
         format!(
-            "kind=run\npid={pid}\nstart={start}\nruntime=global-app:demo-app\ndetached=false\n\
+            "kind=run\npid={pid}\nstart={start}\nruntime=global-app:{app}\ndetached=false\n\
              project={project}\n"
         ),
     )
     .unwrap();
+}
+
+#[test]
+fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
+    let fx = fixture_with_a_leftover();
+    register_live_session(&fx, "demo-app");
 
     let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
     assert!(
@@ -669,6 +674,41 @@ fn prune_all_sweeps_every_app_that_has_a_home() {
     assert!(
         s.contains("and 2 cache(s)"),
         "the sweep totals both apps' caches in one line: {s}"
+    );
+}
+
+/// A sweep must not stop at the first app it may not touch: an app whose session is live is skipped
+/// and named, the rest are still pruned, and the run exits non-zero so a script sees that the sweep
+/// was not complete. Refusing outright, as the named form does, would let one running agent stand
+/// between the user and every other app's caches.
+#[test]
+fn prune_all_skips_a_live_app_names_it_and_still_sweeps_the_rest() {
+    let fx = fixture_with_a_leftover();
+    fx.write_cache_entry("demo-app", "mise", 4096);
+    fx.write_cache_entry("other-app", "npm", 2048);
+    register_live_session(&fx, "demo-app");
+
+    let out = fx.run(&["app", "prune", "--all", "--caches", "--yes"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an incomplete sweep must exit non-zero: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("demo-app") && text(&out).contains("live session"),
+        "the skipped app must be named, with the reason: {}",
+        text(&out)
+    );
+    assert!(
+        fx.app_home("demo-app").join(".cache/mise/blob").exists(),
+        "the live app's cache must be left alone"
+    );
+    assert!(
+        !fx.app_home("other-app").join(".cache/npm").exists(),
+        "every other app is still swept: {}",
+        text(&out)
     );
 }
 

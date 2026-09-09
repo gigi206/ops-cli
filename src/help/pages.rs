@@ -2317,8 +2317,7 @@ pub(super) const PAGES: &[Page] = &[
             what it downloaded, which is usually the larger half of an app's footprint and is not\n\
             shared between apps. The XDG base directory specification defines that directory as\n\
             non-essential data, so what goes costs a refetch and nothing else; login and session\n\
-            state lives elsewhere and is not touched. A tool that pinned a resolution there resolves\n\
-            again on the next launch, so a floating version may land on a newer release.\n\
+            state lives elsewhere and is not touched.\n\
             \n\
             `--all` sweeps every app that has an installed home rather than one named — it widens\n\
             the scope the way `sbx gc --all` does, and means something different there. Naming an\n\

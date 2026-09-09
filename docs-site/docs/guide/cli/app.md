@@ -408,10 +408,6 @@ than as a per-tool list: what goes costs a refetch and nothing else. An app's lo
 session state lives under `.config` and `.local/share`, and neither is touched, so an app
 stays signed in.
 
-One behavioural caveat: a tool that had pinned a resolution in its cache resolves again on
-the next launch, so a dependency declared as a floating version may land on a newer release
-than the one it was running. A version pinned in a config file is unaffected.
-
 `--all` sweeps every app that has an installed home instead of one named. It widens the
 scope the way [`sbx gc --all`](gc) does, though the two widen different things. Naming an
 app **and** `--all` is refused, since neither would clearly govern.
