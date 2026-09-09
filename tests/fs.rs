@@ -764,3 +764,52 @@ fn test_fs_refuses_a_path_outside_the_project() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("outside the project"), "{err}");
 }
+
+/// A path the **project** chose reaches this terminal through the verdict, and it must arrive as
+/// text rather than as instructions.
+///
+/// `sbx test fs` resolves its argument through the project's own symlinks, so the name it prints
+/// back can be one a file in the tree spells: a repository holding `a<ESC>[31mevil.key` and a
+/// symlink to it puts that escape sequence on the screen at the moment the user is reading what
+/// sbx would close. The launch already filters the warnings it prints for this reason; the whole
+/// verb has to, which is why this asserts on both streams rather than on one line.
+#[test]
+fn test_fs_prints_no_escape_a_project_path_carried_into_it() {
+    let p = masked_project();
+    assert!(p.run(&["trust"]).status.success(), "trust the fixture");
+
+    // The project spells the names; the caller says only `link.key` and `deep`, so an escape can
+    // only enter through the resolution, never through the argument. The entries themselves are
+    // globs, because an `[fs]` entry carrying a control byte is refused when the config loads.
+    let root = p.proj.path();
+    let evil = root.join("a\u{1b}[31mevil.key");
+    std::fs::write(&evil, b"K").unwrap();
+    std::os::unix::fs::symlink(&evil, root.join("link.key")).unwrap();
+    // And the other shape: a name covered by a denied *directory*, which the verdict names too.
+    let hidden = root.join("b\u{1b}[31mevil");
+    std::fs::create_dir(&hidden).unwrap();
+    std::fs::write(hidden.join("inside"), b"K").unwrap();
+    std::os::unix::fs::symlink(hidden.join("inside"), root.join("deep")).unwrap();
+    p.write_project("[fs]\ndeny = [\"*.key\", \"*evil\"]\n");
+    assert!(
+        p.run(&["trust"]).status.success(),
+        "re-trust after the write"
+    );
+
+    for arg in ["link.key", "deep"] {
+        let out = p.run(&["test", "fs", arg]);
+        let body = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            body.contains("DENIED"),
+            "{arg}: the verdict is still answered: {body}"
+        );
+        assert!(
+            !body.contains('\u{1b}'),
+            "{arg}: an escape the project chose reached the terminal: {body:?}"
+        );
+    }
+}

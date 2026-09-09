@@ -1014,9 +1014,17 @@ fn fs_test(args: &[OsString]) -> ExitCode {
     // `[fs]` closes paths of the project it is declared in and nothing else, which is the same
     // sentence the expansion refuses an outside entry with. Said before the verdict, because "OPEN"
     // for a path no mask could ever reach would read as a policy decision.
+    // Every path printed below is the project's to spell: `resolve_under_project` follows the
+    // project's own symlinks, so the name that comes back can be one a file in the tree chose, and
+    // the covering path comes straight out of that tree. Filtered on the way to the terminal for
+    // the reason [`diag::warn_config`] states and `sbx inspect` already applies to the names it
+    // lists: a control byte here lands at the moment the user is reading a verdict, which is the
+    // moment worth forging.
+    let shown = |p: &Path| crate::sandbox::sanitize(&p.display().to_string());
+
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
     if !path.starts_with(&root) {
-        println!("  {dim}{}{r}", path.display(), dim = pal.dim);
+        println!("  {dim}{}{r}", shown(&path), dim = pal.dim);
         diag::error(
             "sbx: test fs: that path is outside the project — `[fs]` closes paths of the project \
              it is declared in, and nothing else",
@@ -1037,7 +1045,7 @@ fn fs_test(args: &[OsString]) -> ExitCode {
         ),
         None => ("OPEN", pal.ok, None),
     };
-    println!("  {hue}{word}{r}  {}", path.display());
+    println!("  {hue}{word}{r}  {}", shown(&path));
     match why {
         Some((field, pattern, masked, is_dir)) if masked == path => {
             println!(
@@ -1058,7 +1066,7 @@ fn fs_test(args: &[OsString]) -> ExitCode {
             };
             println!(
                 "  {dim}by `[fs] {field}` entry `{pattern}`, which {verb} `{}` above it{r}",
-                masked.display(),
+                shown(&masked),
                 dim = pal.dim
             )
         }
