@@ -145,6 +145,7 @@ navbar entry: they are for looking things up, not reading through.
 - [`dbus`](configuration/dbus): a private in-cage desktop portal (file chooser + theme + notifications).
 - [`network`](configuration/network): the egress posture (links to [Networking](networking/)).
 - [`[proc]`](configuration/proc): observe or block what the agent execs (trusted-only).
+- [`[observe]`](configuration/observe): keep what a lens saw after the session ends (trusted-only).
 - [`[fs]`](configuration/fs): close a project path off inside the cage (the one ungated field).
 - [`[service]`](configuration/service): what else runs in the cage alongside the command.
 - [`[open]`](configuration/open): what a link opens with, inside the cage.
