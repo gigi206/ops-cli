@@ -379,7 +379,7 @@ fn launch_foreground(
     cmd: Vec<OsString>,
     observe: bool,
 ) -> ExitCode {
-    let (spec, guard) = match build(prep, runtime, cmd) {
+    let (spec, guard, record) = match build(prep, runtime, cmd) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -418,6 +418,7 @@ fn launch_foreground(
                     exec_poll,
                     fs,
                     true,
+                    record.as_ref(),
                 )
             });
             let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
@@ -665,9 +666,11 @@ fn launch_foreground_learning(
     cmd: Vec<OsString>,
     interactive: bool,
 ) -> Result<(ExitCode, LearningRun), ExitCode> {
-    let (spec, guard) = match build(prep, runtime, cmd) {
-        Ok((s, g)) if interactive => (s.with_private_tty(), g),
-        Ok((s, g)) => (s, g),
+    // The learning path starts no observation lens of its own, so the session record `build`
+    // resolved has no ring to attach to here; the four lenses inside `build` already hold it.
+    let (spec, guard, _) = match build(prep, runtime, cmd) {
+        Ok((s, g, rec)) if interactive => (s.with_private_tty(), g, rec),
+        Ok((s, g, rec)) => (s, g, rec),
         Err(code) => return Err(code),
     };
 
@@ -796,8 +799,8 @@ fn launch_pty_supervised(
         && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland))
     .then(|| launch_display_name(&runtime, &cmd));
 
-    let (spec, guard) = match build(prep, runtime, cmd) {
-        Ok((s, g)) => (s.with_private_tty(), g),
+    let (spec, guard, record) = match build(prep, runtime, cmd) {
+        Ok((s, g, rec)) => (s.with_private_tty(), g, rec),
         Err(code) => return code,
     };
 
@@ -816,6 +819,7 @@ fn launch_pty_supervised(
             exec_poll,
             fs,
             false,
+            record.as_ref(),
         )
     });
 

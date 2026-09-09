@@ -607,6 +607,7 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ssh_agent,
         fs,
         redact,
+        observe,
         open,
         service,
         // `env` is a *free* field: folded without a notice, as this function's own doc says.
@@ -645,6 +646,7 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ("audio", audio.is_some(), cli_side.audio.is_some()),
         ("dbus", dbus.is_some(), cli_side.dbus.is_some()),
         ("redact", redact.is_some(), cli_side.redact.is_some()),
+        ("observe", observe.is_some(), cli_side.observe.is_some()),
         (
             "allow_insecure_http",
             allow_insecure_http.is_some(),
@@ -720,6 +722,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         ssh_agent,
         fs,
         redact,
+        observe,
         bundle,
         // Read from the `net-groups/` directory by the config reader, never carried by a parsed
         // layer: an override shapes one launch, and a group is a global-config affordance.
@@ -797,6 +800,11 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     // depend on which blob was written first rather than on which one ranks higher.
     if redact.is_some() {
         base.redact = redact;
+    }
+    // The same scalar-table rule: whether a session is kept is one answer, and the higher blob's is
+    // the one that holds.
+    if observe.is_some() {
+        base.observe = observe;
     }
     base.forward = union_forward_opt(base.forward, forward);
     base.fs = union_fs_opt(base.fs, fs);

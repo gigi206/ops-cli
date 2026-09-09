@@ -109,6 +109,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[broker.<name>]` | security (global-only) | [broker](broker) |
 | `[secret]` | security | [secret](secret) |
 | `[redact]` | security | [redaction](../secrets/redaction#the-length-floor) |
+| `[observe]` | security | [observe](observe) |
 | `[task.<name>]` | security | [task](task), and [Declared operations](../tasks/) |
 | `[app.<name>]` | security overlay | [apps](apps) |
 | `[plugin.<name>]` | security | [`[plugin.<name>]`](../plugins/configuring) |

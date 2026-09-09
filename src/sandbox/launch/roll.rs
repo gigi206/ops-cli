@@ -283,7 +283,7 @@ pub(crate) fn upgrade_mise_packages(
             &tokens,
         );
 
-        let (spec, guard) = match build(&prep, runtime, cmd) {
+        let (spec, guard, _) = match build(&prep, runtime, cmd) {
             Ok(v) => v,
             Err(_) => {
                 println!(
@@ -579,7 +579,7 @@ pub(crate) fn upgrade_provision_steps(
         }
         prep.cfg = cfg;
 
-        let (spec, guard) = match build(&prep, runtime, provision_only_cmd(&steps)) {
+        let (spec, guard, _) = match build(&prep, runtime, provision_only_cmd(&steps)) {
             Ok(v) => v,
             Err(_) => {
                 println!(
@@ -701,7 +701,7 @@ fn roll_task_pool(
     // the project's declared operations, not to any app, so restore the baseline before deriving a
     // cage from it.
     prep.cfg = cfg.clone();
-    let (spec, guard) = build(
+    let (spec, guard, _) = build(
         prep,
         binds::Runtime::ProjectDefault,
         vec![OsString::from("/bin/true")],

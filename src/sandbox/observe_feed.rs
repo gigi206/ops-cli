@@ -257,13 +257,16 @@ impl Observation {
         exec_poll: bool,
         fs: bool,
         inline: bool,
+        record: Option<&super::lens::RecordWiring>,
     ) -> Self {
         let pid = std::process::id();
 
         // Exec lens (the cheap `/proc` poll). Skipped when the launch is enforcing — the seccomp
         // user-notification supervisor is the exec source then, and owns the proc control socket.
         let (observer, exec_socket) = if exec_poll {
-            let exec_ring = Arc::new(ExecRing::new(EXEC_RING_CAP));
+            let exec_ring = Arc::new(ExecRing::new(EXEC_RING_CAP).with_record(
+                super::lens::open_record(record, &proc_control_dir(data_dir)),
+            ));
             let exec_socket = bind_control(data_dir, pid, &exec_ring);
             let observer = ExecObserver::start(pid, OBSERVE_POLL_INTERVAL, exec_ring, inline);
             (Some(observer), exec_socket)
@@ -273,7 +276,7 @@ impl Observation {
 
         // Filesystem lens (independent: a failure here leaves exec observation running).
         let (fs_watcher, fs_socket) = if fs {
-            start_fs(data_dir, pid, project)
+            start_fs(data_dir, pid, project, record)
         } else {
             (None, None)
         };
@@ -304,8 +307,18 @@ impl Drop for Observation {
 /// the project tree with inotify, and bind + serve the fs control socket. A failure to create the
 /// inotify instance warns and yields `None` (the exec lens is untouched); a watcher that starts but
 /// whose socket cannot be bound is still held (harmless) so its own Drop tears it down cleanly.
-fn start_fs(data_dir: &Path, pid: u32, project: &Path) -> (Option<FsWatcher>, Option<PathBuf>) {
-    let ring = Arc::new(FsRing::new(FS_RING_CAP));
+fn start_fs(
+    data_dir: &Path,
+    pid: u32,
+    project: &Path,
+    record: Option<&super::lens::RecordWiring>,
+) -> (Option<FsWatcher>, Option<PathBuf>) {
+    let ring = Arc::new(
+        FsRing::new(FS_RING_CAP).with_record(super::lens::open_record(
+            record,
+            &super::fs_control::fs_control_dir(data_dir),
+        )),
+    );
     let watcher = match FsWatcher::start(project, ring.clone()) {
         Ok(w) => w,
         Err(e) => {

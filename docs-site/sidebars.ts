@@ -181,6 +181,7 @@ const sidebars: SidebarsConfig = {
             'configuration/devices',
             'configuration/fs',
             'configuration/proc',
+            'configuration/observe',
             'configuration/notify',
           ],
         },

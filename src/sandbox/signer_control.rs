@@ -120,6 +120,13 @@ impl SignerRing {
         SignerRing(super::lens::Ring::new(cap))
     }
 
+    /// Attach this session's record, so the events also reach a file that outlives the session.
+    /// Relayed to [`super::lens::Ring::with_record`]; `None` leaves the ring memory-only.
+    pub(crate) fn with_record(mut self, record: Option<super::lens::Recorder>) -> Self {
+        self.0 = self.0.with_record(record);
+        self
+    }
+
     /// Append one signature or refusal. `observed` is sbx's own account and is written first;
     /// `claimed` is the plugin's — its label on an answer, its reason on a refusal — and is appended
     /// only when it said something.
@@ -215,11 +222,15 @@ impl Drop for SignerFeed {
 /// no signing. The guard is `None` then, and the warning says so.
 pub(crate) fn stand_up_feed(
     layout: &crate::store::Layout,
+    record: Option<&super::lens::RecordWiring>,
 ) -> (Arc<SignerRing>, Option<SignerFeed>) {
-    let ring = Arc::new(SignerRing::new(SIGNER_RING_CAP));
+    let dir = layout.data_dir().join("signer");
+    let ring = Arc::new(
+        SignerRing::new(SIGNER_RING_CAP).with_record(super::lens::open_record(record, &dir)),
+    );
     let control_uds = signer_control_socket(layout.data_dir(), std::process::id());
     let served = ring.clone();
-    let bound = super::lens::ensure_control_dir(&layout.data_dir().join("signer")).and_then(|()| {
+    let bound = super::lens::ensure_control_dir(&dir).and_then(|()| {
         super::lens::bind_and_serve(&control_uds, move |control| serve(control, served))
     });
     match bound {

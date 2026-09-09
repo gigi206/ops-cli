@@ -216,6 +216,10 @@ pub(crate) struct EgressStats {
 
 /// Whether a session file can carry this identity.
 ///
+/// Shared with [`super::lens::Recorder`], whose record files open with the same two header lines
+/// and are attributed the same way. One definition, because the rule is a property of the header
+/// format rather than of what the file below it counts.
+///
 /// The two header lines are `project=<path>` and `app=<name>`, each read back as everything after
 /// the `=` to the end of the line. A line break in either does two things, neither of them loud: the
 /// value comes back truncated, so the session's counters answer to a project nobody will ask about;
@@ -230,7 +234,7 @@ pub(crate) struct EgressStats {
 /// project that normalised to the same string. A name the format cannot carry therefore records no
 /// stats at all — the same outcome a project that cannot be canonicalised already gets, and for the
 /// same reason: counters are worth having, never worth a wrong answer.
-fn identity_is_recordable(project: &str, app: Option<&str>) -> bool {
+pub(crate) fn identity_is_recordable(project: &str, app: Option<&str>) -> bool {
     let carries_break = |s: &str| s.contains('\n') || s.contains('\r');
     !carries_break(project) && !app.is_some_and(carries_break)
 }

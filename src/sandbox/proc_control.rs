@@ -151,6 +151,13 @@ impl ExecRing {
         ExecRing(super::lens::Ring::new(cap))
     }
 
+    /// Attach this session's record, so the events also reach a file that outlives the session.
+    /// Relayed to [`super::lens::Ring::with_record`]; `None` leaves the ring memory-only.
+    pub(crate) fn with_record(mut self, record: Option<super::lens::Recorder>) -> Self {
+        self.0 = self.0.with_record(record);
+        self
+    }
+
     /// Append one observed exec (the non-enforcing `/proc` poll path — verdict `observe`). Returns
     /// the assigned sequence.
     pub(crate) fn push(&self, pid: u32, command: &str) -> u64 {

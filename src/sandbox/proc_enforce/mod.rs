@@ -301,6 +301,7 @@ pub(crate) fn start(
     open: Option<(crate::open_policy::OpenPolicy, PathBuf)>,
     notifier: Arc<crate::sandbox::notify_sink::Notifier>,
     learn: bool,
+    record: Option<&crate::sandbox::lens::RecordWiring>,
 ) -> io::Result<(ProcEnforce, Wiring)> {
     start_inner(
         data_dir,
@@ -312,6 +313,7 @@ pub(crate) fn start(
             instance: "",
             control: true,
             learn,
+            record,
         },
     )
 }
@@ -345,16 +347,22 @@ pub(crate) fn start_for_task(
             control: false,
             // A task declares the programs it may run, so there is nothing about it to discover.
             learn: false,
+            // A task's supervisor shares the session's `<data>/proc/` directory but not its record:
+            // the session's is keyed by the session incarnation, and two invocations writing into
+            // one file would interleave their events under a single header.
+            record: None,
         },
     )
 }
 
 /// What one supervisor is stood up for, beside the policy it enforces: which instance of a session's
-/// sockets it owns, whether it serves a control socket, and whether it keeps a learning record.
+/// sockets it owns, whether it serves a control socket, whether it keeps a learning record, and the
+/// session record its exec ring appends to.
 struct StartOpts<'a> {
     instance: &'a str,
     control: bool,
     learn: bool,
+    record: Option<&'a crate::sandbox::lens::RecordWiring>,
 }
 
 fn start_inner(
@@ -369,13 +377,17 @@ fn start_inner(
         instance,
         control,
         learn,
+        record,
     } = opts;
     let dir = super::proc_control::proc_control_dir(data_dir);
     // Unlike the observing path, this directory holds the notification socket enforcement itself
     // runs on, not only the reader's — so a failure here is the launch's, not a lens going quiet.
     super::lens::ensure_control_dir(&dir)?;
 
-    let ring = Arc::new(ExecRing::new(super::proc_control::EXEC_RING_CAP));
+    let ring = Arc::new(
+        ExecRing::new(super::proc_control::EXEC_RING_CAP)
+            .with_record(super::lens::open_record(record, &dir)),
+    );
     let pending = Arc::new(PendingExec::new());
     // The live `--session` rule overlay, shared between the control server (which writes it) and the
     // supervisor (which folds it into every decision). The mode is captured here (Copy) because the

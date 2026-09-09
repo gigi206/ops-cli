@@ -831,6 +831,7 @@ pub(crate) fn start(
     host_sock: &Path,
     confirm_with: Option<PathBuf>,
     notifier: Arc<super::notify_sink::Notifier>,
+    record: Option<&super::lens::RecordWiring>,
 ) -> io::Result<(SshAgent, Wiring)> {
     // The data directory is owner-only, and this socket is the reason it must be: anything that can
     // connect to it can ask the user's agent for a signature.
@@ -850,8 +851,11 @@ pub(crate) fn start(
     // **never** bound into the cage. A failure to stand it up is not a reason to refuse the grant:
     // the broker is the fence, the log is the witness — so it degrades to a broker with no reader
     // rather than to no broker at all.
-    let ring =
-        Arc::new(AgentRing::new(super::sshagent_control::AGENT_RING_CAP).with_notifier(notifier));
+    let ring = Arc::new(
+        AgentRing::new(super::sshagent_control::AGENT_RING_CAP)
+            .with_notifier(notifier)
+            .with_record(super::lens::open_record(record, &dir)),
+    );
     let control_uds =
         super::sshagent_control::agent_control_socket(layout.data_dir(), std::process::id());
     let served = ring.clone();

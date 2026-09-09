@@ -120,6 +120,13 @@ impl BrokerRing {
         BrokerRing(super::lens::Ring::new(cap))
     }
 
+    /// Attach this session's record, so the events also reach a file that outlives the session.
+    /// Relayed to [`super::lens::Ring::with_record`]; `None` leaves the ring memory-only.
+    pub(crate) fn with_record(mut self, record: Option<super::lens::Recorder>) -> Self {
+        self.0 = self.0.with_record(record);
+        self
+    }
+
     /// Append one decision. `broker` names which one made it, `observed` is sbx's own account and is
     /// written first, and `label` is the plugin's, appended only when it said something.
     ///

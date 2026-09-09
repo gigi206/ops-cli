@@ -147,6 +147,13 @@ impl AgentRing {
         self
     }
 
+    /// Attach this session's record, so the events also reach a file that outlives the session.
+    /// Relayed to [`super::lens::Ring::with_record`]; `None` leaves the ring memory-only.
+    pub(crate) fn with_record(mut self, record: Option<super::lens::Recorder>) -> Self {
+        self.ring = self.ring.with_record(record);
+        self
+    }
+
     /// Append one decision, sanitising and capping its detail. Returns the assigned sequence number.
     pub(crate) fn push(&self, kind: AgentKind, detail: &str) -> u64 {
         // Announce a refusal from here, the single point every outcome passes through, and announce

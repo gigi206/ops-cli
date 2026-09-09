@@ -833,6 +833,38 @@ fn gui_store_roots(
     gui_roots
 }
 
+/// The session record every lens opens its own file from, or `None` when `[observe] record` is off
+/// or the project has no identity a record can be attributed to.
+///
+/// `needles` is the launch's own set, borrowed and cloned by `Arc` rather than built here: the same
+/// set the notifier redacts against, filled in later once the egress proxy has resolved this
+/// launch's secrets. A fresh set would stay empty for the session and every recorded line would go
+/// to disk in the clear.
+///
+/// The project key is [`binds::project_identity`]'s canonical path, the derivation `sbx net stats`
+/// already keys on, so a record and a reader standing in the same project agree on the name.
+fn record_wiring(
+    prep: &Prepared,
+    runtime: binds::Runtime,
+    needles: &crate::sandbox::notify_sink::Needles,
+) -> Option<crate::sandbox::lens::RecordWiring> {
+    if !prep.cfg.observe_record {
+        return None;
+    }
+    let (_, canonical) = binds::project_identity(&prep.cwd).ok()?;
+    let app = match runtime {
+        binds::Runtime::GlobalApp(name) | binds::Runtime::ProjectApp(name) => {
+            Some(name.to_string())
+        }
+        binds::Runtime::ProjectDefault => None,
+    };
+    Some(crate::sandbox::lens::RecordWiring::new(
+        canonical.display().to_string(),
+        app,
+        Arc::clone(needles),
+    ))
+}
+
 /// Stand up the refusal notifier (`[notify]`) and announce what the trust gate already dropped.
 ///
 /// First, because it must exist before the first lens that can refuse anything: the exec
@@ -928,6 +960,7 @@ struct ProcLens {
 fn proc_lens<'a>(
     prep: &'a Prepared,
     notify_wiring: &crate::sandbox::notify_sink::NotifyWiring,
+    record: Option<&crate::sandbox::lens::RecordWiring>,
     wraps: &mut Vec<(WrapLayer, CommandWrap<'a>)>,
 ) -> Result<ProcLens, ExitCode> {
     // Exec enforcement (`[proc] mode = enforce|ask`): stand up the seccomp user-notification
@@ -992,6 +1025,7 @@ fn proc_lens<'a>(
             content_lens,
             Arc::clone(&notify_wiring.notifier),
             prep.learn_exec,
+            record,
         )
         .map_err(|e| {
             crate::diag::error(&format!("sbx: cannot start exec enforcement: {e}"));
@@ -1295,7 +1329,10 @@ struct BrokersUp {
 /// Every failure degrades to *no broker* rather than to an unfenced one, and says which: a cage
 /// without a broker cannot reach that resource, which is the fail-closed direction. Only failing to
 /// stand up a broker the config asked for and could otherwise have is fatal.
-fn broker_plugins(prep: &Prepared) -> Result<BrokersUp, ExitCode> {
+fn broker_plugins(
+    prep: &Prepared,
+    record: Option<&crate::sandbox::lens::RecordWiring>,
+) -> Result<BrokersUp, ExitCode> {
     // Broker plugins: the same shape as the ssh-agent broker below, for a protocol sbx does not
     // implement itself. Each `[broker.<name>]` pairs an installed plugin with the host resource
     // the global config bound it to; sbx serves the socket, holds the host connection, and the
@@ -1335,7 +1372,7 @@ fn broker_plugins(prep: &Prepared) -> Result<BrokersUp, ExitCode> {
         // and one socket, whatever the config declares. The guard lives as long as the brokers do,
         // so a reader's `--follow` ends with the launch rather than with whichever broker was torn
         // down first.
-        let (ring, feed) = broker::stand_up_feed(&prep.layout);
+        let (ring, feed) = broker::stand_up_feed(&prep.layout, record);
         broker_feed = Some(feed);
         for binding in &prep.cfg.brokers {
             let name = &binding.name;
@@ -1614,6 +1651,7 @@ struct SshAgentUp {
 fn ssh_agent_broker(
     prep: &Prepared,
     notify_wiring: &crate::sandbox::notify_sink::NotifyWiring,
+    record: Option<&crate::sandbox::lens::RecordWiring>,
 ) -> Result<SshAgentUp, ExitCode> {
     // The ssh-agent broker: a filtering agent socket in front of the host's own, so the cage can
     // sign with the keys `[ssh_agent] allow` names and do nothing else — not list the rest, not add
@@ -1673,6 +1711,7 @@ fn ssh_agent_broker(
                                 &host_sock,
                                 confirmation.helper(),
                                 Arc::clone(&notify_wiring.notifier),
+                                record,
                             )
                             .map_err(|e| {
                                 crate::diag::error(&format!(
@@ -2180,7 +2219,14 @@ pub(super) fn build(
     prep: &Prepared,
     runtime: binds::Runtime,
     cmd: Vec<OsString>,
-) -> Result<(SandboxSpec, Option<LaunchGuard>), ExitCode> {
+) -> Result<
+    (
+        SandboxSpec,
+        Option<LaunchGuard>,
+        Option<crate::sandbox::lens::RecordWiring>,
+    ),
+    ExitCode,
+> {
     for warning in &prep.cfg.warnings {
         crate::diag::warn_config(warning);
     }
@@ -2257,6 +2303,10 @@ pub(super) fn build(
     // relay starts before the refusal notifier and the two must hold the *same* set: it is filled in
     // later, once the egress proxy has resolved this launch's secrets.
     let notify_needles: crate::sandbox::notify_sink::Needles = Arc::new(RwLock::new(Vec::new()));
+    // The session record (`[observe] record`), resolved before the first lens stands up and shared
+    // by all of them. It holds the needle set above by `Arc`, which is what makes the redaction on
+    // the way to disk real rather than nominal.
+    let record = record_wiring(prep, runtime, &notify_needles);
     let portal_stack = portal_stack(prep, runtime, Arc::clone(&notify_needles));
 
     // The rendering and hardware holes this posture asks for, provisioned before the seed so their
@@ -2313,7 +2363,7 @@ pub(super) fn build(
     let notify_wiring = notify_wiring(prep, runtime, notify_needles);
 
     // The exec and content lenses, and the supervisor both ride on.
-    let proc_lens = proc_lens(prep, &notify_wiring, &mut wraps)?;
+    let proc_lens = proc_lens(prep, &notify_wiring, record.as_ref(), &mut wraps)?;
 
     // Mise-backed tools are equipped in-cage at launch rather than host-provisioned, in two
     // distinct lanes. The app's `[packages] mise:` tools are durable, trusted-only declarations,
@@ -2364,7 +2414,7 @@ pub(super) fn build(
     let forward_up = forward_ports(prep, &mut wraps)?;
 
     // The broker plugins, stood up ahead of the egress proxy that may resolve through one.
-    let brokers_up = broker_plugins(prep)?;
+    let brokers_up = broker_plugins(prep, record.as_ref())?;
 
     // Where each `tcp://` destination lives inside the cage.
     let tcp_plan = tcp_plan(prep);
@@ -2386,7 +2436,8 @@ pub(super) fn build(
             .any(|t| t.injections.iter().any(|i| i.signer.is_some()));
     let (signer_ring, signer_feed) = match signs {
         true => {
-            let (ring, feed) = crate::sandbox::signer_control::stand_up_feed(&prep.layout);
+            let (ring, feed) =
+                crate::sandbox::signer_control::stand_up_feed(&prep.layout, record.as_ref());
             (Some(ring), feed)
         }
         false => (None, None),
@@ -2472,7 +2523,7 @@ pub(super) fn build(
     }
 
     // The filtering ssh-agent, when the grant resolves to a key the host agent holds.
-    let ssh_agent = ssh_agent_broker(prep, &notify_wiring)?;
+    let ssh_agent = ssh_agent_broker(prep, &notify_wiring, record.as_ref())?;
 
     // The three GUI holes, appended in the order their pushes had.
     let mut gui = display_binds(
@@ -2869,7 +2920,7 @@ pub(super) fn build(
     };
     #[cfg(debug_assertions)]
     debug_dump_spec(&spec, guard.as_ref());
-    Ok((spec, guard))
+    Ok((spec, guard, record))
 }
 
 /// Whether this launch runs behind the netns holder, and with what.

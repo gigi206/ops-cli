@@ -74,6 +74,11 @@ pub(crate) struct ConfigView {
     pub(crate) redact_min_len: usize,
     /// Which layer supplied the redaction floor (`Default` when no config set it).
     pub(crate) redact_min_len_origin: ProvenanceView,
+    /// Whether the observation lenses keep a session record on disk (`[observe] record`, off by
+    /// default).
+    pub(crate) observe_record: bool,
+    /// Which layer supplied the record posture (`Default` when no config set it).
+    pub(crate) observe_record_origin: ProvenanceView,
     /// The resolved process/exec posture.
     pub(crate) proc: ProcView,
     /// Which layer supplied the proc posture (`Default` when neither config set it).
@@ -1163,6 +1168,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         egress_stats: resolved.egress_stats,
         redact_min_len: resolved.redact_min_len,
         redact_min_len_origin: resolved.redact_min_len_origin.into(),
+        observe_record: resolved.observe_record,
+        observe_record_origin: resolved.observe_record_origin.into(),
         proc: proc_view(&resolved.proc),
         proc_origin: resolved.proc_origin.into(),
         notify: notify_view(&resolved.notify),
@@ -2145,6 +2152,8 @@ mod tests {
             egress_stats: true,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             redact_min_len_origin: Default::default(),
+            observe_record: false,
+            observe_record_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::Wayland,
@@ -2565,6 +2574,8 @@ mod tests {
             egress_stats: true,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             redact_min_len_origin: Default::default(),
+            observe_record: false,
+            observe_record_origin: Default::default(),
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
             gpu: false,

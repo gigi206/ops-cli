@@ -2572,6 +2572,8 @@ mod tests {
             egress_stats: true,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             redact_min_len_origin: Default::default(),
+            observe_record: false,
+            observe_record_origin: Default::default(),
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
             proc: Default::default(),

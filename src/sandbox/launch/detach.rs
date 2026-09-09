@@ -107,7 +107,7 @@ fn detached_child(
     // terminal through build/register so provisioning progress and any error are seen live.
     redirect_stdin_to_null();
 
-    let (spec, guard) = match build(&prep, runtime, cmd) {
+    let (spec, guard, record) = match build(&prep, runtime, cmd) {
         Ok(v) => v,
         // `build` already printed the cause to the terminal; close the pipe (no readiness byte)
         // so the parent reports failure.
@@ -160,6 +160,7 @@ fn detached_child(
             exec_poll,
             fs,
             false,
+            record.as_ref(),
         )
     });
 

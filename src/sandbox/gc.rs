@@ -1369,6 +1369,17 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 /// runs. Deleting it would discard what `sbx net stats` aggregates (`sbx net stats --reset` remains
 /// the way to actually discard it).
 ///
+/// A lens's `record-<pid>-<ticks>.log` is absent from this table for the same reason
+/// `stats-<pid>-<ticks>` is, and for a different one. The same: its data outlives the session, so a
+/// sweep keyed on liveness would delete it at the exact moment it became the only answer to "what
+/// did that session do". The different: a record is not folded either — two sessions' events are not
+/// additive the way two sessions' counters are, and a merged file would lose the one thing a record
+/// is read for, which is what happened in order. Its ceiling is therefore its own, applied by
+/// [`super::lens::Recorder::create`] when a new record is opened: the oldest finished ones past
+/// [`super::lens::RECORD_KEEP`] are dropped. Neither name is identifiable by [`runtime_entry_pid`]
+/// anyway — the tail of both is not a bare number — so a prefix list that grew one could not sweep
+/// them by accident.
+///
 /// `dbus` is a legacy directory — the filtered host-bus proxy it belonged to was replaced by the
 /// private in-cage portal, so nothing writes there any more; sweeping it reclaims the residue an
 /// older version left behind, after which the directory simply stays empty.

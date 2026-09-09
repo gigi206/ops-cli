@@ -715,6 +715,15 @@ pub(crate) struct Resolved {
     /// Which layer supplied the winning `redact_min_len` (`Default` when neither config set it).
     /// A display affordance for `sbx config`; the launcher ignores it.
     pub(crate) redact_min_len_origin: Provenance,
+    /// Whether the observation lenses write a session record — `[observe] record`, off by default.
+    /// The ring every lens holds is memory that dies with the session; this keeps a redacted copy of
+    /// the same lines in an owner-only file under the data dir, so `sbx … logs` can still answer for
+    /// a session that has ended. A security field, gated like `[redact]` — the process lens records
+    /// the cage's own argv, so an untrusted project does not get to decide it is kept.
+    pub(crate) observe_record: bool,
+    /// Which layer supplied the winning `observe_record` (`Default` when neither config set it).
+    /// A display affordance for `sbx config`; the launcher ignores it.
+    pub(crate) observe_record_origin: Provenance,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -997,6 +1006,7 @@ impl Resolved {
             proc,
             notify,
             redact,
+            observe,
             open,
             service,
             // The channel is applied earlier (before the lock is chosen); groups/apps/bundles are
@@ -1064,6 +1074,7 @@ impl Resolved {
             notify,
             limits,
             redact,
+            observe,
             &mut notes,
         );
         if !fatal.is_empty() {
@@ -1076,6 +1087,7 @@ impl Resolved {
             notify: new_notify,
             limits: new_limits,
             redact_min_len: new_redact_min_len,
+            observe_record: new_observe_record,
         } = scalars;
 
         // No fatal — apply. Promote the (non-fatal) validation notes to the resolved warnings.
@@ -1238,6 +1250,12 @@ impl Resolved {
             self.redact_min_len = floor;
             self.redact_min_len_origin = Provenance::Override;
         }
+        // `[observe] record` — trusted by invocation, and the final word: an invoker who wants this
+        // session kept (or not) says so on the command line whatever the config layers decided.
+        if let Some(record) = new_observe_record {
+            self.observe_record = record;
+            self.observe_record_origin = Provenance::Override;
+        }
 
         // `forward` — trusted by invocation; the ports add to the effective set (a collection, so a
         // bad port — only `0` is possible after parse — is warned and skipped, not fatal). The
@@ -1361,6 +1379,7 @@ impl Resolved {
             ov.raw.notify.clone(),
             ov.raw.limits.clone(),
             ov.raw.redact.clone(),
+            ov.raw.observe.clone(),
             &mut notes,
         );
         if fatal.is_empty() {
@@ -1387,6 +1406,8 @@ struct OverrideScalars {
     limits: Option<crate::sandbox::cgroup::Limits>,
     /// The redaction floor (`Some` only when the override set `[redact] min_len` and it validated).
     redact_min_len: Option<usize>,
+    /// Whether to keep a session record (`Some` only when the override set `[observe] record`).
+    observe_record: Option<bool>,
 }
 
 /// Validate an override's scalar security postures (`network`/`gui`/`[limits]`) against `baseline`
@@ -1405,6 +1426,7 @@ fn build_override_scalars(
     notify: Option<schema::NotifyField>,
     limits: Option<schema::RawLimits>,
     redact: Option<schema::RawRedact>,
+    observe: Option<schema::RawObserve>,
     notes: &mut Vec<String>,
 ) -> (OverrideScalars, Vec<String>) {
     let mut fatal = Vec::new();
@@ -1470,6 +1492,11 @@ fn build_override_scalars(
     // `[redact] min_len` — a set-but-unusable value is fatal, like a limit: an override that meant
     // to move the floor and instead left the baseline's would watch this launch to a depth its
     // invoker did not choose.
+    // `[observe] record` — a boolean, so there is no value to be invalid and nothing fatal to
+    // report: it is either stated or absent.
+    if let Some(record) = observe.and_then(|o| o.record) {
+        scalars.observe_record = Some(record);
+    }
     if let Some(value) = redact.and_then(|r| r.min_len) {
         match validate_redact_min_len(notes, OVERRIDE_SOURCE, value) {
             Some(floor) => scalars.redact_min_len = Some(floor),
@@ -2075,6 +2102,12 @@ fn resolve(
     }
     // The redaction floor is trusted by location at the global layer; an unusable value is dropped
     // (warned) and the built-in floor kept.
+    let mut observe_record = false;
+    let mut observe_record_origin = Provenance::Default;
+    if let Some(record) = global.observe.as_ref().and_then(|o| o.record) {
+        observe_record = record;
+        observe_record_origin = Provenance::Global;
+    }
     let mut redact_min_len = crate::sandbox::redact::MIN_LEN_DEFAULT;
     let mut redact_min_len_origin = Provenance::Default;
     if let Some(value) = global.redact.as_ref().and_then(|r| r.min_len)
@@ -2518,6 +2551,19 @@ fn resolve(
                 gate.refuse("`[redact]`", &mut warnings);
             }
         }
+        // `[observe]` is a security field — a trusted project may ask for its session to be kept;
+        // an untrusted one may not, since the process lens's record is the cage's own argv and
+        // keeping it is a decision about the *owner's* disk, not about the project's tree.
+        if let Some(raw) = proj.observe {
+            if trusted {
+                if let Some(record) = raw.record {
+                    observe_record = record;
+                    observe_record_origin = Provenance::Project;
+                }
+            } else {
+                gate.refuse("`[observe]`", &mut warnings);
+            }
+        }
         // `[limits]` is a security field — a trusted project may tune the cgroup limits; an
         // untrusted or changed one may not (loosening them weakens the anti-DoS control). The
         // three fields layer independently: a project's set field overrides the global one, an
@@ -2796,6 +2842,8 @@ fn resolve(
         egress_stats,
         redact_min_len,
         redact_min_len_origin,
+        observe_record,
+        observe_record_origin,
         proc,
         proc_origin,
         notify,
@@ -3197,6 +3245,9 @@ pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &
     }
     if let Some(redact) = &raw.redact {
         report(" under `[redact]`", &redact.rest);
+    }
+    if let Some(observe) = &raw.observe {
+        report(" under `[observe]`", &observe.rest);
     }
     if let Some(fs) = &raw.fs {
         report(" under `[fs]`", &fs.rest);

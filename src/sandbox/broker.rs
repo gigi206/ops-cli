@@ -1677,17 +1677,20 @@ fn host_socket(data_dir: &std::path::Path, name: &str, pid: u32) -> std::path::P
 /// parent process this launch would otherwise not need.
 pub(crate) fn stand_up_feed(
     layout: &crate::store::Layout,
+    record: Option<&super::lens::RecordWiring>,
 ) -> (
     std::sync::Arc<super::broker_control::BrokerRing>,
     BrokerFeed,
 ) {
-    let ring = std::sync::Arc::new(super::broker_control::BrokerRing::new(
-        super::broker_control::BROKER_RING_CAP,
-    ));
+    let dir = layout.data_dir().join("broker");
+    let ring = std::sync::Arc::new(
+        super::broker_control::BrokerRing::new(super::broker_control::BROKER_RING_CAP)
+            .with_record(super::lens::open_record(record, &dir)),
+    );
     let pid = std::process::id();
     let control_uds = super::broker_control::broker_control_socket(layout.data_dir(), pid);
     let served = ring.clone();
-    let bound = super::lens::ensure_control_dir(&layout.data_dir().join("broker")).and_then(|()| {
+    let bound = super::lens::ensure_control_dir(&dir).and_then(|()| {
         super::lens::bind_and_serve(&control_uds, move |control| {
             super::broker_control::serve(control, served)
         })

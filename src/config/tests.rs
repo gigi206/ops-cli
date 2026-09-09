@@ -90,6 +90,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
         broker: Default::default(),
         fs: None,
         redact: None,
+        observe: None,
         notify: None,
         rest: Default::default(),
         task: None,
@@ -9009,6 +9010,58 @@ fn a_set_but_invalid_override_security_value_is_a_hard_error_and_mutates_nothing
     // and nothing was applied — the baseline posture stands (never a silent wider fallback).
     assert_eq!(resolved.network, NetworkPolicy::Shared);
     assert_eq!(resolved.network_origin, Provenance::Global);
+}
+
+/// `[observe] record` layers the way `[redact]` does: the global config sets it, a **trusted**
+/// project may change it, an untrusted one is refused and named, and a `--config` blob (trusted by
+/// invocation) is the final word. The gate matters more here than the value does: the process
+/// lens's record is the cage's own command lines, and a project sbx does not trust does not get to
+/// decide they are kept on the owner's disk.
+#[test]
+fn the_session_record_is_a_security_field_layered_like_the_redaction_floor() {
+    let observe = |record: bool| RawConfig {
+        observe: Some(schema::RawObserve {
+            record: Some(record),
+            rest: Default::default(),
+        }),
+        ..RawConfig::default()
+    };
+
+    // The default: nothing keeps a record, and no layer claims the setting.
+    let off = resolve_no_plugins(RawConfig::default(), None);
+    assert!(!off.observe_record);
+    assert_eq!(off.observe_record_origin, Provenance::Default);
+
+    // The global config is trusted by location.
+    let global = resolve_no_plugins(observe(true), None);
+    assert!(global.observe_record);
+    assert_eq!(global.observe_record_origin, Provenance::Global);
+
+    // A trusted project may turn it back off.
+    let trusted = resolve_no_plugins(observe(true), Some((observe(false), TrustState::Trusted)));
+    assert!(!trusted.observe_record);
+    assert_eq!(trusted.observe_record_origin, Provenance::Project);
+
+    // An untrusted one may not turn it on, and the refusal is named rather than silent.
+    let untrusted = resolve_no_plugins(
+        RawConfig::default(),
+        Some((observe(true), TrustState::Untrusted)),
+    );
+    assert!(
+        !untrusted.observe_record,
+        "an untrusted project set the record posture"
+    );
+    assert_eq!(untrusted.observe_record_origin, Provenance::Default);
+    assert!(
+        untrusted.warnings.iter().any(|w| w.contains("`[observe]`")),
+        "the refusal names the table: {:?}",
+        untrusted.warnings
+    );
+
+    // A `--config` blob outranks both.
+    let overridden = with_override(resolve_no_plugins(observe(false), None), observe(true));
+    assert!(overridden.observe_record);
+    assert_eq!(overridden.observe_record_origin, Provenance::Override);
 }
 
 /// A `--config` blob may move the redaction floor for one launch (trusted by invocation), and an

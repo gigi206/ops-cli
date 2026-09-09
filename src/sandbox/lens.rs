@@ -19,11 +19,13 @@
 //! amendments, captured traffic and secret sightings. That is a superset, and the lenses that never
 //! need any of it would carry the weight.
 //!
-//! Security is the same for all three, and it is the reason the ring is RAM and the socket is not in
-//! the cage. The socket is bound under the `0700` data dir and is **never** bound into the cage: in
-//! Mode B the in-cage agent is the adversary, so it must not reach the record of what it did. A ring
-//! is never written to disk and never crosses the boundary; it is the supervisor's owner-only memory
-//! for the session's lifetime, and it dies with it.
+//! Security is the same for all five, and it is the reason the socket is not in the cage. The socket
+//! is bound under the `0700` data dir and is **never** bound into the cage: in Mode B the in-cage
+//! agent is the adversary, so it must not reach the record of what it did. The property that carries
+//! that is **unreachable from the cage**, not "never on disk": a ring is the supervisor's owner-only
+//! memory for the session's lifetime, and a launch that asked for one also writes an owner-only
+//! [`Recorder`] file beside the socket, under the same directory and the same rule. What crosses the
+//! boundary is nothing, in either direction.
 //!
 //! The wire is line-based and minimal, one command per connection: `LOG` returns the retained events
 //! (a `dropped=` line when a `--follow` cursor fell behind the ring, a `head=` cursor, then one
@@ -113,6 +115,10 @@ pub(crate) struct Snapshot<E> {
 pub(crate) struct Ring<E> {
     inner: Mutex<Inner<E>>,
     cap: usize,
+    /// Where every pushed event is also written, when the launch asked for a record. `None` is the
+    /// default and the shape every lens had before: memory for the session's lifetime, and nothing
+    /// after it. See [`Recorder`].
+    record: Option<Recorder>,
 }
 
 struct Inner<E> {
@@ -128,7 +134,16 @@ impl<E: Event> Ring<E> {
                 events: VecDeque::new(),
             }),
             cap: cap.max(1),
+            record: None,
         }
+    }
+
+    /// Attach the session record every push is also written to, or leave the ring memory-only when
+    /// the launch asked for none. A builder rather than a second constructor, the same shape the
+    /// ssh-agent lens's notifier already uses, so every existing `new(cap)` stays as it is.
+    pub(crate) fn with_record(mut self, record: Option<Recorder>) -> Self {
+        self.record = record;
+        self
     }
 
     /// Append one event, assigning the next sequence number and evicting the oldest if the ring is
@@ -138,7 +153,14 @@ impl<E: Event> Ring<E> {
     /// `make` runs **while the ring is locked**, so it must do nothing but build the event. Anything
     /// that reaches outside — announcing a refusal on the desktop, say — belongs to the caller
     /// around this call, never inside it: a lens whose notification blocked would hold the lock the
-    /// reader needs to answer `sbx … logs`.
+    /// reader needs to answer `sbx … logs`. The session record obeys the same rule from the other
+    /// side: the event is cloned out under the lock and written after it is released, so the file
+    /// this push may be waiting on is never a file a reader is waiting behind.
+    ///
+    /// This is the single door every lens's event goes through, which is why the record is attached
+    /// here rather than to each lens. Two of them have producers written apart — the exec lens's
+    /// observer and its enforcer — and a duty stated once per producer is the kind the second one
+    /// misses.
     pub(crate) fn push_with(&self, make: impl FnOnce(u64, u128) -> E) -> u64 {
         // Stamped before the lock, so a contended ring times events by when they happened rather
         // than by when they got their turn.
@@ -146,12 +168,23 @@ impl<E: Event> Ring<E> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut g = locked(&self.inner);
-        let seq = g.next_seq;
-        g.next_seq += 1;
-        g.events.push_back(make(seq, at_epoch_ms));
-        while g.events.len() > self.cap {
-            g.events.pop_front();
+        let (seq, recorded) = {
+            let mut g = locked(&self.inner);
+            let seq = g.next_seq;
+            g.next_seq += 1;
+            let event = make(seq, at_epoch_ms);
+            // Cloned only when there is a record to write, and formatted below rather than here:
+            // the lock this holds is the one `sbx … logs` waits on, and a `write(2)` under it would
+            // put a reader behind the disk.
+            let recorded = self.record.as_ref().map(|_| event.clone());
+            g.events.push_back(event);
+            while g.events.len() > self.cap {
+                g.events.pop_front();
+            }
+            (seq, recorded)
+        };
+        if let (Some(record), Some(event)) = (&self.record, recorded) {
+            record.record(&event.format_line());
         }
         seq
     }
@@ -283,6 +316,274 @@ fn handle(stream: UnixStream, dispatch: &dyn Fn(&str) -> String) -> io::Result<(
     let response = dispatch(line.trim());
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
+}
+
+// ── The record (what outlives the session) ────────────────────────────────────────────────────
+
+/// The line prefixes a record file reserves for its own lines: the two identity headers a reader
+/// attributes the file by, and the note a capped record ends with. No event line can collide with
+/// one, because every [`Event::format_line`] opens with `event `.
+pub(crate) const RECORD_RESERVED: [&str; 3] = ["project=", "app=", "truncated="];
+
+/// The most one session's record may grow to before it stops accepting lines.
+///
+/// A ring is bounded by construction; a file is not, and the party that decides how many events a
+/// session produces is the cage. Without a ceiling, an agent that churns short-lived processes
+/// writes until the owner's disk is full — the same shape as the request-body cap on the proxy, and
+/// the reason [`super::egress_stats`] bounds its destination count. Past the cap the record ends
+/// with a `truncated=` line rather than silently stopping, so a reader is told the tail is missing.
+pub(crate) const RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many finished sessions' records one lens directory keeps.
+///
+/// The per-file cap bounds a session; nothing bounds the number of sessions, and a record is
+/// deliberately **not** swept when its session ends — that is the whole point of it. So the ceiling
+/// has to be a count, applied when a new record is opened: the oldest finished records past this
+/// many are removed. A running session's record is never a candidate, whatever its age.
+pub(crate) const RECORD_KEEP: usize = 32;
+
+/// One session's record file inside a lens's own directory, keyed by the session incarnation rather
+/// than the pid alone. Same reason the session registry and the egress counters use the pair: a
+/// later process landing on a reused pid would otherwise append into its predecessor's record and
+/// the two sessions would read as one.
+pub(crate) fn record_path(dir: &Path, pid: u32, start_ticks: u64) -> PathBuf {
+    dir.join(format!("record-{pid}-{start_ticks}.log"))
+}
+
+/// The launcher pid a `record-<pid>-<ticks>.log` names, or `None` for any other name.
+///
+/// Deliberately its own parser rather than [`super::gc::sweep_runtime_dirs`]'s: that one answers
+/// "may this be deleted when its session is gone", and a record's answer to that is always no. This
+/// one answers "whose record is this", which is asked only to keep a *live* session's file out of a
+/// prune that is otherwise ordered by age.
+fn record_entry_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("record-")?;
+    let (pid, _) = rest.split_once('-')?;
+    pid.parse().ok()
+}
+
+/// Remove the oldest finished sessions' records past [`RECORD_KEEP`], newest kept.
+///
+/// Best-effort throughout: a directory that cannot be listed, a modification time the filesystem
+/// will not report, a file that will not unlink — none of them is worth failing a launch over, and
+/// each simply leaves a record in place. The one thing that is not best-effort is skipping a live
+/// session: a record still being appended to must never be a candidate, whatever its age.
+fn prune_records(dir: &Path, keep: usize, is_live: &dyn Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut finished: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let pid = record_entry_pid(name.to_str()?)?;
+            if is_live(pid) {
+                return None;
+            }
+            let at = e.metadata().ok()?.modified().ok()?;
+            Some((at, e.path()))
+        })
+        .collect();
+    if finished.len() <= keep {
+        return;
+    }
+    // Oldest first, so the tail of the sort is what is kept.
+    finished.sort_by_key(|entry| entry.0);
+    for (_, path) in finished.iter().take(finished.len() - keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A lens's session record: the same lines the control wire carries, appended to an owner-only file
+/// under the data dir, redacted on the way out.
+///
+/// This is the one thing a ring is not. A ring is bounded and dies with the session, which is right
+/// for a live view and wrong for an audit: the question "what did that agent run last Tuesday" has
+/// no answer once the supervisor exits. A record answers it, and the properties that make the ring
+/// safe have to be carried over rather than assumed:
+///
+/// - **Out of the cage's reach.** The file is `0600` inside the lens's `0700` control directory,
+///   which is never bound into the cage. That, not "never written down", is the property the
+///   recorded party must not be able to defeat.
+/// - **Redacted at the write.** Only [`super::signer_control`] redacts before its ring; the process
+///   lens records the cage's own argv, which is where a credential passed on a command line lands.
+///   In RAM that died with the session. On disk it would not, so the substitution happens here, for
+///   every lens at once. It is against the needles known **at that moment**: a credential the launch
+///   learns later cannot reach back into a line already written, which is why recording is opt-in
+///   rather than the default meaning of `observe`.
+/// - **Bounded.** See [`RECORD_MAX_BYTES`].
+///
+/// Recording is best-effort by construction: a lens that cannot open its record still stands up and
+/// still serves its live reader, because a missing audit file is worth less than a missing lens.
+pub(crate) struct Recorder {
+    /// `None` once the record is closed — capped, or failed on a write. A closed record is never
+    /// reopened: the next line would sit past a `truncated=` note and read as if nothing was lost.
+    inner: Mutex<Option<OpenRecord>>,
+    /// The launch's credential set, read fresh on every line. It is filled as the launch resolves
+    /// secrets, so a handle taken at construction is empty and correct.
+    needles: crate::sandbox::notify_sink::Needles,
+}
+
+/// The open half of a [`Recorder`]: the file and how many bytes have gone into it.
+struct OpenRecord {
+    file: std::fs::File,
+    written: u64,
+}
+
+impl Recorder {
+    /// Create a session's record, or `None` when there is nothing safe to write: an identity the
+    /// header lines cannot carry ([`super::egress_stats::identity_is_recordable`]), or a file that
+    /// will not open. Both are the same outcome as recording being off.
+    pub(crate) fn create(
+        path: &Path,
+        project: &str,
+        app: Option<&str>,
+        needles: crate::sandbox::notify_sink::Needles,
+    ) -> Option<Recorder> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if !super::egress_stats::identity_is_recordable(project, app) {
+            return None;
+        }
+        // Before the new file, not after: the ceiling is on what the directory holds, and opening
+        // first would let a launch that fails on the write leave the directory one over.
+        if let Some(dir) = path.parent() {
+            prune_records(dir, RECORD_KEEP, &crate::session::pid_is_live);
+        }
+        let mut header = format!("project={project}\n");
+        if let Some(app) = app {
+            header.push_str(&format!("app={app}\n"));
+        }
+        // Truncating rather than appending: the path names one session incarnation, so anything
+        // already there is residue from a pid the kernel reused, and appending would splice two
+        // sessions' events under one header.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .ok()?;
+        file.write_all(header.as_bytes()).ok()?;
+        Some(Recorder {
+            inner: Mutex::new(Some(OpenRecord {
+                file,
+                written: header.len() as u64,
+            })),
+            needles,
+        })
+    }
+
+    /// Append one wire line, redacted and bounded. Errors are the record's own to absorb: a lens
+    /// that failed to write its audit line has still recorded the event in the ring its reader is
+    /// watching, and there is no caller for whom failing the push would be the better outcome.
+    ///
+    /// The redaction happens **before** the file lock is taken, so a slow credential set is never
+    /// held against another lens thread pushing into the same record.
+    pub(crate) fn record(&self, line: &str) {
+        let line = {
+            let needles = crate::sandbox::locks::read_locked(&self.needles);
+            crate::sandbox::redact::redact_string(
+                line,
+                &needles,
+                &crate::sandbox::redact::Placeholder::Plain,
+            )
+            .0
+        };
+        // A line that could be read back as one of this file's own is not written at all. Nothing
+        // produces one today — every `format_line` opens with `event ` — which is exactly why the
+        // rule belongs here rather than in each lens: it stays true for the sixth lens too.
+        if RECORD_RESERVED.iter().any(|p| line.starts_with(p)) {
+            return;
+        }
+        let mut g = locked(&self.inner);
+        let Some(open) = g.as_mut() else {
+            return;
+        };
+        if open.written + line.len() as u64 > RECORD_MAX_BYTES {
+            let _ = open.file.write_all(b"truncated=1\n");
+            *g = None;
+            return;
+        }
+        if open.file.write_all(line.as_bytes()).is_err() {
+            *g = None;
+            return;
+        }
+        open.written += line.len() as u64;
+    }
+}
+
+/// What a launch resolves once so every lens opens its record the same way.
+///
+/// One value rather than five arguments, for the reason [`super::notify_sink::NotifyWiring`] is one
+/// value: the parts are only correct together. The needle set must be the launch's own `Arc` — a
+/// fresh one stays empty for the session and every line goes down unredacted — and the project key
+/// must be the canonical identity a reader derives independently from a cwd, or the record is
+/// written under a name nothing will ever ask for.
+#[derive(Clone)]
+pub(crate) struct RecordWiring {
+    /// The launcher pid, and the incarnation it is: together they name one session, which is what
+    /// keeps a pid the kernel reuses from writing into its predecessor's record.
+    pid: u32,
+    start_ticks: u64,
+    /// The canonical project path, from [`super::binds::project_identity`] — the same derivation the
+    /// egress counters key on, so a record and a reader cannot drift apart.
+    project: String,
+    /// The app name for an `sbx app <name>` launch, else `None`.
+    app: Option<String>,
+    needles: crate::sandbox::notify_sink::Needles,
+}
+
+/// Omits the needle set, which is the credential values themselves — the same reason
+/// [`super::notify_sink::NotifyWiring`]'s does.
+impl std::fmt::Debug for RecordWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordWiring")
+            .field("pid", &self.pid)
+            .field("start_ticks", &self.start_ticks)
+            .field("project", &self.project)
+            .field("app", &self.app)
+            .field("needles", &"<redacted>")
+            .finish()
+    }
+}
+
+impl RecordWiring {
+    /// The wiring for this supervisor's session. `needles` is cloned from the launch's set by `Arc`,
+    /// never built here.
+    pub(crate) fn new(
+        project: String,
+        app: Option<String>,
+        needles: crate::sandbox::notify_sink::Needles,
+    ) -> Self {
+        let pid = std::process::id();
+        RecordWiring {
+            pid,
+            // Zero for a kernel that will not report the incarnation: the name stays unique among
+            // live sessions (one pid, one session) and only loses its guard against pid reuse.
+            start_ticks: crate::session::read_start_ticks(pid).unwrap_or(0),
+            project,
+            app,
+            needles,
+        }
+    }
+
+    /// Open this session's record in `dir`, a lens's own control directory. `None` when there is
+    /// nothing to write into — the directory would not go owner-only, or the file would not open.
+    pub(crate) fn open(&self, dir: &Path) -> Option<Recorder> {
+        ensure_control_dir(dir).ok()?;
+        Recorder::create(
+            &record_path(dir, self.pid, self.start_ticks),
+            &self.project,
+            self.app.as_deref(),
+            self.needles.clone(),
+        )
+    }
+}
+
+/// [`RecordWiring::open`] for the shape every lens holds: recording off is `None`, and so is
+/// recording on that could not open a file. One call at each of the six ring constructions.
+pub(crate) fn open_record(wiring: Option<&RecordWiring>, dir: &Path) -> Option<Recorder> {
+    wiring.and_then(|w| w.open(dir))
 }
 
 // ── The client (the `sbx … logs` process) ─────────────────────────────────────────────────────
@@ -674,5 +975,206 @@ mod tests {
 
         let mode = std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    // ── The record ────────────────────────────────────────────────────────────────────────────
+
+    fn needles(pairs: &[(&str, &str)]) -> crate::sandbox::notify_sink::Needles {
+        std::sync::Arc::new(std::sync::RwLock::new(
+            pairs
+                .iter()
+                .map(|(name, value)| {
+                    crate::sandbox::proxy::SecretNeedle::named(*name, value.as_bytes().to_vec())
+                })
+                .collect(),
+        ))
+    }
+
+    fn push_tail(ring: &Ring<TestEvent>, tail: &str) -> u64 {
+        ring.push_with(|seq, at_epoch_ms| TestEvent {
+            seq,
+            at_epoch_ms,
+            tail: tail.to_string(),
+        })
+    }
+
+    /// The file a reader will look at: the identity it is attributed by, then one line per event in
+    /// the order they were pushed — the same lines the control wire carries.
+    #[test]
+    fn a_record_is_the_identity_then_one_wire_line_per_event() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = Recorder::create(&path, "/home/u/proj", Some("demo"), needles(&[])).unwrap();
+        let ring = Ring::<TestEvent>::new(10).with_record(Some(record));
+        push_tail(&ring, "first");
+        push_tail(&ring, "second");
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines[0], "project=/home/u/proj");
+        assert_eq!(lines[1], "app=demo");
+        assert!(lines[2].starts_with("event seq=1 "), "{}", lines[2]);
+        assert!(lines[2].ends_with("tail=first"), "{}", lines[2]);
+        assert!(lines[3].ends_with("tail=second"), "{}", lines[3]);
+        // What the ring still holds and what the file holds are the same events, which is the
+        // property that lets one reader answer from either.
+        assert_eq!(ring.snapshot(None).events.len(), 2);
+    }
+
+    /// The reason recording is opt-in rather than implied by `observe`. The process lens records the
+    /// cage's own argv, so a credential passed on a command line reaches this writer in the clear;
+    /// in RAM it died with the session, and on disk it must not survive as itself.
+    #[test]
+    fn a_recorded_line_is_redacted_against_the_launch_needles() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = Recorder::create(
+            &path,
+            "/p",
+            None,
+            needles(&[("API_TOKEN", "sk-abcdefghijklmnop")]),
+        )
+        .unwrap();
+        let ring = Ring::<TestEvent>::new(10).with_record(Some(record));
+        push_tail(
+            &ring,
+            "curl -H authorization:sk-abcdefghijklmnop https://api",
+        );
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !body.contains("sk-abcdefghijklmnop"),
+            "the credential reached the disk verbatim: {body}"
+        );
+        assert!(body.contains("${API_TOKEN}"), "{body}");
+        // The ring itself is untouched: it is memory the cage cannot reach, and a reader watching a
+        // live session is the launch's own owner.
+        assert_eq!(
+            ring.snapshot(None).events[0].tail,
+            "curl -H authorization:sk-abcdefghijklmnop https://api"
+        );
+    }
+
+    /// The cage decides how many events a session produces, so the file needs a ceiling. Past it the
+    /// record says the tail is missing rather than simply stopping, which would read as a session
+    /// that went quiet.
+    #[test]
+    fn a_record_past_its_cap_says_so_and_writes_no_more() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = Recorder::create(&path, "/p", None, needles(&[])).unwrap();
+        // Push lines until the cap is crossed. Each carries a long tail so the count stays small.
+        let long = "x".repeat(DETAIL_MAX);
+        let ring = Ring::<TestEvent>::new(4).with_record(Some(record));
+        for _ in 0..(RECORD_MAX_BYTES as usize / DETAIL_MAX) + 2 {
+            push_tail(&ring, &long);
+        }
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.ends_with("truncated=1\n"), "no truncation note");
+        assert!((body.len() as u64) <= RECORD_MAX_BYTES + 32);
+        let before = body.len();
+        push_tail(&ring, "after the cap");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            before,
+            "a closed record must not accept another line"
+        );
+    }
+
+    /// The identity lines are matching keys, compared against what a reader derives on its own. A
+    /// value the format cannot carry writes no record at all rather than one under a forged name —
+    /// the same answer [`super::super::egress_stats`] gives for its counters, from the same rule.
+    #[test]
+    fn an_identity_the_header_cannot_carry_writes_no_record() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        assert!(
+            Recorder::create(&path, "/p\nproject=/other", None, needles(&[])).is_none(),
+            "a project name spelling a second header line must be refused"
+        );
+        assert!(
+            !path.exists(),
+            "nothing may be written for a refused identity"
+        );
+    }
+
+    /// A record is deliberately not swept when its session ends, so the ceiling on the directory has
+    /// to be applied when a new one is opened. A running session's record is never a candidate,
+    /// whatever its age.
+    #[test]
+    fn opening_a_record_drops_the_oldest_finished_ones() {
+        let dir = crate::testutil::TmpDir::new();
+        // Three finished sessions and one still running, oldest first.
+        for (i, name) in ["record-10-1.log", "record-11-1.log", "record-12-1.log"]
+            .iter()
+            .enumerate()
+        {
+            std::fs::write(dir.path().join(name), "project=/p\n").unwrap();
+            let at =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100 + i as u64);
+            filetime_set(&dir.path().join(name), at);
+        }
+        let live = dir.path().join("record-99-1.log");
+        std::fs::write(&live, "project=/p\n").unwrap();
+        filetime_set(&live, std::time::SystemTime::UNIX_EPOCH);
+
+        prune_records(dir.path(), 1, &|pid| pid == 99);
+
+        assert!(!dir.path().join("record-10-1.log").exists(), "oldest kept");
+        assert!(
+            !dir.path().join("record-11-1.log").exists(),
+            "second oldest kept"
+        );
+        assert!(
+            dir.path().join("record-12-1.log").exists(),
+            "newest dropped"
+        );
+        assert!(
+            live.exists(),
+            "a live session's record must survive the prune whatever its age"
+        );
+    }
+
+    /// The one line the writer must never produce: an event that could be read back as this file's
+    /// own metadata. Nothing formats one today, which is why the rule lives at the single door every
+    /// lens's line goes through rather than in each lens.
+    #[test]
+    fn a_line_that_could_pass_for_a_header_is_not_written() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = Recorder::create(&path, "/p", None, needles(&[])).unwrap();
+        for reserved in RECORD_RESERVED {
+            record.record(&format!("{reserved}/forged\n"));
+        }
+        record.record("event seq=1 at=0 tail=real\n");
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body, "project=/p\nevent seq=1 at=0 tail=real\n",
+            "only the writer's own header may carry a reserved prefix"
+        );
+    }
+
+    /// Set one file's modification time, so the prune's ordering is asserted on a known order rather
+    /// than on how fast the test's own writes happen to run.
+    fn filetime_set(path: &Path, at: std::time::SystemTime) {
+        let secs = at
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let times = [
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+        ];
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid path and a two-element `timeval` array, as `utimes(2)` requires.
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) }, 0);
     }
 }

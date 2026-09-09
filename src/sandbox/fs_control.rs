@@ -128,6 +128,13 @@ impl FsRing {
         FsRing(super::lens::Ring::new(cap))
     }
 
+    /// Attach this session's record, so the events also reach a file that outlives the session.
+    /// Relayed to [`super::lens::Ring::with_record`]; `None` leaves the ring memory-only.
+    pub(crate) fn with_record(mut self, record: Option<super::lens::Recorder>) -> Self {
+        self.0 = self.0.with_record(record);
+        self
+    }
+
     /// Append one observed change. `path` must already be sanitised of control characters and
     /// length-capped by the caller. Returns the assigned sequence number.
     pub(crate) fn push(&self, kind: FsKind, path: &str) -> u64 {

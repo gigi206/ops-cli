@@ -363,6 +363,11 @@ pub(crate) struct RawConfig {
     /// untrusted one: raising the floor drops credentials out of the leak tripwires, a choice an
     /// untrusted project may not make. Absent leaves the built-in floor.
     pub(crate) redact: Option<RawRedact>,
+    /// Whether the observation lenses keep a record of this session, declared as the `[observe]`
+    /// table. A security field — honored from the global config or a trusted project, ignored from
+    /// an untrusted one. Absent means off, which is the shape every lens had before the table
+    /// existed: memory for the session, and nothing after it.
+    pub(crate) observe: Option<RawObserve>,
     /// Reusable tool bundles, `[bundle.<name>]` — everything one tool needs to be *installed* and
     /// to *reach its own services*, declared once and folded into any app that names it in `use`.
     /// A bundle is the map-side companion of a `[network.groups]` group: a group factors out egress
@@ -722,6 +727,33 @@ pub(crate) struct RawRedact {
     /// floor; `0` is refused (a zero-length needle matches at every offset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) min_len: Option<u64>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// The `[observe]` table: whether the observation lenses keep what they saw.
+///
+/// Every lens records into a bounded, in-RAM ring that dies with the session, which answers "what is
+/// this agent doing" and cannot answer "what did it do last Tuesday". This table turns on the second
+/// answer: each lens also appends its events to an owner-only file under the data dir, which
+/// outlives the session and is read back by the same `sbx … logs` view.
+///
+/// It is off by default rather than implied by `observe`, and that is not caution for its own sake.
+/// The process lens records the cage's own argv, which is where a credential passed on a command
+/// line lands; in RAM that died with the session. Written down it does not, and the substitution
+/// that protects it is against the credentials known **at the moment of the write** — one the launch
+/// resolves later cannot reach back into a line already on disk. Keeping the record is therefore a
+/// choice with a cost, and the launch makes it explicitly.
+///
+/// A security field, gated like `[redact]`: an untrusted project may not decide that its agent's
+/// command lines are kept on the owner's disk. Baseline-only, like `[redact]`: the record is a
+/// property of the session rather than of one app inside it.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawObserve {
+    /// Whether each lens writes its session record. Unset is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) record: Option<bool>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,

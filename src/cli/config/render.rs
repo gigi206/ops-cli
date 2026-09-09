@@ -718,6 +718,26 @@ fn redact_section(view: &config::view::ConfigView, pal: &style::Palette) -> Opti
     Some(o)
 }
 
+/// Whether this launch keeps a session record, shown only when a layer stated it. Off is both the
+/// default and the shape every lens had before the table existed, so at the default there is
+/// nothing a reader needs told; on is a standing change to what lands on the owner's disk, which is
+/// exactly what a provenance view is for.
+fn observe_section(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    if view.observe_record_origin == config::view::ProvenanceView::Default {
+        return None;
+    }
+    let kept = if view.observe_record {
+        "kept"
+    } else {
+        "not kept"
+    };
+    Some(format!(
+        "  {h}observe:{r} each lens's session record is {n}{kept}{r} on disk{}\n",
+        provenance_tag(view.observe_record_origin, pal)
+    ))
+}
+
 /// What the host answers to a resolver plugin. Values are shown: a `[plugin.<name>]` table carries
 /// configuration, never a credential — a secret is declared in `[secret]`, which
 /// [`secrets_section`] prints by locator and never by value.
@@ -1319,6 +1339,7 @@ pub(super) fn render_config(
         brokers_section(&view.brokers, pal),
         secrets_section(&view.secrets, pal),
         redact_section(view, pal),
+        observe_section(view, pal),
         plugins_section(&view.plugins, pal),
         tasks_section(&view.tasks, pal),
         apps_section(&view.apps, pal, details),
@@ -1414,6 +1435,8 @@ mod tests {
             egress_stats: true,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             redact_min_len_origin: Default::default(),
+            observe_record: false,
+            observe_record_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::None,
