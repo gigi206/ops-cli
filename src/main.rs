@@ -115,6 +115,12 @@ fn current_project() -> Result<PathBuf, ExitCode> {
 /// A pid given explicitly is deliberately not filtered by it. `sbx session ls` lists every live
 /// session on the machine with its project beside it, so an id typed from that listing is answered
 /// wherever it belongs.
+///
+/// Nor is an **aggregate** view: `sbx net logs`, `sbx task logs` and their kind show many sessions
+/// at once, each tagged by its pid, and an inventory that hid the neighbours would answer a question
+/// nobody asked. The line is between picking one session and listing them, not between one command
+/// family and another. A verb that *writes* a live rule is scoped too, through
+/// [`session_scope_pids`], where `--all` widens it back.
 fn sessions_of_project<'a>(
     sessions: &'a [session::Session],
     project: &Path,

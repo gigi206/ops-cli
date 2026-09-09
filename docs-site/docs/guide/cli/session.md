@@ -19,6 +19,26 @@ is an alias.
 
 See also: [Sessions](../housekeeping/sessions) · [`sbx projects`](projects) · [`sbx gc`](gc).
 
+## Which session a command acts on
+
+`sbx session ls` is the machine inventory: every live session, whatever project started it, with its
+PID and its project beside it. That is where a PID comes from, and it is what lets the rest of the
+CLI narrow to one project without losing reach.
+
+Three rules, and each verb follows the one that fits it:
+
+| The command | With no id | With a PID |
+|---|---|---|
+| resolves **one** session ([`sbx logs`](logs) and its per-lens siblings, [`sbx proc ls`](proc), [`sbx proc live`](proc)) | this project's sole live session, or its records | that session, whatever project it belongs to |
+| loads a **live rule** ([`sbx net allow`](net), [`sbx proc deny`](proc), [`sbx proc rules`](proc)) | this project's sessions; `--all` widens to every project | not taken |
+| lists **many** sessions at once ([`sbx net logs`](net), [`sbx net live`](net), [`sbx net pending`](net), [`sbx proc pending`](proc), [`sbx task logs`](task)) | every live session; `-a <app>` narrows where offered | not taken |
+
+The split is what each command can *show you*. A view of one session has to pick, so it picks in the
+project you are standing in; a listing of many is already an inventory, and an inventory that hid
+the neighbours would be answering a question you did not ask. Anything keyed by project on disk,
+[`sbx net stats`](net) and the [session records](../configuration/observe), answers for this project
+only, listed or resolved.
+
 ## `ls`
 
 ```
