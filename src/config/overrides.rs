@@ -13,11 +13,11 @@
 //!
 //! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `SBX_CONFIG` — carries
 //! inline TOML shaped exactly like an `sbx.toml`, so it can set *any* field the schema has. A
-//! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/
-//! `--seccomp`/`--device`/`--proc`/`--notify`/`--gpu`/`--audio`/`--dbus` (and their `--env` sibling), each with
-//! an `SBX_*` environment equivalent — is an ergonomic shorthand for one field. The booleans
-//! `--gpu`/`--audio`/`--dbus` are optional-value (bare = `true`, or `=true`/`=false`); the rest take
-//! a required value.
+//! **typed flag** — `--net`/`--fs`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/
+//! `--seccomp`/`--device`/`--proc`/`--notify`/`--gpu`/`--audio`/`--dbus` (and their `--env`
+//! sibling), each with an `SBX_*` environment equivalent — is an ergonomic shorthand for one
+//! field. The booleans `--gpu`/`--audio`/`--dbus` are optional-value (bare = `true`, or
+//! `=true`/`=false`); the rest take a required value.
 //!
 //! Because an override is trusted by invocation, its `--seccomp`/`--device` (and a blob's
 //! `[seccomp]`/`[devices]`) relax the mandatory syscall denylist and grant a host device for the
