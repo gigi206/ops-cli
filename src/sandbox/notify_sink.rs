@@ -545,32 +545,58 @@ impl DesktopSink {
     /// one — the seam the reconnect test drives, so that path is exercised against a real bus and a
     /// real daemon going away, without touching the user's desktop.
     fn connect_to(address: Option<&str>, app_name: String) -> Option<DesktopSink> {
+        Self::connect_within(address, app_name, DELIVER_DEADLINE)
+    }
+
+    /// [`connect_to`](Self::connect_to) with the bound as an argument, so a test can drive the
+    /// giving-up branch without waiting the real window out.
+    ///
+    /// Bounded for the reason the send is, and by the same window: the reconnect runs on the
+    /// delivery thread, which `Drop` joins. `Drop` already reasons about the wait it can inherit as
+    /// two `DELIVER_DEADLINE` windows — a timed-out call, then the retry that follows the
+    /// reconnect — and that arithmetic only holds if the reconnect between them is bounded too. A
+    /// bus that accepts the connection and never answers `GetServerInformation` is exactly the peer
+    /// the send guards against, met one step earlier.
+    fn connect_within(
+        address: Option<&str>,
+        app_name: String,
+        deadline: Duration,
+    ) -> Option<DesktopSink> {
         async_io::block_on(async {
-            let conn = match address {
-                Some(addr) => zbus::connection::Builder::address(addr)
-                    .ok()?
-                    .build()
-                    .await
-                    .ok()?,
-                None => zbus::Connection::session().await.ok()?,
-            };
-            let proxy = crate::sandbox::notify_relay::HostNotificationsProxy::new(&conn)
+            futures_util::select! {
+                sink = Self::bind(address, app_name).fuse() => sink,
+                _ = FutureExt::fuse(async_io::Timer::after(deadline)) => None,
+            }
+        })
+    }
+
+    /// The connection itself: bind the bus, prove something serves the interface, bind the portal.
+    /// Unbounded on purpose — [`connect_within`](Self::connect_within) owns the window.
+    async fn bind(address: Option<&str>, app_name: String) -> Option<DesktopSink> {
+        let conn = match address {
+            Some(addr) => zbus::connection::Builder::address(addr)
+                .ok()?
+                .build()
                 .await
-                .ok()?;
-            // Ask the daemon what it is: proof that something actually serves the interface, rather
-            // than discovering it at the first refusal — when the fallback would be too late to warn
-            // about. The answer itself is not used.
-            proxy.get_server_information().await.ok()?;
-            // The portal is optional: a desktop without one simply never says it is dark. Bound
-            // here so a reconnect rebinds it alongside the notifications proxy, on the same
-            // connection, rather than leaving a proxy pointing at a connection that has gone.
-            let settings = crate::sandbox::theme_relay::bind_host_settings(&conn).await;
-            Some(DesktopSink {
-                proxy,
-                settings,
-                app_name,
-                address: address.map(str::to_string),
-            })
+                .ok()?,
+            None => zbus::Connection::session().await.ok()?,
+        };
+        let proxy = crate::sandbox::notify_relay::HostNotificationsProxy::new(&conn)
+            .await
+            .ok()?;
+        // Ask the daemon what it is: proof that something actually serves the interface, rather
+        // than discovering it at the first refusal — when the fallback would be too late to warn
+        // about. The answer itself is not used.
+        proxy.get_server_information().await.ok()?;
+        // The portal is optional: a desktop without one simply never says it is dark. Bound
+        // here so a reconnect rebinds it alongside the notifications proxy, on the same
+        // connection, rather than leaving a proxy pointing at a connection that has gone.
+        let settings = crate::sandbox::theme_relay::bind_host_settings(&conn).await;
+        Some(DesktopSink {
+            proxy,
+            settings,
+            app_name,
+            address: address.map(str::to_string),
         })
     }
 }
