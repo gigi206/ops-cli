@@ -2,17 +2,31 @@
 
 ## Environment
 
-- Code navigation: `rg` to locate (5ms) — blind to re-exports/
-  aliases and matches comments, always confirm hits via LSP.
-- LSP (rust-analyzer) for exact 1-hop resolution (definition,
-  references, call hierarchy) — one hop per call, no global view.
+- LSP and `cargo-callgraph` are DEFERRED tools: absent from the
+  tool list until loaded. Load them before use, e.g.
+  `ToolSearch("select:LSP")`. A tool you cannot see in the list
+  is not a tool that is unavailable here.
+- A fresh rust-analyzer is spawned by the first LSP call and
+  answers nothing for about a minute. "not indexed" means wait
+  and re-probe; it never means the LSP is broken.
+- These questions REQUIRE the LSP, `rg` cannot answer them: who
+  calls X, is X dead, has X another impl, what does this symbol
+  resolve to. `rg` locates a candidate (5ms) — blind to
+  re-exports and aliases, and it matches comments. Use it to
+  find, never to conclude.
+- LSP call-hierarchy positions point at the start of the item's
+  block, doc-comment included, not at the signature. Cross-check
+  with `grep -n` before citing a line.
 - `cargo-callgraph` MCP for ≥2 hops, call paths, impact analysis,
-  dead-code/bottlenecks — qualified patterns only
-  (`cli::dispatch`, never `dispatch`), depth ≤3, never dump
-  the full JSON (10MB+); first index takes minutes, then cached.
-- MCP graph goes stale on any Rust edit (cache keys on
-  Cargo.toml mtime only): call `generate_callgraph` with
-  `reload: true` after touching sources, before trusting results.
+  dead-code/bottlenecks — depth ≤3, never dump the full JSON
+  (10MB+). Free functions are stored qualified
+  (`proc_policy::shebang_interpreter`), but impl METHODS are
+  stored BARE (`matches`, never `ProcRule::matches`) and collide
+  across types: a qualified pattern returning nothing proves
+  nothing — re-probe with the bare name.
+- The graph caches on Cargo.toml's mtime alone, so it is normally
+  stale and line numbers drift, per file. `reload: true` rebuilds
+  nothing and costs seconds — prefer it to doubting the answer.
 - semgrep for versioned policy rules enforced in CI, not for
   exploration — one pattern per spelling, no call resolution.
 - Golden rule: never assume, ALWAYS verify!
