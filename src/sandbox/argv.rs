@@ -507,6 +507,7 @@ mod tests {
                 Path::new("/data/store/nix"),
                 Path::new("/data/mise"),
                 &[],
+                None,
                 Path::new("/nix/store/abc-mise/bin/mise"),
                 &[OsString::from("--version")],
             ),

@@ -46,6 +46,12 @@ const MISE_BIN: &str = "bin/mise";
 /// directory sbx binds read-write — never the user's real mise state.
 const MISE_HOME: &str = "/mise";
 
+/// Where the `nix:` backend plugin is registered, relative to the private home on the **host**.
+/// `MISE_DATA_DIR` is this cage's `/mise/data`, and mise looks for its plugins in `plugins/` under
+/// that, so the registration symlink belongs here and nowhere else. Written host-side before the
+/// cage exists, which is why it is a host-relative path rather than an in-sandbox one.
+const MISE_PLUGINS_REL: &str = "data/plugins";
+
 /// In-sandbox directory holding the project's mise file(s) when mise reads a
 /// trusted project. Only the *authorized* files are bound here (one read-only bind
 /// each), and mise is run from here — so its config discovery, which walks up from
@@ -123,6 +129,14 @@ fn command(
 ) -> io::Result<(Command, Vec<std::fs::File>)> {
     let home_src = ensure_home(layout)?;
     let store_nix = store::physical_path(layout, Path::new("/nix"));
+    // The bundled `nix:` backend plugin, staged and registered for this helper's mise the way a
+    // launch does it for the cage's. It is what gives `nix` a meaning here: a project that writes
+    // `_.nix` in its `[env]`, or a `nix:` tool in its `[tools]`, is naming this backend, and a mise
+    // that has not loaded it reads the word as a version string and fails on it. The registration
+    // goes under this cage's own `MISE_DATA_DIR`, which is the private home's `data/`, so the link
+    // lives on the one writable surface the helper has.
+    let plugin = super::miseplugin::stage(layout.data_dir())?;
+    super::miseplugin::register(&home_src, MISE_PLUGINS_REL)?;
     // The mandatory syscall denylist, as every other cage sbx builds carries it. This one is
     // assembled by hand rather than through the `SandboxSpec` keystone, which is how it came to have
     // the namespaces and the dropped capabilities but not the filters — and this is the cage that
@@ -134,6 +148,7 @@ fn command(
         &store_nix,
         &home_src,
         project_binds,
+        Some(plugin.as_path()),
         mise_bin,
         args,
     ));
@@ -320,6 +335,7 @@ pub(super) fn bwrap_argv(
     store_nix: &Path,
     home_src: &Path,
     project_binds: &[ProjectBind],
+    plugin_dir: Option<&Path>,
     mise_bin: &Path,
     args: &[OsString],
 ) -> Vec<OsString> {
@@ -343,6 +359,15 @@ pub(super) fn bwrap_argv(
         a.push(lit("--ro-bind"));
         a.push(path(&b.src));
         a.push(path(&b.dest));
+    }
+
+    // The staged `nix:` backend plugin, read-only at the path its registration symlink points at.
+    // Read-only because nothing here writes to a plugin, and because the tree is content-keyed and
+    // shared with every other cage that mounts it.
+    if let Some(dir) = plugin_dir {
+        a.push(lit("--ro-bind"));
+        a.push(path(dir));
+        a.push(lit(super::miseplugin::INCAGE_DIR));
     }
 
     // Confine every mise directory to the private home, auto-confirm so a prompt
@@ -530,6 +555,7 @@ mod tests {
             Path::new("/data/store/nix"),
             Path::new("/data/mise"),
             &[],
+            None,
             Path::new("/nix/store/abc-mise/bin/mise"),
             &[OsString::from("--version")],
         );
@@ -636,6 +662,7 @@ mod tests {
             Path::new("/data/store/nix"),
             Path::new("/data/mise"),
             &binds,
+            Some(Path::new("/data/mise-plugin/abc")),
             Path::new("/nix/store/abc-mise/bin/mise"),
             &[OsString::from("env"), OsString::from("--json-extended")],
         );
@@ -667,6 +694,20 @@ mod tests {
             .map(|w| w[2].clone())
             .collect();
         assert_eq!(writable, vec![OsString::from("/mise")]);
+
+        // The `nix:` backend plugin rides along read-only, at the path its registration symlink
+        // names. Without it this mise does not know the backend, and a project that writes `_.nix`
+        // in its `[env]` fails resolution on a word mise reads as a version.
+        let plugin: Vec<_> = argv
+            .windows(3)
+            .filter(|w| w[0] == "--ro-bind" && w[2] == super::super::miseplugin::INCAGE_DIR)
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(
+            plugin,
+            vec![OsString::from("/data/mise-plugin/abc")],
+            "the plugin must be bound read-only at its in-cage path"
+        );
 
         // named trusted (colon-joined) so mise loads them without prompting
         assert_eq!(
