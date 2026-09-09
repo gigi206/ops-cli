@@ -336,6 +336,11 @@ there, reclaiming the app's now-unreferenced `nix:`/`flake:` closures. For a glo
 used in several projects, run the sweep in each of them (one command covers the current
 project only). Use `sbx app list` to see which apps have an installed home to purge.
 
+`--purge` also leaves your project tree alone. An app that keys state by the directory it
+runs in wrote that state at the project root, in your tree, and taking it out is yours to
+do: see [what an app writes in the
+project](../concepts/decisions#what-an-app-writes-in-the-project-stays-where-the-app-puts-it).
+
 Several names may be given in one call, like [`sbx projects rm`](projects). Each app is
 removed on its own: a name that fails (no profile to remove, a live session holding its
 home) leaves the others removed and only makes the exit code non-zero, while an invalid
