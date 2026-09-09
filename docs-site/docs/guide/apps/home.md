@@ -69,7 +69,19 @@ Only the **home** (and its sibling synthetic `/etc`) becomes app-scoped. The
 per-project **store** (`/nix`), the nixpkgs/tools locks, and the mise-config staging
 stay **project-scoped** (shared across an app and the project shell). So per-app *home*
 isolation is not per-app *store* isolation: a consciously accepted, same-uid,
-self-harm-class residual.
+self-harm-class residual. What that costs you is spelled out in [the store an agent
+writes into is shared by the project's
+apps](../concepts/security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps):
+the unit of isolation there is the project, not the app.
+
+An app's own per-project state is a different thing and rides the **project bind**: a tool
+that keys its settings, its logs or its session database by the directory it runs in
+writes them at the project root, inside the cage, exactly where it would on the host. What
+an app writes there is the app's choice. One provisioning path lands there as well, and
+only one: the bundled `nix:` mise plugin caches a resolved dev environment in `.mise-nix/`
+at the project root, and it does so only for a project that carries a `flake.nix` of its
+own. Every other backend writes into the project's store or into sbx's data directory,
+never into the tree.
 
 ### Two mise pools keep a global app's self-equips aligned
 

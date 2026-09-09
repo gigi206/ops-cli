@@ -99,6 +99,16 @@ The net effect:
 > An agent that self-equips writes **only** into its project's own store. The shared
 > store stays immutable, and one project's installs never touch another's.
 
+**Declared packages land there too, not just self-equips.** A store is keyed by the
+project directory and holds whatever is built for a cage launched in it, so an app's
+[`packages`](../configuration/packages) go into the store of whichever project you run
+that app in. A project that declares nothing of its own still accumulates the payload of
+every app launched there, and the same app launched in a second project builds its
+payload again in that project's store. [`sbx projects show <id>`](../cli/projects) names
+what a store actually holds and which backend put each root there. The disk arithmetic
+above is what decides whether that matters: on a copy-on-write filesystem the second copy
+shares blocks with the first, and on ext4 it does not.
+
 The per-project directory also holds that project's resolution locks, `nixpkgs.lock` (a project channel pin), `tools.lock` (resolved `nix:` mise tools),
 and `flake-packages.lock` (pinned `flake:` packages). See
 [Directory layout](../concepts/directory-layout).

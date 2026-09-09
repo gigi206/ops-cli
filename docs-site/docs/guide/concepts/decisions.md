@@ -52,6 +52,29 @@ are in [Where the protection stops](security-model#where-the-protection-stops). 
 most important limit on this page and it is not summarised here, because a summary is
 exactly what a reader would act on instead of the table.
 
+### What an app writes in the project stays where the app puts it
+
+A tool that keys state by the directory it runs in writes at the project root: a settings
+directory, a log, a session database, a lock file. The cage does not change that. sbx binds
+the project read-write at its real path and starts the process there, which is what makes
+the tool work on your code at all, and it does not intercept where the tool then writes. So
+running an app in a project can leave a directory in your tree that neither you nor sbx
+authored, and git-ignoring it is the whole of the cleanup.
+
+Two things follow, and the second is the one worth knowing. It is untracked residue, so it
+is yours to ignore or delete. And it sits in the project bind, which means every app run in
+that project reads and writes it: the unit of isolation there is the project, not the app,
+the same way it is for the [store they
+share](security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps).
+
+Redirecting it per app was weighed and not taken. The mount machinery already places a host
+path at a different path inside the cage, so the mechanism is not the obstacle. A mount is
+resolved once, when the cage starts, so the redirect's target would have to exist before
+the launch that is supposed to prevent it from existing, and whether an app's project-local
+state is residue or something you want kept per repository is a judgement that differs app
+by app. What is per-app and what is per-project, including the one provisioning path that
+also lands in the tree, is in [Per-app isolated `$HOME`](../apps/home#what-is-per-app-vs-per-project).
+
 ### The holes are opened on request, and each one is a hole
 
 A cage nobody configured exposes no display, no device, no bus and no host network. The
