@@ -791,11 +791,9 @@ fn session_app_of(data_dir: &Path, pid: u32) -> Option<String> {
 /// [`sandbox::project_identity`]), so a session and its project never disagree. A session not in the
 /// registry has no known project, so under a filter it is excluded.
 fn session_pids_for_project(data_dir: &Path, project: &Path) -> std::collections::HashSet<u32> {
-    session::Registry::at(data_dir)
-        .live()
-        .unwrap_or_default()
+    let live = session::Registry::at(data_dir).live().unwrap_or_default();
+    sessions_of_project(&live, project)
         .into_iter()
-        .filter(|s| s.project == project)
         .map(|s| s.pid)
         .collect()
 }

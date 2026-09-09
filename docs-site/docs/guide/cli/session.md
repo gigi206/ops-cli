@@ -29,7 +29,7 @@ Three rules, and each verb follows the one that fits it:
 
 | The command | With no id | With a PID |
 |---|---|---|
-| resolves **one** session ([`sbx logs`](logs) and its per-lens siblings, [`sbx proc ls`](proc), [`sbx proc live`](proc)) | this project's sole live session, or its records | that session, whatever project it belongs to |
+| resolves **one** session ([`sbx logs`](logs) and its per-lens siblings, [`sbx proc ls`](proc), [`sbx proc live`](proc)) | this project's sole live session, or (the `logs` views) its records | that live session, whatever project it belongs to |
 | loads a **live rule** ([`sbx net allow`](net), [`sbx proc deny`](proc), [`sbx proc rules`](proc)) | this project's sessions; `--all` widens to every project | not taken |
 | lists **many** sessions at once ([`sbx net logs`](net), [`sbx net live`](net), [`sbx net pending`](net), [`sbx proc pending`](proc), [`sbx task logs`](task)) | every live session; `-a <app>` narrows where offered | not taken |
 
