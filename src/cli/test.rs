@@ -1017,7 +1017,7 @@ fn fs_test(args: &[OsString]) -> ExitCode {
     // Every path printed below is the project's to spell: `resolve_under_project` follows the
     // project's own symlinks, so the name that comes back can be one a file in the tree chose, and
     // the covering path comes straight out of that tree. Filtered on the way to the terminal for
-    // the reason [`diag::warn_config`] states and `sbx inspect` already applies to the names it
+    // the reason [`diag::warn_config`] states and `sbx config show` already applies to the names it
     // lists: a control byte here lands at the moment the user is reading a verdict, which is the
     // moment worth forging.
     let shown = |p: &Path| crate::sandbox::sanitize(&p.display().to_string());
