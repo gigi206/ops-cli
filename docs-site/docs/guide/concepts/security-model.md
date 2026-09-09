@@ -249,6 +249,31 @@ The other carriers stay open deliberately: the `package.json`, the `Makefile` an
 workflow files *are* the work. Closing them would close the job. They are reported by the
 feed, and reading the diff is the whole control.
 
+### The store an agent writes into is shared by the project's apps
+
+There is a second place the boundary stops short, and it is not in the project tree. The
+cage's `/nix` is the **project's own** store, bound read-write so an agent can self-equip
+a toolchain. Every app launched in that directory gets that same store: one per project,
+shared by all of its apps, and [`sbx projects show`](../cli/projects) lists what one
+holds.
+
+So the unit of isolation here is the **project**, not the app. An agent running under one
+app can rewrite a file inside the store path another app is launched from, and the next
+launch of that second app in that project runs what it wrote.
+
+Modes are not what would stop that. A store path is read-only (`0555`), but it is owned
+by you and the cage runs as your uid, and an owner may `chmod` what it owns. Nor is the
+store re-verified at launch. What protects the **shared** store against all of this is
+that no cage ever holds it writable: each project gets a physically independent copy, so
+a write inside a cage cannot reach the original. The one place a cage sees the shared
+store at all is the read-only pins sbx binds for the programs it execs itself, and there
+it is bytes the cage cannot write. A project's own store has no such separation from the
+cages that run in it, since those cages are precisely what writes to it.
+
+Two agents you need kept apart therefore belong in two project directories, which is two
+stores. Within one directory, apps share a filesystem the way they already share the
+project tree.
+
 ## See also
 
 [Decisions and limits](decisions) gathers the limits stated across the other pages, which
