@@ -22,10 +22,15 @@
   `traverse_incoming`/`traverse_outgoing` with depth ≤3 — one call
   replaces a chain of `incomingCalls`. Confirm a hop at the LSP
   before acting on it, and never dump the full JSON (10MB+).
-- Do NOT use `find_dead_code`: it reports live functions as
-  orphaned, and `-D warnings` already fails the build on code that
-  is really dead. `find_call_paths` returns less than a single
-  `incomingCalls` — prefer the traversals.
+- The graph records direct call expressions only. A function
+  reached inside a macro argument (`format!("{}", contract(p))`) or
+  passed as a value (`read: read_net_rows`) carries no edge, so the
+  graph is blind to both — and a codebase built on `format!` and
+  callback tables hides much of its wiring there.
+- Do NOT use `find_dead_code`: those two blind spots make it report
+  live functions as orphaned, and `-D warnings` already fails the
+  build on code that is really dead. `find_call_paths` returns less
+  than a single `incomingCalls` — prefer the traversals.
 - Free functions are stored qualified
   (`proc_policy::shebang_interpreter`), but impl METHODS are
   stored BARE (`matches`, never `ProcRule::matches`) and collide
