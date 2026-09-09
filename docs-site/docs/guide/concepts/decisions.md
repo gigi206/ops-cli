@@ -75,6 +75,32 @@ state is residue or something you want kept per repository is a judgement that d
 by app. What is per-app and what is per-project, and what provisioning does with each, is in
 [Per-app isolated `$HOME`](../apps/home#what-is-per-app-vs-per-project).
 
+### An install pool is per app, and only its `nix:` half has to be
+
+A global app's mise installs are split in two: the app's own declared tools live in its
+home and follow it everywhere, while what an agent equips inside a project lands in a pool
+under that project's tree. The reason for the second pool is the store: a `nix:` tool
+resolved through mise is built into the project's `/nix`, so its install record has to be
+scoped the same way, or an app carries a record pointing at a store another project cannot
+see. That is [the split's whole
+argument](../apps/home#two-mise-pools-keep-a-global-apps-self-equips-aligned), and for a
+`nix:` tool it holds.
+
+It does not hold for the other backends. A tool from `aqua:`, `npm:` or `github:` is a
+downloaded binary that never touches the project's store, so nothing about it is
+project-shaped. Yet the pool is keyed by project **and by app**, so two apps run in the
+same project, equipping the same tool at the same version, each keep their own copy of it.
+The tools a project's own mise file declares are the case where this is most visible: they
+are the same tools for every app, by construction, and each app installs them again.
+
+Sharing them was not refused, it was not reached. Two properties that would have to hold do
+hold: an install directory is written once and not touched again by later launches, and the
+activation record that says which version is current lives in the app's home rather than in
+the pool, so a shared install would carry no per-app state. What is unsettled is whether the
+gain is worth reworking a split that was reasoned and documented for the case it does cover.
+The gain is real only where apps overlap, which depends on how a given machine is used, and
+that is the number to put against the cost before touching it.
+
 ### The holes are opened on request, and each one is a hole
 
 A cage nobody configured exposes no display, no device, no bus and no host network. The
