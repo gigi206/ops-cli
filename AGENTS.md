@@ -17,9 +17,16 @@
 - LSP call-hierarchy positions point at the start of the item's
   block, doc-comment included, not at the signature. Cross-check
   with `grep -n` before citing a line.
-- `cargo-callgraph` MCP for ≥2 hops, call paths, impact analysis,
-  dead-code/bottlenecks — depth ≤3, never dump the full JSON
-  (10MB+). Free functions are stored qualified
+- `cargo-callgraph` MCP answers the one question the LSP cannot:
+  everything that reaches X, at ≥2 hops. Use
+  `traverse_incoming`/`traverse_outgoing` with depth ≤3 — one call
+  replaces a chain of `incomingCalls`. Confirm a hop at the LSP
+  before acting on it, and never dump the full JSON (10MB+).
+- Do NOT use `find_dead_code`: it reports live functions as
+  orphaned, and `-D warnings` already fails the build on code that
+  is really dead. `find_call_paths` returns less than a single
+  `incomingCalls` — prefer the traversals.
+- Free functions are stored qualified
   (`proc_policy::shebang_interpreter`), but impl METHODS are
   stored BARE (`matches`, never `ProcRule::matches`) and collide
   across types: a qualified pattern returning nothing proves
