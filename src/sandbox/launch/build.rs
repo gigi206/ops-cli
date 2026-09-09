@@ -2473,6 +2473,7 @@ pub(super) fn build(
             crate::sandbox::control::Plane::Agent,
             signer_ring.clone(),
             prep.unresolved_secret,
+            record.as_ref(),
         )
         .map_err(|e| {
             // Through `diag::error` despite carrying no backtick of its own: the error it
@@ -2881,6 +2882,7 @@ pub(super) fn build(
                 std::process::id(),
                 engine,
                 &client,
+                record.as_ref(),
             ) {
                 Ok(plane) => Some(plane),
                 Err(e) => {

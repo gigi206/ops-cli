@@ -486,7 +486,7 @@ fn plane_and_client_inner(
         socat: &socat,
         head: &head,
     };
-    let plane = start(data.path(), std::process::id(), engine, &programs).expect("start");
+    let plane = start(data.path(), std::process::id(), engine, &programs, None).expect("start");
     let script = data.path().join("client");
     super::super::task_shim::write(
         &script,
@@ -597,7 +597,7 @@ fn plane_with_launcher(body: &str) -> Option<(TmpDir, TaskPlane, PathBuf)> {
         socat: &socat,
         head: &head,
     };
-    let plane = start(data.path(), std::process::id(), engine, &programs).expect("start");
+    let plane = start(data.path(), std::process::id(), engine, &programs, None).expect("start");
     let script = data.path().join("client");
     super::super::task_shim::write(
         &script,
@@ -637,7 +637,7 @@ fn plane_with_output(body: &str) -> Option<(TmpDir, TmpDir, TaskPlane)> {
         socat: &socat,
         head: &head,
     };
-    let plane = start(data.path(), std::process::id(), engine, &programs).expect("start");
+    let plane = start(data.path(), std::process::id(), engine, &programs, None).expect("start");
     Some((data, project, plane))
 }
 
@@ -1676,6 +1676,7 @@ fn the_plane_writes_a_client_aimed_at_the_cage_socket() {
         std::process::id(),
         super::super::task::TaskEngine::inventory_only(vec![]),
         &programs,
+        None,
     )
     .expect("start");
     let path = shim_path(data.path(), std::process::id());
@@ -2132,4 +2133,36 @@ fn an_empty_stream_is_not_a_withheld_one() {
     let parsed = client::parse_run(raw.as_bytes()).unwrap();
     assert_eq!(parsed.stdout.as_deref(), Some(""));
     assert_eq!(parsed.stderr, None);
+}
+
+/// The task plane's log is append-only — an invocation is recorded once, when it finishes — so
+/// its record needs nothing beyond the shared file shape and this plane's own line parser.
+#[test]
+fn a_task_record_reads_back_as_the_invocations_that_were_logged() {
+    let dir = crate::testutil::TmpDir::new();
+    let path = dir.path().join("record-1-2.log");
+    let record = crate::sandbox::lens::Recorder::create(
+        &path,
+        "/p",
+        Some("demo"),
+        std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+    )
+    .unwrap();
+    let log = TaskLog::new().with_record(Some(record));
+    log.push(entry(7, "build", 0));
+    let mut refused = entry(8, "deploy", 1);
+    refused.refused = Some("not declared".to_string());
+    log.push(refused);
+
+    let back = super::read_record(&path).unwrap();
+    assert_eq!(back.project, "/p");
+    assert_eq!(back.app.as_deref(), Some("demo"));
+    assert!(!back.truncated);
+    let names: Vec<&str> = back.events.iter().map(|e| e.task.as_str()).collect();
+    assert_eq!(names, ["build", "deploy"]);
+    // The append cursor is what a reader follows, and the file carries it: the two entries are
+    // distinguishable in the order they landed even though their ids are the invocations'.
+    assert_eq!(back.events[0].cursor, 1);
+    assert_eq!(back.events[1].cursor, 2);
+    assert_eq!(back.events[1].refused.as_deref(), Some("not declared"));
 }

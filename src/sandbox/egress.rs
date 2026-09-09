@@ -723,6 +723,10 @@ pub(crate) fn start(
     // What an unresolvable credential costs: the launch, or only its own destination. See
     // [`Unresolved`] — every caller but the batch rolls passes `Abort`.
     unresolved: Unresolved,
+    // This session's record (`[observe] record`), or `None`. Used only where this call **creates**
+    // the event ring: a proxy handed one already has a record attached to it, and opening a second
+    // at the same path would truncate the first.
+    record: Option<&super::lens::RecordWiring>,
 ) -> io::Result<(Egress, Wiring)> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -799,7 +803,7 @@ pub(crate) fn start(
     // here is the proxy's control socket and the session CA, so the `0700` has to hold over a
     // directory that already existed as much as over one this line creates — which is the half a
     // bare `DirBuilder::create` does not do.
-    let dir = layout.data_dir().join("egress");
+    let dir = super::control::control_dir(layout.data_dir());
     super::lens::ensure_control_dir(&dir)?;
 
     // Per-**proxy** names. The pid separates concurrent launches, but one launch can stand up more
@@ -929,8 +933,12 @@ pub(crate) fn start(
     // The event ring is created here, before the control block, so a clone can be kept on the guard
     // for `--net-learn` to snapshot after the run — the control thread and the proxy get their own
     // clones of the same `Arc`.
-    let log = event_log
-        .unwrap_or_else(|| Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP)));
+    let log = event_log.unwrap_or_else(|| {
+        Arc::new(
+            super::control::LogRing::new(super::control::LOG_RING_CAP)
+                .with_record(super::lens::open_record(record, &dir)),
+        )
+    });
     // One stop signal for both serve threads. Set by the guard's `Drop`, which then connects to each
     // socket once to unpark the `accept` that would otherwise block forever — see `Egress`.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1797,6 +1805,7 @@ mod tests {
             Plane::Agent,
             None,
             Unresolved::Abort,
+            None,
         )
         .expect("start the egress proxy");
 
@@ -1974,6 +1983,7 @@ mod tests {
                 Plane::Agent,
                 None,
                 Unresolved::Abort,
+                None,
             )
             .expect("start the egress proxy");
 
@@ -2378,6 +2388,7 @@ mod tests {
             Plane::Agent,
             None,
             Unresolved::Abort,
+            None,
         )
         .expect("start the ask egress proxy");
 
@@ -2452,6 +2463,7 @@ mod tests {
             Plane::Agent,
             None,
             Unresolved::Abort,
+            None,
         )
         .expect("start with stats off");
         drop(guard);
@@ -2481,6 +2493,7 @@ mod tests {
             Plane::Agent,
             None,
             Unresolved::Abort,
+            None,
         )
         .expect("start with stats on");
         drop(guard);
@@ -3557,6 +3570,7 @@ mod tests {
             Plane::Task,
             None,
             Unresolved::Abort,
+            None,
         )
         .expect("start with a shared ring");
         shared.push(
@@ -3602,6 +3616,7 @@ mod tests {
             Plane::Agent,
             None,
             Unresolved::Abort,
+            None,
         )
         .expect("start with a ring of its own");
         assert!(

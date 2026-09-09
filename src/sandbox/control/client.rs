@@ -340,6 +340,80 @@ pub(super) fn parse_flow_line(line: &str) -> Option<FlowSnapshot> {
     })
 }
 
+/// Read one session's egress record back: the decisions it holds, each completed by whatever landed
+/// after it.
+///
+/// Three line kinds, because this plane is the one that revises what it already said. An `event`
+/// line is a decision at the moment it was made; an `amend` line carries the upstream status that
+/// arrived afterwards, which a file cannot go back and write into the line it landed on; a `seen`
+/// line is a credential noticed crossing a tunnel that was already open. The reader replays them in
+/// order, which is the same order the live plane's amendment cursor hands them to a `--follow`
+/// reader.
+///
+/// A line naming a `seq` no event carries is dropped rather than invented into a bare record — the
+/// same choice [`read_log`] makes on the wire, for the same reason: a status with no host or time to
+/// show it against is not a row. It happens when a record was truncated before its event.
+pub(crate) fn read_record(path: &Path) -> io::Result<crate::sandbox::lens::Record<LogEvent>> {
+    /// What one line of an egress record turns into.
+    enum Line {
+        /// Boxed: a `LogEvent` is far larger than the two amendments, and an unboxed variant would
+        /// make every parsed line that size.
+        Event(Box<LogEvent>),
+        Amend {
+            seq: u64,
+            status: u16,
+        },
+        Seen {
+            seq: u64,
+            seen: SecretSighting,
+        },
+    }
+
+    let parsed = crate::sandbox::lens::read_record_with(path, |line| {
+        if let Some(rest) = line.strip_prefix(crate::sandbox::lens::RECORD_AMEND) {
+            let (mut seq, mut status) = (None, None);
+            for token in rest.split_whitespace() {
+                match token.split_once('=') {
+                    Some(("seq", v)) => seq = v.parse().ok(),
+                    Some(("status", v)) => status = v.parse().ok(),
+                    _ => {}
+                }
+            }
+            return Some(Line::Amend {
+                seq: seq?,
+                status: status?,
+            });
+        }
+        if let Some((seq, seen)) = parse_sighting_line(line) {
+            return Some(Line::Seen { seq, seen });
+        }
+        parse_event_line(line).map(|ev| Line::Event(Box::new(ev)))
+    })?;
+
+    let mut out = crate::sandbox::lens::Record {
+        project: parsed.project,
+        app: parsed.app,
+        truncated: parsed.truncated,
+        events: Vec::new(),
+    };
+    for line in parsed.events {
+        match line {
+            Line::Event(ev) => out.events.push(*ev),
+            Line::Amend { seq, status } => {
+                if let Some(ev) = out.events.iter_mut().rev().find(|e| e.seq == seq) {
+                    ev.status = Some(status);
+                }
+            }
+            Line::Seen { seq, seen } => {
+                if let Some(ev) = out.events.iter_mut().rev().find(|e| e.seq == seq) {
+                    ev.secrets_seen.push(seen);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Parse one `seen seq=… way=… name=…` line into the event sequence it belongs to and the sighting,
 /// or `None` if it is malformed.
 ///

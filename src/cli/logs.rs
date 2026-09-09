@@ -496,11 +496,8 @@ struct Feed {
     /// [`absent`](Feed::absent), which explains a live session with no such lens. A feed that keeps
     /// no record says so here, so its silence is never read as a quiet session.
     no_record: &'static str,
-    /// Where this feed's directory is, and how to read a record out of it — `None` for the two feeds
-    /// that keep no `lens` record: the egress plane, whose ring carries retroactive amendments a
-    /// line-per-event file cannot express, and the task plane, whose invocation log is its own
-    /// in-memory structure rather than one of these rings. Both are named in the header when a
-    /// finished session is read, so nobody reads their absence as a quiet session.
+    /// Where this feed's directory is, and how to read a record out of it. Every feed has one; the
+    /// `Option` is what a feed added later, before it records anything, would use.
     record: Option<RecordRead>,
     /// The cursor to read past, or `None` once this feed is gone: either it was never stood up, or
     /// it ended while the others ran on. A gone feed is never polled again.
@@ -656,6 +653,39 @@ fn record_signer_rows(path: &Path) -> std::io::Result<(Vec<Row>, bool)> {
     record_rows(path, signer_row)
 }
 
+/// One egress decision as a merged row. Named rather than inlined for the reason the lens feeds'
+/// twins are: the socket read and the record read make the same mapping, and a view where the two
+/// diverged would show one session two ways depending on whether it was still running.
+fn net_row(e: crate::sandbox::control::LogEvent) -> Row {
+    let mut subject = format!("{}:{}", e.host, e.port);
+    if let (Some(method), Some(path)) = (&e.method, &e.path) {
+        subject.push_str(&format!("  {method} {path}"));
+    }
+    // The reason is a stable category token, never a rule's text or a secret's name — and it is the
+    // whole value of a refusal line: `deny` alone does not say what to change. The verdicts whose
+    // reason only spells the verdict again are the type's own rule, so this view and `sbx net logs`
+    // cannot drift into rendering one event two ways.
+    if !e.verdict.reason_restates_verdict() {
+        subject.push_str(&format!("  ({})", e.reason));
+    }
+    Row {
+        at_epoch_ms: e.at_epoch_ms,
+        feed: "net",
+        token: e.verdict.as_str().to_string(),
+        subject,
+    }
+}
+
+/// A finished session's egress decisions, read from the record the proxy left behind. Muted refusals
+/// are absent by construction: `mute` is `dontaudit`, so they are counted and never written.
+fn record_net_rows(path: &Path) -> std::io::Result<(Vec<Row>, bool)> {
+    let record = crate::sandbox::control::read_record(path)?;
+    Ok((
+        record.events.into_iter().map(net_row).collect(),
+        record.truncated,
+    ))
+}
+
 fn read_net_rows(
     socket: &Path,
     after: Option<u64>,
@@ -664,30 +694,33 @@ fn read_net_rows(
     // and `sbx net logs --all --with-body` is where one request is opened up. Asking for neither
     // keeps the read cheap and the column honest about what the default egress view shows.
     let snap = crate::sandbox::control::read_log(socket, after, None, false, false)?;
-    let rows = snap
-        .events
-        .into_iter()
-        .map(|e| {
-            let mut subject = format!("{}:{}", e.host, e.port);
-            if let (Some(method), Some(path)) = (&e.method, &e.path) {
-                subject.push_str(&format!("  {method} {path}"));
-            }
-            // The reason is a stable category token, never a rule's text or a secret's name — and it
-            // is the whole value of a refusal line: `deny` alone does not say what to change. The
-            // verdicts whose reason only spells the verdict again are the type's own rule, so this
-            // view and `sbx net logs` cannot drift into rendering one event two ways.
-            if !e.verdict.reason_restates_verdict() {
-                subject.push_str(&format!("  ({})", e.reason));
-            }
-            Row {
-                at_epoch_ms: e.at_epoch_ms,
-                feed: "net",
-                token: e.verdict.as_str().to_string(),
-                subject,
-            }
-        })
-        .collect();
+    let rows = snap.events.into_iter().map(net_row).collect();
     Ok((rows, Some(snap.head), snap.dropped))
+}
+
+/// One task invocation as a merged row, shared by the socket read and the record read.
+fn task_row(e: crate::sandbox::task_control::LogEntry) -> Row {
+    Row {
+        at_epoch_ms: e.started_epoch_ms,
+        feed: "task",
+        token: match e.refused.is_some() {
+            true => "refused".to_string(),
+            false => format!("exit={}", e.exit),
+        },
+        subject: match e.refused {
+            Some(reason) => format!("{}  ({reason})", e.task),
+            None => e.task,
+        },
+    }
+}
+
+/// A finished session's task invocations, read from the record the plane left behind.
+fn record_task_rows(path: &Path) -> std::io::Result<(Vec<Row>, bool)> {
+    let record = crate::sandbox::task_control::read_record(path)?;
+    Ok((
+        record.events.into_iter().map(task_row).collect(),
+        record.truncated,
+    ))
 }
 
 fn read_task_rows(
@@ -695,21 +728,7 @@ fn read_task_rows(
     after: Option<u64>,
 ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
     let (entries, head, dropped) = crate::sandbox::task_control::read_entries(socket, after)?;
-    let rows: Vec<Row> = entries
-        .into_iter()
-        .map(|e| Row {
-            at_epoch_ms: e.started_epoch_ms,
-            feed: "task",
-            token: match e.refused.is_some() {
-                true => "refused".to_string(),
-                false => format!("exit={}", e.exit),
-            },
-            subject: match e.refused {
-                Some(reason) => format!("{}  ({reason})", e.task),
-                None => e.task,
-            },
-        })
-        .collect();
+    let rows: Vec<Row> = entries.into_iter().map(task_row).collect();
     // A plane that predates the append cursor answers with no `head=`, and rows all the same. Zero
     // with nothing to show is simply an empty log and follows fine; zero *with* rows is that older
     // plane, which has no way to say what is new — so it is read once and not followed.
@@ -767,8 +786,9 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::control::control_socket(data_dir, pid),
             absent: "no filtering egress posture — `[network] mode` decides nothing to record",
             read: read_net_rows,
-            no_record: "the egress plane keeps no session record; `sbx net stats` holds its totals",
-            record: None,
+            no_record: "no record — that config had no filtering `[network] mode`, or the launch \
+                        had no `[observe] record`",
+            record: Some((crate::sandbox::control::control_dir, record_net_rows)),
             cursor: Some(0),
         },
         Feed {
@@ -809,8 +829,9 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::task_control::log_socket(data_dir, pid),
             absent: "no declared operations — this config has no `[task]`",
             read: read_task_rows,
-            no_record: "the task plane keeps no session record",
-            record: None,
+            no_record: "no record — that config declared no `[task]`, or the launch had no \
+                        `[observe] record`",
+            record: Some((crate::sandbox::task_control::tasks_dir, record_task_rows)),
             cursor: Some(0),
         },
     ]

@@ -325,6 +325,13 @@ fn handle(stream: UnixStream, dispatch: &dyn Fn(&str) -> String) -> io::Result<(
 /// one, because every [`Event::format_line`] opens with `event `.
 pub(crate) const RECORD_RESERVED: [&str; 3] = ["project=", "app=", "truncated="];
 
+/// The line an egress record uses to say that an event already written was completed later: the
+/// status arrives after the decision, and a file cannot go back and rewrite the line it landed on.
+/// Not one of [`RECORD_RESERVED`] — this is a line a *writer* emits on purpose, where those are
+/// lines it must refuse — but it opens the same way an event line does not, so a reader tells them
+/// apart on the prefix alone.
+pub(crate) const RECORD_AMEND: &str = "amend ";
+
 /// The most one session's record may grow to before it stops accepting lines.
 ///
 /// A ring is bounded by construction; a file is not, and the party that decides how many events a
@@ -495,6 +502,15 @@ impl Recorder {
         if RECORD_RESERVED.iter().any(|p| line.starts_with(p)) {
             return;
         }
+        // Newline-terminated here rather than by each producer. Every writer formats a line, and
+        // one of them formats it without the terminator (the task plane's, whose wire adds it at the
+        // serve site) — which spliced two entries into one and made the first entry's last field
+        // swallow the next line's head. A duty stated per producer is exactly the kind the second
+        // one misses, so it is settled at the single door instead.
+        let line = match line.ends_with('\n') {
+            true => line,
+            false => line + "\n",
+        };
         let mut g = locked(&self.inner);
         let Some(open) = g.as_mut() else {
             return;
@@ -542,6 +558,19 @@ pub(crate) struct Record<E> {
 /// A line that is not a well-formed event of this lens is skipped rather than fatal: a record whose
 /// last line was half-written when the machine went down still yields everything before it.
 pub(crate) fn read_record<E: Event>(path: &Path) -> io::Result<Record<E>> {
+    read_record_with(path, E::parse_line)
+}
+
+/// [`read_record`] for a feed whose events are not [`Event`]s.
+///
+/// The egress plane and the task plane keep records too, and neither is built on [`Ring`] — the
+/// first carries a muted ring and a retroactive amendment cursor, the second a cursor over append
+/// order. What they do share with the five lenses is the *file*: two header lines, then one line per
+/// thing that happened. That rule has one definition, and this is it; only the line parser differs.
+pub(crate) fn read_record_with<T>(
+    path: &Path,
+    parse: impl Fn(&str) -> Option<T>,
+) -> io::Result<Record<T>> {
     let contents = std::fs::read_to_string(path)?;
     let mut record = Record {
         project: String::new(),
@@ -562,7 +591,7 @@ pub(crate) fn read_record<E: Event>(path: &Path) -> io::Result<Record<E>> {
             }
         } else if line.starts_with("truncated=") {
             record.truncated = true;
-        } else if let Some(event) = E::parse_line(line) {
+        } else if let Some(event) = parse(line) {
             record.events.push(event);
         }
     }
@@ -1494,6 +1523,23 @@ mod tests {
         assert_eq!(records_for_project(&proc, "/p").len(), 1);
         assert!(record_of_pid(&proc, "/p", 11).is_none());
         assert!(record_of_pid(&broker, "/p", 11).is_some());
+    }
+
+    /// The writer terminates a line, so a producer that formats one without a newline cannot splice
+    /// two records into one. This is not hypothetical: the task plane's `to_line` has no terminator
+    /// (its wire adds it at the serve site), and its first entry's last field swallowed the next
+    /// entry's head until this was settled at the single door.
+    #[test]
+    fn a_line_with_no_terminator_does_not_splice_into_the_next() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = Recorder::create(&path, "/p", None, needles(&[])).unwrap();
+        record.record("event seq=1 at=1 tail=first");
+        record.record("event seq=2 at=2 tail=second\n");
+
+        let back = read_record::<TestEvent>(&path).unwrap();
+        let tails: Vec<&str> = back.events.iter().map(|e| e.tail.as_str()).collect();
+        assert_eq!(tails, ["first", "second"]);
     }
 
     /// Set one file's modification time, so the prune's ordering is asserted on a known order rather

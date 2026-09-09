@@ -138,6 +138,8 @@ pub(crate) fn run(rootfs: &Path, ctx: &Context<'_>) -> io::Result<()> {
             crate::sandbox::control::Plane::Build,
             None,
             crate::sandbox::egress::Unresolved::Abort,
+            // A distro build is not a session: nothing reads a record of it.
+            None,
         )?),
         _ => None,
     };

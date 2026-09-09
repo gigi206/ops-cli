@@ -24,8 +24,8 @@ ended still has a record.
 
 ## What is written, and where
 
-One file per lens per session, named `record-<pid>-<incarnation>.log` under that lens's own
-directory (`proc/`, `fs/`, `ssh-agent/`, `broker/`, `signer/`). It opens with the project and app
+One file per feed per session, named `record-<pid>-<incarnation>.log` under that feed's own
+directory (`proc/`, `fs/`, `ssh-agent/`, `broker/`, `signer/`, `egress/`, `tasks/`). It opens with the project and app
 the session ran for, then carries one line per event, in the order the events happened. The lines
 are the ones the live view already shows.
 
@@ -61,17 +61,32 @@ once. A record that hit the size cap says its last events are missing, the way a
 many events fell off the ring. A PID the kernel wrapped round onto names more than one record; the
 newest is shown, and the view says that a choice was made.
 
-Two feeds appear in `sbx logs` with no record of their own, and the header names them: the egress
-plane (its ring carries retroactive amendments that a line-per-event file cannot express;
-`sbx net stats` holds its totals) and the task plane.
-
-`sbx logs` looks a session up across **every** lens's records, not just one: a launch with a broker
-and no `--observe` writes a broker record and no exec record, and resolving on a single lens would
+`sbx logs` looks a session up across **every** feed's records, not just one: a launch with a broker
+and no `--observe` writes a broker record and no exec record, and resolving on a single feed would
 make that session unnameable.
+
+### The two feeds that are not lenses
+
+The **egress plane** is the one feed that revises what it already said: a request's upstream status
+arrives after the decision was recorded, and an append-only file cannot rewrite the line it landed
+on. It writes a second `amend` line instead, which the reader replays onto the event it names; a
+credential noticed crossing an open tunnel is written the same way, the moment it is noticed. The
+traffic capture is not in the record: it lives in its own store and stays there.
+
+A **muted** refusal (`mute`, the `dontaudit` rule) is counted and never written. In memory a muted
+flood is kept in a ring of its own so it cannot evict a real event; on disk it would evict nothing
+and fill instead, truncating the end of the session. `sbx net stats` keeps its counters either way,
+which is the contract `mute` already had.
+
+`sbx net logs` is a **live, multi-session** view and is unchanged: it globs the sessions that are
+running. A finished session's egress record is read through `sbx logs <id>`.
+
+The **task plane** is the simple case: an invocation is recorded once, when it finishes, and nothing
+ever revises it.
 
 ## Discarding one
 
-There is no verb for it. A record lives at `<data>/<lens>/record-<pid>-<incarnation>.log` (`sbx
+There is no verb for it. A record lives at `<data>/<feed>/record-<pid>-<incarnation>.log` (`sbx
 storage status` prints where `<data>` is), and `rm` on that path is the way. `sbx gc` deliberately
 leaves records alone: a sweep keyed on liveness would delete one at the moment it became the only
 answer left.
@@ -91,7 +106,8 @@ resolved as the egress proxy starts, before an agent runs) but it is real, and i
 keeping the record is a choice rather than the default meaning of `observe`.
 
 The second reason is the disk. A session's record stops at 4 MiB and ends with a `truncated=` line
-saying so; a lens directory keeps the 32 most recent finished sessions and drops the rest when a
+saying so, which a busy egress session reaches sooner than a quiet one; a feed's directory keeps the
+32 most recent finished sessions and drops the rest when a
 new session opens its own. A running session's record is never dropped, whatever its age.
 `sbx gc` does not sweep records: a sweep keyed on liveness would delete a record at the moment it
 became the only answer left.

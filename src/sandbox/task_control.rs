@@ -422,6 +422,11 @@ fn head_field(text: &str) -> String {
 #[derive(Default)]
 pub(crate) struct TaskLog {
     inner: Mutex<Inner>,
+    /// Where every appended entry is also written, when the launch asked for a session record. The
+    /// same [`super::lens::Recorder`] the five observation lenses use: this log is not one of their
+    /// rings, but what reaches the disk is one line per event either way, so the writer — its
+    /// redaction, its two caps, its owner-only file — is the one they share.
+    record: Option<super::lens::Recorder>,
 }
 
 #[derive(Default)]
@@ -438,6 +443,13 @@ impl TaskLog {
         Self::default()
     }
 
+    /// Attach this session's record, so the invocations also reach a file that outlives the session.
+    /// `None` leaves the log memory-only, which is what it always was.
+    pub(crate) fn with_record(mut self, record: Option<super::lens::Recorder>) -> Self {
+        self.record = record;
+        self
+    }
+
     /// Record one invocation, evicting the oldest when the ring is full.
     ///
     /// The entry arrives carrying its own id — the invocation's, drawn when it was admitted. The log
@@ -450,23 +462,33 @@ impl TaskLog {
     /// invocation belongs where it *began*, not where it happened to end, or a slow one reads as
     /// having been provoked by whatever ran while it was still going.
     fn push(&self, mut entry: LogEntry) {
-        let mut inner = locked(&self.inner);
-        entry.at_epoch_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        entry.started_epoch_ms = entry
-            .at_epoch_ms
-            .saturating_sub(u128::from(entry.elapsed_ms));
-        inner.appended += 1;
-        entry.cursor = inner.appended;
-        if inner.entries.len() == LOG_CAPACITY {
-            // No lifetime eviction counter is kept: what a reader is told is the gap between its
-            // own cursor and the window it is handed, which `since` computes from the oldest entry
-            // still held. A running total answers a question nobody asks here.
-            inner.entries.pop_front();
+        let recorded = {
+            let mut inner = locked(&self.inner);
+            entry.at_epoch_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            entry.started_epoch_ms = entry
+                .at_epoch_ms
+                .saturating_sub(u128::from(entry.elapsed_ms));
+            inner.appended += 1;
+            entry.cursor = inner.appended;
+            if inner.entries.len() == LOG_CAPACITY {
+                // No lifetime eviction counter is kept: what a reader is told is the gap between its
+                // own cursor and the window it is handed, which `since` computes from the oldest
+                // entry still held. A running total answers a question nobody asks here.
+                inner.entries.pop_front();
+            }
+            // Cloned only when there is a record to write, and formatted below rather than here: the
+            // lock this holds is the one a reader waits on, and a `write(2)` under it would put that
+            // reader behind the disk.
+            let recorded = self.record.as_ref().map(|_| entry.clone());
+            inner.entries.push_back(entry);
+            recorded
+        };
+        if let (Some(record), Some(entry)) = (&self.record, recorded) {
+            record.record(&entry.to_line());
         }
-        inner.entries.push_back(entry);
     }
 
     /// The retained entries past `after`, how many fell out of the ring, and the head to come back
@@ -599,9 +621,25 @@ impl Drop for TaskPlane {
 /// ticks, the same discriminator the session registry uses against pid reuse.
 const INCARNATION: &str = "incarnation";
 
+/// Read one session's task record back: the invocations it holds, in the order they were appended.
+///
+/// The plane's log is append-only — an invocation is recorded once, when it finishes, and nothing
+/// ever revises it — so the file needs nothing beyond the shared record shape and this lens's own
+/// line parser.
+pub(crate) fn read_record(path: &Path) -> io::Result<super::lens::Record<LogEntry>> {
+    super::lens::read_record_with(path, LogEntry::from_line)
+}
+
 /// The directory a session's task sockets live in, under the `0700` data dir.
 pub(crate) fn task_dir(data_dir: &Path, pid: u32) -> PathBuf {
-    data_dir.join("tasks").join(pid.to_string())
+    tasks_dir(data_dir).join(pid.to_string())
+}
+
+/// The plane's own `0700` directory, one level above a session's. This is where a session **record**
+/// goes, and it has to be here rather than in [`task_dir`]: that one is removed by
+/// [`TaskPlane`]'s `Drop`, which is exactly when a record starts being the only answer left.
+pub(crate) fn tasks_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("tasks")
 }
 
 /// The generated in-cage client's host path for a session pid. Derivable before the plane starts,
@@ -625,6 +663,7 @@ pub(crate) fn start(
     pid: u32,
     engine: TaskEngine,
     client: &ClientPrograms<'_>,
+    record: Option<&super::lens::RecordWiring>,
 ) -> io::Result<TaskPlane> {
     // Sweep first, for its effect rather than its answer: every launch removes the directories of
     // sessions that are gone, so the listing stays honest on a machine where nobody runs
@@ -656,7 +695,9 @@ pub(crate) fn start(
     super::task_shim::write(&shim, client.bash, client.socat, client.head, CAGE_TASK_UDS)?;
 
     let engine = Arc::new(engine);
-    let log = Arc::new(TaskLog::new());
+    let log = Arc::new(
+        TaskLog::new().with_record(super::lens::open_record(record, &tasks_dir(data_dir))),
+    );
     let results = Arc::new(TaskResults::default());
     let quota = Arc::new(AtomicU64::new(DEFAULT_CALL_QUOTA));
 

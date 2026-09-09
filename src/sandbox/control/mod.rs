@@ -808,6 +808,9 @@ pub(crate) struct LogSnapshot {
 pub(crate) struct LogRing {
     inner: Mutex<LogInner>,
     cap: usize,
+    /// Where every decision is also written, when the launch asked for a session record. `None` is
+    /// the default and the shape this ring always had. See [`LogRing::with_record`].
+    record: Option<super::lens::Recorder>,
 }
 
 // The same choice [`crate::sandbox::signer_control::SignerRing`] makes, for the same reason: a
@@ -843,7 +846,18 @@ impl LogRing {
                 muted: VecDeque::new(),
             }),
             cap: cap.max(1),
+            record: None,
         }
+    }
+
+    /// Attach this session's record, so the decisions also reach a file that outlives the session.
+    ///
+    /// Attached where the ring is **created**, never where one is passed in: a task's per-invocation
+    /// proxy is handed the session's ring (see [`super::egress::Egress::event_log`]), and attaching
+    /// there would open a second record at the same path and truncate the first.
+    pub(crate) fn with_record(mut self, record: Option<super::lens::Recorder>) -> Self {
+        self.record = record;
+        self
     }
 
     /// Append one decision, assigning it the next sequence number and evicting the oldest if the ring
@@ -873,7 +887,8 @@ impl LogRing {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut g = locked(&self.inner);
+        let mut guard = locked(&self.inner);
+        let g = &mut *guard;
         let seq = g.next_seq;
         g.next_seq += 1;
         // The three free-form values are sanitised **here**, on the way in, for the reason
@@ -918,9 +933,23 @@ impl LogRing {
         // A muted refusal goes to its own ring so it can never evict a real event from `events`;
         // both rings share `self.cap` and the monotonic `seq`.
         let ring = if muted { &mut g.muted } else { &mut g.events };
+        // Cloned only when there is a record to write, and only for an event the record keeps. A
+        // muted refusal is not one: `mute` is `dontaudit`, and on disk a muted flood does not evict
+        // real events the way the separate ring stops it doing in memory — it fills the file's cap
+        // and truncates the tail, which is the real events at the end of the session. The counters
+        // `sbx net stats` keeps for it are unaffected, which is the contract `mute` already had.
+        let recorded = self
+            .record
+            .as_ref()
+            .filter(|_| !muted)
+            .map(|_| event.clone());
         ring.push_back(event);
         while ring.len() > self.cap {
             ring.pop_front();
+        }
+        drop(guard);
+        if let (Some(record), Some(event)) = (&self.record, recorded) {
+            record.record(&format_event_line(&event));
         }
         seq
     }
@@ -931,20 +960,34 @@ impl LogRing {
     /// sequence order, so a reverse scan finds the target quickly (the amend usually lands on the
     /// newest events).
     pub(crate) fn set_status(&self, seq: u64, status: u16) {
-        let mut guard = locked(&self.inner);
-        let g = &mut *guard;
-        if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
+        let recorded = {
+            let mut guard = locked(&self.inner);
+            let g = &mut *guard;
+            let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) else {
+                return;
+            };
             ev.status = Some(status);
             if ev.awaiting_capture {
                 // A capture is still being filled in for this exchange. Amending now would re-emit
                 // the event with a status but no traffic, and again once the capture lands — so hold
-                // the amendment for `capture_settled`, which fires exactly once.
+                // the amendment for `capture_settled`, which fires exactly once. The record waits
+                // with it, so a file never carries the same status twice.
                 return;
             }
             // Stamp the amendment cursor so a follow reader that already passed this event's `seq`
             // re-reads it once (with its status now filled) on its next poll.
             ev.amend_seq = Some(g.next_amend);
             g.next_amend += 1;
+            self.record.as_ref().map(|_| format_amend_line(seq, status))
+        };
+        self.write_record(recorded);
+    }
+
+    /// Append one already-formatted line to the session record, outside the ring's lock. `None` is
+    /// the ordinary case of a launch that keeps no record.
+    fn write_record(&self, line: Option<String>) {
+        if let (Some(record), Some(line)) = (&self.record, line) {
+            record.record(&line);
         }
     }
 
@@ -962,16 +1005,28 @@ impl LogRing {
     /// actually stored; with none, the event is amended only if a status is waiting to be shown (so
     /// an exchange with nothing new is not re-emitted at all).
     pub(crate) fn capture_settled(&self, seq: u64, filed: bool) {
-        let mut guard = locked(&self.inner);
-        let g = &mut *guard;
-        if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
+        let recorded = {
+            let mut guard = locked(&self.inner);
+            let g = &mut *guard;
+            let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) else {
+                return;
+            };
             ev.awaiting_capture = false;
             if !filed && ev.status.is_none() {
                 return;
             }
             ev.amend_seq = Some(g.next_amend);
             g.next_amend += 1;
-        }
+            // The status this release was holding, if one arrived while the capture filled. A
+            // capture that settled with no status has nothing the file can carry: the traffic is in
+            // its own store, and the record is a line per decision.
+            let status = ev.status;
+            self.record
+                .as_ref()
+                .zip(status)
+                .map(|(_, status)| format_amend_line(seq, status))
+        };
+        self.write_record(recorded);
     }
 
     /// Amend the event `seq` again because its capture grew after it was first settled — the one case
@@ -1011,12 +1066,19 @@ impl LogRing {
             {
                 return;
             }
-            ev.secrets_seen.push(SecretSighting {
+            let seen = SecretSighting {
                 name: name.to_string(),
                 way,
-            });
+            };
+            let recorded = self
+                .record
+                .as_ref()
+                .map(|_| format_sighting_line(seq, &seen));
+            ev.secrets_seen.push(seen);
             ev.amend_seq = Some(g.next_amend);
             g.next_amend += 1;
+            drop(guard);
+            self.write_record(recorded);
         }
     }
 
@@ -1646,14 +1708,30 @@ fn format_capture_lines(cap: &Capture) -> String {
 fn format_sighting_lines(ev: &LogEvent) -> String {
     let mut out = String::new();
     for seen in &ev.secrets_seen {
-        out.push_str(&format!(
-            "seen seq={} way={} name={}\n",
-            ev.seq,
-            seen.way.as_str(),
-            seen.name,
-        ));
+        out.push_str(&format_sighting_line(ev.seq, seen));
     }
     out
+}
+
+/// One sighting as its wire line. Split out of [`format_sighting_lines`] because the session record
+/// writes a sighting the moment it is noticed, one line, where the wire re-emits an event's whole
+/// set — and the two must produce the same bytes or a record would not read back as a reply does.
+fn format_sighting_line(seq: u64, seen: &SecretSighting) -> String {
+    format!(
+        "seen seq={} way={} name={}\n",
+        seq,
+        seen.way.as_str(),
+        seen.name,
+    )
+}
+
+/// One `amend` line: the upstream status of an event already written.
+///
+/// The file is append-only, so an event completed after it was recorded cannot have its line
+/// rewritten. It gets a second line instead, which the reader applies onto the event it names. The
+/// capture is not carried: it lives in its own store and stays there.
+fn format_amend_line(seq: u64, status: u16) -> String {
+    format!("{}seq={seq} status={status}\n", super::lens::RECORD_AMEND)
 }
 
 /// Make `value` safe to occupy one whitespace-split `key=value` token of a control-wire line.
@@ -3183,5 +3261,144 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, pid);
         assert_eq!(sessions[0].snapshot.events.len(), 2);
+    }
+    /// The egress plane is the one feed that revises what it already said: a status arrives after
+    /// the decision was recorded, and an append-only file cannot rewrite the line it landed on. It
+    /// gets a second line, and the reader replays it onto the event it names.
+    #[test]
+    fn a_status_that_arrives_later_is_a_second_line_the_reader_applies() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = crate::sandbox::lens::Recorder::create(
+            &path,
+            "/p",
+            None,
+            std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+        )
+        .unwrap();
+        let ring = LogRing::new(8).with_record(Some(record));
+        let seq = ring.push(
+            false,
+            "a.test",
+            443,
+            Some("GET"),
+            Some("/one"),
+            LogVerdict::Allow,
+            "allowed",
+            Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
+            Plane::Agent,
+        );
+        ring.set_status(seq, 204);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines[0], "project=/p");
+        assert!(lines[1].starts_with("event seq=1 "), "{}", lines[1]);
+        assert_eq!(lines[2], "amend seq=1 status=204");
+
+        let back = super::read_record(&path).unwrap();
+        assert_eq!(back.events.len(), 1, "the amendment is not a second event");
+        assert_eq!(back.events[0].status, Some(204));
+        assert_eq!(back.events[0].host, "a.test");
+    }
+
+    /// `mute` is `dontaudit`. In memory a muted flood is kept off the real ring so it cannot evict
+    /// anything; on disk it would evict nothing and **fill** instead, truncating the tail of the
+    /// session. The counters `sbx net stats` keeps for it are untouched, which is the contract mute
+    /// already had.
+    #[test]
+    fn a_muted_refusal_is_counted_but_never_recorded() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = crate::sandbox::lens::Recorder::create(
+            &path,
+            "/p",
+            None,
+            std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+        )
+        .unwrap();
+        let ring = LogRing::new(8).with_record(Some(record));
+        ring.push(
+            true,
+            "noisy.test",
+            443,
+            None,
+            None,
+            LogVerdict::Deny,
+            "no-rule",
+            Proto::Https,
+            HttpVer::Unknown,
+            RpcKind::None,
+            Plane::Agent,
+        );
+        ring.push(
+            false,
+            "real.test",
+            443,
+            None,
+            None,
+            LogVerdict::Deny,
+            "no-rule",
+            Proto::Https,
+            HttpVer::Unknown,
+            RpcKind::None,
+            Plane::Agent,
+        );
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("noisy.test"), "{body}");
+        assert!(body.contains("real.test"), "{body}");
+        // Both are still in the rings the live view reads, the muted one in its own.
+        assert_eq!(
+            super::LogRing::snapshot(&ring, None, None, true)
+                .events
+                .len(),
+            2
+        );
+    }
+
+    /// A credential seen crossing an open tunnel is the single most audit-worthy thing this plane
+    /// reports, and it arrives long after the event was written. It is recorded the moment it is
+    /// noticed, as the same `seen` line the wire carries.
+    #[test]
+    fn a_secret_sighting_reaches_the_record_as_its_own_line() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = crate::sandbox::lens::Recorder::create(
+            &path,
+            "/p",
+            None,
+            std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+        )
+        .unwrap();
+        let ring = LogRing::new(8).with_record(Some(record));
+        let seq = ring.push(
+            false,
+            "ws.test",
+            443,
+            None,
+            None,
+            LogVerdict::Allow,
+            "allowed",
+            Proto::Https,
+            HttpVer::Unknown,
+            RpcKind::None,
+            Plane::Agent,
+        );
+        ring.secret_seen(seq, "API_TOKEN", SecretWay::Out);
+        // Reported once per direction: a second sighting of the same pair adds no line.
+        ring.secret_seen(seq, "API_TOKEN", SecretWay::Out);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("seen ")).count(),
+            1,
+            "{body}"
+        );
+        let back = super::read_record(&path).unwrap();
+        assert_eq!(back.events[0].secrets_seen.len(), 1);
+        assert_eq!(back.events[0].secrets_seen[0].name, "API_TOKEN");
     }
 }

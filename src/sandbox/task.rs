@@ -819,6 +819,9 @@ impl TaskEngine {
                 // A task runs a command the configuration named, so a credential it declared but
                 // cannot read is the launch's problem, not something to work around.
                 super::egress::Unresolved::Abort,
+                // A task's proxy shares the session's ring, which already carries the record; see
+                // `egress::start`.
+                None,
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;
