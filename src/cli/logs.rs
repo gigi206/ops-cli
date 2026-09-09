@@ -298,7 +298,7 @@ fn records_listing(verb: &str, records: &[crate::sandbox::lens::RecordEntry]) ->
         );
     }
     let mut out = format!(
-        "sbx: {verb}: no live session — {} finished session(s) recorded here:\n",
+        "sbx: {verb}: no live session in this project — {} finished session(s) recorded here:\n",
         records.len()
     );
     for r in records {

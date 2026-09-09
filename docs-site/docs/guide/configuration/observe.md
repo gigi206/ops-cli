@@ -46,7 +46,7 @@ PID, so with none of this project's sessions live these views **list its records
 and one can be named:
 
 ```
-sbx: proc logs: no live session — 2 finished session(s) recorded here:
+sbx: proc logs: no live session in this project — 2 finished session(s) recorded here:
        148820  2026-09-09
        147311  2026-09-08
      read one with `sbx proc logs <id>`.
