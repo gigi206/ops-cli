@@ -983,9 +983,12 @@ fn fs_test(args: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     // The expansion's own prose is the diagnostic half of this verb: an entry that matched nothing,
-    // a second hard link to a closed file, a path git tracks. A launch prints these; so does this.
+    // a second hard link to a closed file, a path git tracks. A launch prints these through
+    // `warn_config`, and so does this, for the reason that function states: every one of them names
+    // an `[fs]` entry the project spelled, so the text is the project's — control bytes and escape
+    // sequences included — and it lands on the terminal at the moment the user is reading it.
     for w in &expanded.warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
 
     let path = match resolve_under_project(&cwd, target) {
