@@ -72,8 +72,8 @@ path at a different path inside the cage, so the mechanism is not the obstacle. 
 resolved once, when the cage starts, so the redirect's target would have to exist before
 the launch that is supposed to prevent it from existing, and whether an app's project-local
 state is residue or something you want kept per repository is a judgement that differs app
-by app. What is per-app and what is per-project, including the one provisioning path that
-also lands in the tree, is in [Per-app isolated `$HOME`](../apps/home#what-is-per-app-vs-per-project).
+by app. What is per-app and what is per-project, and what provisioning does with each, is in
+[Per-app isolated `$HOME`](../apps/home#what-is-per-app-vs-per-project).
 
 ### The holes are opened on request, and each one is a hole
 
