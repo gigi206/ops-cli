@@ -374,7 +374,7 @@ They write the project `.sbx.toml` by default, the global config with `-g`, and 
 with `-a <name>`; a project write re-trusts the file, on the terms
 [`sbx fs deny`](../cli/fs#deny--readonly) states. Entries are lists, so the generic
 `sbx config set` does not reach them: before these verbs the only way in was
-[`sbx config edit`](../cli/config#edit), which is still how you rewrite several at once.
+[`sbx config edit`](../cli/config#sbx-config-edit), which is still how you rewrite several at once.
 
 There is no `--session` form and no `sbx fs rules`, and both absences are the same fact: a mask is
 a mount, resolved at launch, so there is no live overlay to load into or to list. The effective

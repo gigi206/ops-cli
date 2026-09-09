@@ -69,7 +69,7 @@ A mask is a **mount**, and a cage's mounts are fixed when it is built. `[fs]` re
 there is no live overlay to load a mask into the way
 [`sbx proc deny --session`](proc#--session-load-a-rule-into-a-running-session) does, and nothing for
 a `rules` verb to list: what its two siblings' `rules` shows is exactly that overlay. The effective
-masks and the layer each came from are already in [`sbx config show`](config#show).
+masks and the layer each came from are already in [`sbx config show`](config#sbx-config-show).
 
 To close a path in a session that is already running, add the mask and relaunch. To cover a file
 that appears or changes **mid-session**, reach for
@@ -85,7 +85,7 @@ sbx fs unreadonly <path> [-l|--local|-g|--global] [-a|--app <name>]
 
 Remove a mask added by its namesake, so an entry is undone with the vocabulary it was written in.
 The `<path>` is an **exact-string** match of what was written, as
-[`sbx config show`](config#show) lists it. Idempotent: removing an entry that is not there is a
+[`sbx config show`](config#sbx-config-show) lists it. Idempotent: removing an entry that is not there is a
 reported no-op, not an error. The two do not reach each other's list.
 
 ```sh

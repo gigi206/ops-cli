@@ -134,11 +134,11 @@ sbx bundle rm demo
 sbx bundle rm demo other      # several at once
 ```
 
-There is no `--purge`/`--gc` pair here, unlike [`sbx app rm`](app#sbx-app-rm), and the difference
+There is no `--purge`/`--gc` pair here, unlike [`sbx app rm`](app#removing-an-app), and the difference
 is structural. An app owns runtime state: a home, and the tools its backends installed into it. A
 bundle owns none: it is a declaration that contributes packages, environment and rules to the apps
 that name it. Whatever those apps provisioned belongs to **them**, and is reclaimed with
-[`sbx app rm --purge`](app#sbx-app-rm) or [`sbx gc`](gc).
+[`sbx app rm --purge`](app#removing-an-app) or [`sbx gc`](gc).
 
 An app profile that still names the bundle in `use` is **reported, not refused**. The config left
 behind is valid, and a launch already warns about a `use` naming a bundle that is not declared;
