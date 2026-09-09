@@ -87,13 +87,56 @@ fn main() -> ExitCode {
     cli::dispatch(name, rest)
 }
 
-/// Resolve the session a `proc`/`fs` subcommand acts on: an explicit PID (a 0-or-1 match among the
-/// live set), or the sole live session when no id is given. On ambiguity or absence it prints guidance
-/// (tagged with `verb`) and returns the exit code the caller should propagate.
+/// The canonical project root the command is standing in, resolved the way a launch resolves its own
+/// ([`sandbox::project_identity`]) so a reader and a writer never disagree about which tree this is.
+///
+/// Refused rather than swallowed. Every caller uses this to **narrow** to one project, so an
+/// identity that could not be resolved must not become "no filter": that widens a listing to every
+/// project on the machine, which is the opposite of what was asked. The same reasoning `sbx proc
+/// rules` states at its own filter.
+fn current_project() -> Result<PathBuf, ExitCode> {
+    let cwd = config_cwd()?;
+    sandbox::project_identity(&cwd)
+        .map(|(_, canonical)| canonical)
+        .map_err(|e| {
+            diag::error(&format!("sbx: cannot resolve the project directory: {e}"));
+            ExitCode::FAILURE
+        })
+}
+
+/// The live sessions that belong to `project`, in the order the registry gave them.
+///
+/// This is the no-id scope of every view that resolves **one** session: `sbx proc ls`, `sbx proc
+/// live` and the seven `logs` views all mean "this project's sole live session" when none is named,
+/// so a neighbouring project's cannot stand in for a session this reader never started. One
+/// definition rather than a filter per resolver: the comparison is `s.project == project`, exactly
+/// what the launch recorded, and two copies of "which sessions are mine" is the shape that drifts.
+///
+/// A pid given explicitly is deliberately not filtered by it. `sbx session ls` lists every live
+/// session on the machine with its project beside it, so an id typed from that listing is answered
+/// wherever it belongs.
+fn sessions_of_project<'a>(
+    sessions: &'a [session::Session],
+    project: &Path,
+) -> Vec<&'a session::Session> {
+    sessions
+        .iter()
+        .filter(|s| s.project.as_path() == project)
+        .collect()
+}
+
+/// Resolve the session a `proc` subcommand acts on: an explicit PID (a 0-or-1 match among the live
+/// set), or this project's sole live session when no id is given. On ambiguity or absence it prints
+/// guidance (tagged with `verb`) and returns the exit code the caller should propagate.
+///
+/// The scope of the no-id path is [`sessions_of_project`], the same one `sbx proc logs` resolves
+/// through: a family whose verbs disagreed about which session "no id" means would make the answer
+/// depend on which of them was asked.
 fn resolve_session_target<'a>(
     sessions: &'a [session::Session],
     id: Option<&str>,
     verb: &str,
+    project: &Path,
 ) -> Result<&'a session::Session, ExitCode> {
     match id {
         Some(id) => sessions
@@ -105,10 +148,13 @@ fn resolve_session_target<'a>(
                 ));
                 ExitCode::from(2)
             }),
-        None => match sessions {
+        None => match sessions_of_project(sessions, project).as_slice() {
             [one] => Ok(one),
             [] => {
-                eprintln!("sbx: no active sandbox sessions.");
+                eprintln!("sbx: {verb}: no live session in this project.");
+                eprintln!(
+                    "       `sbx session ls` lists every project's; name one of them by its PID."
+                );
                 Err(ExitCode::from(2))
             }
             many => {
@@ -2002,6 +2048,48 @@ mod tests {
         assert!(
             session_pids_for_project(data.path(), &elsewhere).is_empty(),
             "a different project must select no session"
+        );
+    }
+
+    /// `sbx proc ls`, `sbx proc live` and `sbx proc logs` are one family, so "no id" has to mean the
+    /// same session in all three: this project's. A neighbour's standing in would show the wrong
+    /// agent's process tree, which is the same surprise the record readers were scoped for.
+    #[test]
+    fn with_no_id_the_proc_views_resolve_this_projects_session() {
+        use session::{Kind, Session, SessionRuntime};
+
+        let here = PathBuf::from("/tmp/demo-app");
+        let elsewhere = PathBuf::from("/tmp/other-app");
+        let session = |project: &Path| Session {
+            project: project.to_path_buf(),
+            pid: 4242,
+            start_ticks: 7,
+            kind: Kind::Run,
+            runtime: SessionRuntime::Project,
+            detached: false,
+        };
+
+        let mine = [session(&here)];
+        assert_eq!(
+            resolve_session_target(&mine, None, "proc", &here)
+                .ok()
+                .map(|s| s.pid),
+            Some(4242)
+        );
+
+        let theirs = [session(&elsewhere)];
+        assert!(
+            resolve_session_target(&theirs, None, "proc", &here).is_err(),
+            "another project's session must not answer a bare `sbx proc ls`"
+        );
+
+        // A pid is answered wherever it belongs: `sbx session ls` lists every live session on the
+        // machine with its project beside it, so that is one the user was shown and chose.
+        assert_eq!(
+            resolve_session_target(&theirs, Some("4242"), "proc", &here)
+                .ok()
+                .map(|s| s.pid),
+            Some(4242)
         );
     }
 

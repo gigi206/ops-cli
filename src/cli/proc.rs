@@ -526,8 +526,8 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
 
 /// `sbx proc ls [<id>] [--json]`: snapshot the process tree of a running session — what the agent
 /// has spawned inside the cage, read host-side from `/proc` (no privilege, no cage cooperation).
-/// `<id>` is the PID `sbx session ls` shows; with no id the sole live session is used, otherwise the
-/// live sessions are listed so one can be named.
+/// `<id>` is the PID `sbx session ls` shows, of any project; with no id this project's sole live
+/// session is used, otherwise the live sessions are listed so one can be named.
 fn proc_ls(args: &[OsString]) -> ExitCode {
     let mut json = false;
     let mut id: Option<&str> = None;
@@ -561,7 +561,11 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
         Err(code) => return code,
     };
 
-    let target = match resolve_session_target(&sessions, id, "proc") {
+    let project = match crate::current_project() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let target = match resolve_session_target(&sessions, id, "proc", &project) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -667,7 +671,11 @@ fn proc_live(args: &[OsString]) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let target = match resolve_session_target(&sessions, parsed.id.as_deref(), "proc") {
+    let project = match crate::current_project() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let target = match resolve_session_target(&sessions, parsed.id.as_deref(), "proc", &project) {
         Ok(t) => t,
         Err(code) => return code,
     };

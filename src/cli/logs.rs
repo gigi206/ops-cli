@@ -135,14 +135,8 @@ pub(crate) fn run<E: crate::sandbox::lens::Event>(
     let dir = (view.dir)(data_dir);
     // The project this reader stands in, derived exactly as a launch derived the `project=` header
     // it wrote — one derivation, so a record and a reader never drift apart.
-    let project = match crate::config_cwd() {
-        Ok(cwd) => match crate::sandbox::project_identity(&cwd) {
-            Ok((_, canon)) => canon.display().to_string(),
-            Err(e) => {
-                diag::error(&format!("sbx: cannot resolve the project directory: {e}"));
-                return ExitCode::FAILURE;
-            }
-        },
+    let project = match crate::current_project() {
+        Ok(canon) => canon.display().to_string(),
         Err(code) => return code,
     };
     let sessions = match live_sessions(data_dir) {
@@ -231,11 +225,7 @@ fn resolve_source(
         ));
         return Err(ExitCode::from(2));
     }
-    let mine: Vec<&crate::session::Session> = sessions
-        .iter()
-        .filter(|s| s.project.as_path() == Path::new(project))
-        .collect();
-    match mine.as_slice() {
+    match crate::sessions_of_project(sessions, Path::new(project)).as_slice() {
         [one] => Ok(Source::Live {
             pid: one.pid,
             header: format!(
@@ -986,14 +976,8 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         Err(code) => return code,
     };
     let data_dir = layout.data_dir();
-    let project = match crate::config_cwd() {
-        Ok(cwd) => match crate::sandbox::project_identity(&cwd) {
-            Ok((_, canon)) => canon.display().to_string(),
-            Err(e) => {
-                diag::error(&format!("sbx: cannot resolve the project directory: {e}"));
-                return ExitCode::FAILURE;
-            }
-        },
+    let project = match crate::current_project() {
+        Ok(canon) => canon.display().to_string(),
         Err(code) => return code,
     };
     let sessions = match live_sessions(data_dir) {

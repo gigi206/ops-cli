@@ -472,7 +472,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "the PID `sbx session ls` shows; omit it when only one session is live",
+                "the PID `sbx session ls` shows, of any project; omit it when this project has \
+                one live session",
             ),
             (
                 "--json",
@@ -482,7 +483,8 @@ pub(super) const PAGES: &[Page] = &[
         details: "Shows the tree of processes the agent has spawned inside the cage, read host-side from\n\
             `/proc` — the launcher (or bubblewrap on the exec path) is the root, and every cage\n\
             process is one of its descendants. No privilege, no cage cooperation, no launch. With no\n\
-            id the sole live session is used; otherwise name one by its PID.",
+            id this project's sole live session is used; otherwise name one by its PID, which\n\
+            `sbx session ls` shows for every project.",
     },
     Page {
         path: &["proc", "live"],
@@ -491,7 +493,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "the PID `sbx session ls` shows; omit it when only one session is live",
+                "the PID `sbx session ls` shows, of any project; omit it when this project has \
+                one live session",
             ),
             (
                 "-i, --interval <secs>",
@@ -505,7 +508,10 @@ pub(super) const PAGES: &[Page] = &[
         details: "The `top`-style live view of `sbx proc ls`: the process tree an agent has spawned inside\n\
             its cage, redrawn in place on an interval until the session ends or you interrupt, so you\n\
             see processes start and finish in real time. Requires a terminal; `--json` streams one\n\
-            snapshot per tick and works in a pipe. Read-only and host-side — it just polls `/proc`.",
+            snapshot per tick and works in a pipe. Read-only and host-side — it just polls `/proc`.\n\
+            With no id this project's sole live session is used, the same scope `sbx proc logs`\n\
+            resolves; otherwise name one by its PID, which `sbx session ls` shows for every\n\
+            project.",
     },
     Page {
         path: &["proc", "logs"],

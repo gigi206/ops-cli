@@ -47,11 +47,12 @@ its descendants in host pid-space, so a plain `/proc` walk from that root shows 
 
 | Operand / option | Meaning |
 |---|---|
-| `<id>` | the PID [`sbx session ls`](session) shows; omit it when only one session is live |
+| `<id>` | the PID [`sbx session ls`](session) shows, of any project; omit it when this project has one live session |
 | `--json` | emit the tree as JSON instead of the indented view |
 
-With no `<id>` the sole live session is used; if several are live, they are listed so you can
-name one by its PID.
+With no `<id>` this project's sole live session is used; if several are live, they are listed so
+you can name one by its PID. A PID names a session of any project, which is why
+[`sbx session ls`](session) lists them all.
 
 ```sh
 sbx session ls                 # find the id
@@ -89,13 +90,13 @@ processes in real time**.
 
 | Operand / option | Meaning |
 |---|---|
-| `<id>` | the PID [`sbx session ls`](session) shows; omit it when only one session is live |
+| `<id>` | the PID [`sbx session ls`](session) shows, of any project; omit it when this project has one live session |
 | `-i`, `--interval <secs>` | redraw interval in seconds (default 1) |
 | `--json` | emit one snapshot object per tick (NDJSON): for a pipe, not a terminal |
 
 ```sh
 sbx proc live 12345            # watch the agent's process tree update every second
-sbx proc live -i 2            # slower refresh, sole live session
+sbx proc live -i 2            # slower refresh, this project's sole live session
 sbx proc live --json 12345 | jq .tree   # one snapshot object per tick
 ```
 

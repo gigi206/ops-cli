@@ -69,7 +69,13 @@ fn proc_ls_with_no_sessions_reports_none_and_exits_2() {
     let out = sbx(&["proc", "ls"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
-    assert!(err.contains("no active sandbox sessions"), "got: {err}");
+    // Scoped to the project, like `proc logs`: it says so rather than denying sessions that may be
+    // live elsewhere, and points at the listing that names them.
+    assert!(
+        err.contains("no live session in this project"),
+        "got: {err}"
+    );
+    assert!(err.contains("sbx session ls"), "got: {err}");
 }
 
 #[test]
@@ -132,7 +138,10 @@ fn proc_live_json_with_no_session_exits_2() {
     let out = sbx(&["proc", "live", "--json"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
-    assert!(err.contains("no active sandbox sessions"), "got: {err}");
+    assert!(
+        err.contains("no live session in this project"),
+        "got: {err}"
+    );
 }
 
 #[test]
