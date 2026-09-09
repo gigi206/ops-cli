@@ -123,7 +123,7 @@ event stream, the session must have been launched with **observation on**:
 
 | Operand / option | Meaning |
 |---|---|
-| `<id>` | the PID [`sbx session ls`](session) shows; omit it when only one session is live |
+| `<id>` | a session PID, live or finished; omit it to use the sole live session, or to list this project's finished ones |
 | `-f`, `--follow` | stream new events until the session ends (`Ctrl-C` to stop) |
 | `--json` | emit one object per event (NDJSON): works in a pipe |
 

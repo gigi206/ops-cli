@@ -269,4 +269,35 @@ mod tests {
         let tail = read_fs_log(&socket, Some(1)).unwrap();
         assert_eq!(tail.events.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
     }
+    /// The record is written through [`super::redact::redact_string`], so a credential that reached
+    /// a lens becomes `${NAME}` on the way to disk. That substitution happens on the **whole**
+    /// formatted line, fixed fields included, so the round trip has to survive it: a reader that
+    /// could not parse a redacted line would present a session with a secret in it as a session with
+    /// no events at all.
+    ///
+    /// This lens's only free field is the path, which is where a credential-named file lands.
+    #[test]
+    fn a_redacted_event_line_still_parses_back() {
+        let ev = FsEvent {
+            seq: 3,
+            at_epoch_ms: 1_700_000_000_123,
+            kind: FsKind::Write,
+            path: "secrets/zzsecretvalue0123.env".to_string(),
+        };
+        let needles = vec![crate::sandbox::proxy::SecretNeedle::named(
+            "API_TOKEN",
+            b"zzsecretvalue0123".to_vec(),
+        )];
+        let (line, n) = crate::sandbox::redact::redact_string(
+            &ev.format_line(),
+            &needles,
+            &crate::sandbox::redact::Placeholder::Plain,
+        );
+        assert!(n > 0, "the fixture must actually carry the needle");
+        assert!(!line.contains("zzsecretvalue0123"), "{line}");
+        let back = FsEvent::parse_line(line.trim_end()).expect("a redacted line must still parse");
+        assert_eq!(back.seq, 3);
+        assert_eq!(back.kind, FsKind::Write);
+        assert_eq!(back.path, "secrets/${API_TOKEN}.env");
+    }
 }

@@ -205,10 +205,17 @@ pub(crate) fn serve(listener: UnixListener, ring: Arc<AgentRing>) -> io::Result<
 
 // ── Client side (the `sbx ssh-agent log` process) ──────────────────────────────────────────────
 
+/// The broker's own runtime directory: `0700`, holding the agent socket, the control socket and the
+/// session records beside them. One spelling, because the writer and the reader must not disagree
+/// about where a record lives — the same reason the socket path has one.
+pub(crate) fn agent_control_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("ssh-agent")
+}
+
 /// The control socket path for a session pid, under the broker's own runtime directory — the same
 /// `0700` directory its agent socket is bound in, and never a path inside any cage.
 pub(crate) fn agent_control_socket(data_dir: &Path, pid: u32) -> PathBuf {
-    super::lens::control_socket(&data_dir.join("ssh-agent"), pid)
+    super::lens::control_socket(&agent_control_dir(data_dir), pid)
 }
 
 /// Query one session's control socket for its broker decisions. A session whose socket is absent
@@ -329,6 +336,39 @@ mod tests {
         let snap = read_agent_log(&sock, Some(snap.head)).expect("the follow read");
         assert_eq!(snap.events.len(), 1);
         assert_eq!(snap.events[0].kind, AgentKind::Refuse);
+    }
+    /// The record is written through [`super::redact::redact_string`], so a credential that reached
+    /// a lens becomes `${NAME}` on the way to disk. That substitution happens on the **whole**
+    /// formatted line, fixed fields included, so the round trip has to survive it: a reader that
+    /// could not parse a redacted line would present a session with a secret in it as a session with
+    /// no events at all.
+    ///
+    /// The detail is a key comment, which the user's own agent chose.
+    #[test]
+    fn a_redacted_event_line_still_parses_back() {
+        use crate::sandbox::lens::Event as _;
+        let ev = AgentEvent {
+            seq: 2,
+            at_epoch_ms: 1_700_000_000_123,
+            kind: AgentKind::Refuse,
+            detail: "key zzsecretvalue0123".to_string(),
+        };
+        let needles = vec![crate::sandbox::proxy::SecretNeedle::named(
+            "API_TOKEN",
+            b"zzsecretvalue0123".to_vec(),
+        )];
+        let (line, n) = crate::sandbox::redact::redact_string(
+            &ev.format_line(),
+            &needles,
+            &crate::sandbox::redact::Placeholder::Plain,
+        );
+        assert!(n > 0, "the fixture must actually carry the needle");
+        assert!(!line.contains("zzsecretvalue0123"), "{line}");
+        let back =
+            AgentEvent::parse_line(line.trim_end()).expect("a redacted line must still parse");
+        assert_eq!(back.seq, 2);
+        assert_eq!(back.kind, AgentKind::Refuse);
+        assert_eq!(back.detail, "key ${API_TOKEN}");
     }
 }
 

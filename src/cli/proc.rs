@@ -734,6 +734,7 @@ fn proc_logs(args: &[OsString]) -> ExitCode {
             session_verb: "proc",
             feed: "process feed",
             socket: sandbox::proc_control::proc_control_socket,
+            dir: sandbox::proc_control::proc_control_dir,
             read: sandbox::proc_control::read_exec_log,
             absent: |pid| {
                 format!(

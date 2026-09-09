@@ -514,7 +514,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "the PID `sbx session ls` shows; omit it when only one session is live",
+                "a session PID, live or finished; omit it to use the sole live session, or to list \
+                 this project's finished ones",
             ),
             (
                 "-f, --follow",
@@ -531,6 +532,10 @@ pub(super) const PAGES: &[Page] = &[
             It is the way to watch an observed session from another terminal — and the only way to\n\
             watch a detached (`--detach`) one, which has no terminal for the inline feed. With no id\n\
             the sole live session is used; otherwise name one by its PID.\n\
+            \n\
+            A session that has **ended** is read too, when it ran under `[observe] record` — its\n\
+            events are on disk rather than in the supervisor's memory. With nothing live, this lists\n\
+            the finished sessions recorded for this project so one can be named.\n\
             \n\
             Each line carries a verdict: `observe` for a non-enforcing `--observe` run (a `/proc`\n\
             poll, so a process shorter than one tick can be missed), or the real `allow`/`deny`/`ask`\n\
@@ -726,7 +731,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "the PID `sbx session ls` shows; omit it when only one session is live",
+                "a session PID, live or finished; omit it to use the sole live session, or to list \
+                 this project's finished ones",
             ),
             (
                 "--feed <a,b,...>",
@@ -750,6 +756,10 @@ pub(super) const PAGES: &[Page] = &[
             and those show more of their own detail; this one answers the question none of them can,\n\
             which is what happened in what order. `broker` and `signer` are read here and nowhere\n\
             else.\n\
+            \n\
+            A finished session is read from the records its lenses left, when it ran under\n\
+            `[observe] record`; the two feeds that keep none (`net`, `task`) say so in the header.\n\
+            With nothing live, the finished sessions recorded for this project are listed.\n\
             \n\
             A feed that is not recording is **named, with the reason**, before the events. That is\n\
             the point: a feed nothing stood up and a feed with nothing to say both come back empty,\n\
@@ -907,7 +917,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "the PID `sbx session ls` shows; omit it when only one session is live",
+                "a session PID, live or finished; omit it to use the sole live session, or to list \
+                 this project's finished ones",
             ),
             (
                 "-f, --follow",
@@ -950,7 +961,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "the PID `sbx session ls` shows; omit it when only one session is live",
+                "a session PID, live or finished; omit it to use the sole live session, or to list \
+                 this project's finished ones",
             ),
             (
                 "-f, --follow",

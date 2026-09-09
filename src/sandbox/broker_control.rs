@@ -167,10 +167,17 @@ pub(crate) fn serve(listener: UnixListener, ring: Arc<BrokerRing>) -> io::Result
     super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
 }
 
+/// This lens's own `0700` runtime directory: the control socket and the session records sit in
+/// it together. One spelling, because the writer and the reader must not disagree about where a
+/// record lives.
+pub(crate) fn broker_control_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("broker")
+}
+
 /// The control socket path for a session pid, under the broker's own `0700` runtime directory —
 /// never a path inside any cage.
 pub(crate) fn broker_control_socket(data_dir: &Path, pid: u32) -> PathBuf {
-    super::lens::control_socket(&data_dir.join("broker"), pid)
+    super::lens::control_socket(&broker_control_dir(data_dir), pid)
 }
 
 /// Query one session's broker decisions. A session whose socket is absent (no broker, or a dead
@@ -267,5 +274,38 @@ mod tests {
         // the terminator `format_line` writes.
         let parsed = BrokerEvent::parse_line(event.format_line().trim_end()).expect("parses back");
         assert_eq!(parsed, event);
+    }
+    /// The record is written through [`super::redact::redact_string`], so a credential that reached
+    /// a lens becomes `${NAME}` on the way to disk. That substitution happens on the **whole**
+    /// formatted line, fixed fields included, so the round trip has to survive it: a reader that
+    /// could not parse a redacted line would present a session with a secret in it as a session with
+    /// no events at all.
+    ///
+    /// A broker's detail is written by third-party plugin code, which is exactly the text no lens can
+    /// vouch for.
+    #[test]
+    fn a_redacted_event_line_still_parses_back() {
+        use crate::sandbox::lens::Event as _;
+        let ev = BrokerEvent {
+            seq: 5,
+            at_epoch_ms: 1_700_000_000_123,
+            kind: BrokerKind::Refuse,
+            detail: "unwrap zzsecretvalue0123".to_string(),
+        };
+        let needles = vec![crate::sandbox::proxy::SecretNeedle::named(
+            "API_TOKEN",
+            b"zzsecretvalue0123".to_vec(),
+        )];
+        let (line, n) = crate::sandbox::redact::redact_string(
+            &ev.format_line(),
+            &needles,
+            &crate::sandbox::redact::Placeholder::Plain,
+        );
+        assert!(n > 0, "the fixture must actually carry the needle");
+        assert!(!line.contains("zzsecretvalue0123"), "{line}");
+        let back =
+            BrokerEvent::parse_line(line.trim_end()).expect("a redacted line must still parse");
+        assert_eq!(back.seq, 5);
+        assert_eq!(back.detail, "unwrap ${API_TOKEN}");
     }
 }

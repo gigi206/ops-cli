@@ -1,5 +1,5 @@
 ---
-description: "One running session's feeds in a single column of time, including the two plugin feeds."
+description: "One session's feeds in a single column of time, including the two plugin feeds."
 ---
 
 # `sbx logs`
@@ -8,7 +8,7 @@ description: "One running session's feeds in a single column of time, including 
 sbx logs [<id>] [--feed <a,b,...>] [-n|--lines <N>] [-f|--follow] [--json]
 ```
 
-One running session's **seven feeds in one column of time**: what it execs, where it goes, what it
+One session's **seven feeds in one column of time**: what it execs, where it goes, what it
 writes, what it asked your keys to sign, what its plugins decided and formed, and the declared
 operations it invoked. `sbx log` is an accepted alias. At most one session id: a second one
 is refused (usage, exit 2).
@@ -18,7 +18,14 @@ answers the question none of them can on its own: **what happened in what order*
 only reader for the two plugin feeds, `broker` and `signer`.
 
 See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx proc`](proc) ·
-[`sbx net`](net) · [`sbx fs`](fs) · [`sbx ssh-agent`](ssh-agent) · [`sbx task`](task).
+[`sbx net`](net) · [`sbx fs`](fs) · [`sbx ssh-agent`](ssh-agent) · [`sbx task`](task) ·
+[`[observe]`](../configuration/observe).
+
+A session that has **ended** is read too, when it ran under
+[`[observe] record`](../configuration/observe): its events are on disk instead of in the
+supervisor's memory. The five lens feeds answer from their records; `net` and `task` keep none, and
+the header says so. With nothing live, this project's finished sessions are listed so one can be
+named.
 
 ## What it shows
 

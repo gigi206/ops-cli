@@ -34,6 +34,48 @@ cage. This is the property the record rests on: not that events are unwritten, b
 recorded party cannot reach the record. An agent under `enforce` can no more read its own exec
 record than it can read the live ring behind the control socket.
 
+## Reading one back
+
+`sbx proc logs`, `sbx fs logs`, `sbx ssh-agent logs` and the merged `sbx logs` read a finished
+session from its record with no extra flag. Which source answers is decided by whether the session
+is still running: while it runs, its ring holds what its record does and what has not reached the
+disk yet, so the socket is read; once it is gone, the file is.
+
+A finished session is no longer in `sbx session ls`, and a foreground `sbx run` never printed its
+PID, so with nothing live these views **list this project's records** with their dates, and one can
+be named:
+
+```
+sbx: proc logs: no live session — 2 finished session(s) recorded here:
+       148820  2026-09-09
+       147311  2026-09-08
+     read one with `sbx proc logs <id>`.
+```
+
+Only this project's records are listed or resolved. The data directory holds every project's, and
+the same user owns them all, so this is not a boundary: it is that a view of "this project's
+sessions" has no business naming a neighbouring project's paths.
+
+`--follow` on a finished session says there is nothing writing the record any more and shows it
+once. A record that hit the size cap says its last events are missing, the way a live view says how
+many events fell off the ring. A PID the kernel wrapped round onto names more than one record; the
+newest is shown, and the view says that a choice was made.
+
+Two feeds appear in `sbx logs` with no record of their own, and the header names them: the egress
+plane (its ring carries retroactive amendments that a line-per-event file cannot express;
+`sbx net stats` holds its totals) and the task plane.
+
+`sbx logs` looks a session up across **every** lens's records, not just one: a launch with a broker
+and no `--observe` writes a broker record and no exec record, and resolving on a single lens would
+make that session unnameable.
+
+## Discarding one
+
+There is no verb for it. A record lives at `<data>/<lens>/record-<pid>-<incarnation>.log` (`sbx
+storage status` prints where `<data>` is), and `rm` on that path is the way. `sbx gc` deliberately
+leaves records alone: a sweep keyed on liveness would delete one at the moment it became the only
+answer left.
+
 ## Why it is off by default
 
 Two reasons, and the first is about credentials.

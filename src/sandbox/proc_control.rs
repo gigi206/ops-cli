@@ -762,4 +762,41 @@ mod tests {
             "ok\n"
         );
     }
+    /// The record is written through [`super::redact::redact_string`], so a credential that reached
+    /// a lens becomes `${NAME}` on the way to disk. That substitution happens on the **whole**
+    /// formatted line, fixed fields included, so the round trip has to survive it: a reader that
+    /// could not parse a redacted line would present a session with a secret in it as a session with
+    /// no events at all.
+    ///
+    /// The needle sits in `caller=` as well as in the verbatim tail, because a placeholder landing in a
+    /// fixed field is the case a tail-only fixture would never reach.
+    #[test]
+    fn a_redacted_event_line_still_parses_back() {
+        let ev = ExecEvent {
+            seq: 7,
+            at_epoch_ms: 1_700_000_000_123,
+            pid: 4242,
+            verdict: "deny".to_string(),
+            caller: "/tmp/zzsecretvalue0123/bash".to_string(),
+            command: "curl -H authorization:zzsecretvalue0123".to_string(),
+        };
+        let needles = vec![crate::sandbox::proxy::SecretNeedle::named(
+            "API_TOKEN",
+            b"zzsecretvalue0123".to_vec(),
+        )];
+        let (line, n) = crate::sandbox::redact::redact_string(
+            &ev.format_line(),
+            &needles,
+            &crate::sandbox::redact::Placeholder::Plain,
+        );
+        assert!(n > 0, "the fixture must actually carry the needle");
+        assert!(!line.contains("zzsecretvalue0123"), "{line}");
+        let back =
+            ExecEvent::parse_line(line.trim_end()).expect("a redacted line must still parse");
+        assert_eq!(back.seq, 7);
+        assert_eq!(back.pid, 4242);
+        assert_eq!(back.verdict, "deny");
+        assert_eq!(back.caller, "/tmp/${API_TOKEN}/bash");
+        assert_eq!(back.command, "curl -H authorization:${API_TOKEN}");
+    }
 }

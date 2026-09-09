@@ -15,6 +15,14 @@
 //! session ends. What differs is the words and the two functions that reach the socket, and that is
 //! what [`LogView`] carries.
 //!
+//! A session that has **ended** has no socket, and is read from the record its lenses left under the
+//! data dir when the launch asked for one ([`crate::sandbox::lens::Recorder`]). Which of the two
+//! answers is decided by whether the session is running, never by a flag: while it runs its ring
+//! holds what its record does and what has not reached the disk yet. The one thing a finished
+//! session needs that a live one does not is a way to be *named* — it is gone from `sbx session ls`,
+//! and a foreground `sbx run` never printed its pid — so a view with nothing live lists this
+//! project's records instead of reporting that there is nothing.
+//!
 //! The output discipline is the reason this is worth having in one place rather than three. Rust
 //! ignores `SIGPIPE`, so a bare `println!` into a closed downstream pipe (`… | head`) panics; every
 //! write here goes through a locked, error-checked stdout and a failed write ends the view cleanly
@@ -27,7 +35,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::sandbox::lens::Snapshot;
-use crate::{diag, help, layout_or_fail, live_sessions, resolve_session_target, style};
+use crate::{diag, help, layout_or_fail, live_sessions, style};
 
 /// How often a `--follow` view asks the session for what is new. Short enough to read as live,
 /// long enough that watching a busy agent is not itself a load.
@@ -49,11 +57,16 @@ pub(crate) struct LogView<E: 'static> {
     pub(crate) feed: &'static str,
     /// Where this lens's socket for a session pid lives.
     pub(crate) socket: fn(&Path, u32) -> PathBuf,
+    /// This lens's own directory under the data dir: the socket's parent, and where the session
+    /// records ([`crate::sandbox::lens::Recorder`]) sit beside it.
+    pub(crate) dir: fn(&Path) -> PathBuf,
     /// Read the retained window, or everything past a cursor.
     pub(crate) read: fn(&Path, Option<u64>) -> std::io::Result<Snapshot<E>>,
-    /// What to say when the socket is absent. This is the message that has to teach: a lens that was
-    /// never stood up and a lens with nothing to report both come back empty-handed, and only this
-    /// text tells them apart — so each lens says why *it* in particular might not be there.
+    /// What to say when a **live** session's socket does not answer. This is the message that has to
+    /// teach: a lens that was never stood up and a lens with nothing to report both come back
+    /// empty-handed, and only this text tells them apart — so each lens says why *it* in particular
+    /// might not be there. A finished session never reaches this: it was resolved by finding its
+    /// record, so there is one to read.
     pub(crate) absent: fn(u32) -> String,
     /// Write one event: a JSON object per line (so a `--follow` stream is valid NDJSON), or this
     /// lens's human row. Returns the write result so the caller ends cleanly on a closed pipe.
@@ -61,9 +74,30 @@ pub(crate) struct LogView<E: 'static> {
         fn(&mut dyn Write, u32, &E, bool, &style::Palette) -> std::io::Result<()>,
 }
 
-/// `sbx <lens> logs [<id>] [-f|--follow] [--json]`. `<id>` is the PID `sbx session ls` shows; with
-/// no id the sole live session is used, otherwise the live ones are listed so one can be named.
-pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
+/// Where one view's events come from, once a target has been resolved.
+///
+/// The two are not variants of a preference: a live session's ring is the only place its newest
+/// events exist, and a finished session's record is the only place any of them still do. Which one
+/// answers is decided by whether the session is running, never by a flag.
+enum Source {
+    /// A running session, read over its control socket.
+    Live { pid: u32, header: String },
+    /// A session that has ended, read from the file its lens left behind. `reused` marks a pid that
+    /// named more than one record, so the view can say a choice was made.
+    Record {
+        pid: u32,
+        path: PathBuf,
+        reused: bool,
+    },
+}
+
+/// `sbx <lens> logs [<id>] [-f|--follow] [--json]`. `<id>` is the PID `sbx session ls` shows, or one
+/// a session left a record under; with no id the sole live session is used, otherwise the live ones
+/// are listed so one can be named, and with none live this project's records are.
+pub(crate) fn run<E: crate::sandbox::lens::Event>(
+    args: &[OsString],
+    view: &LogView<E>,
+) -> ExitCode {
     let mut json = false;
     let mut follow = false;
     let mut id: Option<&str> = None;
@@ -94,15 +128,170 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let sessions = match live_sessions(layout.data_dir()) {
+    let data_dir = layout.data_dir();
+    let dir = (view.dir)(data_dir);
+    // The project this reader stands in, derived exactly as a launch derived the `project=` header
+    // it wrote — one derivation, so a record and a reader never drift apart.
+    let project = match crate::config_cwd() {
+        Ok(cwd) => match crate::sandbox::project_identity(&cwd) {
+            Ok((_, canon)) => canon.display().to_string(),
+            Err(e) => {
+                diag::error(&format!("sbx: cannot resolve the project directory: {e}"));
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(code) => return code,
+    };
+    let sessions = match live_sessions(data_dir) {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let target = match resolve_session_target(&sessions, id, view.session_verb) {
-        Ok(t) => t,
+
+    let source = match resolve_source(
+        view.verb,
+        view.session_verb,
+        &sessions,
+        id,
+        std::slice::from_ref(&dir),
+        &project,
+    ) {
+        Ok(s) => s,
         Err(code) => return code,
     };
-    let socket = (view.socket)(layout.data_dir(), target.pid);
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+
+    match source {
+        Source::Live { pid, header } => live_view(view, data_dir, pid, &header, follow, json, &pal),
+        Source::Record { pid, path, reused } => {
+            record_view(view, pid, &path, reused, follow, json, &pal)
+        }
+    }
+}
+
+/// Which session this invocation is about, and where its events are.
+///
+/// A live session is preferred over a record of the same pid: while a session runs its ring holds
+/// what its record does *and* what has not been written yet, so reading the file would answer with
+/// a lag nobody asked for.
+///
+/// With no id and nothing live, the answer is not an error but a **list**: a finished session is not
+/// in `sbx session ls` any more, and a foreground `sbx run` never printed its pid, so a user with a
+/// record to read has no way to name it. Listing what is there is the only thing that makes the
+/// record reachable at all.
+fn resolve_source(
+    verb: &str,
+    session_verb: &str,
+    sessions: &[crate::session::Session],
+    id: Option<&str>,
+    dirs: &[PathBuf],
+    project: &str,
+) -> Result<Source, ExitCode> {
+    if let Some(id) = id {
+        if let Some(live) = sessions.iter().find(|s| s.pid.to_string() == id) {
+            return Ok(Source::Live {
+                pid: live.pid,
+                header: format!(
+                    "session {} [{}] {}",
+                    live.pid,
+                    live.label(),
+                    live.project.display()
+                ),
+            });
+        }
+        // Not live. A pid that named a record of *this* project is answered from it; one that named
+        // a record of another project is not there at all, which is the same answer as a pid that
+        // named nothing (see `records_for_project`).
+        if let Ok(pid) = id.parse::<u32>()
+            && let Some((path, reused)) = first_record(dirs, project, pid)
+        {
+            return Ok(Source::Record { pid, path, reused });
+        }
+        diag::error(&format!(
+            "sbx: {verb}: no live session '{id}' and no record of one — run `sbx session ls` for \
+             the live ones, or `sbx {verb}` for this project's records."
+        ));
+        return Err(ExitCode::from(2));
+    }
+    match sessions {
+        [one] => Ok(Source::Live {
+            pid: one.pid,
+            header: format!(
+                "session {} [{}] {}",
+                one.pid,
+                one.label(),
+                one.project.display()
+            ),
+        }),
+        [] => Err(list_records(verb, dirs, project)),
+        many => {
+            eprintln!(
+                "sbx: {session_verb}: {} live sessions — name one by its PID:",
+                many.len()
+            );
+            for s in many {
+                eprintln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
+            }
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// The empty case: nothing is running, so say what *was*. Returns the exit code the caller ends on,
+/// which is `2` either way — the invocation named no session and produced no events — but the two
+/// texts differ in the only thing that matters, whether there is anything to ask for.
+fn list_records(verb: &str, dirs: &[PathBuf], project: &str) -> ExitCode {
+    let records = crate::sandbox::lens::records_across(dirs, project);
+    eprint!("{}", records_listing(verb, &records));
+    ExitCode::from(2)
+}
+
+/// The record `pid` names in the first of `dirs` that has one — the view then reads that lens, which
+/// is the only one it shows. For the merged view the directories are every lens's, so a session that
+/// recorded only a broker is found by its broker record; the merged reader looks each feed up in its
+/// own directory afterwards.
+fn first_record(dirs: &[PathBuf], project: &str, pid: u32) -> Option<(PathBuf, bool)> {
+    dirs.iter()
+        .find_map(|dir| crate::sandbox::lens::record_of_pid(dir, project, pid))
+}
+
+/// The text [`list_records`] prints, built apart from the printing so it can be asserted.
+///
+/// A finished session is gone from `sbx session ls` and a foreground `sbx run` never printed its
+/// pid, so this listing is the only thing that makes a record nameable. When there is none, the
+/// wording stays the one every other view uses for an empty machine — inventing a second sentence
+/// for "no sessions" would make the same state read two ways depending on which verb asked.
+fn records_listing(verb: &str, records: &[crate::sandbox::lens::RecordEntry]) -> String {
+    use std::fmt::Write as _;
+    if records.is_empty() {
+        return "sbx: no active sandbox sessions.\n".to_string();
+    }
+    let mut out = format!(
+        "sbx: {verb}: no live session — {} finished session(s) recorded here:\n",
+        records.len()
+    );
+    for r in records {
+        let when =
+            r.at.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| crate::paths::civil_date(std::time::UNIX_EPOCH + d))
+                .unwrap_or_else(|_| "?".to_string());
+        let _ = writeln!(out, "       {}  {}", r.pid, when);
+    }
+    let _ = writeln!(out, "     read one with `sbx {verb} <id>`.");
+    out
+}
+
+/// A running session: the retained ring, then optionally a poll past a cursor until it ends. This is
+/// the view as it always was.
+fn live_view<E>(
+    view: &LogView<E>,
+    data_dir: &Path,
+    pid: u32,
+    header: &str,
+    follow: bool,
+    json: bool,
+    pal: &style::Palette,
+) -> ExitCode {
+    let socket = (view.socket)(data_dir, pid);
 
     // The first read is a tail of the whole retained window. A connect failure means this lens was
     // never stood up for this session — there is no ring to read, which is a different thing from
@@ -110,12 +299,10 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
     let first = match (view.read)(&socket, None) {
         Ok(s) => s,
         Err(_) => {
-            diag::error(&(view.absent)(target.pid));
+            diag::error(&(view.absent)(pid));
             return ExitCode::from(2);
         }
     };
-
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
 
     // Write the header and the tail batch through a locked, error-checked stdout: a closed
     // downstream pipe (`… | head`) ends the view cleanly (exit 0) rather than panicking on the
@@ -125,17 +312,10 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
         let wrote = (|| -> std::io::Result<()> {
             if !json {
                 let (h, r) = (pal.head, pal.reset);
-                writeln!(
-                    out,
-                    "{h}{} — session {} [{}] {}{r}",
-                    view.feed,
-                    target.pid,
-                    target.label(),
-                    target.project.display()
-                )?;
+                writeln!(out, "{h}{} — {header}{r}", view.feed)?;
             }
             for e in &first.events {
-                (view.write_event)(&mut out, target.pid, e, json, &pal)?;
+                (view.write_event)(&mut out, pid, e, json, pal)?;
             }
             out.flush()
         })();
@@ -161,7 +341,7 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
                 if !json {
                     let mut out = std::io::stdout().lock();
                     let (dim, r) = (pal.dim, pal.reset);
-                    let _ = writeln!(out, "  {dim}(session {} ended){r}", target.pid);
+                    let _ = writeln!(out, "  {dim}(session {pid} ended){r}");
                 }
                 return ExitCode::SUCCESS;
             }
@@ -177,7 +357,7 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
                 )?;
             }
             for e in &snap.events {
-                (view.write_event)(&mut out, target.pid, e, json, &pal)?;
+                (view.write_event)(&mut out, pid, e, json, pal)?;
             }
             out.flush()
         })();
@@ -188,6 +368,77 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
         }
         cursor = snap.head;
     }
+}
+
+/// A finished session: its record, read once.
+///
+/// `--follow` is accepted and says why it did nothing rather than being refused. A file whose writer
+/// is gone will never grow, so polling it would be a spinner over a fixed answer; refusing the flag
+/// outright would break the ordinary habit of leaving `-f` on a command one re-runs.
+///
+/// A `truncated=` record is announced the way an eviction gap is on the live path: the events shown
+/// are true, and what is missing is stated rather than left to be inferred from a tail that stops.
+fn record_view<E: crate::sandbox::lens::Event>(
+    view: &LogView<E>,
+    pid: u32,
+    path: &Path,
+    reused: bool,
+    follow: bool,
+    json: bool,
+    pal: &style::Palette,
+) -> ExitCode {
+    let record = match crate::sandbox::lens::read_record::<E>(path) {
+        Ok(r) => r,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: {}: cannot read the session record {}: {e}",
+                view.verb,
+                path.display()
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut out = std::io::stdout().lock();
+    let wrote = (|| -> std::io::Result<()> {
+        if !json {
+            let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+            writeln!(
+                out,
+                "{h}{} — session {pid} (ended) {}{r}",
+                view.feed, record.project
+            )?;
+            if reused {
+                writeln!(
+                    out,
+                    "  {dim}(more than one session recorded under pid {pid}; showing the most \
+                     recent){r}"
+                )?;
+            }
+            if record.truncated {
+                writeln!(
+                    out,
+                    "  {dim}(this session outran the record's size cap; its last events are \
+                     missing){r}"
+                )?;
+            }
+            if follow {
+                writeln!(
+                    out,
+                    "  {dim}(nothing is writing this record any more, so there is nothing to \
+                     follow){r}"
+                )?;
+            }
+        }
+        for e in &record.events {
+            (view.write_event)(&mut out, pid, e, json, pal)?;
+        }
+        out.flush()
+    })();
+    if wrote.is_err() {
+        // A closed downstream pipe (`… | head`) ends the view cleanly.
+        return ExitCode::SUCCESS;
+    }
+    ExitCode::SUCCESS
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -225,6 +476,13 @@ struct Row {
 /// ending, and the view says so: see [`FollowEnd`].
 type FeedRead = fn(&Path, Option<u64>) -> std::io::Result<(Vec<Row>, Option<u64>, u64)>;
 
+/// How a feed answers for a session that has ended: where its records live, and how to turn one into
+/// merged rows plus whether it was cut short by the size cap.
+type RecordRead = (
+    fn(&Path) -> PathBuf,
+    fn(&Path) -> std::io::Result<(Vec<Row>, bool)>,
+);
+
 /// One feed of the merged view, and where it stands.
 struct Feed {
     name: &'static str,
@@ -234,99 +492,168 @@ struct Feed {
     /// wrong. Each feed keeps its own wording, because the remedy differs.
     absent: &'static str,
     read: FeedRead,
+    /// Why this feed has nothing for a session that has **ended** — a different sentence from
+    /// [`absent`](Feed::absent), which explains a live session with no such lens. A feed that keeps
+    /// no record says so here, so its silence is never read as a quiet session.
+    no_record: &'static str,
+    /// Where this feed's directory is, and how to read a record out of it — `None` for the two feeds
+    /// that keep no `lens` record: the egress plane, whose ring carries retroactive amendments a
+    /// line-per-event file cannot express, and the task plane, whose invocation log is its own
+    /// in-memory structure rather than one of these rings. Both are named in the header when a
+    /// finished session is read, so nobody reads their absence as a quiet session.
+    record: Option<RecordRead>,
     /// The cursor to read past, or `None` once this feed is gone: either it was never stood up, or
     /// it ended while the others ran on. A gone feed is never polled again.
     cursor: Option<u64>,
 }
 
+/// One feed's session record read into merged rows: the same mapping its socket read makes, over
+/// the file instead of the ring. Also hands back whether the record was cut short, which the view
+/// states rather than letting a reader infer it from a tail that stops.
+fn record_rows<E: crate::sandbox::lens::Event>(
+    path: &Path,
+    map: fn(E) -> Row,
+) -> std::io::Result<(Vec<Row>, bool)> {
+    let record = crate::sandbox::lens::read_record::<E>(path)?;
+    Ok((
+        record.events.into_iter().map(map).collect(),
+        record.truncated,
+    ))
+}
+
+/// One `fs` event as a merged row. Named rather than inlined because the socket read and the
+/// record read make the same mapping, and a view where the two diverged would show one session two
+/// ways depending on whether it was still running.
+fn fs_row(e: crate::sandbox::fs_control::FsEvent) -> Row {
+    Row {
+        at_epoch_ms: e.at_epoch_ms,
+        feed: "fs",
+        token: e.kind.token().to_string(),
+        subject: e.path,
+    }
+}
+
+/// A running session's `fs` feed (the files it wrote), read over its control socket.
 fn read_fs_rows(
     socket: &Path,
     after: Option<u64>,
 ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
     let snap = crate::sandbox::fs_control::read_fs_log(socket, after)?;
-    let rows = snap
-        .events
-        .into_iter()
-        .map(|e| Row {
-            at_epoch_ms: e.at_epoch_ms,
-            feed: "fs",
-            token: e.kind.token().to_string(),
-            subject: e.path,
-        })
-        .collect();
+    let rows = snap.events.into_iter().map(fs_row).collect();
     Ok((rows, Some(snap.head), snap.dropped))
 }
 
+/// The same feed for a session that has ended, read from the record it left behind.
+fn record_fs_rows(path: &Path) -> std::io::Result<(Vec<Row>, bool)> {
+    record_rows(path, fs_row)
+}
+
+/// One `proc` event as a merged row. Named rather than inlined because the socket read and the
+/// record read make the same mapping, and a view where the two diverged would show one session two
+/// ways depending on whether it was still running.
+fn proc_row(e: crate::sandbox::proc_control::ExecEvent) -> Row {
+    Row {
+        at_epoch_ms: e.at_epoch_ms,
+        feed: "proc",
+        token: e.verdict,
+        subject: e.command,
+    }
+}
+
+/// A running session's `proc` feed (the processes it execd), read over its control socket.
 fn read_proc_rows(
     socket: &Path,
     after: Option<u64>,
 ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
     let snap = crate::sandbox::proc_control::read_exec_log(socket, after)?;
-    let rows = snap
-        .events
-        .into_iter()
-        .map(|e| Row {
-            at_epoch_ms: e.at_epoch_ms,
-            feed: "proc",
-            token: e.verdict,
-            subject: e.command,
-        })
-        .collect();
+    let rows = snap.events.into_iter().map(proc_row).collect();
     Ok((rows, Some(snap.head), snap.dropped))
 }
 
+/// The same feed for a session that has ended, read from the record it left behind.
+fn record_proc_rows(path: &Path) -> std::io::Result<(Vec<Row>, bool)> {
+    record_rows(path, proc_row)
+}
+
+/// One `ssh` event as a merged row. Named rather than inlined because the socket read and the
+/// record read make the same mapping, and a view where the two diverged would show one session two
+/// ways depending on whether it was still running.
+fn ssh_row(e: crate::sandbox::sshagent_control::AgentEvent) -> Row {
+    Row {
+        at_epoch_ms: e.at_epoch_ms,
+        feed: "ssh",
+        token: e.kind.token().to_string(),
+        subject: e.detail,
+    }
+}
+
+/// A running session's `ssh` feed (what its ssh-agent broker decided), read over its control socket.
 fn read_ssh_rows(
     socket: &Path,
     after: Option<u64>,
 ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
     let snap = crate::sandbox::sshagent_control::read_agent_log(socket, after)?;
-    let rows = snap
-        .events
-        .into_iter()
-        .map(|e| Row {
-            at_epoch_ms: e.at_epoch_ms,
-            feed: "ssh",
-            token: e.kind.token().to_string(),
-            subject: e.detail,
-        })
-        .collect();
+    let rows = snap.events.into_iter().map(ssh_row).collect();
     Ok((rows, Some(snap.head), snap.dropped))
 }
 
+/// The same feed for a session that has ended, read from the record it left behind.
+fn record_ssh_rows(path: &Path) -> std::io::Result<(Vec<Row>, bool)> {
+    record_rows(path, ssh_row)
+}
+
+/// One `broker` event as a merged row. Named rather than inlined because the socket read and the
+/// record read make the same mapping, and a view where the two diverged would show one session two
+/// ways depending on whether it was still running.
+fn broker_row(e: crate::sandbox::broker_control::BrokerEvent) -> Row {
+    Row {
+        at_epoch_ms: e.at_epoch_ms,
+        feed: "broker",
+        token: e.kind.token().to_string(),
+        subject: e.detail,
+    }
+}
+
+/// A running session's `broker` feed (what a broker plugin ruled on), read over its control socket.
 fn read_broker_rows(
     socket: &Path,
     after: Option<u64>,
 ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
     let snap = crate::sandbox::broker_control::read_broker_log(socket, after)?;
-    let rows = snap
-        .events
-        .into_iter()
-        .map(|e| Row {
-            at_epoch_ms: e.at_epoch_ms,
-            feed: "broker",
-            token: e.kind.token().to_string(),
-            subject: e.detail,
-        })
-        .collect();
+    let rows = snap.events.into_iter().map(broker_row).collect();
     Ok((rows, Some(snap.head), snap.dropped))
 }
 
+/// The same feed for a session that has ended, read from the record it left behind.
+fn record_broker_rows(path: &Path) -> std::io::Result<(Vec<Row>, bool)> {
+    record_rows(path, broker_row)
+}
+
+/// One `signer` event as a merged row. Named rather than inlined because the socket read and the
+/// record read make the same mapping, and a view where the two diverged would show one session two
+/// ways depending on whether it was still running.
+fn signer_row(e: crate::sandbox::signer_control::SignerEvent) -> Row {
+    Row {
+        at_epoch_ms: e.at_epoch_ms,
+        feed: "signer",
+        token: e.kind.token().to_string(),
+        subject: e.detail,
+    }
+}
+
+/// A running session's `signer` feed (what a signer plugin formed), read over its control socket.
 fn read_signer_rows(
     socket: &Path,
     after: Option<u64>,
 ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
     let snap = crate::sandbox::signer_control::read_signer_log(socket, after)?;
-    let rows = snap
-        .events
-        .into_iter()
-        .map(|e| Row {
-            at_epoch_ms: e.at_epoch_ms,
-            feed: "signer",
-            token: e.kind.token().to_string(),
-            subject: e.detail,
-        })
-        .collect();
+    let rows = snap.events.into_iter().map(signer_row).collect();
     Ok((rows, Some(snap.head), snap.dropped))
+}
+
+/// The same feed for a session that has ended, read from the record it left behind.
+fn record_signer_rows(path: &Path) -> std::io::Result<(Vec<Row>, bool)> {
+    record_rows(path, signer_row)
 }
 
 fn read_net_rows(
@@ -416,6 +743,11 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::proc_control::proc_control_socket(data_dir, pid),
             absent: "not observed — relaunch with `--observe` to record what it execs",
             read: read_proc_rows,
+            no_record: "no record — the exec lens did not run (`--observe`, or a `[proc] mode`), or the launch had no `[observe] record`",
+            record: Some((
+                crate::sandbox::proc_control::proc_control_dir,
+                record_proc_rows,
+            )),
             cursor: Some(0),
         },
         Feed {
@@ -423,6 +755,11 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::signer_control::signer_control_socket(data_dir, pid),
             absent: "no signer plugin — no credential in this config declares `sign`",
             read: read_signer_rows,
+            no_record: "no record — no credential in that config declared `sign`, or the launch had no `[observe] record`",
+            record: Some((
+                crate::sandbox::signer_control::signer_control_dir,
+                record_signer_rows,
+            )),
             cursor: Some(0),
         },
         Feed {
@@ -430,6 +767,8 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::control::control_socket(data_dir, pid),
             absent: "no filtering egress posture — `[network] mode` decides nothing to record",
             read: read_net_rows,
+            no_record: "the egress plane keeps no session record; `sbx net stats` holds its totals",
+            record: None,
             cursor: Some(0),
         },
         Feed {
@@ -437,6 +776,8 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::fs_control::fs_control_socket(data_dir, pid),
             absent: "not observed — relaunch with `--observe` to record what it writes",
             read: read_fs_rows,
+            no_record: "no record — the file lens did not run (`--observe`), or the launch had no `[observe] record`",
+            record: Some((crate::sandbox::fs_control::fs_control_dir, record_fs_rows)),
             cursor: Some(0),
         },
         Feed {
@@ -444,6 +785,11 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::sshagent_control::agent_control_socket(data_dir, pid),
             absent: "no ssh-agent broker — this config has no `[ssh_agent] allow`",
             read: read_ssh_rows,
+            no_record: "no record — that config granted no key (`[ssh_agent] allow`), or the launch had no `[observe] record`",
+            record: Some((
+                crate::sandbox::sshagent_control::agent_control_dir,
+                record_ssh_rows,
+            )),
             cursor: Some(0),
         },
         Feed {
@@ -451,6 +797,11 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::broker_control::broker_control_socket(data_dir, pid),
             absent: "no broker plugin — this config has no `[broker.<name>]`",
             read: read_broker_rows,
+            no_record: "no record — that config declared no `[broker.<name>]`, or the launch had no `[observe] record`",
+            record: Some((
+                crate::sandbox::broker_control::broker_control_dir,
+                record_broker_rows,
+            )),
             cursor: Some(0),
         },
         Feed {
@@ -458,6 +809,8 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::task_control::log_socket(data_dir, pid),
             absent: "no declared operations — this config has no `[task]`",
             read: read_task_rows,
+            no_record: "the task plane keeps no session record",
+            record: None,
             cursor: Some(0),
         },
     ]
@@ -579,16 +932,42 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let sessions = match live_sessions(layout.data_dir()) {
+    let data_dir = layout.data_dir();
+    let project = match crate::config_cwd() {
+        Ok(cwd) => match crate::sandbox::project_identity(&cwd) {
+            Ok((_, canon)) => canon.display().to_string(),
+            Err(e) => {
+                diag::error(&format!("sbx: cannot resolve the project directory: {e}"));
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(code) => return code,
+    };
+    let sessions = match live_sessions(data_dir) {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let target = match resolve_session_target(&sessions, id, "logs") {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
+    // Resolved through the same door one lens's view uses, so `sbx logs` and `sbx proc logs` accept
+    // exactly the same ids. Every lens's directory is consulted, not just one: no single lens is the
+    // one every session records — a launch with a broker and no `--observe` writes a broker record
+    // and no exec record — so resolving on one directory would make such a session unnameable.
+    let dirs: Vec<PathBuf> = feeds_for(data_dir, 0)
+        .iter()
+        .filter_map(|f| f.record.map(|(dir, _)| dir(data_dir)))
+        .collect();
+    let (pid, live, header, reused) =
+        match resolve_source("logs", "logs", &sessions, id, &dirs, &project) {
+            Ok(Source::Live { pid, header }) => (pid, true, header, false),
+            Ok(Source::Record { pid, reused, .. }) => (
+                pid,
+                false,
+                format!("session {pid} (ended) {project}"),
+                reused,
+            ),
+            Err(code) => return code,
+        };
 
-    let mut feeds = feeds_for(layout.data_dir(), target.pid);
+    let mut feeds = feeds_for(data_dir, pid);
     if let Some(names) = &only {
         // A name nobody answers to is a typo, and silently showing fewer feeds than asked for is the
         // one failure this view cannot afford — the reader would read absence as quiet.
@@ -607,17 +986,40 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     let mut absent: Vec<(&str, &str)> = Vec::new();
     // Feeds that answered but handed back no cursor: shown once, then not polled again.
     let mut unfollowable: Vec<&str> = Vec::new();
+    // Records that were cut short: named once, beside the feeds that are missing entirely.
+    let mut truncated: Vec<&str> = Vec::new();
     for feed in &mut feeds {
-        match (feed.read)(&feed.socket, None) {
-            Ok((batch, head, _)) => {
+        // A running session is read from its ring, which holds what its record does and what has
+        // not reached the disk yet; a finished one only exists as a file.
+        let read = if live {
+            (feed.read)(&feed.socket, None).map(|(batch, head, _)| (batch, head))
+        } else {
+            match &feed.record {
+                Some((dir, read_record)) => {
+                    match crate::sandbox::lens::record_of_pid(&dir(data_dir), &project, pid) {
+                        Some((path, _)) => read_record(&path).map(|(batch, cut)| {
+                            if cut {
+                                truncated.push(feed.name);
+                            }
+                            // No cursor: a record nobody is writing has nothing to poll for.
+                            (batch, None)
+                        }),
+                        None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                    }
+                }
+                None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            }
+        };
+        match read {
+            Ok((batch, head)) => {
                 rows.extend(batch);
                 feed.cursor = head;
-                if head.is_none() {
+                if head.is_none() && live {
                     unfollowable.push(feed.name);
                 }
             }
             Err(_) => {
-                absent.push((feed.name, feed.absent));
+                absent.push((feed.name, if live { feed.absent } else { feed.no_record }));
                 feed.cursor = None;
             }
         }
@@ -629,11 +1031,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     // session was recording nothing while holding its record in hand.
     if absent.len() == feeds.len() {
         let consulted: Vec<&str> = absent.iter().map(|(name, _)| *name).collect();
-        diag::error(&nothing_recorded_message(
-            target.pid,
-            only.is_some(),
-            &consulted,
-        ));
+        diag::error(&nothing_recorded_message(pid, only.is_some(), &consulted));
         for (name, why) in &absent {
             diag::hint(&format!("       {name}: {why}"));
         }
@@ -660,21 +1058,36 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         let wrote = (|| -> std::io::Result<()> {
             if !json {
                 let (h, d, r) = (pal.head, pal.dim, pal.reset);
-                let live: Vec<&str> = feeds
+                let answered: Vec<&str> = feeds
                     .iter()
-                    .filter(|f| f.cursor.is_some())
+                    .filter(|f| !absent.iter().any(|(name, _)| *name == f.name))
                     .map(|f| f.name)
                     .collect();
+                writeln!(out, "{h}feeds — {header}{r}")?;
+                if reused {
+                    writeln!(
+                        out,
+                        "  {d}(more than one session recorded under pid {pid}; showing the most \
+                         recent){r}"
+                    )?;
+                }
                 writeln!(
                     out,
-                    "{h}feeds — session {} [{}] {}{r}",
-                    target.pid,
-                    target.label(),
-                    target.project.display()
+                    "  {d}{}: {}{r}",
+                    if live { "recording" } else { "recorded" },
+                    answered.join(", ")
                 )?;
-                writeln!(out, "  {d}recording: {}{r}", live.join(", "))?;
                 for (name, why) in &absent {
                     writeln!(out, "  {d}{name}: {why}{r}")?;
+                }
+                // A record that outran its cap shows true events and stops early; saying which feed
+                // was cut is the only thing that separates that from a session that went quiet.
+                for name in &truncated {
+                    writeln!(
+                        out,
+                        "  {d}{name}: this session outran the record's size cap; its last events \
+                         are missing{r}"
+                    )?;
                 }
                 // Said out loud rather than left to look like a quiet feed: this one answered, and
                 // what it showed is the whole of what it has to say here.
@@ -687,7 +1100,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                 }
             }
             for row in &rows {
-                write_row(&mut out, target.pid, row, json, &pal)?;
+                write_row(&mut out, pid, row, json, &pal)?;
             }
             out.flush()
         })();
@@ -700,6 +1113,22 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // A finished session was read from files nobody is writing, so there is nothing to poll and
+    // nothing *ended* while this view ran. Said in the record's own words rather than falling into
+    // the loop below, whose `(session … ended)` is about a socket that closed under a live read.
+    if !live {
+        if !json {
+            let mut out = std::io::stdout().lock();
+            let (dim, r) = (pal.dim, pal.reset);
+            let _ = writeln!(
+                out,
+                "  {dim}(nothing is writing these records any more, so there is nothing to \
+                 follow){r}"
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // Nothing left to poll before the first sleep: every feed either did not answer or answered
     // without a cursor, and what was printed above is the whole of their record. Saying the session
     // ended here would report a live session as finished, so the follow declines instead.
@@ -707,7 +1136,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         if !json {
             let mut out = std::io::stdout().lock();
             let (dim, r) = (pal.dim, pal.reset);
-            let _ = writeln!(out, "  {dim}({}){r}", end.note(target.pid));
+            let _ = writeln!(out, "  {dim}({}){r}", end.note(pid));
         }
         return ExitCode::SUCCESS;
     }
@@ -734,7 +1163,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                 )?;
             }
             for row in &round.rows {
-                write_row(&mut out, target.pid, row, json, &pal)?;
+                write_row(&mut out, pid, row, json, &pal)?;
             }
             out.flush()
         })();
@@ -746,7 +1175,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
             if !json {
                 let mut out = std::io::stdout().lock();
                 let (dim, r) = (pal.dim, pal.reset);
-                let _ = writeln!(out, "  {dim}({}){r}", end.note(target.pid));
+                let _ = writeln!(out, "  {dim}({}){r}", end.note(pid));
             }
             return ExitCode::SUCCESS;
         }
@@ -901,6 +1330,8 @@ mod tests {
             socket: PathBuf::from("/nonexistent"),
             absent: "no declared operations",
             read: answers_without_a_cursor,
+            no_record: "no session record",
+            record: None,
             cursor: Some(0),
         }];
         let round = follow_round(&mut feeds);
@@ -928,6 +1359,8 @@ mod tests {
             socket: PathBuf::from("/nonexistent"),
             absent: "no filtering egress posture",
             read: refuses,
+            no_record: "no session record",
+            record: None,
             cursor: Some(0),
         }];
         let round = follow_round(&mut feeds);
@@ -948,6 +1381,8 @@ mod tests {
                 socket: PathBuf::from("/nonexistent"),
                 absent: "no declared operations",
                 read: answers_without_a_cursor,
+                no_record: "no session record",
+                record: None,
                 cursor: Some(0),
             },
             Feed {
@@ -955,11 +1390,57 @@ mod tests {
                 socket: PathBuf::from("/nonexistent"),
                 absent: "no filtering egress posture",
                 read: answers_with_a_cursor,
+                no_record: "no session record",
+                record: None,
                 cursor: Some(0),
             },
         ];
         let round = follow_round(&mut feeds);
         assert_eq!(round.rows.len(), 1);
         assert_eq!(round.end, None);
+    }
+    /// A finished session is gone from `sbx session ls`, and a foreground `sbx run` never printed
+    /// its pid, so this listing is the only way a record can be named. It has to carry the id and
+    /// the day, and say what to type next.
+    #[test]
+    fn the_empty_case_lists_what_can_still_be_read() {
+        let records = vec![
+            crate::sandbox::lens::RecordEntry {
+                pid: 148820,
+                path: PathBuf::from("/d/proc/record-148820-1.log"),
+                at: std::time::UNIX_EPOCH + Duration::from_secs(1_757_376_000),
+            },
+            crate::sandbox::lens::RecordEntry {
+                pid: 147311,
+                path: PathBuf::from("/d/proc/record-147311-1.log"),
+                at: std::time::UNIX_EPOCH + Duration::from_secs(1_757_289_600),
+            },
+        ];
+        let out = records_listing("proc logs", &records);
+        assert!(out.contains("2 finished session(s)"), "{out}");
+        assert!(out.contains("148820"), "{out}");
+        assert!(out.contains("147311"), "{out}");
+        assert!(out.contains("`sbx proc logs <id>`"), "{out}");
+        // The suggestion is what the user types, so it is built from the verb and never from the
+        // session-resolver's word for the command: `logs` and `ssh-agent logs` both carry `logs`
+        // already, and a second one would print `sbx logs logs`.
+        assert!(!out.contains("logs logs"), "{out}");
+        assert!(!records_listing("logs", &records).contains("logs logs"));
+        assert!(
+            !records_listing("ssh-agent logs", &records).contains("logs logs"),
+            "{}",
+            records_listing("ssh-agent logs", &records)
+        );
+    }
+
+    /// With no record either, the wording stays the one every other view uses for an empty machine:
+    /// a second sentence for the same state would make it read two ways depending on which verb
+    /// asked.
+    #[test]
+    fn the_empty_case_with_no_record_says_what_it_always_said() {
+        assert_eq!(
+            records_listing("proc logs", &[]),
+            "sbx: no active sandbox sessions.\n"
+        );
     }
 }

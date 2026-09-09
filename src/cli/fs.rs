@@ -178,6 +178,7 @@ fn fs_logs(args: &[OsString]) -> ExitCode {
             session_verb: "fs",
             feed: "file-write feed",
             socket: sandbox::fs_control::fs_control_socket,
+            dir: sandbox::fs_control::fs_control_dir,
             read: sandbox::fs_control::read_fs_log,
             absent: |pid| {
                 format!(

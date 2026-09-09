@@ -60,7 +60,7 @@ pub(crate) fn sanitize_detail(s: &str) -> String {
 }
 
 use crate::sandbox::locks::locked;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -510,6 +510,175 @@ impl Recorder {
         }
         open.written += line.len() as u64;
     }
+}
+
+/// One session's record read back: who it belongs to, whether its tail is missing, and the events.
+///
+/// Held whole in memory, which is bounded by construction: [`RECORD_MAX_BYTES`] caps the file the
+/// writer produced, so the largest thing this can be is that cap plus what parsing it costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Record<E> {
+    /// The `project=` header: the canonical path [`super::binds::project_identity`] derives, which
+    /// is what a reader standing in a project compares against.
+    pub(crate) project: String,
+    /// The `app=` header, for an `sbx app <name>` launch.
+    pub(crate) app: Option<String>,
+    /// Whether the record ends on a `truncated=` line, meaning the session outran the cap and the
+    /// tail is missing. Surfaced by the reader the way an eviction gap is, never swallowed.
+    pub(crate) truncated: bool,
+    pub(crate) events: Vec<E>,
+}
+
+/// Read one record file back into its events.
+///
+/// **The identity is the first line that states it**, the same rule
+/// [`super::egress_stats`]'s reader follows and for the same reason: the writer emits both headers
+/// before any event, so the first is always the real one, and honouring a later `project=` would let
+/// something further down the file rename the session. What is further down is the cage's own
+/// command lines. The writer already refuses to emit a line that could pass for a header
+/// ([`RECORD_RESERVED`]); this closes the same hole from the read side, for a file written by any
+/// version.
+///
+/// A line that is not a well-formed event of this lens is skipped rather than fatal: a record whose
+/// last line was half-written when the machine went down still yields everything before it.
+pub(crate) fn read_record<E: Event>(path: &Path) -> io::Result<Record<E>> {
+    let contents = std::fs::read_to_string(path)?;
+    let mut record = Record {
+        project: String::new(),
+        app: None,
+        truncated: false,
+        events: Vec::new(),
+    };
+    let mut named = false;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("project=") {
+            if !named {
+                record.project = rest.to_string();
+                named = true;
+            }
+        } else if let Some(rest) = line.strip_prefix("app=") {
+            if record.app.is_none() {
+                record.app = Some(rest.to_string());
+            }
+        } else if line.starts_with("truncated=") {
+            record.truncated = true;
+        } else if let Some(event) = E::parse_line(line) {
+            record.events.push(event);
+        }
+    }
+    Ok(record)
+}
+
+/// The `project=` header alone, without parsing the events under it.
+///
+/// A view that lists a project's records reads one header per file, and a file may be up to
+/// [`RECORD_MAX_BYTES`]. Reading them whole to compare one line would make listing cost whatever
+/// the sessions spent. The scan stops at the first line that is not a header, which the writer
+/// guarantees is the first event.
+pub(crate) fn record_project(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        if let Some(rest) = line.strip_prefix("project=") {
+            return Some(rest.to_string());
+        }
+        if !RECORD_RESERVED.iter().any(|p| line.starts_with(p)) {
+            return None;
+        }
+    }
+    None
+}
+
+/// One record file in a lens's directory, as the reader finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordEntry {
+    /// The launcher pid the file is named for: what a reader passes as the session id.
+    pub(crate) pid: u32,
+    pub(crate) path: PathBuf,
+    /// The file's modification time, which is when the session last recorded anything.
+    pub(crate) at: std::time::SystemTime,
+}
+
+/// Every record in `dir`, newest first. Empty for a directory that is not there, which is what a
+/// lens that never recorded anything leaves behind.
+pub(crate) fn records_in(dir: &Path) -> Vec<RecordEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<RecordEntry> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let pid = record_entry_pid(name.to_str()?)?;
+            Some(RecordEntry {
+                pid,
+                path: e.path(),
+                at: e.metadata().ok()?.modified().ok()?,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.path.cmp(&b.path)));
+    out
+}
+
+/// The records in `dir` that belong to `project`, newest first.
+///
+/// The data directory is one per user, not one per project, so a lens's directory holds every
+/// project's records. A record of another project is simply **not there** for this reader: not
+/// counted, not named, not hinted at. Same uid, so nothing here is a boundary — it is that a view
+/// of "this project's sessions" that leaked a neighbouring project's paths would be answering a
+/// question nobody asked.
+pub(crate) fn records_for_project(dir: &Path, project: &str) -> Vec<RecordEntry> {
+    records_in(dir)
+        .into_iter()
+        .filter(|e| record_project(&e.path).as_deref() == Some(project))
+        .collect()
+}
+
+/// This project's records across several lenses' directories, newest first, one entry per session.
+///
+/// The merged view needs this because no single lens is the one every session records: a launch with
+/// a broker and no `--observe` writes a broker record and no exec record, and resolving on either
+/// directory alone would make such a session unnameable. A pid is listed once, at the time of its
+/// newest record among the directories.
+pub(crate) fn records_across(dirs: &[PathBuf], project: &str) -> Vec<RecordEntry> {
+    let mut best: BTreeMap<u32, RecordEntry> = BTreeMap::new();
+    for dir in dirs {
+        for entry in records_for_project(dir, project) {
+            best.entry(entry.pid)
+                .and_modify(|kept| {
+                    if entry.at > kept.at {
+                        *kept = entry.clone();
+                    }
+                })
+                .or_insert(entry);
+        }
+    }
+    let mut out: Vec<RecordEntry> = best.into_values().collect();
+    out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.pid.cmp(&b.pid)));
+    out
+}
+
+/// The record `pid` names in `dir`, and whether more than one file carried that pid.
+///
+/// A record is keyed by the session incarnation, but a reader only ever has the pid: it is what
+/// `sbx session ls` showed and what a detached launch printed. So the pid may name more than one
+/// file, once the kernel has wrapped its counter round onto it. The newest is the answer — the
+/// session a user just watched end is the one they are asking about — and the second return value
+/// is what lets the view *say* that a choice was made, rather than presenting one of several as the
+/// only one.
+///
+/// The alternative, one file per pid with in-file session headers, is what `sbx session logs` does
+/// for the detached log. It is the right shape there, where the writer is `>>` on a path a caller
+/// named; it is the wrong one here, where the writer knows its own incarnation and a reader that
+/// wants a whole session should not have to scan for its boundaries.
+pub(crate) fn record_of_pid(dir: &Path, project: &str, pid: u32) -> Option<(PathBuf, bool)> {
+    let matching: Vec<RecordEntry> = records_for_project(dir, project)
+        .into_iter()
+        .filter(|e| e.pid == pid)
+        .collect();
+    let newest = matching.first()?;
+    Some((newest.path.clone(), matching.len() > 1))
 }
 
 /// What a launch resolves once so every lens opens its record the same way.
@@ -1154,6 +1323,177 @@ mod tests {
             body, "project=/p\nevent seq=1 at=0 tail=real\n",
             "only the writer's own header may carry a reserved prefix"
         );
+    }
+
+    /// The reader's half of the round trip: what [`Recorder`] wrote is what [`read_record`] hands
+    /// back, headers and all.
+    #[test]
+    fn a_record_reads_back_as_the_events_that_were_pushed() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = Recorder::create(&path, "/home/u/proj", Some("demo"), needles(&[])).unwrap();
+        let ring = Ring::<TestEvent>::new(10).with_record(Some(record));
+        push_tail(&ring, "first one");
+        push_tail(&ring, "second one");
+
+        let back = read_record::<TestEvent>(&path).unwrap();
+        assert_eq!(back.project, "/home/u/proj");
+        assert_eq!(back.app.as_deref(), Some("demo"));
+        assert!(!back.truncated);
+        let tails: Vec<&str> = back.events.iter().map(|e| e.tail.as_str()).collect();
+        assert_eq!(tails, ["first one", "second one"]);
+        assert_eq!(back.events[0].seq, 1);
+    }
+
+    /// The identity is the **first** line that states it. The writer refuses to emit a line that
+    /// could pass for a header, so this is the read side of the same rule: a record written before
+    /// that refusal existed, or damaged, must not be renamable by its own contents.
+    #[test]
+    fn a_later_project_line_cannot_rename_a_record() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        std::fs::write(
+            &path,
+            "project=/real\nevent seq=1 at=1 tail=x\nproject=/forged\nevent seq=2 at=2 tail=y\n",
+        )
+        .unwrap();
+
+        let back = read_record::<TestEvent>(&path).unwrap();
+        assert_eq!(back.project, "/real", "a later header renamed the session");
+        assert_eq!(back.events.len(), 2, "the events after it are still read");
+    }
+
+    /// A truncated record is a record: the events before the cap are true, and the reader is told
+    /// the tail is gone rather than left to infer it from a feed that stops.
+    #[test]
+    fn a_truncated_record_reads_its_events_and_says_it_was_cut() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        std::fs::write(&path, "project=/p\nevent seq=1 at=1 tail=x\ntruncated=1\n").unwrap();
+
+        let back = read_record::<TestEvent>(&path).unwrap();
+        assert_eq!(back.events.len(), 1);
+        assert!(back.truncated);
+    }
+
+    /// A half-written last line costs that line, never the file: a machine that went down mid-append
+    /// still leaves everything it had already recorded.
+    #[test]
+    fn a_damaged_line_costs_that_line_and_nothing_else() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        std::fs::write(
+            &path,
+            "project=/p\nevent seq=1 at=1 tail=x\nevent seq=2 at=no\nevent seq=3 at=3 tail=z\n",
+        )
+        .unwrap();
+
+        let back = read_record::<TestEvent>(&path).unwrap();
+        let seqs: Vec<u64> = back.events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [1, 3]);
+    }
+
+    /// The data directory holds every project's records. A view of "this project's sessions" that
+    /// listed a neighbouring project's would be answering a question nobody asked, so a record of
+    /// another project is simply not there.
+    #[test]
+    fn a_record_of_another_project_is_not_listed_or_resolved() {
+        let dir = crate::testutil::TmpDir::new();
+        std::fs::write(dir.path().join("record-10-1.log"), "project=/mine\n").unwrap();
+        std::fs::write(dir.path().join("record-11-1.log"), "project=/theirs\n").unwrap();
+
+        let mine = records_for_project(dir.path(), "/mine");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].pid, 10);
+        assert!(record_of_pid(dir.path(), "/mine", 11).is_none());
+        assert!(record_of_pid(dir.path(), "/mine", 10).is_some());
+    }
+
+    /// A pid the kernel wrapped round onto names two records. The newest is the answer — the session
+    /// a user just watched end is the one they are asking about — and the second value is what lets
+    /// the view say a choice was made instead of presenting one of two as the only one.
+    #[test]
+    fn a_reused_pid_resolves_to_the_newest_record_and_says_so() {
+        let dir = crate::testutil::TmpDir::new();
+        let old = dir.path().join("record-42-100.log");
+        let new = dir.path().join("record-42-200.log");
+        std::fs::write(&old, "project=/p\n").unwrap();
+        std::fs::write(&new, "project=/p\n").unwrap();
+        filetime_set(
+            &old,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(100),
+        );
+        filetime_set(
+            &new,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(200),
+        );
+
+        let (path, reused) = record_of_pid(dir.path(), "/p", 42).unwrap();
+        assert_eq!(path, new);
+        assert!(reused, "two records under one pid must be announced");
+
+        let (path, reused) = record_of_pid(dir.path(), "/p", 42).unwrap();
+        assert_eq!(path, new);
+        assert!(reused);
+        std::fs::remove_file(&old).unwrap();
+        let (_, reused) = record_of_pid(dir.path(), "/p", 42).unwrap();
+        assert!(!reused, "one record is not a choice");
+    }
+
+    /// Listing reads one header per file, never the events under it: a directory of full records
+    /// must cost the same to list as a directory of empty ones.
+    #[test]
+    fn the_project_header_is_read_without_the_events() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        std::fs::write(&path, "project=/p\napp=demo\nevent seq=1 at=1 tail=x\n").unwrap();
+        assert_eq!(record_project(&path).as_deref(), Some("/p"));
+
+        // A file whose first line is not a header of this format names no project, so it is not one
+        // of ours and is never listed as one.
+        let alien = dir.path().join("record-2-2.log");
+        std::fs::write(&alien, "something else\nproject=/p\n").unwrap();
+        assert_eq!(record_project(&alien), None);
+    }
+
+    /// No single lens is the one every session records: a launch with a broker and no `--observe`
+    /// writes a broker record and no exec record. A merged view that resolved on one directory would
+    /// make that session unnameable, so the listing is the union — one entry per session, at the
+    /// time of its newest record.
+    #[test]
+    fn records_across_lenses_list_a_session_that_only_one_of_them_saw() {
+        let root = crate::testutil::TmpDir::new();
+        let proc = root.path().join("proc");
+        let broker = root.path().join("broker");
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::create_dir_all(&broker).unwrap();
+        // Session 10 recorded on both lenses; session 11 only on the broker.
+        for (dir, name, at) in [
+            (&proc, "record-10-1.log", 100),
+            (&broker, "record-10-1.log", 200),
+            (&broker, "record-11-1.log", 150),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, "project=/p\n").unwrap();
+            filetime_set(
+                &path,
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(at),
+            );
+        }
+
+        let all = records_across(&[proc.clone(), broker.clone()], "/p");
+        let pids: Vec<u32> = all.iter().map(|e| e.pid).collect();
+        assert_eq!(pids, [10, 11], "newest first, one entry per session");
+        assert_eq!(
+            all[0].at,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(200),
+            "a session is dated by its newest record among the lenses"
+        );
+
+        // Resolving on the exec directory alone would lose the broker-only session entirely.
+        assert_eq!(records_for_project(&proc, "/p").len(), 1);
+        assert!(record_of_pid(&proc, "/p", 11).is_none());
+        assert!(record_of_pid(&broker, "/p", 11).is_some());
     }
 
     /// Set one file's modification time, so the prune's ordering is asserted on a known order rather

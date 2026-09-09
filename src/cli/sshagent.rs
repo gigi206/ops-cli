@@ -41,6 +41,7 @@ fn agent_logs(args: &[OsString]) -> ExitCode {
             session_verb: "ssh-agent logs",
             feed: "ssh-agent feed",
             socket: sandbox::sshagent_control::agent_control_socket,
+            dir: sandbox::sshagent_control::agent_control_dir,
             read: sandbox::sshagent_control::read_agent_log,
             absent: |pid| {
                 format!(

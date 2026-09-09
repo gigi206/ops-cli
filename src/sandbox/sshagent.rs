@@ -836,7 +836,7 @@ pub(crate) fn start(
     // The data directory is owner-only, and this socket is the reason it must be: anything that can
     // connect to it can ask the user's agent for a signature.
     crate::store::ensure(layout)?;
-    let dir = layout.data_dir().join("ssh-agent");
+    let dir = super::sshagent_control::agent_control_dir(layout.data_dir());
     super::lens::ensure_control_dir(&dir)?;
 
     // Keyed by the launcher pid, like the egress and forward sockets, so a crashed predecessor's

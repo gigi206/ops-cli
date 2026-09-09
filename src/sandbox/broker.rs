@@ -1682,7 +1682,7 @@ pub(crate) fn stand_up_feed(
     std::sync::Arc<super::broker_control::BrokerRing>,
     BrokerFeed,
 ) {
-    let dir = layout.data_dir().join("broker");
+    let dir = super::broker_control::broker_control_dir(layout.data_dir());
     let ring = std::sync::Arc::new(
         super::broker_control::BrokerRing::new(super::broker_control::BROKER_RING_CAP)
             .with_record(super::lens::open_record(record, &dir)),
