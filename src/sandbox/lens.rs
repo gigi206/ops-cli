@@ -341,6 +341,20 @@ pub(crate) const RECORD_AMEND: &str = "amend ";
 /// with a `truncated=` line rather than silently stopping, so a reader is told the tail is missing.
 pub(crate) const RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The note the writer appends when a session outruns [`RECORD_MAX_BYTES`], written once and read
+/// as the reader's own ceiling below. It is the only thing that may follow the cap.
+const RECORD_TRUNCATED_NOTE: &[u8] = b"truncated=1\n";
+
+/// The largest record [`read_record_with`] will hold in memory.
+///
+/// [`RECORD_MAX_BYTES`] bounds what the writer emits, and the reader used to take that for its own
+/// bound. It is not one: the writer's ceiling describes files sbx produced, while the reader opens
+/// whatever is at the path — a file another process on the host left there, or one an older sbx
+/// wrote to a directory since inherited. A ceiling the reader enforces itself holds for both, and a
+/// file past it is reported the way an outrun session already is, with its tail declared missing
+/// rather than read.
+const RECORD_READ_MAX: u64 = RECORD_MAX_BYTES + RECORD_TRUNCATED_NOTE.len() as u64;
+
 /// How many finished sessions' records one lens directory keeps.
 ///
 /// The per-file cap bounds a session; nothing bounds the number of sessions, and a record is
@@ -518,7 +532,7 @@ impl Recorder {
             return;
         };
         if open.written + line.len() as u64 > RECORD_MAX_BYTES {
-            let _ = open.file.write_all(b"truncated=1\n");
+            let _ = open.file.write_all(RECORD_TRUNCATED_NOTE);
             *g = None;
             return;
         }
@@ -532,8 +546,9 @@ impl Recorder {
 
 /// One session's record read back: who it belongs to, whether its tail is missing, and the events.
 ///
-/// Held whole in memory, which is bounded by construction: [`RECORD_MAX_BYTES`] caps the file the
-/// writer produced, so the largest thing this can be is that cap plus what parsing it costs.
+/// Held whole in memory, bounded by the reader rather than by the writer: [`RECORD_READ_MAX`] is
+/// what [`read_record_with`] accepts, so the largest thing this can be is that ceiling plus what
+/// parsing it costs — whoever wrote the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Record<E> {
     /// The `project=` header: the canonical path [`super::binds::project_identity`] derives, which
@@ -545,6 +560,45 @@ pub(crate) struct Record<E> {
     /// tail is missing. Surfaced by the reader the way an eviction gap is, never swallowed.
     pub(crate) truncated: bool,
     pub(crate) events: Vec<E>,
+}
+
+/// Read `path` as text, stopping at [`RECORD_READ_MAX`]; the flag says the file had more to give.
+///
+/// The ceiling is the `take`, not a length check after the fact: a check has already read the file
+/// it is checking, which is the cost the ceiling exists to refuse. Whether there was more is asked
+/// of the descriptor afterwards — one byte — rather than inferred from the length, so the answer
+/// stays right for a file that ends exactly on the ceiling.
+///
+/// Opened `O_NOFOLLOW`. What the writer guarantees about its own output says nothing about the
+/// path, and this is handed a path: a link there would resolve wherever it points. The record
+/// directory is the owner's alone, so this is a guard rather than a boundary.
+fn read_bounded(path: &Path) -> io::Result<(String, bool)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut bounded = file.take(RECORD_READ_MAX);
+    bounded.read_to_end(&mut buf)?;
+    let mut probe = [0u8; 1];
+    let over = bounded.into_inner().read(&mut probe)? > 0;
+    let text = match std::str::from_utf8(&buf) {
+        Ok(_) => buf,
+        // A cut lands mid-character as easily as mid-line, and the incomplete tail it leaves is
+        // dropped the way a half-written last line already is. Bytes that are invalid for any other
+        // reason are still the error they have always been: a record is text, and one that is not
+        // is not a record read short.
+        Err(e) if over && e.error_len().is_none() => {
+            buf.truncate(e.valid_up_to());
+            buf
+        }
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+    };
+    Ok((
+        String::from_utf8(text).expect("validated, or cut at the last valid boundary"),
+        over,
+    ))
 }
 
 /// Read one record file back into its events.
@@ -569,15 +623,19 @@ pub(crate) fn read_record<E: Event>(path: &Path) -> io::Result<Record<E>> {
 /// first carries a muted ring and a retroactive amendment cursor, the second a cursor over append
 /// order. What they do share with the five lenses is the *file*: two header lines, then one line per
 /// thing that happened. That rule has one definition, and this is it; only the line parser differs.
+///
+/// The file is read by [`read_bounded`], which owns the ceiling and the link refusal. A file that
+/// had more than the ceiling is reported `truncated` — the answer a reader already knows how to
+/// show, and the same one an outrun session gets.
 pub(crate) fn read_record_with<T>(
     path: &Path,
     parse: impl Fn(&str) -> Option<T>,
 ) -> io::Result<Record<T>> {
-    let contents = std::fs::read_to_string(path)?;
+    let (contents, over) = read_bounded(path)?;
     let mut record = Record {
         project: String::new(),
         app: None,
-        truncated: false,
+        truncated: over,
         events: Vec::new(),
     };
     let mut named = false;
@@ -1431,6 +1489,105 @@ mod tests {
         let back = read_record::<TestEvent>(&path).unwrap();
         assert_eq!(back.events.len(), 1);
         assert!(back.truncated);
+    }
+
+    /// [`RECORD_MAX_BYTES`] bounds what [`Recorder`] writes; it does not bound what is at the path.
+    /// A file past the reader's own ceiling is read up to [`RECORD_READ_MAX`] and reported cut,
+    /// rather than held whole: the writer's guarantee describes sbx's output, and this reader is
+    /// handed a path.
+    #[test]
+    fn a_record_past_the_readers_ceiling_is_cut_rather_than_held_whole() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let mut body = String::from("project=/p\n");
+        let mut written = 1u64;
+        while (body.len() as u64) < RECORD_READ_MAX + 4096 {
+            body.push_str(&format!("event seq={written} at={written} tail=x\n"));
+            written += 1;
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        let back = read_record::<TestEvent>(&path).unwrap();
+        assert!(
+            back.truncated,
+            "a file past the ceiling must say its tail is gone"
+        );
+        assert_eq!(back.project, "/p", "the head is still read");
+        assert!(
+            !back.events.is_empty(),
+            "the events before the ceiling are still events"
+        );
+        assert!(
+            (back.events.len() as u64) < written - 1,
+            "the whole file was held after all: {} events of {}",
+            back.events.len(),
+            written - 1
+        );
+    }
+
+    /// The ceiling is what the reader *holds*, not only what it reports. A reader that took the
+    /// file whole and trimmed afterwards answers every caller the same thing while paying exactly
+    /// the cost the ceiling exists to refuse, so the property is asserted on the read itself.
+    #[test]
+    fn the_bounded_read_holds_the_ceiling_not_the_file() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let body = "x".repeat((RECORD_READ_MAX * 2) as usize);
+        std::fs::write(&path, &body).unwrap();
+
+        let (text, over) = read_bounded(&path).unwrap();
+        assert!(over, "a file twice the ceiling had more to give");
+        assert!(
+            (text.len() as u64) <= RECORD_READ_MAX,
+            "held {} bytes of a {} byte file",
+            text.len(),
+            body.len()
+        );
+    }
+
+    /// A cut that lands mid-character is a read stopped short, not a corrupt file: the incomplete
+    /// tail goes the way a half-written last line does. Bytes invalid for any other reason stay the
+    /// error they were, which is what keeps a short read and a damaged file apart.
+    #[test]
+    fn a_ceiling_that_falls_mid_character_costs_the_character_not_the_read() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let head = "project=/p\n";
+        let mut body = head.to_string();
+        body.push_str(&"y".repeat(RECORD_READ_MAX as usize - head.len() - 1));
+        body.push('\u{20ac}');
+        std::fs::write(&path, body.as_bytes()).unwrap();
+
+        let (text, over) = read_bounded(&path).unwrap();
+        assert!(over, "the straddling character is past the ceiling");
+        assert!(
+            !text.contains('\u{20ac}'),
+            "a character straddling the ceiling was kept whole"
+        );
+        assert!(text.starts_with(head), "the head was lost with the tail");
+    }
+
+    /// The record directory is the owner's alone, so a link at a record's name is a guard rather
+    /// than a boundary. It is still the difference between reading the file named and reading
+    /// wherever something else pointed: the reader is handed a path, and `O_NOFOLLOW` is what makes
+    /// that path mean the file itself.
+    #[test]
+    fn a_symlink_where_a_record_belongs_is_refused_rather_than_followed() {
+        let dir = crate::testutil::TmpDir::new();
+        let real = dir.path().join("elsewhere.log");
+        std::fs::write(&real, "project=/p\nevent seq=1 at=1 tail=x\n").unwrap();
+        let link = dir.path().join("record-9-9.log");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The target reads back, so what the link is refused for is being a link and not its
+        // content.
+        assert_eq!(read_record::<TestEvent>(&real).unwrap().events.len(), 1);
+        let err = read_record::<TestEvent>(&link).expect_err("the link was followed");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "refused for some other reason than the link: {err}"
+        );
     }
 
     /// A half-written last line costs that line, never the file: a machine that went down mid-append
