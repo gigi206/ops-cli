@@ -20,7 +20,6 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// What a live launch revealed about the sandbox. Each field is a fact the kernel
@@ -197,18 +196,33 @@ fn probe_spec(work: &Path, script: String) -> io::Result<SandboxSpec> {
     })
 }
 
-/// A process-unique temp dir, removed on drop, so the probe leaves nothing on the
-/// host. The pid+counter name is collision-free for the single probe `doctor`
-/// runs; a leftover from a crashed run is overwritten, never trusted.
+/// A temp dir the probe owns outright, removed on drop, so the check leaves nothing
+/// behind on the host.
+///
+/// The directory is bound read-write into the cage as the probe's home, so the path
+/// it lands on decides what gets mounted there. A name built from the pid alone is
+/// one a bystander can compute and prepare ahead of the run — a pid recycles, and a
+/// crashed run leaves its own behind — so the name carries six characters drawn from
+/// the system CSPRNG as well. The pid stays, because a directory left on the host
+/// should still say which run left it.
+///
+/// `create_dir` rather than `create_dir_all`: it fails on a path that already exists,
+/// whatever it is, instead of adopting a file, a symlink or a directory prepared by
+/// someone else. With an unguessable name a collision is a fault to report, not a
+/// state to recover from, so no retry.
 struct ScratchDir(PathBuf);
 
 impl ScratchDir {
     fn new() -> io::Result<Self> {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        use ring::rand::SecureRandom;
+        let mut bytes = [0u8; 3];
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| io::Error::other("no system randomness for the probe scratch name"))?;
+        let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let mut dir = std::env::temp_dir();
-        dir.push(format!("sbx-doctor-smoke-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        dir.push(format!("sbx-doctor-smoke-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&dir)?;
         Ok(ScratchDir(dir))
     }
 
@@ -348,5 +362,32 @@ mod tests {
             p
         };
         assert!(!path.exists(), "scratch dir should be gone after drop");
+    }
+
+    /// The scratch dir is bound read-write into the probe cage as its home, so its path must not
+    /// be one a bystander can predict and prepare. The pid keeps a leftover attributable to the
+    /// run that made it; the random suffix is what makes the path unguessable. A later change
+    /// that dropped the suffix would restore a computable name without failing anything else,
+    /// so the shape is asserted here.
+    #[test]
+    fn the_scratch_name_carries_a_pid_and_a_random_suffix() {
+        let scratch = ScratchDir::new().expect("create scratch dir");
+        let name = scratch
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("scratch dir has a UTF-8 name")
+            .to_string();
+        let prefix = format!("sbx-doctor-smoke-{}-", std::process::id());
+        let suffix = name
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("scratch name is not {prefix}<suffix>: {name}"));
+        assert_eq!(suffix.len(), 6, "suffix should be six characters: {name}");
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "suffix should be lowercase hex: {name}"
+        );
     }
 }
