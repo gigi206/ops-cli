@@ -1415,7 +1415,7 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["session", "stop"],
-        synopsis: "sbx session stop <id>...|--all [--delay <secs>]",
+        synopsis: "sbx session stop [--delay <secs>] [--] <id>...|--all",
         summary: "stop running sessions",
         options: &[
             (
@@ -1429,6 +1429,10 @@ pub(super) const PAGES: &[Page] = &[
             (
                 "--delay <secs>",
                 "seconds to wait after SIGTERM before SIGKILL (default 10; 0 = at once)",
+            ),
+            (
+                "--",
+                "end sbx's own flags; every later word is an id, even --all",
             ),
         ],
         details: "Sends SIGTERM, then SIGKILL after the grace delay. Either ids or --all is required,\n\

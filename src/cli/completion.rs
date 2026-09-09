@@ -154,13 +154,6 @@ fn candidates(words: &[String]) -> Vec<(String, String)> {
     let cur = words.last().map(String::as_str).unwrap_or("");
     let before: &[String] = words.split_last().map_or(&[], |(_, b)| b);
 
-    // Past a bare `--` the words belong to a launched command, not to sbx. Offering sbx's
-    // own names there would be wrong, and answering nothing would leave the line dead:
-    // the word is handed to the shell, which completes it as it would any other command's.
-    if before.iter().any(|w| w == "--") {
-        return vec![(FILES.to_string(), String::new())];
-    }
-
     // The deepest known command path the words name. A leading `help` is transparent, so
     // `sbx help plugins store` offers the same subcommands as `sbx plugins store`. A word
     // that is an accepted alias descends through the name it stands for, so `sbx plugins
@@ -188,6 +181,22 @@ fn candidates(words: &[String]) -> Vec<(String, String)> {
             // subcommand.
             break;
         }
+    }
+
+    // Past a bare `--` sbx's own names and flags are over. What follows is decided by the
+    // page's grammar rather than by the separator, because the separator does not mean the
+    // same thing on every page: on `run` it hands the rest to a launched command, on the
+    // verbs that take an operand a flag could be mistaken for (`sbx session stop -- 1234`,
+    // `sbx net allow -- --all`) it only ends the options, and the words after it are still
+    // sbx's own. Asking the operand grammar answers both without a list to keep in step:
+    // a page with an operand left offers it, a page with none has nothing of its own to
+    // say. The marker rather than an empty list is what leaves `sbx run -- ls <TAB>`
+    // completing the launched command's files instead of nothing at all.
+    if before[tail_at..].iter().any(|w| w == "--") {
+        return match cursor_value_kind(&path, &before[tail_at..]) {
+            Some(kind) => value_candidates(&kind, cur),
+            None => vec![(FILES.to_string(), String::new())],
+        };
     }
 
     if cur.starts_with('-') {
@@ -858,7 +867,13 @@ fn walk_operands(slots: &[Operand], path: &[&str], before: &[String]) -> Walk {
             }
             continue;
         }
-        if word.starts_with('-') && word != "--" {
+        // A bare `--` ends the flags without standing on an operand slot. Counted as a
+        // positional it shifted every later word one place along the grammar, so the page's
+        // own operand was offered one position too far in — or not at all.
+        if word == "--" {
+            continue;
+        }
+        if word.starts_with('-') {
             let (name, inline) = match word.split_once('=') {
                 Some((flag, value)) => (flag, Some(value)),
                 None => (word, None),
@@ -1523,6 +1538,39 @@ mod tests {
         assert_eq!(names(&["run", "--", "ls", "-"]), [FILES]);
         // Before the separator, the flags of `run` are still the answer.
         assert!(names(&["run", "--det"]).contains(&"--detach".to_string()));
+    }
+
+    #[test]
+    fn past_a_double_dash_a_terminator_page_still_answers_with_its_operand() {
+        // `--` does not mean the same thing on every page. On the verbs that take an
+        // operand a flag could be mistaken for, it ends the options and nothing more:
+        // `sbx session stop -- 1234` stops the session 1234, so the word after the
+        // separator is a PID and the menu is the live sessions — the shell's files there
+        // would offer a path where only an id is accepted.
+        assert_eq!(
+            cursor_value_kind(&["session", "stop"], &words(&["--"])),
+            Some(ValueKind::Sessions)
+        );
+        // The separator holds no operand slot of its own, so the id it protects is still
+        // the first position and not the second.
+        assert_eq!(
+            cursor_value_kind(&["session", "stop"], &words(&[])),
+            cursor_value_kind(&["session", "stop"], &words(&["--"]))
+        );
+        // A page that hands the rest to a launched command has no operand of its own left
+        // to offer, which is what sends `run` to the shell above.
+        assert_eq!(cursor_value_kind(&["run"], &words(&["--"])), None);
+        // Once the page's own operand is filled, the separator changes nothing either:
+        // `sbx session attach <id> -- <TAB>` is the launched command's word.
+        assert_eq!(
+            cursor_value_kind(&["session", "attach"], &words(&["1234", "--"])),
+            None
+        );
+        // And the menu itself: whatever the machine's live sessions are — none, on most runs —
+        // the answer is that page's own, never the shell's files. Asserted on the whole menu
+        // rather than on the ids, so the test says the same thing on a host that has a session
+        // running and on one that has none.
+        assert_ne!(names(&["session", "stop", "--", ""]), [FILES]);
     }
 
     #[test]

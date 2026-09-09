@@ -8,7 +8,7 @@ description: "List, attach to and stop the live sandbox sessions, and read what 
 sbx session ls
 sbx session logs <id> [-f|--follow] [-n|--lines <N>] [--all]
 sbx session attach <id> [-- command [args...]]
-sbx session stop <id>...|--all [--delay <secs>]
+sbx session stop [--delay <secs>] [--] <id>...|--all
 ```
 
 Inspect and control the **live sandbox sessions**: the running cages. `sbx session ls`
@@ -226,7 +226,7 @@ the re-applied confinement bounds what it can do.
 ## `stop`
 
 ```
-sbx session stop <id>...|--all [--delay <secs>]
+sbx session stop [--delay <secs>] [--] <id>...|--all
 ```
 
 Stop running sessions. Sends `SIGTERM`, then `SIGKILL` after the grace delay, tearing down
