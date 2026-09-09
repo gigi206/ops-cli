@@ -571,11 +571,13 @@ impl Registry {
 
         let name = session.file_name();
         let final_path = self.dir.join(&name);
-        // A dotted temp name: `list` skips dotfiles, so an in-flight registration
-        // is never parsed or pruned by a concurrent lister.
-        let tmp_path = self.dir.join(format!(".{name}.tmp"));
-        std::fs::write(&tmp_path, serialize(session))?;
-        std::fs::rename(&tmp_path, &final_path)?;
+        // Staged and renamed by [`crate::sandbox::atomicfile`], whose temp is a dotfile — `list`
+        // skips dotfiles, so an in-flight registration is never parsed or pruned by a concurrent
+        // lister — and carries the pid and a per-call counter. The name alone, which this wrote
+        // before, is shared by any two writers of the same record: the second truncates the inode
+        // the first is still filling, and the rename then publishes one writer's head over the
+        // other's tail.
+        crate::sandbox::atomicfile::write_atomic(&final_path, serialize(session).as_bytes())?;
         Ok(final_path)
     }
 

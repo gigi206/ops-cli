@@ -430,17 +430,12 @@ fn trust_inner(store_dir: &Path, config_path: &Path, written: Option<&[u8]>) -> 
     // Written through a temporary and renamed, like every other record this repository keeps: a
     // crash mid-write would otherwise leave a marker carrying its path line and no hash line, which
     // reads as `Changed` — safe, but it makes a trusted config ask for re-approval for a reason the
-    // user cannot see. The temporary is a dotfile beside the marker so a listing of the store shows
-    // markers only, and it lands in the same 0o700 directory, on the same filesystem.
-    let tmp = marker.with_file_name(format!(
-        ".{}.tmp",
-        marker.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    std::fs::write(&tmp, body).map_err(&store_err)?;
-    std::fs::rename(&tmp, &marker).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        store_err(e)
-    })
+    // user cannot see. Staged by [`crate::sandbox::atomicfile`] rather than here: this call site
+    // once named its own temp from the marker alone, which two `sbx trust` runs on the same config
+    // share, and a shared temp is the one thing the rename cannot make atomic — the second writer
+    // truncates the inode the first is still filling. That the marker's torn form reads `Changed`
+    // makes the outcome safe, not correct.
+    crate::sandbox::atomicfile::write_atomic(&marker, body.as_bytes()).map_err(&store_err)
 }
 
 /// Remove any trust marker for `config_path`. Returns whether one existed, so the
