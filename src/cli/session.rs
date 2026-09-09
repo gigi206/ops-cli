@@ -563,6 +563,13 @@ fn tail_lines(body: &[u8], n: usize) -> &[u8] {
 /// `(pid, start_ticks)` match: a pid the kernel has since handed to an unrelated process must not
 /// read as this session still running, which would leave `--follow` waiting forever on a file
 /// nothing will ever append to.
+///
+/// The pair answers that for every reuser but one. `id` is a bare pid, and a *new* sbx session
+/// landing on that number registers a live record under it: the registry holds the pair, this holds
+/// only the number, and the two cannot be compared. The follow then reads as live — of the later
+/// incarnation. The pid is the whole of what the user types and of what names the log file the two
+/// sessions already share, so what would separate them is an id carrying the incarnation: a change
+/// to the surface rather than to this function.
 fn session_is_live(data_dir: &Path, id: u32) -> bool {
     session::Registry::at(data_dir)
         .live()
