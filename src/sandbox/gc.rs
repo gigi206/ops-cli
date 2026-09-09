@@ -428,7 +428,21 @@ fn sweep(nix_store: &Path, store_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Why a printed total is not what a removal returns, in the words the verbs share. Written once so
+/// four surfaces cannot drift into describing the same gap differently; a verb prefixes it with
+/// whatever is specific to what it just counted.
+pub(crate) const SIZE_CAVEAT: &str = "a compressed volume, or blocks shared with another tree, \
+                                      returns less to the disk: `sbx storage status` reports what \
+                                      it holds.";
+
 /// Render `bytes` as a short human figure (e.g. `412.0 MiB`), for the gc report.
+///
+/// What every caller here is rendering is a **size of data**, counted from `st_blocks` by
+/// [`tree_usage`]: it is not the space a removal returns. A compressing filesystem stored those
+/// bytes smaller, and a block shared with another tree survives until its last reference goes, so
+/// the disk gets back less than the figure on both counts. A verb that prints a total built from
+/// this must say so and point at `sbx storage status`, which asks the filesystem instead of
+/// counting blocks; [`SIZE_CAVEAT`] is the sentence to print.
 pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = bytes as f64;
@@ -1244,6 +1258,11 @@ pub(crate) struct TreeUsage {
 /// every extent with another tree, because no cheap syscall exposes extent sharing (`du` has the
 /// same blind spot). On a filesystem with reflink the per-tree figures are therefore an upper
 /// bound, and their sum can exceed what the filesystem reports as used.
+///
+/// **Nor compression-aware**, for the same reason and with the same effect: `st_blocks` counts what
+/// a file occupies before its extents are compressed, so on a compressing volume a tree reports
+/// more than removing it frees. Neither gap is measurable from here, which is why a verb printing
+/// these figures carries [`SIZE_CAVEAT`] rather than adjusting them.
 pub(crate) fn tree_usage(path: &Path) -> TreeUsage {
     use std::os::unix::fs::MetadataExt;
     let mut usage = TreeUsage::default();

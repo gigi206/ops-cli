@@ -593,11 +593,13 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
     println!(
         "{}",
         crate::style::dim_prose(
-            "sizes are apparent, not what removal returns: a tree seeded from the shared store \
-             shares its blocks with it where the filesystem supports that, and a compressing \
-             volume stored those bytes smaller, so a tree usually frees far less than it reads. \
-             `sbx storage status` reports what the volume holds. remove one with \
-             `sbx projects rm <id>`; sweep dead trees with `sbx projects rm --dead --yes`.",
+            &format!(
+                "sizes are apparent, not what removal returns: a tree is seeded from the shared \
+                 store rather than copied from it, so it usually frees far less than it reads, \
+                 and {} remove one with `sbx projects rm <id>`; sweep dead trees with \
+                 `sbx projects rm --dead --yes`.",
+                super::SIZE_CAVEAT
+            ),
             pal
         )
     );

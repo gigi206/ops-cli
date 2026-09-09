@@ -299,10 +299,22 @@ copy is not itself a profile (only `*.toml` files are read as profiles) and goes
 
 ### Listing apps
 
-`sbx app list` (alias `sbx app ls`) shows one row per app with its `HOME` column: the total
-size a `--purge` would reclaim, and where that state lives. `--json` emits the same rows as a
+`sbx app list` (alias `sbx app ls`) shows one row per app with its `HOME` column: the size of
+the state a `--purge` would remove, and where that state lives. `--json` emits the same rows as a
 document, with the sizes in **bytes** rather than `12.4 MiB`: the human column is a rendering of
 that number, and a consumer compares and sums it.
+
+:::warning The sizes are of the data, not of the space returned
+Every size sbx prints for a home, a tree or a prune is the size of the **data** it holds. The disk can get back less, for
+two reasons that stack: a volume with compression enabled stored those bytes smaller, so
+removing a gigabyte of data frees less than a gigabyte of blocks; and a block shared with
+another tree survives until the last reference to it goes. Only the filesystem knows either
+number, so read it from [`sbx storage status`](storage), which reports what the volume holds
+and, on an image, how much is waiting on a discard to return to the host.
+:::
+
+The same applies to [`sbx app show`](#inspecting-an-app), [`sbx app prune`](#pruning-undeclared-tools)
+and [`sbx projects`](projects).
 
 | Reads | Means |
 |---|---|
@@ -418,14 +430,8 @@ is the number to look at before deciding, and [`sbx app list`](#listing-apps) sh
 app holds in total.
 :::
 
-:::warning The sizes are of the data, not of the space returned
-Every figure the verb prints is the size of what it removed. The disk can get back less, for
-two reasons that stack: a volume with compression enabled stored those bytes smaller, so
-removing a gigabyte of data frees less than a gigabyte of blocks; and a block shared with
-another tree survives until the last reference to it goes. Only the filesystem knows either
-number, so read it from [`sbx storage status`](storage), which reports what the volume holds
-and, on an image, how much is waiting on a discard to return to the host.
-:::
+The sizes it prints carry the same caveat as everywhere else: see
+[what a size means](#listing-apps).
 
 Under `--all`, an app whose session is running is **skipped and named** rather than refusing
 the whole sweep, so one live agent does not hold up the rest; the sweep then exits non-zero

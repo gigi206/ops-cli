@@ -149,7 +149,7 @@ pub(crate) use flake::{
     withheld as withheld_flake_packages,
 };
 pub(crate) use gc::{
-    InstalledApp, classify_tree, human_bytes, installed_app_homes, prune_app_caches,
+    InstalledApp, SIZE_CAVEAT, classify_tree, human_bytes, installed_app_homes, prune_app_caches,
     prune_app_tools, purge_app_homes, tree_size, tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{

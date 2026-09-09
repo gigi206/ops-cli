@@ -1564,6 +1564,20 @@ fn app_list(json: bool) -> ExitCode {
         "{dim}(remove a profile: sbx app rm <name>; also remove its home + tools: \
          sbx app rm <name> --purge){r}"
     );
+    // The sizes above are what each home reads, which is not what removing it returns. Printed
+    // whenever a size was, so the figure and its caveat are never read apart.
+    if !installed.is_empty() {
+        println!(
+            "{}",
+            style::dim_prose(
+                &format!(
+                    "sizes are of the data each home holds; {}",
+                    sandbox::SIZE_CAVEAT
+                ),
+                &pal
+            )
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -2007,6 +2021,13 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
                 sandbox::human_bytes(pool.bytes),
             );
         }
+        // Attached to the figures rather than to the verb, and only on the branch that printed
+        // any: the `not launched yet` case has no size to qualify.
+        let _ = writeln!(
+            s,
+            "    {dim}sizes are of the data held; {}{r}",
+            sandbox::SIZE_CAVEAT
+        );
     }
     // Packages, each `backend:locator` (the declaration syntax) with its realized state.
     if v.packages.is_empty() {
@@ -2311,8 +2332,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     println!(
         "{}",
         style::dim_prose(
-            "that is the size of the data; a compressed volume, or blocks shared with another \
-             tree, returns less to the disk: `sbx storage status` reports what it holds.",
+            &format!("that is the size of the data; {}", sandbox::SIZE_CAVEAT),
             &pal
         )
     );

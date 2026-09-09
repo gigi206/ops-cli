@@ -2271,6 +2271,12 @@ pub(super) const PAGES: &[Page] = &[
             the per-project mise install pools a global app self-equipped a tool into. The empty\n\
             pool every launch creates is not listed, though its size still counts (a purge removes\n\
             it); `sbx app show <name>` breaks every pool down, empty ones included.\n\
+            \n\
+            Every size here is the size of the **data** a home holds, not the space removing it\n\
+            returns: a compressing volume stored those bytes smaller, and a block shared with\n\
+            another tree survives until its last reference goes. `sbx storage status` reports what\n\
+            the volume actually holds.\n\
+            \n\
             `sbx app ls` is the same command. The full resolved app set —\n\
             inline, project, and profile apps with their gating — is `sbx config show`.",
     },
@@ -2351,9 +2357,13 @@ pub(super) const PAGES: &[Page] = &[
             `deb:`/`appimage:`/`flake:` build lives in the per-project nix store, so it is reported\n\
             as pinned in N project tree(s) (see `sbx projects show`); a `nix:` package is built\n\
             per-project. A package a launch would not provision because an untrusted layer declared\n\
-            it reads `withheld`, distinct from `not installed`. Read-only: no trust gate, no launch,\n\
-            no network. For the app's *declared* configuration with provenance, see `sbx config show\n\
-            --app <name>`; for the full realized state of a project tree, `sbx projects show <id>`.",
+            it reads `withheld`, distinct from `not installed`. Every size in the disk breakdown is\n\
+            the size of the **data** held, not the space removing it returns: a compressing volume\n\
+            stored those bytes smaller, and a block shared with another tree survives until its\n\
+            last reference goes; `sbx storage status` reports what the volume holds. Read-only: no\n\
+            trust gate, no launch, no network. For the app's *declared* configuration with\n\
+            provenance, see `sbx config show --app <name>`; for the full realized state of a\n\
+            project tree, `sbx projects show <id>`.",
     },
     // ---- test subcommands ---------------------------------------------------------
     Page {

@@ -462,6 +462,7 @@ fn prune_previews_the_undeclared_tool_by_provider_and_removes_nothing() {
 /// entries and interpreters live in `installs/`, so a build in flight loses its tool mid-command.
 /// The applying form is refused while such a session exists; the preview stays safe and stays
 /// available.
+///
 /// Register a live session of `app` in the fixture's registry: a record for *this* process, which
 /// is alive, so it survives the liveness pruning the registry does on every read.
 fn register_live_session(fx: &Project, app: &str) {
@@ -709,6 +710,39 @@ fn prune_all_skips_a_live_app_names_it_and_still_sweeps_the_rest() {
         !fx.app_home("other-app").join(".cache/npm").exists(),
         "every other app is still swept: {}",
         text(&out)
+    );
+}
+
+/// Every verb that prints a size prints one counted from `st_blocks`, which is the data held and
+/// not the space a removal returns. A figure read without that is a plan against a number that will
+/// not materialise, so each surface that shows one has to carry the caveat: this pins the two that
+/// report an app's footprint, alongside the prune total and the `sbx projects` footer.
+#[test]
+fn the_size_reporting_verbs_say_the_figure_is_data_not_reclaimed_space() {
+    let fx = fixture_with_a_leftover();
+    fx.write_cache_entry("demo-app", "mise", 4096);
+
+    for args in [
+        vec!["app", "list"],
+        vec!["app", "show", "demo-app"],
+        vec!["app", "prune", "demo-app", "--caches"],
+    ] {
+        let out = fx.run(&args);
+        assert!(out.status.success(), "{args:?} failed: {}", text(&out));
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains("sbx storage status"),
+            "{args:?} prints sizes without saying what they mean:\n{s}"
+        );
+    }
+
+    // Not in the JSON: a consumer reads `bytes` and compares them, and a sentence in a document is
+    // something it would have to skip rather than something it can act on.
+    let json = fx.run(&["app", "list", "--json"]);
+    assert!(json.status.success(), "{}", text(&json));
+    assert!(
+        !String::from_utf8_lossy(&json.stdout).contains("storage status"),
+        "the caveat is prose for a reader, not a field for a script"
     );
 }
 
