@@ -932,6 +932,106 @@ fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell()
     );
 }
 
+/// Every per-project home an app has on disk under `data`, as the directories themselves. A
+/// `home_scope = "project"` app roots its home at `projects/<id>/apps/<app>/home`, one per project
+/// it was launched in; a global-scope app has none of these and keeps a single
+/// `apps/<app>/home` instead. The project id is a hash, so a test finds these by walking rather
+/// than by naming one.
+fn per_project_app_homes(data: &Path, app: &str) -> Vec<PathBuf> {
+    let projects = data.join("sbx").join("projects");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+        let home = entry.path().join("apps").join(app).join("home");
+        if home.is_dir() {
+            out.push(home);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn a_project_scope_app_keeps_one_home_per_project() {
+    // `home_scope = "project"` is carried by no shipped profile, so this is the only launch that
+    // exercises it. The app reports whether a marker is already in its `$HOME`, then leaves one, so
+    // three launches read as FRESH, SEEN, FRESH: a fresh home in project A, the same home again in
+    // A, and a *different* home in project B. That middle launch is what gives the third its
+    // meaning, since "B is fresh" would also hold if the app never managed to write at all.
+    //
+    // The disk assertions carry the discrimination. An implementation that ignored the field would
+    // give both projects the app-global home, where the marker would be shared (B would read SEEN)
+    // and where `apps/<name>` would appear instead of the two per-project homes. Asserting the
+    // app-global home is *absent* is what a passing "two homes exist" alone would not catch.
+    let project_a = TmpDir::prefixed("r", "scopeda-proj");
+    let project_b = TmpDir::prefixed("r", "scopedb-proj");
+    let data = TmpDir::prefixed("r", "scoped-data");
+    let toml = "[app.scoped]\n\
+                home_scope = \"project\"\n\
+                cmd = [\"sh\", \"-c\", \"test -e \\\"$HOME/MARK\\\" && echo SEEN || echo FRESH; \
+                echo x > \\\"$HOME/MARK\\\"\"]\n";
+    std::fs::write(project_a.path().join(".sbx.toml"), toml).unwrap();
+    std::fs::write(project_b.path().join(".sbx.toml"), toml).unwrap();
+
+    // capability probe per project (each also seeds its own base store once); skip, never fail,
+    // where the host cannot sandbox.
+    probe_or_skip!(
+        "project-scope app-home e2e",
+        run_in(project_a.path(), data.path(), &["true"])
+    );
+    probe_or_skip!(
+        "project-scope app-home e2e",
+        run_in(project_b.path(), data.path(), &["true"])
+    );
+
+    let launch = |project: &Path, label: &str| -> String {
+        let out = app_in(project, data.path(), "scoped");
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(
+            out.status.success(),
+            "launch {label} failed: stdout={stdout:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    };
+
+    assert_eq!(
+        launch(project_a.path(), "A1"),
+        "FRESH",
+        "project A started with a home that already held a marker"
+    );
+    assert_eq!(
+        launch(project_a.path(), "A2"),
+        "SEEN",
+        "project A's home did not persist across two launches"
+    );
+    assert_eq!(
+        launch(project_b.path(), "B1"),
+        "FRESH",
+        "project B saw project A's marker: the two projects share one home"
+    );
+
+    let homes = per_project_app_homes(data.path(), "scoped");
+    assert_eq!(
+        homes.len(),
+        2,
+        "expected one per-project home per project launched in, found: {homes:?}"
+    );
+    // The app-global *directory* is expected to exist even here: `<data>/apps/<name>/` holds the
+    // app's channel lock, which is keyed by the app name whatever its home scope, since one app has
+    // one pin (`store::channel`). What must not be there is a home inside it.
+    let app_global_home = data
+        .path()
+        .join("sbx")
+        .join("apps")
+        .join("scoped")
+        .join("home");
+    assert!(
+        !app_global_home.exists(),
+        "a `home_scope = \"project\"` app must root no app-global home, yet {} exists",
+        app_global_home.display()
+    );
+}
+
 #[test]
 fn an_imported_profile_launches_trusted_by_location() {
     let project = TmpDir::prefixed("r", "import-proj");
