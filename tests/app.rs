@@ -48,6 +48,18 @@ impl Project {
         .unwrap();
     }
 
+    /// The global app home itself, the directory a cage runs with as `$HOME`.
+    fn app_home(&self, app: &str) -> PathBuf {
+        self.data_home.path().join(format!("sbx/apps/{app}/home"))
+    }
+
+    /// Fabricate a cache entry of a known size under the global app home's `.cache`.
+    fn write_cache_entry(&self, app: &str, name: &str, bytes: usize) {
+        let dir = self.app_home(app).join(".cache").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("blob"), vec![b'x'; bytes]).unwrap();
+    }
+
     /// Write the app home's mise `config.toml` (the `mise use` record).
     fn write_home_mise_config(&self, app: &str, body: &str) {
         let dir = self
@@ -561,6 +573,115 @@ fn prune_reports_nothing_when_all_installed_tools_are_declared() {
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("no undeclared mise tools"),
         "should report nothing to prune: {}",
+        text(&out)
+    );
+}
+
+/// Without `--caches` the cache directory is not in scope at all: the flag is what widens the verb,
+/// and a prune that emptied caches by default would delete on a command line that asked for tools.
+#[test]
+fn prune_leaves_the_caches_alone_unless_asked_for_them() {
+    let fx = fixture_with_a_leftover();
+    fx.write_cache_entry("demo-app", "mise", 4096);
+
+    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
+    assert!(out.status.success(), "prune --yes failed: {}", text(&out));
+    assert!(
+        fx.app_home("demo-app").join(".cache/mise/blob").exists(),
+        "a prune without --caches must not touch the cache: {}",
+        text(&out)
+    );
+}
+
+/// `--caches` names each cache entry with its size and, previewing, removes none of them. The entry
+/// is named rather than summed into a total, so what has to refill is legible before the removal.
+#[test]
+fn prune_caches_previews_each_entry_and_removes_nothing() {
+    let fx = fixture_with_a_leftover();
+    fx.write_cache_entry("demo-app", "mise", 4096);
+    fx.write_cache_entry("demo-app", "uv", 2048);
+
+    let out = fx.run(&["app", "prune", "demo-app", "--caches"]);
+    assert!(out.status.success(), "preview failed: {}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains(".cache/mise") && s.contains(".cache/uv"),
+        "the preview must name each cache entry: {s}"
+    );
+    assert!(
+        s.contains("2 cache(s)"),
+        "the preview must count the caches: {s}"
+    );
+    assert!(
+        fx.app_home("demo-app").join(".cache/mise/blob").exists(),
+        "a preview must remove nothing"
+    );
+}
+
+/// Applied, the caches go and the app stays signed in: login and session state lives under
+/// `.config` and `.local/share`, which is what makes emptying `.cache` cost a refetch and nothing
+/// else. A declared tool is not a cache and stays installed.
+#[test]
+fn prune_caches_yes_empties_the_cache_and_keeps_login_state() {
+    let fx = fixture_with_a_leftover();
+    fx.write_cache_entry("demo-app", "mise", 4096);
+    let home = fx.app_home("demo-app");
+    std::fs::create_dir_all(home.join(".local/share/demo-app")).unwrap();
+    std::fs::write(home.join(".local/share/demo-app/session"), b"signed-in").unwrap();
+
+    let out = fx.run(&["app", "prune", "demo-app", "--caches", "--yes"]);
+    assert!(out.status.success(), "prune failed: {}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("cache(s)"),
+        "the applied line must account for the caches: {}",
+        text(&out)
+    );
+    assert!(
+        !home.join(".cache/mise").exists(),
+        "the cache entry must be gone"
+    );
+    assert!(
+        home.join(".local/share/demo-app/session").exists(),
+        "login state must survive a cache prune"
+    );
+    assert!(
+        fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir(),
+        "a declared tool is not a cache and stays installed"
+    );
+}
+
+/// `--all` stands instead of a name and covers every app that has an installed home, so the sweep
+/// reaches an app the command line never mentions. Each line is attributed, since a report over
+/// several apps that does not name them cannot be acted on.
+#[test]
+fn prune_all_sweeps_every_app_that_has_a_home() {
+    let fx = fixture_with_a_leftover();
+    fx.write_cache_entry("demo-app", "mise", 4096);
+    fx.write_cache_entry("other-app", "npm", 2048);
+
+    let out = fx.run(&["app", "prune", "--all", "--caches"]);
+    assert!(out.status.success(), "sweep failed: {}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("demo-app") && s.contains("other-app"),
+        "each app's lines must be attributed to it: {s}"
+    );
+    assert!(
+        s.contains("and 2 cache(s)"),
+        "the sweep totals both apps' caches in one line: {s}"
+    );
+}
+
+/// The two selectors are alternatives, and a line carrying both leaves it unsaid which governs —
+/// so it is refused rather than resolved by a precedence nobody can see on the command line.
+#[test]
+fn prune_refuses_a_name_and_all_together() {
+    let fx = fixture_with_a_leftover();
+    let out = fx.run(&["app", "prune", "demo-app", "--all"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        text(&out).contains("not both"),
+        "the refusal must say why: {}",
         text(&out)
     );
 }

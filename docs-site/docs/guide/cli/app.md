@@ -12,7 +12,7 @@ sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
 sbx app list
 sbx app show <name> [--json]
-sbx app prune <name> [-y|--yes]
+sbx app prune <name>|--all [--caches] [-y|--yes]
 ```
 
 `sbx app run <name>` launches a named application profile: a project `[app.<name>]`
@@ -396,6 +396,36 @@ under a command in flight, and what the agent then reports looks nothing like wh
 happened. Stop it with `sbx session stop` and retry. The preview deletes nothing, so
 it stays available either way.
 
+### Reclaiming the caches
+
+`--caches` empties `.cache` in each of the app's homes as well. That directory is where a
+package manager keeps what it downloaded, and it is usually the larger half of an app's
+footprint: each app has its own isolated home, so nothing there is shared with the other
+apps, and the same archives are held once per app. The
+[XDG base directory specification](https://specifications.freedesktop.org/basedir-spec/latest/)
+defines it as non-essential data, which is what makes emptying it sound as a rule rather
+than as a per-tool list: what goes costs a refetch and nothing else. An app's login and
+session state lives under `.config` and `.local/share`, and neither is touched, so an app
+stays signed in.
+
+One behavioural caveat: a tool that had pinned a resolution in its cache resolves again on
+the next launch, so a dependency declared as a floating version may land on a newer release
+than the one it was running. A version pinned in a config file is unaffected.
+
+`--all` sweeps every app that has an installed home instead of one named. It widens the
+scope the way [`sbx gc --all`](gc) does, though the two widen different things. Naming an
+app **and** `--all` is refused, since neither would clearly govern.
+
+:::tip Start with the preview
+`sbx app prune --all --caches` lists every app's caches with sizes and removes nothing. That
+is the number to look at before deciding, and [`sbx app list`](#listing-apps) shows what each
+app holds in total.
+:::
+
+Under `--all`, an app whose session is running is **skipped and named** rather than refusing
+the whole sweep, so one live agent does not hold up the rest; the sweep then exits non-zero
+so a script notices that not everything was covered.
+
 ## Examples
 
 ```sh
@@ -411,6 +441,9 @@ sbx app list                           # imported profiles + installed homes
 sbx app show claude-code               # what this app has actually installed on disk
 sbx app prune hermes                    # preview undeclared mise tools in hermes' home
 sbx app prune hermes --yes              # …and remove them
+sbx app prune hermes --caches           # …preview its downloaded caches too
+sbx app prune --all --caches            # what every app's caches hold, across all homes
+sbx app prune --all --caches --yes      # …and empty them
 sbx app export claude-code > my-claude.toml
 sbx app rm claude-code --purge         # remove the profile, home, and tools
 sbx app rm claude-code --purge --gc    # …and sweep this project's nix store too

@@ -149,8 +149,8 @@ pub(crate) use flake::{
     withheld as withheld_flake_packages,
 };
 pub(crate) use gc::{
-    InstalledApp, classify_tree, human_bytes, installed_app_homes, prune_app_tools,
-    purge_app_homes, tree_size, tree_usage, tree_usage_parts,
+    InstalledApp, classify_tree, human_bytes, installed_app_homes, prune_app_caches,
+    prune_app_tools, purge_app_homes, tree_size, tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{
     AppOutcome, SessionHeader, app, attach, detach_log_path, distro_lock_path,

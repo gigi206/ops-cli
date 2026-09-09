@@ -2296,10 +2296,12 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "prune"],
-        synopsis: "sbx app prune <name> [--yes]",
-        summary: "remove an app home's mise tools that its config does not declare",
+        synopsis: "sbx app prune <name>|--all [--caches] [--yes]",
+        summary: "remove an app home's undeclared mise tools, and with --caches its caches",
         options: &[
             ("<name>", "the app whose home(s) to prune"),
+            ("--all", "sweep every app that has an installed home"),
+            ("--caches", "also empty each home's cache directory"),
             ("-y, --yes", "apply the removal (previews by default)"),
         ],
         details: "Removes the mise tools an app's home(s) carry that the app's config does not declare —\n\
@@ -2311,10 +2313,22 @@ pub(super) const PAGES: &[Page] = &[
             covered. Declared tools, the app's login/session state, and any `nix:`/`deb:`/`flake:`\n\
             build are left untouched. To remove the whole home instead, see `sbx app rm --purge`.\n\
             \n\
+            `--caches` additionally empties `.cache` in each home — where a package manager keeps\n\
+            what it downloaded, which is usually the larger half of an app's footprint and is not\n\
+            shared between apps. The XDG base directory specification defines that directory as\n\
+            non-essential data, so what goes costs a refetch and nothing else; login and session\n\
+            state lives elsewhere and is not touched. A tool that pinned a resolution there resolves\n\
+            again on the next launch, so a floating version may land on a newer release.\n\
+            \n\
+            `--all` sweeps every app that has an installed home rather than one named — it widens\n\
+            the scope the way `sbx gc --all` does, and means something different there. Naming an\n\
+            app and `--all` together is refused.\n\
+            \n\
             `--yes` is refused while a session of that app is running: the tools live in the home\n\
             that session is using, so deleting them takes an interpreter or a `PATH` entry out from\n\
-            under a command in flight. Stop it with `sbx session stop` and retry. The preview deletes\n\
-            nothing and stays available.",
+            under a command in flight. Stop it with `sbx session stop` and retry. Under `--all` such\n\
+            an app is skipped and named instead, so one running agent does not hold up the rest, and\n\
+            the sweep then exits non-zero. The preview deletes nothing and stays available.",
     },
     Page {
         path: &["app", "show"],

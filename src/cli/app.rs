@@ -2068,109 +2068,276 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
     s
 }
 
-/// `sbx app prune <name> [--yes]`: remove the mise tools an app's home(s) carry that the app's
-/// config does **not** declare — the `installed (undeclared)` leftovers `sbx app show` surfaces (a
-/// former profile's tool, or one added by hand). Each is deleted from the home's mise `installs/`
-/// and dropped from its `config.toml` `[tools]` so it does not re-equip. Previews by default; `--yes`
-/// applies. Declared tools, login/session state, and any `nix:`/`deb:`/`flake:` build are untouched.
-fn app_prune(args: &[OsString]) -> ExitCode {
-    let (name, apply) =
-        match crate::cli::one_name(args, &["app", "prune"], &["-y", "--yes"], "name an app") {
-            Ok(parsed) => parsed,
-            Err(code) => return code,
-        };
-    let AppTarget {
-        resolved,
-        layout,
-        homes,
-    } = match open_app("app prune", name) {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
-    let app = resolved.apps.get(name);
-    // The app's declared `mise:` tokens; a tool matching none of them is undeclared. A home-only app
-    // (no config) declares nothing, so every mise tool in its home is prunable.
-    let declared: Vec<&str> = app
-        .map(|a| {
-            a.packages
-                .iter()
-                .filter_map(|p| match &p.backend {
-                    config::Backend::Mise(token) => Some(token.as_str()),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+/// What `sbx app prune` was asked to do: which app(s), whether the caches go too, and whether this
+/// is the applying run.
+struct PruneArgs {
+    /// The named app, or `None` under `--all`.
+    name: Option<String>,
+    /// `--all`: every app with an installed home, rather than one named.
+    all: bool,
+    /// `--caches`: also empty each home's cache directory.
+    caches: bool,
+    /// `--yes`: apply, rather than preview.
+    apply: bool,
+}
 
-    // A prune deletes trees out of the home a running session of this app is using: its `PATH`
-    // entries and interpreters are in `installs/`, so a build in flight loses the tool mid-command
-    // and reports something that looks nothing like what happened. The preview is always safe, so
-    // only the applying form is refused, and refused rather than flagged: there is no reading of
-    // `sbx app prune <name> --yes` under which deleting a live agent's tools is the intent.
-    if apply {
-        let live = session_pids_for_app(layout.data_dir(), name);
-        if !live.is_empty() {
-            let mut pids: Vec<u32> = live.into_iter().collect();
-            pids.sort_unstable();
-            let rendered: Vec<String> = pids.iter().map(u32::to_string).collect();
-            let listed = rendered.join(", ");
-            diag::error(&format!(
-                "sbx: app prune: {name} has a live session (pid {listed}) whose home these tools \
-                 are in — refusing to delete them under a running agent"
-            ));
-            diag::hint(&format!(
-                "       stop it with `sbx session stop {}`, or re-run without `--yes` to see what \
-                 would go",
-                rendered.join(" ")
-            ));
-            return ExitCode::FAILURE;
+/// Parse `<name> | --all` plus `[--caches] [-y|--yes]`. A dedicated parser rather than
+/// [`crate::cli::one_name`], which reads exactly one name and one switch: this verb has a bulk
+/// selector that stands *instead* of the name, and two switches that compose.
+fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
+    let (mut name, mut all, mut caches, mut apply) = (None, false, false, false);
+    for a in args {
+        match a.to_str() {
+            Some("--all") => all = true,
+            Some("--caches") => caches = true,
+            Some("-y") | Some("--yes") => apply = true,
+            Some("--help") | Some("-h") => return Err(help::show(&["app", "prune"])),
+            Some(flag) if flag.starts_with('-') => {
+                diag::error(&format!("sbx: app prune: unknown flag `{flag}`"));
+                diag::hint("       run `sbx help app prune` for usage.");
+                return Err(ExitCode::from(2));
+            }
+            Some(n) if name.is_none() => name = Some(n.to_string()),
+            Some(n) => {
+                diag::error(&format!(
+                    "sbx: app prune: name one app, not two (`{}` and `{n}`) — or use --all.",
+                    name.unwrap_or_default()
+                ));
+                return Err(ExitCode::from(2));
+            }
+            None => {
+                diag::error("sbx: app prune: argument is not valid UTF-8");
+                return Err(ExitCode::from(2));
+            }
         }
     }
+    // The two selectors are alternatives, and naming both leaves it unsaid which one governs.
+    if name.is_some() && all {
+        diag::error("sbx: app prune: name an app or use --all, not both.");
+        return Err(ExitCode::from(2));
+    }
+    if name.is_none() && !all {
+        diag::error("sbx: app prune: name an app, or use --all to sweep every installed one.");
+        diag::hint("       `sbx app list` names them.");
+        return Err(ExitCode::from(2));
+    }
+    Ok(PruneArgs {
+        name,
+        all,
+        caches,
+        apply,
+    })
+}
+
+/// What one app's prune freed (or would free), for the run's totals.
+#[derive(Default)]
+struct PruneTotals {
+    tools: usize,
+    caches: usize,
+    bytes: u64,
+}
+
+/// `sbx app prune <name>|--all [--caches] [--yes]`: remove the mise tools an app's home(s) carry
+/// that the app's config does **not** declare — the `installed (undeclared)` leftovers `sbx app
+/// show` surfaces (a former profile's tool, or one added by hand). Each is deleted from the home's
+/// mise `installs/` and dropped from its `config.toml` `[tools]` so it does not re-equip. With
+/// `--caches`, each home's cache directory is emptied as well. Previews by default; `--yes` applies.
+/// Declared tools, login/session state, and any `nix:`/`deb:`/`flake:` build are untouched.
+fn app_prune(args: &[OsString]) -> ExitCode {
+    let PruneArgs {
+        name,
+        all,
+        caches,
+        apply,
+    } = match parse_prune_args(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+
+    // Resolved once, whether one app or seventy: the configuration for this directory does not
+    // change between apps, and re-reading it per app would read the same files each time.
+    let (resolved, layout) = if let Some(name) = &name {
+        match open_app("app prune", name) {
+            Ok(t) => (t.resolved, t.layout),
+            Err(code) => return code,
+        }
+    } else {
+        let cwd = match config_cwd() {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        match layout_or_fail() {
+            Ok(l) => (config::load(&cwd), l),
+            Err(code) => return code,
+        }
+    };
+
+    let targets: Vec<String> = match &name {
+        Some(n) => vec![n.clone()],
+        // Only apps with an installed home: an app is nothing to prune until it has one, and a
+        // profile with no home would report an empty sweep for every app the user ever imported.
+        None => sandbox::installed_app_homes(layout.data_dir())
+            .into_iter()
+            .map(|a| a.name)
+            .collect(),
+    };
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
-    let mut total_bytes = 0u64;
-    let mut count = 0usize;
-    for home in &homes {
-        let pruned = sandbox::prune_app_tools(&home.dir, &declared, apply);
-        if pruned.is_empty() {
-            continue;
+    let mut totals = PruneTotals::default();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut had_error = false;
+
+    for app_name in &targets {
+        let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), app_name);
+        // A prune deletes trees out of the home a running session of this app is using: its `PATH`
+        // entries and interpreters are in `installs/`, and a cache is written to while the app runs,
+        // so work in flight loses a tool or a cache mid-command and reports something that looks
+        // nothing like what happened. The preview is always safe, so only the applying form is held
+        // back. Named, it is refused outright: there is no reading of `sbx app prune <name> --yes`
+        // under which deleting a live agent's state is the intent. Under `--all` the app is skipped
+        // and named instead, so one running agent does not stand between the user and the rest.
+        if apply {
+            let live = session_pids_for_app(layout.data_dir(), app_name);
+            if !live.is_empty() {
+                let mut pids: Vec<u32> = live.into_iter().collect();
+                pids.sort_unstable();
+                let rendered: Vec<String> = pids.iter().map(u32::to_string).collect();
+                let listed = rendered.join(", ");
+                if all {
+                    skipped.push(format!("{app_name} (pid {listed})"));
+                    continue;
+                }
+                diag::error(&format!(
+                    "sbx: app prune: {app_name} has a live session (pid {listed}) whose home this \
+                     would delete from — refusing to act under a running agent"
+                ));
+                diag::hint(&format!(
+                    "       stop it with `sbx session stop {}`, or re-run without `--yes` to see \
+                     what would go",
+                    rendered.join(" ")
+                ));
+                return ExitCode::FAILURE;
+            }
         }
-        let location = if home.global {
-            "global home".to_string()
-        } else {
-            format!("project {} home", home.project_id.as_deref().unwrap_or("?"))
+
+        let declared = declared_mise_tokens(&resolved, app_name);
+        let declared: Vec<&str> = declared.iter().map(String::as_str).collect();
+        for home in &homes {
+            let pruned = sandbox::prune_app_tools(&home.dir, &declared, apply);
+            let cached = if caches {
+                sandbox::prune_app_caches(&home.dir, apply)
+            } else {
+                Vec::new()
+            };
+            if pruned.is_empty() && cached.is_empty() {
+                continue;
+            }
+            let location = if home.global {
+                "global home".to_string()
+            } else {
+                format!("project {} home", home.project_id.as_deref().unwrap_or("?"))
+            };
+            // Under `--all` the app has to be named, or a line cannot be attributed; named, the
+            // heading would repeat what the command line already said.
+            if all {
+                println!("{n}{app_name}{r} {dim}{location}:{r}");
+            } else {
+                println!("{dim}{location}:{r}");
+            }
+            for p in &pruned {
+                totals.tools += 1;
+                totals.bytes += p.bytes;
+                println!(
+                    "  {n}{}{r}  {dim}{}{r}",
+                    p.token,
+                    sandbox::human_bytes(p.bytes)
+                );
+            }
+            for c in &cached {
+                totals.caches += 1;
+                totals.bytes += c.bytes;
+                println!(
+                    "  {n}.cache/{}{r}  {dim}{}{r}",
+                    c.name,
+                    sandbox::human_bytes(c.bytes)
+                );
+            }
+        }
+    }
+
+    for line in &skipped {
+        diag::note(&format!(
+            "sbx: app prune: skipped {line} — a live session holds that home"
+        ));
+        had_error = true;
+    }
+
+    if totals.tools == 0 && totals.caches == 0 {
+        let subject = match &name {
+            Some(n) => n.clone(),
+            None => "no app".to_string(),
         };
-        println!("{dim}{location}:{r}");
-        for p in &pruned {
-            count += 1;
-            total_bytes += p.bytes;
-            println!(
-                "  {n}{}{r}  {dim}{}{r}",
-                p.token,
-                sandbox::human_bytes(p.bytes)
-            );
-        }
+        let what = if caches {
+            "undeclared mise tools or caches"
+        } else {
+            "undeclared mise tools"
+        };
+        println!("{h}sbx app prune{r} {dim}— {subject}: no {what} to prune.{r}");
+        return if had_error {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
     }
-    if count == 0 {
-        println!("{h}sbx app prune{r} {dim}— {name}: no undeclared mise tools to prune.{r}");
-        return ExitCode::SUCCESS;
-    }
-    let size = sandbox::human_bytes(total_bytes);
+
+    let size = sandbox::human_bytes(totals.bytes);
+    let subject = prune_subject(totals.tools, totals.caches);
     if apply {
-        println!("{ok}pruned {count} undeclared tool(s), freeing {size}.{r}");
+        println!("{ok}pruned {subject}, freeing {size}.{r}");
     } else {
         println!(
             "{}",
             style::dim_prose(
-                &format!(
-                    "would prune {count} undeclared tool(s) ({size}) — re-run with `--yes` to apply."
-                ),
+                &format!("would prune {subject} ({size}) — re-run with `--yes` to apply."),
                 &pal
             )
         );
     }
-    ExitCode::SUCCESS
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The app's declared `mise:` tokens; a tool matching none of them is undeclared. A home-only app
+/// (no config) declares nothing, so every mise tool in its home is prunable.
+fn declared_mise_tokens(resolved: &config::Resolved, name: &str) -> Vec<String> {
+    resolved
+        .apps
+        .get(name)
+        .map(|a| {
+            a.packages
+                .iter()
+                .filter_map(|p| match &p.backend {
+                    config::Backend::Mise(token) => Some(token.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `2 undeclared tool(s) and 3 cache(s)`, dropping either half when it is empty — the phrase both
+/// the preview and the applied line are built from, so the two can never describe the same run
+/// differently.
+fn prune_subject(tools: usize, caches: usize) -> String {
+    match (tools, caches) {
+        (0, c) => format!("{c} cache(s)"),
+        (t, 0) => format!("{t} undeclared tool(s)"),
+        (t, c) => format!("{t} undeclared tool(s) and {c} cache(s)"),
+    }
 }
 
 /// A compact description of where an app's isolated state lives — `global`, `N project home(s)`, and

@@ -90,7 +90,7 @@ pub(crate) enum OneName<'a> {
 }
 
 /// Parse the grammar shared by the verbs that inspect or act on a single named thing
-/// (`sbx app show`, `sbx app prune`, `sbx projects show`): one required name, one optional boolean
+/// (`sbx app show`, `sbx app upgrade`, `sbx projects show`): one required name, one optional boolean
 /// switch under any of its spellings, and the usual help flags. Pure — it reads no config and
 /// prints nothing — so the grammar is unit-tested, which a loop returning an `ExitCode` around
 /// `println!` is not.
@@ -1014,7 +1014,7 @@ mod tests {
             assert_eq!(
                 parse_one_name(
                     &os(&["demo-app", spelling]),
-                    &["app", "prune"],
+                    &["app", "demo"],
                     &["-y", "--yes"],
                     "name an app",
                 ),
@@ -1100,9 +1100,9 @@ mod tests {
     }
 
     /// The pair a caller destructures, which is the one thing a command-line comparison cannot
-    /// check: a verb that acts on its switch (`sbx app prune`) previews when it is off and applies
-    /// when it is on, so a switch read as anything but the second element would act on a line that
-    /// asked for a preview.
+    /// check: a caller reads the switch as the second element and branches on it, so a switch read
+    /// as anything but that would take the branch the command line did not ask for. Exercised on an
+    /// apply-style switch, the shape with the most to lose from being misread.
     #[test]
     fn the_reported_pair_is_the_name_then_the_switch() {
         for (line, want) in [
@@ -1112,7 +1112,7 @@ mod tests {
         ] {
             let args = os(&line);
             assert_eq!(
-                one_name(&args, &["app", "prune"], &["-y", "--yes"], "name an app").ok(),
+                one_name(&args, &["app", "demo"], &["-y", "--yes"], "name an app").ok(),
                 Some(want),
                 "{line:?}"
             );
