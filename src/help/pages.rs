@@ -757,9 +757,10 @@ pub(super) const PAGES: &[Page] = &[
             which is what happened in what order. `broker` and `signer` are read here and nowhere\n\
             else.\n\
             \n\
-            A finished session is read from the records its lenses left, when it ran under\n\
-            `[observe] record`; the two feeds that keep none (`net`, `task`) say so in the header.\n\
-            With nothing live, the finished sessions recorded for this project are listed.\n\
+            A finished session is read from the records its feeds left, when it ran under\n\
+            `[observe] record`; every feed here keeps one, and a feed that recorded nothing is named\n\
+            with its reason like any other. With nothing live, the finished sessions recorded for\n\
+            this project are listed.\n\
             \n\
             A feed that is not recording is **named, with the reason**, before the events. That is\n\
             the point: a feed nothing stood up and a feed with nothing to say both come back empty,\n\

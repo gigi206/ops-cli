@@ -82,7 +82,8 @@ which is the contract `mute` already had.
 running. A finished session's egress record is read through `sbx logs <id>`.
 
 The **task plane** is the simple case: an invocation is recorded once, when it finishes, and nothing
-ever revises it.
+ever revises it. `sbx task logs` is the live view, like `sbx net logs`: it reads the planes of a
+running session, so a finished one's invocations are read through `sbx logs <id>` as well.
 
 ## Discarding one
 

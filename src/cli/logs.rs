@@ -82,11 +82,14 @@ pub(crate) struct LogView<E: 'static> {
 enum Source {
     /// A running session, read over its control socket.
     Live { pid: u32, header: String },
-    /// A session that has ended, read from the file its lens left behind. `reused` marks a pid that
-    /// named more than one record, so the view can say a choice was made.
+    /// A session that has ended, read from the file its lens left behind. `ticks` is the
+    /// incarnation the pid resolved to, which is how a second lens opens the same session's file
+    /// rather than its own newest; `reused` marks a pid that named more than one session, so the
+    /// view can say a choice was made.
     Record {
         pid: u32,
         path: PathBuf,
+        ticks: u64,
         reused: bool,
     },
 }
@@ -162,9 +165,9 @@ pub(crate) fn run<E: crate::sandbox::lens::Event>(
 
     match source {
         Source::Live { pid, header } => live_view(view, data_dir, pid, &header, follow, json, &pal),
-        Source::Record { pid, path, reused } => {
-            record_view(view, pid, &path, reused, follow, json, &pal)
-        }
+        Source::Record {
+            pid, path, reused, ..
+        } => record_view(view, pid, &path, reused, follow, json, &pal),
     }
 }
 
@@ -202,9 +205,14 @@ fn resolve_source(
         // a record of another project is not there at all, which is the same answer as a pid that
         // named nothing (see `records_for_project`).
         if let Ok(pid) = id.parse::<u32>()
-            && let Some((path, reused)) = first_record(dirs, project, pid)
+            && let Some((path, ticks, reused)) = first_record(dirs, project, pid)
         {
-            return Ok(Source::Record { pid, path, reused });
+            return Ok(Source::Record {
+                pid,
+                path,
+                ticks,
+                reused,
+            });
         }
         diag::error(&format!(
             "sbx: {verb}: no live session '{id}' and no record of one — run `sbx session ls` for \
@@ -245,13 +253,16 @@ fn list_records(verb: &str, dirs: &[PathBuf], project: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// The record `pid` names in the first of `dirs` that has one — the view then reads that lens, which
-/// is the only one it shows. For the merged view the directories are every lens's, so a session that
-/// recorded only a broker is found by its broker record; the merged reader looks each feed up in its
-/// own directory afterwards.
-fn first_record(dirs: &[PathBuf], project: &str, pid: u32) -> Option<(PathBuf, bool)> {
-    dirs.iter()
-        .find_map(|dir| crate::sandbox::lens::record_of_pid(dir, project, pid))
+/// The session `pid` names, and the file the first of `dirs` holds for it — the single-lens view
+/// then reads that file, which is the only one it shows. For the merged view the directories are
+/// every lens's, so a session that recorded only a broker is found by its broker record; the merged
+/// reader opens each feed under the incarnation resolved here, never one each lens picks for itself.
+fn first_record(dirs: &[PathBuf], project: &str, pid: u32) -> Option<(PathBuf, u64, bool)> {
+    let (ticks, reused) = crate::sandbox::lens::session_of_pid(dirs, project, pid)?;
+    let path = dirs
+        .iter()
+        .find_map(|dir| crate::sandbox::lens::record_of_session(dir, project, pid, ticks))?;
+    Some((path, ticks, reused))
 }
 
 /// The text [`list_records`] prints, built apart from the printing so it can be asserted.
@@ -976,14 +987,17 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         .iter()
         .filter_map(|f| f.record.map(|(dir, _)| dir(data_dir)))
         .collect();
-    let (pid, live, header, reused) =
+    let (pid, live, header, reused, ticks) =
         match resolve_source("logs", "logs", &sessions, id, &dirs, &project) {
-            Ok(Source::Live { pid, header }) => (pid, true, header, false),
-            Ok(Source::Record { pid, reused, .. }) => (
+            Ok(Source::Live { pid, header }) => (pid, true, header, false, None),
+            Ok(Source::Record {
+                pid, reused, ticks, ..
+            }) => (
                 pid,
                 false,
                 format!("session {pid} (ended) {project}"),
                 reused,
+                Some(ticks),
             ),
             Err(code) => return code,
         };
@@ -1016,9 +1030,14 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
             (feed.read)(&feed.socket, None).map(|(batch, head, _)| (batch, head))
         } else {
             match &feed.record {
+                // Every feed opens the *same* session: the incarnation was resolved once over all
+                // the directories, so a pid the kernel has reused cannot hand one lens's file from
+                // one session and another lens's from the next.
                 Some((dir, read_record)) => {
-                    match crate::sandbox::lens::record_of_pid(&dir(data_dir), &project, pid) {
-                        Some((path, _)) => read_record(&path).map(|(batch, cut)| {
+                    match ticks.and_then(|t| {
+                        crate::sandbox::lens::record_of_session(&dir(data_dir), &project, pid, t)
+                    }) {
+                        Some(path) => read_record(&path).map(|(batch, cut)| {
                             if cut {
                                 truncated.push(feed.name);
                             }
@@ -1428,11 +1447,13 @@ mod tests {
         let records = vec![
             crate::sandbox::lens::RecordEntry {
                 pid: 148820,
+                ticks: 1,
                 path: PathBuf::from("/d/proc/record-148820-1.log"),
                 at: std::time::UNIX_EPOCH + Duration::from_secs(1_757_376_000),
             },
             crate::sandbox::lens::RecordEntry {
                 pid: 147311,
+                ticks: 1,
                 path: PathBuf::from("/d/proc/record-147311-1.log"),
                 at: std::time::UNIX_EPOCH + Duration::from_secs(1_757_289_600),
             },

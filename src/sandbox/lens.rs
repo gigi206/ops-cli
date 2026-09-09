@@ -357,16 +357,18 @@ pub(crate) fn record_path(dir: &Path, pid: u32, start_ticks: u64) -> PathBuf {
     dir.join(format!("record-{pid}-{start_ticks}.log"))
 }
 
-/// The launcher pid a `record-<pid>-<ticks>.log` names, or `None` for any other name.
+/// The launcher pid and incarnation a `record-<pid>-<ticks>.log` names, or `None` for any other
+/// name.
 ///
 /// Deliberately its own parser rather than [`super::gc::sweep_runtime_dirs`]'s: that one answers
 /// "may this be deleted when its session is gone", and a record's answer to that is always no. This
-/// one answers "whose record is this", which is asked only to keep a *live* session's file out of a
-/// prune that is otherwise ordered by age.
-fn record_entry_pid(name: &str) -> Option<u32> {
+/// one answers "whose record is this", which two callers ask for two reasons: to keep a *live*
+/// session's file out of a prune that is otherwise ordered by age, and to name one session across
+/// the several lens directories that each hold a piece of it.
+fn record_entry_key(name: &str) -> Option<(u32, u64)> {
     let rest = name.strip_prefix("record-")?;
-    let (pid, _) = rest.split_once('-')?;
-    pid.parse().ok()
+    let (pid, ticks) = rest.split_once('-')?;
+    Some((pid.parse().ok()?, ticks.strip_suffix(".log")?.parse().ok()?))
 }
 
 /// Remove the oldest finished sessions' records past [`RECORD_KEEP`], newest kept.
@@ -383,7 +385,7 @@ fn prune_records(dir: &Path, keep: usize, is_live: &dyn Fn(u32) -> bool) {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name();
-            let pid = record_entry_pid(name.to_str()?)?;
+            let (pid, _) = record_entry_key(name.to_str()?)?;
             if is_live(pid) {
                 return None;
             }
@@ -623,6 +625,9 @@ pub(crate) fn record_project(path: &Path) -> Option<String> {
 pub(crate) struct RecordEntry {
     /// The launcher pid the file is named for: what a reader passes as the session id.
     pub(crate) pid: u32,
+    /// The incarnation the file is keyed by: what tells two sessions that landed on the same pid
+    /// apart, and what every lens's copy of one session shares.
+    pub(crate) ticks: u64,
     pub(crate) path: PathBuf,
     /// The file's modification time, which is when the session last recorded anything.
     pub(crate) at: std::time::SystemTime,
@@ -638,9 +643,10 @@ pub(crate) fn records_in(dir: &Path) -> Vec<RecordEntry> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name();
-            let pid = record_entry_pid(name.to_str()?)?;
+            let (pid, ticks) = record_entry_key(name.to_str()?)?;
             Some(RecordEntry {
                 pid,
+                ticks,
                 path: e.path(),
                 at: e.metadata().ok()?.modified().ok()?,
             })
@@ -688,26 +694,48 @@ pub(crate) fn records_across(dirs: &[PathBuf], project: &str) -> Vec<RecordEntry
     out
 }
 
-/// The record `pid` names in `dir`, and whether more than one file carried that pid.
+/// The session `pid` names across `dirs` — its incarnation — and whether the pid named more than
+/// one.
 ///
 /// A record is keyed by the session incarnation, but a reader only ever has the pid: it is what
 /// `sbx session ls` showed and what a detached launch printed. So the pid may name more than one
-/// file, once the kernel has wrapped its counter round onto it. The newest is the answer — the
+/// session, once the kernel has wrapped its counter round onto it. The newest is the answer — the
 /// session a user just watched end is the one they are asking about — and the second return value
 /// is what lets the view *say* that a choice was made, rather than presenting one of several as the
 /// only one.
+///
+/// The choice is made once, over every directory, because a reader then opens each lens's file by
+/// that incarnation. Letting every lens pick "the newest under this pid in my own directory" would
+/// splice two sessions that happened to share a pid into one page of audit.
 ///
 /// The alternative, one file per pid with in-file session headers, is what `sbx session logs` does
 /// for the detached log. It is the right shape there, where the writer is `>>` on a path a caller
 /// named; it is the wrong one here, where the writer knows its own incarnation and a reader that
 /// wants a whole session should not have to scan for its boundaries.
-pub(crate) fn record_of_pid(dir: &Path, project: &str, pid: u32) -> Option<(PathBuf, bool)> {
-    let matching: Vec<RecordEntry> = records_for_project(dir, project)
-        .into_iter()
+pub(crate) fn session_of_pid(dirs: &[PathBuf], project: &str, pid: u32) -> Option<(u64, bool)> {
+    let mut matching: Vec<RecordEntry> = dirs
+        .iter()
+        .flat_map(|dir| records_for_project(dir, project))
         .filter(|e| e.pid == pid)
         .collect();
-    let newest = matching.first()?;
-    Some((newest.path.clone(), matching.len() > 1))
+    matching.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.ticks.cmp(&a.ticks)));
+    let newest = matching.first()?.ticks;
+    Some((newest, matching.iter().any(|e| e.ticks != newest)))
+}
+
+/// The file one lens holds for exactly that session, or `None` when it recorded nothing.
+///
+/// Named rather than searched: every lens's copy of a session is under the same name, so a reader
+/// that has already resolved which session it wants asks each directory for the file directly. The
+/// project is still checked, because the answer is shown to someone who asked about *this* one.
+pub(crate) fn record_of_session(
+    dir: &Path,
+    project: &str,
+    pid: u32,
+    ticks: u64,
+) -> Option<PathBuf> {
+    let path = record_path(dir, pid, ticks);
+    (record_project(&path).as_deref() == Some(project)).then_some(path)
 }
 
 /// What a launch resolves once so every lens opens its record the same way.
@@ -1434,8 +1462,12 @@ mod tests {
         let mine = records_for_project(dir.path(), "/mine");
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].pid, 10);
-        assert!(record_of_pid(dir.path(), "/mine", 11).is_none());
-        assert!(record_of_pid(dir.path(), "/mine", 10).is_some());
+        assert!(session_of_pid(&[dir.path().to_path_buf()], "/mine", 11).is_none());
+        assert!(session_of_pid(&[dir.path().to_path_buf()], "/mine", 10).is_some());
+        // A file opened by name is checked too: knowing the incarnation is not a way past the
+        // question the reader actually asked, which was about this project.
+        assert!(record_of_session(dir.path(), "/mine", 11, 1).is_none());
+        assert!(record_of_session(dir.path(), "/mine", 10, 1).is_some());
     }
 
     /// A pid the kernel wrapped round onto names two records. The newest is the answer — the session
@@ -1457,15 +1489,20 @@ mod tests {
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(200),
         );
 
-        let (path, reused) = record_of_pid(dir.path(), "/p", 42).unwrap();
-        assert_eq!(path, new);
+        let dirs = [dir.path().to_path_buf()];
+        let (ticks, reused) = session_of_pid(&dirs, "/p", 42).unwrap();
+        assert_eq!(
+            record_of_session(dir.path(), "/p", 42, ticks).as_ref(),
+            Some(&new)
+        );
         assert!(reused, "two records under one pid must be announced");
 
-        let (path, reused) = record_of_pid(dir.path(), "/p", 42).unwrap();
-        assert_eq!(path, new);
-        assert!(reused);
         std::fs::remove_file(&old).unwrap();
-        let (_, reused) = record_of_pid(dir.path(), "/p", 42).unwrap();
+        let (ticks, reused) = session_of_pid(&dirs, "/p", 42).unwrap();
+        assert_eq!(
+            record_of_session(dir.path(), "/p", 42, ticks).as_ref(),
+            Some(&new)
+        );
         assert!(!reused, "one record is not a choice");
     }
 
@@ -1521,8 +1558,50 @@ mod tests {
 
         // Resolving on the exec directory alone would lose the broker-only session entirely.
         assert_eq!(records_for_project(&proc, "/p").len(), 1);
-        assert!(record_of_pid(&proc, "/p", 11).is_none());
-        assert!(record_of_pid(&broker, "/p", 11).is_some());
+        assert!(session_of_pid(std::slice::from_ref(&proc), "/p", 11).is_none());
+        assert!(session_of_pid(&[proc.clone(), broker.clone()], "/p", 11).is_some());
+    }
+
+    /// A pid the kernel reused between two sessions that did not record the same lenses. Resolving
+    /// per directory hands the merged view one session's exec record beside the other's broker
+    /// record, under a single header that names one session — an audit page assembled from two.
+    /// The incarnation is resolved once, so every lens is asked for the same session and the one the
+    /// newer session never used answers with nothing, which the view already knows how to say.
+    #[test]
+    fn a_reused_pid_does_not_splice_two_sessions_across_lenses() {
+        let root = crate::testutil::TmpDir::new();
+        let proc = root.path().join("proc");
+        let broker = root.path().join("broker");
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::create_dir_all(&broker).unwrap();
+        // Session (7, 100) recorded both lenses; the later (7, 200) only its broker.
+        for (dir, name, at) in [
+            (&proc, "record-7-100.log", 100),
+            (&broker, "record-7-100.log", 100),
+            (&broker, "record-7-200.log", 200),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, "project=/p\n").unwrap();
+            filetime_set(
+                &path,
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(at),
+            );
+        }
+
+        let (ticks, reused) = session_of_pid(&[proc.clone(), broker.clone()], "/p", 7).unwrap();
+        assert_eq!(
+            ticks, 200,
+            "the newest session is the one being asked about"
+        );
+        assert!(reused);
+        assert!(
+            record_of_session(&proc, "/p", 7, ticks).is_none(),
+            "the newer session recorded no exec: its predecessor's must not stand in for it"
+        );
+        assert_eq!(
+            record_of_session(&broker, "/p", 7, ticks),
+            Some(broker.join("record-7-200.log"))
+        );
     }
 
     /// The writer terminates a line, so a producer that formats one without a newline cannot splice
