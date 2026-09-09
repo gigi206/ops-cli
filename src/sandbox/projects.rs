@@ -148,7 +148,10 @@ struct ProjectTreeView {
     /// On-disk size in bytes (an upper bound — reflinked content shared with another tree counts
     /// per file).
     bytes: u64,
-    /// The `bytes` figure rendered human-readably (the text listing shows this).
+    /// What the tree holds that the shared store does not: `bytes` less the seeded part of its
+    /// store. The figure a removal would actually have to give back, and the one the listing shows.
+    own_bytes: u64,
+    /// The `own_bytes` figure rendered human-readably (the text listing shows this).
     size: String,
     /// `YYYY-MM-DD` of the last launch (the marker's mtime), else the tree directory's mtime.
     last_used: String,
@@ -166,6 +169,9 @@ fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> 
     let live_ids = super::launch::session_housekeeping(layout);
     let current = crate::current_project_id();
     let projects_dir = layout.data_dir().join("projects");
+    // Read once for every tree: each one is classified against the same shared store, and that
+    // listing is the larger of the two.
+    let shared = super::inspect::shared_store_names(&layout.store_dir());
     let mut rows: Vec<ProjectTreeView> = match std::fs::read_dir(&projects_dir) {
         Ok(rd) => rd
             .flatten()
@@ -174,13 +180,18 @@ fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> 
                 let dir = e.path();
                 let id = e.file_name().to_string_lossy().into_owned();
                 let class = super::gc::classify_tree(&dir, &live_ids);
-                let bytes = super::gc::tree_size(&dir);
+                let (total, parts) = super::gc::tree_usage_parts(&dir, &[dir.join("store")]);
+                let bytes = total.bytes;
+                let own_bytes = bytes
+                    .saturating_sub(parts[0].bytes)
+                    .saturating_add(super::inspect::store_built_here_against(&dir, &shared));
                 ProjectTreeView {
                     current: current.as_deref() == Some(id.as_str()),
                     id,
                     state: class.state.label(),
                     bytes,
-                    size: super::gc::human_bytes(bytes),
+                    own_bytes,
+                    size: super::gc::human_bytes(own_bytes),
                     last_used: crate::paths::civil_date(class.last_used),
                     project: class.project_path.map(|p| p.display().to_string()),
                 }
@@ -247,7 +258,16 @@ struct ProjectShowView {
     total_bytes: u64,
     store_bytes: u64,
     home_bytes: u64,
+    /// The per-project mise pools of the global apps launched here. Not app *homes*: a global app
+    /// keeps its home under `<data>/apps`, and only its install pool is scoped per project.
+    pools_bytes: u64,
     other_bytes: u64,
+    /// What the tree's store holds that the shared store does not, so what the store really adds to
+    /// this tree rather than reads from the seed.
+    store_built_here_bytes: u64,
+    /// Everything the tree holds except the seeded part of its store: what removing it would
+    /// actually have to give back.
+    own_bytes: u64,
     nixpkgs: Option<NixpkgsView>,
     store_roots: StoreRootsView,
     mise_tools: Vec<ProjToolView>,
@@ -297,11 +317,23 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
 
     // One walk for all three figures: `store` and `home` are inside the tree, so sizing them
     // separately visited every one of their inodes twice.
-    let (total, parts) = super::gc::tree_usage_parts(&dir, &[dir.join("store"), dir.join("home")]);
-    let (total_bytes, store_bytes, home_bytes) = (total.bytes, parts[0].bytes, parts[1].bytes);
+    let (total, parts) = super::gc::tree_usage_parts(
+        &dir,
+        &[dir.join("store"), dir.join("home"), dir.join("apps")],
+    );
+    let (total_bytes, store_bytes, home_bytes, pools_bytes) =
+        (total.bytes, parts[0].bytes, parts[1].bytes, parts[2].bytes);
     let other_bytes = total_bytes
         .saturating_sub(store_bytes)
-        .saturating_sub(home_bytes);
+        .saturating_sub(home_bytes)
+        .saturating_sub(pools_bytes);
+    // The store is seeded from the shared one path for path, so reporting it as part of what the
+    // tree costs counts the seed against the tree. What the tree adds is what was built into it,
+    // which is the store paths the shared store does not have.
+    let store_built_here_bytes = super::inspect::store_built_here(&dir, &layout.store_dir());
+    let own_bytes = total_bytes
+        .saturating_sub(store_bytes)
+        .saturating_add(store_built_here_bytes);
 
     // Realized signals, read once from the tree.
     let gcroots = super::inspect::gcroot_names(data, id);
@@ -424,7 +456,10 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
         total_bytes,
         store_bytes,
         home_bytes,
+        pools_bytes,
         other_bytes,
+        store_built_here_bytes,
+        own_bytes,
         nixpkgs,
         store_roots,
         mise_tools,
@@ -460,11 +495,17 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
     let _ = writeln!(s, "  last:     {dim}{}{r}", v.last_used);
     let _ = writeln!(
         s,
-        "  disk:     {} apparent  {dim}(store {} · home {} · other {}){r}",
-        super::gc::human_bytes(v.total_bytes),
-        super::gc::human_bytes(v.store_bytes),
+        "  disk:     {} own  {dim}(app mise pools {} · home {} · other {}){r}",
+        super::gc::human_bytes(v.own_bytes),
+        super::gc::human_bytes(v.pools_bytes),
         super::gc::human_bytes(v.home_bytes),
         super::gc::human_bytes(v.other_bytes),
+    );
+    let _ = writeln!(
+        s,
+        "            {dim}store {}, seeded from the shared store ({} built here){r}",
+        super::gc::human_bytes(v.store_bytes),
+        super::gc::human_bytes(v.store_built_here_bytes),
     );
     match &v.nixpkgs {
         Some(np) => {
@@ -567,11 +608,13 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
         println!("{h}sbx projects{r} {dim}— no per-project runtime trees.{r}");
         return ExitCode::SUCCESS;
     }
-    let total: u64 = rows.iter().map(|row| row.bytes).sum();
+    let total: u64 = rows.iter().map(|row| row.own_bytes).sum();
+    let apparent: u64 = rows.iter().map(|row| row.bytes).sum();
     println!(
-        "{h}sbx projects{r} {dim}({} tree(s), {} apparent){r}",
+        "{h}sbx projects{r} {dim}({} tree(s), {} own, {} counting the seeded stores){r}",
         rows.len(),
-        super::gc::human_bytes(total)
+        super::gc::human_bytes(total),
+        super::gc::human_bytes(apparent)
     );
     let state_w = rows.iter().map(|row| row.state.len()).max().unwrap_or(0);
     let size_w = rows.iter().map(|row| row.size.len()).max().unwrap_or(0);
@@ -594,10 +637,10 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
         "{}",
         crate::style::dim_prose(
             &format!(
-                "sizes are apparent, not what removal returns: a tree is seeded from the shared \
-                 store rather than copied from it, so it usually frees far less than it reads, \
-                 and {} remove one with `sbx projects rm <id>`; sweep dead trees with \
-                 `sbx projects rm --dead --yes`.",
+                "the size column is what a tree holds on its own: its store is seeded from the \
+                 shared store rather than copied from it, and the seeded part is left out of it \
+                 because removing the tree does not free it. Of what is left, {} remove one with \
+                 `sbx projects rm <id>`; sweep dead trees with `sbx projects rm --dead --yes`.",
                 super::SIZE_CAVEAT
             ),
             pal

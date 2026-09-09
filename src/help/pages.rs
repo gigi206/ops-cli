@@ -2102,15 +2102,15 @@ pub(super) const PAGES: &[Page] = &[
             (richer than `sbx path`'s projects section — it adds each tree's size); `sbx\n\
             projects rm` removes them.\n\
             \n\
-            **The sizes are apparent, not what a removal returns.** A tree's store is seeded from\n\
-            the shared one, and on a filesystem that shares blocks (btrfs, xfs with reflinks) the\n\
-            seed shares them rather than copying, so most of what a tree reads is storage it holds\n\
-            in common with the shared store and with its sibling trees. Removing it frees only what\n\
-            it alone holds, which is usually a small fraction of the figure shown; a compressing\n\
-            volume stored those bytes smaller, so even that part frees fewer blocks than it reads;\n\
-            and on an image the freed blocks return to the host only after a discard.\n\
-            `sbx storage status` reports the volume's own numbers, which are the ones to plan\n\
-            against.\n\
+            **The size column is what a tree holds on its own.** A tree's store is seeded from the\n\
+            shared one, path for path, and on a filesystem that shares blocks (btrfs, xfs with\n\
+            reflinks) the seed shares them rather than copying, so removing a tree does not free\n\
+            its store. The seeded part is therefore left out of the column, and only what was\n\
+            *built into* this tree counts. The header names both figures, the second being what\n\
+            the tree reads with its store included. Even the column is an upper bound: a\n\
+            compressing volume stored those bytes smaller, and on an image freed blocks return to\n\
+            the host only after a discard. `sbx storage status` reports the volume's own numbers,\n\
+            which are the ones to plan against.\n\
             \n\
             A named `rm <id>` removes immediately (you named it, so it is not an accident); pass\n\
             `--dry-run` to preview first. The bulk selectors `--dead` and `--markerless` preview\n\
@@ -2297,10 +2297,11 @@ pub(super) const PAGES: &[Page] = &[
             declared packages/tools that are **not** built yet (an untrusted one flagged `withheld`,\n\
             distinct from a trusted one simply not equipped yet). The store is shared by the project\n\
             and every app launched in it, so the roots include app packages. A dead tree (its project\n\
-            directory gone) shows realized state only. Every size here is **apparent**: a tree is\n\
-            seeded from the shared store, and on a filesystem that shares blocks the seed shares\n\
-            them, so a tree's size is what it reads rather than what removing it returns. Read-only:\n\
-            no sandbox, no nix, no network. For an app rather than a tree, see `sbx app show <name>`.",
+            directory gone) shows realized state only. The `disk` line leads with what the tree holds\n\
+            **on its own** (its app mise pools, its home, and whatever was built into its store) and\n\
+            reports the store separately, since a store seeded from the shared one is not freed by\n\
+            removing the tree. Read-only: no sandbox, no nix, no network. For an app rather than a\n\
+            tree, see `sbx app show <name>`.",
     },
     Page {
         path: &["app", "prune"],

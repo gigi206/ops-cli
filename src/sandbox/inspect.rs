@@ -450,6 +450,63 @@ fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
 /// package (or a hole provision). Sorted.
 ///
 /// A root is a **leaf** out-link, so a sub-*directory* is not one:
+/// How much of a runtime tree's store the tree holds **on its own**: the bytes under store paths
+/// that the shared store does not also have.
+///
+/// A tree's store is seeded from the shared one, path for path, and on a filesystem that shares
+/// blocks the seed shares them rather than copying. So nearly everything a tree's store reads is
+/// storage the shared store already holds, and reporting the tree's store as part of what the tree
+/// costs overstates it by the whole seed. What a tree really adds is what was built *into it*: a
+/// local `flake:`, or an in-cage `sbx mise install nix:` whose output the shared store never had.
+///
+/// The classification is by **name**, not by extent: a store path is content-addressed, so a name
+/// present in both stores is the same closure in both, and a name only the tree has was built
+/// there. That is two directory listings and a set difference, where measuring the sharing itself
+/// would need the filesystem's extent map. Sizes are still [`tree_usage`](super::gc::tree_usage)
+/// figures, so they carry its blindnesses; what this removes is the much larger error of counting
+/// the seed.
+///
+/// Read-only. A tree with no store, or no readable shared store, reports zero: nothing is claimed
+/// as built here that cannot be shown to be.
+pub(crate) fn store_built_here(tree_dir: &Path, shared_store_dir: &Path) -> u64 {
+    store_built_here_against(tree_dir, &shared_store_names(shared_store_dir))
+}
+
+/// The store path names the shared store holds, for [`store_built_here_against`]. Read once by a
+/// caller classifying several trees: the shared store is the larger of the two listings, and
+/// re-reading it per tree is the only part of this that would not be free.
+pub(crate) fn shared_store_names(
+    shared_store_dir: &Path,
+) -> std::collections::HashSet<std::ffi::OsString> {
+    match std::fs::read_dir(shared_store_dir.join("nix/store")) {
+        Ok(rd) => rd.flatten().map(|e| e.file_name()).collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// [`store_built_here`] against an already-read set of shared store path names.
+///
+/// An empty set means the shared store could not be read, and every path would then look built
+/// here. Reporting the whole store as the tree's own on a failed listing would be a far larger
+/// error than reporting none of it, so the empty set answers zero.
+pub(crate) fn store_built_here_against(
+    tree_dir: &Path,
+    shared: &std::collections::HashSet<std::ffi::OsString>,
+) -> u64 {
+    if shared.is_empty() {
+        return 0;
+    }
+    let tree_paths = tree_dir.join("store/nix/store");
+    let Ok(mine) = std::fs::read_dir(&tree_paths) else {
+        return 0;
+    };
+    mine.flatten()
+        .map(|e| e.file_name())
+        .filter(|name| !shared.contains(name))
+        .map(|name| super::gc::tree_size(&tree_paths.join(name)))
+        .sum()
+}
+
 /// [`nixhub::provision`](crate::sandbox::nixhub::provision) roots the tree's `nix:` mise tools one
 /// level down, in the `nix-tools/` directory it keeps apart from the native `[packages]` roots so the
 /// two tool sources cannot collide on a shared name — and that directory entry was read as a root of

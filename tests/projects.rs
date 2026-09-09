@@ -128,12 +128,13 @@ fn list_classifies_and_sizes_each_tree() {
         s.contains("KiB"),
         "the size column should show a KiB figure:\n{s}"
     );
-    // Every figure here is what a tree reads, not what removing it returns: a store seeded by
-    // reflink shares most of its blocks with the shared store. The word is the whole guard, since
-    // a reader who plans a cleanup around the total is the person this listing misleads.
+    // The column is what a tree holds on its own, with the seeded store left out of it: a store
+    // seeded by reflink shares its blocks with the shared store, so counting it against the tree
+    // overstates a cleanup by the whole seed. The listing has to say which figure it is showing,
+    // since a reader who plans around the number is the person a bare total misleads.
     assert!(
-        s.contains("apparent"),
-        "the listing must say its sizes are apparent:\n{s}"
+        s.contains("own") && s.contains("seeded"),
+        "the listing must say the column is what the tree holds on its own:\n{s}"
     );
 }
 

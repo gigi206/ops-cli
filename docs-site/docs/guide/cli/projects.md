@@ -22,21 +22,26 @@ See also: [`sbx gc`](gc) · [`sbx path`](path) · [Garbage collection](../housek
 
 ## `list`
 
-Lists every runtime tree with its id, state, apparent size, last-used date, and
+Lists every runtime tree with its id, state, own size, last-used date, and
 recorded project path, richer than [`sbx path`](path)'s `projects/` section, which omits
 the size. The tree of the directory you are in is marked `*`. `sbx projects ls` is an
 accepted alias.
 
-:::warning The sizes are apparent, not what a removal returns
-A tree's store is **seeded from the shared one**, and on a filesystem that shares blocks
-(btrfs, or xfs with reflinks) the seed shares them instead of copying. So most of what a
-tree reads is storage it holds in common with the shared store and with its sibling trees,
-and removing it frees only the part it alone holds, which is usually a small fraction of
-the figure shown. A second gap stacks on that one: a volume with compression enabled stored
-those bytes smaller, so even the part a tree alone holds frees fewer blocks than it reads.
-On an image, the freed blocks return to the host only after a discard.
-Plan against [`sbx storage status`](storage), which reports the volume's own numbers, and
-reclaim the closures a removal orphans with [`sbx gc`](gc).
+:::warning What the size column counts, and what it leaves out
+A tree's store is **seeded from the shared one**, path for path, and on a filesystem that
+shares blocks (btrfs, or xfs with reflinks) the seed shares them instead of copying. So
+removing a tree does not free its store: nearly all of it is storage the shared store still
+holds. The column therefore leaves the seeded part out, and counts only what the tree holds
+on its own: its app mise pools, its home, and whatever was **built into** its store rather
+than seeded there (a local `flake:`, or an in-cage `sbx mise install nix:` the shared store
+never had). The header prints both figures, so the number including the store is still
+there to read.
+
+Even the column is an upper bound. A volume with compression enabled stored those bytes
+smaller, so freeing a gigabyte of data returns fewer blocks than that; and on an image, the
+freed blocks return to the host only after a discard. Plan against
+[`sbx storage status`](storage), which reports the volume's own numbers, and reclaim the
+closures a removal orphans with [`sbx gc`](gc).
 :::
 
 Each tree's **state**:
@@ -52,10 +57,13 @@ Each tree's **state**:
 
 ## `show`
 
-`sbx projects show <id>` reports one tree's realized detail, with the caveat above applying
-to every size it prints:
+`sbx projects show <id>` reports one tree's realized detail. Its `disk` line follows the same
+rule as the listing: it leads with what the tree holds on its own, broken down by app mise
+pools, home and the rest, then reports the store separately with the part built into it
+rather than seeded:
 
-- its **state** and **size**, broken down `store` / `home` / `other`;
+- its **state** and **size**, the own figure broken down `app mise pools` / `home` /
+  `other`, with the store reported beside it;
 - the **nixpkgs** channel or per-project pin it resolves against;
 - the **store roots** built in its store, grouped by backend (`nix`, `deb`, `appimage`), a host-side `flake:` build is provisioned like a `nix:` one, so it appears under `nix`; a `tarball:` build's gcroot likewise lands under `nix`; only `deb-`/`appimage-` gcroots get their own group. The
   store is **shared** by the project and every app launched in it, so the roots include
