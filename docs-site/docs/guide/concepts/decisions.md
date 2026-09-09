@@ -93,13 +93,25 @@ same project, equipping the same tool at the same version, each keep their own c
 The tools a project's own mise file declares are the case where this is most visible: they
 are the same tools for every app, by construction, and each app installs them again.
 
-Sharing them was not refused, it was not reached. Two properties that would have to hold do
-hold: an install directory is written once and not touched again by later launches, and the
-activation record that says which version is current lives in the app's home rather than in
-the pool, so a shared install would carry no per-app state. What is unsettled is whether the
-gain is worth reworking a split that was reasoned and documented for the case it does cover.
-The gain is real only where apps overlap, which depends on how a given machine is used, and
-that is the number to put against the cost before touching it.
+Sharing them was not refused, it was not reached, and the mechanism for it is already in
+place: mise reads a list of read-only install directories to fall back on, and sbx already
+points it at the app's own pool so that a tool the agent equips in one project is reused in
+the next. A pool shared between apps would be another entry in that list, not a rewrite of
+the split. Two properties such a pool would need also hold today: an install directory is
+written once and not touched again by later launches, and the activation record that names
+the current version lives in the app's home rather than in the pool, so a shared install
+would carry no per-app state.
+
+What argues against it is not the plumbing, it is what the sharing would mean. An install
+directory holds executables, and a pool two apps read is a pool one app can write for the
+other to run: the same shape as [the store they already
+share](security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps), except
+that the store's sharing is the price of provisioning a project at all, while this one would
+buy disk space. That is a boundary moved for a saving, and the saving is real only where apps
+equip the same tools. Where they do, it is a handful of agents shipping the same helper rather
+than a broad overlap, so the ceiling is a fraction of what the homes hold. Measuring that
+overlap on the machine in question, and deciding whether a shared pool would be written by the
+apps or only by sbx, comes before any of it.
 
 ### The holes are opened on request, and each one is a hole
 
