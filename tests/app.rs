@@ -60,6 +60,16 @@ impl Project {
         std::fs::write(dir.join("blob"), vec![b'x'; bytes]).unwrap();
     }
 
+    /// Fabricate a global app's per-project mise pool with a tool installed at `version`. The pool
+    /// dir *is* mise's data dir, so `installs/` sits directly under it.
+    fn install_pool_tool(&self, app: &str, tree: &str, munged: &str, version: &str) {
+        let ver = self.data_home.path().join(format!(
+            "sbx/projects/{tree}/apps/{app}/mise/installs/{munged}/{version}"
+        ));
+        std::fs::create_dir_all(&ver).unwrap();
+        std::fs::write(ver.join("bin"), vec![b'x'; 2048]).unwrap();
+    }
+
     /// Write the app home's mise `config.toml` (the `mise use` record).
     fn write_home_mise_config(&self, app: &str, body: &str) {
         let dir = self
@@ -743,6 +753,69 @@ fn the_size_reporting_verbs_say_the_figure_is_data_not_reclaimed_space() {
     assert!(
         !String::from_utf8_lossy(&json.stdout).contains("storage status"),
         "the caveat is prose for a reader, not a field for a script"
+    );
+}
+
+/// A global app's install pool is per project, so a version it equipped there stays behind when the
+/// app's own activation record moves on: the tool is still declared and still current, and an older
+/// copy of it sits in a pool nothing reaches. `--stale` is the only thing that reaches it, since
+/// plain `prune` asks whether the *tool* is declared and this one is.
+#[test]
+fn prune_stale_drops_a_pool_version_no_activation_asks_for() {
+    let fx = fixture_with_a_leftover();
+    // The app's record names 2.0.0; its pool in a project still holds 1.0.0 from an earlier launch.
+    fx.write_home_mise_config("demo-app", "[tools]\n\"aqua:demo/keep\" = \"2.0.0\"\n");
+    fx.install_pool_tool("demo-app", "testproj", "aqua-demo-keep", "1.0.0");
+    let pool = fx
+        .data_home
+        .path()
+        .join("sbx/projects/testproj/apps/demo-app/mise/installs/aqua-demo-keep/1.0.0");
+    // The tree has to name a project that exists, or the pool is skipped: what that project's mise
+    // file asks for is part of the answer, and it cannot be read once the directory is gone.
+    let marker = fx.data_home.path().join("sbx/projects/testproj/project");
+    std::fs::write(&marker, fx.proj.path().as_os_str().as_bytes()).unwrap();
+
+    let preview = fx.run(&["app", "prune", "demo-app", "--stale"]);
+    assert!(preview.status.success(), "{}", text(&preview));
+    let s = String::from_utf8_lossy(&preview.stdout);
+    assert!(
+        s.contains("1.0.0") && s.contains("stale version"),
+        "the preview must name the version and why:\n{s}"
+    );
+    assert!(pool.exists(), "a preview removes nothing");
+
+    let applied = fx.run(&["app", "prune", "demo-app", "--stale", "--yes"]);
+    assert!(applied.status.success(), "{}", text(&applied));
+    assert!(
+        !pool.exists(),
+        "the applied run removes it: {}",
+        text(&applied)
+    );
+    assert!(
+        fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir(),
+        "the app's own current install is untouched"
+    );
+}
+
+/// Without `--stale` the pool version is not in scope: the flag is what widens the verb, and a
+/// `prune` that dropped versions by default would delete on a line that asked about tools.
+#[test]
+fn prune_leaves_a_stale_pool_version_alone_unless_asked() {
+    let fx = fixture_with_a_leftover();
+    fx.write_home_mise_config("demo-app", "[tools]\n\"aqua:demo/keep\" = \"2.0.0\"\n");
+    fx.install_pool_tool("demo-app", "testproj", "aqua-demo-keep", "1.0.0");
+    let marker = fx.data_home.path().join("sbx/projects/testproj/project");
+    std::fs::write(&marker, fx.proj.path().as_os_str().as_bytes()).unwrap();
+
+    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        fx.data_home
+            .path()
+            .join("sbx/projects/testproj/apps/demo-app/mise/installs/aqua-demo-keep/1.0.0")
+            .exists(),
+        "a prune without --stale must not touch a pool version: {}",
+        text(&out)
     );
 }
 

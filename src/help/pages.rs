@@ -2305,12 +2305,16 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "prune"],
-        synopsis: "sbx app prune <name>|--all [--caches] [--yes]",
-        summary: "remove an app home's undeclared mise tools, and with --caches its caches",
+        synopsis: "sbx app prune <name>|--all [--caches] [--stale] [--yes]",
+        summary: "remove an app home's undeclared mise tools, its caches, and its stale versions",
         options: &[
             ("<name>", "the app whose home(s) to prune"),
             ("--all", "sweep every app that has an installed home"),
             ("--caches", "also empty each home's cache directory"),
+            (
+                "--stale",
+                "also drop installed versions no activation asks for",
+            ),
             ("-y, --yes", "apply the removal (previews by default)"),
         ],
         details: "Removes the mise tools an app's home(s) carry that the app's config does not declare —\n\
@@ -2333,6 +2337,16 @@ pub(super) const PAGES: &[Page] = &[
             tree survives until its last reference goes. `sbx storage status` reports what the\n\
             volume actually holds, and on an image the freed blocks return to the host only after a\n\
             discard.\n\
+            \n\
+            `--stale` additionally drops, from each pool, an installed **version** no activation\n\
+            asks for. That is a different question from an undeclared tool: the tool may be\n\
+            declared and current, while an older version of it sits in a per-project pool that\n\
+            nothing reaches any more. The activations read are the app's own record, which is\n\
+            app-global, and the project's mise file, where a `mise use` without `-g` writes; an\n\
+            alias (`latest`, `2`) is resolved against the pool rather than matched as text. A tool\n\
+            no activation mentions **at all** is left alone: that means the file asking for it may\n\
+            simply not have been read, and a pool whose project directory is gone is skipped for\n\
+            the same reason (`sbx projects rm --dead` is the verb for those trees).\n\
             \n\
             `--all` sweeps every app that has an installed home rather than one named — it widens\n\
             the scope the way `sbx gc --all` does, and means something different there. Naming an\n\

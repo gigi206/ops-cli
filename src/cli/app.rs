@@ -2098,6 +2098,8 @@ struct PruneArgs {
     all: bool,
     /// `--caches`: also empty each home's cache directory.
     caches: bool,
+    /// `--stale`: also drop installed versions no activation asks for.
+    stale: bool,
     /// `--yes`: apply, rather than preview.
     apply: bool,
 }
@@ -2107,10 +2109,12 @@ struct PruneArgs {
 /// selector that stands *instead* of the name, and two switches that compose.
 fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
     let (mut name, mut all, mut caches, mut apply) = (None, false, false, false);
+    let mut stale = false;
     for a in args {
         match a.to_str() {
             Some("--all") => all = true,
             Some("--caches") => caches = true,
+            Some("--stale") => stale = true,
             Some("-y") | Some("--yes") => apply = true,
             Some("--help") | Some("-h") => return Err(help::show(&["app", "prune"])),
             Some(flag) if flag.starts_with('-') => {
@@ -2146,6 +2150,7 @@ fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
         name,
         all,
         caches,
+        stale,
         apply,
     })
 }
@@ -2155,6 +2160,7 @@ fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
 struct PruneTotals {
     tools: usize,
     caches: usize,
+    versions: usize,
     bytes: u64,
 }
 
@@ -2169,6 +2175,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         name,
         all,
         caches,
+        stale,
         apply,
     } = match parse_prune_args(args) {
         Ok(parsed) => parsed,
@@ -2285,6 +2292,55 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                 );
             }
         }
+
+        if !stale {
+            continue;
+        }
+        // A home's own activation record governs its own pool, and nothing else reaches it.
+        for home in &homes {
+            let specs = sandbox::mise_tool_specs(&home.dir.join(".config/mise/config.toml"));
+            let installs = home.dir.join(".local/share/mise/installs");
+            let stale_versions = sandbox::prune_stale_versions(&installs, &specs, apply);
+            report_stale(
+                &stale_versions,
+                app_name,
+                "global home",
+                all,
+                &pal,
+                &mut totals,
+            );
+        }
+        // A per-project pool is governed by two files: the app's own activation record, which is
+        // app-global and stays in its home, and the project's mise file, where a `mise use` without
+        // `-g` writes. Reading only the first would call stale a version the project asks for.
+        for pool in sandbox::inspect::app_per_project_mise_pools(layout.data_dir(), app_name) {
+            let tree = layout.data_dir().join("projects").join(&pool.project_id);
+            let Some(project) = sandbox::read_marker(&tree) else {
+                continue;
+            };
+            // The project directory is gone, so its mise file cannot be read and what it asked for
+            // is unknown. A tree in that state is removed whole by `sbx projects rm --dead`, which
+            // is the verb for it; guessing here would delete on a reading that was never made.
+            if !project.is_dir() {
+                continue;
+            }
+            let mut specs = sandbox::mise_tool_specs(
+                &layout
+                    .data_dir()
+                    .join("apps")
+                    .join(app_name)
+                    .join("home/.config/mise/config.toml"),
+            );
+            for file in crate::trust::mise_files_for(&project.join(".sbx.toml")) {
+                for (tool, versions) in sandbox::mise_tool_specs(&file) {
+                    specs.entry(tool).or_default().extend(versions);
+                }
+            }
+            let stale_versions =
+                sandbox::prune_stale_versions(&pool.dir.join("installs"), &specs, apply);
+            let where_ = format!("project {} mise pool", pool.project_id);
+            report_stale(&stale_versions, app_name, &where_, all, &pal, &mut totals);
+        }
     }
 
     for line in &skipped {
@@ -2294,15 +2350,16 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         had_error = true;
     }
 
-    if totals.tools == 0 && totals.caches == 0 {
+    if totals.tools == 0 && totals.caches == 0 && totals.versions == 0 {
         let subject = match &name {
             Some(n) => n.clone(),
             None => "no app".to_string(),
         };
-        let what = if caches {
-            "undeclared mise tools or caches"
-        } else {
-            "undeclared mise tools"
+        let what = match (caches, stale) {
+            (false, false) => "undeclared mise tools",
+            (true, false) => "undeclared mise tools or caches",
+            (false, true) => "undeclared mise tools or stale versions",
+            (true, true) => "undeclared mise tools, caches or stale versions",
         };
         println!("{h}sbx app prune{r} {dim}— {subject}: no {what} to prune.{r}");
         return if had_error {
@@ -2313,7 +2370,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     }
 
     let size = sandbox::human_bytes(totals.bytes);
-    let subject = prune_subject(totals.tools, totals.caches);
+    let subject = prune_subject(totals.tools, totals.caches, totals.versions);
     if apply {
         println!("{ok}pruned {subject}, freeing {size} of data.{r}");
     } else {
@@ -2343,6 +2400,37 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// Print one pool's stale versions and fold them into the run's totals. Written once because the
+/// homes and the per-project pools report identically and differ only in where they are.
+fn report_stale(
+    versions: &[sandbox::PrunedVersion],
+    app_name: &str,
+    location: &str,
+    all: bool,
+    pal: &style::Palette,
+    totals: &mut PruneTotals,
+) {
+    if versions.is_empty() {
+        return;
+    }
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    if all {
+        println!("{n}{app_name}{r} {dim}{location}:{r}");
+    } else {
+        println!("{dim}{location}:{r}");
+    }
+    for v in versions {
+        totals.versions += 1;
+        totals.bytes += v.bytes;
+        println!(
+            "  {n}{}@{}{r}  {dim}{} (no activation asks for it){r}",
+            v.token,
+            v.version,
+            sandbox::human_bytes(v.bytes)
+        );
+    }
+}
+
 /// The app's declared `mise:` tokens; a tool matching none of them is undeclared. A home-only app
 /// (no config) declares nothing, so every mise tool in its home is prunable.
 fn declared_mise_tokens(resolved: &config::Resolved, name: &str) -> Vec<String> {
@@ -2364,11 +2452,24 @@ fn declared_mise_tokens(resolved: &config::Resolved, name: &str) -> Vec<String> 
 /// `2 undeclared tool(s) and 3 cache(s)`, dropping either half when it is empty — the phrase both
 /// the preview and the applied line are built from, so the two can never describe the same run
 /// differently.
-fn prune_subject(tools: usize, caches: usize) -> String {
-    match (tools, caches) {
-        (0, c) => format!("{c} cache(s)"),
-        (t, 0) => format!("{t} undeclared tool(s)"),
-        (t, c) => format!("{t} undeclared tool(s) and {c} cache(s)"),
+fn prune_subject(tools: usize, caches: usize, versions: usize) -> String {
+    let mut parts = Vec::new();
+    if tools > 0 {
+        parts.push(format!("{tools} undeclared tool(s)"));
+    }
+    if caches > 0 {
+        parts.push(format!("{caches} cache(s)"));
+    }
+    if versions > 0 {
+        parts.push(format!("{versions} stale version(s)"));
+    }
+    match parts.len() {
+        0 => "nothing".to_string(),
+        1 => parts.remove(0),
+        _ => {
+            let last = parts.pop().unwrap_or_default();
+            format!("{} and {last}", parts.join(", "))
+        }
     }
 }
 

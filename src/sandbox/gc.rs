@@ -612,7 +612,7 @@ fn reap_dead_projects_with(
 /// The canonical project path recorded in `<dir>/project`, if the marker is present and holds an
 /// absolute path. An absent, unreadable, empty, or non-absolute marker yields `None` — the tree is
 /// then treated as unidentified, never reaped on a path that cannot be trusted.
-fn read_marker(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn read_marker(dir: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let bytes = std::fs::read(dir.join(super::projectstore::PROJECT_MARKER)).ok()?;
     if bytes.is_empty() {
@@ -996,6 +996,139 @@ pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Ve
         prune_mise_config(&cfg, declared);
     }
     pruned
+}
+
+/// The version specs a mise config's `[tools]` table carries, keyed by the tool's **munged**
+/// directory name so a caller can look one up from what is on disk.
+///
+/// `"aqua:anthropics/claude-code" = "2.1.266"` yields `aqua-anthropics-claude-code -> ["2.1.266"]`.
+/// A spec may name a version, or an alias (`latest`, `2`) the pool resolves; both are kept verbatim,
+/// since resolving one needs the pool this is matched against. A table entry whose value is not a
+/// string (mise accepts an inline table for options) contributes its `version` field when it has
+/// one, and nothing otherwise: a spec that cannot be read must not narrow what is considered wanted.
+/// An absent or unparsable file yields nothing.
+pub(crate) fn mise_tool_specs(path: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut specs: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return specs;
+    };
+    let Ok(doc) = body.parse::<toml::Table>() else {
+        return specs;
+    };
+    let Some(toml::Value::Table(tools)) = doc.get("tools") else {
+        return specs;
+    };
+    for (key, value) in tools {
+        let entry = specs.entry(super::inspect::mise_munge(key)).or_default();
+        match value {
+            toml::Value::String(v) => entry.push(v.clone()),
+            toml::Value::Array(vs) => {
+                entry.extend(vs.iter().filter_map(|v| v.as_str().map(str::to_string)));
+            }
+            toml::Value::Table(t) => {
+                if let Some(v) = t.get("version").and_then(toml::Value::as_str) {
+                    entry.push(v.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    specs
+}
+
+/// One installed version `sbx app prune --stale` would remove (or removed) from a mise pool.
+pub(crate) struct PrunedVersion {
+    /// The tool's backend token (`aqua:anthropics/claude-code`), for the report.
+    pub(crate) token: String,
+    /// The version directory that was (or would be) freed.
+    pub(crate) version: String,
+    /// Its on-disk size.
+    pub(crate) bytes: u64,
+}
+
+/// Remove, from a mise `installs/` directory, the versions no activation asks for — `sbx app prune
+/// --stale`.
+///
+/// `wanted` maps a tool's munged directory name to the version specs the activations that govern
+/// this pool carry for it. A spec is resolved *against the pool*: mise writes `latest`, `2` and
+/// `2.1` as symlinks beside the version directory they name, so a spec is matched by following the
+/// entry it names rather than by comparing strings, and a pool whose `latest` points elsewhere does
+/// not keep a version alive under that name.
+///
+/// A tool with **no** spec is left entirely alone. Having no spec does not mean nothing wants it: it
+/// equally means the activation that does was not among the files read, and deleting on that
+/// reading would take a tool a project still asks for. What an app does not declare at all is
+/// [`prune_app_tools`]'s question, answered from the app's config rather than from this pool.
+///
+/// Alias symlinks pointing at a removed version go with it, so the pool is not left with links to
+/// nothing. With `apply = false` nothing is removed.
+pub(crate) fn prune_stale_versions(
+    installs: &Path,
+    wanted: &std::collections::BTreeMap<String, Vec<String>>,
+    apply: bool,
+) -> Vec<PrunedVersion> {
+    let mut pruned = Vec::new();
+    for tool in super::inspect::mise_installed_in(installs) {
+        let Some(specs) = wanted.get(&super::inspect::mise_munge(&tool.name)) else {
+            continue;
+        };
+        let tool_dir = installs.join(&tool.dir_name);
+        // Each spec names an entry in the tool's directory: the version itself, or an alias link to
+        // it. Reading the link is what makes `latest` mean the version it currently points at.
+        let mut live: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for spec in specs {
+            let named = tool_dir.join(spec);
+            match std::fs::read_link(&named) {
+                Ok(target) => {
+                    if let Some(v) = target.file_name() {
+                        live.insert(v.to_string_lossy().into_owned());
+                    }
+                }
+                Err(_) if named.is_dir() => {
+                    live.insert(spec.clone());
+                }
+                Err(_) => {}
+            }
+        }
+        for version in &tool.versions {
+            if live.contains(version) {
+                continue;
+            }
+            let dir = tool_dir.join(version);
+            let bytes = tree_size(&dir);
+            if apply {
+                if force_remove_dir_all(&dir).is_err() {
+                    continue;
+                }
+                drop_dangling_aliases(&tool_dir);
+            }
+            pruned.push(PrunedVersion {
+                token: tool.label().to_string(),
+                version: version.clone(),
+                bytes,
+            });
+        }
+    }
+    pruned
+}
+
+/// Remove the alias symlinks in a tool's install directory whose target no longer exists. mise
+/// writes `latest`, `2` and `2.1` beside the version they name, so removing that version leaves
+/// links to nothing, and a `mise which` following one reports a path rather than an absence.
+fn drop_dangling_aliases(tool_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(tool_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_link = std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link && !path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// One cache tree `sbx app prune --caches` would remove (or removed) from an app home.
@@ -1811,6 +1944,121 @@ mod tests {
         assert!(
             !installs.join("drop-me").exists(),
             "the undeclared one goes"
+        );
+    }
+
+    /// Build a pool holding `tool` at each of `versions`, with mise's alias links (`latest` and the
+    /// truncations) pointing at the first one, the way mise writes them.
+    fn pool_with(installs: &Path, tool: &str, versions: &[&str], aliases: &[(&str, &str)]) {
+        for v in versions {
+            let dir = installs.join(tool).join(v);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("bin"), vec![b'x'; 2048]).unwrap();
+        }
+        for (alias, target) in aliases {
+            std::os::unix::fs::symlink(format!("./{target}"), installs.join(tool).join(alias))
+                .unwrap();
+        }
+    }
+
+    /// The version an activation names stays and the others go. This is the whole verb: a pool
+    /// carrying a version nothing asks for is holding it for no reader.
+    #[test]
+    fn stale_prune_keeps_the_version_an_activation_names() {
+        let tmp = TmpDir::new();
+        let installs = tmp.path().join("installs");
+        pool_with(&installs, "demo-tool", &["1.0.0", "2.0.0"], &[]);
+        let wanted = std::collections::BTreeMap::from([(
+            "demo-tool".to_string(),
+            vec!["2.0.0".to_string()],
+        )]);
+
+        let pruned = prune_stale_versions(&installs, &wanted, true);
+
+        assert_eq!(
+            pruned.iter().map(|p| p.version.clone()).collect::<Vec<_>>(),
+            vec!["1.0.0".to_string()],
+            "only the version nothing asks for goes"
+        );
+        assert!(
+            installs.join("demo-tool/2.0.0").exists(),
+            "the named one stays"
+        );
+        assert!(!installs.join("demo-tool/1.0.0").exists(), "the other goes");
+    }
+
+    /// An activation may name an alias rather than a version, and mise writes aliases as links
+    /// beside the version. Matching the spec as a string would call the version stale although
+    /// `latest` is exactly what asks for it.
+    #[test]
+    fn stale_prune_follows_an_alias_to_the_version_it_names() {
+        let tmp = TmpDir::new();
+        let installs = tmp.path().join("installs");
+        pool_with(&installs, "demo-tool", &["3.1.4"], &[("latest", "3.1.4")]);
+        let wanted = std::collections::BTreeMap::from([(
+            "demo-tool".to_string(),
+            vec!["latest".to_string()],
+        )]);
+
+        let pruned = prune_stale_versions(&installs, &wanted, true);
+
+        assert!(
+            pruned.is_empty(),
+            "a version reached through an alias is asked for, got {:?}",
+            pruned.iter().map(|p| &p.version).collect::<Vec<_>>()
+        );
+        assert!(installs.join("demo-tool/3.1.4").exists());
+    }
+
+    /// A tool with no spec at all is left alone. Having no spec does not prove nothing wants it: it
+    /// equally means the file that asks for it was not among those read, and deleting on that
+    /// reading would take a tool a project still needs.
+    #[test]
+    fn stale_prune_leaves_a_tool_no_activation_mentions_untouched() {
+        let tmp = TmpDir::new();
+        let installs = tmp.path().join("installs");
+        pool_with(&installs, "unmentioned", &["1.0.0"], &[]);
+        let wanted = std::collections::BTreeMap::from([(
+            "other-tool".to_string(),
+            vec!["9.9.9".to_string()],
+        )]);
+
+        let pruned = prune_stale_versions(&installs, &wanted, true);
+
+        assert!(
+            pruned.is_empty(),
+            "a tool with no spec is not this verb's business"
+        );
+        assert!(installs.join("unmentioned/1.0.0").exists());
+    }
+
+    /// Removing a version leaves the links mise wrote beside it pointing at nothing, and a `mise
+    /// which` following one reports a path where there is no file. They go with it.
+    #[test]
+    fn stale_prune_drops_the_aliases_that_pointed_at_what_it_removed() {
+        let tmp = TmpDir::new();
+        let installs = tmp.path().join("installs");
+        pool_with(
+            &installs,
+            "demo-tool",
+            &["1.0.0", "2.0.0"],
+            &[("latest", "1.0.0"), ("2", "2.0.0")],
+        );
+        let wanted = std::collections::BTreeMap::from([(
+            "demo-tool".to_string(),
+            vec!["2.0.0".to_string()],
+        )]);
+
+        let pruned = prune_stale_versions(&installs, &wanted, true);
+
+        assert_eq!(pruned.len(), 1);
+        assert!(
+            std::fs::symlink_metadata(installs.join("demo-tool/latest")).is_err(),
+            "the link to the removed version must go with it"
+        );
+        assert!(
+            installs.join("demo-tool/2").exists(),
+            "a link to a version that stays is untouched"
         );
     }
 

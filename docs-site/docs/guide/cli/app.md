@@ -12,7 +12,7 @@ sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
 sbx app list
 sbx app show <name> [--json]
-sbx app prune <name>|--all [--caches] [-y|--yes]
+sbx app prune <name>|--all [--caches] [--stale] [-y|--yes]
 ```
 
 `sbx app run <name>` launches a named application profile: a project `[app.<name>]`
@@ -433,6 +433,26 @@ app holds in total.
 The sizes it prints carry the same caveat as everywhere else: see
 [what a size means](#listing-apps).
 
+### Dropping stale versions
+
+`--stale` drops, from each of the app's pools, an installed **version** that no activation asks
+for. This is a different question from an undeclared tool: the tool can be declared and current
+while an older version of it sits in a per-project pool that nothing reaches. That happens
+because a global app's install pool is scoped per project (see
+[Two mise pools](../apps/home#two-mise-pools-keep-a-global-apps-self-equips-aligned)), so a
+version equipped there stays behind when the app's own record moves on.
+
+Two files are read to decide: the app's activation record, which is app-global and lives in its
+home, and the project's mise file, where a `mise use` without `-g` writes. An alias such as
+`latest` or `2` is resolved **against the pool**, by following the link mise wrote beside the
+version, rather than compared as text: a pool whose `latest` points at the version an activation
+names is asking for it.
+
+What it deliberately leaves alone: a tool no activation mentions at all (that may mean the file
+asking for it was not among those read, and a tool the app does not declare is what plain
+`prune` is for), and a pool whose project directory is gone (its tree is removed whole by
+[`sbx projects rm --dead`](projects#rm)).
+
 Under `--all`, an app whose session is running is **skipped and named** rather than refusing
 the whole sweep, so one live agent does not hold up the rest; the sweep then exits non-zero
 so a script notices that not everything was covered.
@@ -453,6 +473,7 @@ sbx app show claude-code               # what this app has actually installed on
 sbx app prune hermes                    # preview undeclared mise tools in hermes' home
 sbx app prune hermes --yes              # …and remove them
 sbx app prune hermes --caches           # …preview its downloaded caches too
+sbx app prune hermes --stale            # …and versions nothing asks for any more
 sbx app prune --all --caches            # what every app's caches hold, across all homes
 sbx app prune --all --caches --yes      # …and empty them
 sbx app export claude-code > my-claude.toml
