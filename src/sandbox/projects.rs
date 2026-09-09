@@ -460,7 +460,7 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
     let _ = writeln!(s, "  last:     {dim}{}{r}", v.last_used);
     let _ = writeln!(
         s,
-        "  disk:     {}  {dim}(store {} · home {} · other {}){r}",
+        "  disk:     {} apparent  {dim}(store {} · home {} · other {}){r}",
         super::gc::human_bytes(v.total_bytes),
         super::gc::human_bytes(v.store_bytes),
         super::gc::human_bytes(v.home_bytes),
@@ -569,7 +569,7 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
     }
     let total: u64 = rows.iter().map(|row| row.bytes).sum();
     println!(
-        "{h}sbx projects{r} {dim}({} tree(s), {}){r}",
+        "{h}sbx projects{r} {dim}({} tree(s), {} apparent){r}",
         rows.len(),
         super::gc::human_bytes(total)
     );
@@ -593,7 +593,10 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
     println!(
         "{}",
         crate::style::dim_prose(
-            "remove one with `sbx projects rm <id>`; sweep dead trees with `sbx projects rm --dead --yes`.",
+            "sizes are apparent, not what removal returns: a tree seeded from the shared store \
+             shares its blocks with it where the filesystem supports that, so a tree usually \
+             frees far less than it reads. remove one with `sbx projects rm <id>`; sweep dead \
+             trees with `sbx projects rm --dead --yes`.",
             pal
         )
     );

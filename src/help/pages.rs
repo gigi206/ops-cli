@@ -2099,8 +2099,16 @@ pub(super) const PAGES: &[Page] = &[
         ],
         details: "The per-project runtime trees live under `<data>/projects/<id>` and hold each\n\
             project's writable store, isolated home, and locks. `sbx projects list` lists them\n\
-            (richer than `sbx path`'s projects section — it adds each tree's on-disk size); `sbx\n\
+            (richer than `sbx path`'s projects section — it adds each tree's size); `sbx\n\
             projects rm` removes them.\n\
+            \n\
+            **The sizes are apparent, not what a removal returns.** A tree's store is seeded from\n\
+            the shared one, and on a filesystem that shares blocks (btrfs, xfs with reflinks) the\n\
+            seed shares them rather than copying, so most of what a tree reads is storage it holds\n\
+            in common with the shared store and with its sibling trees. Removing it frees only what\n\
+            it alone holds, which is usually a small fraction of the figure shown, and on an image\n\
+            the freed blocks return to the host only after a discard. `sbx storage status` reports\n\
+            the volume's own numbers, which are the ones to plan against.\n\
             \n\
             A named `rm <id>` removes immediately (you named it, so it is not an accident); pass\n\
             `--dry-run` to preview first. The bulk selectors `--dead` and `--markerless` preview\n\
@@ -2281,8 +2289,10 @@ pub(super) const PAGES: &[Page] = &[
             declared packages/tools that are **not** built yet (an untrusted one flagged `withheld`,\n\
             distinct from a trusted one simply not equipped yet). The store is shared by the project\n\
             and every app launched in it, so the roots include app packages. A dead tree (its project\n\
-            directory gone) shows realized state only. Read-only: no sandbox, no nix, no network. For\n\
-            an app rather than a tree, see `sbx app show <name>`.",
+            directory gone) shows realized state only. Every size here is **apparent**: a tree is\n\
+            seeded from the shared store, and on a filesystem that shares blocks the seed shares\n\
+            them, so a tree's size is what it reads rather than what removing it returns. Read-only:\n\
+            no sandbox, no nix, no network. For an app rather than a tree, see `sbx app show <name>`.",
     },
     Page {
         path: &["app", "prune"],

@@ -22,10 +22,20 @@ See also: [`sbx gc`](gc) · [`sbx path`](path) · [Garbage collection](../housek
 
 ## `list`
 
-Lists every runtime tree with its id, state, on-disk size, last-used date, and
+Lists every runtime tree with its id, state, apparent size, last-used date, and
 recorded project path, richer than [`sbx path`](path)'s `projects/` section, which omits
 the size. The tree of the directory you are in is marked `*`. `sbx projects ls` is an
 accepted alias.
+
+:::warning The sizes are apparent, not what a removal returns
+A tree's store is **seeded from the shared one**, and on a filesystem that shares blocks
+(btrfs, or xfs with reflinks) the seed shares them instead of copying. So most of what a
+tree reads is storage it holds in common with the shared store and with its sibling trees,
+and removing it frees only the part it alone holds, which is usually a small fraction of
+the figure shown. On an image, the freed blocks return to the host only after a discard.
+Plan against [`sbx storage status`](storage), which reports the volume's own numbers, and
+reclaim the closures a removal orphans with [`sbx gc`](gc).
+:::
 
 Each tree's **state**:
 
@@ -40,7 +50,8 @@ Each tree's **state**:
 
 ## `show`
 
-`sbx projects show <id>` reports one tree's **realized-on-disk** detail:
+`sbx projects show <id>` reports one tree's realized detail, with the caveat above applying
+to every size it prints:
 
 - its **state** and **size**, broken down `store` / `home` / `other`;
 - the **nixpkgs** channel or per-project pin it resolves against;
