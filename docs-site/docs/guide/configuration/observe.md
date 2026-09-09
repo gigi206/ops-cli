@@ -87,8 +87,10 @@ running session, so a finished one's invocations are read through `sbx logs <id>
 
 ## Discarding one
 
-There is no verb for it. A record lives at `<data>/<feed>/record-<pid>-<incarnation>.log` (`sbx
-storage status` prints where `<data>` is), and `rm` on that path is the way. `sbx gc` deliberately
+There is no verb for it. A record lives at `<data>/<dir>/record-<pid>-<incarnation>.log` (`sbx
+storage status` prints where `<data>` is), and `rm` on that path is the way. The directory is the
+feed's own, and two of them are not named after the feed: `proc/`, `fs/`, `ssh-agent/`, `broker/`,
+`signer/`, then `egress/` for `net` and `tasks/` for `task`. `sbx gc` deliberately
 leaves records alone: a sweep keyed on liveness would delete one at the moment it became the only
 answer left.
 

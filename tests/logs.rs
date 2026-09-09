@@ -669,3 +669,72 @@ fn the_merged_view_refuses_a_session_that_records_nothing() {
         "each feed says why it in particular is not there: {err}"
     );
 }
+
+/// A pid the kernel wrapped its counter round onto names two sessions, and the merged view has to
+/// read exactly one of them. Resolving the incarnation once per directory — each feed taking the
+/// newest file under the pid in its own — builds a single page of audit out of two sessions: the
+/// older one's exec record beside the newer one's broker record, under a header naming one session.
+/// Only a run of the real command checks that, because the resolution can be right in the helper
+/// and wrong at the call site that reads each feed.
+#[test]
+fn a_reused_pid_reads_one_session_across_every_feed() {
+    let dir = TmpDir::new("l");
+    let data = dir.path();
+    let project = TmpDir::new("p");
+    // The header a launch writes is the canonical project path, which is what the reader derives
+    // from its own cwd: one derivation, so the fixture cannot drift from the product.
+    let canon = std::fs::canonicalize(project.path()).unwrap();
+
+    // Session (7, 100) recorded an exec lens and a broker; the later (7, 200) only its broker.
+    for (lens, ticks, event) in [
+        (
+            "proc",
+            100,
+            "event seq=1 at=1700000000100 pid=9 verdict=observe cmd=/bin/of-the-older-session",
+        ),
+        (
+            "broker",
+            100,
+            "event seq=1 at=1700000000100 kind=forward detail=gpg-agent: the older session",
+        ),
+        (
+            "broker",
+            200,
+            "event seq=1 at=1700000000200 kind=forward detail=gpg-agent: the newer session",
+        ),
+    ] {
+        let lens_dir = data.join("sbx").join(lens);
+        std::fs::create_dir_all(&lens_dir).unwrap();
+        std::fs::write(
+            lens_dir.join(format!("record-7-{ticks}.log")),
+            format!("project={}\n{event}\n", canon.display()),
+        )
+        .unwrap();
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["logs", "7"])
+        .current_dir(&canon)
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("run the merged view");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("more than one session recorded under pid 7"),
+        "the choice is announced: {text}"
+    );
+    assert!(text.contains("the newer session"), "{text}");
+    assert!(
+        !text.contains("the older session"),
+        "each feed answers for the session that was resolved, not for the newest file it holds \
+         under that pid: {text}"
+    );
+    assert!(
+        !text.contains("of-the-older-session"),
+        "and a lens the resolved session never used shows nothing: {text}"
+    );
+    assert!(
+        text.contains("recorded: broker"),
+        "the header names the feeds of the one session being read: {text}"
+    );
+}
