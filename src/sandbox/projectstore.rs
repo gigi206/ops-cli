@@ -62,13 +62,17 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Owner-only mode for the directories the seed creates. The shared store makes
-/// path directories read-only (`0555`); the seed creates owner-writable ones
-/// instead, so it can populate them and the cage's nix can later add new paths.
+/// Owner-only mode for the directories the seed creates while it fills them, and the
+/// mode sbx's own runtime-tree directories keep for good. A store path's directories
+/// are read-only (`0555`) in the shared store, and a copy created at that mode could
+/// take no entry, so [`copy_recursive`] creates each one writable and restores the
+/// source's mode once it is full: a placed store path ends up mode-identical to the
+/// one it was copied from.
 ///
-/// A path's content hash does not cover directory modes, so this does not affect
-/// `nix-store --verify`; the copied *files* keep their own modes (`std::fs::copy`
-/// and the reflink path both preserve them).
+/// A path's content hash does not cover directory modes, so neither the mode a
+/// directory is built at nor the one it is sealed to affects `nix-store --verify`;
+/// the copied *files* keep their own modes (`std::fs::copy` and the reflink path both
+/// preserve them).
 const DIR_MODE: u32 = 0o700;
 
 /// A per-process counter feeding the unique temporary names the seed renames from
@@ -365,22 +369,32 @@ fn place_atomically(tmp: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
-/// Recursively copy `from` to a fresh `to`: directories are created owner-writable
-/// and recursed into, symlinks are recreated (never dereferenced), and regular
-/// files are copied as physically independent copies (reflinked when `reflink_ok`,
-/// else fully copied). `to` is assumed not to exist — the caller copies into a
-/// unique temporary, so there is no existing content to preserve here.
+/// Recursively copy `from` to a fresh `to`: directories are created owner-writable,
+/// recursed into, then sealed to the mode of the directory they were copied from;
+/// symlinks are recreated (never dereferenced); and regular files are copied as
+/// physically independent copies (reflinked when `reflink_ok`, else fully copied). `to`
+/// is assumed not to exist — the caller copies into a unique temporary, so there is no
+/// existing content to preserve here.
+///
+/// Sealing is what gives a seeded path the shape nix gives its own (`0555`), so a stray
+/// recursive delete meets the same refusal in a project's store as in the shared one,
+/// and the two copies of a path differ in no attribute a walk can read. It is **not** a
+/// boundary against the cage: the cage runs as the uid that owns these paths, and an
+/// owner may `chmod` what it owns. What protects the shared store is that the cage never
+/// holds it — the copy is physically independent ([`place_file`]) — never a mode.
 fn copy_recursive(from: &Path, to: &Path, reflink_ok: bool) -> io::Result<()> {
     // `symlink_metadata` does not follow symlinks, so a store symlink is recreated
     // rather than dereferenced.
-    let file_type = from.symlink_metadata()?.file_type();
+    let meta = from.symlink_metadata()?;
+    let file_type = meta.file_type();
     if file_type.is_dir() {
         DirBuilder::new().mode(DIR_MODE).create(to)?;
         for entry in fs::read_dir(from)? {
             let entry = entry?;
             copy_recursive(&entry.path(), &to.join(entry.file_name()), reflink_ok)?;
         }
-        Ok(())
+        // After the entries, never before: a directory sealed read-only takes none.
+        fs::set_permissions(to, meta.permissions())
     } else if file_type.is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(from)?, to)
     } else {
@@ -464,11 +478,15 @@ fn unique() -> String {
 }
 
 /// Remove a temporary placement, whether it ended up a directory tree or a single
-/// file/symlink. Best effort: the temp is owner-writable (its directories are
-/// created `0700`), so removal succeeds; a leftover only wastes disk, never
-/// corrupts the store (it never carries a real store-path name).
+/// file/symlink. Goes through [`super::gc::force_remove_dir_all`], which adds write
+/// to each directory as it descends: a temp [`copy_recursive`] finished is sealed
+/// read-only like the store path it is about to become, and a plain
+/// `remove_dir_all` cannot empty such a directory. Best effort, since a leftover
+/// only wastes disk and never corrupts the store (it never carries a real
+/// store-path name) — but a leftover that survived *would* fail the next seed of
+/// that path, whose non-recursive dir-create meets it as `EEXIST`.
 fn discard(path: &Path) {
-    if fs::remove_dir_all(path).is_err() {
+    if super::gc::force_remove_dir_all(path).is_err() {
         let _ = fs::remove_file(path);
     }
 }
@@ -959,6 +977,34 @@ mod tests {
     }
 
     #[test]
+    fn copy_recursive_seals_each_directory_to_its_source_mode() {
+        // A real store path arrives read-only (`0555`), which is the mode a copy has to
+        // end at and cannot be built at: a directory sealed before its entries takes
+        // none. Both halves are asserted here, the second by the content being present.
+        let base = TmpDir::new();
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("bin/tool"), b"payload").unwrap();
+        // nix's own shape: every directory of the path read-only, written innermost
+        // first so each one is still writable when its entries are placed
+        for d in ["bin", ""] {
+            std::fs::set_permissions(src.join(d), std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        copy_recursive(&src, &dst, false).expect("a read-only source must still copy");
+
+        assert_eq!(std::fs::read(dst.join("bin/tool")).unwrap(), b"payload");
+        for d in ["", "bin"] {
+            let mode = std::fs::metadata(dst.join(d)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o555,
+                "the copy of `{d}` kept the mode it was built at instead of its source's"
+            );
+        }
+    }
+
+    #[test]
     fn seed_path_skips_an_existing_path_and_tops_up_a_missing_one() {
         let base = TmpDir::new();
         let shared = base.join("shared");
@@ -1021,6 +1067,30 @@ mod tests {
 
         copy_into_place(&src, &dest, &tmp, false)
             .expect("a stale temp must be cleared, not fail EEXIST");
+        assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"content");
+        assert!(!tmp.exists(), "the temp was consumed by the atomic rename");
+    }
+
+    #[test]
+    fn copy_into_place_clears_a_stale_temp_dir_that_was_already_sealed() {
+        // The stale temp a crash actually leaves: one `copy_recursive` had finished, so
+        // its directories are sealed read-only and a plain `remove_dir_all` cannot empty
+        // them. Clearing it has to add write back, or the re-seed of that path meets its
+        // own leftover as `EEXIST` and never recovers.
+        let base = TmpDir::new();
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/file"), b"content").unwrap();
+        let dest = base.join("dest");
+        let tmp = base.join(".tmp-sealed-dest");
+        std::fs::create_dir_all(tmp.join("leftover")).unwrap();
+        std::fs::write(tmp.join("leftover/half"), b"partial").unwrap();
+        for d in ["leftover", ""] {
+            std::fs::set_permissions(tmp.join(d), std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        copy_into_place(&src, &dest, &tmp, false)
+            .expect("a sealed stale temp must be cleared, not fail EEXIST");
         assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"content");
         assert!(!tmp.exists(), "the temp was consumed by the atomic rename");
     }
