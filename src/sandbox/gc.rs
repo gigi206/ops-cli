@@ -1018,10 +1018,16 @@ pub(crate) fn prune_app_caches(home: &Path, apply: bool) -> Vec<PrunedCache> {
     // Sorted so two runs over the same home report in the same order, and a preview reads as the
     // list the applying run will work through.
     names.sort();
+    // Sized in one walk rather than one per entry: a package manager's cache runs to 10^5 inodes,
+    // and [`tree_usage_parts`] visits each once while giving every entry its own figure. The
+    // hardlink set being shared across that walk is what keeps the sum of the entries from counting
+    // a file linked into two of them twice.
+    let paths: Vec<PathBuf> = names.iter().map(|name| cache.join(name)).collect();
+    let (_, sizes) = tree_usage_parts(&cache, &paths);
     let mut pruned = Vec::new();
-    for name in names {
+    for (name, size) in names.into_iter().zip(sizes) {
         let entry = cache.join(&name);
-        let bytes = tree_size(&entry);
+        let bytes = size.bytes;
         // Reported only when the removal actually went — the rule [`prune_app_tools`] follows, at a
         // verb that prints a freed total. A plain file directly under the cache directory is not
         // something [`force_remove_dir_all`] can walk, so each kind is removed by its own call.
@@ -1886,6 +1892,30 @@ mod tests {
         assert!(
             cache.join("mise").join("blob").exists(),
             "a preview must remove nothing"
+        );
+    }
+
+    /// A file linked into two entries occupies its blocks once, so the entries must not each claim
+    /// them: the verb adds the reported figures into the total it prints, and sizing every entry on
+    /// its own would count such a file as many times as it is linked.
+    #[test]
+    fn prune_caches_counts_a_file_linked_into_two_entries_once() {
+        let tmp = TmpDir::new();
+        let home = tmp.path().join("home");
+        let cache = home.join(".cache");
+        std::fs::create_dir_all(cache.join("npm")).unwrap();
+        std::fs::create_dir_all(cache.join("pnpm")).unwrap();
+        let payload = cache.join("npm").join("blob");
+        std::fs::write(&payload, vec![b'x'; 8192]).unwrap();
+        std::fs::hard_link(&payload, cache.join("pnpm").join("blob")).unwrap();
+
+        let pruned = prune_app_caches(&home, false);
+
+        let total: u64 = pruned.iter().map(|p| p.bytes).sum();
+        let whole = tree_size(&cache);
+        assert!(
+            total <= whole,
+            "the entries together claimed {total} bytes where the cache holds {whole}"
         );
     }
 

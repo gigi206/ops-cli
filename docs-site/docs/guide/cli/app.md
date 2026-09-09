@@ -418,6 +418,15 @@ is the number to look at before deciding, and [`sbx app list`](#listing-apps) sh
 app holds in total.
 :::
 
+:::warning The sizes are of the data, not of the space returned
+Every figure the verb prints is the size of what it removed. The disk can get back less, for
+two reasons that stack: a volume with compression enabled stored those bytes smaller, so
+removing a gigabyte of data frees less than a gigabyte of blocks; and a block shared with
+another tree survives until the last reference to it goes. Only the filesystem knows either
+number, so read it from [`sbx storage status`](storage), which reports what the volume holds
+and, on an image, how much is waiting on a discard to return to the host.
+:::
+
 Under `--all`, an app whose session is running is **skipped and named** rather than refusing
 the whole sweep, so one live agent does not hold up the rest; the sweep then exits non-zero
 so a script notices that not everything was covered.

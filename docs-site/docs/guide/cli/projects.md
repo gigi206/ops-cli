@@ -32,7 +32,9 @@ A tree's store is **seeded from the shared one**, and on a filesystem that share
 (btrfs, or xfs with reflinks) the seed shares them instead of copying. So most of what a
 tree reads is storage it holds in common with the shared store and with its sibling trees,
 and removing it frees only the part it alone holds, which is usually a small fraction of
-the figure shown. On an image, the freed blocks return to the host only after a discard.
+the figure shown. A second gap stacks on that one: a volume with compression enabled stored
+those bytes smaller, so even the part a tree alone holds frees fewer blocks than it reads.
+On an image, the freed blocks return to the host only after a discard.
 Plan against [`sbx storage status`](storage), which reports the volume's own numbers, and
 reclaim the closures a removal orphans with [`sbx gc`](gc).
 :::

@@ -2294,16 +2294,28 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     let size = sandbox::human_bytes(totals.bytes);
     let subject = prune_subject(totals.tools, totals.caches);
     if apply {
-        println!("{ok}pruned {subject}, freeing {size}.{r}");
+        println!("{ok}pruned {subject}, freeing {size} of data.{r}");
     } else {
         println!(
             "{}",
             style::dim_prose(
-                &format!("would prune {subject} ({size}) — re-run with `--yes` to apply."),
+                &format!("would prune {subject} ({size} of data) — re-run with `--yes` to apply."),
                 &pal
             )
         );
     }
+    // The figure is the size of what was removed, which is what the caller can be told before the
+    // fact. What the disk gets back is another number: a compressing volume stored those bytes
+    // smaller, and a block shared with another tree stays until its last reference goes. Only the
+    // filesystem knows either, so the line points at the verb that asks it rather than guessing.
+    println!(
+        "{}",
+        style::dim_prose(
+            "that is the size of the data; a compressed volume, or blocks shared with another \
+             tree, returns less to the disk: `sbx storage status` reports what it holds.",
+            &pal
+        )
+    );
     if had_error {
         ExitCode::FAILURE
     } else {

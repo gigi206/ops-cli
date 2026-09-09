@@ -2106,9 +2106,11 @@ pub(super) const PAGES: &[Page] = &[
             the shared one, and on a filesystem that shares blocks (btrfs, xfs with reflinks) the\n\
             seed shares them rather than copying, so most of what a tree reads is storage it holds\n\
             in common with the shared store and with its sibling trees. Removing it frees only what\n\
-            it alone holds, which is usually a small fraction of the figure shown, and on an image\n\
-            the freed blocks return to the host only after a discard. `sbx storage status` reports\n\
-            the volume's own numbers, which are the ones to plan against.\n\
+            it alone holds, which is usually a small fraction of the figure shown; a compressing\n\
+            volume stored those bytes smaller, so even that part frees fewer blocks than it reads;\n\
+            and on an image the freed blocks return to the host only after a discard.\n\
+            `sbx storage status` reports the volume's own numbers, which are the ones to plan\n\
+            against.\n\
             \n\
             A named `rm <id>` removes immediately (you named it, so it is not an accident); pass\n\
             `--dry-run` to preview first. The bulk selectors `--dead` and `--markerless` preview\n\
@@ -2318,6 +2320,12 @@ pub(super) const PAGES: &[Page] = &[
             shared between apps. The XDG base directory specification defines that directory as\n\
             non-essential data, so what goes costs a refetch and nothing else; login and session\n\
             state lives elsewhere and is not touched.\n\
+            \n\
+            Every size printed is the size of the **data**: what the disk gets back can be less,\n\
+            because a compressing volume stored those bytes smaller and a block shared with another\n\
+            tree survives until its last reference goes. `sbx storage status` reports what the\n\
+            volume actually holds, and on an image the freed blocks return to the host only after a\n\
+            discard.\n\
             \n\
             `--all` sweeps every app that has an installed home rather than one named — it widens\n\
             the scope the way `sbx gc --all` does, and means something different there. Naming an\n\
