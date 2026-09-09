@@ -119,7 +119,7 @@ shown empty. `sbx proc log` is an accepted alias.
 
 | Operand / option | Meaning |
 |---|---|
-| `<id>` | a session PID, live or finished; omit it to use the sole live session, or to list this project's finished ones |
+| `<id>` | a session PID, live or finished; omit it to use this project's sole live session, or to list its finished ones |
 | `-f`, `--follow` | stream new events until the session ends (`Ctrl-C` to stop) |
 | `--json` | emit one object per event (NDJSON): works in a pipe |
 

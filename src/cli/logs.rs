@@ -95,8 +95,8 @@ enum Source {
 }
 
 /// `sbx <lens> logs [<id>] [-f|--follow] [--json]`. `<id>` is the PID `sbx session ls` shows, or one
-/// a session left a record under; with no id the sole live session is used, otherwise the live ones
-/// are listed so one can be named, and with none live this project's records are.
+/// a session left a record under; with no id this project's sole live session is used, otherwise its
+/// live ones are listed so one can be named, and with none of them live its records are.
 pub(crate) fn run<E: crate::sandbox::lens::Event>(
     args: &[OsString],
     view: &LogView<E>,
@@ -181,6 +181,17 @@ pub(crate) fn run<E: crate::sandbox::lens::Event>(
 /// in `sbx session ls` any more, and a foreground `sbx run` never printed its pid, so a user with a
 /// record to read has no way to name it. Listing what is there is the only thing that makes the
 /// record reachable at all.
+///
+/// "Nothing live" means nothing live **of this project**. A reader standing in one project is not
+/// asking about another one's session, and answering with it costs more than a surprising header:
+/// it takes the listing above out of reach, because on a machine where any other project has a
+/// session running the empty case is never reached and a finished session here can never be named.
+///
+/// A pid given explicitly is answered whatever project it belongs to, which is the one place the
+/// two halves differ: `sbx session ls` lists every live session on the machine with its project
+/// beside it, so that pid is one the user was shown and chose. A record is in no such listing — it
+/// is only ever reached through this project's own — so a pid naming another project's record
+/// stays absent, as [`crate::sandbox::lens::records_for_project`] has it.
 fn resolve_source(
     verb: &str,
     session_verb: &str,
@@ -220,7 +231,11 @@ fn resolve_source(
         ));
         return Err(ExitCode::from(2));
     }
-    match sessions {
+    let mine: Vec<&crate::session::Session> = sessions
+        .iter()
+        .filter(|s| s.project.as_path() == Path::new(project))
+        .collect();
+    match mine.as_slice() {
         [one] => Ok(Source::Live {
             pid: one.pid,
             header: format!(
@@ -269,12 +284,18 @@ fn first_record(dirs: &[PathBuf], project: &str, pid: u32) -> Option<(PathBuf, u
 ///
 /// A finished session is gone from `sbx session ls` and a foreground `sbx run` never printed its
 /// pid, so this listing is the only thing that makes a record nameable. When there is none, the
-/// wording stays the one every other view uses for an empty machine — inventing a second sentence
-/// for "no sessions" would make the same state read two ways depending on which verb asked.
+/// text says **this project** rather than borrowing the machine-wide "no active sandbox sessions"
+/// the live-only views use: the scope here is the project, so another one's session can be running
+/// and listed by `sbx session ls` while this reader has nothing, and the shared sentence would read
+/// as a contradiction of a listing the user just saw. The second line answers the question the
+/// first raises, which is why there is no record to fall back on.
 fn records_listing(verb: &str, records: &[crate::sandbox::lens::RecordEntry]) -> String {
     use std::fmt::Write as _;
     if records.is_empty() {
-        return "sbx: no active sandbox sessions.\n".to_string();
+        return format!(
+            "sbx: {verb}: no live session in this project, and no record of a finished one.\n       \
+             a launch keeps one when its config sets `[observe] record`.\n"
+        );
     }
     let mut out = format!(
         "sbx: {verb}: no live session — {} finished session(s) recorded here:\n",
@@ -1475,14 +1496,64 @@ mod tests {
         );
     }
 
-    /// With no record either, the wording stays the one every other view uses for an empty machine:
-    /// a second sentence for the same state would make it read two ways depending on which verb
-    /// asked.
+    /// With no record either, the text names **this project**. The machine-wide sentence the
+    /// live-only views use would contradict a `sbx session ls` the user may have just run: another
+    /// project's session can be live while this reader has nothing at all.
     #[test]
-    fn the_empty_case_with_no_record_says_what_it_always_said() {
-        assert_eq!(
-            records_listing("proc logs", &[]),
-            "sbx: no active sandbox sessions.\n"
+    fn the_empty_case_names_the_project_it_is_empty_for() {
+        let out = records_listing("proc logs", &[]);
+        assert!(
+            out.contains("proc logs: no live session in this project"),
+            "{out}"
         );
+        assert!(
+            !out.contains("no active sandbox sessions"),
+            "the machine-wide wording would deny a session `sbx session ls` still lists: {out}"
+        );
+        assert!(
+            out.contains("`[observe] record`"),
+            "and it says why there is no record to fall back on: {out}"
+        );
+    }
+
+    /// With no id the scope is this project. A neighbouring project's live session is not the
+    /// answer, and letting it be one costs more than a surprising header: it takes the record
+    /// listing out of reach, because on a machine where any other project has a session running the
+    /// empty case that makes a finished session nameable is never reached.
+    #[test]
+    fn with_no_id_a_neighbouring_projects_live_session_is_not_the_answer() {
+        let here = PathBuf::from("/tmp/demo-app");
+        let elsewhere = PathBuf::from("/tmp/other-app");
+        let session = |project: &Path| crate::session::Session {
+            project: project.to_path_buf(),
+            pid: 4242,
+            start_ticks: 7,
+            kind: crate::session::Kind::Run,
+            runtime: crate::session::SessionRuntime::Project,
+            detached: false,
+        };
+        let project = here.display().to_string();
+
+        // Standing in this project, its own live session answers.
+        let mine = [session(&here)];
+        assert!(matches!(
+            resolve_source("logs", "logs", &mine, None, &[], &project),
+            Ok(Source::Live { pid: 4242, .. })
+        ));
+
+        // A neighbour's does not: with no record here either, the answer is the empty listing.
+        let theirs = [session(&elsewhere)];
+        assert!(
+            resolve_source("logs", "logs", &theirs, None, &[], &project).is_err(),
+            "another project's session must not stand in for this project's"
+        );
+
+        // A pid given explicitly is answered whatever project it belongs to: `sbx session ls`
+        // lists every live session on the machine with its project beside it, so that is a pid the
+        // user was shown and chose.
+        assert!(matches!(
+            resolve_source("logs", "logs", &theirs, Some("4242"), &[], &project),
+            Ok(Source::Live { pid: 4242, .. })
+        ));
     }
 }

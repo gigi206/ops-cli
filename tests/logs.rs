@@ -738,3 +738,48 @@ fn a_reused_pid_reads_one_session_across_every_feed() {
         "the header names the feeds of the one session being read: {text}"
     );
 }
+
+/// With no id the scope is this project. Another project's session is live on the same machine in
+/// nearly every real case, and answering with it hides the listing that makes a finished session
+/// nameable: a foreground `sbx run` never printed its pid, and a record is in no other view.
+#[test]
+fn with_no_id_a_neighbouring_projects_live_session_does_not_hide_this_projects_records() {
+    let dir = TmpDir::new("l");
+    let data = dir.path();
+    let project = TmpDir::new("p");
+    let canon = std::fs::canonicalize(project.path()).unwrap();
+
+    // A live session, belonging to another project entirely.
+    let standin = Standin::new();
+    write_session_record(data, standin.pid(), Path::new("/tmp/demo-app"));
+
+    // A finished session of the project the reader is standing in.
+    let lens_dir = data.join("sbx").join("broker");
+    std::fs::create_dir_all(&lens_dir).unwrap();
+    std::fs::write(
+        lens_dir.join("record-7-100.log"),
+        format!(
+            "project={}\nevent seq=1 at=1700000000100 kind=forward detail=gpg-agent: a request\n",
+            canon.display()
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["logs"])
+        .current_dir(&canon)
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("run the merged view");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        err.contains("1 finished session(s) recorded here"),
+        "the empty case is reached, and it lists what can still be read: {err}"
+    );
+    assert!(err.contains("read one with `sbx logs <id>`"), "{err}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("demo-app"),
+        "the neighbouring project's live session is not this reader's answer: {err}"
+    );
+}

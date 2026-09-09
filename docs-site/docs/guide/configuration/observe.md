@@ -42,8 +42,8 @@ is still running: while it runs, its ring holds what its record does and what ha
 disk yet, so the socket is read; once it is gone, the file is.
 
 A finished session is no longer in `sbx session ls`, and a foreground `sbx run` never printed its
-PID, so with nothing live these views **list this project's records** with their dates, and one can
-be named:
+PID, so with none of this project's sessions live these views **list its records** with their dates,
+and one can be named:
 
 ```
 sbx: proc logs: no live session — 2 finished session(s) recorded here:
@@ -55,6 +55,11 @@ sbx: proc logs: no live session — 2 finished session(s) recorded here:
 Only this project's records are listed or resolved. The data directory holds every project's, and
 the same user owns them all, so this is not a boundary: it is that a view of "this project's
 sessions" has no business naming a neighbouring project's paths.
+
+The same scope decides which **live** session answers when no PID is given: another project's is not
+it, or the listing above would be out of reach on any machine where something else is running. A PID
+given explicitly is answered whichever project's session it is, because `sbx session ls` shows every
+live session with its project beside it, so that is one you were shown and chose.
 
 `--follow` on a finished session says there is nothing writing the record any more and shows it
 once. A record that hit the size cap says its last events are missing, the way a live view says how

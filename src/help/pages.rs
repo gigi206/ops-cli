@@ -514,8 +514,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "a session PID, live or finished; omit it to use the sole live session, or to list \
-                 this project's finished ones",
+                "a session PID, live or finished; omit it to use this project's sole live \
+                 session, or to list its finished ones",
             ),
             (
                 "-f, --follow",
@@ -531,11 +531,11 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             It is the way to watch an observed session from another terminal — and the only way to\n\
             watch a detached (`--detach`) one, which has no terminal for the inline feed. With no id\n\
-            the sole live session is used; otherwise name one by its PID.\n\
+            this project's sole live session is used; otherwise name one by its PID.\n\
             \n\
             A session that has **ended** is read too, when it ran under `[observe] record` — its\n\
-            events are on disk rather than in the supervisor's memory. With nothing live, this lists\n\
-            the finished sessions recorded for this project so one can be named.\n\
+            events are on disk rather than in the supervisor's memory. With none of this project's\n\
+            sessions live, this lists the ones it recorded so that one can be named.\n\
             \n\
             Each line carries a verdict: `observe` for a non-enforcing `--observe` run (a `/proc`\n\
             poll, so a process shorter than one tick can be missed), or the real `allow`/`deny`/`ask`\n\
@@ -727,12 +727,12 @@ pub(super) const PAGES: &[Page] = &[
         path: &["logs"],
         synopsis: "sbx logs [<id>] [--feed <a,b,...>] [-n <N>] [-f|--follow] [--json]  \
                    (alias: sbx log)",
-        summary: "every feed of one running session, interleaved in time",
+        summary: "every feed of one session, interleaved in time",
         options: &[
             (
                 "<id>",
-                "a session PID, live or finished; omit it to use the sole live session, or to list \
-                 this project's finished ones",
+                "a session PID, live or finished; omit it to use this project's sole live \
+                 session, or to list its finished ones",
             ),
             (
                 "--feed <a,b,...>",
@@ -759,8 +759,8 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             A finished session is read from the records its feeds left, when it ran under\n\
             `[observe] record`; every feed here keeps one, and a feed that recorded nothing is named\n\
-            with its reason like any other. With nothing live, the finished sessions recorded for\n\
-            this project are listed.\n\
+            with its reason like any other. With none of this project's sessions live, the ones it\n\
+            recorded are listed.\n\
             \n\
             A feed that is not recording is **named, with the reason**, before the events. That is\n\
             the point: a feed nothing stood up and a feed with nothing to say both come back empty,\n\
@@ -918,8 +918,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "a session PID, live or finished; omit it to use the sole live session, or to list \
-                 this project's finished ones",
+                "a session PID, live or finished; omit it to use this project's sole live \
+                 session, or to list its finished ones",
             ),
             (
                 "-f, --follow",
@@ -935,8 +935,8 @@ pub(super) const PAGES: &[Page] = &[
             session without it is reported as unobserved, not empty.\n\
             \n\
             It is the way to watch an observed session from another terminal — and the only way to\n\
-            watch a detached (`--detach`) one. With no id the sole live session is used; otherwise name\n\
-            one by its PID.\n\
+            watch a detached (`--detach`) one. With no id this project's sole live session is used;\n\
+            otherwise name one by its PID.\n\
             \n\
             Scope: only the project tree is watched. The per-project nix store and the app home are\n\
             excluded as provisioning/state noise, build/VCS/vendor trees (`.git`, `node_modules`,\n\
@@ -962,8 +962,8 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>",
-                "a session PID, live or finished; omit it to use the sole live session, or to list \
-                 this project's finished ones",
+                "a session PID, live or finished; omit it to use this project's sole live \
+                 session, or to list its finished ones",
             ),
             (
                 "-f, --follow",

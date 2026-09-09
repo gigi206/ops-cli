@@ -32,7 +32,11 @@ fn fs_logs_with_no_sessions_reports_none_and_exits_2() {
     let out = sbx(&["fs", "logs"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
-    assert!(err.contains("no active sandbox sessions"), "got: {err}");
+    // Scoped to the project, so it says that rather than denying sessions live elsewhere.
+    assert!(
+        err.contains("no live session in this project"),
+        "got: {err}"
+    );
 }
 
 #[test]

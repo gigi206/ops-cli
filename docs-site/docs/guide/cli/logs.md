@@ -24,7 +24,8 @@ See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx 
 A session that has **ended** is read too, when it ran under
 [`[observe] record`](../configuration/observe): its events are on disk instead of in the
 supervisor's memory. All seven feeds answer from their records, and the header names any that has
-none. With nothing live, this project's finished sessions are listed so one can be named.
+none. With none of this project's sessions live, the ones it recorded are listed so one can be
+named.
 
 ## What it shows
 

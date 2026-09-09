@@ -199,7 +199,12 @@ fn proc_logs_with_no_sessions_reports_none_and_exits_2() {
     let out = sbx(&["proc", "logs"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
-    assert!(err.contains("no active sandbox sessions"), "got: {err}");
+    // This view is scoped to the project, unlike `proc ls` above: it says so, rather than denying
+    // sessions that may well be live elsewhere on the machine.
+    assert!(
+        err.contains("no live session in this project"),
+        "got: {err}"
+    );
 }
 
 #[test]
