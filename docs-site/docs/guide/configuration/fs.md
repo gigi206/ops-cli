@@ -414,6 +414,26 @@ deny = [".env"]' -- pytest
   fs readonly: Cargo.lock  (readable in the cage, not writable)  (project)
 ```
 
+`sbx test fs <path>` answers the same question for one path, including a name that does not exist
+yet under a denied directory. See [`sbx test`](../cli/test#sbx-test-fs).
+
+### What the agent is told
+
+The cage carries a generated contract at `/opt/sbx/egress-contract.md`, named by
+`SBX_EGRESS_CONTRACT`, and the masks have a section in it. This is not a second enforcement point:
+it exists because one of the three shapes is invisible from inside. A denied **file** keeps its
+name and answers `EACCES`, so a process discovers it by trying; a **read-only** path refuses the
+write, so a process discovers that too, though only after producing the bytes. A denied
+**directory** lists **empty**, so trying teaches a process something false, and it acts on that
+instead of on a refusal.
+
+The section therefore names the resolved paths and what each looks like from inside, never the
+`[fs]` entries that produced them: a path's name is already visible in a listing, so naming it
+discloses nothing new, while a pattern would describe files that do not exist. It also states its
+own limits, so the list is not read as the whole of `[fs]`: a path nobody listed is open, and an
+open may still be refused by [`scan`](#scan-closing-a-file-by-what-it-holds), whose shapes stay
+out of the document.
+
 ## Related
 
 `[fs]` closes paths. Two neighbours do different jobs on the same subject:

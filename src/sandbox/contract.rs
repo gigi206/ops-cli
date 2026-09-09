@@ -2,6 +2,9 @@
 //! permits, generated from the resolved config and bound read-only into the cage at
 //! [`EGRESS_CONTRACT_INCAGE`].
 //!
+//! Four planes are described, and the file keeps its name from the first: the egress posture, the
+//! project paths the `[fs]` masks cover, how execution is mediated, and the declared operations.
+//!
 //! It is purely informational — it enforces nothing (the empty network namespace plus
 //! the host filtering proxy are the boundary). Its job is to let a process inside the
 //! cage understand *why* a direct connection or a `ping` fails and *which* hosts it can
@@ -27,6 +30,8 @@
 //! same as one that was never granted.
 
 use crate::config::{NetworkPolicy, ParamBound, TaskSpec};
+use crate::proc_policy::{ProcMode, ProcPolicy};
+use crate::sandbox::fsmask::Expanded;
 
 /// Where the generated contract is bound read-only inside the cage. Also the value of
 /// the `SBX_EGRESS_CONTRACT` environment variable, so a tool need not hard-code the path.
@@ -54,14 +59,108 @@ pub(crate) fn egress_contract(policy: &NetworkPolicy) -> String {
     }
 }
 
-/// The whole contract the cage is given: the egress posture, then the declared operations when the
-/// session offers any.
+/// The whole contract the cage is given: the egress posture, then the project paths the `[fs]`
+/// masks cover, then how execution is mediated, then the declared operations when the session
+/// offers any.
 ///
-/// One file rather than two, and the one a process already knows to read (`$SBX_EGRESS_CONTRACT`).
-/// A second file would reintroduce the very problem this section exists to solve — something the
-/// cage can only use if it already knows to look for it.
-pub(crate) fn cage_contract(policy: &NetworkPolicy, tasks: &[TaskSpec]) -> String {
-    format!("{}{}", egress_contract(policy), operations_section(tasks))
+/// One file rather than four, and the one a process already knows to read
+/// (`$SBX_EGRESS_CONTRACT`). A second file would reintroduce the very problem this section exists
+/// to solve — something the cage can only use if it already knows to look for it. Each section
+/// omits itself entirely when the posture it describes is absent, so the document stays the length
+/// of what was actually configured.
+pub(crate) fn cage_contract(
+    policy: &NetworkPolicy,
+    tasks: &[TaskSpec],
+    masks: &Expanded,
+    proc: &ProcPolicy,
+) -> String {
+    format!(
+        "{}{}{}{}",
+        egress_contract(policy),
+        masked_paths_section(masks),
+        exec_section(proc),
+        operations_section(tasks)
+    )
+}
+
+/// The section describing the `[fs]` masks: which project paths hold nothing the cage can read, and
+/// which refuse a write.
+///
+/// It earns its place by the module's own rule, and the three shapes sit at different points of it.
+/// A denied **file** keeps its name and answers `EACCES`, so trying discovers it in one open. A
+/// **read-only** path reads normally and refuses the write, so trying discovers it too, but only
+/// after the work that produced the bytes. A denied **directory** is the one that trying does *not*
+/// discover: inside the cage it lists **empty**, so an honest process learns a false fact rather
+/// than meeting a refusal, and acts on it. That is the same failure the isolation note exists to
+/// prevent one plane over, where a `ping` that fails reads as "no network".
+///
+/// Only the **resolved paths** are listed, never the `[fs]` entries that produced them. A path's
+/// name is already visible in a listing (the mask takes the contents, not the name), so naming it
+/// here discloses nothing new; a pattern would disclose more than the cage can see, since it
+/// describes files that do not exist yet.
+fn masked_paths_section(masks: &Expanded) -> String {
+    if masks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(MASKED_HEAD);
+    if !masks.denied.is_empty() {
+        out.push_str("\nEmptied (the name still lists; the contents are not here):\n");
+        for m in &masks.denied {
+            let shape = if m.is_dir {
+                "directory: lists empty, and anything inside answers ENOENT"
+            } else {
+                "file: answers EACCES on open"
+            };
+            out.push_str(&format!(
+                "- `{}` ({shape})\n",
+                one_line(&m.path.display().to_string())
+            ));
+        }
+    }
+    if !masks.readonly.is_empty() {
+        out.push_str("\nRead-only (the contents are the real ones; a write is refused):\n");
+        for m in &masks.readonly {
+            out.push_str(&format!(
+                "- `{}`\n",
+                one_line(&m.path.display().to_string())
+            ));
+        }
+    }
+    out.push_str(MASKED_CAVEAT);
+    out
+}
+
+/// The section describing `[proc]`: that execution is mediated, and under which posture.
+///
+/// **The posture, and no list of programs.** The rule that governs this file is "state what the
+/// cage could discover by trying", and a list of what runs fails it in the one mode where it
+/// matters: under `ask`, an unmatched program parks for a human decision, so naming what runs
+/// silently names, by complement, exactly what would reach that human. Discovering that by trying
+/// means triggering the review the list would teach a process to avoid. The mechanism is
+/// discoverable and worth stating; the map of what evades review is neither.
+fn exec_section(proc: &ProcPolicy) -> String {
+    let posture = match proc.mode {
+        // Nothing mediates, so there is nothing to explain and no refusal to misread.
+        ProcMode::Off => return String::new(),
+        ProcMode::Observe => {
+            "Execution is **observed**: every program runs, and what ran is recorded host-side. \
+             Nothing here is refused by this lens."
+        }
+        ProcMode::Enforce => {
+            "Execution is **mediated**: sbx decides each program before it runs, and a refused one \
+             never executes."
+        }
+        ProcMode::Ask => {
+            "Execution is **mediated interactively**: sbx decides each program before it runs. A \
+             program no rule settles is parked for a person to allow or refuse, so the call can \
+             block for as long as that takes, and is refused if nobody answers."
+        }
+        ProcMode::Confine => {
+            "Execution is **confined to what was declared**: only a program this session's \
+             declaration names runs, and anything else is refused."
+        }
+    };
+    format!("{EXEC_HEAD}\n{posture}\n{EXEC_NOTE}\n")
 }
 
 /// The contract for a filtered-egress (allowlist) posture: the isolation note, then the reachable
@@ -263,6 +362,44 @@ const RAW_HEAD: &str = "\
 Reachable as a raw TCP stream (spliced, not inspected — not an HTTP endpoint;\n\
 connect to the host and port directly rather than through the proxy):";
 
+/// The head of the masked-paths section. A heading rather than a paragraph, so a process scanning
+/// the document for its own limits finds this the way it finds the reachable hosts.
+const MASKED_HEAD: &str = "\
+\n\
+## Project paths this cage cannot read, or cannot write\n\
+\n\
+Some paths of the project are covered inside this cage. This is deliberate configuration, not\n\
+damage and not a broken checkout: the files on the host are untouched, and nothing here can\n\
+uncover them. The shapes differ in what they look like from in here, which is why they are\n\
+listed:\n";
+
+/// What the masked-paths listing does **not** say, on the model of [`DENY_CAVEAT`].
+///
+/// Two absences, and both would otherwise be read as promises. `[fs] scan` closes a file on what it
+/// *holds*, decided at each open, so it names no path and cannot appear in a list built before the
+/// launch. And a path nobody listed is simply open, which is worth stating because a document that
+/// enumerates restrictions invites the opposite reading.
+const MASKED_CAVEAT: &str = "\
+\n\
+A path not listed above is not covered by these mounts. An open may still be refused by the\n\
+content lens, which decides on what a file holds rather than on its path, and whose shapes are\n\
+not disclosed here.\n";
+
+/// The head of the exec section.
+const EXEC_HEAD: &str = "\
+\n\
+## Programs this cage runs\n";
+
+/// The line that makes a refusal legible, which is the whole reason this section exists.
+///
+/// Its counterpart one plane over is the `ping` sentence in [`ISOLATION_NOTE`]: a refusal that
+/// looks like breakage is what sends an honest process rewriting its environment to work around a
+/// limit that was deliberate.
+const EXEC_NOTE: &str = "\
+A program refused here fails with a permission error, not a \"command not found\": the binary is\n\
+present and the execution is what was refused. Retrying it, copying it elsewhere, or reaching for\n\
+an interpreter to run it indirectly will not change the answer.";
+
 /// The caveat every listing above carries, whatever the default action.
 ///
 /// The list holds **allow** rules, and an allow rule is not a promise: a deny rule shadows any allow
@@ -312,6 +449,109 @@ mod tests {
             .map(|s| crate::allowlist::classify(s).expect("valid deny rule"))
             .collect();
         EgressPolicy::new(allow, deny)
+    }
+
+    /// A `[fs]` policy expanded against a real project, for the sections that describe it.
+    fn masks_for(deny: &[&str], readonly: &[&str]) -> (crate::testutil::TmpDir, Expanded) {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::create_dir_all(root.join("certs")).unwrap();
+        std::fs::write(root.join("secrets/token"), b"T").unwrap();
+        std::fs::write(root.join("certs/server.pem"), b"C").unwrap();
+        std::fs::write(root.join("prod.key"), b"K").unwrap();
+        let policy = crate::config::fspolicy::FsPolicy {
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            readonly: readonly.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let expanded = crate::sandbox::fsmask::expand(&root, &policy);
+        assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
+        (tmp, expanded)
+    }
+
+    fn proc_policy(mode: ProcMode, deny: &[&str]) -> ProcPolicy {
+        ProcPolicy {
+            mode,
+            allow: Vec::new(),
+            deny: deny
+                .iter()
+                .map(|s| crate::proc_policy::ProcRule::new(s))
+                .collect(),
+            graph: None,
+        }
+    }
+
+    /// The emptied **directory** is the line the section exists for, and it says what the cage
+    /// sees rather than what the config asked for.
+    ///
+    /// A denied file answers `EACCES`, so a process discovers it by trying; a denied directory
+    /// lists empty, so trying teaches it a false fact instead. If this section ever stops
+    /// distinguishing the two, it stops answering the question that justified writing it.
+    #[test]
+    fn the_masked_section_says_an_emptied_directory_lists_empty() {
+        let (_tmp, masks) = masks_for(&["secrets/", "prod.key"], &["certs/"]);
+        let out = masked_paths_section(&masks);
+        assert!(out.contains("lists empty"), "{out}");
+        assert!(out.contains("answers EACCES on open"), "{out}");
+        assert!(out.contains("secrets") && out.contains("prod.key"), "{out}");
+        assert!(
+            out.contains("Read-only") && out.contains("certs"),
+            "the write-refusing paths are named too: {out}"
+        );
+    }
+
+    /// The listing states its own limits, so it is not read as the whole of `[fs]`.
+    #[test]
+    fn the_masked_section_states_what_it_does_not_cover() {
+        let (_tmp, masks) = masks_for(&["prod.key"], &[]);
+        let out = masked_paths_section(&masks);
+        assert!(out.contains("not covered by these mounts"), "{out}");
+        assert!(
+            out.contains("content lens") && out.contains("not disclosed here"),
+            "the `scan` lens is named without its shapes: {out}"
+        );
+    }
+
+    /// A posture that covers nothing writes no section, like every other plane here.
+    #[test]
+    fn a_policy_that_masks_nothing_writes_no_section() {
+        let (_tmp, masks) = masks_for(&[], &[]);
+        assert!(masked_paths_section(&masks).is_empty());
+        assert!(exec_section(&proc_policy(ProcMode::Off, &[])).is_empty());
+    }
+
+    /// The exec section states the posture and **never a program**.
+    ///
+    /// This is the disclosure decision, pinned. Under `ask` an unmatched program parks for a
+    /// person, so a list of what runs would name, by complement, exactly what reaches that person
+    /// — a map of how to avoid review, which is the one thing trying cannot discover without
+    /// triggering the review it describes. The denied program's name is distinctive so that a
+    /// section which ever started listing rules fails here rather than passing quietly.
+    #[test]
+    fn the_exec_section_states_the_posture_and_names_no_program() {
+        for mode in [
+            ProcMode::Observe,
+            ProcMode::Enforce,
+            ProcMode::Ask,
+            ProcMode::Confine,
+        ] {
+            let out = exec_section(&proc_policy(mode, &["zzcurlzz"]));
+            assert!(!out.is_empty(), "{mode:?} describes itself");
+            assert!(
+                !out.contains("zzcurlzz"),
+                "{mode:?} must not name a program: {out}"
+            );
+            assert!(
+                out.contains("permission error"),
+                "{mode:?} makes a refusal legible: {out}"
+            );
+        }
+        let ask = exec_section(&proc_policy(ProcMode::Ask, &[]));
+        assert!(
+            ask.contains("parked for a person"),
+            "the interactive posture is stated: {ask}"
+        );
     }
 
     /// A task carrying both kinds of credential, a bounded and a defaulted parameter.
@@ -378,7 +618,12 @@ mod tests {
     #[test]
     fn a_session_with_no_operations_gets_no_section() {
         assert_eq!(operations_section(&[]), "");
-        let whole = cage_contract(&NetworkPolicy::Isolated, &[]);
+        let whole = cage_contract(
+            &NetworkPolicy::Isolated,
+            &[],
+            &Expanded::default(),
+            &ProcPolicy::default(),
+        );
         assert!(!whole.contains("Declared operations"), "{whole}");
     }
 
@@ -449,7 +694,12 @@ mod tests {
     // out why a connection failed, then what it may invoke instead.
     #[test]
     fn the_contract_carries_the_posture_then_the_operations() {
-        let whole = cage_contract(&NetworkPolicy::Isolated, &[demo_task()]);
+        let whole = cage_contract(
+            &NetworkPolicy::Isolated,
+            &[demo_task()],
+            &Expanded::default(),
+            &ProcPolicy::default(),
+        );
         let posture = whole.find("no egress at all").expect("the posture");
         let operations = whole
             .find("## Declared operations")

@@ -196,6 +196,26 @@ reported, without ending the wait: the shim's own handoff, arriving behind it, i
 that check cannot supply is a bound on how often something may connect, so a caller determined to
 occupy the socket for the second the shim spends retrying can still cost itself its own launch.
 
+### What the agent is told
+
+The cage's generated contract (`/opt/sbx/egress-contract.md`, named by `SBX_EGRESS_CONTRACT`)
+carries a section for this lens, and it states the **posture only**: that execution is mediated,
+under which mode, and, under `ask`, that a program no rule settles is parked for a person to allow
+or refuse. It names **no program**, in any mode.
+
+That is a deliberate limit, and the reason is `ask`. The rule the contract follows elsewhere is to
+state what the cage could discover by trying and withhold what it could not, which is why the
+reachable hosts are listed and the deny rules are not. A list of programs that run would fail that
+rule in the one mode where it matters: it would name, by complement, exactly what reaches the
+person deciding, and a process cannot discover that by trying without triggering the review the
+list would teach it to avoid.
+
+What the section does say is the part that prevents honest damage: a refused program fails with a
+permission error, not a "command not found". Without that line a process reads a refusal as a
+broken toolchain and starts reinstalling, copying binaries elsewhere, or reaching for an
+interpreter to run the program indirectly, which is indistinguishable from evasion and drowns the
+real signal.
+
 ## Watching and deciding
 
 - [`sbx proc logs [<id>] [-f]`](../cli/proc#logs): the exec feed, each line carrying its verdict

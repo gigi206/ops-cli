@@ -2640,8 +2640,12 @@ pub(super) fn build(
     // and which declared operations it may invoke. The tasks are the gated ones — the same list the
     // task plane serves — so the file never advertises an operation the socket would refuse to run.
     // Informational only; bound read-only by `build_spec`.
-    let egress_contract =
-        crate::sandbox::contract::cage_contract(&prep.cfg.network, &prep.cfg.tasks);
+    let egress_contract = crate::sandbox::contract::cage_contract(
+        &prep.cfg.network,
+        &prep.cfg.tasks,
+        &fs.masks,
+        &prep.cfg.proc,
+    );
     // The device grant: the resolved `[devices]` plus, under `gpu = true`, this host's DRM **render**
     // nodes (`/dev/dri/renderD*`), so the cage can reach the GPU. Both become `--dev-bind-try`
     // mounts. Never the whole `/dev/dri` directory: that carries the `card*` primary nodes in with
