@@ -1151,6 +1151,65 @@ fn a_trusted_mise_env_reaches_the_sandbox_only_once_trusted() {
     );
 }
 
+#[test]
+fn a_mise_env_that_names_the_nix_backend_resolves_at_launch() {
+    let project = TmpDir::prefixed("r", "nixenv-proj");
+    let data = TmpDir::prefixed("r", "nixenv-data");
+    let state = TmpDir::prefixed("r", "nixenv-state");
+    // `_.nix` names the bundled nix backend, so the helper mise that extracts this table must have
+    // the plugin loaded to read the word as a backend rather than as a version string. The ordinary
+    // variable beside it is the discriminant: `[env]` resolution is all-or-nothing, so the value
+    // arriving proves the whole table resolved, where a bare exit code would also be satisfied by a
+    // launch that never read the file. No flake is staged: naming the backend is what the helper has
+    // to understand, and the hook surfaces a missing one as a diagnostic rather than a failure.
+    std::fs::write(project.path().join(".sbx.toml"), b"").unwrap();
+    std::fs::write(
+        project.path().join(".mise.toml"),
+        b"[env]\n_.nix = true\nSBX_NIX_ENV_VAR = \"from-mise\"\n",
+    )
+    .unwrap();
+
+    probe_or_skip!(
+        "nix-backed mise env e2e",
+        sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["run", "--", "true"],
+        )
+    );
+
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "printenv", "SBX_NIX_ENV_VAR"],
+    );
+    assert!(
+        out.status.success(),
+        "a mise [env] naming the nix backend must still resolve: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "from-mise",
+        "the mise [env] value did not reach the sandbox: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Best-effort TCP reach of the binary cache, so the egress e2e skips (does not fail)
 /// when offline — the allowed fetch genuinely hits `cache.nixos.org` through the proxy.
 fn cache_reachable() -> bool {
