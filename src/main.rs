@@ -12,6 +12,10 @@
 // modules reach for raw syscalls to build their own fixtures, and this gate is about the code
 // that ships.
 #![cfg_attr(not(test), warn(clippy::undocumented_unsafe_blocks))]
+// A doc reference that resolves to nothing fails the build, and `forbid` keeps it that way: rustdoc
+// names `#[allow(rustdoc::broken_intra_doc_links)]` in its own error text, so the escape it offers is
+// refused here rather than left to prose. Carry a reference with the symbol it names instead.
+#![forbid(rustdoc::broken_intra_doc_links)]
 
 // Declared before every other module, and only for that reason: `macro_rules!` are textually
 // scoped, so `#[macro_use]` lifts the skip macros into scope for the modules that follow. A module

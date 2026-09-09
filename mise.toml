@@ -74,11 +74,6 @@ node                            = "24"
 # crate rather than building it, so no version of it can change what CI accepts.
 # First run indexes the workspace (minutes), then disk-cached.
 "cargo:cargo-callgraph" = "latest"
-# AST policy audits (versioned rules enforced in CI, not exploration).
-# Pinned like cargo-audit: an audit is only as reproducible as its client.
-# The pipx backend shells out to the `pipx` tool below, so the two go together.
-pipx = "1.8.0"
-"pipx:semgrep" = "1.156.0"
 
 # ============================================================================
 # Tasks — invoked via `mise run <name>`. `mise run ci` is the full one-liner you

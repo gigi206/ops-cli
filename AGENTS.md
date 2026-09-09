@@ -27,8 +27,6 @@
 - The graph caches on Cargo.toml's mtime alone, so it is normally
   stale and line numbers drift, per file. `reload: true` rebuilds
   nothing and costs seconds — prefer it to doubting the answer.
-- semgrep for versioned policy rules enforced in CI, not for
-  exploration — one pattern per spelling, no call resolution.
 - Golden rule: never assume, ALWAYS verify!
 
 ## Development rules
