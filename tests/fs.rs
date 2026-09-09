@@ -671,3 +671,92 @@ fn fs_deny_scoped_to_an_app_in_the_project_config_nests_under_that_app() {
     assert!(body.contains("[app.demo.fs]"), "{body}");
     assert!(body.contains("deny = [\"prod.key\"]"), "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// `sbx test fs` — the mask tester. Host-side: no cage, no nix.
+// ---------------------------------------------------------------------------
+
+/// Stage a project with the four shapes a mask answer has to tell apart.
+fn masked_project() -> Project {
+    let p = Project::new("tfs");
+    let root = p.proj.path();
+    std::fs::create_dir_all(root.join("secrets")).unwrap();
+    std::fs::create_dir_all(root.join("certs")).unwrap();
+    std::fs::write(root.join("secrets/token"), b"TOKEN").unwrap();
+    std::fs::write(root.join("certs/server.pem"), b"CERT").unwrap();
+    std::fs::write(root.join("certs/client.pem"), b"CERT2").unwrap();
+    std::fs::write(root.join("main.rs"), b"fn main() {}").unwrap();
+    p.write_project("[fs]\ndeny = [\"secrets/\", \"certs/server.pem\"]\nreadonly = [\"certs/\"]\n");
+    p
+}
+
+#[test]
+fn test_fs_reports_what_the_masks_would_do_to_each_shape() {
+    let p = masked_project();
+    // The project config must be trusted for its security fields to apply, exactly as a launch
+    // requires — otherwise this would test the empty baseline and pass for the wrong reason.
+    assert!(p.run(&["trust"]).status.success(), "trust the fixture");
+
+    let verdict = |path: &str| -> String {
+        let out = p.run(&["test", "fs", path]);
+        assert!(
+            out.status.success(),
+            "test fs {path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let listed = verdict("secrets/token");
+    assert!(listed.contains("DENIED"), "{listed}");
+    assert!(listed.contains("secrets/"), "the entry is named: {listed}");
+
+    // A denied directory covers the names that appear inside it later in the session, so the
+    // tester must answer for one that does not exist yet. Reporting "no such file, so it is open"
+    // is the one answer the cage never gives.
+    let future = verdict("secrets/written-later");
+    assert!(future.contains("DENIED"), "{future}");
+
+    let file = verdict("certs/server.pem");
+    assert!(file.contains("DENIED"), "{file}");
+
+    // Its sibling under the same read-only directory, so a tester that printed DENIED for
+    // everything under `certs/` would fail here.
+    let ro = verdict("certs/client.pem");
+    assert!(ro.contains("READ-ONLY"), "{ro}");
+
+    // And the other direction again: a path no entry names.
+    let open = verdict("main.rs");
+    assert!(open.contains("OPEN"), "{open}");
+}
+
+#[test]
+fn test_fs_masks_apply_from_an_untrusted_project_like_a_launch_would() {
+    // `[fs]` is the security table that is NOT trust-gated, and the tester has to match that or it
+    // describes a different cage: a project closing its own files off gains nothing it could turn
+    // on the user, while dropping the masks would leave a file the project asked to close wide
+    // open. Written against an untrusted fixture on purpose — the sibling testers (`net`, `proc`)
+    // report the baseline here, and copying their sentence into this verb would make it claim a
+    // gate the loader does not apply.
+    let p = masked_project();
+    let out = p.run(&["test", "fs", "secrets/token"]);
+    assert!(out.status.success(), "{:?}", out.status);
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.contains("DENIED"),
+        "untrusted masks still apply: {body}"
+    );
+}
+
+#[test]
+fn test_fs_refuses_a_path_outside_the_project() {
+    // `[fs]` closes paths of the project it is declared in and nothing else, which is the sentence
+    // the expansion refuses an outside entry with. Answering OPEN here would read as a policy
+    // decision about a path the table could never reach.
+    let p = masked_project();
+    assert!(p.run(&["trust"]).status.success(), "trust the fixture");
+    let out = p.run(&["test", "fs", "/etc/hostname"]);
+    assert_eq!(out.status.code(), Some(2), "{:?}", out.status);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("outside the project"), "{err}");
+}

@@ -105,7 +105,9 @@ pub(crate) mod seccomp;
 // Filesystem observability.
 pub(crate) mod fs_control;
 pub(crate) mod fs_watch;
-mod fsmask;
+// `pub(crate)` for `sbx test fs`, which answers with the launch's own expansion rather than a
+// second reading of the same table.
+pub(crate) mod fsmask;
 
 // Desktop / GUI holes: Wayland, GPU, audio, the D-Bus portal, theme/notifications.
 mod audio;

@@ -6,17 +6,18 @@ description: "Report whether an access would be allowed, and why, without launch
 
 ```
 sbx test net  [--app <name>] [-X|--method <verb>] <url|tcp://host:port>
+sbx test fs   [--app <name>] <path>
 sbx test proc [--app <name>] [--caller <path>]... <program>
 ```
 
 A diagnostic surface that reports whether an access would be allowed, and why. No
 launch, no nix, no network: it reports a verdict against the resolved policy.
 
-Both kinds answer by calling the **same** decision the enforcing path calls, rather than
-re-deriving a verdict of their own. A tester carrying its own copy of the rule would eventually
+Each kind answers by calling the **same** decision the enforcing path calls, rather than
+re-deriving a verdict of its own. A tester carrying its own copy of the rule would eventually
 disagree with what the cage does, and it would disagree silently.
 
-See also: [`sbx net`](net) · [`sbx proc`](proc) · [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Egress observability](../networking/observability).
+See also: [`sbx net`](net) · [`sbx fs`](fs) · [`sbx proc`](proc) · [the `[fs]` table](../configuration/fs) · [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Egress observability](../networking/observability).
 
 ## `sbx test net`
 
@@ -32,6 +33,53 @@ is noted (by header and source, never the value, and not resolved). Reflects the
 | `tcp://host:port` | test a raw L4 splice instead: reports **SPLICED / NOT SPLICED** |
 | `-a, --app <name>` | test against that app's effective policy (baseline + overlay) |
 | `-X, --method <verb>` | the HTTP method to test (default `GET`); a `{GET}` rule only matches that verb (ignored for `tcp://`) |
+
+## `sbx test fs`
+
+Reports **DENIED / READ-ONLY / OPEN** against the [`[fs]`](../configuration/fs) masks a launch
+mounts, and names the entry that decides. When a directory above the target is what closes it,
+the covering path is named too, because the pattern alone does not say why that name is shut.
+
+| Option | Meaning |
+|---|---|
+| `<path>` | the project path to ask about, absolute or relative to the project |
+| `-a, --app <name>` | test against that app's effective policy (baseline + overlay) |
+
+```sh
+sbx test fs secrets/token               # is this closed?
+sbx test fs certs/client.pem            # read-only, or open?
+sbx test fs -a claude-code prod.key     # under that app's overlay
+```
+
+```
+fs: 2 denied, 1 read-only
+  DENIED  /home/you/project/secrets/token
+  by `[fs] deny` entry `secrets/`, which closes `/home/you/project/secrets` above it
+```
+
+The path **need not exist**. A denied directory is an empty one inside the cage, so a file that
+appears there later in the session is unreachable too, and that is the answer this reports: a name
+nothing bears yet still reads as `DENIED`. Symlinks are followed, since a mask names a link's
+target rather than the link.
+
+The expansion's own warnings are printed here as well, which is half of what the verb is for: an
+entry that matched nothing, a second hard link reaching a closed file, a path git tracks. A
+refusal is fatal here for the same reason it is fatal to a launch, because a run without the masks
+leaves open exactly the paths the policy closes.
+
+### What it cannot tell you
+
+Two things, and they are different in kind.
+
+`[fs] scan` is the other half of the same table, and this verb cannot answer it: that lens decides
+at **each open**, on what the file holds, so there is no verdict without the bytes and the launch
+that reads them. Its presence is reported, never a result.
+
+And unlike its siblings, this verb reports no [trust gate](../concepts/trust) on the masks,
+because there is none. A project closing its own files off gains nothing it could turn on the
+user, while dropping its masks would leave a file the project asked to close wide open, so `deny`
+and `readonly` apply from an untrusted project too. The one gated key is `scan_max_kb`, which
+raises how much of a file the content lens reads past.
 
 ## `sbx test proc`
 

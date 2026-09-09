@@ -2328,6 +2328,38 @@ pub(super) const PAGES: &[Page] = &[
             Reflects the trust gate (an untrusted project's policy is dropped). No nix.",
     },
     Page {
+        path: &["test", "fs"],
+        synopsis: "sbx test fs [--app <name>] <path>",
+        summary: "test a project path against the resolved [fs] masks",
+        options: &[
+            (
+                "<path>",
+                "the project path to ask about, absolute or relative to the project. It need not exist: a denied directory closes the names that appear inside it later, and that is the answer this reports",
+            ),
+            (
+                "-a, --app <name>",
+                "test against that app's effective policy (baseline + overlay), not the baseline",
+            ),
+        ],
+        details: "Reports DENIED/READ-ONLY/OPEN against the `[fs]` masks a launch mounts, and names the\n\
+            entry that decides — with the covering path when a directory above the target is what\n\
+            closes it. The verdict comes from the same expansion the launch binds, so it cannot\n\
+            drift from the mounts; the expansion's own warnings (an entry matching nothing, a\n\
+            second hard link to a closed file, a path git tracks) are printed here too, and a\n\
+            refusal is fatal here because it is fatal to a launch. Symlinks are followed, since a\n\
+            mask names a link's target rather than the link.\n\
+            \n\
+            What it does not answer is `[fs] scan`, the other half of the same table: that lens\n\
+            decides at each open on what a file holds, so there is no verdict without the bytes and\n\
+            the launch that reads them. Its presence is reported, never a result.\n\
+            \n\
+            Unlike its siblings, this one does not report a trust gate on the masks, because there\n\
+            is none: a project closing its own files off gains nothing it could turn on the user,\n\
+            so `deny` and `readonly` apply from an untrusted project too. The one gated key is\n\
+            `scan_max_kb`, which raises how much of a file the content lens reads past. No launch,\n\
+            no nix.",
+    },
+    Page {
         path: &["test", "proc"],
         synopsis: "sbx test proc [--app <name>] [--caller <path>]... <program>",
         summary: "test a program against the resolved [proc] exec policy",

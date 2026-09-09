@@ -98,10 +98,49 @@ pub(crate) struct Expanded {
     pub(crate) refused: Option<String>,
 }
 
+/// What an expansion does to one project path: the two answers a bind produces, and the entry
+/// that produces it.
+///
+/// It exists so that "this path is closed" has **one** definition. The launch never asks the
+/// question — it emits the binds and the kernel answers it — so a caller that needs the answer
+/// without launching (`sbx test fs`) would otherwise restate the containment rule in its own
+/// words, and a restatement drifts from the mounts in silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Cover<'a> {
+    /// The contents are unreachable: a decoy is bound at this path, or at a directory above it.
+    Denied(&'a Masked),
+    /// The contents are the real ones and a write is refused: the path, or a directory above it,
+    /// is re-bound over itself read-only.
+    ReadOnly(&'a Masked),
+}
+
 impl Expanded {
     /// Whether anything will be mounted, so a launch with an empty policy stages nothing.
     pub(crate) fn is_empty(&self) -> bool {
         self.denied.is_empty() && self.readonly.is_empty()
+    }
+
+    /// What this expansion does to `path`, which is expected to be canonical and inside the
+    /// project. `None` is "no mask names it": open to the cage as far as `[fs]` is concerned.
+    ///
+    /// Two rules, both of them properties of the mounts rather than choices made here:
+    ///
+    /// - **A directory carries its subtree.** A bind at a directory covers every path below it, so
+    ///   a path under a denied directory is denied even when nothing on disk bears its name yet —
+    ///   which is the one shape that stays closed for a whole session.
+    /// - **`deny` is checked first.** `agent_binds` emits `readonly` and then `deny`, and the later
+    ///   mount is the one that wins, so where a denied file sits inside a read-only directory the
+    ///   answer is the decoy. The opposite nesting cannot occur: [`expand`] drops a `readonly`
+    ///   entry that a `deny` already covers.
+    pub(crate) fn covering(&self, path: &Path) -> Option<Cover<'_>> {
+        fn under<'m>(masks: &'m [Masked], path: &Path) -> Option<&'m Masked> {
+            masks
+                .iter()
+                .find(|m| m.path == path || (m.is_dir && path.starts_with(&m.path)))
+        }
+        under(&self.denied, path)
+            .map(Cover::Denied)
+            .or_else(|| under(&self.readonly, path).map(Cover::ReadOnly))
     }
 
     /// How many binds this expansion costs.
@@ -791,6 +830,63 @@ mod tests {
             deny: deny.iter().map(|s| s.to_string()).collect(),
             readonly: readonly.iter().map(|s| s.to_string()).collect(),
             ..FsPolicy::default()
+        }
+    }
+
+    /// The coverage rule answers for a path *under* a denied directory, not only for the paths the
+    /// expansion listed.
+    ///
+    /// That is the whole point of a denied directory: the cage sees an empty one, so a file created
+    /// there later in the session is unreachable too. A rule that only compared against the listed
+    /// paths would report a name that does not exist yet as open, which is the opposite of what the
+    /// mount does.
+    #[test]
+    fn covering_answers_for_a_path_under_a_denied_directory() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let out = expand(&root, &policy(&["secrets/"], &[]));
+        assert!(out.refused.is_none(), "{:?}", out.refused);
+
+        let listed = out.covering(&root.join("secrets"));
+        assert!(matches!(listed, Some(Cover::Denied(_))), "{listed:?}");
+        let inside = out.covering(&root.join("secrets/token"));
+        assert!(matches!(inside, Some(Cover::Denied(_))), "{inside:?}");
+        // Nothing bears this name on disk; the empty directory covers it all the same.
+        let future = out.covering(&root.join("secrets/written-later"));
+        assert!(matches!(future, Some(Cover::Denied(_))), "{future:?}");
+        assert!(out.covering(&root.join("main.rs")).is_none());
+    }
+
+    /// Where a denied file sits inside a read-only directory, the answer is the deny.
+    ///
+    /// `agent_binds` emits `readonly` first and `deny` second, and the later mount wins, so any
+    /// other answer here would describe a cage that is not the one a launch builds. Written as a
+    /// pair — the sibling under the same read-only directory must still read as read-only — so the
+    /// test cannot pass by reporting `Denied` for everything.
+    #[test]
+    fn covering_lets_deny_win_inside_a_readonly_directory() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let out = expand(&root, &policy(&["certs/server.pem"], &["certs/"]));
+        assert!(out.refused.is_none(), "{:?}", out.refused);
+
+        let denied = out.covering(&root.join("certs/server.pem"));
+        assert!(matches!(denied, Some(Cover::Denied(_))), "{denied:?}");
+        let sibling = out.covering(&root.join("certs/client.pem"));
+        assert!(matches!(sibling, Some(Cover::ReadOnly(_))), "{sibling:?}");
+    }
+
+    /// The entry that decides comes back with the verdict, so a caller can name what to edit.
+    #[test]
+    fn covering_names_the_entry_that_decides() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let out = expand(&root, &policy(&["*.key"], &[]));
+        assert!(out.refused.is_none(), "{:?}", out.refused);
+
+        match out.covering(&root.join("prod.key")) {
+            Some(Cover::Denied(m)) => assert_eq!(m.pattern, "*.key"),
+            other => panic!("{other:?}"),
         }
     }
 

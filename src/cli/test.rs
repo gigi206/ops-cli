@@ -1,16 +1,19 @@
 //! `sbx test <kind> <target>`: probe whether an access would be allowed and explain why — a
 //! diagnostic surface over the access controls a launch enforces: `net <url>` against the egress
-//! allowlist, `proc <program>` against the `[proc]` exec policy. No launch, no nix, no network. The
-//! app-overlay fold and the `net_mode_word` keyword it shares with `sbx net`/`sbx config` stay at
-//! the crate root, referenced via crate::.
+//! allowlist, `fs <path>` against the `[fs]` masks, `proc <program>` against the `[proc]` exec
+//! policy. No launch, no nix, no network. The app-overlay fold and the `net_mode_word` keyword it
+//! shares with `sbx net`/`sbx config` stay at the crate root, referenced via crate::.
 //!
-//! Both kinds answer by calling the **same** decision the enforcing path calls — `l4_decision` and
-//! the allowlist for egress, [`crate::proc_policy::ProcPolicy::decide`] for exec — rather than
-//! re-deriving a verdict here. A tester with its own copy of the rule would eventually disagree
-//! with the wire, and it would disagree silently, which is worse than not having one.
+//! Every kind answers by calling the **same** decision the enforcing path calls — `l4_decision` and
+//! the allowlist for egress, [`crate::sandbox::fsmask::expand`] and
+//! [`crate::sandbox::fsmask::Expanded::covering`] for the filesystem,
+//! [`crate::proc_policy::ProcPolicy::decide`] for exec — rather than re-deriving a verdict here. A
+//! tester with its own copy of the rule would eventually disagree with the wire, and it would
+//! disagree silently, which is worse than not having one.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::fold_app_overlay;
@@ -22,6 +25,7 @@ use crate::{allowlist, config, config_cwd, diag, help, sandbox, style};
 pub(crate) fn test_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("net") => net_test(&args[1..]),
+        Some("fs") => fs_test(&args[1..]),
         Some("proc") => proc_test(&args[1..]),
         // Unknown or no kind: name the mistake (if any), then print the full page so its
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
@@ -826,12 +830,319 @@ fn proc_test(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The parsed form of `sbx test fs`: which app's overlay to fold in, and the path to ask about.
+#[derive(Debug)]
+struct FsTestArgs<'a> {
+    app: Option<String>,
+    target: &'a OsStr,
+}
+
+/// Parse `sbx test fs`'s arguments: an optional `--app/-a <name>` and the positional path.
+///
+/// The target stays an [`OsStr`] rather than becoming a `&str`. A mask compares *paths*, so a file
+/// whose name is not valid UTF-8 is closed by a literal `deny` entry naming it — refusing to ask
+/// about it here would make the tester answer "cannot" where the cage answers `EACCES`. Options
+/// still have to be UTF-8: they are compared against literals, and a byte string that is not one
+/// of them is a path.
+fn parse_fs_test_args(args: &[OsString]) -> Result<FsTestArgs<'_>, Vec<String>> {
+    let usage = || format!("sbx: usage: {}", help::synopsis_of(&["test", "fs"]));
+    let mut app: Option<String> = None;
+    let mut target: Option<&OsStr> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].to_str() {
+            Some("-a") | Some("--app") => match args.get(i + 1).and_then(|a| a.to_str()) {
+                Some(name) if !name.is_empty() => {
+                    app = Some(name.to_string());
+                    i += 2;
+                }
+                _ => {
+                    return Err(vec![
+                        "sbx: test fs: --app needs an app name".to_string(),
+                        usage(),
+                    ]);
+                }
+            },
+            // Refused rather than taken for the path, like its siblings: a mistyped flag must not
+            // silently become the thing under test.
+            Some(flag) if flag.starts_with('-') => {
+                return Err(vec![
+                    format!("sbx: test fs: unknown option `{flag}`"),
+                    usage(),
+                ]);
+            }
+            _ => {
+                if target.is_some() {
+                    return Err(vec!["sbx: test fs: at most one path".to_string(), usage()]);
+                }
+                target = Some(args[i].as_os_str());
+                i += 1;
+            }
+        }
+    }
+    match target {
+        Some(target) => Ok(FsTestArgs { app, target }),
+        None => Err(vec![
+            "sbx: test fs: a path is required".to_string(),
+            usage(),
+        ]),
+    }
+}
+
+/// Resolve `target` to the absolute path a mask would be compared against, or say why it cannot be
+/// one.
+///
+/// Two things make this more than a `join`. Symlinks are followed, because the expansion resolves
+/// every entry it admits and a mask therefore names the *target* of a link rather than the link;
+/// and a path that does not exist is still answered, because a denied **directory** covers names
+/// that appear inside it later in the session — reporting "no such file, so it is open" would be
+/// the one answer the cage never gives. So the longest existing prefix is canonicalized and the
+/// remainder is appended verbatim.
+///
+/// A `..` that lands in that remainder is refused rather than folded away: with nothing on disk to
+/// resolve it against, folding it would be this function's guess at a path, and a guess that climbs
+/// out of the project is the one guess that must not be made quietly. It is recognised by looking
+/// at the component, not at the popped name, because [`Path::file_name`] answers `None` for `..` —
+/// so a check on the name alone would never fire and would read like a guard while being none.
+fn resolve_under_project(project: &Path, target: &OsStr) -> Result<PathBuf, String> {
+    let raw = Path::new(target);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        project.join(raw)
+    };
+
+    let mut tail: Vec<&OsStr> = Vec::new();
+    let mut head = joined.as_path();
+    let resolved = loop {
+        match head.canonicalize() {
+            Ok(canon) => break canon,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if head.components().next_back() == Some(Component::ParentDir) {
+                    return Err(format!(
+                        "`{}` climbs with `..` through a path that does not exist — say the path \
+                         it means",
+                        joined.display()
+                    ));
+                }
+                let Some(name) = head.file_name() else {
+                    return Err(format!("cannot resolve `{}`", joined.display()));
+                };
+                tail.push(name);
+                let Some(parent) = head.parent() else {
+                    return Err(format!("cannot resolve `{}`", joined.display()));
+                };
+                head = parent;
+            }
+            Err(e) => return Err(format!("cannot resolve `{}` ({e})", head.display())),
+        }
+    };
+
+    let mut out = resolved;
+    for name in tail.iter().rev() {
+        out.push(name);
+    }
+    Ok(out)
+}
+
+/// `sbx test fs <path>`: report what the `[fs]` masks do to one project path, and which entry
+/// decides it.
+fn fs_test(args: &[OsString]) -> ExitCode {
+    let FsTestArgs { app, target } = match parse_fs_test_args(args) {
+        Ok(parsed) => parsed,
+        Err(lines) => {
+            for line in lines {
+                diag::error(&line);
+            }
+            return ExitCode::from(2);
+        }
+    };
+
+    let cwd = match config_cwd() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let mut resolved = config::load(&cwd);
+    for w in &resolved.warnings {
+        diag::warn_config(w);
+    }
+    if let Some(name) = &app
+        && let Err(e) = fold_app_overlay(&mut resolved, name)
+    {
+        diag::error(&format!("sbx: test fs: {e}"));
+        return ExitCode::from(2);
+    }
+
+    let policy = &resolved.fs;
+    let expanded = crate::sandbox::fsmask::expand(&cwd, policy);
+    // The launch treats this as fatal, so the tester does too: a refusal means the masks the config
+    // names cannot be placed, and an answer computed from the paths that survived would describe a
+    // cage no launch will build.
+    if let Some(reason) = &expanded.refused {
+        diag::error(&format!("sbx: test fs: {reason}"));
+        return ExitCode::FAILURE;
+    }
+    // The expansion's own prose is the diagnostic half of this verb: an entry that matched nothing,
+    // a second hard link to a closed file, a path git tracks. A launch prints these; so does this.
+    for w in &expanded.warnings {
+        diag::warn(w);
+    }
+
+    let path = match resolve_under_project(&cwd, target) {
+        Ok(p) => p,
+        Err(e) => {
+            diag::error(&format!("sbx: test fs: {e}"));
+            return ExitCode::from(2);
+        }
+    };
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, r) = (pal.head, pal.reset);
+    let scope = match &app {
+        Some(name) => format!(" (app {name})"),
+        None => String::new(),
+    };
+    println!(
+        "{h}fs{scope}:{r} {} denied, {} read-only",
+        expanded.denied.len(),
+        expanded.readonly.len()
+    );
+
+    // `[fs]` closes paths of the project it is declared in and nothing else, which is the same
+    // sentence the expansion refuses an outside entry with. Said before the verdict, because "OPEN"
+    // for a path no mask could ever reach would read as a policy decision.
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    if !path.starts_with(&root) {
+        println!("  {dim}{}{r}", path.display(), dim = pal.dim);
+        diag::error(
+            "sbx: test fs: that path is outside the project — `[fs]` closes paths of the project \
+             it is declared in, and nothing else",
+        );
+        return ExitCode::from(2);
+    }
+
+    let (word, hue, why) = match expanded.covering(&path) {
+        Some(crate::sandbox::fsmask::Cover::Denied(m)) => (
+            "DENIED",
+            pal.err,
+            Some(("deny", m.pattern.clone(), m.path.clone(), m.is_dir)),
+        ),
+        Some(crate::sandbox::fsmask::Cover::ReadOnly(m)) => (
+            "READ-ONLY",
+            pal.warn,
+            Some(("readonly", m.pattern.clone(), m.path.clone(), m.is_dir)),
+        ),
+        None => ("OPEN", pal.ok, None),
+    };
+    println!("  {hue}{word}{r}  {}", path.display());
+    match why {
+        Some((field, pattern, masked, is_dir)) if masked == path => {
+            println!(
+                "  {dim}by `[fs] {field}` entry `{pattern}`{r}",
+                dim = pal.dim
+            );
+            let _ = is_dir;
+        }
+        // Naming the *covering* path, not just the entry: under a denied directory the pattern
+        // alone does not say why this name is closed, and the answer holds for names that do not
+        // exist yet. The verb follows the field, because the two masks do different things: one
+        // takes the contents away, the other leaves them and refuses the write.
+        Some((field, pattern, masked, _)) => {
+            let verb = if field == "deny" {
+                "closes"
+            } else {
+                "protects"
+            };
+            println!(
+                "  {dim}by `[fs] {field}` entry `{pattern}`, which {verb} `{}` above it{r}",
+                masked.display(),
+                dim = pal.dim
+            )
+        }
+        None => println!("  {dim}no `[fs]` entry names it{r}", dim = pal.dim),
+    }
+
+    // The content lens is the part of the same table this verb cannot answer: it decides at each
+    // open, on what the file holds, so there is no verdict to report without the file's bytes and
+    // the launch that reads them. Named rather than left out, since a reader who declared `scan`
+    // would otherwise take "OPEN" for the whole `[fs]` answer.
+    if !policy.scan.is_empty() {
+        println!(
+            "  {dim}`[fs] scan` also closes files by content at each open ({} shape{}) — not \
+             answered here{r}",
+            policy.scan.len(),
+            if policy.scan.len() == 1 { "" } else { "s" },
+            dim = pal.dim
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn os(xs: &[&str]) -> Vec<OsString> {
         xs.iter().map(OsString::from).collect()
+    }
+
+    /// The `fs` grammar refuses a mistyped flag instead of testing it as a path.
+    ///
+    /// The failure this closes is silent: `sbx test fs --ap claude secrets/token` would otherwise
+    /// report on a file named `--ap` and then blame the second argument, so the one answer printed
+    /// would be about a path the user never asked about.
+    #[test]
+    fn fs_test_refuses_an_unknown_flag_rather_than_testing_it_as_a_path() {
+        let err = parse_fs_test_args(&os(&["--ap", "claude", "secrets/token"])).unwrap_err();
+        assert!(err[0].contains("unknown option `--ap`"), "{err:?}");
+        assert!(
+            err[1].contains("sbx test fs"),
+            "the usage names this verb: {err:?}"
+        );
+
+        let missing = parse_fs_test_args(&os(&[])).unwrap_err();
+        assert!(missing[0].contains("a path is required"), "{missing:?}");
+
+        let two = parse_fs_test_args(&os(&["a", "b"])).unwrap_err();
+        assert!(two[0].contains("at most one path"), "{two:?}");
+    }
+
+    /// A path argument that is not valid UTF-8 is still asked about.
+    ///
+    /// A mask compares paths, so a literal `deny` entry closes a file whose name is not UTF-8, and
+    /// a tester that refused the argument would answer "cannot" where the cage answers `EACCES`.
+    /// The sibling verbs take programs and URLs and can refuse; this one must not.
+    #[test]
+    fn fs_test_accepts_a_path_that_is_not_valid_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![b'b', 0xff, b'.', b'k', b'e', b'y']);
+        let args = [raw.clone()];
+        let parsed = parse_fs_test_args(&args).expect("a non-UTF-8 path is a path");
+        assert_eq!(parsed.target, raw.as_os_str());
+        assert!(parsed.app.is_none());
+    }
+
+    /// A path that does not exist resolves to the name it would have, so a denied directory can
+    /// answer for it — and a `..` below that point is refused rather than guessed at.
+    #[test]
+    fn resolving_a_path_keeps_a_name_nothing_bears_yet() {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        let canon = root.canonicalize().unwrap();
+
+        let future = resolve_under_project(&root, OsStr::new("secrets/written-later")).unwrap();
+        assert_eq!(future, canon.join("secrets/written-later"));
+
+        // An existing path still canonicalizes, which is what makes a symlinked entry compare
+        // against the same target the expansion admitted.
+        let here = resolve_under_project(&root, OsStr::new("secrets")).unwrap();
+        assert_eq!(here, canon.join("secrets"));
+
+        // Nothing on disk resolves this one, so folding it would be a guess, and the guess that
+        // climbs out of the project is the one that must not be made quietly.
+        let climb = resolve_under_project(&root, OsStr::new("nope/../../elsewhere")).unwrap_err();
+        assert!(climb.contains("climbs with `..`"), "{climb}");
     }
 
     #[test]
