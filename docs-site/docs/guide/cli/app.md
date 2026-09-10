@@ -437,6 +437,42 @@ as an empty one. Under `--all` that refuses the whole sweep, since naming the ap
 needs the answer the registry could not give. The preview never asks the registry, so it
 keeps working.
 
+### Taking a named entry
+
+`--drop <entry>` removes one entry of each home, named relative to the home exactly as
+[`show`](#what-a-home-is-made-of) lists it. The flag repeats.
+
+```sh
+sbx app prune hermes-desktop --drop .rustup --drop .npm
+```
+
+Nothing about the name is interpreted, and that is the design rather than a gap: what a
+directory holds is yours to judge, because an app's own data and a package manager's
+downloads sit side by side and their names do not tell them apart. sbx lists what is there
+and removes what you name.
+
+A name that resolves outside the home is skipped rather than followed, including one whose
+parent turned out to be a symlink. A name that is not there reports nothing. It previews by
+default, like every other form of `prune`.
+
+### Resetting an app
+
+`--reset` takes everything: every home, its configuration and its login state included, and
+the per-project [mise pools](../concepts/directory-layout) a global app self-equipped into.
+
+```sh
+sbx app prune hermes-desktop --reset          # what would go
+sbx app prune hermes-desktop --reset --yes    # take it
+```
+
+What survives is what the app **declares**, so the next launch builds the home again from
+the profile: tools reinstall, and you sign in again. That is the difference from
+[`rm --purge`](#removing-an-app), which takes the declaration too and leaves nothing to
+launch.
+
+It acts on one named app rather than under `--all`, and it stands instead of the other
+flags rather than beside them. A live session refuses it, as it refuses `--caches`.
+
 ### Reclaiming the caches
 
 `--caches` empties `.cache` in each of the app's homes as well. That directory is where a

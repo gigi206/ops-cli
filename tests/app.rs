@@ -175,10 +175,16 @@ fn show_reports_declared_vs_installed_across_backends() {
         s.contains("nix:hello") && s.contains("built in 1 tree"),
         "nix per-tree status missing:\n{s}"
     );
-    // The size breakdown is present.
+    // The size breakdown is present, and it is the home's own composition rather than a total: a
+    // location line, then at least one entry carrying its share of the home.
     assert!(
-        s.contains("disk:") && s.contains("tools"),
+        s.contains("disk:") && s.contains("global \u{b7} "),
         "size breakdown missing:\n{s}"
+    );
+    assert!(
+        s.lines()
+            .any(|l| l.trim_start().starts_with('.') && l.trim_end().ends_with('%')),
+        "the home's composition is missing its entries:\n{s}"
     );
 }
 

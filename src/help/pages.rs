@@ -2306,8 +2306,8 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "prune"],
-        synopsis: "sbx app prune <name>|--all [--caches] [--stale] [--yes]",
-        summary: "remove an app home's undeclared mise tools, its caches, and its stale versions",
+        synopsis: "sbx app prune <name>|--all [--caches] [--stale] [--drop <entry>]... [--reset] [--yes]",
+        summary: "remove an app home's undeclared mise tools, its caches, named entries, or all of it",
         options: &[
             ("<name>", "the app whose home(s) to prune"),
             ("--all", "sweep every app that has an installed home"),
@@ -2315,6 +2315,14 @@ pub(super) const PAGES: &[Page] = &[
             (
                 "--stale",
                 "also drop installed versions no activation asks for",
+            ),
+            (
+                "--drop <entry>",
+                "take this entry of each home, named as `sbx app show` lists it (repeatable)",
+            ),
+            (
+                "--reset",
+                "take everything the app's home(s) and mise pools hold, keeping its profile",
             ),
             ("-y, --yes", "apply the removal (previews by default)"),
         ],
@@ -2326,6 +2334,19 @@ pub(super) const PAGES: &[Page] = &[
             only with `--yes`. Every home the app has (the global one and any per-project ones) is\n\
             covered. Declared tools, the app's login/session state, and any `nix:`/`deb:`/`flake:`\n\
             build are left untouched. To remove the whole home instead, see `sbx app rm --purge`.\n\
+            \n\
+            `--drop <entry>` takes one entry of each home, named relative to the home exactly as\n\
+            `sbx app show` lists it (`.rustup`, `.local/share/pnpm`). Nothing about the name is\n\
+            interpreted: what a directory holds is yours to judge, which is why `show` lists a home\n\
+            rather than sorting it — an app's own data and a package manager's downloads sit side by\n\
+            side and their names do not tell them apart. A name that resolves outside the home is\n\
+            skipped, one that is not there reports nothing, and the flag repeats.\n\
+            \n\
+            `--reset` takes everything: every home, its configuration and its login state included,\n\
+            and the per-project mise pools a global app self-equipped into. What survives is what\n\
+            the app *declares*, so the next launch builds the home again from the profile. It acts\n\
+            on one named app rather than under `--all`, and it stands instead of the other flags\n\
+            rather than beside them. Removing the declaration too is `sbx app rm --purge`.\n\
             \n\
             `--caches` additionally empties `.cache` in each home — where a package manager keeps\n\
             what it downloaded, which is usually the larger half of an app's footprint and is not\n\

@@ -2118,6 +2118,10 @@ struct PruneArgs {
     caches: bool,
     /// `--stale`: also drop installed versions no activation asks for.
     stale: bool,
+    /// `--drop <entry>`: named entries of each home to take, relative to the home. Repeatable.
+    drop: Vec<String>,
+    /// `--reset`: take everything each home holds, leaving the app's declaration.
+    reset: bool,
     /// `--yes`: apply, rather than preview.
     apply: bool,
 }
@@ -2127,12 +2131,26 @@ struct PruneArgs {
 /// selector that stands *instead* of the name, and two switches that compose.
 fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
     let (mut name, mut all, mut caches, mut apply) = (None, false, false, false);
-    let mut stale = false;
+    let (mut stale, mut reset) = (false, false);
+    let mut drop: Vec<String> = Vec::new();
+    let mut want_entry = false;
     for a in args {
+        // `--drop` takes the next argument, which may look like anything a directory can be named.
+        if want_entry {
+            let Some(entry) = a.to_str() else {
+                diag::error("sbx: app prune: --drop takes a path, and this one is not valid UTF-8");
+                return Err(ExitCode::from(2));
+            };
+            drop.push(entry.to_string());
+            want_entry = false;
+            continue;
+        }
         match a.to_str() {
             Some("--all") => all = true,
             Some("--caches") => caches = true,
             Some("--stale") => stale = true,
+            Some("--reset") => reset = true,
+            Some("--drop") => want_entry = true,
             Some("-y") | Some("--yes") => apply = true,
             Some("--help") | Some("-h") => return Err(help::show(&["app", "prune"])),
             Some(flag) if flag.starts_with('-') => {
@@ -2164,11 +2182,31 @@ fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
         diag::hint("       `sbx app list` names them.");
         return Err(ExitCode::from(2));
     }
+    if want_entry {
+        diag::error("sbx: app prune: --drop needs the entry to take, as `sbx app show` names it.");
+        return Err(ExitCode::from(2));
+    }
+    // `--reset` takes everything, so pairing it with a narrower selector says two things at once
+    // and only one of them happens.
+    if reset && (!drop.is_empty() || caches || stale) {
+        diag::error("sbx: app prune: --reset already takes everything the other flags select.");
+        return Err(ExitCode::from(2));
+    }
+    // Refused rather than supported: emptying every app's home in one gesture is not something a
+    // command line says by accident, and there is no reading of it that a per-app run does not
+    // cover more safely.
+    if reset && all {
+        diag::error("sbx: app prune: --reset acts on one named app, not on --all.");
+        diag::hint("       run it per app; `sbx app list` names them.");
+        return Err(ExitCode::from(2));
+    }
     Ok(PruneArgs {
         name,
         all,
         caches,
         stale,
+        drop,
+        reset,
         apply,
     })
 }
@@ -2179,6 +2217,8 @@ struct PruneTotals {
     tools: usize,
     caches: usize,
     versions: usize,
+    /// Home entries taken by `--drop` or `--reset`.
+    entries: usize,
     bytes: u64,
 }
 
@@ -2194,6 +2234,8 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         all,
         caches,
         stale,
+        drop,
+        reset,
         apply,
     } = match parse_prune_args(args) {
         Ok(parsed) => parsed,
@@ -2310,13 +2352,26 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         let declared = declared_mise_tokens(&resolved, app_name);
         let declared: Vec<&str> = declared.iter().map(String::as_str).collect();
         for home in &homes {
-            let pruned = sandbox::prune_app_tools(&home.dir, &declared, apply);
+            // `--reset` stands instead of the tool sweep rather than beside it: it takes the
+            // directory the sweep would have worked through.
+            let pruned = if reset {
+                Vec::new()
+            } else {
+                sandbox::prune_app_tools(&home.dir, &declared, apply)
+            };
             let cached = if caches {
                 sandbox::prune_app_caches(&home.dir, apply)
             } else {
                 Vec::new()
             };
-            if pruned.is_empty() && cached.is_empty() {
+            let taken = if reset {
+                sandbox::reset_home(&home.dir, apply)
+            } else if drop.is_empty() {
+                Vec::new()
+            } else {
+                sandbox::drop_home_entries(&home.dir, &drop, apply)
+            };
+            if pruned.is_empty() && cached.is_empty() && taken.is_empty() {
                 continue;
             }
             let location = if home.global {
@@ -2348,6 +2403,42 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                     c.name,
                     sandbox::human_bytes(c.bytes)
                 );
+            }
+            for e in &taken {
+                totals.entries += 1;
+                totals.bytes += e.bytes;
+                println!(
+                    "  {n}{}{r}  {dim}{}{r}",
+                    e.rel,
+                    sandbox::human_bytes(e.bytes)
+                );
+            }
+        }
+
+        // A global app's state is not all in its home: the two-scope split puts what it
+        // self-equipped per project in a pool of its own, and a reset that left those standing
+        // would leave the app equipped in some projects and bare in others.
+        if reset {
+            for pool in sandbox::inspect::app_per_project_mise_pools(layout.data_dir(), app_name) {
+                let taken = sandbox::reset_home(&pool.dir, apply);
+                if taken.is_empty() {
+                    continue;
+                }
+                let location = format!("project {} mise pool", pool.project_id);
+                if all {
+                    println!("{n}{app_name}{r} {dim}{location}:{r}");
+                } else {
+                    println!("{dim}{location}:{r}");
+                }
+                for e in &taken {
+                    totals.entries += 1;
+                    totals.bytes += e.bytes;
+                    println!(
+                        "  {n}{}{r}  {dim}{}{r}",
+                        e.rel,
+                        sandbox::human_bytes(e.bytes)
+                    );
+                }
             }
         }
 
@@ -2408,16 +2499,24 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         had_error = true;
     }
 
-    if totals.tools == 0 && totals.caches == 0 && totals.versions == 0 {
+    if totals.tools == 0 && totals.caches == 0 && totals.versions == 0 && totals.entries == 0 {
         let subject = match &name {
             Some(n) => n.clone(),
             None => "no app".to_string(),
         };
-        let what = match (caches, stale) {
-            (false, false) => "undeclared mise tools",
-            (true, false) => "undeclared mise tools or caches",
-            (false, true) => "undeclared mise tools or stale versions",
-            (true, true) => "undeclared mise tools, caches or stale versions",
+        // Names what was asked for, so an empty run reads as an answer to the question rather than
+        // to a different one: `--reset` and `--drop` stand on their own, and the other two compose.
+        let what = if reset {
+            "state"
+        } else if !drop.is_empty() {
+            "named entry"
+        } else {
+            match (caches, stale) {
+                (false, false) => "undeclared mise tools",
+                (true, false) => "undeclared mise tools or caches",
+                (false, true) => "undeclared mise tools or stale versions",
+                (true, true) => "undeclared mise tools, caches or stale versions",
+            }
         };
         println!("{h}sbx app prune{r} {dim}— {subject}: no {what} to prune.{r}");
         return if had_error {
@@ -2428,7 +2527,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     }
 
     let size = sandbox::human_bytes(totals.bytes);
-    let subject = prune_subject(totals.tools, totals.caches, totals.versions);
+    let subject = prune_subject(totals.tools, totals.caches, totals.versions, totals.entries);
     if apply {
         println!("{ok}pruned {subject}, freeing {size} of data.{r}");
     } else {
@@ -2510,7 +2609,7 @@ fn declared_mise_tokens(resolved: &config::Resolved, name: &str) -> Vec<String> 
 /// `2 undeclared tool(s) and 3 cache(s)`, dropping either half when it is empty — the phrase both
 /// the preview and the applied line are built from, so the two can never describe the same run
 /// differently.
-fn prune_subject(tools: usize, caches: usize, versions: usize) -> String {
+fn prune_subject(tools: usize, caches: usize, versions: usize, entries: usize) -> String {
     let mut parts = Vec::new();
     if tools > 0 {
         parts.push(format!("{tools} undeclared tool(s)"));
@@ -2520,6 +2619,9 @@ fn prune_subject(tools: usize, caches: usize, versions: usize) -> String {
     }
     if versions > 0 {
         parts.push(format!("{versions} stale version(s)"));
+    }
+    if entries > 0 {
+        parts.push(format!("{entries} home entry(ies)"));
     }
     match parts.len() {
         0 => "nothing".to_string(),
