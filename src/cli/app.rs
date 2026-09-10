@@ -2114,8 +2114,6 @@ struct PruneArgs {
     name: Option<String>,
     /// `--all`: every app with an installed home, rather than one named.
     all: bool,
-    /// `--caches`: also empty each home's cache directory.
-    caches: bool,
     /// `--stale`: also drop installed versions no activation asks for.
     stale: bool,
     /// `--drop <entry>`: named entries of each home to take, relative to the home. Repeatable.
@@ -2130,7 +2128,7 @@ struct PruneArgs {
 /// [`crate::cli::one_name`], which reads exactly one name and one switch: this verb has a bulk
 /// selector that stands *instead* of the name, and two switches that compose.
 fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
-    let (mut name, mut all, mut caches, mut apply) = (None, false, false, false);
+    let (mut name, mut all, mut apply) = (None, false, false);
     let (mut stale, mut reset) = (false, false);
     let mut drop: Vec<String> = Vec::new();
     let mut want_entry = false;
@@ -2156,7 +2154,6 @@ fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
         }
         match a.to_str() {
             Some("--all") => all = true,
-            Some("--caches") => caches = true,
             Some("--stale") => stale = true,
             Some("--reset") => reset = true,
             Some("--drop") => want_entry = true,
@@ -2197,7 +2194,7 @@ fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
     }
     // `--reset` takes everything, so pairing it with a narrower selector says two things at once
     // and only one of them happens.
-    if reset && (!drop.is_empty() || caches || stale) {
+    if reset && (!drop.is_empty() || stale) {
         diag::error("sbx: app prune: --reset already takes everything the other flags select.");
         return Err(ExitCode::from(2));
     }
@@ -2212,7 +2209,6 @@ fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
     Ok(PruneArgs {
         name,
         all,
-        caches,
         stale,
         drop,
         reset,
@@ -2264,7 +2260,6 @@ mod prune_args_tests {
 #[derive(Default)]
 struct PruneTotals {
     tools: usize,
-    caches: usize,
     versions: usize,
     /// Home entries taken by `--drop` or `--reset`.
     entries: usize,
@@ -2281,7 +2276,6 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     let PruneArgs {
         name,
         all,
-        caches,
         stale,
         drop,
         reset,
@@ -2408,11 +2402,6 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             } else {
                 sandbox::prune_app_tools(&home.dir, &declared, apply)
             };
-            let cached = if caches {
-                sandbox::prune_app_caches(&home.dir, apply)
-            } else {
-                Vec::new()
-            };
             let taken = if reset {
                 sandbox::reset_home(&home.dir, apply)
             } else if drop.is_empty() {
@@ -2420,7 +2409,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             } else {
                 sandbox::drop_home_entries(&home.dir, &drop, apply)
             };
-            if pruned.is_empty() && cached.is_empty() && taken.is_empty() {
+            if pruned.is_empty() && taken.is_empty() {
                 continue;
             }
             let location = if home.global {
@@ -2442,15 +2431,6 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                     "  {n}{}{r}  {dim}{}{r}",
                     p.token,
                     sandbox::human_bytes(p.bytes)
-                );
-            }
-            for c in &cached {
-                totals.caches += 1;
-                totals.bytes += c.bytes;
-                println!(
-                    "  {n}.cache/{}{r}  {dim}{}{r}",
-                    c.name,
-                    sandbox::human_bytes(c.bytes)
                 );
             }
             for e in &taken {
@@ -2548,7 +2528,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         had_error = true;
     }
 
-    if totals.tools == 0 && totals.caches == 0 && totals.versions == 0 && totals.entries == 0 {
+    if totals.tools == 0 && totals.versions == 0 && totals.entries == 0 {
         let subject = match &name {
             Some(n) => n.clone(),
             None => "no app".to_string(),
@@ -2559,13 +2539,10 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             "state"
         } else if !drop.is_empty() {
             "named entry"
+        } else if stale {
+            "undeclared mise tools or stale versions"
         } else {
-            match (caches, stale) {
-                (false, false) => "undeclared mise tools",
-                (true, false) => "undeclared mise tools or caches",
-                (false, true) => "undeclared mise tools or stale versions",
-                (true, true) => "undeclared mise tools, caches or stale versions",
-            }
+            "undeclared mise tools"
         };
         println!("{h}sbx app prune{r} {dim}— {subject}: no {what} to prune.{r}");
         return if had_error {
@@ -2576,7 +2553,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     }
 
     let size = sandbox::human_bytes(totals.bytes);
-    let subject = prune_subject(totals.tools, totals.caches, totals.versions, totals.entries);
+    let subject = prune_subject(totals.tools, totals.versions, totals.entries);
     if apply {
         println!("{ok}pruned {subject}, freeing {size} of data.{r}");
     } else {
@@ -2658,13 +2635,10 @@ fn declared_mise_tokens(resolved: &config::Resolved, name: &str) -> Vec<String> 
 /// `2 undeclared tool(s) and 3 cache(s)`, dropping either half when it is empty — the phrase both
 /// the preview and the applied line are built from, so the two can never describe the same run
 /// differently.
-fn prune_subject(tools: usize, caches: usize, versions: usize, entries: usize) -> String {
+fn prune_subject(tools: usize, versions: usize, entries: usize) -> String {
     let mut parts = Vec::new();
     if tools > 0 {
         parts.push(format!("{tools} undeclared tool(s)"));
-    }
-    if caches > 0 {
-        parts.push(format!("{caches} cache(s)"));
     }
     if versions > 0 {
         parts.push(format!("{versions} stale version(s)"));

@@ -2306,12 +2306,11 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "prune"],
-        synopsis: "sbx app prune <name>|--all [--caches] [--stale] [--drop <entry>]... [--reset] [--yes]",
-        summary: "remove an app home's undeclared mise tools, its caches, named entries, or all of it",
+        synopsis: "sbx app prune <name>|--all [--stale] [--drop <entry>]... [--reset] [--yes]",
+        summary: "remove an app home's undeclared mise tools, named entries of it, or all of it",
         options: &[
             ("<name>", "the app whose home(s) to prune"),
             ("--all", "sweep every app that has an installed home"),
-            ("--caches", "also empty each home's cache directory"),
             (
                 "--stale",
                 "also drop installed versions no activation asks for",
@@ -2347,12 +2346,6 @@ pub(super) const PAGES: &[Page] = &[
             the app *declares*, so the next launch builds the home again from the profile. It acts\n\
             on one named app rather than under `--all`, and it stands instead of the other flags\n\
             rather than beside them. Removing the declaration too is `sbx app rm --purge`.\n\
-            \n\
-            `--caches` additionally empties `.cache` in each home — where a package manager keeps\n\
-            what it downloaded, which is usually the larger half of an app's footprint and is not\n\
-            shared between apps. The XDG base directory specification defines that directory as\n\
-            non-essential data, so what goes costs a refetch and nothing else; login and session\n\
-            state lives elsewhere and is not touched.\n\
             \n\
             Every size printed is the size of the **data**: what the disk gets back can be less,\n\
             because a compressing volume stored those bytes smaller and a block shared with another\n\

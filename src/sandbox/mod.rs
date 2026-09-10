@@ -150,8 +150,8 @@ pub(crate) use flake::{
 };
 pub(crate) use gc::{
     InstalledApp, PrunedVersion, SIZE_CAVEAT, classify_tree, drop_home_entries, human_bytes,
-    installed_app_homes, mise_tool_specs, prune_app_caches, prune_app_tools, prune_stale_versions,
-    purge_app_homes, read_marker, reset_home, tree_size, tree_usage, tree_usage_parts,
+    installed_app_homes, mise_tool_specs, prune_app_tools, prune_stale_versions, purge_app_homes,
+    read_marker, reset_home, tree_size, tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{
     AppOutcome, SessionHeader, app, attach, detach_log_path, distro_lock_path,

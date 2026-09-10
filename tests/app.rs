@@ -721,63 +721,22 @@ fn prune_reports_nothing_when_all_installed_tools_are_declared() {
     );
 }
 
-/// Without `--caches` the cache directory is not in scope at all: the flag is what widens the verb,
-/// and a prune that emptied caches by default would delete on a command line that asked for tools.
+/// A named entry goes and the app stays signed in: `--drop` takes what it is told and reaches
+/// nothing else, so login and session state under `.config` and `.local/share` survives. A declared
+/// tool is not an entry anybody named, and stays installed.
 #[test]
-fn prune_leaves_the_caches_alone_unless_asked_for_them() {
-    let fx = fixture_with_a_leftover();
-    fx.write_cache_entry("demo-app", "mise", 4096);
-
-    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
-    assert!(out.status.success(), "prune --yes failed: {}", text(&out));
-    assert!(
-        fx.app_home("demo-app").join(".cache/mise/blob").exists(),
-        "a prune without --caches must not touch the cache: {}",
-        text(&out)
-    );
-}
-
-/// `--caches` names each cache entry with its size and, previewing, removes none of them. The entry
-/// is named rather than summed into a total, so what has to refill is legible before the removal.
-#[test]
-fn prune_caches_previews_each_entry_and_removes_nothing() {
-    let fx = fixture_with_a_leftover();
-    fx.write_cache_entry("demo-app", "mise", 4096);
-    fx.write_cache_entry("demo-app", "uv", 2048);
-
-    let out = fx.run(&["app", "prune", "demo-app", "--caches"]);
-    assert!(out.status.success(), "preview failed: {}", text(&out));
-    let s = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        s.contains(".cache/mise") && s.contains(".cache/uv"),
-        "the preview must name each cache entry: {s}"
-    );
-    assert!(
-        s.contains("2 cache(s)"),
-        "the preview must count the caches: {s}"
-    );
-    assert!(
-        fx.app_home("demo-app").join(".cache/mise/blob").exists(),
-        "a preview must remove nothing"
-    );
-}
-
-/// Applied, the caches go and the app stays signed in: login and session state lives under
-/// `.config` and `.local/share`, which is what makes emptying `.cache` cost a refetch and nothing
-/// else. A declared tool is not a cache and stays installed.
-#[test]
-fn prune_caches_yes_empties_the_cache_and_keeps_login_state() {
+fn drop_yes_takes_the_named_entry_and_keeps_login_state() {
     let fx = fixture_with_a_leftover();
     fx.write_cache_entry("demo-app", "mise", 4096);
     let home = fx.app_home("demo-app");
     std::fs::create_dir_all(home.join(".local/share/demo-app")).unwrap();
     std::fs::write(home.join(".local/share/demo-app/session"), b"signed-in").unwrap();
 
-    let out = fx.run(&["app", "prune", "demo-app", "--caches", "--yes"]);
+    let out = fx.run(&["app", "prune", "demo-app", "--drop", ".cache/mise", "--yes"]);
     assert!(out.status.success(), "prune failed: {}", text(&out));
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("cache(s)"),
-        "the applied line must account for the caches: {}",
+        String::from_utf8_lossy(&out.stdout).contains("home entry(ies)"),
+        "the applied line must account for the entry: {}",
         text(&out)
     );
     assert!(
@@ -786,11 +745,11 @@ fn prune_caches_yes_empties_the_cache_and_keeps_login_state() {
     );
     assert!(
         home.join(".local/share/demo-app/session").exists(),
-        "login state must survive a cache prune"
+        "login state must survive a targeted drop"
     );
     assert!(
         fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir(),
-        "a declared tool is not a cache and stays installed"
+        "a declared tool is not an entry anybody named, and stays installed"
     );
 }
 
@@ -803,7 +762,7 @@ fn prune_all_sweeps_every_app_that_has_a_home() {
     fx.write_cache_entry("demo-app", "mise", 4096);
     fx.write_cache_entry("other-app", "npm", 2048);
 
-    let out = fx.run(&["app", "prune", "--all", "--caches"]);
+    let out = fx.run(&["app", "prune", "--all", "--drop", ".cache"]);
     assert!(out.status.success(), "sweep failed: {}", text(&out));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -811,15 +770,15 @@ fn prune_all_sweeps_every_app_that_has_a_home() {
         "each app's lines must be attributed to it: {s}"
     );
     assert!(
-        s.contains("and 2 cache(s)"),
-        "the sweep totals both apps' caches in one line: {s}"
+        s.contains("2 home entry(ies)"),
+        "the sweep totals both apps' entries in one line: {s}"
     );
 }
 
 /// A sweep must not stop at the first app it may not touch: an app whose session is live is skipped
 /// and named, the rest are still pruned, and the run exits non-zero so a script sees that the sweep
 /// was not complete. Refusing outright, as the named form does, would let one running agent stand
-/// between the user and every other app's caches.
+/// between the user and every other app's home.
 #[test]
 fn prune_all_skips_a_live_app_names_it_and_still_sweeps_the_rest() {
     let fx = fixture_with_a_leftover();
@@ -827,7 +786,7 @@ fn prune_all_skips_a_live_app_names_it_and_still_sweeps_the_rest() {
     fx.write_cache_entry("other-app", "npm", 2048);
     register_live_session(&fx, "demo-app");
 
-    let out = fx.run(&["app", "prune", "--all", "--caches", "--yes"]);
+    let out = fx.run(&["app", "prune", "--all", "--drop", ".cache", "--yes"]);
 
     assert_eq!(
         out.status.code(),
@@ -842,10 +801,10 @@ fn prune_all_skips_a_live_app_names_it_and_still_sweeps_the_rest() {
     );
     assert!(
         fx.app_home("demo-app").join(".cache/mise/blob").exists(),
-        "the live app's cache must be left alone"
+        "the live app's home must be left alone"
     );
     assert!(
-        !fx.app_home("other-app").join(".cache/npm").exists(),
+        !fx.app_home("other-app").join(".cache").exists(),
         "every other app is still swept: {}",
         text(&out)
     );
@@ -863,7 +822,7 @@ fn the_size_reporting_verbs_say_the_figure_is_data_not_reclaimed_space() {
     for args in [
         vec!["app", "list"],
         vec!["app", "show", "demo-app"],
-        vec!["app", "prune", "demo-app", "--caches"],
+        vec!["app", "prune", "demo-app", "--drop", ".cache"],
     ] {
         let out = fx.run(&args);
         assert!(out.status.success(), "{args:?} failed: {}", text(&out));

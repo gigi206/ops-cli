@@ -12,7 +12,7 @@ sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
 sbx app list
 sbx app show <name> [--json]
-sbx app prune <name>|--all [--caches] [--stale] [-y|--yes]
+sbx app prune <name>|--all [--stale] [--drop <entry>]... [--reset] [-y|--yes]
 ```
 
 `sbx app run <name>` launches a named application profile: a project `[app.<name>]`
@@ -472,28 +472,19 @@ launch.
 
 It acts on one named app rather than under `--all`, and it stands instead of the other
 flags rather than beside them. A live session of the app refuses the **applying** run, the
-way it refuses `--caches`; the preview stays available, since it deletes nothing.
+way it refuses any applying prune; the preview stays available, since it deletes nothing.
 
-### Reclaiming the caches
-
-`--caches` empties `.cache` in each of the app's homes as well. That directory is where a
-package manager keeps what it downloaded, and it is usually the larger half of an app's
-footprint: each app has its own isolated home, so nothing there is shared with the other
-apps, and the same archives are held once per app. The
-[XDG base directory specification](https://specifications.freedesktop.org/basedir-spec/latest/)
-defines it as non-essential data, which is what makes emptying it sound as a rule rather
-than as a per-tool list: what goes costs a refetch and nothing else. An app's login and
-session state lives under `.config` and `.local/share`, and neither is touched, so an app
-stays signed in.
+### Sweeping every app
 
 `--all` sweeps every app that has an installed home instead of one named. It widens the
 scope the way [`sbx gc --all`](gc) does, though the two widen different things. Naming an
-app **and** `--all` is refused, since neither would clearly govern.
+app **and** `--all` is refused, since neither would clearly govern. `--drop` composes with
+it, so one entry can be taken from every app at once.
 
 :::tip Start with the preview
-`sbx app prune --all --caches` lists every app's caches with sizes and removes nothing. That
-is the number to look at before deciding, and [`sbx app list`](#listing-apps) shows what each
-app holds in total.
+`sbx app prune --all --drop .npm` lists what every app holds under that name, with sizes,
+and removes nothing. That is the number to look at before deciding, and
+[`sbx app list`](#listing-apps) shows what each app holds in total.
 :::
 
 The sizes it prints carry the same caveat as everywhere else: see
@@ -538,10 +529,10 @@ sbx app list                           # imported profiles + installed homes
 sbx app show claude-code               # what this app has actually installed on disk
 sbx app prune hermes                    # preview undeclared mise tools in hermes' home
 sbx app prune hermes --yes              # …and remove them
-sbx app prune hermes --caches           # …preview its downloaded caches too
 sbx app prune hermes --stale            # …and versions nothing asks for any more
-sbx app prune --all --caches            # what every app's caches hold, across all homes
-sbx app prune --all --caches --yes      # …and empty them
+sbx app prune hermes --drop .rustup     # take one entry `sbx app show` listed
+sbx app prune hermes --reset --yes      # empty its home entirely, keeping the profile
+sbx app prune --all --drop .npm         # what every app holds under that name
 sbx app export claude-code > my-claude.toml
 sbx app rm claude-code --purge         # remove the profile, home, and tools
 sbx app rm claude-code --purge --gc    # …and sweep this project's nix store too
