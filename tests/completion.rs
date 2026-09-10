@@ -53,6 +53,43 @@ fn cases(paths: &[Vec<String>]) -> String {
     out
 }
 
+/// The oracle runs on a keystroke, so it must not **write**. This file already holds that rule for
+/// the store — the layout is resolved without mounting, because completing an argument had been
+/// attaching a loop device and mounting a filesystem — and the session registry is its other half:
+/// `Registry::list` is the reclaiming walk, unlinking every record it finds dead. Offering a pid
+/// therefore used to reap the registry behind the prompt, taking the work `sbx gc` reports.
+///
+/// That the value path is reached at all is what the defect shows: run against `list`, this record
+/// is gone. A record that reads dead without depending on a pid being free — pid 1 is always taken
+/// and its start ticks are never this, so the pair fails — is exactly what such a walk removes.
+#[test]
+fn the_oracle_reads_the_session_registry_without_reclaiming_it() {
+    let dir = scratch("registry");
+    let record = dir.join("sbx/sessions/1-999999999999");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    // `project` is the path in hex (`/nowhere`).
+    std::fs::write(
+        &record,
+        b"kind=run\npid=1\nstart=999999999999\nproject=2f6e6f7768657265\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["__complete", "--", "session", "logs", ""])
+        .env("XDG_DATA_HOME", &dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("LC_ALL", "C.UTF-8")
+        .output()
+        .expect("spawn sbx");
+
+    assert!(out.status.success(), "the oracle failed: {out:?}");
+    assert!(
+        record.exists(),
+        "a keystroke reclaimed the session registry: {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn shell_available(shell: &str) -> bool {
     Command::new(shell)
         .arg("-c")

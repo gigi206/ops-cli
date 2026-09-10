@@ -399,8 +399,11 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     match kind {
         Sessions => {
-            // The same listing the verbs use, liveness and all; the pid is the value.
-            if let Ok(sessions) = session::Registry::at(layout.data_dir()).list() {
+            // The same live sessions the verbs offer, liveness and all; the pid is the value. Asked
+            // through `live`, for the reason the layout above is resolved without mounting: this
+            // runs on a keystroke, and `list` is the reclaiming walk — it unlinks every record it
+            // finds dead. Pressing Tab would take the work `sbx gc` reports, behind the prompt.
+            if let Ok(sessions) = session::Registry::at(layout.data_dir()).live() {
                 for s in sessions {
                     out.push((s.pid.to_string(), String::new()));
                 }
@@ -495,8 +498,10 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
             // A parked request's id is `<session-pid>.<n>`, held by each live session's
             // own control plane; ask it as `sbx proc pending` does — but on a glance
             // budget, since this runs on a keystroke and every live session is asked. A
-            // session slow to answer drops out of the menu rather than stalling the prompt.
-            if let Ok(sessions) = session::Registry::at(layout.data_dir()).list() {
+            // session slow to answer drops out of the menu rather than stalling the prompt. Asked
+            // through `live` for the same reason as `Sessions` above: a keystroke reads, never
+            // reclaims.
+            if let Ok(sessions) = session::Registry::at(layout.data_dir()).live() {
                 for s in sessions {
                     let socket = proc_control::proc_control_socket(layout.data_dir(), s.pid);
                     if let Ok(parked) =
