@@ -972,8 +972,9 @@ fn open_dir_nofollow(parent: Option<&OwnedFd>, name: &std::ffi::CStr) -> io::Res
 /// [`contained_in`] cannot offer.
 ///
 /// `..` is **not** a symlink, and `O_NOFOLLOW` does not stop it: a walk that accepted it would climb
-/// straight out of the home into the data dir. So only `Component::Normal` is accepted, and a `rel`
-/// carrying `..`, a leading `/`, or a bare `.` is refused outright. An empty `rel` names `home`.
+/// straight out of the home into the data dir. So a `rel` carrying `..`, or a leading `/`, is refused
+/// outright. A `.` is skipped instead of refused — it names the directory the walk already stands in,
+/// so it cannot reach anywhere, and `./.npm` is a name a user writes. An empty `rel` names `home`.
 ///
 /// A link that stays *inside* the home is refused too, where `contained_in` follows it. That is a
 /// narrowing, and the fail-closed side of one: the caller is a verb whose only action is to delete.
@@ -983,11 +984,15 @@ fn open_beneath(home: &Path, rel: &Path) -> io::Result<OwnedFd> {
     let anchor = std::ffi::CString::new(home.as_os_str().as_bytes()).map_err(io::Error::other)?;
     let mut dir = open_dir_nofollow(None, &anchor)?;
     for comp in rel.components() {
-        let std::path::Component::Normal(name) = comp else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a name that does not stay below the home it is read from",
-            ));
+        let name = match comp {
+            std::path::Component::Normal(name) => name,
+            std::path::Component::CurDir => continue,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a name that does not stay below the home it is read from",
+                ));
+            }
         };
         let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
         dir = open_dir_nofollow(Some(&dir), &name)?;
@@ -2383,21 +2388,42 @@ mod tests {
     /// `..` is not a symlink, so `O_NOFOLLOW` does not refuse it: a walk that took components as
     /// they came would climb out of the home into the data dir beside it, where the other apps'
     /// homes are. The refusal has to be on the component's kind.
+    ///
+    /// `.` is the other half of that, and it goes the other way: it names the directory the walk
+    /// already stands in, so accepting it reaches nowhere new — and refusing it would drop
+    /// `./.npm`, which is a name a user writes, on a verb that would then say nothing about having
+    /// skipped it.
     #[test]
     fn the_walk_refuses_a_component_that_is_not_a_plain_name() {
         let tmp = TmpDir::new();
         let home = home_with(tmp.path(), &[(".npm", 128)]);
 
-        for rel in ["..", "../..", ".npm/../..", "/etc", "."] {
+        for rel in ["..", "../..", ".npm/../..", "/etc", "/"] {
             assert!(
                 open_beneath(&home, Path::new(rel)).is_err(),
                 "the walk accepted `{rel}`"
             );
         }
-        assert!(
-            open_beneath(&home, Path::new(".npm")).is_ok(),
-            "the walk refused a plain name"
-        );
+        for rel in [".npm", "./.npm", ".", ""] {
+            assert!(
+                open_beneath(&home, Path::new(rel)).is_ok(),
+                "the walk refused `{rel}`"
+            );
+        }
+    }
+
+    /// A name a user writes with a `./` in front of it reaches the same entry as one without.
+    #[test]
+    fn drop_takes_a_name_written_against_the_home_it_is_read_from() {
+        let tmp = TmpDir::new();
+        let home = home_with(tmp.path(), &[(".npm", 2048), (".config", 128)]);
+
+        let taken = drop_home_entries(&home, &["./.npm".to_string()], true);
+
+        let named: Vec<&str> = taken.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(named, ["./.npm"]);
+        assert!(!home.join(".npm").exists());
+        assert!(home.join(".config/f").exists());
     }
 
     /// A link on the way down is refused at the step that meets it, rather than traversed — the
