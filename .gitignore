@@ -40,6 +40,11 @@ docs-site/.docusaurus/
 # that will not exist. `.claude/settings.json` beside them is tracked and stays so.
 .claude/worktrees/
 
+# Per-contributor local agent settings (MCP enablement and the like), created beside the tracked
+# `.claude/settings.json`. Machine-local by definition, so it stays untracked — same reason as the
+# worktrees above: a bare `git add -A` must not sweep it into a commit.
+.claude/settings.local.json
+
 # Runtime state a caged app writes into the project root. `freebuff` keys its per-project data by a
 # `project-id` it drops here alongside a SQLite database, so the directory appears the first time
 # `sbx app run freebuff` is used on this tree and is never something to commit. Listed for the same

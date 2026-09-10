@@ -9,5 +9,8 @@
         "repo": "boostvolt/claude-code-lsps"
       }
     }
-  }
+  },
+  "enabledMcpjsonServers": [
+    "cargo-callgraph"
+  ]
 }
