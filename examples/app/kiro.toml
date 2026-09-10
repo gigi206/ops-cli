@@ -21,7 +21,8 @@
 # kiro-cli-term) — NOT an Electron/Chromium app. It runs like any other CLI in the cage; the
 # in-cage Chromium below is used ONLY to complete the OAuth sign-in, never for daily runs.
 #
-# It is packaged from nixpkgs' own `kiro-cli` derivation (`nix:kiro-cli`): built host-side
+# It is packaged from nixpkgs' own `kiro-cli` derivation, at the `.unwrapped` attribute the
+# bundle names and explains (`nix:kiro-cli.unwrapped`): built host-side
 # into sbx's shared store (once, then seeded per project — no per-project rebuild of the
 # ~530 MB artifact), from the official vendor `.tar.gz` that nixpkgs pins and autoPatchelfs.
 # `kiro-cli` is proprietary (an `unfree` nixpkgs package); a `[packages]` declaration is

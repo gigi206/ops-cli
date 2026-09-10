@@ -181,7 +181,27 @@ shared_credential = [[
 # derivation fetches the official AWS `.tar.gz`, patchelfs the native binaries, and puts
 # kiro-cli / kiro-cli-chat / kiro-cli-term on PATH. It is proprietary (an `unfree` nixpkgs
 # package), which a `[packages]` declaration is trusted-only for.
-kiro = "nix:kiro-cli"
+#
+# `.unwrapped` IS THE ATTRIBUTE THAT RUNS IN A CAGE; THE PLAIN ONE DOES NOT. nixpkgs additionally
+# wraps these binaries in a `buildFHSEnv` whose launcher is bubblewrap, so reaching the CLI through
+# the plain `kiro-cli` attribute asks for a user namespace from inside the cage — which sbx's
+# seccomp denylist refuses. bwrap reports that refusal as the kernel forbidding unprivileged user
+# namespaces; it cannot tell a denylist apart from a kernel that really does forbid them, so its
+# message names the wrong culprit and the launch dies with no usable diagnosis.
+#
+# The wrapper's own launcher execs this very derivation, and these binaries are linked against the
+# store rather than against an FHS root, so their loader needs nothing that root would supply. What
+# upstream added it for is not stated here; were a later release to come to need it at run time,
+# the symptom would be a missing path under `/usr`, not a refused namespace.
+#
+# ALL THREE BINARIES MATTER, NOT ONLY THE ENTRY POINT. `kiro-cli` delegates some verbs to
+# `kiro-cli-chat`, which it resolves by name on PATH — the install step below is one of them. A
+# PATH carrying the wrapped form of any of the three therefore fails the same way, one level down
+# and with the same misdirected message.
+#
+# The attribute is upstream's own, so a release that stops exposing it fails the build by name
+# rather than falling back to the wrapper unnoticed.
+kiro = "nix:kiro-cli.unwrapped"
 # Chromium for the in-cage OAuth sign-in only — see the note above.
 chromium = "nix:chromium"
 

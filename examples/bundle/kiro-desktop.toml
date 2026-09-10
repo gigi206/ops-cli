@@ -16,7 +16,8 @@
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope — nor the `[network] http2` designation, which
 # is a transport posture rather than a requirement of the package.
 #
-# DISTINCT FROM THE `kiro` BUNDLE. That one carries the terminal CLI (`nix:kiro-cli`); this one
+# DISTINCT FROM THE `kiro` BUNDLE. That one carries the terminal CLI (`nix:kiro-cli.unwrapped`);
+# this one
 # carries the IDE tarball. They are different artifacts of the same product, with overlapping but
 # not identical egress — the IDE adds the Open VSX marketplace and treats `cognito-identity` as an
 # auth dependency rather than telemetry.

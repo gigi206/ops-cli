@@ -119,7 +119,7 @@ again.
 | `freebuff-desktop` | `appimage:resolve` (+ `nix:chromium`) | `www.codebuff.com` (account) |
 | `goose-desktop` | `deb:github:aaif-goose/goose` | provider-dependent (BYOK) |
 | `hermes-desktop` | `flake:github:NousResearch/hermes-agent#desktop` (+ `nix:chromium`, `nix:nodejs`, …) | `openrouter.ai` (BYOK) |
-| `kiro` | `nix:kiro-cli` (+ `nix:chromium`) | `*.kiro.dev` (AWS/Kiro account) |
+| `kiro` | `nix:kiro-cli.unwrapped` (+ `nix:chromium`) | `*.kiro.dev` (AWS/Kiro account) |
 | `kiro-desktop` | `tarball:resolve` (+ `nix:chromium`) | `app.kiro.dev` (AWS/Kiro account) |
 | `opencode-desktop` | `deb:github:anomalyco/opencode` | provider-dependent (BYOK) |
 | `openwork` | `appimage:resolve` (the public build, whose OpenCode engine ships inside the artifact as a sidecar) (+ `nix:chromium`) | provider-dependent (BYOK); an OpenWork Den account (`app.openworklabs.com`) is optional |
