@@ -787,12 +787,11 @@ mod tests {
         let sock_path = wiring_host_socket(&layout, port);
         let cage = UnixListener::bind(&sock_path).expect("bind the stand-in cage socket");
         let echo = std::thread::spawn(move || {
-            if let Ok((mut conn, _)) = cage.accept() {
-                let mut buf = [0u8; 64];
-                if let Ok(n) = conn.read(&mut buf) {
-                    let up = buf[..n].to_ascii_uppercase();
-                    let _ = conn.write_all(&up);
-                }
+            let mut conn = accept_within(&cage, "the bridge never dialed the stand-in cage socket");
+            let mut buf = [0u8; 64];
+            if let Ok(n) = conn.read(&mut buf) {
+                let up = buf[..n].to_ascii_uppercase();
+                let _ = conn.write_all(&up);
             }
         });
 
@@ -837,9 +836,7 @@ mod tests {
         });
         // Stand in for the in-cage socat: accept, then vanish. Dropping the connection EOFs the
         // cage→host direction while nothing at all happens on the host→cage one.
-        let (conn, _) = cage
-            .accept()
-            .expect("the bridge connects to the cage socket");
+        let conn = accept_within(&cage, "the bridge never dialed the cage socket");
         drop(conn);
 
         rx.recv_timeout(Duration::from_secs(10)).expect(
@@ -1142,6 +1139,48 @@ mod tests {
         let _ = echo.join();
         drop(guard);
     }
+
+    /// Accept one connection on `listener` within a bounded wait, or fail saying what never
+    /// arrived.
+    ///
+    /// A bare `accept()` waits for ever, which turns a defect in the code under test into a
+    /// **hang** rather than a failure — and a hang carries none of the information a red line
+    /// does. Met for real: under the shipping target the bridge could not dial the cage socket, so
+    /// nothing ever connected here, and the test written to prove exactly that printed no verdict
+    /// at all. The run had to be killed to learn which test it was.
+    ///
+    /// Polled rather than given a socket timeout, because `accept` takes none: the listener goes
+    /// non-blocking for the wait and back to blocking for the caller, which uses the connection
+    /// the ordinary way.
+    fn accept_within(listener: &std::os::unix::net::UnixListener, what: &str) -> UnixStream {
+        let deadline = std::time::Instant::now() + ACCEPT_DEADLINE;
+        listener
+            .set_nonblocking(true)
+            .expect("poll the stand-in listener");
+        loop {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    let _ = listener.set_nonblocking(false);
+                    conn.set_nonblocking(false)
+                        .expect("the accepted connection is used blocking");
+                    return conn;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{what} within {}s",
+                        ACCEPT_DEADLINE.as_secs()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{what}: {e}"),
+            }
+        }
+    }
+
+    /// How long [`accept_within`] waits. The same budget the channel waits below use, since both
+    /// bound the same thing: a step of the bridge that a broken dial simply never reaches.
+    const ACCEPT_DEADLINE: Duration = Duration::from_secs(10);
 
     /// The host-side socket path `start` creates for `port`, so the round-trip test can bind the
     /// stand-in cage there. Mirrors `start`'s construction exactly (keyed by this pid).
