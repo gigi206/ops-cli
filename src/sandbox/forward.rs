@@ -48,7 +48,7 @@ use std::ffi::OsString;
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -296,6 +296,12 @@ fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) 
         // The accepted stream inherits nothing from the non-blocking listener on Linux, but make it
         // explicit: the bridge uses a simple blocking read/write loop.
         let _ = stream.set_nonblocking(false);
+        // Nagle off, for the reason every leg of the egress plane already states: a server answers
+        // with a head then a body, and Nagle holds the second write until the first is acknowledged.
+        // On a connection that stays open the wait is a delayed ACK — tens of milliseconds per
+        // response, on a loopback hop with no congestion for Nagle to protect anyone from. This is
+        // the leg the browser reads, so the stall lands on the interactive path.
+        let _ = stream.set_nodelay(true);
         // Past the ceiling the stream is dropped, which closes it (fail-closed) rather than pinning
         // another thread.
         let Some(slot) = cap.take() else { continue };
@@ -393,27 +399,10 @@ fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
     // connection was accepted and closed with the error swallowed at the call site. A host-target
     // test run cannot see it — the same source is correct against glibc — so the flags are passed
     // as written, where no library may reinterpret them.
-    let c_sock = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "`{}` cannot name a socket to dial — the path holds a NUL byte",
-                sock.display()
-            ),
-        )
-    })?;
-    // SAFETY: c_sock is a live NUL-terminated path for the duration of the call.
-    let fd = unsafe {
-        libc::open(
-            c_sock.as_ptr(),
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
-    let pinned = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let pinned = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(sock)?;
     if !pinned.metadata()?.file_type().is_socket() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -444,7 +433,7 @@ pub(crate) fn wrap_command(
     let mut preamble = String::new();
     for f in forwards {
         preamble.push_str(&format!(
-            "{socat} UNIX-LISTEN:{uds},fork TCP-CONNECT:127.0.0.1:{port} \
+            "{socat} UNIX-LISTEN:{uds},fork TCP-CONNECT:127.0.0.1:{port},nodelay \
              </dev/null >/dev/null 2>&1 & ",
             socat = socat.to_string_lossy(),
             uds = f.cage_uds.display(),
@@ -688,6 +677,50 @@ mod tests {
         assert_eq!(out[3], OsString::from("sbx-forward"));
         assert_eq!(out[4], OsString::from("demo-app"));
         assert_eq!(out[5], OsString::from("login"));
+    }
+
+    /// Every TCP address the in-cage forwarder owns carries `nodelay`, the rule
+    /// [`super::egress::wrap_command`] already holds itself to on the way out.
+    ///
+    /// A dev server answers with a head then a body, and Nagle holds the second write until the
+    /// first is acknowledged; on a connection that stays open for the next request that wait is a
+    /// delayed ACK, tens of milliseconds per response over a loopback hop with no congestion to
+    /// protect anyone from. Read off the emitted script rather than trusted to the string above, so
+    /// a later edit to the socat line cannot drop the option silently.
+    #[test]
+    fn every_tcp_address_of_the_in_cage_forwarder_disables_nagle() {
+        let forwards = vec![
+            Forward {
+                cage_port: 1455,
+                cage_uds: PathBuf::from("/tmp/sbx-forward/p-1455.sock"),
+            },
+            Forward {
+                cage_port: 8080,
+                cage_uds: PathBuf::from("/tmp/sbx-forward/p-8080.sock"),
+            },
+        ];
+        let out = wrap_command(
+            Path::new("/nix/store/x-socat/bin/socat"),
+            Path::new("/nix/store/y-bash/bin/bash"),
+            &forwards,
+            vec![OsString::from("demo-app")],
+        );
+        let script = out[2].to_string_lossy().into_owned();
+        let tcp_addresses: Vec<&str> = script
+            .split_whitespace()
+            .filter(|token| token.starts_with("TCP-CONNECT:"))
+            .collect();
+        assert_eq!(
+            tcp_addresses.len(),
+            2,
+            "one outgoing leg per declared forward: {script}"
+        );
+        for address in tcp_addresses {
+            assert!(
+                address.contains(",nodelay"),
+                "`{address}` must disable Nagle: {script}"
+            );
+        }
     }
 
     /// The host-side bridge round-trips bytes: a host TCP connection to the listener is pumped
