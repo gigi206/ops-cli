@@ -14,6 +14,30 @@ use crate::proc_policy::ProcMode;
 use crate::sandbox::locks::{locked, write_locked};
 use crate::testutil::TmpDir;
 
+/// Hold `path`'s inode the way the lens holds a probe: an `O_PATH` descriptor, opened by the
+/// syscall.
+///
+/// Not through `OpenOptions::custom_flags`, which masks its argument with `!O_ACCMODE` — a mask
+/// that *contains* `O_PATH` on the musl target this crate ships as, so the flag is dropped and the
+/// open becomes an ordinary read: on a socket it then fails outright, and on a regular file it
+/// succeeds while handing back a descriptor of a different kind than the one under test. The guard
+/// that names this shape crate-wide is `sandbox::forward`'s
+/// `no_o_path_open_is_left_to_open_options_to_mask`.
+fn o_path_probe(path: &std::path::Path) -> std::fs::File {
+    let c =
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a path with no NUL");
+    // SAFETY: c is a live NUL-terminated path for the duration of the call.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    assert!(
+        fd >= 0,
+        "hold {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
+    unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+}
+
 #[test]
 fn ioctl_codes_match_the_kernel_abi() {
     // Computed once against the struct sizes; pin the well-known x86_64/aarch64 values so a wrong
@@ -1054,7 +1078,6 @@ fn a_silent_handoff_connection_does_not_park_the_accept_loop() {
 /// the `resolve` word, which is the point.
 #[test]
 fn a_restricted_openat2_is_left_to_the_kernel_to_walk() {
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = TmpDir::new();
     let sock_path = dir.join("probe.sock");
     let _listener = UnixListener::bind(&sock_path).expect("bind the probe socket");
@@ -1062,11 +1085,7 @@ fn a_restricted_openat2_is_left_to_the_kernel_to_walk() {
     let serve = |resolve: u64| {
         // `O_PATH` is the only way to hold a descriptor on a socket inode, and it is how the
         // lens holds every probe.
-        let probe = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH)
-            .open(&sock_path)
-            .expect("hold the socket inode");
+        let probe = o_path_probe(&sock_path);
         let how: [u64; 3] = [libc::O_RDONLY as u64, 0, resolve];
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
         req.pid = std::process::id();
@@ -1106,17 +1125,12 @@ fn a_restricted_openat2_is_left_to_the_kernel_to_walk() {
 /// live notification descriptor — so the only difference between the arms is `size`.
 #[test]
 fn a_short_openat2_is_left_to_the_kernel_to_refuse() {
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = TmpDir::new();
     let sock_path = dir.join("probe.sock");
     let _listener = UnixListener::bind(&sock_path).expect("bind the probe socket");
 
     let serve = |size: u64| {
-        let probe = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH)
-            .open(&sock_path)
-            .expect("hold the socket inode");
+        let probe = o_path_probe(&sock_path);
         let how: [u64; 3] = [libc::O_RDONLY as u64, 0, 0];
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
         req.pid = std::process::id();
@@ -1154,7 +1168,6 @@ fn a_short_openat2_is_left_to_the_kernel_to_refuse() {
 /// a belief about them.
 #[test]
 fn an_open_that_asked_not_to_follow_a_link_is_refused_when_the_final_component_is_one() {
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = TmpDir::new();
     let real = dir.join("real.txt");
     std::fs::write(&real, b"the file the cage meant to open\n").expect("write the fixture");
@@ -1180,11 +1193,7 @@ fn an_open_that_asked_not_to_follow_a_link_is_refused_when_the_final_component_i
     let serve = |target: &Path| {
         // The probe the lens holds: opened without `O_NOFOLLOW`, so on the link it names the
         // file behind it. That is the descriptor that must not be handed over.
-        let probe = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH)
-            .open(target)
-            .expect("hold the probe");
+        let probe = o_path_probe(target);
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
         req.pid = std::process::id();
         req.data.nr = libc::SYS_openat as libc::c_int;

@@ -90,12 +90,12 @@ cd "$HOME/odysseus"
 . .venv/bin/activate
 # Expose the C++ runtime the provisioned `nix:gcc.cc` carries. manylinux wheels (numpy, …) link
 # libstdc++.so.6, which is absent from the cage's glibc — without this, importing Odysseus dies at
-# `import numpy` with `libstdc++.so.6: cannot open shared object file`. The store path is
-# hash-addressed, so discover it under /nix/store at launch rather than hardcoding the hash. Extend
-# the glob list if another scientific wheel needs more (libgfortran/libgomp/…).
-for d in /nix/store/*gcc-*-lib/lib /nix/store/*libstdcxx*/lib /nix/store/*libstdc++*/lib; do
-  [ -e "$d/libstdc++.so.6" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-done
+# `import numpy` with `libstdc++.so.6: cannot open shared object file`. The `odysseus` bundle's
+# install step writes this prelude and `[service.chroma]` sources the same file, so the discovery
+# lives in one place: the store path is hash-addressed, the glob has to run at each start, and a
+# hand-copy here would fall behind the tool. Extend the glob list in the bundle if another
+# scientific wheel needs more (libgfortran/libgomp/…).
+. "$HOME/.odysseus-native-libs.sh"
 # Point Odysseus' built-in Browser MCP at sbx's provisioned Chromium: it reads
 # ODYSSEUS_BROWSER_EXECUTABLE and passes `--executable-path` to @playwright/mcp, so Playwright uses
 # this binary instead of downloading its own. The wrapper adds the flags Odysseus' env surface

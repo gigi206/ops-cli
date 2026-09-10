@@ -47,6 +47,29 @@ provision = [
     '''
 set -e
 cd "$HOME"
+
+# The C++ runtime the native wheels link against, written down ONCE for the two callers that need
+# it: the `[service.chroma]` below, and the profile's own `cmd`. manylinux wheels (numpy, and every
+# wheel chromadb pulls in) link libstdc++.so.6, which the cage's glibc does not carry and the
+# `nix:gcc.cc` this bundle declares does. The store path is hash-addressed and moves on every
+# `sbx upgrade nix`, so the prelude globs at each start instead of recording a path here.
+#
+# A sourceable file rather than an export in the app's command, because a service starts BEFORE that
+# command and inherits the cage's environment, not the command's: an export written there reaches
+# the command alone, and leaves every service to load the wheels without it. `[env]` cannot carry it
+# either — the value is not known until the glob runs.
+#
+# Written unconditionally, ahead of the commit-keyed guard below: a service that cannot start is not
+# something a warm launch may skip. The closing `:` is load-bearing — `.` returns the status of the
+# last command in the file, the last glob matches nothing on a normal cage, and both callers run
+# under `set -e`.
+cat > "$HOME/.odysseus-native-libs.sh" <<'PRELUDE'
+for d in /nix/store/*gcc-*-lib/lib /nix/store/*libstdcxx*/lib /nix/store/*libstdc++*/lib; do
+  [ -e "$d/libstdc++.so.6" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+done
+:
+PRELUDE
+
 # Clone the curated `main` branch (upstream marks `dev` as possibly-unstable and the repo default
 # really is `dev`, so the branch is pinned explicitly); reuse the persistent app home afterwards.
 if [ ! -d odysseus ]; then
@@ -153,9 +176,18 @@ CHROMADB_PORT = "8100"
 # installed by the step above (a venv dependency) and configured by the `[env]` above it, so a
 # hand-copy in a profile would fall behind the tool.
 #
-# Named by its absolute path in the venv, not by `chroma` on PATH: a service runs in the cage's
-# environment, and the venv this was installed into is activated by the app's own command, later.
-# The interpreter comes from the entry point's shebang, so activation is not needed.
+# Started through `bash -c`, on ONE line, so the native-library prelude the install step wrote is
+# sourced first. The single line is a constraint, not a style: sbx drops a `[service]` entry whose
+# argv carries any control character, a newline included, and a dropped entry only warns.
+# Without it chroma dies at `import numpy` with `libstdc++.so.6: cannot open shared object file`
+# before it ever binds: the readiness gate then expires and the workspace starts degraded, which in
+# the launch output reads exactly like a slow start and is distinguishable only in the log below.
+# A service runs in the cage's environment and the app's command runs after it, so the export that
+# command carries cannot reach here; the prelude is the one definition both share.
+#
+# The server is named by its absolute path in the venv rather than by `chroma` on PATH, for the same
+# reason: the venv is activated by the app's own command, later. The interpreter comes from the
+# entry point's shebang, so activation is not needed.
 #
 # It binds 0.0.0.0 (all cage interfaces) while `[env]` sets CHROMADB_HOST=127.0.0.1, so the workspace
 # reaches the literal IPv4 loopback: a `localhost` resolving to ::1 in the cage would refuse silently
@@ -164,13 +196,8 @@ CHROMADB_PORT = "8100"
 # `ready` is what the app's command used to do by hand. The gate is not fatal: on expiry the
 # workspace starts anyway and degrades, which is what it does without a store at all.
 cmd = [
-    "~/odysseus/.venv/bin/chroma",
-    "run",
-    "--host",
-    "0.0.0.0",
-    "--port",
-    "8100",
-    "--path",
-    "~/chroma-data",
+    "bash",
+    "-c",
+    '. "$HOME/.odysseus-native-libs.sh"; exec "$HOME/odysseus/.venv/bin/chroma" run --host 0.0.0.0 --port 8100 --path "$HOME/chroma-data"',
 ]
 ready = { tcp = 8100 }

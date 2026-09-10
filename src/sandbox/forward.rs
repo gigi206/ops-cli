@@ -48,7 +48,7 @@ use std::ffi::OsString;
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -384,12 +384,36 @@ pub(super) fn pump_tcp_uds(client: TcpStream, uds: UnixStream) -> io::Result<()>
 /// A missing socket keeps its old meaning — the cage forwarder may simply not have bound it yet,
 /// and the caller drops that connection for the client to retry.
 fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
-    // `read(true)` is only there because `OpenOptions` requires an access mode; `O_PATH` makes the
-    // kernel ignore it, which is what lets this open a socket at all.
-    let pinned = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(sock)?;
+    // Opened by the syscall rather than through `OpenOptions::custom_flags`, which cannot carry
+    // `O_PATH` on the target this binary ships as. `OpenOptions` masks the custom flags with
+    // `!O_ACCMODE` so they cannot disturb the access mode Rust set; glibc spells `O_ACCMODE` `3`,
+    // and musl spells it `0o10000003`, because musl defines `O_SEARCH` as `O_PATH` and folds it into
+    // the access mode. Under musl the mask therefore ate the one flag this open exists for: the
+    // kernel then met a socket without it, `open(2)` answers that with `ENXIO`, and every forwarded
+    // connection was accepted and closed with the error swallowed at the call site. A host-target
+    // test run cannot see it — the same source is correct against glibc — so the flags are passed
+    // as written, where no library may reinterpret them.
+    let c_sock = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "`{}` cannot name a socket to dial — the path holds a NUL byte",
+                sock.display()
+            ),
+        )
+    })?;
+    // SAFETY: c_sock is a live NUL-terminated path for the duration of the call.
+    let fd = unsafe {
+        libc::open(
+            c_sock.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
+    let pinned = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
     if !pinned.metadata()?.file_type().is_socket() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -913,6 +937,46 @@ mod tests {
         cage.accept()
             .expect("the dial reached the socket at the name");
         drop(client);
+    }
+
+    #[test]
+    fn no_o_path_open_is_left_to_open_options_to_mask() {
+        // The one regression on this path that the suite around it cannot see. `OpenOptions` masks
+        // custom flags with `!O_ACCMODE` so they cannot disturb the access mode it set; glibc
+        // spells `O_ACCMODE` `3` and musl spells it `0o10000003`, folding `O_PATH` into it. The
+        // source is therefore correct against the target the tests are built for and wrong against
+        // the target the binary ships as, and every behavioural assertion above passes either way.
+        //
+        // What is visible on any target is the shape that carries it, so this reads the source
+        // rather than running it. Crate-wide rather than this file: pinning an inode before acting
+        // on it is how several planes here stay safe against a name their subject can rewrite, and
+        // the next one to reach for `OpenOptions` will not be this module.
+        let mut offenders = Vec::new();
+        for path in crate::testutil::crate_sources() {
+            let text = std::fs::read_to_string(&path).expect("read a crate source");
+            // Whitespace-collapsed: rustfmt routinely splits a call from its argument, and a search
+            // that reads one line at a time stops at the break. The production half only, so this
+            // guard's own needles do not answer it.
+            let flat = crate::testutil::production_half(&text)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            for (at, _) in flat.match_indices("custom_flags(") {
+                let tail = &flat[at..];
+                // `)` is ASCII, so the index it reports is always a char boundary.
+                let Some(end) = tail.find(')') else { continue };
+                if tail[..end].contains("O_PATH") {
+                    offenders.push(format!("{}: {}", path.display(), &tail[..end]));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`O_PATH` reaches the kernel only if no library masks it, and `OpenOptions` masks it \
+             on the target this binary ships as — the open then meets the inode the flag exists to \
+             pin without it, and fails. Open these through `libc::open` or `openat2` instead: \
+             {offenders:#?}"
+        );
     }
 
     /// The host-side socket path `start` creates for `port`, so the round-trip test can bind the

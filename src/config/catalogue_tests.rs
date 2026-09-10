@@ -21,6 +21,58 @@ fn shipped_bundle(path: &std::path::Path) -> schema::RawBundle {
     super::validate_bundle(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// One shipped file, paired with the tables whose entries a validator may drop one by one.
+///
+/// A single walk rather than a `read_dir` per guard: the guards that follow differ only in which
+/// table they hand to which validator, so the population they read is one fact, and two copies of
+/// it drift apart the first time a directory is added to the catalogue.
+struct ShippedTables {
+    /// The file, named the way a launch's own warning names it.
+    source: String,
+    open: std::collections::BTreeMap<String, schema::RawOpen>,
+    service: std::collections::BTreeMap<String, schema::RawService>,
+}
+
+/// Every file of the shipped catalogue that can carry one of those tables, parsed through sbx's own
+/// reader.
+///
+/// Both halves: a bundle carries what rides with a tool, a profile what belongs to one app. The
+/// other `examples/` directories hold egress groups and secrets, whose schemas carry neither table.
+fn shipped_tables() -> Vec<ShippedTables> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    for dir in ["examples/bundle", "examples/app"] {
+        for entry in std::fs::read_dir(root.join(dir))
+            .unwrap_or_else(|e| panic!("{dir}/ dir exists: {e}"))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let source = format!("{dir}/{}", path.file_name().unwrap().to_string_lossy());
+            out.push(if dir == "examples/bundle" {
+                let bundle = shipped_bundle(&path);
+                ShippedTables {
+                    source,
+                    open: bundle.open,
+                    service: bundle.service,
+                }
+            } else {
+                let bytes = std::fs::read(&path).expect("read the profile");
+                let app =
+                    schema::parse_app(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                ShippedTables {
+                    source,
+                    open: app.open,
+                    service: app.service,
+                }
+            });
+        }
+    }
+    out
+}
+
 #[test]
 fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
     // The catalogue is the population the new app-scoped unknown-key report is loudest on: 71
@@ -1075,6 +1127,103 @@ fn every_shipped_service_is_named_in_the_bundles_table() {
     assert!(
         wrong.is_empty(),
         "the bundles table does not say which bundles run a process beside the app: {wrong:#?}"
+    );
+}
+
+#[test]
+fn every_shipped_service_survives_the_validation_that_will_read_it() {
+    // [`super::validate::validate_service`] DROPS an entry it cannot honor rather than refusing the
+    // file: the launch warns, loses the daemon, and starts the app without it. That trade is right
+    // for a profile someone wrote by hand — a refused launch leaves them nothing at all — and it is
+    // what makes the catalogue's own mistakes invisible. Nothing here is typed at a prompt: a
+    // shipped entry the validator drops warns once, inside a launch whose output nobody reads
+    // twice, and the app then runs in exactly the degraded state the service was declared to
+    // prevent.
+    //
+    // The guard above reads the field; this one runs the code that will read it. Every rule that
+    // decides whether a service lives is applied at launch — the name's shape, an argv that names
+    // no program, a control character an argument may not carry — and none of them is expressible
+    // as an assertion on the text.
+    //
+    // "No warning at all" rather than "the entry survived", because `enable` and `ready` are
+    // dropped on their own: an entry that keeps its argv and loses its readiness gate leaves the
+    // app racing the process it was meant to wait for, and one that loses its `enable` starts a
+    // daemon the condition was there to hold back.
+    let mut dropped = Vec::new();
+    let mut carriers = 0;
+    for ShippedTables {
+        source, service, ..
+    } in shipped_tables()
+    {
+        if service.is_empty() {
+            continue;
+        }
+        carriers += 1;
+        let declared: Vec<String> = service.keys().cloned().collect();
+        let mut warnings = Vec::new();
+        let kept = super::validate::validate_service(&mut warnings, &source, service);
+        // The warnings name what was dropped and why, so they are the finding rather than a detail
+        // of it. The key check stands beside them for the drop that ever stops warning.
+        dropped.extend(warnings);
+        for name in declared {
+            if !kept.contains_key(&name) {
+                dropped.push(format!("{source}: `{name}` does not survive validation"));
+            }
+        }
+    }
+    assert!(
+        carriers > 0,
+        "no shipped file declares a service, so this guard now asserts nothing"
+    );
+    dropped.sort();
+    assert!(
+        dropped.is_empty(),
+        "these shipped services are not honored as they are written — the launch drops what it \
+         cannot read and says so in a warning nothing fails on: {dropped:#?}"
+    );
+}
+
+#[test]
+fn every_shipped_open_handler_survives_the_validation_that_will_read_it() {
+    // The `[service]` guard's twin, on the table that decides where a link opens.
+    // [`super::validate::validate_open`] drops an entry it cannot honor with the same warning and
+    // the same silence, and the consequence is quieter still: a URI with no handler is PRINTED and
+    // the launch carries on, so a dropped entry surfaces as a sign-in that never opens a browser,
+    // with nothing in the app's own output naming a routing table as the reason.
+    //
+    // The wider half of the two populations, and the one where a hand-written argv is long enough
+    // to hide a mistake: the browser handlers carry a dozen flags apiece.
+    //
+    // The key comparison folds, unlike the service guard's: `validate_open` lowercases the scheme
+    // before storing the handler, because RFC 3986 makes schemes case-insensitive while the
+    // router's match is literal. Compared unfolded, a profile spelling `HTTPS` would be reported as
+    // dropped when it was in fact honored.
+    let mut dropped = Vec::new();
+    let mut carriers = 0;
+    for ShippedTables { source, open, .. } in shipped_tables() {
+        if open.is_empty() {
+            continue;
+        }
+        carriers += 1;
+        let declared: Vec<String> = open.keys().cloned().collect();
+        let mut warnings = Vec::new();
+        let kept = super::validate::validate_open(&mut warnings, &source, open);
+        dropped.extend(warnings);
+        for scheme in declared {
+            if !kept.contains_key(&scheme.to_ascii_lowercase()) {
+                dropped.push(format!("{source}: `{scheme}` does not survive validation"));
+            }
+        }
+    }
+    assert!(
+        carriers > 0,
+        "no shipped file declares an `[open]` handler, so this guard now asserts nothing"
+    );
+    dropped.sort();
+    assert!(
+        dropped.is_empty(),
+        "these shipped URI handlers are not honored as they are written — the launch drops what it \
+         cannot read, then prints the link instead of opening it: {dropped:#?}"
     );
 }
 
