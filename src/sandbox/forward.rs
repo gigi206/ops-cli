@@ -48,13 +48,12 @@ use std::ffi::OsString;
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 /// Where the per-launch host directory appears in the cage. Under the `/tmp` tmpfs (a writable
 /// mountpoint — a bind onto the read-only root would fail), and a single dir carries every
@@ -71,9 +70,21 @@ const CAGE_FORWARD_DIR: &str = "/tmp/sbx-forward";
 /// both `127.0.0.1` and `[::1]` admits this many on each.
 const MAX_CONCURRENT_CONNS: usize = 512;
 
-/// How long an accept loop waits between non-blocking `accept()` polls. Small enough that dropping
-/// the guard frees the port promptly, large enough that an idle port costs nothing.
-const ACCEPT_POLL: Duration = Duration::from_millis(20);
+/// The longest an accept loop waits in `poll(2)` before re-reading the shutdown flag, in
+/// milliseconds.
+///
+/// It bounds **teardown only**. The wait ends as soon as the listener has a connection, so this
+/// number never reaches a peer: it says how long after dropping the guard a loop may still be
+/// parked before it notices and frees its port. Large enough that an idle port costs nothing —
+/// an idle listener wakes 50 times a second and does nothing else.
+///
+/// It used to be a `thread::sleep` between non-blocking `accept()` calls, and then it bounded
+/// latency as well: nothing woke the loop when a connection arrived, so a peer that opened one
+/// just after a nap waited out the remainder before its first byte moved. Measured on the
+/// sequential arrivals an interactive caller makes — a browser, a `curl` — that was the whole
+/// interval on every connection rather than half of it on some, because the loop napped after
+/// serving each one and the next connection landed inside that nap.
+const ACCEPT_POLL_MS: libc::c_int = 20;
 
 /// A running forward session's host-side resources: the per-launch directory (whose socket files
 /// the in-cage forwarder creates) and the accept-loop threads. Dropping the guard signals the loops
@@ -277,11 +288,28 @@ fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) 
         }
         let stream = match listener.accept() {
             Ok((s, _)) => s,
-            // The listener is non-blocking, so "nothing pending" is the ordinary idle state: nap
-            // and re-poll the shutdown flag. It is matched first because it is the only error this
-            // loop is entitled to swallow.
+            // The listener is non-blocking, so "nothing pending" is the ordinary idle state: wait
+            // on the listener itself, then re-read the shutdown flag. It is matched first because
+            // it is the only error this loop is entitled to swallow.
+            //
+            // Waiting in `poll` rather than in `sleep` is what keeps the interval off the peer's
+            // path: it returns the moment the listener has a connection, so the timeout bounds
+            // teardown alone (see [`ACCEPT_POLL_MS`]). The same shape `fs_watch`'s event loop
+            // uses, and for the same reason — wake on the event, not on the clock.
+            //
+            // Its result is deliberately not inspected. A timeout, an `EINTR` and a readable
+            // listener all lead to the same next step, and an error condition on the listener is
+            // left to the `accept` below to report through [`super::conncap::accept_backoff`], so
+            // this stays one place where an accept failure is named rather than two.
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL);
+                let mut pfd = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid `pollfd` naming the listener this loop owns, waited for a
+                // bounded time; `poll` writes only `revents`.
+                unsafe { libc::poll(&mut pfd, 1, ACCEPT_POLL_MS) };
                 continue;
             }
             // Anything else is a real failure — host fd exhaustion (`EMFILE`) above all, which is
@@ -399,10 +427,27 @@ fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
     // connection was accepted and closed with the error swallowed at the call site. A host-target
     // test run cannot see it — the same source is correct against glibc — so the flags are passed
     // as written, where no library may reinterpret them.
-    let pinned = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(sock)?;
+    let c_sock = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "`{}` cannot name a socket to dial — the path holds a NUL byte",
+                sock.display()
+            ),
+        )
+    })?;
+    // SAFETY: c_sock is a live NUL-terminated path for the duration of the call.
+    let fd = unsafe {
+        libc::open(
+            c_sock.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
+    let pinned = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
     if !pinned.metadata()?.file_type().is_socket() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -450,6 +495,7 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::io::{Read, Write};
+    use std::time::Duration;
 
     /// Starts a forwarder on ports the OS has just handed out. A port is chosen by binding and
     /// releasing it, so between the release and the forwarder's own bind there is a window
@@ -1010,6 +1056,91 @@ mod tests {
              pin without it, and fails. Open these through `libc::open` or `openat2` instead: \
              {offenders:#?}"
         );
+    }
+
+    /// What a host peer waits between opening a connection to a forwarded port and reading the
+    /// first byte back through the bridge.
+    ///
+    /// The grandeur is not "how fast is the bridge" but "how long does a connection sit before the
+    /// accept loop notices it". `TcpStream::connect` returns as soon as the kernel has completed
+    /// the handshake and queued the connection on the listener's backlog — before any `accept(2)`
+    /// in user space — so the wait shows up on the first byte read, not on the connect. This is the
+    /// interactive path: a browser chasing an OAuth callback, or a developer opening a cage dev
+    /// server, pays it once per connection.
+    ///
+    /// Reported as quantiles rather than a mean, because the shape is what identifies the cause. A
+    /// loop that naps a fixed interval between polls leaves a signature a mean hides: a connection
+    /// arriving just after a poll waits out the whole interval, one arriving just before waits
+    /// almost nothing, so the spread runs from ~0 to the interval with the median near half of it.
+    /// A loop that sleeps on the listener itself has no such spread.
+    ///
+    /// Connections are opened one at a time, each waiting for its own echo. A tight loop would
+    /// measure something else: the backlog absorbs several arrivals per interval, and the second
+    /// and third are accepted in the same wake as the first, which averages the wait away instead
+    /// of measuring it.
+    #[test]
+    #[ignore = "a measurement, not an assertion: run explicitly, in release"]
+    fn connect_latency() {
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+
+        const CONNECTIONS: usize = 200;
+
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let (guard, _wiring, picked) =
+            start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
+        let port = picked[0];
+
+        // The stand-in cage: accept in a loop (the round-trip test accepts once) and echo, so every
+        // connection of the run meets the same trivial responder and the figure is the bridge's.
+        let sock_path = wiring_host_socket(&layout, port);
+        let cage = UnixListener::bind(&sock_path).expect("bind the stand-in cage socket");
+        let stop = Arc::new(AtomicBool::new(false));
+        let cage_stop = Arc::clone(&stop);
+        let echo = std::thread::spawn(move || {
+            while !cage_stop.load(Ordering::Relaxed) {
+                let Ok((mut conn, _)) = cage.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 8];
+                if let Ok(n) = conn.read(&mut buf)
+                    && n > 0
+                {
+                    let _ = conn.write_all(&buf[..n]);
+                }
+            }
+        });
+
+        let mut waits: Vec<Duration> = Vec::with_capacity(CONNECTIONS);
+        for _ in 0..CONNECTIONS {
+            let started = Instant::now();
+            let mut client =
+                TcpStream::connect(("127.0.0.1", port)).expect("connect to the host port");
+            client.write_all(b"x").expect("write through the bridge");
+            let mut back = [0u8; 1];
+            client.read_exact(&mut back).expect("read the echo back");
+            waits.push(started.elapsed());
+            drop(client);
+        }
+
+        waits.sort_unstable();
+        let at = |q: f64| waits[((waits.len() - 1) as f64 * q) as usize].as_secs_f64() * 1e3;
+        println!("\nhost→cage forward: connect to first byte back ({CONNECTIONS} connections)");
+        println!(
+            "  {:<28} {:>8.2} {:>8.2} {:>8.2} {:>8.2}   (ms)",
+            "min / p50 / p95 / max",
+            at(0.0),
+            at(0.5),
+            at(0.95),
+            at(1.0)
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        // Unpark the stand-in cage's blocking accept, the way `Egress::drop` unparks its own.
+        let _ = std::os::unix::net::UnixStream::connect(&sock_path);
+        let _ = echo.join();
+        drop(guard);
     }
 
     /// The host-side socket path `start` creates for `port`, so the round-trip test can bind the
