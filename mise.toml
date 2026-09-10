@@ -272,10 +272,12 @@ description = "Report unit-test coverage with cargo-llvm-cov (fast, deterministi
 # What the concurrent stores cost, and the one lever over it: a fixture's data dir holds a store
 # provisioned for it alone, and its project stores are seeded from that store -- reflinked where the
 # filesystem supports it (`place_file`, src/sandbox/projectstore.rs), copied in full where it does
-# not. On ext4 there is no reflink and no compression, so each fixture pays for its base twice and
-# pays it uncompressed. Pointing `SBX_TEST_TMPDIR` at a btrfs filesystem turns the seeds into clones
-# and compresses the rest, for no change to the suite; it costs a longer path, which `sun_path` has
-# a fixed budget for (see the note in tests/run.rs on the egress socket).
+# not. On ext4 there is neither, so a fixture that reaches the seed stage pays for its base twice
+# and pays it uncompressed -- late in a run rather than throughout it, since the seed comes after
+# the store it copies. A root on a btrfs filesystem reflinks the seeds and compresses the stores,
+# for no change to the suite; what has been measured is the total each way, not the share of the
+# two. It costs a longer path, which `sun_path` has a fixed budget for (see the note in tests/run.rs
+# on the egress socket).
 #
 # Sharing one store between fixtures is a different proposition and is deliberately not done. A nix
 # store keeps its database and its gcroots inside itself, so a shared store is a shared collector --
