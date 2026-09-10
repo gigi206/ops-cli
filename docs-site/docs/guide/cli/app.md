@@ -471,7 +471,8 @@ the profile: tools reinstall, and you sign in again. That is the difference from
 launch.
 
 It acts on one named app rather than under `--all`, and it stands instead of the other
-flags rather than beside them. A live session refuses it, as it refuses `--caches`.
+flags rather than beside them. A live session of the app refuses the **applying** run, the
+way it refuses `--caches`; the preview stays available, since it deletes nothing.
 
 ### Reclaiming the caches
 

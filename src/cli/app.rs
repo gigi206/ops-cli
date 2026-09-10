@@ -2141,6 +2141,15 @@ fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
                 diag::error("sbx: app prune: --drop takes a path, and this one is not valid UTF-8");
                 return Err(ExitCode::from(2));
             };
+            // A forgotten entry would otherwise make the next flag the thing to delete, silently.
+            // An entry really starting with `-` is unreachable this way, and reachable as `./-x`.
+            if entry.starts_with('-') {
+                diag::error(&format!(
+                    "sbx: app prune: --drop takes an entry to remove, got the flag `{entry}`"
+                ));
+                diag::hint("       name it as `sbx app show` lists it, e.g. `--drop .rustup`.");
+                return Err(ExitCode::from(2));
+            }
             drop.push(entry.to_string());
             want_entry = false;
             continue;
@@ -2209,6 +2218,46 @@ fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
         reset,
         apply,
     })
+}
+
+#[cfg(test)]
+mod prune_args_tests {
+    use super::parse_prune_args;
+    use std::ffi::OsString;
+
+    fn parse(args: &[&str]) -> Result<super::PruneArgs, std::process::ExitCode> {
+        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
+        parse_prune_args(&owned)
+    }
+
+    #[test]
+    fn drop_collects_every_entry_it_is_given() {
+        let Ok(parsed) = parse(&["demo", "--drop", ".rustup", "--drop", ".local/share/pnpm"])
+        else {
+            panic!("two entries must parse");
+        };
+        assert_eq!(parsed.drop, [".rustup", ".local/share/pnpm"]);
+        assert_eq!(parsed.name.as_deref(), Some("demo"));
+        assert!(!parsed.reset && !parsed.apply);
+    }
+
+    #[test]
+    fn drop_refuses_the_flag_that_follows_a_forgotten_entry() {
+        // Without this, `--drop --reset` reads as "remove the entry named `--reset`", and the flag
+        // the user meant to pass is silently gone.
+        assert!(parse(&["demo", "--drop", "--reset"]).is_err());
+        assert!(parse(&["demo", "--drop"]).is_err());
+    }
+
+    #[test]
+    fn reset_stands_alone() {
+        // It already takes everything the others select, and it acts on one app.
+        assert!(parse(&["demo", "--reset", "--caches"]).is_err());
+        assert!(parse(&["demo", "--reset", "--stale"]).is_err());
+        assert!(parse(&["demo", "--reset", "--drop", ".npm"]).is_err());
+        assert!(parse(&["--all", "--reset"]).is_err());
+        assert!(parse(&["demo", "--reset", "--yes"]).is_ok());
+    }
 }
 
 /// What one app's prune freed (or would free), for the run's totals.

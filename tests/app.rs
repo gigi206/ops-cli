@@ -506,6 +506,79 @@ fn register_live_session(fx: &Project, app: &str) {
 }
 
 #[test]
+fn reset_yes_refuses_while_a_session_of_that_app_is_live() {
+    // The most destructive form of the verb answers to the same guard as the narrowest one, and
+    // the preview stays available under it because it deletes nothing.
+    let fx = fixture_with_a_leftover();
+    register_live_session(&fx, "demo-app");
+
+    let out = fx.run(&["app", "prune", "demo-app", "--reset", "--yes"]);
+    assert!(
+        !out.status.success(),
+        "a reset under a live session must refuse: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("live session"),
+        "and say why: {}",
+        text(&out)
+    );
+    assert!(
+        fx.installs_dir("demo-app").join("pipx-orphan").is_dir(),
+        "nothing may be deleted under the running agent"
+    );
+
+    let preview = fx.run(&["app", "prune", "demo-app", "--reset"]);
+    assert!(
+        preview.status.success(),
+        "the preview deletes nothing, so a live session has nothing to refuse: {}",
+        text(&preview)
+    );
+}
+
+#[test]
+fn reset_empties_every_home_and_pool_and_keeps_the_profile() {
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    let profile = sbx_dir.join("apps/demo/profile.toml");
+    touch_under(&profile);
+    touch_under(&sbx_dir.join("apps/demo/home/.config/creds"));
+    touch_under(&sbx_dir.join("apps/demo/home/.rustup/toolchain/bin/rustc"));
+    // The per-project mise pool a global app self-equips into: part of "everything", or the app
+    // comes back equipped in one project and bare in the next.
+    touch_under(&sbx_dir.join("projects/testproj/apps/demo/mise/installs/node/22/bin/node"));
+    // Another app, which the reset must not reach.
+    touch_under(&sbx_dir.join("apps/other/home/.config/creds"));
+
+    let out = fx.run(&["app", "prune", "demo", "--reset", "--yes"]);
+    assert!(out.status.success(), "reset failed: {}", text(&out));
+
+    let home = sbx_dir.join("apps/demo/home");
+    assert!(home.is_dir(), "the home itself must survive its reset");
+    assert_eq!(
+        std::fs::read_dir(&home).unwrap().count(),
+        0,
+        "the home still holds something: {}",
+        text(&out)
+    );
+    assert!(
+        !sbx_dir
+            .join("projects/testproj/apps/demo/mise/installs/node")
+            .exists(),
+        "the per-project mise pool survived the reset: {}",
+        text(&out)
+    );
+    assert!(
+        profile.exists(),
+        "a reset keeps the declaration — removing it is `app rm --purge`"
+    );
+    assert!(
+        sbx_dir.join("apps/other/home/.config/creds").exists(),
+        "the reset reached another app"
+    );
+}
+
+#[test]
 fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
     let fx = fixture_with_a_leftover();
     register_live_session(&fx, "demo-app");

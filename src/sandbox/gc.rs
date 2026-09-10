@@ -1245,6 +1245,10 @@ pub(crate) fn drop_home_entries(home: &Path, rels: &[String], apply: bool) -> Ve
 /// Nothing is spared, including the app's configuration and its login state. That is the verb: what
 /// survives is what the app *declares*, and the next launch builds the home again from it. Removing
 /// the declaration too is `sbx app rm --purge`, which is a different question.
+///
+/// An entry holding nothing is reported all the same, unlike in
+/// [`super::inspect::home_composition`], which drops it: there the zero says the entry is not worth
+/// a line, here it says the entry goes.
 pub(crate) fn reset_home(home: &Path, apply: bool) -> Vec<DroppedEntry> {
     let Some(real_home) = contained_in(home, home) else {
         return Vec::new();
