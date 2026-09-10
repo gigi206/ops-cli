@@ -79,28 +79,3 @@ impl Drop for TmpDir {
         force_remove(&self.0);
     }
 }
-
-/// Remove a tree that may contain read-only directories — a provisioned nix store makes its
-/// directories `0555`, so a plain `remove_dir_all` cannot delete their contents. Add write to each
-/// directory on the way down, then remove. Best effort: cleanup never fails a test.
-///
-/// One definition rather than eleven. The copies were identical to the byte, and the suites that
-/// did *not* carry one dropped their fixtures with `remove_dir_all` — which is exactly the call
-/// that walks into a store's `0555` directories and leaves most of the tree on disk.
-pub fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}

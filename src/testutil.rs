@@ -103,28 +103,6 @@ impl Drop for TmpDir {
     }
 }
 
-/// Remove a tree that may contain read-only directories — a provisioned nix store
-/// makes its directories `0555`, so a plain `remove_dir_all` cannot delete their
-/// contents. Add write to each directory on the way down, then remove. Best
-/// effort: cleanup never fails a test.
-pub(crate) fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 /// Every `.rs` source under `dir`, sorted, subdirectories included. The walk descends because a
 /// module that outgrew one file keeps its root in `<name>.rs` and everything else in a `<name>/`
 /// beside it: a flat listing would read the root, skip the children, and report the silence as a
@@ -431,10 +409,105 @@ pub(crate) fn app_with(packages: Vec<crate::config::Package>) -> crate::config::
     }
 }
 
+/// What the fixture root promises: it names one place, and it reclaims what a killed run left
+/// there. The sweep is the half that can do damage, so its tests state liveness rather than
+/// borrow it — except the one that has to ask the real `/proc`.
+#[cfg(test)]
+mod fixture_root_tests {
+    use super::TmpDir;
+    use std::path::{Path, PathBuf};
+
+    /// Write a fixture directory under `root`, with the read-only inner directory a provisioned
+    /// nix store leaves behind — the thing a plain `remove_dir_all` cannot get past.
+    fn fixture_like(root: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join(name);
+        let store = dir.join("sbx/store/nix/store/abc-tool");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("payload"), b"x").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        dir
+    }
+
+    /// A `/proc` holding exactly the pids named, so liveness is stated rather than borrowed from
+    /// whatever this host happens to be running.
+    fn fake_proc(root: &Path, live: &[u32]) -> PathBuf {
+        let proc = root.join("proc");
+        for pid in live {
+            std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+        }
+        std::fs::create_dir_all(&proc).unwrap();
+        proc
+    }
+
+    #[test]
+    fn a_fixture_name_yields_its_owner_pid_and_nothing_else_does() {
+        // Both spellings, and a tag carrying its own dashes and digits.
+        assert_eq!(
+            super::fixture_owner_pid("sbx-test-3738169-0"),
+            Some(3738169)
+        );
+        assert_eq!(
+            super::fixture_owner_pid("r-ingr-datb-3725338-10"),
+            Some(3725338)
+        );
+        assert_eq!(super::fixture_owner_pid("p-670023-17"), Some(670023));
+        // The shared directories under the same root, which the sweep must never reach.
+        assert_eq!(super::fixture_owner_pid("isolated-config"), None);
+        assert_eq!(super::fixture_owner_pid("fs-isolated-config"), None);
+        assert_eq!(super::fixture_owner_pid("proc-isolated-config"), None);
+        // A name with only one number, or none, is not a fixture's.
+        assert_eq!(super::fixture_owner_pid("scratch-12"), None);
+        assert_eq!(super::fixture_owner_pid("notes"), None);
+    }
+
+    #[test]
+    fn the_sweep_takes_the_trees_of_dead_runs_and_leaves_every_other_entry() {
+        let tmp = TmpDir::new();
+        let root = tmp.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let dead = fixture_like(&root, "r-gpu-data-4711-3");
+        let live = fixture_like(&root, "r-gpu-data-4712-3");
+        let shared = root.join("isolated-config");
+        std::fs::create_dir_all(&shared).unwrap();
+        let proc = fake_proc(tmp.path(), &[4712]);
+
+        super::sweep_in(&root, &proc);
+
+        // The read-only store inside is what a plain `remove_dir_all` would have choked on.
+        assert!(!dead.exists(), "a dead run's fixture was left behind");
+        assert!(live.exists(), "a live run's fixture was taken");
+        assert!(shared.exists(), "the shared config directory was taken");
+    }
+
+    #[test]
+    fn the_sweep_reads_this_very_process_as_live() {
+        // The one error that would cost a running suite its fixtures, asserted against the real
+        // `/proc` rather than a written one: a fixture named after a live pid has to survive.
+        let tmp = TmpDir::new();
+        let root = tmp.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mine = fixture_like(&root, &format!("r-mine-{}-0", std::process::id()));
+
+        super::sweep_in(&root, Path::new("/proc"));
+
+        assert!(
+            mine.exists(),
+            "the sweep took the fixture of the running process"
+        );
+    }
+
+    #[test]
+    fn the_sweep_says_nothing_about_a_root_that_is_not_there() {
+        // A first run on a clean machine has no root yet, and the sweep runs before anything
+        // creates one.
+        super::sweep_in(Path::new("/nonexistent/sbx-test-root"), Path::new("/proc"));
+    }
+}
+
 #[cfg(test)]
 mod skip_macro_tests {
     use super::{EnvVar, TmpDir, env_lock};
-
     /// The three promises of the skip macros, asserted together because they are one contract: a
     /// skip is **recorded** so a run can report it, a host skip **fails** where the host was
     /// declared capable, and a remote skip never does — no setting on this machine makes a binary
