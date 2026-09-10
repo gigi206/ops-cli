@@ -2105,6 +2105,126 @@ fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
     );
 }
 
+/// The host directory an in-cage path resolves to, through the spec's own mounts — the mount
+/// whose destination is the longest prefix of `incage`, rebased onto its source. Answering the
+/// question "which directory on disk receives this write" from the mount table rather than from a
+/// second copy of the layout rule.
+fn host_dir_of(spec: &SandboxSpec, incage: &str) -> PathBuf {
+    let incage = Path::new(incage);
+    let (dest, src) = spec
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            Mount::Bind { src, dest } | Mount::RoBind { src, dest } => Some((dest, src)),
+            _ => None,
+        })
+        .filter(|(dest, _)| incage.starts_with(dest))
+        .max_by_key(|(dest, _)| dest.components().count())
+        .unwrap_or_else(|| panic!("no mount covers {}", incage.display()));
+    src.join(incage.strip_prefix(dest).expect("checked prefix"))
+}
+
+#[test]
+fn every_runtime_names_the_host_directory_a_declared_tool_installs_into() {
+    // Where a mise tool physically lands is settled in three places, and no test crosses them: the
+    // runtime's host trees, the cage's ambient `MISE_DATA_DIR`, and the pin the app-package equip
+    // runs under. Compose them, then resolve the in-cage target back through the spec's own mounts,
+    // so what is asserted is the directory on disk that receives the install rather than the value
+    // of an environment variable.
+    //
+    // Two origins are pinned, across all three runtimes. What the APP declares (`[packages] mise:`,
+    // equipped with `mise use -g`) lands in that runtime's own home — app-global for a global app,
+    // under the project for the other two. What the PROJECT declares (its own mise file, equipped
+    // with `mise install`) lands in the ambient primary. A tool an agent equips itself in-cage is a
+    // third origin, declared by neither, and its destination is deliberately not asserted here.
+    let data = TmpDir::new();
+    let project = TmpDir::new();
+    std::fs::write(project.path().join("README"), b"hi").unwrap();
+    let id = project_id(&project.path().canonicalize().unwrap());
+    let projects = data.path().join("projects").join(&id);
+
+    let cases: [(Runtime, PathBuf, PathBuf); 3] = [
+        (
+            Runtime::ProjectDefault,
+            projects.join("home").join(MISE_DATA_REL),
+            projects.join("home").join(MISE_DATA_REL),
+        ),
+        (
+            Runtime::GlobalApp("demo-app"),
+            data.path()
+                .join("apps")
+                .join("demo-app")
+                .join("home")
+                .join(MISE_DATA_REL),
+            projects.join("apps").join("demo-app").join("mise"),
+        ),
+        (
+            Runtime::ProjectApp("demo-app"),
+            projects
+                .join("apps")
+                .join("demo-app")
+                .join("home")
+                .join(MISE_DATA_REL),
+            projects
+                .join("apps")
+                .join("demo-app")
+                .join("home")
+                .join(MISE_DATA_REL),
+        ),
+    ];
+
+    for (runtime, app_declared, project_declared) in cases {
+        let overlay = Overlay {
+            env: &[],
+            binds: &[],
+            bin_paths: &[],
+            timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
+            ignored_mise_paths: &[],
+        };
+        let spec = build_spec(
+            data.path(),
+            project.path(),
+            runtime,
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            NetPolicy::Shared,
+            "",
+            &Default::default(),
+            crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
+            &Default::default(),
+            false,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("build spec");
+
+        // The cage's ambient primary: what a `mise install` of the project's own mise file runs
+        // under, read from the spec rather than restated.
+        let ambient = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "MISE_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("the cage sets MISE_DATA_DIR");
+        // The app-package equip's pin, or the ambient primary when it needs none.
+        let app_lane = app_equip_data_dir(runtime).unwrap_or_else(|| ambient.clone());
+
+        assert_eq!(
+            host_dir_of(&spec, &app_lane),
+            app_declared,
+            "{runtime:?}: an app-declared mise tool does not land in the app's own home"
+        );
+        assert_eq!(
+            host_dir_of(&spec, &ambient),
+            project_declared,
+            "{runtime:?}: a project-declared mise tool does not land in the ambient primary"
+        );
+    }
+}
+
 #[test]
 fn distro_mountpoints_cover_every_structural_destination() {
     // The list of mountpoints a provisioned tree carries is written by hand, and a structural mount

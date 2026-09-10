@@ -1076,8 +1076,7 @@ fn mise_equip_lanes<'a>(
     // app-global home pool (installed once, shared across projects, and where `sbx app show`/`list`/
     // `gc` read), not the ambient per-project primary. Pin the equip step there for a global app;
     // for `sbx run`/a per-project app the ambient primary is already the app-global home, so no pin.
-    let app_global_mise_dir =
-        matches!(runtime, binds::Runtime::GlobalApp(_)).then(binds::mise_app_global_data_dir);
+    let app_global_mise_dir = binds::app_equip_data_dir(runtime);
     if !global_mise.is_empty() || !auto_equip.is_empty() {
         if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
             // `network = "none"`: a mise tool cannot be fetched, so skip the equip (it would only

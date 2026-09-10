@@ -1289,6 +1289,16 @@ pub(crate) fn mise_app_global_data_dir() -> String {
     format!("{SANDBOX_HOME}/{MISE_DATA_REL}")
 }
 
+/// The `MISE_DATA_DIR` the app-package equip must run under when it differs from the cage's
+/// ambient primary: [`mise_app_global_data_dir`] for a global app, whose ambient primary is the
+/// per-project pool, and `None` for every other runtime, whose ambient primary already is the
+/// app's own home. One definition, because the same rule is read twice — by the launch, which
+/// pins the equip step with it, and by the layout tests, which assert the host directory each
+/// origin's install lands in.
+pub(crate) fn app_equip_data_dir(runtime: Runtime) -> Option<String> {
+    matches!(runtime, Runtime::GlobalApp(_)).then(mise_app_global_data_dir)
+}
+
 /// Where a `flake:` package's `nix build --out-link` gcroot lives inside the cage,
 /// relative to the sandbox `$HOME`. Each package gets `<this>/<name>`, a symlink into
 /// `/nix` (the per-project store); its `<name>/bin` joins PATH. Under the persistent home,

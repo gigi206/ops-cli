@@ -218,6 +218,79 @@ fn wrap_mise_equip_pins_the_app_global_data_dir_for_the_global_lane() {
     assert_eq!(argv[4], OsString::from("aqua:example/demo-tool"));
 }
 
+/// A stand-in `mise` (and a stand-in command) that appends the `MISE_DATA_DIR` it was invoked
+/// with to `$SBX_TEST_RECORD`, so a run of the generated script reports the value each half
+/// actually saw rather than the value the script text appears to set.
+fn recording_stub(path: &std::path::Path, tag: &str) {
+    std::fs::write(
+        path,
+        format!(
+            "#!/bin/sh\nprintf '{tag}=%s\\n' \"${{MISE_DATA_DIR-unset}}\" >> \"$SBX_TEST_RECORD\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn running_the_equip_script_gives_mise_the_pinned_dir_and_the_command_the_ambient_one() {
+    // The pin is a string in a generated bash script, and a test that only reads that string
+    // cannot tell an assignment that reaches mise from one that does not — nor that the pin stops
+    // at the equip step, which is the whole reason it is written as a prefix rather than an export.
+    // So run the script, with a stand-in mise and a stand-in command that each report the
+    // `MISE_DATA_DIR` they were given.
+    let bash = std::path::PathBuf::from("/bin/bash");
+    if !bash.is_file() {
+        skip_incapable!("skipping equip-script run: no /bin/bash on this host");
+        return;
+    }
+    let dir = crate::testutil::TmpDir::new();
+    let mise = dir.path().join("mise");
+    let cmd = dir.path().join("app");
+    recording_stub(&mise, "mise");
+    recording_stub(&cmd, "cmd");
+
+    let ambient = "/opt/sbx/mise-project";
+    let pinned = crate::sandbox::binds::mise_app_global_data_dir();
+    let tokens = vec!["aqua:example/demo-tool".to_string()];
+
+    // Lane 1 for a global app: pinned. Lane 2 (and every other runtime): no pin.
+    for (pin, expected_mise) in [(Some(pinned.as_str()), pinned.as_str()), (None, ambient)] {
+        let record = dir.path().join("record");
+        let _ = std::fs::remove_file(&record);
+        let argv = wrap_mise_equip(
+            &mise,
+            &bash,
+            "use -g",
+            &tokens,
+            pin,
+            vec![cmd.clone().into_os_string()],
+        );
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("SBX_TEST_RECORD", &record)
+            .env("MISE_DATA_DIR", ambient)
+            .output()
+            .expect("run the generated equip script");
+        assert!(
+            out.status.success(),
+            "the equip script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let seen = std::fs::read_to_string(&record).expect("the stubs recorded their env");
+        assert!(
+            seen.contains(&format!("mise={expected_mise}\n")),
+            "mise did not run under {expected_mise}: {seen}"
+        );
+        // The pin never reaches the exec'd command, which keeps the cage's ambient primary: an
+        // agent's own `mise use` after launch must still land where the ambient value says.
+        assert!(
+            seen.contains(&format!("cmd={ambient}\n")),
+            "the exec'd command did not keep the ambient primary: {seen}"
+        );
+    }
+}
+
 #[test]
 fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
     // `sbx upgrade mise` rolls `[packages] mise:` tools, which for a global app live in the
