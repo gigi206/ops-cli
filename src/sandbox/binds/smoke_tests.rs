@@ -1084,6 +1084,106 @@ fn a_global_app_cage_puts_both_mise_shims_dirs_on_path_and_splits_the_pool() {
     );
 }
 
+#[test]
+fn a_neighbour_pool_removed_between_the_plan_and_the_spawn_does_not_fail_the_launch() {
+    // The shared-pool binds are `-try` for one reason: the source belongs to another app, and
+    // `sbx app prune <neighbour> --reset` can remove it after `build_spec` read it off disk and
+    // before bubblewrap acts on the plan. Nothing but a launch shows what bwrap does with a bind
+    // whose source went away, and the race is exactly reproducible -- plan, delete, spawn -- so it
+    // is run rather than argued. If this ever goes back to a hard `RoBind`, this is what fails.
+    let Some((bwrap, nix)) = prerequisites() else {
+        skip_incapable!("skipping vanished-pool smoke: need bwrap, userns, and nix");
+        return;
+    };
+    let data = TmpDir::new();
+    let layout = crate::store::Layout::under(data.path());
+    let nixpkgs = crate::store::LockTarget::global(&layout, None)
+        .resolve(&nix, &layout)
+        .expect("resolve nixpkgs");
+    let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
+    else {
+        skip_unreachable!("skipping: base userland provisioning failed (cache or channel drift)");
+        return;
+    };
+
+    let project = TmpDir::new();
+    std::fs::write(project.path().join("README"), b"hi").unwrap();
+    let id = super::project_id(&project.path().canonicalize().unwrap());
+    let neighbour = data
+        .path()
+        .join("projects")
+        .join(&id)
+        .join("apps/neighbour/mise/installs");
+    std::fs::create_dir_all(neighbour.join("nix-jq/1.8.1")).unwrap();
+
+    let env = [("TERM".to_string(), "dumb".to_string())];
+    let overlay = Overlay {
+        env: &env,
+        binds: &[],
+        bin_paths: &[],
+        timezone: DEFAULT_ZONE,
+        fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
+        share_install_pools: true,
+    };
+    let nix_mount = NixMount {
+        src: crate::store::physical_path(&layout, Path::new("/nix")),
+        writable: false,
+        on_btrfs: false,
+    };
+    let spec = build_spec(
+        data.path(),
+        project.path(),
+        Runtime::GlobalApp("asker"),
+        &userland,
+        &nix_mount,
+        &overlay,
+        &[],
+        NetPolicy::Shared,
+        "",
+        &Default::default(),
+        crate::sandbox::seccomp::SeccompPolicy::default(),
+        &[],
+        &Default::default(),
+        false,
+        vec![
+            userland.shell_bin.clone().into_os_string(),
+            OsString::from("-c"),
+            OsString::from("echo alive"),
+        ],
+    )
+    .expect("build spec");
+    // The plan saw it; assert that, so a spec that never carried the mount cannot pass this test
+    // by having nothing to lose.
+    assert!(
+        spec.mounts
+            .iter()
+            .any(|m| m.dest().starts_with(super::MISE_SHARED_INCAGE)),
+        "the plan must carry the neighbour's pool for its removal to mean anything"
+    );
+
+    // The neighbour is pruned while this launch is between its plan and its spawn.
+    std::fs::remove_dir_all(
+        data.path()
+            .join("projects")
+            .join(&id)
+            .join("apps/neighbour"),
+    )
+    .unwrap();
+
+    let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
+    assert!(
+        out.status.success(),
+        "a launch whose neighbour pool vanished must still start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("alive"),
+        "the command must have run: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// A declared distribution really is the cage's root filesystem: the image's own userland answers,
 /// its loader and its shell are the ones in use, and everything sbx mounts still lands on top.
 ///
