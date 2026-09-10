@@ -268,6 +268,18 @@ description = "Report unit-test coverage with cargo-llvm-cov (fast, deterministi
 # workspace, `$XDG_CACHE_HOME/sbx/test-tmp` or `~/.cache/sbx/test-tmp`, and `SBX_TEST_TMPDIR` moves
 # it. A killed run leaves its trees there until the next test binary asks for the root and sweeps
 # them, or until `mise run clean-fixtures` does.
+#
+# What the concurrent stores cost, and the one lever over it: a fixture's data dir holds a store
+# provisioned for it alone, and its project stores are seeded from that store -- reflinked where the
+# filesystem supports it (`place_file`, src/sandbox/projectstore.rs), copied in full where it does
+# not. On ext4 there is no reflink and no compression, so each fixture pays for its base twice and
+# pays it uncompressed. Pointing `SBX_TEST_TMPDIR` at a btrfs filesystem turns the seeds into clones
+# and compresses the rest, for no change to the suite; it costs a longer path, which `sun_path` has
+# a fixed budget for (see the note in tests/run.rs on the egress socket).
+#
+# Sharing one store between fixtures is a different proposition and is deliberately not done. A nix
+# store keeps its database and its gcroots inside itself, so a shared store is a shared collector --
+# and six tests run `sbx gc` while others provision.
 run = "cargo llvm-cov --bins"
 
 [tasks.build]
