@@ -86,6 +86,20 @@ see. That is [the split's whole
 argument](../apps/home#two-mise-pools-keep-a-global-apps-self-equips-aligned), and for a
 `nix:` tool it holds.
 
+Three things install a mise tool for an app, and only two of them are declared. What the app
+declares in its own `[packages] mise:` is equipped into the app's home, so it follows the app
+into every project. What the project declares in its own mise file is equipped into the
+ambient pool, which for a global app is the project's. The third is a tool the agent equips at
+the prompt, declared by neither, and it follows the ambient pool as well.
+
+That last destination is a constraint rather than a policy. A single mise invocation carries
+one install root, and the backend token does not enter it, so a tool the agent asks for cannot
+be routed by what it turns out to be. Sending every self-equip to the app's home instead would
+put a `nix:` tool's install record there, which is the failure the split exists to prevent. The
+rule to read off this is narrower than it first looks: what builds an app stays with the app
+when the app declares it, and a tool nobody declared stays with the project, because only the
+project can say where its store is.
+
 It does not hold for the other backends. A tool from `aqua:`, `npm:` or `github:` is a
 downloaded binary that never touches the project's store, so nothing about it is
 project-shaped. Yet the pool is keyed by project **and by app**, so two apps run in the
@@ -110,8 +124,12 @@ that the store's sharing is the price of provisioning a project at all, while th
 buy disk space. That is a boundary moved for a saving, and the saving is real only where apps
 equip the same tools. Where they do, it is a handful of agents shipping the same helper rather
 than a broad overlap, so the ceiling is a fraction of what the homes hold. Measuring that
-overlap on the machine in question, and deciding whether a shared pool would be written by the
-apps or only by sbx, comes before any of it.
+overlap on the machine in question comes before any of it. The second question is already
+answered: the fallback list is a search path, so a pool shared this way is read by the apps and
+written by none of them, and a version an app holds itself is the one it resolves. What sharing
+would still need is a housekeeping change, because the sweep that removes the versions no
+activation asks for reads one app's activations, and a pool another app reads is one it must
+not empty.
 
 ### The holes are opened on request, and each one is a hole
 
