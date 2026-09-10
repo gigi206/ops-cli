@@ -1296,6 +1296,40 @@ fn touch_under(path: &Path) {
     std::fs::write(path, b"x").unwrap();
 }
 
+/// The purge reads the registry to prove no session of the app is live. It must not *tidy* it while
+/// it asks: `Registry::list` is the reclaiming walk — it unlinks every record it finds dead — and
+/// that work belongs to the verbs that mean it and report the count (`sbx session ls`, `sbx session
+/// stop`, `sbx gc`). A guard that took it silently left gc's count as whatever a concurrent reader
+/// had happened to do.
+#[test]
+fn sbx_app_rm_purge_asks_the_registry_without_reclaiming_it() {
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    touch_under(&sbx_dir.join("apps/claude/home/state"));
+
+    // A record that reads dead without depending on a pid being free: pid 1 is always taken, and its
+    // start ticks are never this, so the pair fails and the record becomes exactly what a reclaiming
+    // walk removes. `project` is the path in hex (`/nowhere`).
+    let record = sbx_dir.join("sessions/1-999999999999");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(
+        &record,
+        b"kind=run\npid=1\nstart=999999999999\nproject=2f6e6f7768657265\n",
+    )
+    .unwrap();
+
+    let purged = fx.run(&["app", "rm", "claude", "--purge"]);
+    assert!(purged.status.success(), "purge failed: {purged:?}");
+    assert!(
+        !sbx_dir.join("apps/claude").exists(),
+        "the purge did not do its own job, so this proves nothing about how it asked"
+    );
+    assert!(
+        record.exists(),
+        "the guard reclaimed the registry it was questioning"
+    );
+}
+
 #[test]
 fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
     let fx = Project::new("app");

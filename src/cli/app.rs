@@ -1205,8 +1205,10 @@ fn app_rm_purge(names: &[&str], gc: bool) -> ExitCode {
     };
 
     // Read once for the batch, and fail closed for all of it: without the registry no name can be
-    // proven idle, so none of them may be purged.
-    let sessions = match session::Registry::at(layout.data_dir()).list() {
+    // proven idle, so none of them may be purged. Asked through `live` rather than `list`, because a
+    // guard should not reclaim the directory it is questioning — `list` unlinks every record it
+    // finds dead, and reclaiming belongs to the verbs that mean it and report the count.
+    let sessions = match session::Registry::at(layout.data_dir()).live() {
         Ok(sessions) => sessions,
         Err(e) => {
             let listed: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
