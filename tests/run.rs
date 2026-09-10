@@ -5879,6 +5879,110 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
     );
 }
 
+#[test]
+fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
+    // `apps_share_install_pools` is a read of one app's pool by another, and the only thing that
+    // shows whether the read happened is where the tool does NOT get installed. Two apps in one
+    // project, both auto-equipping the same tool from the project's own `mise.toml` (Lane 2, the
+    // case the grant exists for). The first has nothing to fall back on and installs it; the second
+    // finds it on the fallback list and installs nothing.
+    //
+    // The discrimination is by install location, not by the tool running: `rg --version` succeeds in
+    // the second app either way, from its own copy or from the first's, so only the absence of a
+    // second copy separates a shared read from a silent re-download. Without the grant this same
+    // shape puts a copy in each pool, which is what
+    // `a_global_apps_project_mise_tool_lands_in_the_per_project_pool` pins.
+    let project = TmpDir::prefixed("r", "shp-proj");
+    let data = TmpDir::prefixed("r", "shp-data");
+    let state = TmpDir::prefixed("r", "shp-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "apps_share_install_pools = true\n\
+         [app.one]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n\
+         [app.two]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("mise.toml"),
+        "[tools]\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\n",
+    )
+    .unwrap();
+
+    probe_or_skip!(
+        "shared-pool e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping shared-pool e2e: the network is unreachable"
+    );
+    need_reachable!(
+        github_api_has_quota(),
+        "skipping shared-pool e2e: github's api quota is spent, and the `mise:aqua:` tool resolves \
+         its release through it"
+    );
+
+    // The grant is trusted-only: an untrusted project's line is refused, and both apps would then
+    // install their own copy — the test would read as a failure of the sharing rather than of the
+    // trust it depends on.
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // Launched through `sbx_in`, not `app_in`: the trust record above lives under the state dir,
+    // and a launch that does not carry it reads the project as untrusted and refuses the grant --
+    // which the first run of this test did, silently enough that only the second copy showed it.
+    let launch = |name: &str| {
+        let out = sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["app", "run", name],
+        );
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !log.contains("ignoring `apps_share_install_pools`"),
+            "the grant must be honored for app `{name}`, or the sharing is not what is measured: \
+             {log}"
+        );
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ripgrep"),
+            "app `{name}` must auto-equip the project's mise.toml tool and run it: {log}"
+        );
+    };
+    launch("one");
+    launch("two");
+
+    let holds_rg = |app: &str| {
+        per_project_app_mise_installs(data.path(), app)
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .any(|e| e.contains("ripgrep"))
+    };
+    assert!(
+        holds_rg("one"),
+        "the first app must install the project's tool into its own pool: {:?}",
+        per_project_app_mise_installs(data.path(), "one")
+    );
+    assert!(
+        !holds_rg("two"),
+        "the second app must read the first's pool instead of installing its own copy: {:?}",
+        per_project_app_mise_installs(data.path(), "two")
+    );
+}
+
 /// The path to a mise shim in the single project's default home under `data`, if present.
 ///
 /// `sbx upgrade mise`/`sbx run` equip a baseline `mise:` tool into this home, where mise creates
