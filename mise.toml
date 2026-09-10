@@ -198,6 +198,25 @@ fi
 exit $rc
 '''
 
+# The unit suite compiled and run against the target the binary actually ships as.
+#
+# `test` above builds for the host, which is glibc, while `build` ships static musl. The two
+# libcs do not merely differ in code: the `libc` crate mirrors their constants and types per
+# target, so one expression can mean two things. Both kinds have already shipped a defect here —
+# `O_ACCMODE` contains `O_PATH` under musl, which silently disarmed the forward plane's inode pin,
+# and `pthread_t` is a pointer under musl, which a test closure cannot send. Neither is reachable
+# from a host run: the sources are correct against glibc, and the suite passes.
+#
+# Through cargo-zigbuild for the reason `build` uses it — a plain `cargo test --target` wants an
+# `x86_64-linux-musl-gcc` this toolchain does not carry, and zig supplies the cross-cc instead.
+# `--bins` matches what CI runs on the host, so the two runs cover the same population.
+#
+# Not in `ci`: it is a cross-compile of the whole suite, and the maintainer decides when to pay
+# for it. Run it before a release, and after anything that touches libc types or constants.
+[tasks.test-musl]
+description = "Run the unit suite against the shipping musl target, where a libc divergence is visible"
+run = "cargo-zigbuild test --target x86_64-unknown-linux-musl --bins"
+
 [tasks.coverage]
 description = "Report unit-test coverage with cargo-llvm-cov (fast, deterministic; pass --html for a browsable report)"
 # `--bins` measures the unit tests only — fast, network-free, and reproducible everywhere (the

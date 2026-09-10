@@ -102,8 +102,15 @@ mute = [
 # Telemetry OFF by default, written once into a fresh app home.
 #
 # This is the CLI's own settings writer (a proper merge, local-only, no auth), so it states the
-# preference the way the tool itself would. It is gated on the key being absent, which means it
-# never fights a user who later turns telemetry back on.
+# preference the way the tool itself would, and it is gated on the key being absent so it never
+# rewrites one a user has since edited.
+#
+# It is no longer the only defence, nor the deciding one. The `[env]` at the end of this file sets
+# the opt-out the two engines read from their environment, and an environment variable is answered
+# before any settings file: it holds even on a launch where this step fails, which is the state
+# that left telemetry at the CLI's default. The step stays because the setting is what the tool
+# itself records, and because a user reading `cli.json` should find the preference stated there
+# rather than inferring it from a launch's environment.
 #
 # THE PROBE USES BASH BUILTINS ONLY, AND THAT IS THE GUARANTEE'S LOAD-BEARING PART. A `grep -q`
 # gate cannot tell "the key is absent" from "the probe could not run": both leave a non-zero
@@ -164,3 +171,29 @@ shared_credential = [[
 kiro = "nix:kiro-cli"
 # Chromium for the in-cage OAuth sign-in only — see the note above.
 chromium = "nix:chromium"
+
+# The telemetry opt-out the two engines actually read, and the reason this bundle no longer depends
+# on the install step above succeeding.
+#
+# Kiro ships TWO of them and they do not read the same name. `kiro-cli` and `kiro-cli-term` are
+# native binaries carrying the legacy Amazon Q name, `Q_DISABLE_TELEMETRY`; `kiro-cli-chat` is a
+# bundled JavaScript engine reading `KIRO_DISABLE_TELEMETRY`. Setting one alone leaves the other
+# reporting. The native side is the one that matters most here: its metrics POST to
+# `cognito-identity.us-east-1.amazonaws.com` goes through an AWS SDK that emits an absolute-form
+# request inside the CONNECT tunnel, which sbx's proxy refuses as a pre-verdict security guard —
+# and `mute` only suppresses a `deny`, so that one call cannot be quietened from the network side
+# at all. Disabling at the source is the only thing that stops it being made.
+#
+# `"1"` rather than `"true"` or `"0"`: the JavaScript side tests the variable for truthiness, so
+# any non-empty value disables it — `"0"` included, which reads as the opposite of what it does.
+# `"1"` is unambiguous under that reading and under a value comparison alike.
+#
+# THIS OVERRIDES THE SETTING, IN BOTH DIRECTIONS. An environment variable is read before
+# `cli.json`, so turning telemetry back on now means removing these two lines, not editing the
+# settings file. That is the trade this table makes: the step above could be defeated by its own
+# failure, and this cannot.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[env]
+Q_DISABLE_TELEMETRY = "1"
+KIRO_DISABLE_TELEMETRY = "1"

@@ -335,7 +335,7 @@ The 67 shipped bundles, and what each carries:
 | `junie` | 2 (`mise:`, `nix:`) | 8 egress entries, 1 env var, an install step | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
 | `kimi` | 2 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-registry` |
-| `kiro` | 2 (`nix:`) | 34 egress entries, an install step | `chromium-background`, `google-signin-incage` |
+| `kiro` | 2 (`nix:`) | 34 egress entries, 2 env vars, an install step | `chromium-background`, `google-signin-incage` |
 | `kiro-desktop` | 2 (`nix:`, `tarball:`) | 36 egress entries, 1 env var, a `tarball:` resolver | `chromium-background` |
 | `mimo` | 2 (`mise:`, `nix:`) | 6 egress entries | `models-catalog`, `npm-registry` |
 | `muse` | none | 4 egress entries, 1 env var, an install step | none |

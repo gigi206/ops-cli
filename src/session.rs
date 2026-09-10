@@ -1432,14 +1432,36 @@ mod tests {
             .unwrap();
         let pidfd = open_pidfd(child.id()).unwrap();
 
+        // The identifier crosses a thread boundary, and its type is not the same on both targets
+        // this crate builds for: `c_ulong` against glibc, `*mut c_void` against musl. A raw
+        // pointer is not `Send`, so the closure below does not compile for the target the binary
+        // actually ships as — invisibly, because the suite is built for the host. Carried in a
+        // wrapper that states the reason once.
+        struct Waiter(libc::pthread_t);
+        // SAFETY: a `pthread_t` is an opaque thread identifier, not a handle to data this thread
+        // owns, and handing it to another thread is precisely what `pthread_kill` exists for. The
+        // thread it names is this one, which outlives the signaller by joining it below.
+        unsafe impl Send for Waiter {}
+        impl Waiter {
+            /// The identifier, read through a method so the closure below captures the wrapper.
+            ///
+            /// A field access would not: since edition 2021 a closure captures the *places* it
+            /// uses, so `waiter.0` would capture the `pthread_t` itself and leave the `Send` above
+            /// with nothing to apply to — which compiles against glibc, where the raw type is
+            /// already `Send`, and fails only for the target that ships.
+            fn id(&self) -> libc::pthread_t {
+                self.0
+            }
+        }
+
         // SAFETY: `pthread_self` on the waiting thread, handed to a signaller thread so the
         // interrupts land on the `poll` and not on some unrelated harness thread.
-        let waiter = unsafe { libc::pthread_self() };
+        let waiter = Waiter(unsafe { libc::pthread_self() });
         let signaller = std::thread::spawn(move || {
             for _ in 0..5 {
                 std::thread::sleep(Duration::from_millis(20));
                 // SAFETY: signalling a live thread of this process with an installed handler.
-                unsafe { libc::pthread_kill(waiter, libc::SIGUSR1) };
+                unsafe { libc::pthread_kill(waiter.id(), libc::SIGUSR1) };
             }
         });
 
