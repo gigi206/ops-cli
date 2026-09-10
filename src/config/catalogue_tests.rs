@@ -1291,6 +1291,127 @@ fn the_hermes_desktop_install_step_writes_its_marker_and_yields_to_a_roll() {
     );
 }
 
+/// `name`, as an absolute path, found the way a launch finds a program: by walking `PATH`.
+///
+/// The step below is run with a `PATH` of this fixture's own making, and a program named without a
+/// slash is resolved against the CHILD's environment — so the interpreter has to be named outright.
+/// Writing `/bin/bash` instead would assume a filesystem layout the hosts sbx targets do not all
+/// have.
+fn program_on_path(name: &str) -> std::path::PathBuf {
+    let path = std::env::var_os("PATH").expect("the test runner has a PATH");
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("`{name}` is not on this host's PATH"))
+}
+
+/// What the stand-in `kiro-cli` does when the step calls it.
+enum Writer {
+    /// States the preference and reports success, as the CLI does when it works.
+    States,
+    /// Fails outright, and says so.
+    Fails,
+    /// Returns success having written nothing. The real `kiro-cli settings` has been seen doing
+    /// this, which is why the shipped step reads the file back rather than believing the status —
+    /// and why a stub that only exits zero models a failure rather than a success.
+    ClaimsToHaveStated,
+}
+
+/// What the step's `PATH` carries besides the stand-in writer.
+enum Search {
+    /// The host's own program directories, as a launch has them.
+    Host,
+    /// The writer alone, so a step reaching for anything else finds nothing.
+    WriterOnly,
+}
+
+/// The stand-in home, writer and `PATH` the shipped kiro `provision` is exercised against.
+///
+/// Two guards run that one step: one on the preference it states, one on what it reaches for to
+/// decide. Both need the same three stand-ins, so they are built once here.
+struct KiroStep {
+    /// Held for its `Drop`: every path below lives under it.
+    _tmp: TmpDir,
+    home: std::path::PathBuf,
+    bin: std::path::PathBuf,
+    /// The app home's settings file: what the writer writes, and what the step reads to decide.
+    settings: std::path::PathBuf,
+    /// Where the stand-in writer records the arguments it was called with.
+    called: std::path::PathBuf,
+    bash: std::path::PathBuf,
+    script: String,
+}
+
+impl KiroStep {
+    fn new() -> Self {
+        let tmp = TmpDir::new();
+        let (home, bin) = (tmp.join("home"), tmp.join("bin"));
+        std::fs::create_dir_all(home.join(".kiro/settings")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        Self {
+            settings: home.join(".kiro/settings/cli.json"),
+            called: tmp.join("called"),
+            bash: program_on_path("bash"),
+            script: shipped_install_step("kiro"),
+            home,
+            bin,
+            _tmp: tmp,
+        }
+    }
+
+    /// Installs the stand-in `kiro-cli`: it records the arguments it was called with, then behaves
+    /// as `writer` says.
+    fn stub(&self, writer: Writer) {
+        use std::os::unix::fs::PermissionsExt;
+        let (states, code) = match writer {
+            Writer::States => (
+                format!(
+                    "printf '{{\"telemetry.enabled\": false}}\\n' > {}\n",
+                    self.settings.display()
+                ),
+                0,
+            ),
+            Writer::Fails => (String::new(), 1),
+            Writer::ClaimsToHaveStated => (String::new(), 0),
+        };
+        let path = self.bin.join("kiro-cli");
+        std::fs::write(
+            &path,
+            format!(
+                "#!{}\nprintf '%s\\n' \"$*\" >> {}\n{states}exit {code}\n",
+                self.bash.display(),
+                self.called.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Runs the shipped step, and returns what it said on stderr.
+    fn run(&self, upgrade: bool, search: Search) -> String {
+        let bin = self.bin.display();
+        let path = match search {
+            Search::Host => format!("{bin}:/usr/bin:/bin"),
+            Search::WriterOnly => bin.to_string(),
+        };
+        let out = std::process::Command::new(&self.bash)
+            .arg("-c")
+            .arg(&self.script)
+            .env("HOME", &self.home)
+            .env("PATH", path)
+            .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
+            .output()
+            .expect("run the shipped step");
+        assert!(out.status.success(), "the step failed: {out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Every call the stand-in writer recorded, one per line.
+    fn invocations(&self) -> String {
+        std::fs::read_to_string(&self.called).unwrap_or_default()
+    }
+}
+
 #[test]
 fn the_kiro_install_step_states_the_preference_once_and_then_says_what_it_did() {
     // Runs the SHIPPED step against a stand-in home with a stand-in `kiro-cli` that records being
@@ -1299,62 +1420,16 @@ fn the_kiro_install_step_states_the_preference_once_and_then_says_what_it_did() 
     // edit. So what is asserted is the pair the text cannot show: the writer is invoked exactly
     // when the preference is unset, and on a roll that finds it set the step SAYS so instead of
     // going quiet, which is the honesty `sbx upgrade provision` reports on.
-    let script = shipped_install_step("kiro");
-    let tmp = TmpDir::new();
-    let (home, bin) = (tmp.path().join("home"), tmp.path().join("bin"));
-    std::fs::create_dir_all(home.join(".kiro/settings")).unwrap();
-    std::fs::create_dir_all(&bin).unwrap();
-    let called = tmp.path().join("called");
-
-    // A stand-in writer that records being called and, when it is meant to succeed, WRITES THE
-    // FILE. The shipped step no longer believes an exit status — the real `kiro-cli settings` has
-    // been seen returning zero having created nothing, which left the step announcing a success it
-    // never obtained — so a stub that only exits zero models a failure here, and modelling it as a
-    // success is what let the old assertion pass over the defect.
-    let settings = home.join(".kiro/settings/cli.json");
-    let stub = |ok: bool| {
-        use std::os::unix::fs::PermissionsExt;
-        let path = bin.join("kiro-cli");
-        let code = i32::from(!ok);
-        let write = if ok {
-            format!(
-                "printf '{{\"telemetry.enabled\": false}}\\n' > {}\n",
-                settings.display()
-            )
-        } else {
-            String::new()
-        };
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{write}exit {code}\n",
-                called.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    };
-    let run = |upgrade: bool| {
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("HOME", &home)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
-            .output()
-            .expect("run the shipped step");
-        assert!(out.status.success(), "the step failed: {out:?}");
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    };
-    let invocations = || std::fs::read_to_string(&called).unwrap_or_default();
+    let step = KiroStep::new();
 
     // 1. Nothing stated yet: the CLI's own settings writer is invoked, with the preference.
-    stub(true);
-    let quiet = run(false);
+    step.stub(Writer::States);
+    let quiet = step.run(false, Search::Host);
     assert!(
-        invocations().contains("settings telemetry.enabled false"),
+        step.invocations()
+            .contains("settings telemetry.enabled false"),
         "the step did not state the preference through the CLI's own writer: {:?}",
-        invocations()
+        step.invocations()
     );
     assert_eq!(
         quiet, "",
@@ -1362,15 +1437,11 @@ fn the_kiro_install_step_states_the_preference_once_and_then_says_what_it_did() 
     );
 
     // 2. The preference is now stated. A roll must not restate it — and must not go quiet either.
-    std::fs::write(
-        home.join(".kiro/settings/cli.json"),
-        "{\"telemetry.enabled\": true}\n",
-    )
-    .unwrap();
-    let before = invocations();
-    let said = run(true);
+    std::fs::write(&step.settings, "{\"telemetry.enabled\": true}\n").unwrap();
+    let before = step.invocations();
+    let said = step.run(true, Search::Host);
     assert_eq!(
-        invocations(),
+        step.invocations(),
         before,
         "the roll called the settings writer again, overriding a preference the user may have set"
     );
@@ -1380,9 +1451,9 @@ fn the_kiro_install_step_states_the_preference_once_and_then_says_what_it_did() 
     );
 
     // 3. A writer that fails is reported rather than swallowed — the same silence, other branch.
-    std::fs::remove_file(&settings).unwrap();
-    stub(false);
-    let complained = run(false);
+    std::fs::remove_file(&step.settings).unwrap();
+    step.stub(Writer::Fails);
+    let complained = step.run(false, Search::Host);
     assert!(
         complained.contains("could not state"),
         "a failed write said nothing: {complained:?}"
@@ -1393,15 +1464,50 @@ fn the_kiro_install_step_states_the_preference_once_and_then_says_what_it_did() 
     // here: a step that believed the status reported nothing, left the preference unstated, and —
     // because the gate above reads that same absent file — took this branch again on every launch
     // that followed, announcing a success it never obtained.
-    use std::os::unix::fs::PermissionsExt;
-    let liar = bin.join("kiro-cli");
-    std::fs::write(&liar, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&liar, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(!settings.exists(), "the fixture starts with nothing stated");
-    let lied = run(false);
+    step.stub(Writer::ClaimsToHaveStated);
+    assert!(
+        !step.settings.exists(),
+        "the fixture starts with nothing stated"
+    );
+    let lied = step.run(false, Search::Host);
     assert!(
         lied.contains("could not state"),
         "a writer that exited zero having written nothing was taken at its word: {lied:?}"
+    );
+}
+
+#[test]
+fn the_kiro_install_step_decides_without_a_program_its_path_may_not_carry() {
+    // The step decides whether to state the preference by looking at the app home's settings file.
+    // It must answer that question with what a bundle is guaranteed — the shell's builtins and the
+    // tools it declares itself — because a probe spawned from `PATH` reports "not found" and "not
+    // stated" through the same exit status. On a host whose `PATH` does not carry the probe, a step
+    // resting on one reads its own failure as an absence and restates a preference the user has
+    // since changed, which is the one thing this step exists not to do.
+    //
+    // The `PATH` here therefore carries the declared writer and nothing else. That the writer is
+    // reachable is the point: the step is free to call it, and what holds is that it does not.
+    let step = KiroStep::new();
+    step.stub(Writer::States);
+    std::fs::write(&step.settings, "{\"telemetry.enabled\": true}\n").unwrap();
+
+    let said = step.run(true, Search::WriterOnly);
+
+    assert_eq!(
+        step.invocations(),
+        "",
+        "the step reached for a program this `PATH` does not carry, read the failure as an unstated \
+         preference, and called the writer: {:?}",
+        step.invocations()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&step.settings).unwrap(),
+        "{\"telemetry.enabled\": true}\n",
+        "the stated preference was overwritten"
+    );
+    assert!(
+        said.contains("leaving it as it is"),
+        "the step did not report the preference it found: {said:?}"
     );
 }
 
