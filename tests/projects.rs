@@ -624,8 +624,12 @@ fn rm_rejects_a_path_shaped_id() {
 
 /// The pid of a process that has run and been reaped — dead by construction, so a liveness check
 /// classifies anything keyed by it as a leftover.
+///
+/// The program is resolved through `PATH` rather than named at `/bin/true`: the pid's only job is
+/// to have existed and been reaped, and an FHS-less host (a nix profile, the sandbox this crate
+/// builds) carries no `/bin`, where the hardcoded path failed the test before it asserted anything.
 fn reaped_pid() -> u32 {
-    let mut child = Command::new("/bin/true").spawn().expect("spawn /bin/true");
+    let mut child = Command::new("true").spawn().expect("spawn true");
     let pid = child.id();
     let _ = child.wait();
     pid
