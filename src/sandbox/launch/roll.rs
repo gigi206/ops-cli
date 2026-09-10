@@ -592,18 +592,24 @@ pub(crate) fn upgrade_provision_steps(
             }
         };
         // Fork-and-wait so the next group runs; the guard holds the proxy/forwarder across the
-        // fetch. The output is always shown on failure. On a clean run it is shown only when the
-        // guards decided (`!force`), because there it is the only thing that says which way they
-        // decided; under `force` the line above already says what happened, and an install is
-        // verbose enough that repeating it would bury a fifty-app report.
+        // fetch. The step's output is echoed on every outcome, `force` included.
+        //
+        // Under `force` the verdict line reads `re-installed`, which is sbx's inference from an
+        // exit status. What can contradict it is a step that reads `SBX_UPGRADE` and deliberately
+        // stands down: the step says so on its own output, and `force` is what sets that signal in
+        // the first place. So the run that asks for the re-install is both the one that most needs
+        // the step's account and the only one in which that account exists at all. The price is
+        // volume: this command is as loud as the wider `sbx upgrade`, which echoes every step too.
         let (code, out) = run_captured(&prep.bwrap, &spec, &prep.cfg.limits);
         drop(guard);
         if code == 0 {
             let bundles = step_bundles(&steps);
             // What is KNOWN is the exit status, and the line says no more than that. Under `force`
-            // the re-install was asked for, so naming it is fair; without it the guard decided, and
-            // sbx cannot see which way — the version a guard compares lives in the vendor's channel
-            // and in the vendor's own manifest, which is exactly why the guard is in the step.
+            // the re-install was asked for, so naming it is fair — but only as the request, not as
+            // the outcome: a step may read the signal and decline. Without `force` the guard
+            // decided, and sbx cannot see which way — the version a guard compares lives in the
+            // vendor's channel and in the vendor's own manifest, which is exactly why the guard is
+            // in the step. Either way the step's own output below is what settles it.
             //
             // So the step's own output is what tells the user, and here it is SHOWN rather than
             // dropped: a step that acted says so (`… the release channel moved (a -> b)`), and one
@@ -615,9 +621,7 @@ pub(crate) fn upgrade_provision_steps(
                 format!("{ok_c}install step ran ({bundles}){r}")
             };
             println!("{}", roll_line(&name, width, &verdict, pal));
-            if !force {
-                echo_cage_output(&out);
-            }
+            echo_cage_output(&out);
             ran.push(name);
         } else {
             println!(
