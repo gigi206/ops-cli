@@ -2685,6 +2685,7 @@ pub(super) fn build(
         timezone: &timezone,
         fresh_release_tokens: &fresh_release_tokens,
         ignored_mise_paths: &prep.cfg.mise_ignored,
+        share_install_pools: prep.cfg.apps_share_install_pools,
     };
     // Generate the in-cage contract from the resolved (post-`merge_app`) config, so a process
     // inside the cage can see which hosts it can reach, why a direct connection or `ping` fails,

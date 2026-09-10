@@ -82,6 +82,7 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
+        apps_share_install_pools: false,
         accepts_fresh_releases: Default::default(),
         net_group_files: Default::default(),
         timezone: None,

@@ -74,6 +74,7 @@ fn base_paths() -> SandboxPaths<'static> {
         distro_writable: &[],
         home_src: Path::new("/data/sbx/projects/abc/home"),
         mise_project_src: None,
+        mise_shared_installs: &[],
         passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
         group_src: Path::new("/data/sbx/projects/abc/etc/group"),
         mise_plugin_src: Path::new("/store/mise-plugin"),
@@ -105,6 +106,7 @@ fn assembled_from(paths: &SandboxPaths) -> SandboxSpec {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     assemble(
         paths,
@@ -131,8 +133,13 @@ fn assembled_with_ssh_config(ssh_config_src: Option<&Path>) -> SandboxSpec {
 /// rather than the bare `assembled()`, because a mount that only some configurations emit is
 /// precisely the one that gets added without being listed.
 fn assembled_with_every_conditional_mount() -> SandboxSpec {
+    let shared = [(
+        "neighbour".to_string(),
+        PathBuf::from("/data/sbx/projects/abc/apps/neighbour/mise/installs"),
+    )];
     assembled_from(&SandboxPaths {
         mise_project_src: Some(Path::new("/data/sbx/projects/abc/mise")),
+        mise_shared_installs: &shared,
         ssh_config_src: Some(Path::new("/data/sbx/projects/abc/etc/ssh_config")),
         open_apps_src: Some(Path::new("/data/sbx/projects/abc/etc/applications")),
         open_mimeapps_src: Some(Path::new("/data/sbx/projects/abc/etc/mimeapps.list")),
@@ -151,6 +158,7 @@ fn assembled_on_distro() -> SandboxSpec {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     let mut userland = userland();
     userland.distro = Some(PathBuf::from("/store/distro/rootfs"));
@@ -274,6 +282,12 @@ fn structural_dests_lists_every_fixed_mount_assemble_emits() {
         // The `/opt` pin is emitted before the config binds and therefore shadows none of them;
         // see the const's own note.
         if dest == Path::new(OPT_DIR) {
+            continue;
+        }
+        // One read-only bind per neighbouring app under the shared-pool root, whose name is
+        // runtime-derived. The root is listed, so a config bind overlapping any of them is caught
+        // by it, exactly as for the home's runtime-derived destinations above.
+        if dest.starts_with(MISE_SHARED_INCAGE) && dest != Path::new(MISE_SHARED_INCAGE) {
             continue;
         }
         assert!(
@@ -589,6 +603,7 @@ fn assemble_binds_a_device_after_the_minimal_dev() {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     let devices = [PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")];
     let spec = assemble(
@@ -835,6 +850,7 @@ fn assemble_emits_launcher_extra_binds_after_the_structural_mounts() {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     let extra = [
         ExtraBind {
@@ -912,6 +928,7 @@ fn assemble_with_zone(
         timezone: zone,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     assemble(
         &paths,
@@ -1226,6 +1243,7 @@ fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     let err = build_spec(
         data.path(),
@@ -1518,6 +1536,7 @@ fn a_writable_nix_mount_is_a_read_write_bind_of_the_per_project_store() {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     let spec = assemble(
         &paths,
@@ -1725,7 +1744,7 @@ fn a_named_package_lifts_the_freshness_delay_and_an_unnamed_cage_carries_no_sett
     // default in place, which is what almost every cage wants.
     assert_eq!(
         get(
-            &mise_env(false, false, &[], &[]),
+            &mise_env(false, false, &[], &[], &[]),
             "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"
         ),
         None
@@ -1741,7 +1760,7 @@ fn a_named_package_lifts_the_freshness_delay_and_an_unnamed_cage_carries_no_sett
     ];
     assert_eq!(
         get(
-            &mise_env(false, false, &two, &[]),
+            &mise_env(false, false, &two, &[], &[]),
             "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"
         ),
         Some("npm:@ampcode/cli,npm:@deepseek-ai/dsh".to_string())
@@ -1749,7 +1768,7 @@ fn a_named_package_lifts_the_freshness_delay_and_an_unnamed_cage_carries_no_sett
     // The setting rides the ambient environment, so it reaches the equip and the roll alike
     // rather than only whichever script it was written beside.
     assert!(
-        mise_env(true, false, &two, &[])
+        mise_env(true, false, &two, &[], &[])
             .iter()
             .any(|(k, _)| k == "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"),
         "the per-project primary cage must carry it too"
@@ -1765,7 +1784,7 @@ fn an_ignored_project_mise_file_is_named_to_the_cage_s_own_mise() {
     // Absent, not empty: a project with nothing to skip leaves mise's own discovery alone.
     assert_eq!(
         get(
-            &mise_env(false, false, &[], &[]),
+            &mise_env(false, false, &[], &[], &[]),
             "MISE_IGNORED_CONFIG_PATHS"
         ),
         None
@@ -1778,7 +1797,7 @@ fn an_ignored_project_mise_file_is_named_to_the_cage_s_own_mise() {
     ];
     assert_eq!(
         get(
-            &mise_env(false, false, &[], &files),
+            &mise_env(false, false, &[], &files, &[]),
             "MISE_IGNORED_CONFIG_PATHS"
         ),
         Some("/home/u/proj/mise.toml:/home/u/proj/.mise.toml".to_string())
@@ -1791,7 +1810,7 @@ fn an_ignored_project_mise_file_is_named_to_the_cage_s_own_mise() {
     ];
     assert_eq!(
         get(
-            &mise_env(false, false, &[], &colon),
+            &mise_env(false, false, &[], &colon, &[]),
             "MISE_IGNORED_CONFIG_PATHS"
         ),
         Some("/home/u/proj/mise.toml".to_string())
@@ -1808,7 +1827,7 @@ fn mise_env_moves_the_primary_and_adds_a_shared_fallback_for_a_global_app() {
         env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
     };
 
-    let single = mise_env(false, false, &[], &[]);
+    let single = mise_env(false, false, &[], &[], &[]);
     assert_eq!(
         get(&single, "MISE_DATA_DIR"),
         Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}"))
@@ -1818,7 +1837,7 @@ fn mise_env_moves_the_primary_and_adds_a_shared_fallback_for_a_global_app() {
         "a single-pool cage has no shared-install fallback"
     );
 
-    let split = mise_env(true, false, &[], &[]);
+    let split = mise_env(true, false, &[], &[], &[]);
     assert_eq!(
         get(&split, "MISE_DATA_DIR"),
         Some(MISE_PROJECT_INCAGE.to_string()),
@@ -1847,7 +1866,7 @@ fn a_btrfs_backed_store_makes_in_cage_nix_ignore_the_compression_attribute() {
     // The flag adds the ignore line; elsewhere the attribute cannot exist and the
     // line stays out.
     let nix_config = |on_btrfs: bool| {
-        mise_env(false, on_btrfs, &[], &[])
+        mise_env(false, on_btrfs, &[], &[], &[])
             .into_iter()
             .find(|(k, _)| k == "NIX_CONFIG")
             .map(|(_, v)| v)
@@ -1921,6 +1940,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
     // ambient env's, not PATH order).
     let pool = Path::new("/data/sbx/projects/abc/apps/demo-app/mise");
     let paths = SandboxPaths {
+        mise_shared_installs: &[],
         project: Path::new("/home/u/proj"),
         distro_writable: &[],
         home_src: Path::new("/data/sbx/apps/demo-app/home"),
@@ -1947,6 +1967,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     let spec = assemble(
         &paths,
@@ -2047,6 +2068,7 @@ fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     let spec = build_spec(
         data.path(),
@@ -2181,6 +2203,7 @@ fn every_runtime_names_the_host_directory_a_declared_tool_installs_into() {
             timezone: DEFAULT_ZONE,
             fresh_release_tokens: &[],
             ignored_mise_paths: &[],
+            share_install_pools: false,
         };
         let spec = build_spec(
             data.path(),
@@ -2223,6 +2246,102 @@ fn every_runtime_names_the_host_directory_a_declared_tool_installs_into() {
             "{runtime:?}: a project-declared mise tool does not land in the ambient primary"
         );
     }
+}
+
+#[test]
+fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
+    // `apps_share_install_pools` is a read of a pool another app owns, so three properties decide
+    // whether it is the grant it claims to be, and none of them is visible in the flag itself.
+    // Each neighbour is bound READ-ONLY (the list is a search path mise never writes, and the mode
+    // says so rather than trusting it); the app's own installs come FIRST in the list, so a version
+    // it holds itself is the one it resolves and a neighbour supplies only what it lacks; and no
+    // neighbour's shims reach PATH, which would let another app's shim answer for a command.
+    let data = TmpDir::new();
+    let project = TmpDir::new();
+    std::fs::write(project.path().join("README"), b"hi").unwrap();
+    let id = project_id(&project.path().canonicalize().unwrap());
+    let apps = data.path().join("projects").join(&id).join("apps");
+    for name in ["neighbour", "other"] {
+        std::fs::create_dir_all(apps.join(name).join("mise/installs/nix-jq/1.8.1")).unwrap();
+    }
+
+    let spec_for = |share: bool| {
+        let overlay = Overlay {
+            env: &[],
+            binds: &[],
+            bin_paths: &[],
+            timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
+            ignored_mise_paths: &[],
+            share_install_pools: share,
+        };
+        build_spec(
+            data.path(),
+            project.path(),
+            Runtime::GlobalApp("asker"),
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            NetPolicy::Shared,
+            "",
+            &Default::default(),
+            crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
+            &Default::default(),
+            false,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("build spec")
+    };
+    let get = |spec: &SandboxSpec, k: &str| {
+        spec.env
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
+    };
+
+    let granted = spec_for(true);
+    for name in ["neighbour", "other"] {
+        let dest = Path::new(MISE_SHARED_INCAGE).join(name);
+        assert!(
+            granted.mounts.iter().any(|m| matches!(
+                m,
+                Mount::RoBind { src, dest: d }
+                    if *d == dest && *src == apps.join(name).join("mise/installs")
+            )),
+            "{name}'s pool is not bound read-only at {}",
+            dest.display()
+        );
+    }
+    assert_eq!(
+        get(&granted, "MISE_SHARED_INSTALL_DIRS"),
+        Some(format!(
+            "{SANDBOX_HOME}/{MISE_DATA_REL}/installs:\
+             {MISE_SHARED_INCAGE}/neighbour:{MISE_SHARED_INCAGE}/other"
+        )),
+        "the app's own installs must come before every neighbour's, colon-joined"
+    );
+    let path = get(&granted, "PATH").expect("PATH set");
+    assert!(
+        !path.split(':').any(|p| p.starts_with(MISE_SHARED_INCAGE)),
+        "no neighbour's shims may reach PATH: {path}"
+    );
+
+    // Without the grant the neighbours are on disk all the same, and the cage sees none of them.
+    let ungranted = spec_for(false);
+    assert!(
+        !ungranted
+            .mounts
+            .iter()
+            .any(|m| m.dest().starts_with(MISE_SHARED_INCAGE)),
+        "an ungranted cage binds no neighbour pool"
+    );
+    assert_eq!(
+        get(&ungranted, "MISE_SHARED_INSTALL_DIRS"),
+        Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs")),
+        "an ungranted cage keeps the app-global fallback and nothing else"
+    );
 }
 
 #[test]
@@ -2472,6 +2591,7 @@ fn the_capture_tap_replaces_the_cages_resolver_with_exactly_one_mount() {
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
+        share_install_pools: false,
     };
     let spec_of = |capture: bool| {
         build_spec(

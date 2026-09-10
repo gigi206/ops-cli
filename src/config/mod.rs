@@ -495,6 +495,13 @@ pub(crate) struct Resolved {
     /// names, deduplicated, in declaration order; see [`schema::RawConfig::accepts_fresh_releases`]
     /// for what the delay is and why lifting it is a trade.
     pub(crate) accepts_fresh_releases: Vec<String>,
+    /// Whether the apps of this project may read each other's per-project mise install pools.
+    ///
+    /// Set only by a trusted project (never by the global config), it puts each app's pool in the
+    /// read-only fallback list of the others, so the second app to want a tool the project declares
+    /// finds the first app's copy instead of fetching one. See
+    /// [`schema::RawConfig::apps_share_install_pools`] for what the grant gives up.
+    pub(crate) apps_share_install_pools: bool,
     /// Per-plugin settings for the installed resolver plugins, keyed by plugin name: where to get
     /// a program the manifest declares when `PATH` does not have it, and values for the variables
     /// it reads. Layered global-under-project and gated by trust, like `[packages]`.
@@ -987,6 +994,9 @@ impl Resolved {
         let Override { raw, .. } = ov;
         let RawConfig {
             allow_insecure_http,
+            // Dropped by `overlay_into` before it reaches here, and named for the same reason: the
+            // grant belongs to the project's config, not to one launch.
+            apps_share_install_pools: _,
             env,
             binds,
             packages,
@@ -1915,6 +1925,27 @@ fn resolve(
             );
         }
     }
+
+    // Whether this project's apps may read each other's mise install pools. Project-only on
+    // purpose: the grant is about *these* apps in *this* project, so there is no global form to
+    // read — a machine-wide default would open the pools of projects that never asked, which is
+    // the shape `decisions.md` reserves for a hole opened on request. A security field, so an
+    // untrusted or changed project is refused with a warning rather than quietly granted.
+    let mut apps_share_install_pools = false;
+    if let Some((proj, state)) = project.as_ref()
+        && proj.apps_share_install_pools
+    {
+        if *state == TrustState::Trusted {
+            apps_share_install_pools = true;
+        } else {
+            refuse_untrusted(
+                &mut warnings,
+                PROJECT_CONFIG,
+                "`apps_share_install_pools`",
+                *state,
+            );
+        }
+    }
     apply_tools(
         &mut packages,
         &mut warnings,
@@ -2813,6 +2844,7 @@ fn resolve(
     }
 
     let resolved = Resolved {
+        apps_share_install_pools,
         allow_insecure_http,
         allow_insecure_http_origin,
         env,

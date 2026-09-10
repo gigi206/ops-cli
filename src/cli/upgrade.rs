@@ -2540,6 +2540,7 @@ mod tests {
         let rev_a = "a".repeat(40);
         let rev_b = "b".repeat(40);
         let cfg = |global: &str| config::Resolved {
+            apps_share_install_pools: false,
             distro_run: Vec::new(),
             accepts_fresh_releases: Default::default(),
             timezone: None,

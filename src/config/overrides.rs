@@ -486,6 +486,13 @@ fn push_ignored_field_notices(
 #[allow(clippy::type_complexity)]
 const DROPPED_TABLES: &[(&str, fn(&RawConfig) -> bool, &str)] = &[
     (
+        "apps_share_install_pools",
+        |r| r.apps_share_install_pools,
+        "the grant that lets a project's apps read each other's install pools is a property of \
+         the app set, written in the project's config where it is reviewed, not a one-launch \
+         decision",
+    ),
+    (
         "distro",
         |r| r.distro.is_some(),
         "the substrate a cage is built on is not a one-launch decision",
@@ -585,6 +592,12 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
     // `_` with its reason, never omitted.
     let RawConfig {
         allow_insecure_http,
+        // The grant that lets this project's apps read each other's install pools is a property
+        // of the app set, recorded in the project's own config where it is reviewed. It is not a
+        // one-launch decision, and an ambient variable carrying it would open the pools of every
+        // launch without a line anywhere saying so. `push_ignored_field_notices` says it is
+        // dropped rather than letting it govern nothing in silence.
+        apps_share_install_pools: _,
         binds,
         packages,
         nixpkgs,
@@ -699,6 +712,12 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     // with its reason, never omitted.
     let RawConfig {
         allow_insecure_http,
+        // The grant that lets this project's apps read each other's install pools is a property
+        // of the app set, recorded in the project's own config where it is reviewed. It is not a
+        // one-launch decision, and an ambient variable carrying it would open the pools of every
+        // launch without a line anywhere saying so. `push_ignored_field_notices` says it is
+        // dropped rather than letting it govern nothing in silence.
+        apps_share_install_pools: _,
         env,
         binds,
         packages,
@@ -3203,9 +3222,21 @@ mod tests {
             .split("\n];")
             .next()
             .expect("its entries");
+        // The table's predicate reads the field, which for a collection or an `Option` is a method
+        // call (`r.flakes.is_empty()`) and for a plain `bool` is the field itself. Match the name at
+        // a word boundary so both forms count, rather than the trailing dot alone -- which would
+        // pass a boolean only if its author wrapped it in a method it does not need.
+        let names_field = |name: &str| {
+            table.match_indices(&format!("r.{name}")).any(|(i, m)| {
+                table[i + m.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            })
+        };
         for name in &let_go {
             assert!(
-                table.contains(&format!("r.{name}.")),
+                names_field(name),
                 "the fold drops `{name}` and nothing names it to the author who wrote it"
             );
         }

@@ -549,6 +549,10 @@ pub(crate) struct Overlay<'a> {
     /// The project mise files sbx declared inert, named to the cage's own mise so it skips them
     /// too. Empty whenever the project has none, or has one that is honored.
     pub(crate) ignored_mise_paths: &'a [std::path::PathBuf],
+    /// Whether this project's apps may read each other's per-project mise install pools
+    /// (`apps_share_install_pools`, a trusted project's grant). Only a global app has such a pool,
+    /// so it changes nothing for the other runtimes.
+    pub(crate) share_install_pools: bool,
 }
 
 /// Host-side locations of one sandbox's mount sources, passed to [`assemble`].
@@ -567,6 +571,11 @@ struct SandboxPaths<'a> {
     /// [`MISE_PROJECT_INCAGE`] (mise's primary for the split). `None` keeps the single app-global
     /// pool ([`mise_env`] then reads its whole install/shim set from the home).
     mise_project_src: Option<&'a Path>,
+    /// The other apps' per-project install pools this cage may read, as `(app name, host
+    /// installs dir)`. Each is bound read-only at `<MISE_SHARED_INCAGE>/<app>` and named to mise as
+    /// a fallback after the app's own. Empty unless a trusted project granted
+    /// `apps_share_install_pools`, and empty for every runtime but a global app.
+    mise_shared_installs: &'a [(String, PathBuf)],
     /// Synthetic identity files; bound read-only at `/etc/passwd`/`/etc/group`.
     passwd_src: &'a Path,
     group_src: &'a Path,
@@ -938,6 +947,20 @@ fn cage_mounts(
         });
     }
 
+    // Zone 2 — the other apps' install pools, bound READ-ONLY, one per app under
+    // [`MISE_SHARED_INCAGE`]. Present only when a trusted project granted
+    // `apps_share_install_pools`; empty otherwise, which is every launch that did not ask. mise
+    // treats its fallback list as a search path and never writes to one, so the read-only mode
+    // states the same thing the tool already does rather than relying on it. An app name is a
+    // validated single path component (the config app-name check), so joining it cannot traverse
+    // out of the root.
+    for (app, installs) in paths.mise_shared_installs {
+        mounts.push(Mount::RoBind {
+            src: installs.clone(),
+            dest: Path::new(MISE_SHARED_INCAGE).join(app),
+        });
+    }
+
     // Zone 1 — the synthetic system-wide ssh client config, present only when a declared `tcp://`
     // destination needs one: a privileged port gets no in-cage listener, so ssh has to ask the
     // cage's CONNECT proxy for it, and this is where that instruction is written. Read-only and
@@ -1201,6 +1224,7 @@ fn cage_env(
         nix.on_btrfs,
         overlay.fresh_release_tokens,
         overlay.ignored_mise_paths,
+        paths.mise_shared_installs,
     ));
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
@@ -1248,6 +1272,7 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     SSH_CONFIG_INCAGE,
     super::miseplugin::INCAGE_DIR,
     MISE_PROJECT_INCAGE,
+    MISE_SHARED_INCAGE,
     super::contract::EGRESS_CONTRACT_INCAGE,
 ];
 
@@ -1277,6 +1302,14 @@ const MISE_SHIMS_REL: &str = ".local/share/mise/shims";
 /// structural mount. Only a global app supplies it; `sbx run` and a per-project app already root
 /// their home — and therefore mise's data dir — per-project, so they keep the single-pool wiring.
 const MISE_PROJECT_INCAGE: &str = "/opt/sbx/mise-project";
+
+/// Where the *other* apps' per-project install pools are bound read-only inside the cage, one
+/// directory per app under this root (`<this>/<app>`). Only a global app in a project whose trusted
+/// config sets `apps_share_install_pools` gets any, and each is a read of a pool another app owns:
+/// the bind is read-only, and mise treats the whole fallback list as a search path it never writes.
+/// Under `/opt/sbx`, disjoint from every structural mount; the root is the destination
+/// [`STRUCTURAL_DESTS`] carries, its per-app children being derived the way the home's are.
+const MISE_SHARED_INCAGE: &str = "/opt/sbx/mise-shared";
 
 /// mise's app-global data dir inside the cage — the sandbox `$HOME`'s mise dir. For a global app,
 /// Lane-1 `mise use -g` of an app `[packages] mise:` tool must run pinned here (not the per-project
@@ -1395,6 +1428,7 @@ fn mise_env(
     store_on_btrfs: bool,
     fresh_release_tokens: &[String],
     ignored_mise_paths: &[std::path::PathBuf],
+    shared_installs: &[(String, PathBuf)],
 ) -> Vec<(String, String)> {
     let mut nix_config = "extra-experimental-features = nix-command flakes\n\
                           sandbox = false\n\
@@ -1417,10 +1451,19 @@ fn mise_env(
         ("NIX_CONFIG".to_string(), nix_config),
     ];
     if per_project_primary {
-        env.push((
-            "MISE_SHARED_INSTALL_DIRS".to_string(),
-            format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs"),
-        ));
+        // The app's own app-global installs come first and the neighbours after, because mise
+        // searches the list in order and a version an app holds itself must be the one it
+        // resolves: a neighbour supplies only what this app has nowhere else. The separator is
+        // the PATH one (`:`) — mise reads this list with `split_paths`, unlike
+        // `MISE_MINIMUM_RELEASE_AGE_EXCLUDES` below, which is comma-joined. Two lists, two
+        // separators, and neither forgives the other's.
+        let mut dirs = vec![format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs")];
+        dirs.extend(
+            shared_installs
+                .iter()
+                .map(|(app, _)| format!("{MISE_SHARED_INCAGE}/{app}")),
+        );
+        env.push(("MISE_SHARED_INSTALL_DIRS".to_string(), dirs.join(":")));
     }
     // Set here, in the cage's ambient environment, rather than in either of the two scripts that
     // invoke mise: the delay governs the **equip** (`mise use -g --pin`, at first launch) as much as
@@ -1738,11 +1781,24 @@ pub(crate) fn build_spec(
         None => Vec::new(),
     };
 
+    // The other apps' pools this cage may read. Only a global app has a per-project pool of its
+    // own, so only a global app has neighbours to read; `project_mise_pools` discovers them on
+    // disk, so the set is exactly the apps that have run in this project and equipped something.
+    // The app's own pool is excluded by name — it is the writable primary, not a fallback.
+    let mise_shared_installs: Vec<(String, PathBuf)> =
+        match (overlay.share_install_pools, runtime.app()) {
+            (true, Some(app)) if rt.mise_project_src.is_some() => {
+                super::inspect::project_mise_pools(data_dir, &project_id(&project), app)
+            }
+            _ => Vec::new(),
+        };
+
     let paths = SandboxPaths {
         project: &project,
         distro_writable: &distro_writable,
         home_src: &rt.home_src,
         mise_project_src: rt.mise_project_src.as_deref(),
+        mise_shared_installs: &mise_shared_installs,
         passwd_src: &passwd,
         group_src: &group,
         mise_plugin_src: &mise_plugin,

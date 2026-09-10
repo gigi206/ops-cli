@@ -107,29 +107,42 @@ same project, equipping the same tool at the same version, each keep their own c
 The tools a project's own mise file declares are the case where this is most visible: they
 are the same tools for every app, by construction, and each app installs them again.
 
-Sharing them was not refused, it was not reached, and the mechanism for it is already in
-place: mise reads a list of read-only install directories to fall back on, and sbx already
-points it at the app's own pool so that a tool the agent equips in one project is reused in
-the next. A pool shared between apps would be another entry in that list, not a rewrite of
-the split. Two properties such a pool would need also hold today: an install directory is
-written once and not touched again by later launches, and the activation record that names
-the current version lives in the app's home rather than in the pool, so a shared install
-would carry no per-app state.
+Sharing them is offered, and it is off until a project asks for it
+([`apps_share_install_pools`](../configuration/packages#apps_share_install_pools-when-two-apps-in-one-project-equip-the-same-tool)).
+The mechanism was already in place: mise reads a list of read-only install directories to
+fall back on, and sbx already points it at the app's own pool so a tool the agent equips in
+one project is reused in the next. Each app's pool is another entry in that list, not a
+rewrite of the split. The properties that makes safe hold today: the list is a search path
+mise never writes to, an app's own pool and home are searched before any neighbour's so a
+version it holds itself is the one it resolves, and the activation record that names the
+current version lives in the app's home rather than in the pool, so a shared install carries
+no per-app state.
 
-What argues against it is not the plumbing, it is what the sharing would mean. An install
+What had to be decided was not the plumbing, it is what the sharing means. An install
 directory holds executables, and a pool two apps read is a pool one app can write for the
 other to run: the same shape as [the store they already
-share](security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps), except
-that the store's sharing is the price of provisioning a project at all, while this one would
-buy disk space. That is a boundary moved for a saving, and the saving is real only where apps
-equip the same tools. Where they do, it is a handful of agents shipping the same helper rather
-than a broad overlap, so the ceiling is a fraction of what the homes hold. Measuring that
-overlap on the machine in question comes before any of it. The second question is already
-answered: the fallback list is a search path, so a pool shared this way is read by the apps and
-written by none of them, and a version an app holds itself is the one it resolves. What sharing
-would still need is a housekeeping change, because the sweep that removes the versions no
-activation asks for reads one app's activations, and a pool another app reads is one it must
-not empty.
+share](security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps). The
+difference is what each buys. The store's sharing is the price of provisioning a project at
+all; this one buys disk space, and only where apps equip the same tools. That is why it is a
+field rather than a default. A cage nobody configured shares nothing, the grant is written in
+the project's config where it is read rather than inferred from the tools two apps happen to
+have in common, and the global config cannot set it: the question is about these apps in this
+project, and answering it once for a machine would open the pools of projects that never
+asked.
+
+The concrete opening is worth naming, because it is narrower than "one app can run another's
+code" suggests and not zero. An app resolves only what its own activation or the project's
+mise file asks for, by name and version, so a neighbour cannot place a binary an app will run
+by accident. What it can do is get there first: the project's mise file is readable by every
+app in it, so an app that equips the version a second app is about to ask for has its copy
+found instead of one being fetched. What an app declares for itself is out of reach, pinned
+in its home and installed at launch, which is searched first.
+
+Housekeeping follows the grant. The sweep that removes the versions no activation asks for
+reads one app's activations, and a pool another app reads is one it must not empty, so it now
+reads the activations of every app that has a pool in the project. It is not conditioned on
+the grant: with sharing off those entries name versions no launch resolves from that pool, so
+the widening can only keep a version, which is the bias the sweep already has.
 
 ### The holes are opened on request, and each one is a hole
 

@@ -281,6 +281,42 @@ pub(crate) fn app_per_project_mise_pools(data_dir: &Path, name: &str) -> Vec<App
     pools
 }
 
+/// The other apps' per-project mise install pools in one project tree — the inverse of
+/// [`app_per_project_mise_pools`], which walks one app across every project.
+///
+/// Returns `(app name, <pool>/installs)` for every app of `project_id` except `except`, keeping
+/// only the pools that actually hold an `installs/` directory: an app that has run in the project
+/// but equipped nothing has a pool with nothing to offer, and naming it would put an empty
+/// directory on a fallback list. Sorted by app name, so the order a cage is given is stable across
+/// launches rather than following the filesystem's.
+///
+/// This is the set `apps_share_install_pools` grants a read of. It is discovered on disk rather
+/// than declared, so the grant covers exactly the apps that have run in this project, and it is
+/// symmetric by construction: each app sees the others, none sees itself twice.
+pub(crate) fn project_mise_pools(
+    data_dir: &Path,
+    project_id: &str,
+    except: &str,
+) -> Vec<(String, PathBuf)> {
+    let mut pools = Vec::new();
+    let apps = data_dir.join("projects").join(project_id).join("apps");
+    let Ok(entries) = std::fs::read_dir(&apps) else {
+        return pools;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == except {
+            continue;
+        }
+        let installs = entry.path().join("mise").join("installs");
+        if installs.is_dir() {
+            pools.push((name, installs));
+        }
+    }
+    pools.sort_by(|a, b| a.0.cmp(&b.0));
+    pools
+}
+
 /// Which project trees pin `locator` in `lockfile` — the realized-where signal for a `deb:`,
 /// `appimage:`, or `flake:` package, whose build output lives in the **per-project** store (not the
 /// app home). Scans every `<data>/projects/<id>/<lockfile>` for a line whose first tab-column is
@@ -872,6 +908,35 @@ mod tests {
     fn mise_installed_is_empty_without_a_mise_dir() {
         let dir = crate::testutil::TmpDir::new();
         assert!(mise_installed(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_projects_pools_are_every_other_apps_that_holds_a_tool() {
+        // `project_mise_pools` answers the question `app_per_project_mise_pools` cannot: within one
+        // project, which OTHER apps have a pool worth reading. Three things it must get right, and
+        // each is a way the fallback list would otherwise be wrong: the asking app is excluded (its
+        // own pool is the writable primary, not a fallback), an app whose pool holds no `installs/`
+        // contributes nothing (naming it would put an empty directory on the list), and the order is
+        // by app name so a cage is given the same list on every launch.
+        let scratch = crate::testutil::TmpDir::new();
+        let data = scratch.path();
+        let apps = data.join("projects/p1/apps");
+        for name in ["zed", "asker", "beta"] {
+            std::fs::create_dir_all(apps.join(name).join("mise/installs/nix-jq/1.8.1")).unwrap();
+        }
+        // ran in the project but equipped nothing: a pool dir with no installs
+        std::fs::create_dir_all(apps.join("bare").join("mise")).unwrap();
+        // another project's pool must not leak into this one's list
+        std::fs::create_dir_all(data.join("projects/p2/apps/other/mise/installs/nix-jq/1.8.1"))
+            .unwrap();
+
+        let pools = project_mise_pools(data, "p1", "asker");
+        let names: Vec<&str> = pools.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["beta", "zed"]);
+        assert_eq!(pools[0].1, apps.join("beta/mise/installs"));
+
+        // and an app alone in its project has nobody to read
+        assert!(project_mise_pools(data, "p2", "other").is_empty());
     }
 
     #[test]

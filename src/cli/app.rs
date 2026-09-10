@@ -2502,15 +2502,31 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             if !project.is_dir() {
                 continue;
             }
-            let mut specs = sandbox::mise_tool_specs(
-                &layout
+            let activation_of = |app: &str| {
+                layout
                     .data_dir()
                     .join("apps")
-                    .join(app_name)
-                    .join("home/.config/mise/config.toml"),
-            );
+                    .join(app)
+                    .join("home/.config/mise/config.toml")
+            };
+            let mut specs = sandbox::mise_tool_specs(&activation_of(app_name));
             for file in crate::trust::mise_files_for(&project.join(".sbx.toml")) {
                 for (tool, versions) in sandbox::mise_tool_specs(&file) {
+                    specs.entry(tool).or_default().extend(versions);
+                }
+            }
+            // And the other apps of this project, because `apps_share_install_pools` lets one
+            // resolve out of another's pool: a tool this app equipped once and no longer asks for
+            // may be the one a neighbour found here and therefore never installed itself, so
+            // reading this app's activations alone would empty a pool under a running neighbour.
+            // Not gated on the grant, which lives in the project's config rather than on disk here:
+            // when it is off those activations name versions no launch resolves from this pool, so
+            // the widening only ever keeps a version, and keeping one is this sweep's stated bias
+            // (see `prune_stale_versions`, which leaves a tool with no spec entirely alone).
+            for (neighbour, _) in
+                sandbox::inspect::project_mise_pools(layout.data_dir(), &pool.project_id, app_name)
+            {
+                for (tool, versions) in sandbox::mise_tool_specs(&activation_of(&neighbour)) {
                     specs.entry(tool).or_default().extend(versions);
                 }
             }

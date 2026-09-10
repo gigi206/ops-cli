@@ -188,6 +188,39 @@ package with the reason written beside it, never as a blanket, and remove it onc
 cadence slows enough for the delay to clear on its own. A [bundle](bundles) may carry the line for
 the tool it ships, which is where it belongs when the package belongs there too.
 
+#### `apps_share_install_pools`: when two apps in one project equip the same tool
+
+A global app's `[packages] mise:` tools live in its own home and follow it into every project. What
+the *project's* mise file declares is equipped somewhere else: a pool under the project's tree,
+keyed by app. Two apps run in the same project therefore install the project's tools twice, once
+each, and a third would make it three times.
+
+Set this in the project's config and each app's pool joins the read-only fallback list of the
+others:
+
+```toml
+apps_share_install_pools = true
+```
+
+The pools stay separate. Each app still writes only its own, and mise treats the others as a search
+path it never writes to. What changes is what an app may read: the second app to want a tool the
+project declares finds the first app's copy instead of fetching one.
+
+An app's own tools win. Its pool and its home are searched before any neighbour's, so a version it
+holds itself is always the one it resolves, and a neighbour supplies only a version it has nowhere
+else.
+
+This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only), and unlike the
+others it cannot be set in the global config at all. The grant is about *these* apps in *this*
+project, and a machine-wide default would open the pools of projects that never asked for it.
+
+What it gives up is that a tool one app installed becomes a tool another app can run. An app that
+equips the version a second app is about to ask for gets its copy run instead, and the version a
+project declares is written in a file every app in it can read. The project's `/nix` store is
+[already shared this way](../concepts/security-model#the-store-an-agent-writes-into-is-shared-by-the-projects-apps);
+this extends the same shape to the backends that never touch the store. Leave it off unless the
+apps in the project are ones you would let each other's tools run.
+
 ### `flake:`: a nix flake output
 
 ```toml
