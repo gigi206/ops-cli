@@ -105,6 +105,12 @@ mute = [
 # preference the way the tool itself would. It is gated on the key being absent, which means it
 # never fights a user who later turns telemetry back on.
 #
+# THE PROBE USES BASH BUILTINS ONLY, AND THAT IS THE GUARANTEE'S LOAD-BEARING PART. A `grep -q`
+# gate cannot tell "the key is absent" from "the probe could not run": both leave a non-zero
+# status, so a `PATH` without grep would send every roll down the writing branch and re-impose the
+# opt-out over a user who had switched it back on. `$(<file)` and `case` need nothing on `PATH`, so
+# the promise above holds whatever userland the consuming app declares.
+#
 # WHAT `SBX_UPGRADE` DOES HERE, AND WHY IT IS NOT THE USUAL THING. An install step yields to the
 # roll by re-installing; this one must not, because re-imposing a preference the user has since
 # changed would undo their edit rather than advance an install. What the roll must never do is
@@ -117,13 +123,21 @@ provision = [
     "-c",
     '''
 set -e
-if ! grep -q 'telemetry.enabled' "$HOME/.kiro/settings/cli.json" 2>/dev/null; then
-  if ! kiro-cli settings telemetry.enabled false >/dev/null 2>&1; then
-    echo "sbx: could not state kiro's telemetry preference; it stays at the CLI's own default" >&2
-  fi
-elif [ -n "${SBX_UPGRADE:-}" ]; then
-  echo "sbx: kiro's telemetry preference is already stated in this app home; leaving it as it is" >&2
-fi
+settings="$HOME/.kiro/settings/cli.json"
+current=""
+if [ -r "$settings" ]; then current=$(<"$settings") || current=""; fi
+case "$current" in
+  *telemetry.enabled*)
+    if [ -n "${SBX_UPGRADE:-}" ]; then
+      echo "sbx: kiro's telemetry preference is already stated in this app home; leaving it as it is" >&2
+    fi
+    ;;
+  *)
+    if ! kiro-cli settings telemetry.enabled false >/dev/null 2>&1; then
+      echo "sbx: could not state kiro's telemetry preference; it stays at the CLI's own default" >&2
+    fi
+    ;;
+esac
 ''',
 ]
 
