@@ -1278,11 +1278,10 @@ mod tests {
         // The cage is up once the outer bwrap names the init it cloned.
         let proc = Path::new("/proc");
         let outer_pid = outer.id();
-        let children = proc.join(outer_pid.to_string()).join("task");
+        let children_of = |pid: &str| proc.join(pid).join("task").join(pid).join("children");
         let mut init = String::new();
         for _ in 0..100 {
-            if let Ok(text) =
-                std::fs::read_to_string(children.join(outer_pid.to_string()).join("children"))
+            if let Ok(text) = std::fs::read_to_string(children_of(&outer_pid.to_string()))
                 && let Some(first) = text.split_whitespace().next()
             {
                 init = first.to_string();
@@ -1294,6 +1293,27 @@ mod tests {
             let _ = outer.kill();
             let _ = outer.wait();
             skip_incapable!("skipping the cage calibration: the cage never came up");
+            return;
+        }
+        // ...and the init is only *running a payload* once it has forked one. Between its clone
+        // and that fork it is a childless namespace leader — which is exactly the shape
+        // `Stillborn` names, so an assertion made in that window reads a starting cage as a
+        // reclaimable one. Waited for through `children` directly rather than through
+        // `occupancy`, so the thing being asserted is not also the thing being waited on.
+        let mut payload = false;
+        for _ in 0..100 {
+            if std::fs::read_to_string(children_of(&init))
+                .is_ok_and(|t| !t.split_whitespace().collect::<Vec<_>>().is_empty())
+            {
+                payload = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !payload {
+            let _ = outer.kill();
+            let _ = outer.wait();
+            skip_incapable!("skipping the cage calibration: the cage never ran its payload");
             return;
         }
         let init_verdict = occupancy(&init, proc);
