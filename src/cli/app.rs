@@ -14,7 +14,7 @@ use crate::cli::confirm::{render_app_exported, render_app_imported, render_remov
 use crate::cli::{import_remedy, refuse_flag_value};
 use crate::{
     build_override, config_cwd, egress_write_target, flag_name, net_mode_word, persist_egress_rule,
-    print_json, session_pids_for_app, take_override_flag,
+    print_json, take_override_flag,
 };
 use crate::{config, diag, help, layout_or_fail, sandbox, session, store, style, trust};
 
@@ -2216,6 +2216,41 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     let mut skipped: Vec<String> = Vec::new();
     let mut had_error = false;
 
+    // The live-session guard below reads the registry once for the whole sweep, and an error
+    // reading it refuses the run rather than defaulting to an empty answer. `unwrap_or_default`
+    // here would turn "cannot know" into "nothing is running", so the one check standing between
+    // `--yes` and a running agent's home would pass by failing. [`session::Registry::scan`] already
+    // skips a single unreadable record so one bad entry cannot blank the answer, and treats a
+    // missing directory as no sessions; what reaches this `Err` is the sessions directory itself
+    // being unreadable, which is exactly the state a destructive verb must not act through.
+    //
+    // The same rule and the same shape as [`app_rm`]'s purge path above, which reads the registry
+    // once for its batch and refuses all of it when it cannot: the two destructive verbs in this
+    // file are allowed to delete out of an app home only because the registry says no session of
+    // that app is live, so neither may read "cannot know" as "nothing there". This one asks through
+    // `live` rather than `list`, because a guard should not reclaim the directory it is questioning.
+    //
+    // Read only when applying: the preview deletes nothing, so it stays available on a host whose
+    // registry cannot be read — which is also where a user would go looking for what happened.
+    let live_sessions = if apply {
+        match session::Registry::at(layout.data_dir()).live() {
+            Ok(live) => live,
+            Err(e) => {
+                diag::error(&format!(
+                    "sbx app prune: cannot read the session registry ({e}) — refusing to prune, \
+                     because a live session of the app cannot be ruled out."
+                ));
+                diag::hint(
+                    "       re-run without `--yes` to see what would go, or fix the data \
+                     directory's permissions",
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     for app_name in &targets {
         let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), app_name);
         // A prune deletes trees out of the home a running session of this app is using: its `PATH`
@@ -2226,10 +2261,15 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         // under which deleting a live agent's state is the intent. Under `--all` the app is skipped
         // and named instead, so one running agent does not stand between the user and the rest.
         if apply {
-            let live = session_pids_for_app(layout.data_dir(), app_name);
-            if !live.is_empty() {
-                let mut pids: Vec<u32> = live.into_iter().collect();
-                pids.sort_unstable();
+            let mut pids: Vec<u32> = live_sessions
+                .iter()
+                .filter(|s| s.app() == Some(app_name.as_str()))
+                .map(|s| s.pid)
+                .collect();
+            // The registry sorts by project then pid, so an app with a session in two projects
+            // would list its pids out of order; the message names them ascending either way.
+            pids.sort_unstable();
+            if !pids.is_empty() {
                 let rendered: Vec<String> = pids.iter().map(u32::to_string).collect();
                 let listed = rendered.join(", ");
                 if all {

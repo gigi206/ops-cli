@@ -530,6 +530,55 @@ fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
     );
 }
 
+#[test]
+fn prune_yes_refuses_when_the_session_registry_cannot_be_read() {
+    let fx = fixture_with_a_leftover();
+    // A plain file where the registry's directory belongs, so `read_dir` answers `ENOTDIR`. That is
+    // neither of the two states the scan already absorbs: a missing directory means no sessions,
+    // and a single unreadable record is skipped so one bad entry cannot blank the answer. What is
+    // left is the guard being unable to know, and the applying form has to refuse rather than read
+    // it as an all-clear — the alternative deletes a running agent's interpreters.
+    let sessions = fx.data_home.path().join("sbx/sessions");
+    std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&sessions);
+    std::fs::write(&sessions, b"not a directory").unwrap();
+
+    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
+    assert!(
+        !out.status.success(),
+        "an unreadable registry must refuse the apply: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("cannot read the session registry"),
+        "and say what it could not know: {}",
+        text(&out)
+    );
+    assert!(
+        fx.installs_dir("demo-app").join("pipx-orphan").is_dir(),
+        "nothing may be deleted while liveness is unknown"
+    );
+
+    // `--all` refuses too. Its live-app semantics is skip-and-name, and naming requires knowing
+    // which app is live: an unreadable registry cannot answer that for any of them, so sweeping
+    // every app is the one reading that would delete the most under a running agent.
+    let all = fx.run(&["app", "prune", "--all", "--yes"]);
+    assert!(
+        !all.status.success(),
+        "the sweep must refuse on the same unreadable registry: {}",
+        text(&all)
+    );
+
+    // The preview is unaffected: it deletes nothing, so it never asks the registry.
+    let preview = fx.run(&["app", "prune", "demo-app"]);
+    assert!(
+        preview.status.success()
+            && String::from_utf8_lossy(&preview.stdout).contains("would prune"),
+        "the preview must still work: {}",
+        text(&preview)
+    );
+}
+
 /// This process's start time in clock ticks, as the session registry records it — read from
 /// `/proc/<pid>/stat`'s 22nd field, past the parenthesised comm which may itself contain spaces.
 fn start_ticks(pid: u32) -> Option<u64> {

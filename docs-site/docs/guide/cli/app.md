@@ -408,6 +408,12 @@ under a command in flight, and what the agent then reports looks nothing like wh
 happened. Stop it with `sbx session stop` and retry. The preview deletes nothing, so
 it stays available either way.
 
+The same refusal covers the case where sbx cannot tell: if the session registry itself
+cannot be read, `--yes` refuses and says so rather than treating an unreadable registry
+as an empty one. Under `--all` that refuses the whole sweep, since naming the apps to skip
+needs the answer the registry could not give. The preview never asks the registry, so it
+keeps working.
+
 ### Reclaiming the caches
 
 `--caches` empties `.cache` in each of the app's homes as well. That directory is where a
