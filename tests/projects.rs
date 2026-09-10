@@ -529,6 +529,43 @@ fn a_listing_reports_liveness_as_unknown_when_the_registry_cannot_be_read() {
     );
 }
 
+/// The third branch of the same rule, and the one carrying no gate of its own: `sbx gc --all
+/// --prune` drops the gcroot of every holder it does not find live, then removes the unpacked
+/// distribution nothing holds any more. An empty live set is not a no-op here — it is the whole
+/// sweep, run against a cage that may still be reading the tree.
+#[test]
+fn gc_all_leaves_a_distribution_tree_alone_when_the_registry_cannot_be_read() {
+    let fx = Project::new("projects");
+    let digest = format!("sha256-{}", "ab".repeat(32));
+    let tree = fx.data_home.path().join("sbx/distro").join(&digest);
+    std::fs::create_dir_all(tree.join("roots")).unwrap();
+    std::fs::write(tree.join("rootfs"), vec![b'x'; 4096]).unwrap();
+    let root = tree.join("roots/1234567890abcdef");
+    std::fs::write(&root, b"x").unwrap();
+
+    let sessions = fx.data_home.path().join("sbx/sessions");
+    std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&sessions);
+    std::fs::write(&sessions, b"not a directory").unwrap();
+
+    let out = fx.run(&["gc", "--all", "--prune"]);
+    assert!(
+        root.exists(),
+        "the gcroot of a holder whose liveness was never established was dropped: {}",
+        text(&out)
+    );
+    assert!(
+        tree.exists(),
+        "the distribution tree went out from under a session that could not be ruled out: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("cannot read the session registry"),
+        "the sweep must say it could not clear the holders: {}",
+        text(&out)
+    );
+}
+
 #[test]
 fn rm_dead_previews_by_default_and_reaps_with_yes() {
     let fx = Project::new("projects");
