@@ -125,6 +125,13 @@ mute = [
 # SAYS which of the two happened. The variable is honoured by being answered, not by being
 # obeyed. A failed write is reported for the same reason: swallowing it would put the silence
 # back on the other branch.
+#
+# WHAT COUNTS AS A FAILED WRITE IS THE FILE, NOT THE EXIT STATUS. The writer has been observed
+# exiting zero having created nothing: the step then reported nothing, the settings file stayed
+# absent, and the gate above — which reads that file — sent the next launch down this same branch,
+# for ever, announcing a success it never obtained. An exit status says the command ran; only the
+# file says the preference is stated. So the branch re-reads it afterwards and answers on what it
+# finds, through the same builtins the gate uses and for the same reason.
 provision = [
     "bash",
     "-c",
@@ -140,9 +147,15 @@ case "$current" in
     fi
     ;;
   *)
-    if ! kiro-cli settings telemetry.enabled false >/dev/null 2>&1; then
-      echo "sbx: could not state kiro's telemetry preference; it stays at the CLI's own default" >&2
-    fi
+    kiro-cli settings telemetry.enabled false >/dev/null 2>&1 || true
+    written=""
+    if [ -r "$settings" ]; then written=$(<"$settings") || written=""; fi
+    case "$written" in
+      *telemetry.enabled*) ;;
+      *)
+        echo "sbx: could not state kiro's telemetry preference in this app home; the environment opt-out this bundle sets is what keeps telemetry off" >&2
+        ;;
+    esac
     ;;
 esac
 ''',

@@ -1306,14 +1306,28 @@ fn the_kiro_install_step_states_the_preference_once_and_then_says_what_it_did() 
     std::fs::create_dir_all(&bin).unwrap();
     let called = tmp.path().join("called");
 
+    // A stand-in writer that records being called and, when it is meant to succeed, WRITES THE
+    // FILE. The shipped step no longer believes an exit status — the real `kiro-cli settings` has
+    // been seen returning zero having created nothing, which left the step announcing a success it
+    // never obtained — so a stub that only exits zero models a failure here, and modelling it as a
+    // success is what let the old assertion pass over the defect.
+    let settings = home.join(".kiro/settings/cli.json");
     let stub = |ok: bool| {
         use std::os::unix::fs::PermissionsExt;
         let path = bin.join("kiro-cli");
         let code = i32::from(!ok);
+        let write = if ok {
+            format!(
+                "printf '{{\"telemetry.enabled\": false}}\\n' > {}\n",
+                settings.display()
+            )
+        } else {
+            String::new()
+        };
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit {code}\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{write}exit {code}\n",
                 called.display()
             ),
         )
@@ -1366,12 +1380,28 @@ fn the_kiro_install_step_states_the_preference_once_and_then_says_what_it_did() 
     );
 
     // 3. A writer that fails is reported rather than swallowed — the same silence, other branch.
-    std::fs::remove_file(home.join(".kiro/settings/cli.json")).unwrap();
+    std::fs::remove_file(&settings).unwrap();
     stub(false);
     let complained = run(false);
     assert!(
         complained.contains("could not state"),
         "a failed write said nothing: {complained:?}"
+    );
+
+    // 4. The branch the exit status cannot see, and the reason this step reads the file instead. A
+    // writer that returns SUCCESS having written nothing is what the real `kiro-cli settings` does
+    // here: a step that believed the status reported nothing, left the preference unstated, and —
+    // because the gate above reads that same absent file — took this branch again on every launch
+    // that followed, announcing a success it never obtained.
+    use std::os::unix::fs::PermissionsExt;
+    let liar = bin.join("kiro-cli");
+    std::fs::write(&liar, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&liar, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!settings.exists(), "the fixture starts with nothing stated");
+    let lied = run(false);
+    assert!(
+        lied.contains("could not state"),
+        "a writer that exited zero having written nothing was taken at its word: {lied:?}"
     );
 }
 
