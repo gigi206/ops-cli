@@ -22,6 +22,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -918,8 +919,16 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
 /// The containment rule `super::fsmask::admit` applies to a project-declared path, applied here to a
 /// path under a **cage-owned home**. Every component is resolved (`canonicalize` follows the whole
 /// chain), so a symlink planted at any depth is caught rather than only one at the leaf — which is
-/// the difference that matters, since the callers hand [`force_remove_dir_all`] a root whose last
-/// component is genuine and whose *parent* is the one the cage replaced.
+/// the difference that matters, since a name reaching a nested entry has components the cage owns
+/// above the one it points at.
+///
+/// **This admits a name; it does not confine the removal that follows.** What it returns is a path,
+/// and a path is re-resolved by every syscall handed it — so between this answer and a removal
+/// acting on it, the cage can replace a component and send that removal elsewhere. The window is not
+/// a matter of instructions: the callers below size the trees they are about to remove first, and a
+/// walk of a large tree is the whole of it. Confinement is held by [`open_beneath`], which resolves
+/// once into a descriptor and never consults the name again; this stays the admission rule, and the
+/// source of the path a size is read from.
 ///
 /// `None` for an absent path is not a refusal: a home with no mise data has nothing to prune, and
 /// that is the ordinary case rather than an error. A path that resolves outside `root` returns
@@ -929,6 +938,106 @@ fn contained_in(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     let real = candidate.canonicalize().ok()?;
     real.starts_with(&root).then_some(real)
+}
+
+/// Open `name` as a directory, refusing a symlink at that component — relative to `parent` when one
+/// is given, and from the filesystem root otherwise.
+fn open_dir_nofollow(parent: Option<&OwnedFd>, name: &std::ffi::CStr) -> io::Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated and valid for the call, and `parent` — when given — is a live
+    // descriptor. The returned descriptor is taken ownership of immediately below.
+    let fd = unsafe {
+        match parent {
+            Some(dir) => libc::openat(dir.as_raw_fd(), name.as_ptr(), flags),
+            None => libc::open(name.as_ptr(), flags),
+        }
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh, owned descriptor this thread just opened.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A descriptor for the directory `rel` names under `home`, resolved one component at a time and
+/// following nothing.
+///
+/// The anchor is `home` itself: sbx's own directory under the data dir, and the cage's mount point,
+/// so it is the one component of the path the cage cannot have swapped. Each component below it is
+/// opened `O_DIRECTORY|O_NOFOLLOW` from the descriptor for the one above, so a link the cage planted
+/// is refused at the step that meets it rather than traversed. A descriptor obtained this way keeps
+/// naming the directory it was opened on however the names above it change afterwards, which is what
+/// [`contained_in`] cannot offer.
+///
+/// `..` is **not** a symlink, and `O_NOFOLLOW` does not stop it: a walk that accepted it would climb
+/// straight out of the home into the data dir. So only `Component::Normal` is accepted, and a `rel`
+/// carrying `..`, a leading `/`, or a bare `.` is refused outright. An empty `rel` names `home`.
+///
+/// A link that stays *inside* the home is refused too, where `contained_in` follows it. That is a
+/// narrowing, and the fail-closed side of one: the caller is a verb whose only action is to delete.
+fn open_beneath(home: &Path, rel: &Path) -> io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let anchor = std::ffi::CString::new(home.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let mut dir = open_dir_nofollow(None, &anchor)?;
+    for comp in rel.components() {
+        let std::path::Component::Normal(name) = comp else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a name that does not stay below the home it is read from",
+            ));
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
+        dir = open_dir_nofollow(Some(&dir), &name)?;
+    }
+    Ok(dir)
+}
+
+/// Remove `name` from the directory `dir` refers to, whatever it holds.
+///
+/// Every step goes through the descriptor: `fstatat` reads the entry's own type without following
+/// it, a directory is emptied through a descriptor of its own, and `unlinkat` removes the entry
+/// itself. Nothing here re-resolves the name from the root, so a component the cage swaps while this
+/// runs cannot move the removal — what was opened is what is emptied.
+///
+/// A symlink is unlinked rather than followed, which is the rule [`force_remove_dir_all`] states for
+/// a root it is handed: what the caller named is gone, and what it pointed at is untouched.
+fn remove_child(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: `stat` is a plain C struct of integer fields, for which all-zero is a valid value; the
+    // call below overwrites it before any field is read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is a live directory descriptor and `c` is a NUL-terminated name valid for the
+    // call, which writes `st` only when it reports success.
+    if unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    if is_dir {
+        // The tree is emptied through a descriptor for the directory itself. `/proc/self/fd/<n>`
+        // names the inode that descriptor holds rather than the path it was reached by, so the walk
+        // stays inside what was opened however the names above it change.
+        let child = open_dir_nofollow(Some(dir), &c)?;
+        empty_dir(Path::new(&format!("/proc/self/fd/{}", child.as_raw_fd())))?;
+    }
+    let flag = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+    // SAFETY: same descriptor and name as above.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), flag) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// One mise tool `sbx app prune` would remove (or removed) from an app home — a tool the app's
@@ -947,21 +1056,27 @@ pub(crate) struct PrunedTool {
 /// `<home>/.config/mise/config.toml` `[tools]`. With `apply = false` nothing is removed — the return
 /// is the preview of what would go. Read-only when previewing; a targeted cleanup when applying.
 pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Vec<PrunedTool> {
-    // Resolved and confined before anything is enumerated or removed. `home` is the cage's own
-    // `$HOME` (a plain writable `Mount::Bind`), so `.local`, `.local/share`, `.local/share/mise` and
-    // `installs` are ordinary directories untrusted in-cage code owns and can replace with a
-    // symlink. [`force_remove_dir_all`]'s guard is explicitly about the root it is *handed* — it
-    // lstats that one path — and the root here is `<installs>/<tool>`, whose last component is a
-    // real directory. The link would sit above it, where nothing on this chain looked, and
-    // `read_dir` would then enumerate somebody else's directory as "installed tools" for a
-    // recursive delete. Confining the enumeration root is what makes the containment
-    // [`force_remove_dir_all`] promises reach the whole path rather than its last component.
+    // `home` is the cage's own `$HOME` (a plain writable `Mount::Bind`), so `.local`, `.local/share`,
+    // `.local/share/mise` and `installs` are ordinary directories untrusted in-cage code owns and can
+    // replace with a symlink. [`force_remove_dir_all`]'s guard is about the root it is *handed* — it
+    // lstats that one path — and the root here is `<installs>/<tool>`, whose last component is a real
+    // directory. A link above it is where nothing on that chain looks, and `read_dir` would then
+    // enumerate somebody else's directory as "installed tools" for a recursive delete.
+    //
+    // So the enumeration root is opened once, component by component and following nothing, and both
+    // the listing and every removal go through that descriptor. Resolving it to a path instead would
+    // be true only at the instant of the answer: `tree_size` walks each candidate before it goes, and
+    // a name re-resolved after that walk is a name the cage has had a walk's worth of time to move.
     let Some(installs) = contained_in(home, &home.join(".local/share/mise/installs")) else {
         return Vec::new();
     };
+    let Ok(root) = open_beneath(home, Path::new(".local/share/mise/installs")) else {
+        return Vec::new();
+    };
+    let listing = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
     let mut pruned = Vec::new();
     let mut removed_any = false;
-    for tool in super::inspect::mise_installed_in(&installs) {
+    for tool in super::inspect::mise_installed_in(&listing) {
         if declared.iter().any(|d| tool.is(d)) {
             continue; // declared — keep it.
         }
@@ -976,7 +1091,7 @@ pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Ve
         // since it is named as gone on every run. With `apply` off this is a plan, and every
         // candidate belongs in it.
         if apply {
-            if force_remove_dir_all(&dir).is_err() {
+            if remove_child(&root, std::ffi::OsStr::new(&tool.dir_name)).is_err() {
                 continue;
             }
             removed_any = true;
@@ -1147,30 +1262,48 @@ pub(crate) struct DroppedEntry {
 /// name reveals. So this removes what it is told to, and the safety is in the caller asking twice
 /// rather than in a rule about which names are safe.
 ///
-/// Every candidate is resolved through [`contained_in`], which canonicalizes each component: a name
-/// climbing out with `..`, or one whose parent the cage replaced with a link, resolves outside the
-/// home and is skipped rather than followed. A name that does not exist reports nothing, which is
-/// not an error — a home that never held it is the ordinary case.
+/// Every candidate is admitted through [`contained_in`]: a name climbing out with `..`, or one whose
+/// parent the cage replaced with a link, resolves outside the home and is skipped rather than
+/// followed. A name that does not exist reports nothing, which is not an error — a home that never
+/// held it is the ordinary case.
+///
+/// Admission is not what confines the removal, though. A `rel` reaching a nested entry
+/// (`.local/share/pnpm`) has components above it the cage owns, the entry is *sized* before it is
+/// taken, and a name re-resolved after that walk is a name the cage has had a walk's worth of time
+/// to move. So the directory holding each entry is opened through [`open_beneath`] **before**
+/// anything is sized, and the removal goes through that descriptor.
 ///
 /// A name nested inside another named entry is dropped from the list, because the sizes come from
 /// one walk and a part inside a part would be counted by neither correctly. The outer one removes
 /// it anyway.
 pub(crate) fn drop_home_entries(home: &Path, rels: &[String], apply: bool) -> Vec<DroppedEntry> {
-    let mut named: Vec<(String, PathBuf)> = Vec::new();
+    let mut named: Vec<Named> = Vec::new();
     for rel in rels {
-        let Some(real) = contained_in(home, &home.join(rel)) else {
+        let (Some(parent), Some(name)) = (Path::new(rel).parent(), Path::new(rel).file_name())
+        else {
             continue;
         };
-        named.push((rel.clone(), real));
+        let Some(path) = contained_in(home, &home.join(rel)) else {
+            continue;
+        };
+        let Ok(dir) = open_beneath(home, parent) else {
+            continue;
+        };
+        named.push(Named {
+            rel: rel.clone(),
+            path,
+            dir,
+            name: name.to_owned(),
+        });
     }
     // Shallowest first, so the nested-inside check below keeps the outer entry.
-    named.sort_by(|a, b| a.1.cmp(&b.1));
-    let mut kept: Vec<(String, PathBuf)> = Vec::new();
-    for (rel, real) in named {
-        if kept.iter().any(|(_, other)| real.starts_with(other)) {
+    named.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut kept: Vec<Named> = Vec::new();
+    for entry in named {
+        if kept.iter().any(|other| entry.path.starts_with(&other.path)) {
             continue;
         }
-        kept.push((rel, real));
+        kept.push(entry);
     }
     remove_named(home, kept, apply)
 }
@@ -1188,40 +1321,64 @@ pub(crate) fn reset_home(home: &Path, apply: bool) -> Vec<DroppedEntry> {
     let Some(real_home) = contained_in(home, home) else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(&real_home) else {
+    // The home is listed and emptied through one descriptor, opened before the sizing walk. Every
+    // name here is a single component, so what a name could reach is not the exposure — the exposure
+    // is the entry itself being renamed away and a link left in its place while the sizing runs, and
+    // a descriptor plus `unlinkat` is what that cannot move.
+    let Ok(dir) = open_beneath(home, Path::new("")) else {
         return Vec::new();
     };
-    let mut names: Vec<std::ffi::OsString> = entries.flatten().map(|e| e.file_name()).collect();
+    let listing = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let Ok(entries) = std::fs::read_dir(&listing) else {
+        return Vec::new();
+    };
+    let mut names: Vec<OsString> = entries.flatten().map(|e| e.file_name()).collect();
     names.sort();
-    let named: Vec<(String, PathBuf)> = names
-        .into_iter()
-        .map(|name| (name.to_string_lossy().into_owned(), real_home.join(&name)))
-        .collect();
+    let mut named: Vec<Named> = Vec::new();
+    for name in names {
+        let Ok(dir) = dir.try_clone() else {
+            continue;
+        };
+        named.push(Named {
+            rel: name.to_string_lossy().into_owned(),
+            path: real_home.join(&name),
+            dir,
+            name,
+        });
+    }
     remove_named(&real_home, named, apply)
+}
+
+/// One entry a removal was asked for, resolved both ways it has to be.
+struct Named {
+    /// The name to report it under, as the caller wrote it.
+    rel: String,
+    /// Where its size is read from. Sizing removes nothing, so it stays a path: a component swapped
+    /// under it costs a miscounted byte, never a deletion somewhere else.
+    path: PathBuf,
+    /// The directory holding the entry, opened before any sizing, and the entry's own name in it.
+    /// The removal goes through these two and never through `path`.
+    dir: OwnedFd,
+    name: OsString,
 }
 
 /// The removal both entry points share: size the whole set in one walk, then take each and report
 /// only what actually went.
 ///
 /// One walk rather than one per entry, so a file linked into two of them is counted once: two
-/// entries of a home may share a file, and sizing them apart would report those bytes twice.
-fn remove_named(root: &Path, named: Vec<(String, PathBuf)>, apply: bool) -> Vec<DroppedEntry> {
-    let paths: Vec<PathBuf> = named.iter().map(|(_, path)| path.clone()).collect();
+/// entries of a home may share a file, and sizing them apart would report those bytes twice. That
+/// walk is also the window this is written around — it is why each entry arrives holding a
+/// descriptor rather than a name to be resolved again once the walk is done.
+fn remove_named(root: &Path, named: Vec<Named>, apply: bool) -> Vec<DroppedEntry> {
+    let paths: Vec<PathBuf> = named.iter().map(|entry| entry.path.clone()).collect();
     let (_, sizes) = tree_usage_parts(root, &paths);
     let mut dropped = Vec::new();
-    for ((rel, path), size) in named.into_iter().zip(sizes) {
-        if apply {
-            let removed = match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_dir() => force_remove_dir_all(&path).is_ok(),
-                Ok(_) => std::fs::remove_file(&path).is_ok(),
-                Err(_) => false,
-            };
-            if !removed {
-                continue;
-            }
+    for (entry, size) in named.into_iter().zip(sizes) {
+        if apply && remove_child(&entry.dir, &entry.name).is_err() {
+            continue;
         }
         dropped.push(DroppedEntry {
-            rel,
+            rel: entry.rel,
             bytes: size.bytes,
         });
     }
@@ -1371,7 +1528,6 @@ fn project_is_gone(path: &Path) -> bool {
 /// A symlink root is therefore *unlinked*, which is what "never followed" means for an entry, and
 /// reported as done: what the caller asked to remove is gone, and nothing outside was touched.
 pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     // `symlink_metadata` is the lstat: it reads the link itself where `metadata` would read its
     // target. A root that is not a symlink falls through to exactly what this always did, and a
     // root that does not exist at all falls through too, so the error still comes from `read_dir`
@@ -1381,6 +1537,23 @@ pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
     {
         return std::fs::remove_file(path);
     }
+    empty_dir(path)?;
+    std::fs::remove_dir(path)
+}
+
+/// Take everything `path` holds, leaving the directory itself — [`force_remove_dir_all`] minus its
+/// last step.
+///
+/// Split out for the caller that holds a descriptor: it removes the directory through that
+/// descriptor with `unlinkat`, and cannot use the `remove_dir` above, because the path it walks is a
+/// `/proc/self/fd/<n>` link and `rmdir` on a link fails `ENOTDIR`.
+///
+/// The descent is by path under the root it is handed, so what it reaches is confined by what that
+/// root resolves to rather than by the names below it. [`remove_child`] is what pins that root to a
+/// descriptor first.
+fn empty_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
@@ -1390,7 +1563,7 @@ pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
             std::fs::remove_file(entry.path())?;
         }
     }
-    std::fs::remove_dir(path)
+    Ok(())
 }
 
 /// What a tree occupies on disk: its allocated bytes and the number of distinct inodes it holds.
@@ -2164,6 +2337,88 @@ mod tests {
 
         assert!(taken.is_empty(), "a name leaving the home was acted on");
         assert!(outside.join("keep.txt").exists());
+    }
+
+    /// The window this verb is written around, scheduled instead of raced.
+    ///
+    /// A drop resolves the entry it was named, then **sizes** it, then removes it. The sizing is a
+    /// full walk of the tree about to go, so anything holding the home between the resolution and
+    /// the removal has that walk's worth of time to rename a directory away and leave a link
+    /// pointing out of the home in its place. A removal that re-read the name would then be sent
+    /// wherever the link points, with the containment check already behind it and passed.
+    ///
+    /// The two calls the implementation makes back to back are made here with the swap between
+    /// them, which is the same order the race produces and needs no timing to reach. What must hold
+    /// is that the descriptor still names the directory it was opened on: the real tree goes, under
+    /// the name it was renamed to, and what the link points at is not touched.
+    #[test]
+    fn a_removal_follows_the_descriptor_it_opened_and_not_the_name_it_was_given() {
+        let tmp = TmpDir::new();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("pnpm/keep")).unwrap();
+        std::fs::write(outside.join("pnpm/keep/theirs"), b"not mine to take").unwrap();
+        let home = home_with(tmp.path(), &[(".local/share/pnpm", 4096)]);
+
+        // What the implementation opens before it sizes anything.
+        let dir = open_beneath(&home, Path::new(".local/share")).expect("the home holds it");
+
+        // The swap, in the window the sizing walk opens.
+        let share = home.join(".local/share");
+        let stash = home.join("stash");
+        std::fs::rename(&share, &stash).unwrap();
+        std::os::unix::fs::symlink(&outside, &share).unwrap();
+
+        remove_child(&dir, std::ffi::OsStr::new("pnpm")).expect("the entry is removed");
+
+        assert!(
+            outside.join("pnpm/keep/theirs").exists(),
+            "the removal followed a link planted after the name was resolved"
+        );
+        assert!(
+            !stash.join("pnpm").exists(),
+            "the removal did not reach the directory the descriptor was opened on"
+        );
+    }
+
+    /// `..` is not a symlink, so `O_NOFOLLOW` does not refuse it: a walk that took components as
+    /// they came would climb out of the home into the data dir beside it, where the other apps'
+    /// homes are. The refusal has to be on the component's kind.
+    #[test]
+    fn the_walk_refuses_a_component_that_is_not_a_plain_name() {
+        let tmp = TmpDir::new();
+        let home = home_with(tmp.path(), &[(".npm", 128)]);
+
+        for rel in ["..", "../..", ".npm/../..", "/etc", "."] {
+            assert!(
+                open_beneath(&home, Path::new(rel)).is_err(),
+                "the walk accepted `{rel}`"
+            );
+        }
+        assert!(
+            open_beneath(&home, Path::new(".npm")).is_ok(),
+            "the walk refused a plain name"
+        );
+    }
+
+    /// A link on the way down is refused at the step that meets it, rather than traversed — the
+    /// static half of the same question the scheduled race above asks.
+    #[test]
+    fn the_walk_refuses_a_link_planted_on_the_way_down() {
+        let tmp = TmpDir::new();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("pnpm")).unwrap();
+        let home = home_with(tmp.path(), &[(".config", 128)]);
+        std::fs::create_dir_all(home.join(".local")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(".local/share")).unwrap();
+
+        assert!(
+            open_beneath(&home, Path::new(".local/share")).is_err(),
+            "the walk traversed a link the cage planted"
+        );
+        assert!(
+            open_beneath(&home, Path::new(".local/share/pnpm")).is_err(),
+            "the walk reached through a link the cage planted"
+        );
     }
 
     #[test]
