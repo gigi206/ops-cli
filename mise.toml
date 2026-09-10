@@ -182,8 +182,8 @@ export SBX_SKIP_LOG="$LOG"
 # directory and one run leaves hundreds of thousands of them; what breaks when the machine's
 # `max_user_watches` runs out is systemd, which then loses the cgroup watches a transient scope needs
 # to learn its cage emptied. The path is defined there and not repeated here. `SBX_TEST_TMPDIR`
-# moves it; reclaim a killed run's leftovers with `chmod -R u+w "$dir" && rm -rf "$dir"`, since a
-# bare `rm -rf` walks into a store's `0555` directories and silently leaves most of the tree behind.
+# moves it. A killed run's trees are reclaimed by the next test binary that asks for the root, and
+# by `mise run clean-fixtures` when none is going to.
 
 rc=0
 cargo test --no-fail-fast || rc=$?
@@ -213,6 +213,45 @@ exit $rc
 #
 # Not in `ci`: it is a cross-compile of the whole suite, and the maintainer decides when to pay
 # for it. Run it before a release, and after anything that touches libc types or constants.
+[tasks.clean-fixtures]
+description = "Remove the fixture trees under the test root whose run is gone"
+# A `TmpDir` removes itself on drop, and `fixture_root` sweeps what a killed run left the next time
+# a test binary asks for the root -- so this task is for the case where no test is going to run:
+# reclaiming the disk of a suite that was interrupted, without starting another one.
+#
+# It mirrors `sweep_in` in `src/testroot.rs`, which is where the rule is written down: a fixture's
+# name ends in `<pid>-<counter>`, and a pid whose `/proc` entry is still there keeps its tree. Every
+# way that answer can be wrong keeps a tree, because the alternative is deleting the fixtures of a
+# suite that is running -- and one may well be, in another terminal.
+#
+# `chmod -R u+w` before the removal: a provisioned nix store makes its directories `0555`, and a
+# bare `rm -rf` walks into them and silently leaves most of the tree behind.
+run = """
+root="${SBX_TEST_TMPDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sbx/test-tmp}"
+[ -d "$root" ] || { echo "no fixture root at $root"; exit 0; }
+freed=0
+for dir in "$root"/*; do
+  [ -d "$dir" ] || continue
+  name=${dir##*/}
+  case "$name" in
+    *-*-*) counter=${name##*-}; rest=${name%-*}; pid=${rest##*-} ;;
+    *) continue ;;
+  esac
+  case "$counter$pid" in ''|*[!0-9]*) continue ;; esac
+  [ "$rest" = "$pid" ] && continue
+  if [ -d "/proc/$pid" ]; then
+    echo "keeping $name: pid $pid is still running"
+    continue
+  fi
+  size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+  chmod -R u+w "$dir" 2>/dev/null || true
+  rm -rf "$dir"
+  echo "removed $name ($size)"
+  freed=$((freed+1))
+done
+echo "$freed fixture tree(s) removed; $(du -sh "$root" 2>/dev/null | cut -f1) left under $root"
+"""
+
 [tasks.test-musl]
 description = "Run the unit suite against the shipping musl target, where a libc divergence is visible"
 run = "cargo-zigbuild test --target x86_64-unknown-linux-musl --bins"
@@ -227,9 +266,8 @@ description = "Report unit-test coverage with cargo-llvm-cov (fast, deterministi
 # `cargo llvm-cov --ignore-run-fail -- --test-threads=6` (bounded threads bound the peak disk the
 # concurrent stores take). The fixtures land under the root `fixture_root()` returns — outside the
 # workspace, `$XDG_CACHE_HOME/sbx/test-tmp` or `~/.cache/sbx/test-tmp`, and `SBX_TEST_TMPDIR` moves
-# it. A killed run leaks its trees there; reclaim them with `chmod -R u+w "$dir" && rm -rf "$dir"`,
-# since a bare `rm -rf` walks into a store's `0555` directories and silently leaves most of the tree
-# behind.
+# it. A killed run leaves its trees there until the next test binary asks for the root and sweeps
+# them, or until `mise run clean-fixtures` does.
 run = "cargo llvm-cov --bins"
 
 [tasks.build]

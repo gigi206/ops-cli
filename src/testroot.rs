@@ -12,9 +12,10 @@
 // `SBX_TEST_TMPDIR` moves it. What a killed run leaves behind is reclaimed by `sweep_in`, which
 // every test binary runs once on its way to the root: a `TmpDir` removes itself on drop, including
 // on a panic-unwind, but a run that is killed outright never reaches either, and the cage suites
-// leave a provisioned nix store per fixture. To reclaim one by hand instead, `chmod -R u+w "$dir"
-// && rm -rf "$dir"` — a bare `rm -rf` walks into a store's `0555` directories and leaves most of
-// the tree behind, which is also why the sweep goes through `force_remove`.
+// leave a provisioned nix store per fixture. `mise run clean-fixtures` applies the same rule from
+// a shell, for the case where no test is going to run and the disk is wanted back now. Neither goes
+// near a plain `rm -rf`: it walks into a store's `0555` directories and leaves most of the tree
+// behind, which is why both add write on the way down.
 //
 // This file is **included**, not linked: the integration tests are separate crates and cannot see
 // into the binary, so `src/testutil.rs` and each suite under `tests/` `include!` this text, the same

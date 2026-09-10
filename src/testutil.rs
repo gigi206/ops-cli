@@ -950,6 +950,31 @@ fn nothing_joins_a_path_that_traverses_out_of_the_one_it_is_joined_to() {
     assert!(files > 100, "the sweep read only {files} source files");
 }
 
+/// The shell task that reclaims fixtures says where its rule is written.
+///
+/// `mise run clean-fixtures` applies the same test as [`sweep_in`] — a fixture's name ends in
+/// `<pid>-<counter>`, and a live pid keeps its tree — from a shell, because the automatic sweep
+/// only runs when a test binary asks for the root and the disk is sometimes wanted back without
+/// starting one. Two spellings of one rule is a drift risk, and what makes it survivable is that
+/// the shell copy names the definition it mirrors: a reader who changes the naming has a thread to
+/// pull. This refuses the task that stops naming it.
+#[test]
+fn the_fixture_cleanup_task_names_the_rule_it_mirrors() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("mise.toml")).expect("read mise.toml");
+    let (_, task) = text
+        .split_once("[tasks.clean-fixtures]")
+        .expect("mise.toml no longer carries a `clean-fixtures` task");
+    let task = task.split("\n[tasks.").next().expect("the task has an end");
+    for needle in ["sweep_in", "src/testroot.rs"] {
+        assert!(
+            task.contains(needle),
+            "the `clean-fixtures` task no longer names `{needle}`, so nothing ties its rule to the \
+             one the test harness applies"
+        );
+    }
+}
+
 /// The cage suites are named in two places, and the two have to agree.
 ///
 /// `mise run test-cage` and the `Cage` workflow both run the suites that carry a capability skip,
