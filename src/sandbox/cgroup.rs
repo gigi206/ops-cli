@@ -474,17 +474,93 @@ fn cage_scope_dirs_under(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Whether a cage scope can be reclaimed: its launcher is gone **and** its cgroup holds no process.
+/// What a cage scope's cgroup holds, reduced to the three shapes the reclaim decision turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Occupancy {
+    /// Nothing at all: the cage is over.
+    Empty,
+    /// One cage init that never forked a payload — bubblewrap's own setup was cut short, so
+    /// nothing ever ran here and nothing ever will.
+    Stillborn,
+    /// Anything else, every unreadable case included.
+    Running,
+}
+
+/// Classify what a `cgroup.procs` holds, reading each pid's facts under `proc_root`.
+///
+/// The root is a parameter so the classification is exercised against a written tree rather than
+/// only against the host's `/proc`, the way [`cage_scope_dirs_under`] takes its own root.
+fn occupancy(procs: &str, proc_root: &Path) -> Occupancy {
+    match procs.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] => Occupancy::Empty,
+        [pid] if is_childless_cage_init(pid, proc_root) => Occupancy::Stillborn,
+        _ => Occupancy::Running,
+    }
+}
+
+/// Whether `pid` leads a nested pid namespace and has no child.
+///
+/// Both facts come from `/proc`, and each is chosen for what it cannot get wrong. `NSpid` lists one
+/// id per namespace a process is visible in, so a cage init lists more than one and its innermost
+/// is `1`; an ordinary process lists a single id. That is the distinction, rather than `comm`,
+/// which would answer differently the moment bubblewrap is shipped under another name. `children`
+/// crosses the namespace boundary — a running cage's init lists its payload there when the file is
+/// read from the host — so an init with no child is one that never reached the point of forking a
+/// payload.
+///
+/// Every read that fails answers `false`, a kernel built without `CONFIG_PROC_CHILDREN` included:
+/// the caller reclaims what this returns true for, so silence must never read as emptiness.
+fn is_childless_cage_init(pid: &str, proc_root: &Path) -> bool {
+    let dir = proc_root.join(pid);
+    let Ok(status) = std::fs::read_to_string(dir.join("status")) else {
+        return false;
+    };
+    let leads_a_namespace = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .is_some_and(|ids| {
+            let ids: Vec<&str> = ids.split_whitespace().collect();
+            ids.len() > 1 && ids.last() == Some(&"1")
+        });
+    if !leads_a_namespace {
+        return false;
+    }
+    // One `children` file per thread, and every one of them has to be both readable and empty.
+    let Ok(threads) = std::fs::read_dir(dir.join("task")) else {
+        return false;
+    };
+    let mut read_one = false;
+    for thread in threads.flatten() {
+        let Ok(children) = std::fs::read_to_string(thread.path().join("children")) else {
+            return false;
+        };
+        if !children.trim().is_empty() {
+            return false;
+        }
+        read_one = true;
+    }
+    read_one
+}
+
+/// Whether a cage scope can be reclaimed: its launcher is gone **and** nothing under it can still
+/// be running.
 ///
 /// Both halves are required, and which way each one fails is the whole safety argument. A live
 /// launcher means a cage is running or starting under this scope, and a starting one has a
 /// momentarily empty cgroup — between the unit's creation and bwrap being moved into it — so the pid
-/// is what covers that window. A cgroup that still lists processes means the cage outlived its
-/// launcher (it was reparented), which is a running cage whatever the pid segment says. `procs` is
-/// `None` when the file could not be read, and that reads as "not empty": an unreadable cgroup
-/// leaves an orphan behind rather than risking a live cage.
-fn is_reclaimable(launcher_alive: bool, procs: Option<&str>) -> bool {
-    !launcher_alive && procs.is_some_and(|p| p.trim().is_empty())
+/// is what covers that window. A cgroup that lists a running process means the cage outlived its
+/// launcher (it was reparented), and that is a live cage whatever the pid segment says.
+///
+/// [`Occupancy::Stillborn`] is the one occupied shape that is nevertheless reclaimable, because it
+/// is not a cage: bubblewrap's parent-death signal does not survive the `clone` that creates the
+/// cage init, and the init re-arms it only at the end of its own setup, so a launcher that dies
+/// inside that window leaves an init blocked on a handshake that will never come. It holds no
+/// payload and can reach none.
+///
+/// An unreadable cgroup answers [`Occupancy::Running`]: leave an orphan behind rather than risk a
+/// live cage.
+fn is_reclaimable(launcher_alive: bool, occupancy: Occupancy) -> bool {
+    !launcher_alive && occupancy != Occupancy::Running
 }
 
 /// Stop the cage scopes left behind by launches that are over — best-effort, once per process,
@@ -498,6 +574,11 @@ fn is_reclaimable(launcher_alive: bool, procs: Option<&str>) -> bool {
 /// Those units accumulate for the life of the session, and each one is walked again by every
 /// consumer of [`cage_scope_dirs`], including the teardown's member lookup. This sweep is the
 /// fallback for that case and for any other reason a scope outlives its cage.
+///
+/// The second case it answers is a scope that is *not* empty and is over all the same: a launcher
+/// killed while bubblewrap was still building the cage leaves an init that will wait forever, and
+/// nothing else ever collects it. [`Occupancy`] is where that shape is told apart from a cage that
+/// is genuinely running.
 ///
 /// [`is_reclaimable`] holds the decision and fails toward leaving an orphan. The launcher pid is
 /// checked first so a scope belonging to a live launcher is never even read. The stop is
@@ -519,7 +600,8 @@ pub(crate) fn sweep_stale_scopes() {
                 } else {
                     std::fs::read_to_string(dir.join("cgroup.procs")).ok()
                 };
-                is_reclaimable(alive, procs.as_deref()).then(|| OsString::from(name))
+                let held = procs.map_or(Occupancy::Running, |p| occupancy(&p, Path::new("/proc")));
+                is_reclaimable(alive, held).then(|| OsString::from(name))
             })
             .collect();
         if stale.is_empty() {
@@ -1077,19 +1159,157 @@ mod tests {
         assert_eq!(scope_launcher_pid("sbx-probe-none.scope"), None);
     }
 
+    /// One process under a fake `/proc`: the `NSpid` line [`is_childless_cage_init`] reads, and one
+    /// thread whose `children` is written only when `children` is `Some` — `None` writes the
+    /// directory without the file, which is the kernel built without `CONFIG_PROC_CHILDREN`.
+    fn fake_proc(root: &Path, pid: &str, nspid: &str, children: Option<&str>) {
+        let dir = root.join(pid);
+        std::fs::create_dir_all(dir.join("task").join(pid)).unwrap();
+        std::fs::write(
+            dir.join("status"),
+            format!("Name:\tbwrap\nNSpid:\t{nspid}\n"),
+        )
+        .unwrap();
+        if let Some(children) = children {
+            std::fs::write(dir.join("task").join(pid).join("children"), children).unwrap();
+        }
+    }
+
     #[test]
-    fn only_a_dead_launcher_over_an_empty_cgroup_is_reclaimable() {
-        // The one reclaimable shape: the launcher is gone and the cgroup holds nothing.
-        assert!(is_reclaimable(false, Some("")));
-        assert!(is_reclaimable(false, Some("\n")));
-        // A live launcher holds its scope even while the cgroup is momentarily empty — the window
-        // between the unit's creation and bwrap being moved into it.
-        assert!(!is_reclaimable(true, Some("")));
-        // A cage reparented off its launcher still lists processes, so the scope is in use.
-        assert!(!is_reclaimable(false, Some("4711\n")));
-        assert!(!is_reclaimable(true, Some("4711\n")));
-        // An unreadable cgroup reads as in-use: leave an orphan rather than risk a running cage.
-        assert!(!is_reclaimable(false, None));
+    fn only_a_dead_launcher_over_a_cgroup_with_nothing_running_is_reclaimable() {
+        // The launcher being gone is necessary but never sufficient.
+        assert!(is_reclaimable(false, Occupancy::Empty));
+        assert!(is_reclaimable(false, Occupancy::Stillborn));
+        assert!(!is_reclaimable(false, Occupancy::Running));
+        // A live launcher holds its scope whatever the cgroup holds — including while it is
+        // momentarily empty, the window between the unit's creation and bwrap being moved into it.
+        assert!(!is_reclaimable(true, Occupancy::Empty));
+        assert!(!is_reclaimable(true, Occupancy::Stillborn));
+        assert!(!is_reclaimable(true, Occupancy::Running));
+    }
+
+    #[test]
+    fn an_empty_cgroup_reads_empty_whatever_the_proc_tree_says() {
+        let tmp = TmpDir::new();
+        assert_eq!(occupancy("", tmp.path()), Occupancy::Empty);
+        assert_eq!(occupancy("\n", tmp.path()), Occupancy::Empty);
+        assert_eq!(occupancy("   \n\n", tmp.path()), Occupancy::Empty);
+    }
+
+    #[test]
+    fn a_lone_cage_init_with_no_payload_reads_stillborn() {
+        let tmp = TmpDir::new();
+        fake_proc(tmp.path(), "4711", "4711 1", Some(""));
+        assert_eq!(occupancy("4711\n", tmp.path()), Occupancy::Stillborn);
+    }
+
+    #[test]
+    fn a_cage_init_holding_a_payload_reads_running() {
+        // `children` crosses the pid-namespace boundary, so a running cage's init names its
+        // payload there. This is the assertion that keeps the sweep off a live cage.
+        let tmp = TmpDir::new();
+        fake_proc(tmp.path(), "4711", "4711 1", Some("4712\n"));
+        assert_eq!(occupancy("4711\n", tmp.path()), Occupancy::Running);
+    }
+
+    #[test]
+    fn a_lone_ordinary_process_reads_running() {
+        // A childless process that leads no namespace lists a single id in `NSpid`. Reading it as
+        // stillborn would let the sweep stop a scope holding something else entirely.
+        let tmp = TmpDir::new();
+        fake_proc(tmp.path(), "4711", "4711", Some(""));
+        assert_eq!(occupancy("4711\n", tmp.path()), Occupancy::Running);
+        // Nor is the innermost id `1` on its own enough: the process must be visible in more than
+        // one namespace to be leading one.
+        fake_proc(tmp.path(), "4713", "1", Some(""));
+        assert_eq!(occupancy("4713\n", tmp.path()), Occupancy::Running);
+    }
+
+    #[test]
+    fn more_than_one_process_reads_running() {
+        // A cage that was interrupted mid-setup leaves exactly one process; anything else is a
+        // shape this sweep does not claim to understand, so it is left alone.
+        let tmp = TmpDir::new();
+        fake_proc(tmp.path(), "4711", "4711 1", Some(""));
+        fake_proc(tmp.path(), "4712", "4712 1", Some(""));
+        assert_eq!(occupancy("4711\n4712\n", tmp.path()), Occupancy::Running);
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_read_reads_running() {
+        let tmp = TmpDir::new();
+        // No entry at all under this root: the process is unreadable, not empty.
+        assert_eq!(occupancy("4711\n", tmp.path()), Occupancy::Running);
+        // The status is there and the `children` file is not — a kernel without
+        // `CONFIG_PROC_CHILDREN`. Silence must not read as emptiness.
+        fake_proc(tmp.path(), "4712", "4712 1", None);
+        assert_eq!(occupancy("4712\n", tmp.path()), Occupancy::Running);
+    }
+
+    #[test]
+    fn a_live_cage_reads_running_on_this_host() {
+        // Calibrates the predicate against the kernel rather than against a written tree: what
+        // `NSpid` and `children` say across a pid-namespace boundary is kernel semantics, and the
+        // sweep stops the scope of whatever this call reads as reclaimable.
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
+            skip_incapable!("skipping the cage calibration: no bwrap on PATH");
+            return;
+        };
+        let spawned = Command::new(bwrap)
+            .args([
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--unshare-pid",
+                "--unshare-user",
+                "--",
+                "sleep",
+                "30",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut outer) = spawned else {
+            skip_incapable!("skipping the cage calibration: bwrap could not start");
+            return;
+        };
+        // The cage is up once the outer bwrap names the init it cloned.
+        let proc = Path::new("/proc");
+        let outer_pid = outer.id();
+        let children = proc.join(outer_pid.to_string()).join("task");
+        let mut init = String::new();
+        for _ in 0..100 {
+            if let Ok(text) =
+                std::fs::read_to_string(children.join(outer_pid.to_string()).join("children"))
+                && let Some(first) = text.split_whitespace().next()
+            {
+                init = first.to_string();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if init.is_empty() {
+            let _ = outer.kill();
+            let _ = outer.wait();
+            skip_incapable!("skipping the cage calibration: the cage never came up");
+            return;
+        }
+        let init_verdict = occupancy(&init, proc);
+        let outer_verdict = occupancy(&outer_pid.to_string(), proc);
+        let _ = outer.kill();
+        let _ = outer.wait();
+        assert_eq!(
+            init_verdict,
+            Occupancy::Running,
+            "a cage init running a payload must never read as reclaimable"
+        );
+        assert_eq!(
+            outer_verdict,
+            Occupancy::Running,
+            "the bwrap outside the pid namespace leads none, so it is not a cage init"
+        );
     }
 
     #[test]

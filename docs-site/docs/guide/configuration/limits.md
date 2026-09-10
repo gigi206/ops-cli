@@ -105,17 +105,30 @@ can fail. systemd treats that failure as non-fatal, the notification then never 
 and the scope stays `active running` over an empty cgroup with no path to a terminal
 state. Left alone, those units accumulate for the life of the login session.
 
-`sbx` reclaims them. Every launch stops the scopes whose launcher is gone **and** whose
-cgroup holds no process, before creating its own. Both conditions are required, and a
-cgroup that cannot be read counts as in use: the sweep leaves a leftover behind rather
-than risk touching a running cage. It never delays the launch behind it, and it says
-nothing, so a clean host looks exactly like a swept one.
+`sbx` reclaims them. Every launch stops the scopes whose launcher is gone **and** that hold
+nothing which could still be running, before creating its own. Both conditions are
+required, and a cgroup that cannot be read counts as in use: the sweep leaves a leftover
+behind rather than risk touching a running cage. It never delays the launch behind it, and
+it says nothing, so a clean host looks exactly like a swept one.
 
 A leftover is recognisable by an empty cgroup under a unit systemd still calls running:
 
 ```sh
 systemctl --user show <unit> -p TasksCurrent --value   # 0 on a leftover
 ```
+
+### The leftover that is not empty
+
+A cage is stood up in two stages, and bubblewrap's guarantee that a cage dies with its
+launcher is not in force for the whole of the second one. A launcher killed inside that gap
+leaves behind the process that was still building the cage, waiting on a handshake that
+will never come. It carries no payload and can reach none, so the sweep counts it as
+nothing running and stops that scope as well. Such a unit reports a single task rather than
+none.
+
+A cage that is genuinely running is left alone even when its launcher is gone, because it
+may be a detached session still doing work. Reclaiming those is what
+[`sbx session stop`](../cli/session#stop) is for.
 
 ## Per-app limits
 
