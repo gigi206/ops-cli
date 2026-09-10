@@ -600,6 +600,87 @@ pub(crate) fn nixpkgs_pin(tree_dir: &Path, data_dir: &Path) -> Option<(String, S
 mod tests {
     use super::*;
 
+    /// Write `bytes` bytes at `rel` under `root`, creating the parents.
+    fn file_of(root: &Path, rel: &str, bytes: usize) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).unwrap();
+        std::fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
+    #[test]
+    fn a_home_composition_lists_its_children_largest_first() {
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.join("home");
+        file_of(&home, ".small/f", 1024);
+        file_of(&home, ".big/f", 64 * 1024);
+        file_of(&home, ".mid/f", 16 * 1024);
+        let seen: Vec<String> = home_composition(&home).into_iter().map(|e| e.rel).collect();
+        assert_eq!(seen, [".big", ".mid", ".small"]);
+        assert!(home_composition(&home).iter().all(|e| e.depth == 0));
+    }
+
+    #[test]
+    fn a_child_holding_its_whole_level_is_opened_under_itself() {
+        // The shape half this repository's own app homes have: everything under one entry, which a
+        // flat listing would report as a single line saying nothing.
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.join("home");
+        file_of(&home, ".local/share/theirs/f", 200 * 1024);
+        file_of(&home, ".local/share/ours/f", 100 * 1024);
+        file_of(&home, ".tiny/f", 512);
+        let got: Vec<(String, usize)> = home_composition(&home)
+            .into_iter()
+            .map(|e| (e.rel, e.depth))
+            .collect();
+        // The expansion sits directly under the line it explains, and `.tiny` stays last.
+        assert_eq!(
+            got,
+            vec![
+                (".local".to_string(), 0),
+                (".local/share".to_string(), 1),
+                (".local/share/theirs".to_string(), 2),
+                (".local/share/ours".to_string(), 2),
+                (".tiny".to_string(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_level_that_branches_is_not_opened() {
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.join("home");
+        file_of(&home, ".one/f", 100 * 1024);
+        file_of(&home, ".two/f", 100 * 1024);
+        let seen: Vec<String> = home_composition(&home).into_iter().map(|e| e.rel).collect();
+        assert_eq!(seen, [".one", ".two"]);
+    }
+
+    #[test]
+    fn a_link_is_never_opened() {
+        // Opening it would report a tree that is not under this home, named as if it were.
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.join("home");
+        let outside = tmp.join("outside");
+        file_of(&outside, "share/f", 100 * 1024);
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(".local")).unwrap();
+        let seen: Vec<String> = home_composition(&home).into_iter().map(|e| e.rel).collect();
+        assert_eq!(seen, [".local"]);
+    }
+
+    #[test]
+    fn the_descent_stops_at_its_limit() {
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.join("home");
+        file_of(&home, "a/b/c/d/e/f", 100 * 1024);
+        let deepest = home_composition(&home)
+            .into_iter()
+            .map(|e| e.depth)
+            .max()
+            .expect("a composition");
+        assert_eq!(deepest, MAX_DESCENT - 1);
+    }
+
     #[test]
     fn munge_mirrors_mises_backend_naming() {
         assert_eq!(
@@ -1124,4 +1205,98 @@ mod tests {
             ("nixos-23.11", "fedcba09", true)
         );
     }
+}
+
+/// The share of a level one child has to hold for [`home_composition`] to open it.
+const PASSTHROUGH_PERCENT: u64 = 90;
+
+/// How far [`home_composition`] may descend. Three levels is deep enough to pass through two
+/// nested wrappers and still report a level rather than a file listing.
+const MAX_DESCENT: usize = 3;
+
+/// One line of a home's composition.
+#[derive(serde::Serialize)]
+pub(crate) struct HomeEntry {
+    /// The entry's path relative to the home.
+    pub(crate) rel: String,
+    /// On-disk size of the data the entry holds.
+    pub(crate) bytes: u64,
+    /// How far the view descended to reach it: `0` for a direct child of the home, `1` for a child
+    /// of the entry that held its whole level, and so on.
+    pub(crate) depth: usize,
+}
+
+/// What a home is made of: one entry per direct child, descending into a child that holds nearly
+/// all of its level.
+///
+/// Nothing here knows the name of a tool, a package manager or a directory. That is the point: the
+/// set of places a program keeps disposable data is open-ended, so a view that recognised them
+/// would be a list to maintain and would be wrong about whatever came next. The listing is read
+/// from the disk instead, and what an entry means is left to the reader — which is also the only
+/// way to tell an app's own data from a download cache, since the two sit side by side under the
+/// same parent and differ by nothing a name reveals.
+///
+/// The descent exists because a flat listing often says nothing: where a single child holds
+/// [`PASSTHROUGH_PERCENT`] of its level, the level below is the one carrying the information, so
+/// the view opens it and lists that too. A symlink is never opened, and neither is anything past
+/// [`MAX_DESCENT`].
+///
+/// Sizes come from one walk per level ([`super::tree_usage_parts`]), so a file linked into two
+/// entries is counted once. They are sizes of data: [`super::SIZE_CAVEAT`] is what qualifies them.
+pub(crate) fn home_composition(home: &Path) -> Vec<HomeEntry> {
+    let mut levels: Vec<Vec<HomeEntry>> = Vec::new();
+    let mut dir = home.to_path_buf();
+    let mut prefix = String::new();
+    for depth in 0..MAX_DESCENT {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            break;
+        };
+        let mut names: Vec<std::ffi::OsString> = entries.flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        let paths: Vec<PathBuf> = names.iter().map(|name| dir.join(name)).collect();
+        let (whole, sizes) = super::tree_usage_parts(&dir, &paths);
+        let mut level: Vec<(std::ffi::OsString, u64)> = names
+            .into_iter()
+            .zip(sizes)
+            .map(|(name, usage)| (name, usage.bytes))
+            .filter(|(_, bytes)| *bytes > 0)
+            .collect();
+        // Largest first, and by name where two are equal, so two runs over one home read alike.
+        level.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let Some((leader, leader_bytes)) = level.first().cloned() else {
+            break;
+        };
+        levels.push(
+            level
+                .into_iter()
+                .map(|(name, bytes)| HomeEntry {
+                    rel: format!("{prefix}{}", name.to_string_lossy()),
+                    bytes,
+                    depth,
+                })
+                .collect(),
+        );
+        if whole.bytes == 0 || leader_bytes * 100 / whole.bytes < PASSTHROUGH_PERCENT {
+            break;
+        }
+        let next = dir.join(&leader);
+        // A real directory, never a link: opening a link would report a tree that is not under this
+        // home at all, and the entry the caller acts on is named relative to the home.
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => break,
+        }
+        prefix = format!("{prefix}{}/", leader.to_string_lossy());
+        dir = next;
+    }
+    // A level opens the entry above it, so it is spliced in directly after that entry rather than
+    // appended: read top to bottom, each expansion sits under the line it explains.
+    while levels.len() > 1 {
+        let deeper = levels.pop().expect("more than one level");
+        let above = levels
+            .last_mut()
+            .expect("a level above the one just popped");
+        above.splice(1..1, deeper);
+    }
+    levels.pop().unwrap_or_default()
 }

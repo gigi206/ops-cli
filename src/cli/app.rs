@@ -1683,8 +1683,11 @@ struct AppHomeShow {
     /// `global`, or `project <id>`.
     location: String,
     bytes: u64,
-    /// Bytes under the mise data dir (the installed tools) — the rest is config/login/state.
-    tools_bytes: u64,
+    /// What the home is made of, largest first — see [`sandbox::inspect::home_composition`]. The
+    /// home is not split by a rule about which directory means what, because no such rule holds:
+    /// a package manager's downloads and an app's own data sit side by side and are told apart by
+    /// the reader, not by their names.
+    entries: Vec<sandbox::inspect::HomeEntry>,
 }
 
 /// A global app's per-project mise pool for `sbx app show`: which project, its size, and the tools
@@ -1756,12 +1759,11 @@ fn build_app_show(
     let home_views: Vec<AppHomeShow> = homes
         .iter()
         .map(|h| {
-            // Size the app's own directory (the parent of `home`), matching `sbx app list`; the mise
-            // data dir is broken out so the tools' share of the home is visible.
+            // Size the app's own directory (the parent of `home`), matching `sbx app list`, and
+            // read what the home holds so the figure is answerable rather than a single total.
             let app_dir = h.dir.parent().unwrap_or(&h.dir);
-            let (whole, parts) =
-                sandbox::tree_usage_parts(app_dir, &[h.dir.join(".local/share/mise")]);
-            let (bytes, tools_bytes) = (whole.bytes, parts[0].bytes);
+            let bytes = sandbox::tree_size(app_dir);
+            let entries = sandbox::inspect::home_composition(&h.dir);
             AppHomeShow {
                 location: if h.global {
                     "global".to_string()
@@ -1769,7 +1771,7 @@ fn build_app_show(
                     format!("project {}", h.project_id.as_deref().unwrap_or("?"))
                 },
                 bytes,
-                tools_bytes,
+                entries,
             }
         })
         .collect();
@@ -2003,15 +2005,31 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
     } else {
         let _ = writeln!(s, "  disk:     {}", sandbox::human_bytes(v.total_bytes));
         for home in &v.homes {
-            let state = home.bytes.saturating_sub(home.tools_bytes);
             let _ = writeln!(
                 s,
-                "    {} · {}  {dim}(tools {} · state {}){r}",
+                "    {} · {}",
                 home.location,
                 sandbox::human_bytes(home.bytes),
-                sandbox::human_bytes(home.tools_bytes),
-                sandbox::human_bytes(state),
             );
+            // Percentages are of the home rather than of the app directory the total covers, so a
+            // level's shares add up to what the reader sees listed.
+            let held: u64 = home
+                .entries
+                .iter()
+                .filter(|e| e.depth == 0)
+                .map(|e| e.bytes)
+                .sum();
+            for entry in &home.entries {
+                let share = (entry.bytes * 100).checked_div(held).unwrap_or(0);
+                // The indent is part of the name column rather than added before it, so the sizes
+                // stay in one column however deep the view went.
+                let name = format!("{:indent$}{}", "", entry.rel, indent = entry.depth * 2);
+                let _ = writeln!(
+                    s,
+                    "      {name:<34} {:>10}  {dim}{share}%{r}",
+                    sandbox::human_bytes(entry.bytes),
+                );
+            }
         }
         for pool in &v.pools {
             let _ = writeln!(

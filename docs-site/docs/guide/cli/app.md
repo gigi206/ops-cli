@@ -364,14 +364,37 @@ shared by every app in the project.
 
 `sbx app show <name>` reports one app's **realized-on-disk** detail: the counterpart to
 [`sbx config show --app <name>`](config), which shows what the app *declares*. It lists
-the profile source, the app's isolated home(s) with on-disk size (and the mise-tools share
-broken out), and each declared package annotated with whether it is **actually installed**:
+the profile source, the app's isolated home(s) with on-disk size and what each one is made
+of, and each declared package annotated with whether it is **actually installed**:
 
 | Package | Installed reads |
 |---|---|
 | `mise:` | `installed <version>` (read from the app's home) or `not installed` |
 | `deb:` / `appimage:` / `tarball:` | `pinned in N tree(s) (<hash>)`, the build lives in the [per-project store](../concepts/directory-layout); see [`sbx projects show`](projects), or `not built` |
 | `nix:` / `flake:` | `built in N tree(s)`, built host-side into the shared store, seeded per project; or `not built` |
+
+### What a home is made of
+
+Under each home, `show` lists what it holds, largest first, read from the disk. It names no
+directory and knows no tool: the places a program keeps disposable data are open-ended, and a
+view that recognised them would be a list to keep current and would still be wrong about the
+next one.
+
+Where a single entry holds nearly all of its level, the level below it is listed too, indented
+under the line it explains. Half the homes on a working machine have that shape, and a line
+reading `.local  5.2 GiB  99%` says nothing a total does not.
+
+```
+    global · 5.2 GiB
+      .local                                5.2 GiB  99%
+        .local/share                        5.2 GiB  99%
+          .local/share/open-design          3.1 GiB  60%
+          .local/share/pnpm                 1.9 GiB  35%
+```
+
+Nothing here says which entries are disposable, because nothing can: an app's own data and a
+package manager's downloads sit side by side under one parent, and their names do not tell them
+apart. Reading them is the reader's, and so is deciding.
 
 A package a launch would not provision because an untrusted layer declared it reads
 `withheld` (distinct from `not installed`, so it is not mistaken for a failed provision).

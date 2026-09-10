@@ -2262,7 +2262,8 @@ pub(super) const PAGES: &[Page] = &[
         summary: "list apps with their profile and installed home",
         options: &[("--json", "emit the apps as JSON (home sizes in bytes)")],
         details: "One row per app: whether it has an imported profile (the `import`/`rm` artifact) and\n\
-            whether it has an installed home on disk (its mise tools + login state, with disk size)\n\
+            whether it has an installed home on disk (with its disk size; `sbx app show` says what\n\
+            that home is made of)\n\
             — which `sbx app rm <name> --purge` removes. An app can have a profile with no home yet\n\
             (never launched), or a home with no profile (launched from an inline/project app, or a\n\
             profile since removed). The `HOME` column names where that state lives: `global` is the\n\
