@@ -114,6 +114,11 @@ pub(crate) struct ConfigView {
     pub(crate) allow_insecure_http: bool,
     /// Which layer opened plaintext fetching (`Default` when none did).
     pub(crate) allow_insecure_http_origin: ProvenanceView,
+    /// Whether this project's apps may read each other's mise install pools
+    /// (`apps_share_install_pools = true`).
+    pub(crate) apps_share_install_pools: bool,
+    /// Which layer granted it (`Default` when none did; only a project can).
+    pub(crate) apps_share_install_pools_origin: ProvenanceView,
     /// Whether audio (microphone + playback) is open (`audio = true`).
     pub(crate) audio: bool,
     /// Which layer supplied the audio posture (`Default` when neither config set it).
@@ -1220,6 +1225,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
             })
             .collect(),
         ssh_agent_confirm: resolved.ssh_agent_confirm,
+        apps_share_install_pools: resolved.apps_share_install_pools,
+        apps_share_install_pools_origin: resolved.apps_share_install_pools_origin.into(),
         limits,
         secrets,
         apps,
@@ -2079,6 +2086,8 @@ mod tests {
         let view = ConfigView {
             timezone: "UTC".to_string(),
             timezone_origin: Default::default(),
+            apps_share_install_pools: false,
+            apps_share_install_pools_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -2531,6 +2540,7 @@ mod tests {
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
             apps_share_install_pools: false,
+            apps_share_install_pools_origin: Default::default(),
             distro_run: Vec::new(),
             accepts_fresh_releases: Default::default(),
             timezone: None,

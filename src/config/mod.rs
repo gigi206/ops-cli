@@ -502,6 +502,10 @@ pub(crate) struct Resolved {
     /// finds the first app's copy instead of fetching one. See
     /// [`schema::RawConfig::apps_share_install_pools`] for what the grant gives up.
     pub(crate) apps_share_install_pools: bool,
+    /// Which layer granted it (`Default` when none did, and never `Global`: there is no global
+    /// form). Carried rather than inferred at the render, so a global form added later cannot make
+    /// a hardcoded tag say `project` about a value the machine set.
+    pub(crate) apps_share_install_pools_origin: Provenance,
     /// Per-plugin settings for the installed resolver plugins, keyed by plugin name: where to get
     /// a program the manifest declares when `PATH` does not have it, and values for the variables
     /// it reads. Layered global-under-project and gated by trust, like `[packages]`.
@@ -1932,11 +1936,13 @@ fn resolve(
     // the shape `decisions.md` reserves for a hole opened on request. A security field, so an
     // untrusted or changed project is refused with a warning rather than quietly granted.
     let mut apps_share_install_pools = false;
+    let mut apps_share_install_pools_origin = Provenance::Default;
     if let Some((proj, state)) = project.as_ref()
         && proj.apps_share_install_pools
     {
         if *state == TrustState::Trusted {
             apps_share_install_pools = true;
+            apps_share_install_pools_origin = Provenance::Project;
         } else {
             refuse_untrusted(
                 &mut warnings,
@@ -2845,6 +2851,7 @@ fn resolve(
 
     let resolved = Resolved {
         apps_share_install_pools,
+        apps_share_install_pools_origin,
         allow_insecure_http,
         allow_insecure_http_origin,
         env,

@@ -305,7 +305,10 @@ pub(crate) fn project_mise_pools(
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == except {
+        // The names here were written by launches, which validate them, so this filter is for the
+        // directory nobody's launch created: the list these become is joined with `:`, and a name
+        // carrying one would cut a path in half rather than be rejected.
+        if name == except || !crate::config::is_valid_app_name(&name) {
             continue;
         }
         let installs = entry.path().join("mise").join("installs");

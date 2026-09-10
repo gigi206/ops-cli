@@ -2307,10 +2307,10 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
         assert!(
             granted.mounts.iter().any(|m| matches!(
                 m,
-                Mount::RoBind { src, dest: d }
+                Mount::RoBindTry { src, dest: d }
                     if *d == dest && *src == apps.join(name).join("mise/installs")
             )),
-            "{name}'s pool is not bound read-only at {}",
+            "{name}'s pool is not bound read-only (and -try) at {}",
             dest.display()
         );
     }

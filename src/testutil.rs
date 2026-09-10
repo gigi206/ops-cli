@@ -278,6 +278,7 @@ pub(crate) fn resolved(
 ) -> crate::config::Resolved {
     crate::config::Resolved {
         apps_share_install_pools: false,
+        apps_share_install_pools_origin: Default::default(),
         distro_run: Vec::new(),
         accepts_fresh_releases: Default::default(),
         timezone: None,

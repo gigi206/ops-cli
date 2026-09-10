@@ -954,8 +954,14 @@ fn cage_mounts(
     // states the same thing the tool already does rather than relying on it. An app name is a
     // validated single path component (the config app-name check), so joining it cannot traverse
     // out of the root.
+    //
+    // A `-try` mount, for the reason the other ones are: the source belongs to another app's
+    // lifecycle, not to this launch. `sbx app prune <neighbour> --reset` between the plan and the
+    // spawn removes a directory this cage was about to bind, and a hard mount would fail the
+    // launch of an app that merely had a neighbour tidied. Skipped, the app installs its own copy,
+    // which is what it would have done had the neighbour never run.
     for (app, installs) in paths.mise_shared_installs {
-        mounts.push(Mount::RoBind {
+        mounts.push(Mount::RoBindTry {
             src: installs.clone(),
             dest: Path::new(MISE_SHARED_INCAGE).join(app),
         });

@@ -342,6 +342,17 @@ fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Op
             provenance_tag(view.allow_insecure_http_origin, pal)
         );
     }
+    // Only when it is on, like the switch above and for the same reason: off is the default and
+    // says nothing, on is a posture a reader auditing the project has to be able to see. What it
+    // opens is narrow but real, so it is named here rather than left to the packages page.
+    if view.apps_share_install_pools {
+        let _ = writeln!(
+            o,
+            "  {h}apps_share_install_pools:{r} enabled {dim}(each app may run a tool another app \
+             in this project installed){r}{}",
+            provenance_tag(view.apps_share_install_pools_origin, pal)
+        );
+    }
     if view.audio {
         let _ = writeln!(
             o,
@@ -1414,6 +1425,8 @@ mod tests {
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
+            apps_share_install_pools: false,
+            apps_share_install_pools_origin: Default::default(),
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -1881,6 +1894,31 @@ mod tests {
         assert!(
             !out.contains("/data (rw)"),
             "a read-only bind must not be marked:\n{out}"
+        );
+    }
+
+    #[test]
+    fn config_render_names_the_pool_grant_only_when_a_project_made_it() {
+        // A security field honoured but never rendered is one an audit cannot find, and this one
+        // says an app may run a tool another app installed. Shown only when it is on, with the
+        // layer that granted it, and silent otherwise -- off is the default and says nothing.
+        let out = render_config(&sample_config_view(), &style::Palette::plain(), false);
+        assert!(
+            !out.contains("apps_share_install_pools"),
+            "an ungranted config must not mention the grant:\n{out}"
+        );
+
+        let mut view = sample_config_view();
+        view.apps_share_install_pools = true;
+        view.apps_share_install_pools_origin = config::view::ProvenanceView::Project;
+        let out = render_config(&view, &style::Palette::plain(), false);
+        let line = out
+            .lines()
+            .find(|l| l.contains("apps_share_install_pools"))
+            .unwrap_or_else(|| panic!("the grant must be rendered:\n{out}"));
+        assert!(
+            line.contains("enabled") && line.contains("another app") && line.contains("(project)"),
+            "the grant must say what it opens and which layer opened it: {line}"
         );
     }
 

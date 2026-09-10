@@ -210,6 +210,14 @@ An app's own tools win. Its pool and its home are searched before any neighbour'
 holds itself is always the one it resolves, and a neighbour supplies only a version it has nowhere
 else.
 
+Only a global app has a pool of its own to share. An app declared
+[`home_scope = "project"`](apps) roots its home under the project already, so its mise data has
+no second pool: it neither offers a pool nor reads one.
+
+[`sbx app prune <name> --reset`](../cli/app) empties that app's pools along with its home, and a
+neighbour reading one of them loses what it was reading. It installs its own copy at the next
+launch, which is what it would have done had the app never run there.
+
 This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only), and unlike the
 others it cannot be set in the global config at all. The grant is about *these* apps in *this*
 project, and a machine-wide default would open the pools of projects that never asked for it.

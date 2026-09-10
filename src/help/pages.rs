@@ -2363,6 +2363,13 @@ pub(super) const PAGES: &[Page] = &[
             simply not have been read, and a pool whose project directory is gone is skipped for\n\
             the same reason (`sbx projects rm --dead` is the verb for those trees).\n\
             \n\
+            For a per-project pool a third source is read: the activation record of every other app\n\
+            with a pool in that project. Where the project sets `apps_share_install_pools`, a\n\
+            version this app no longer asks for may be the one a neighbour found here and never\n\
+            installed itself. They are read whether or not the project shares, since with sharing\n\
+            off they name versions no launch resolves from this pool, so reading them can only keep\n\
+            a version and never remove one.\n\
+            \n\
             `--all` sweeps every app that has an installed home rather than one named — it widens\n\
             the scope the way `sbx gc --all` does, and means something different there. Naming an\n\
             app and `--all` together is refused.\n\
