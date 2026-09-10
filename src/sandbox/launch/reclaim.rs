@@ -41,8 +41,19 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
                 // Prune stale session records, then collect the shared store. Reaping whole
                 // per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the
                 // nix-store side — the shared store's orphaned closures across every project.
-                let live = session_housekeeping(&layout);
-                runtime_housekeeping(&layout, &live, prune, pal);
+                // The shared store is collected either way: it is keyed by what the nix roots
+                // hold, not by which project is live. What the runtime pass needs the registry for
+                // is the opposite — it drops the gcroots of every project it does not find live, so
+                // a registry it could not read would have it pull an unpacked distribution out from
+                // under a running cage.
+                match session_housekeeping(&layout) {
+                    Ok(live) => runtime_housekeeping(&layout, &live, prune, pal),
+                    Err(e) => crate::diag::error(&format!(
+                        "sbx gc: cannot read the session registry ({e}) — leaving the per-launch \
+                         runtime files and the distribution trees alone, because a live session \
+                         holding one cannot be ruled out."
+                    )),
+                }
                 shared_store_gc(&layout, prune, optimise, pal);
             }
             None => crate::diag::error(
@@ -71,9 +82,14 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
 /// an `sbx run` record with no post-exec hook lingered until the next `sbx session ls`). Returns the ids of
 /// projects with a *live* session — hashing each recorded canonical path — so the dead-tree reap
 /// can skip a tree a session still holds without scanning the registry a second time.
+///
+/// The unreadable registry leaves through the `Err`, not through an empty set. A set has no way to
+/// say "I could not tell", so returning one turned "I cannot say what is running" into "nothing is
+/// running" for every caller at once — and the callers are the ones that delete. What each does
+/// about it differs, which is why the answer is handed over rather than decided here.
 pub(in crate::sandbox) fn session_housekeeping(
     layout: &crate::store::Layout,
-) -> std::collections::BTreeSet<String> {
+) -> std::io::Result<std::collections::BTreeSet<String>> {
     match crate::session::Registry::at(layout.data_dir()).housekeep() {
         Ok((live, pruned)) => {
             if pruned > 0 {
@@ -90,14 +106,9 @@ pub(in crate::sandbox) fn session_housekeeping(
             }
             // Hash the stored path directly rather than re-canonicalise: a live session's recorded
             // path is already canonical, so its hash matches the id its tree is keyed by.
-            live.iter().map(|s| binds::project_id(&s.project)).collect()
+            Ok(live.iter().map(|s| binds::project_id(&s.project)).collect())
         }
-        Err(e) => {
-            crate::diag::error(&format!(
-                "sbx gc: cannot read the session registry ({e}); skipping session housekeeping."
-            ));
-            std::collections::BTreeSet::new()
-        }
+        Err(e) => Err(e),
     }
 }
 

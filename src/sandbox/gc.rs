@@ -1433,6 +1433,10 @@ pub(crate) enum TreeState {
     Idle,
     Dead,
     Markerless,
+    /// The registry could not be read, so liveness is not known for any tree. Distinct from `Idle`,
+    /// which is a *finding* — that no session holds this tree — and would be a claim nothing
+    /// checked. A verb that deletes on this distinction refuses instead of acting on it.
+    Unknown,
 }
 
 impl TreeState {
@@ -1443,6 +1447,7 @@ impl TreeState {
             TreeState::Idle => "idle",
             TreeState::Dead => "dead",
             TreeState::Markerless => "markerless",
+            TreeState::Unknown => "unknown",
         }
     }
 }
@@ -1465,22 +1470,23 @@ pub(crate) struct TreeClassification {
 /// uses to guard a live tree), so a tree in use now reads `Live` rather than its marker-based state.
 /// The marker is always read (when present) for `project_path`, so a `Live` tree still reports which
 /// project it belongs to — the marker was written at the launch that is now live.
-pub(crate) fn classify_tree(dir: &Path, live_ids: &BTreeSet<String>) -> TreeClassification {
+pub(crate) fn classify_tree(dir: &Path, live_ids: Option<&BTreeSet<String>>) -> TreeClassification {
     let id = dir.file_name().and_then(|n| n.to_str());
-    let is_live = id.is_some_and(|id| live_ids.contains(id));
     let marker = dir.join(super::projectstore::PROJECT_MARKER);
     let last_used = mtime_of(&marker)
         .or_else(|| mtime_of(dir))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     let project_path = read_marker(dir);
-    let state = if is_live {
-        TreeState::Live
-    } else {
-        match &project_path {
+    // `None` is not an empty set. Without the registry every branch below would report a tree as
+    // unheld, which is the one thing that was never checked.
+    let state = match live_ids {
+        None => TreeState::Unknown,
+        Some(live) if id.is_some_and(|id| live.contains(id)) => TreeState::Live,
+        Some(_) => match &project_path {
             Some(path) if project_is_gone(path) => TreeState::Dead,
             Some(_) => TreeState::Idle,
             None => TreeState::Markerless,
-        }
+        },
     };
     TreeClassification {
         state,

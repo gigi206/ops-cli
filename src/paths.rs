@@ -286,7 +286,7 @@ struct ChildView {
     /// (the `.toml` suffix stripped).
     name: String,
     path: PathBuf,
-    /// Only set for per-project trees: `live`/`idle`/`dead`/`markerless`. `None` for app homes and
+    /// Only set for per-project trees: `live`/`idle`/`dead`/`markerless`/`unknown`. `None` for app homes and
     /// profiles, which have no liveness state.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'static str>,
@@ -336,10 +336,7 @@ fn view_with_roots(
     // liveness annotation. Computed once from the session registry at the data root (the same
     // self-healing housekeep `sbx session ls` runs); empty when there is no data root or no sessions. Only
     // the data base's `projects/` entry consumes it; config and state ignore it.
-    let live_ids: BTreeSet<String> = data_root
-        .as_ref()
-        .map(|d| live_project_ids(d))
-        .unwrap_or_default();
+    let live_ids: Option<BTreeSet<String>> = data_root.as_ref().and_then(|d| live_project_ids(d));
     // The project id of the current working directory, so the matching tree (if any) is marked
     // `current` in the render — the answer to "which of these am I in right now?". `None` when the
     // cwd cannot be canonicalized (it was deleted mid-run, or no cwd at all) — then no tree is
@@ -375,7 +372,7 @@ fn view_with_roots(
                     env_hint,
                     entries,
                     root,
-                    &live_ids,
+                    live_ids.as_ref(),
                     current_id.as_deref(),
                 )
             })
@@ -389,13 +386,16 @@ fn view_with_roots(
 /// sandbox launch / no trust gate / no network, not no filesystem housekeeping). Each live
 /// session's recorded canonical path is hashed the way [`sandbox::project_id`] hashes a launch's
 /// cwd, so the id matches the runtime tree's directory name.
-fn live_project_ids(data_dir: &Path) -> BTreeSet<String> {
-    let Ok((live, _)) = session::Registry::at(data_dir).housekeep() else {
-        return BTreeSet::new();
-    };
-    live.iter()
-        .map(|s| sandbox::project_id(&s.project))
-        .collect()
+///
+/// `None` when the registry could not be read at all, which is not the same answer as an empty set:
+/// a tree whose liveness nothing established is reported `unknown`, never `idle`.
+fn live_project_ids(data_dir: &Path) -> Option<BTreeSet<String>> {
+    let (live, _) = session::Registry::at(data_dir).housekeep().ok()?;
+    Some(
+        live.iter()
+            .map(|s| sandbox::project_id(&s.project))
+            .collect(),
+    )
 }
 
 /// Probe one base: its root's existence, then each entry's existence and (for
@@ -411,7 +411,7 @@ fn probe_base(
     env_hint: &'static str,
     entries: &'static [Entry],
     root: Option<PathBuf>,
-    live_ids: &BTreeSet<String>,
+    live_ids: Option<&BTreeSet<String>>,
     current_id: Option<&str>,
 ) -> BaseView {
     let exists = root
@@ -460,7 +460,7 @@ fn probe_base(
 fn enumerate(
     dir: &Path,
     what: Enumerate,
-    live_ids: &BTreeSet<String>,
+    live_ids: Option<&BTreeSet<String>>,
     current_id: Option<&str>,
 ) -> Vec<ChildView> {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -551,7 +551,7 @@ pub(crate) fn civil_date(t: SystemTime) -> String {
 /// is plain, so a captured test stream is byte-for-byte plain text.
 pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
     use std::fmt::Write as _;
-    let (h, nm, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
+    let (h, nm, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let mut o = String::new();
     let _ = writeln!(
         o,
@@ -615,13 +615,15 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
                 for c in &e.children {
                     // Per-project trees carry a liveness state + a last-used date; app homes and
                     // profiles carry neither, so the line ends at the path. The state is colored:
-                    // live/idle in ok (green), dead/markerless in dim — the stale hues.
+                    // live/idle in ok (green), dead/markerless in dim — the stale hues — and
+                    // unknown in warn, because it is neither: nothing read the registry that would
+                    // have told them apart.
                     match (c.state, c.last_used.as_deref()) {
                         (Some(st), Some(date)) => {
-                            let hue = if matches!(st, "live" | "idle") {
-                                ok
-                            } else {
-                                dim
+                            let hue = match st {
+                                "live" | "idle" => ok,
+                                "unknown" => warn,
+                                _ => dim,
                             };
                             // The project tree line: id, tree path, (state), date, recorded
                             // project path (or "(unknown)" for markerless), and a `*` when it is
@@ -905,7 +907,7 @@ mod tests {
         std::fs::write(apps.join("demo-app.toml"), "").unwrap();
         std::fs::write(apps.join("not-a-profile.txt"), "").unwrap();
         let live = BTreeSet::new();
-        let kids = enumerate(&apps, Enumerate::Profiles, &live, None);
+        let kids = enumerate(&apps, Enumerate::Profiles, Some(&live), None);
         assert_eq!(kids.len(), 1, "only .toml files kept");
         assert_eq!(kids[0].name, "demo-app", "suffix stripped");
         assert!(kids[0].path.ends_with("demo-app.toml"), "full path kept");
@@ -921,7 +923,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("subdir")).unwrap();
         std::fs::write(tmp.path().join("a-file"), "").unwrap();
         let live = BTreeSet::new();
-        let kids = enumerate(tmp.path(), Enumerate::Dirs, &live, None);
+        let kids = enumerate(tmp.path(), Enumerate::Dirs, Some(&live), None);
         assert_eq!(kids.len(), 1, "only the directory kept");
         assert_eq!(kids[0].name, "subdir");
         assert!(kids[0].state.is_none() && kids[0].last_used.is_none());

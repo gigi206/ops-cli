@@ -52,6 +52,7 @@ Each tree's **state**:
 | `idle` | its project directory still exists, just not active |
 | `dead` | the project directory is gone: removable with `rm --dead` |
 | `markerless` | a legacy tree pre-dating marker recording (its project path is unknown) |
+| `unknown` | the session registry could not be read, so no tree's liveness was established |
 
 `--json` emits the trees as a JSON array for scripting.
 

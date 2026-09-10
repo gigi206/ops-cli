@@ -2132,8 +2132,9 @@ pub(super) const PAGES: &[Page] = &[
             created. Under `projects/` it enumerates each project's runtime tree and annotates it\n\
             with a liveness state — `live` (a running session holds it), `idle` (the project\n\
             directory still exists, just not active), `dead` (the project is gone — removable\n\
-            by `sbx projects rm --dead`), or `markerless` (a legacy tree pre-dating marker\n\
-            recording) — plus the last-used date, and (via `sbx projects list`) its size. Under `apps/`\n\
+            by `sbx projects rm --dead`), `markerless` (a legacy tree pre-dating marker\n\
+            recording), or `unknown` (the session registry could not be read, so no tree's\n\
+            liveness was established) — plus the last-used date, and (via `sbx projects list`) its size. Under `apps/`\n\
             it lists each global app home, and under the config\n\
             `apps/` each imported profile. Read-only: no trust gate, no network. For the config\n\
             files in resolution order, see `sbx config path`.",

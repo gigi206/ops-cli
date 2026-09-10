@@ -432,6 +432,104 @@ fn rm_dry_run_previews_without_removing() {
 }
 
 #[test]
+fn rm_refuses_when_the_session_registry_cannot_be_read() {
+    let fx = Project::new("projects");
+    let dir = fx.make_tree("1234567890abcdef", Some(&fx.proj.path().join("gone")));
+    // A plain file where the registry's directory belongs, so `read_dir` answers `ENOTDIR`. That is
+    // neither of the two states the scan already absorbs: a missing directory means no sessions,
+    // and a single unreadable record is skipped so one bad entry cannot blank the answer. What is
+    // left is the guard being unable to know — and there is exactly one gate between an id and the
+    // removal, so reading that as an all-clear deletes the home and store of a project a session is
+    // still running in.
+    let sessions = fx.data_home.path().join("sbx/sessions");
+    std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&sessions);
+    std::fs::write(&sessions, b"not a directory").unwrap();
+
+    let out = fx.run(&["projects", "rm", "1234567890abcdef"]);
+    assert!(
+        !out.status.success(),
+        "an unreadable registry must refuse the removal: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("cannot read the session registry"),
+        "and say what it could not know: {}",
+        text(&out)
+    );
+    assert!(
+        dir.exists(),
+        "nothing may be removed while liveness is unknown"
+    );
+
+    // The bulk selectors reach the same removal through the same set, so the one read holds them
+    // too — a sweep is the reading that would delete the most under a running agent.
+    let dead = fx.run(&["projects", "rm", "--dead", "--yes"]);
+    assert!(
+        !dead.status.success(),
+        "the sweep must refuse on the same unreadable registry: {}",
+        text(&dead)
+    );
+    assert!(dir.exists(), "the sweep removed a tree it could not clear");
+
+    // The preview removes nothing, so it stays available on exactly the host where a user goes
+    // looking for what happened — and it says outright that it could not tell.
+    let preview = fx.run(&["projects", "rm", "1234567890abcdef", "--dry-run"]);
+    assert!(
+        preview.status.success(),
+        "the preview must still work: {}",
+        text(&preview)
+    );
+    assert!(
+        String::from_utf8_lossy(&preview.stdout).contains("removable"),
+        "the preview must still name what would go: {}",
+        text(&preview)
+    );
+    assert!(
+        text(&preview).contains("cannot read the session registry"),
+        "and it must not present that plan as verified: {}",
+        text(&preview)
+    );
+    assert!(dir.exists());
+}
+
+/// A listing answers rather than deletes, so it keeps answering — but `idle` is a finding, and one
+/// stated off a registry nothing could read would be a claim nothing checked.
+#[test]
+fn a_listing_reports_liveness_as_unknown_when_the_registry_cannot_be_read() {
+    let fx = Project::new("projects");
+    fx.make_tree("deadfeeddeadfeed", Some(fx.proj.path()));
+    let sessions = fx.data_home.path().join("sbx/sessions");
+    std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&sessions);
+    std::fs::write(&sessions, b"not a directory").unwrap();
+
+    let out = fx.run(&["projects", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "the listing must still answer: {}",
+        text(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let row = v
+        .as_array()
+        .expect("a JSON array")
+        .iter()
+        .find(|r| r["id"] == "deadfeeddeadfeed")
+        .expect("the fabricated tree in the JSON")
+        .clone();
+    assert_eq!(
+        row["state"], "unknown",
+        "an unreadable registry was reported as a finding about the tree: {row}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot read the session registry"),
+        "the reason belongs on stderr, where `| jq` does not read it: {}",
+        text(&out)
+    );
+}
+
+#[test]
 fn rm_dead_previews_by_default_and_reaps_with_yes() {
     let fx = Project::new("projects");
     let dead = fx.make_tree("deaddeaddeaddead", Some(&fx.proj.path().join("gone")));

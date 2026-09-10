@@ -143,7 +143,8 @@ struct ProjectTreeView {
     /// The tree's directory name under `<data>/projects/` — the id `sbx projects rm` takes.
     id: String,
     /// `live` (a running session holds it), `idle` (its project still exists), `dead` (the project
-    /// directory is gone), or `markerless` (a legacy tree pre-dating marker recording).
+    /// directory is gone), `markerless` (a legacy tree pre-dating marker recording), or `unknown`
+    /// (the session registry could not be read, so no tree's liveness was established).
     state: &'static str,
     /// On-disk size in bytes (an upper bound — reflinked content shared with another tree counts
     /// per file).
@@ -161,12 +162,39 @@ struct ProjectTreeView {
     current: bool,
 }
 
+/// The live-project ids for a verb that **reports** rather than removes: the set when the registry
+/// could be read, and `None`, with the reason on stderr, when it could not.
+///
+/// `None` is what renders a tree as `unknown` instead of `idle`. The distinction is the point:
+/// `idle` is a finding — that no session holds this tree — and printing it off a registry nothing
+/// could read states something nothing established. The verbs that delete do not come through here;
+/// they refuse, because a column a reader can weigh is not a gate a removal can pass.
+fn registry_or_note(
+    listed: std::io::Result<std::collections::BTreeSet<String>>,
+    verb: &str,
+) -> Option<std::collections::BTreeSet<String>> {
+    match listed {
+        Ok(ids) => Some(ids),
+        Err(e) => {
+            crate::diag::error(&format!(
+                "sbx {verb}: cannot read the session registry ({e}) — every tree's liveness is \
+                 reported as unknown."
+            ));
+            None
+        }
+    }
+}
+
 /// Gather the per-project runtime trees under `<data>/projects/`, classified and sized, sorted by
 /// id — the shared core of `sbx projects [list]` (text or JSON). Live ids come from the session
 /// registry (the same self-healing housekeep `sbx session ls` runs), so a tree in use reads `live`. Pure
 /// host-side filesystem work — no sandbox, no nix.
 fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> {
-    let live_ids = super::launch::session_housekeeping(layout);
+    // A listing answers rather than deletes, so an unreadable registry is reported and the rows are
+    // still rendered — with the liveness column saying `unknown` instead of claiming `idle`, which
+    // is what nothing checked. The error goes to stderr, where `sbx projects --json | jq` does not
+    // read it.
+    let live_ids = registry_or_note(super::launch::session_housekeeping(layout), "projects");
     let current = crate::current_project_id();
     let projects_dir = layout.data_dir().join("projects");
     // Read once for every tree: each one is classified against the same shared store, and that
@@ -179,7 +207,7 @@ fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> 
             .map(|e| {
                 let dir = e.path();
                 let id = e.file_name().to_string_lossy().into_owned();
-                let class = super::gc::classify_tree(&dir, &live_ids);
+                let class = super::gc::classify_tree(&dir, live_ids.as_ref());
                 let (total, parts) = super::gc::tree_usage_parts(&dir, &[dir.join("store")]);
                 let bytes = total.bytes;
                 let own_bytes = bytes
@@ -312,8 +340,11 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
         return ExitCode::FAILURE;
     }
 
-    let live_ids = super::launch::session_housekeeping(&layout);
-    let class = super::gc::classify_tree(&dir, &live_ids);
+    let live_ids = registry_or_note(
+        super::launch::session_housekeeping(&layout),
+        "projects show",
+    );
+    let class = super::gc::classify_tree(&dir, live_ids.as_ref());
 
     // One walk for all three figures: `store` and `home` are inside the tree, so sizing them
     // separately visited every one of their inodes twice.
@@ -694,7 +725,36 @@ pub(crate) fn projects_rm(
         Ok(l) => l,
         Err(code) => return code,
     };
-    let live_ids = super::launch::session_housekeeping(&layout);
+    // Read once for the whole batch, and fail closed for all of it — the rule `sbx app rm --purge`
+    // and `sbx app prune` already apply. This verb's only action is to delete a project's own home
+    // and store, and there is exactly one gate between an id and that removal: `reap_one` refuses an
+    // id this set holds. A registry that could not be read leaves no gate at all, and the bulk
+    // selectors below reach the same removal through the same set.
+    //
+    // Read for the applying form only. A preview deletes nothing, so it stays available on a host
+    // whose registry cannot be read — which is where a user goes looking for what happened — and it
+    // says outright that it could not tell a held tree from a free one.
+    let live_ids = match super::launch::session_housekeeping(&layout) {
+        Ok(ids) => ids,
+        Err(e) if apply => {
+            crate::diag::error(&format!(
+                "sbx projects rm: cannot read the session registry ({e}) — refusing to remove, \
+                 because a live session holding one of these trees cannot be ruled out."
+            ));
+            crate::diag::hint(
+                "       re-run with `--dry-run` to see what would go, or fix the data directory's \
+                 permissions",
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            crate::diag::error(&format!(
+                "sbx projects rm: cannot read the session registry ({e}) — this preview cannot tell \
+                 a tree a session holds from a free one."
+            ));
+            std::collections::BTreeSet::new()
+        }
+    };
     let current = crate::current_project_id();
     let projects_dir = layout.data_dir().join("projects");
     let mut had_error = false;
