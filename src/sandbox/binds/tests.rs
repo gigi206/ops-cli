@@ -452,6 +452,34 @@ fn assemble_binds_a_read_only_machine_id_at_both_conventional_paths() {
 }
 
 #[test]
+fn a_nesting_note_writes_the_host_home_as_a_tilde_and_leaves_the_rest() {
+    use super::nesting::elided;
+    let home = Path::new("/home/u");
+
+    // Under the home: the prefix goes, what identifies the bind stays. This is what keeps the note
+    // inside `config show`'s compact contract (counts by default) and keeps a machine's user out of
+    // a pasted transcript.
+    assert_eq!(
+        elided(Path::new("/home/u/work/src"), Some(home)),
+        "~/work/src"
+    );
+    // The home itself is the whole path.
+    assert_eq!(elided(home, Some(home)), "~");
+    // A sibling that merely shares a textual prefix is not under the home and stays verbatim —
+    // `strip_prefix` compares components, which is the difference that matters here.
+    assert_eq!(
+        elided(Path::new("/home/user2/x"), Some(home)),
+        "/home/user2/x"
+    );
+    // Outside the home, and with no home at all, the path is shown as it is.
+    assert_eq!(elided(Path::new("/etc"), Some(home)), "/etc");
+    assert_eq!(elided(Path::new("/etc"), None), "/etc");
+    // A `HOME` of `/` is a prefix of every absolute path, so eliding it would replace the whole
+    // tree with `~` and say nothing. Left alone.
+    assert_eq!(elided(Path::new("/etc"), Some(Path::new("/"))), "/etc");
+}
+
+#[test]
 fn structural_nesting_warning_flags_only_a_nesting_overlap() {
     // A descendant of a structural mount is shadowed by it.
     let w = structural_nesting_warning(Path::new("/tmp/secrets"), false, None)

@@ -44,6 +44,29 @@ fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
     })
 }
 
+/// A bind path as a nesting note names it: the host home written `~`, everything else verbatim.
+///
+/// These notes reach `sbx config show`'s compact view, whose contract is counts by default and
+/// expansion only under `--details`, and that view is what a user pastes into an issue or a support
+/// channel. The home prefix is both the expansion the contract rules out and the segment that
+/// identifies a machine and its user, so it is the segment that goes; the rest of the path is what
+/// the note is *about* and stays, or the note could not be acted on.
+///
+/// `home` is passed rather than read here so the rule is a pure function of its inputs and can be
+/// exercised without an ambient environment. A `home` of `/` is left alone: it is a prefix of every
+/// absolute path, so eliding it would replace the whole tree with `~`.
+pub(super) fn elided(path: &Path, home: Option<&Path>) -> String {
+    let verbatim = || path.display().to_string();
+    let Some(home) = home.filter(|h| h.parent().is_some()) else {
+        return verbatim();
+    };
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => verbatim(),
+    }
+}
+
 /// A warning when a config bind's canonical destination `dest` nests with one of the cage's own
 /// structural mounts, or `None` when it does not. `writable` marks a `mode = "rw"` bind, which the
 /// `Contains` case flags specially: a read-write ancestor bind grants the cage write-through to the
@@ -55,6 +78,10 @@ pub(crate) fn structural_nesting_warning(
     writable: bool,
     project: Option<&Path>,
 ) -> Option<String> {
+    // Read once for every note this call may produce, so the three renderings can never disagree
+    // on how a path is shown.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let shown = elided(dest, home.as_deref());
     // The project is a structural mount too — it is emitted with them, after every config bind —
     // but its path is a per-launch value rather than a constant, so it cannot live in the list
     // above. Only the shadowed direction is worth a word. A bind that *contains* the project is
@@ -73,10 +100,9 @@ pub(crate) fn structural_nesting_warning(
             "sits inside the project".to_string()
         };
         return Some(format!(
-            "bind `{}` {what}, which the cage mounts after it and over it — the bind has no \
+            "bind `{shown}` {what}, which the cage mounts after it and over it — the bind has no \
              effect, whatever its mode. To narrow a path inside the project, use an `[fs] deny` \
-             mask: those are applied after the project rather than before it",
-            dest.display()
+             mask: those are applied after the project rather than before it"
         ));
     }
     structural_nesting_conflict(dest).map(|(structural, nesting)| match nesting {
@@ -90,9 +116,8 @@ pub(crate) fn structural_nesting_warning(
                 ""
             };
             format!(
-                "bind `{}` sits at or under the sandbox's own mount `{structural}` — the cage mounts \
-                 over it, so the bind is shadowed and will not appear inside{dev_hint}",
-                dest.display()
+                "bind `{shown}` sits at or under the sandbox's own mount `{structural}` — the cage mounts \
+                 over it, so the bind is shadowed and will not appear inside{dev_hint}"
             )
         }
         Nesting::Contains => {
@@ -102,10 +127,9 @@ pub(crate) fn structural_nesting_warning(
                 ""
             };
             format!(
-                "bind `{}` contains the sandbox's own mount `{structural}` — the cage mounts that \
+                "bind `{shown}` contains the sandbox's own mount `{structural}` — the cage mounts that \
                  path over part of it, so `{structural}` inside the cage is sbx's, not your \
-                 bind's{write_note}",
-                dest.display()
+                 bind's{write_note}"
             )
         }
     })

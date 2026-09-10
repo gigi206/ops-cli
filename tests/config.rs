@@ -2174,8 +2174,13 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
         stdout.contains("packages: tool (withheld)"),
         "an untrusted app package must read as withheld (it is withheld at launch):\n{stdout}"
     );
+    // Matched on the drop note's own wording rather than on the bare `note:` prefix. The app
+    // block carries every note that app's resolution produced, so a prefix match is satisfied by
+    // any of them: on a host whose home is the sandbox's own mount the nesting tripwire fires here
+    // too, and the assertion below would then read a bind that was honoured as one that was
+    // dropped. What this test is about is the drop, so it says `dropping`.
     assert!(
-        stdout.to_lowercase().contains("note:") && stdout.to_lowercase().contains("bind"),
+        stdout.to_lowercase().contains("dropping") && stdout.to_lowercase().contains("bind"),
         "an untrusted app's bind must be dropped with a note:\n{stdout}"
     );
 
@@ -2189,7 +2194,7 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
         "app command missing:\n{stdout}"
     );
     assert!(
-        !stdout.contains("note:"),
+        !stdout.to_lowercase().contains("dropping"),
         "a trusted app must not drop its bind:\n{stdout}"
     );
     assert!(
