@@ -20,6 +20,10 @@ fn holder_dump() -> Option<(String, String)> {
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args([
             "__netns-holder",
+            // The separator the production wrapper always emits (`holder_wrap`), tap or no tap: it
+            // is what makes the command unambiguous to parse. Without it the holder exits on a
+            // usage error, which this helper would read as an environment gap and skip.
+            "--",
             "/bin/sh",
             "-c",
             "echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route",
