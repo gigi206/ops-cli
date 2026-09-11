@@ -13,8 +13,9 @@
 //! advances it is running that install again, in the app's own cage. `all` runs those steps too —
 //! anything else would make "bring everything up to date" walk past a whole class of agent — but
 //! with each step's own guard in charge, so a step installs when something moved and stands down
-//! when nothing did. The `provision` verb is the one that installs REGARDLESS, which is what an
-//! agent whose guard cannot detect a new release needs, and what a wrong guard needs.
+//! when nothing did. What installs REGARDLESS is naming what to install: the `provision` verb, or a
+//! single app through `-a`. That is what an agent whose guard cannot detect a new release needs,
+//! and what a wrong guard needs.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -354,9 +355,9 @@ fn run_upgrade(
     // What differs is WHO decides to install. Under `all` the steps run with their own guards in
     // charge (`force = false`): one that compares an upstream release to what is installed
     // re-installs exactly when something moved, and one that can only ask whether the agent exists
-    // reports nothing to do. The `provision` verb keeps `SBX_UPGRADE` raised, which is the only
-    // thing that advances an agent whose guard cannot tell — a checkout of a branch has no version
-    // to compare — and the way to re-install over a guard that is wrong.
+    // reports nothing to do. Raising `SBX_UPGRADE` is the only thing that advances an agent whose
+    // guard cannot tell — a checkout of a branch has no version to compare — and the way to
+    // re-install over a guard that is wrong; the rule below says which runs raise it.
     if matches!(what, "provision" | "all") {
         // ONE rule for forcing, written once. Naming a single app is a request to re-install it,
         // not to poll it: the user who typed the name has already decided, and that is the same

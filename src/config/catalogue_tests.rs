@@ -679,8 +679,9 @@ fn every_shipped_install_step_yields_to_the_upgrade_signal() {
         assert!(
             script.contains("SBX_UPGRADE"),
             "`examples/bundle/{name}.toml` carries a `provision` whose script never reads \
-             SBX_UPGRADE — `sbx upgrade provision` would run it, its own guard would skip the \
-             install, and the roll would still report it as re-installed"
+             SBX_UPGRADE — a run that forces (`sbx upgrade provision`, or one app named with \
+             `-a`) would run it, its own guard would skip the install, and the roll would still \
+             report it as re-installed"
         );
         checked += 1;
     }

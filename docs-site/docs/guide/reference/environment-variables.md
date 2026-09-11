@@ -177,6 +177,22 @@ See [Directory layout](../concepts/directory-layout).
 [`sbx config edit`](../cli/config) opens the target file in `$VISUAL`, then
 `$EDITOR`, falling back to `vi`.
 
+## Development and test variables (host)
+
+These are knobs for working **on** sbx, not for running it: the test harness reads the
+first three, and the last four arm a debug dump or a scheduled check. None is part of
+the supported surface, and no ordinary launch needs one.
+
+| Variable | Meaning |
+|---|---|
+| `SBX_REQUIRE_CAPABLE` | set to a non-empty value other than `0`, a test that would skip for a missing host capability (user namespaces, bubblewrap, nix) fails instead |
+| `SBX_SKIP_LOG` | a **path**, not a boolean: every skipped test appends one line to that file, so a green run can be audited for what it did not do |
+| `SBX_TEST_TMPDIR` | moves the root under which the test suites build their temporary trees |
+| `SBX_DEBUG_RESOLVED_DUMP` | a path: appends the resolved configuration each call produced, so two runs can be compared byte for byte |
+| `SBX_DEBUG_SPEC_DUMP` | a path: the same, for the sandbox spec a launch builds |
+| `SBX_CATALOGUE_CHECK` | set to any value (the idiom is `=1`), arms the app catalogue's freshness check; a scheduled run is what arms it, an ordinary launch never does |
+| `SBX_CATALOGUE_MISE` | the `mise` binary that check uses; without one, the specs it would test are reported **unchecked**, never as passing |
+
 ## Variables sbx sets inside the cage
 
 A cage does **not** inherit your host environment. `sbx` sets a small structural set,
@@ -197,9 +213,11 @@ finds the operation plane without being told where it is:
 | `SBX_TASK_CLI` | the in-cage path of the task client (`/opt/sbx/bin/sbx`), a [generated script](../cli/task#what-the-cage-actually-holds) that speaks the plane's protocol and refuses every other word |
 | `SBX_TASK_SOCKET` | the in-cage path of the plane's socket (`/tmp/sbx-task.sock`), which is also how `sbx task` knows it is running inside a cage |
 
-A roll of an app's install steps ([`sbx app upgrade <name>`](../cli/app#advancing-an-app),
-[`sbx upgrade provision`](../cli/upgrade)) adds one, so a step can tell a first install
-from a re-install:
+A roll of an app's install steps adds one, so a step can tell a first install from a
+re-install. Naming a single app is one way in
+([`sbx app upgrade <name>`](../cli/app#advancing-an-app) or
+[`sbx upgrade --app <name>`](../cli/upgrade#rolling-one-app)), and
+[`sbx upgrade provision`](../cli/upgrade) is the other, for every app in the project:
 
 | Variable | Meaning |
 |---|---|

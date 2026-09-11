@@ -153,7 +153,8 @@ and turn every launch into a re-download.
 `sbx upgrade all` runs these steps too, and the difference is `SBX_UPGRADE`. Under `all`
 it is **not** set, so each step's own guard decides: one that compares the upstream release
 to what is installed re-installs exactly when something moved, and costs a channel read of
-a few bytes when nothing did. The `provision` verb sets it, so the install runs regardless.
+a few bytes when nothing did. Naming what to install sets it, so the install runs regardless:
+the `provision` verb, or a single app through `-a`.
 
 That is the split worth understanding when you write a guard. A guard that can only ask
 whether the agent is installed at all will never advance under `all`, because it has
