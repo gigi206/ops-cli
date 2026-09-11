@@ -68,7 +68,7 @@
 # IN-CAGE Chromium — the provider consent page and the loopback callback both resolve inside the
 # sandbox, no host browser, no `forward`. Same pattern as aionui / claude-desktop. HEAVY: it pulls
 # the Chromium closure into the store on first launch (see [packages]). Each provider's OWN login hosts must be in [network] — add them from
-# `sbx net logs -a t3code` on your first login attempt. `--password-store=basic` forces the file cookie
+# `sbx net logs -a t3code` on your first login attempt. `--password-store=gnome-libsecret` forces the file cookie
 # store (no keyring in the cage) so a login survives a relaunch. If every agent you use is configured
 # with an API KEY instead of OAuth (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY in its own config), you
 # can drop the `[open]` table + the chromium package.
@@ -86,7 +86,7 @@ cmd = [
     "--ozone-platform=wayland",
     "--disable-dev-shm-usage",
     "--use-system-ca",
-    "--password-store=basic",
+    "--password-store=gnome-libsecret",
 ]
 
 gui = "wayland"
@@ -168,8 +168,8 @@ use = ["claude-code"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
-https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
 
 [packages]
 # The T3 Code desktop app, tracked from the latest GitHub release's linux `.AppImage` automatically

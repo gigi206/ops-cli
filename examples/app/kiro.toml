@@ -173,8 +173,8 @@ use = ["kiro"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
-https = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+http = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=gnome-libsecret", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+https = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=gnome-libsecret", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
 
 [network]
 mode = "deny"

@@ -2549,10 +2549,7 @@ pub(super) fn build(
             Box::new(|cmd| {
                 crate::sandbox::portal::wrap_command(
                     &prep.userland.shell_bin,
-                    &p.dbus_daemon,
-                    &p.xdp_root,
-                    &p.gtk_root,
-                    &p.update_desktop_db,
+                    p,
                     portal_stack.scheme.as_deref(),
                     cmd,
                 )
@@ -2583,6 +2580,7 @@ pub(super) fn build(
     if let Some(p) = &portal_stack.portal {
         gui_programs.push(&p.dbus_daemon);
         gui_programs.push(&p.update_desktop_db);
+        gui_programs.push(&p.keyring_daemon);
     }
     if let Some(ct) = &hw.ca_trust {
         gui_programs.push(&ct.certutil);
@@ -2959,7 +2957,10 @@ pub(super) fn holder_plan(
         return None;
     }
     let tap = proxy_host_uds.and_then(|uds| {
-        crate::pathfind::find_on_path("nft").map(|nft| crate::sandbox::spec::TapWiring {
+        // The same trusted lookup `probe_capture` uses, and for the same reason: this `nft` writes
+        // the redirect the whole capture rests on. Nothing usable means no tap, which is the
+        // documented degradation to the environment-variable path.
+        crate::store::find_trusted_on_path("nft").map(|nft| crate::sandbox::spec::TapWiring {
             uds: uds.to_path_buf(),
             nft,
             control: proxy_control_uds.map(std::path::Path::to_path_buf),

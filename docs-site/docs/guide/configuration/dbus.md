@@ -132,5 +132,18 @@ sbx config show --app desktop --details  # plus the postures no layer set (folde
 ## Scope
 
 The portal ships the file chooser, theme, and notifications; a **tray icon** (StatusNotifier) is
-deliberately not provided. The **system keyring** is never exposed, so a keyring-backed login inside
-the cage falls back to a file in the app's isolated `$HOME`.
+deliberately not provided.
+
+The **host's** keyring is never exposed. The cage gets one of its **own** instead: a Secret Service
+(`org.freedesktop.secrets`) on the same private bus, whose keyring file lives in the app's isolated
+`$HOME` and holds nothing the host keyring holds. That is what lets a login survive a relaunch, and
+several Electron apps now refuse to finish starting when no Secret Service answers at all.
+
+Two things follow. The keyring is unlocked with a fixed passphrase, because it must reopen on every
+later launch and nobody is there to type one; it is therefore only as strong as the isolated home it
+sits in, which under sbx's same-uid model the user can read anyway. And Chromium does **not** choose
+its credential backend from what is on the bus: it reads `XDG_CURRENT_DESKTOP`, which a cage does not
+set, so it falls back to the plaintext store unless the app's `cmd` names the backend with
+`--password-store=gnome-libsecret`. Every shipped Electron profile that carries `dbus = true` names
+it. A profile without a bus has no keyring to name, so it stays on the plaintext store: naming the
+backend there would leave the app with no credential storage at all rather than a weak one.

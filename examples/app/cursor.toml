@@ -64,7 +64,7 @@
 # notifications, and follows your host light/dark theme. The Electron flags: `--no-sandbox` is
 # mandatory and acceptable (bubblewrap + seccomp + the empty netns IS the boundary); `--ozone-platform=
 # wayland` selects Wayland; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`;
-# `--password-store=basic` forces the file cookie/token store (no keyring in the cage) so a login
+# `--password-store=gnome-libsecret` forces the file cookie/token store (no keyring in the cage) so a login
 # survives a relaunch.
 #
 # CREDENTIAL POSTURE — a Cursor ACCOUNT login (NOT a header-injectable key), wired via an in-cage
@@ -91,7 +91,7 @@
 # If you sign in with Google/GitHub SSO, add the provider's host chain to `allow` (for Google the
 # repo-standard bounded regex — see `examples/app/claude-desktop.toml`; the `accounts.google.<ccTLD>/…/SetSID`
 # redirect is load-bearing). A plain EMAIL sign-in stays on Cursor's own domain and needs no SSO hosts.
-# Whether the session token survives a relaunch under `--password-store=basic` is the thing to confirm.
+# Whether the session token survives a relaunch under `--password-store=gnome-libsecret` is the thing to confirm.
 #
 # EGRESS AND HTTP/2 (gRPC). sbx's MITM proxy speaks HTTP/1.1 by default; a host listed in
 # `[network] http2` is instead man-in-the-middled as HTTP/2 (ALPN h2) for gRPC, every stream still
@@ -151,7 +151,7 @@ mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/polic
 POLICY
 
 exec cursor --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic "$@"
+    --use-system-ca --password-store=gnome-libsecret "$@"
 ''',
 ]
 
@@ -197,8 +197,8 @@ use = ["cursor"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
-https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
 cursor = ["cursor", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--open-url"]
 
 # An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is

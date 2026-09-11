@@ -91,10 +91,16 @@
 #     host. The `cmd` writes a Chromium managed policy so that deep-link opens with no
 #     confirmation dialog. Google is the heavier path (it pulls Chromium); if you only ever use
 #     email, drop the `[open]` table + the `chromium` package, and the `cmd` with them.
-#   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT) and closing the
-#     window does NOT quit (Claude Desktop is a tray/background app and the cage exposes no tray). Press
-#     **Ctrl+C twice within 2s** to force-quit the session (sbx terminates the cage), or `sbx session stop <id>`
-#     from another terminal. The launch prints the hint.
+#   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT), and by default
+#     closing the window does NOT quit: Claude Desktop hides to a tray, and the cage exposes none, so
+#     the window goes away with nothing left to bring it back. Press **Ctrl+C twice within 2s** to
+#     force-quit the session (sbx terminates the cage), or `sbx session stop <id>` from another
+#     terminal. The launch prints the hint. To make the window's close button quit the app instead,
+#     set `menuBarEnabled` to `false` under `preferences` in the app's own
+#     `~/.config/Claude/claude_desktop_config.json` (the copy inside the cage's isolated home): the
+#     app reads that switch on close and quits rather than hiding. Under a WSL kernel the setting
+#     matters more, because the compositor leaves the hidden window's frame standing on the Windows
+#     desktop, where it reads as an application that froze.
 #   * Credential persistence — the app may want the system keyring (Secret Service / dbus), which the
 #     hermetic cage does not provide, and should fall back to a file under the isolated home. Confirm
 #     the login survives a relaunch.
@@ -122,11 +128,17 @@
 # (catrust). You can also just sign in with EMAIL — that stays in the app's webview and needs none of
 # this (see the header).
 #
-# `--password-store=basic` (on both the app and Chromium): Chromium normally encrypts its session
-# cookie with a key from the OS keyring (Secret Service, over dbus), which the cage's private bus does
-# not expose — so without it the cookie cannot be re-decrypted next launch and you are logged out.
-# `basic` forces the file store in the isolated $HOME (a weak fixed key — acceptable: the token already
-# lives only in the per-app isolated cage home, never the project shell).
+# CREDENTIAL STORAGE — the cage carries its own keyring. Under `dbus = true` sbx puts a Secret
+# Service (`org.freedesktop.secrets`) on the cage's private bus, backed by a keyring file inside the
+# app's isolated home. Chromium and Electron both find it, so the session cookie is encrypted with a
+# real key and survives a relaunch, and `safeStorage` reports itself available — which recent
+# versions of this app require before they will finish rendering. This profile therefore passes NO
+# `--password-store` override: forcing `basic` makes the app treat encryption as unavailable and it
+# stops at its error screen, keyring or not.
+#
+# MIGRATING an app home created before the in-cage keyring existed: its old secrets were sealed with
+# the plaintext fallback's fixed key, which the keyring cannot read, so the first launch after this
+# change signs you out once. Sign in again and it persists from then on.
 cmd = [
     "bash",
     "-c",
@@ -140,7 +152,7 @@ POLICY
 
 
 exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic "$@"
+    --use-system-ca --password-store=gnome-libsecret "$@"
 ''',
 ]
 
@@ -185,8 +197,8 @@ use = ["claude-desktop"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
-https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--no-first-run", "--no-default-browser-check"]
 claude = ["claude-desktop", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage"]
 
 [network]

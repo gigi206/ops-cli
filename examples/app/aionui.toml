@@ -85,7 +85,7 @@
 # claude-desktop / hermes-desktop. HEAVY: it pulls the Chromium closure into the store on first
 # launch (see [packages]). The provider's OWN login
 # hosts must be in [network] below — add them from `sbx net logs -a aionui` on your first login attempt.
-# `--password-store=basic` forces the file cookie store (no keyring in the cage) so the OAuth session
+# `--password-store=gnome-libsecret` forces the file cookie store (no keyring in the cage) so the OAuth session
 # survives a relaunch. If you only ever use API keys, drop the `[open]` table + the chromium package.
 #
 # MANAGED NODE RUNTIME (why the wrapper stages it). AionUi's backend, AionCore, ships a bundled Node
@@ -147,7 +147,7 @@ for v in "$NODESRC"/*/; do
 done
 
 exec aionui --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic "$@"
+    --use-system-ca --password-store=gnome-libsecret "$@"
 ''',
 ]
 
@@ -196,8 +196,8 @@ use = ["opencode"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
-https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
 
 [packages]
 # Pinned to the newest release that still carries a linux-amd64 `.deb` — see "THE PIN IS A HARD ONE"

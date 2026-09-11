@@ -61,7 +61,7 @@
 # therefore provisions an IN-CAGE Chromium and names it in `[open]`, which covers both ways a link is
 # opened: a direct `xdg-open` call, and — the load-bearing one under `dbus = true`, where
 # `openExternal` routes through the portal's `org.freedesktop.portal.OpenURI` and consults the desktop
-# database instead — the desktop entry sbx generates from the same declaration. `--password-store=basic` forces the file cookie store (no keyring in the
+# database instead — the desktop entry sbx generates from the same declaration. `--password-store=gnome-libsecret` forces the file cookie store (no keyring in the
 # cage) so a login survives a relaunch. If you would rather sign in with an API key (no browser), drop the
 # `chromium` package and the wrapper for a bare `freebuff` argv with the Electron flags.
 #
@@ -93,7 +93,7 @@ cmd = [
     "--ozone-platform=wayland",
     "--disable-dev-shm-usage",
     "--use-system-ca",
-    "--password-store=basic",
+    "--password-store=gnome-libsecret",
 ]
 home_scope = "global"
 
@@ -125,8 +125,8 @@ use = ["freebuff-desktop"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
-https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
 
 [network]
 # EGRESS — the filtering allowlist WORKS for Freebuff (its Bun orchestrator honors the proxy sbx sets:

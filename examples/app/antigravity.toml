@@ -94,14 +94,14 @@
 #     Ctrl+C twice within 2s to force-quit the session, or `sbx session stop <id>` from another terminal.
 #   * Credential persistence — the app may want the system keyring (Secret Service / dbus), which the
 #     hermetic cage does not provide, and should fall back to a file under the isolated home
-#     (`--password-store=basic` forces Chromium's file store). Confirm the login survives a relaunch.
+#     (`--password-store=gnome-libsecret` forces Chromium's file store). Confirm the login survives a relaunch.
 #   * In-app self-update — the IDE self-updates in the background from the same updater API + gvt1 CDN.
 #     A self-downloaded binary is NOT autoPatchelf'd, so it cannot run in the cage — the in-app updater
 #     is inert; **`sbx upgrade --app antigravity` is the real upgrade path**. Those hosts are muted below.
 #   * The real build + launch + Google login with your account is the pending live validation, as for
 #     every GUI profile (heavy build; not a per-run committed test).
 #
-# `--password-store=basic` (on both the app and Chromium): Chromium normally encrypts its session
+# `--password-store=gnome-libsecret` (on both the app and Chromium): Chromium normally encrypts its session
 # cookie with a key from the OS keyring (over dbus), which the cage's private bus does not expose — so
 # without it the cookie cannot be re-decrypted next launch and you are logged out. `basic` forces the
 # file store in the isolated $HOME (a weak fixed key — acceptable: the token lives only in the per-app
@@ -125,7 +125,7 @@ mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/polic
 POLICY
 
 exec antigravity-ide --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic "$@"
+    --use-system-ca --password-store=gnome-libsecret "$@"
 ''',
 ]
 
@@ -167,8 +167,8 @@ use = ["antigravity"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
-https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
 antigravity-ide = ["antigravity-ide", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--open-url"]
 
 [network]

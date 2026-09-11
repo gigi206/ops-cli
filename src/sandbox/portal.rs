@@ -53,7 +53,11 @@ use std::path::{Path, PathBuf};
 /// which builds the desktop-database index the portal's `OpenURI` needs to resolve a custom-scheme
 /// deep-link handler an app registers (a `.desktop` with a `MimeType=x-scheme-handler/<scheme>`) — the
 /// portal launches only an app in the *registered/recommended* list, which that index (not the bare
-/// `mimeapps.list` default) populates. They share the revision-keyed `gui` gcroot directory with the
+/// `mimeapps.list` default) populates. `gnome-keyring` supplies `gnome-keyring-daemon`, which puts a
+/// **Secret Service** (`org.freedesktop.secrets`) on the private bus: an Electron app asks
+/// `safeStorage` where to keep its session token, and on Linux that question is answered by the
+/// Secret Service. With none on the bus the app falls back to a plaintext store, and an app that
+/// treats that fallback as fatal never finishes rendering. They share the revision-keyed `gui` gcroot directory with the
 /// fonts/certutil/GUI data (all GUI-hole provisions on the same channel), so `sbx gc` keeps or drops
 /// them together.
 const PACKAGES: &[(&str, &str, &str)] = &[
@@ -73,6 +77,7 @@ const PACKAGES: &[(&str, &str, &str)] = &[
         "bin/update-desktop-database",
         "desktop-file-utils",
     ),
+    ("gnome-keyring", "bin/gnome-keyring-daemon", "gnome-keyring"),
 ];
 
 /// The cage-side mount point of the portal runtime directory: sbx bind-mounts a host directory here
@@ -147,6 +152,9 @@ pub(crate) struct Provision {
     /// Logical path of `update-desktop-database` (run in-cage from the wrap preamble to index any
     /// deep-link handler an app registers, so the portal's `OpenURI` can resolve it).
     pub(crate) update_desktop_db: PathBuf,
+    /// Logical path of `gnome-keyring-daemon` (run in-cage from the wrap preamble, so the private
+    /// bus carries a Secret Service the app's credential storage can use).
+    pub(crate) keyring_daemon: PathBuf,
 }
 
 /// Provision the three portal packages into sbx's store against the pinned `nixpkgs`, sharing the
@@ -165,13 +173,14 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
         roots.push(root);
     }
     // `resolved` is in `PACKAGES` order: dbus, xdg-desktop-portal, xdg-desktop-portal-gtk,
-    // desktop-file-utils.
+    // desktop-file-utils, gnome-keyring.
     let dbus_root = &resolved[0];
     Ok(Provision {
         dbus_daemon: dbus_root.join("bin/dbus-daemon"),
         xdp_root: resolved[1].clone(),
         gtk_root: resolved[2].clone(),
         update_desktop_db: resolved[3].join("bin/update-desktop-database"),
+        keyring_daemon: resolved[4].join("bin/gnome-keyring-daemon"),
         roots,
     })
 }
@@ -291,13 +300,18 @@ fn gtk_theme_for(color_scheme: &str) -> &'static str {
 /// config. Pure over its inputs, so the shape is unit-tested without launching a cage.
 pub(crate) fn wrap_command(
     bash: &Path,
-    dbus_daemon: &Path,
-    xdp_root: &Path,
-    gtk_root: &Path,
-    update_desktop_db: &Path,
+    provision: &Provision,
     color_scheme: Option<&str>,
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
+    let Provision {
+        dbus_daemon,
+        xdp_root,
+        gtk_root,
+        update_desktop_db,
+        keyring_daemon,
+        ..
+    } = provision;
     let session = session_conf(CAGE_SOCK, xdp_root, gtk_root);
     let seed = match color_scheme {
         Some(scheme) => {
@@ -330,12 +344,28 @@ pub(crate) fn wrap_command(
          sleep 1; done ) &\n",
         udd = update_desktop_db.display(),
     );
+    // The Secret Service, started AFTER the bus it registers on. `--daemonize` makes this
+    // synchronous the way `dbus-daemon --fork` is: the foreground process reads the passphrase,
+    // opens the keyring, claims `org.freedesktop.secrets`, and only then exits — so the app that
+    // `exec "$@"` runs next cannot race it. The passphrase arrives on stdin (never in the argv a
+    // `[proc]` lens would record), and `--components=secrets` starts only the Secret Service: no
+    // ssh-agent (sbx brokers that one), no PKCS#11. The keyring file lands in the app's isolated
+    // home, so a login stored on one launch is still there on the next. Best-effort like the rest of
+    // the preamble: a cage whose keyring will not open still launches, with the app back on whatever
+    // fallback it chooses.
+    let keyring = format!(
+        "printf %s '{pass}' | \"{kr}\" --unlock --components=secrets --daemonize \
+         >/dev/null 2>&1 || true\n",
+        pass = KEYRING_PASSPHRASE,
+        kr = keyring_daemon.display(),
+    );
     let preamble = format!(
         "mkdir -p {dir}/xdg-desktop-portal 2>/dev/null\n\
          cat > {dir}/session.conf <<'SBXPORTALCF'\n{session}SBXPORTALCF\n\
          cat > {dir}/xdg-desktop-portal/portals.conf <<'SBXPORTALPF'\n{portals}SBXPORTALPF\n\
          {seed}\
          {daemon} --config-file={dir}/session.conf --fork </dev/null >/dev/null 2>&1 || true\n\
+         {keyring}\
          {index}",
         dir = CAGE_DIR,
         daemon = dbus_daemon.display(),
@@ -343,6 +373,15 @@ pub(crate) fn wrap_command(
     );
     super::egress::wrap_background(bash, &preamble, "sbx-incage-portal", cmd)
 }
+
+/// The passphrase the in-cage keyring is unlocked with. A fixed literal on purpose: the keyring
+/// file lives in the app's isolated cage home and must reopen on every later launch, so the
+/// passphrase has to be stable and nobody is there to type one. That makes it a weak key, at exactly
+/// the trust level the plaintext fallback it replaces already had — what it buys is not secrecy
+/// against someone who can read that home (they can read the home either way, and under sbx's
+/// same-uid model that is the user themselves) but a **working** Secret Service, which several apps
+/// now require to start at all.
+const KEYRING_PASSPHRASE: &str = "sbx-in-cage";
 
 /// The GSettings keyfile value for a freedesktop `appearance color-scheme` `uint32`: `1` =
 /// prefer-dark, `2` = prefer-light, anything else (`0`/no-preference) = default. Shared by the
@@ -398,15 +437,26 @@ mod tests {
         assert_eq!(get("XDG_CONFIG_DIRS").as_deref(), Some("/run/sbx-portal"));
     }
 
+    /// The store paths a `wrap_command` test needs, as one value: the function reads them off a
+    /// [`Provision`], so a test that built them separately would be asserting against a shape the
+    /// caller does not have.
+    fn demo_provision() -> Provision {
+        Provision {
+            roots: Vec::new(),
+            dbus_daemon: PathBuf::from("/nix/store/ddd-dbus/bin/dbus-daemon"),
+            xdp_root: PathBuf::from("/nix/store/aaa-xdg-desktop-portal"),
+            gtk_root: PathBuf::from("/nix/store/bbb-xdg-desktop-portal-gtk"),
+            update_desktop_db: PathBuf::from("/nix/store/eee-dfu/bin/update-desktop-database"),
+            keyring_daemon: PathBuf::from("/nix/store/fff-gk/bin/gnome-keyring-daemon"),
+        }
+    }
+
     #[test]
     fn wrap_command_starts_the_daemon_positionally_and_seeds_the_theme() {
         let cmd = vec![OsString::from("demo-app"), OsString::from("--flag")];
         let argv = wrap_command(
             Path::new("/bin/bash"),
-            Path::new("/nix/store/ddd-dbus/bin/dbus-daemon"),
-            Path::new("/nix/store/aaa-xdg-desktop-portal"),
-            Path::new("/nix/store/bbb-xdg-desktop-portal-gtk"),
-            Path::new("/nix/store/eee-dfu/bin/update-desktop-database"),
+            &demo_provision(),
             Some("prefer-dark"),
             cmd,
         );
@@ -445,14 +495,75 @@ mod tests {
         assert_eq!(argv[5], OsString::from("--flag"));
     }
 
+    /// The Secret Service is what several Electron apps now consult before they finish rendering, so
+    /// the preamble must start it — after the bus that carries it, and synchronously, so the app
+    /// `exec "$@"` runs next cannot beat it to the name.
+    #[test]
+    fn the_preamble_starts_the_keyring_after_the_bus_and_waits_for_it() {
+        let argv = wrap_command(
+            Path::new("/bin/bash"),
+            &demo_provision(),
+            None,
+            vec![OsString::from("x")],
+        );
+        let script = argv[2].to_string_lossy();
+        let bus = script
+            .find("dbus-daemon --config-file=")
+            .expect("the bus is started");
+        let keyring = script
+            .find("gnome-keyring-daemon")
+            .expect("the keyring is started");
+        assert!(
+            bus < keyring,
+            "the keyring registers ON the bus, so it must start after it: {script}"
+        );
+        // `--daemonize` is the synchronization: the foreground process claims the name and only
+        // then exits, the way `dbus-daemon --fork` blocks until its socket is ready. Backgrounding
+        // it with `&` instead would let the app read `isEncryptionAvailable` before the name lands.
+        assert!(
+            script.contains("--unlock --components=secrets --daemonize"),
+            "the keyring must be started synchronously and with only the Secret Service: {script}"
+        );
+        assert!(
+            !script.contains("gnome-keyring-daemon --unlock --components=secrets --daemonize &"),
+            "backgrounding it would reintroduce the race --daemonize exists to close: {script}"
+        );
+    }
+
+    /// A passphrase on the command line would be recorded verbatim by the `[proc]` lens, which
+    /// writes the full argv of every exec it observes. Feeding it on stdin keeps it out of that
+    /// record; the value is weak by design, but weak is not the same as published.
+    #[test]
+    fn the_keyring_passphrase_never_rides_the_argv() {
+        let argv = wrap_command(
+            Path::new("/bin/bash"),
+            &demo_provision(),
+            None,
+            vec![OsString::from("x")],
+        );
+        let script = argv[2].to_string_lossy();
+        let start = script
+            .find("gnome-keyring-daemon")
+            .expect("the keyring is started");
+        let line_end = script[start..]
+            .find('\n')
+            .map_or(script.len(), |n| start + n);
+        let invocation = &script[start..line_end];
+        assert!(
+            !invocation.contains(KEYRING_PASSPHRASE),
+            "the passphrase must not follow the binary on its own line: {invocation}"
+        );
+        assert!(
+            script.contains(&format!("printf %s '{KEYRING_PASSPHRASE}' |")),
+            "the passphrase must arrive on stdin: {script}"
+        );
+    }
+
     #[test]
     fn wrap_command_without_a_theme_writes_no_keyfile() {
         let argv = wrap_command(
             Path::new("/bin/bash"),
-            Path::new("/nix/store/ddd-dbus/bin/dbus-daemon"),
-            Path::new("/nix/store/aaa-xdg-desktop-portal"),
-            Path::new("/nix/store/bbb-xdg-desktop-portal-gtk"),
-            Path::new("/nix/store/eee-dfu/bin/update-desktop-database"),
+            &demo_provision(),
             None,
             vec![OsString::from("x")],
         );

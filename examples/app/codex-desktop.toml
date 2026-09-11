@@ -68,12 +68,17 @@
 # IS the boundary, replacing Chromium's own redundant sandbox); `--ozone-platform=wayland` selects
 # the Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
 #
-# `--password-store=basic`: Chromium normally encrypts its session cookie with a key from the OS
-# keyring (Secret Service, over dbus), which the cage's private bus does not expose — so without it
-# the cookie cannot be re-decrypted next launch and you are logged out. The package's own
-# `Suggests: gir1.2-gnomekeyring-1.0` is the vendor saying it looks for exactly that keyring.
-# `basic` forces the file store in the isolated $HOME (a weak fixed key — acceptable: the token
-# already lives only in the per-app isolated cage home, never the project shell).
+# CREDENTIAL STORAGE — the cage carries its own keyring. Under `dbus = true` sbx puts a Secret
+# Service (`org.freedesktop.secrets`) on the cage's private bus, backed by a keyring file inside the
+# app's isolated home. Chromium and Electron both find it, so the session cookie is encrypted with a
+# real key and survives a relaunch, and `safeStorage` reports itself available — which recent
+# versions of this app require before they will finish rendering. This profile therefore passes NO
+# `--password-store` override: forcing `basic` makes the app treat encryption as unavailable and it
+# stops at its error screen, keyring or not.
+#
+# MIGRATING an app home created before the in-cage keyring existed: its old secrets were sealed with
+# the plaintext fallback's fixed key, which the keyring cannot read, so the first launch after this
+# change signs you out once. Sign in again and it persists from then on.
 #
 # CREDENTIAL POSTURE — account sign-in, with an optional BYOK key. You sign in with your ChatGPT
 # account, ONCE inside the cage; the session then persists in the app's dedicated, persistent,
@@ -153,7 +158,11 @@ cmd = [
     "--ozone-platform=wayland",
     "--disable-dev-shm-usage",
     "--use-system-ca",
-    "--password-store=basic",
+    # Name the credential store explicitly. Chromium does NOT pick its backend from what is on the
+    # bus: it reads `XDG_CURRENT_DESKTOP`, and a cage sets no desktop name, so it falls back to the
+    # plaintext store even when a Secret Service is right there. Naming the backend is what makes it
+    # use the keyring `dbus = true` provides.
+    "--password-store=gnome-libsecret",
 ]
 
 gui = "wayland"
@@ -199,8 +208,8 @@ use = ["codex-desktop"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
-https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--no-first-run", "--no-default-browser-check"]
 codex = ["codex-desktop", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage"]
 
 [network]

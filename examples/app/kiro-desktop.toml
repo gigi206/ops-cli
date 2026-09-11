@@ -61,7 +61,7 @@
 # chooser (open folder / attach file) opens IN-CAGE and lists the cage filesystem, relays
 # notifications, and follows your host light/dark theme. Electron flags: `--no-sandbox` is mandatory
 # and acceptable (bubblewrap + seccomp + the empty netns IS the boundary); `--ozone-platform=wayland`
-# selects Wayland; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`; `--password-store=basic`
+# selects Wayland; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`; `--password-store=gnome-libsecret`
 # forces the file cookie/token store (no keyring in the cage) so a login survives a relaunch;
 # `--use-system-ca` tells the embedded Chromium to trust sbx's MITM CA (seeded into the cage NSS db
 # under a filtering posture, part of the GUI hole).
@@ -134,7 +134,7 @@ cmd = [
     "--ozone-platform=wayland",
     "--disable-dev-shm-usage",
     "--use-system-ca",
-    "--password-store=basic",
+    "--password-store=gnome-libsecret",
 ]
 
 gui = "wayland"
@@ -189,8 +189,8 @@ use = ["kiro-desktop"]
 #
 # Must stay below every top-level key: written above one, TOML would fold that key into this table.
 [open]
-http = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
-https = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+http = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=gnome-libsecret", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+https = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=gnome-libsecret", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
 
 [network]
 mode = "deny"
