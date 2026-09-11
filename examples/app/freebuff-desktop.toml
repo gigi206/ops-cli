@@ -61,8 +61,11 @@
 # therefore provisions an IN-CAGE Chromium and names it in `[open]`, which covers both ways a link is
 # opened: a direct `xdg-open` call, and — the load-bearing one under `dbus = true`, where
 # `openExternal` routes through the portal's `org.freedesktop.portal.OpenURI` and consults the desktop
-# database instead — the desktop entry sbx generates from the same declaration. `--password-store=gnome-libsecret` forces the file cookie store (no keyring in the
-# cage) so a login survives a relaunch. If you would rather sign in with an API key (no browser), drop the
+# database instead — the desktop entry sbx generates from the same declaration.
+# `--password-store=gnome-libsecret` names the in-cage keyring a `dbus = true` portal now starts (Chromium
+# picks its backend
+# from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a login survives a relaunch. If you would
+# rather sign in with an API key (no browser), drop the
 # `chromium` package and the wrapper for a bare `freebuff` argv with the Electron flags.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a

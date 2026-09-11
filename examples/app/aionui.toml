@@ -85,7 +85,9 @@
 # claude-desktop / hermes-desktop. HEAVY: it pulls the Chromium closure into the store on first
 # launch (see [packages]). The provider's OWN login
 # hosts must be in [network] below — add them from `sbx net logs -a aionui` on your first login attempt.
-# `--password-store=gnome-libsecret` forces the file cookie store (no keyring in the cage) so the OAuth session
+# `--password-store=gnome-libsecret` names the in-cage keyring a
+# `dbus = true` portal now starts (Chromium picks its backend
+# from `XDG_CURRENT_DESKTOP`, which a cage does not set) so the OAuth session
 # survives a relaunch. If you only ever use API keys, drop the `[open]` table + the chromium package.
 #
 # MANAGED NODE RUNTIME (why the wrapper stages it). AionUi's backend, AionCore, ships a bundled Node

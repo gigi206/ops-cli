@@ -62,7 +62,8 @@
 # notifications, and follows your host light/dark theme. Electron flags: `--no-sandbox` is mandatory
 # and acceptable (bubblewrap + seccomp + the empty netns IS the boundary); `--ozone-platform=wayland`
 # selects Wayland; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`; `--password-store=gnome-libsecret`
-# forces the file cookie/token store (no keyring in the cage) so a login survives a relaunch;
+# names the in-cage keyring a `dbus = true` portal now starts (Chromium picks its backend
+# from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a login survives a relaunch;
 # `--use-system-ca` tells the embedded Chromium to trust sbx's MITM CA (seeded into the cage NSS db
 # under a filtering posture, part of the GUI hole).
 #

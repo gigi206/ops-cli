@@ -92,9 +92,10 @@
 # CAVEATS (honest):
 #   * Quitting — a GUI Electron app ignores a single Ctrl+C and closing the window may not quit. Press
 #     Ctrl+C twice within 2s to force-quit the session, or `sbx session stop <id>` from another terminal.
-#   * Credential persistence — the app may want the system keyring (Secret Service / dbus), which the
-#     hermetic cage does not provide, and should fall back to a file under the isolated home
-#     (`--password-store=gnome-libsecret` forces Chromium's file store). Confirm the login survives a relaunch.
+#   * Credential persistence — the app may want the system keyring (Secret Service / dbus). A cage
+#     with `dbus = true` now starts its own, and `--password-store=gnome-libsecret` names it:
+#     Chromium picks its backend from `XDG_CURRENT_DESKTOP`, which a cage does not set, so without
+#     the flag it falls back to the plaintext store. Confirm the login survives a relaunch.
 #   * In-app self-update — the IDE self-updates in the background from the same updater API + gvt1 CDN.
 #     A self-downloaded binary is NOT autoPatchelf'd, so it cannot run in the cage — the in-app updater
 #     is inert; **`sbx upgrade --app antigravity` is the real upgrade path**. Those hosts are muted below.

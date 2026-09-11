@@ -101,9 +101,9 @@
 #     app reads that switch on close and quits rather than hiding. Under a WSL kernel the setting
 #     matters more, because the compositor leaves the hidden window's frame standing on the Windows
 #     desktop, where it reads as an application that froze.
-#   * Credential persistence — the app may want the system keyring (Secret Service / dbus), which the
-#     hermetic cage does not provide, and should fall back to a file under the isolated home. Confirm
-#     the login survives a relaunch.
+#   * Credential persistence — the app wants the system keyring (Secret Service / dbus). A cage with
+#     `dbus = true` now starts its own and `--password-store=gnome-libsecret` names it; measured on
+#     this profile, `safeStorage` went from four complaints per launch to none.
 #   * `deb:` build — PROVEN host-side (the `.deb` unpacks, autoPatchelfs, and wraps its launcher). Two
 #     sbx-core fixes made it work and now benefit every Electron `deb:` app: the extraction drops the
 #     setuid bit on Chromium's `chrome-sandbox` (an unprivileged nix builder cannot set setuid), and

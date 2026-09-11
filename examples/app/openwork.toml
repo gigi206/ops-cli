@@ -113,16 +113,19 @@
 # The app ALSO embeds a browser panel that intercepts `openwork://` on its own ("so in-app browser
 # auth works without the system protocol handler", in upstream's words), so a sign-in driven entirely
 # from inside that panel closes without any of the above. It is a second route, not a replacement:
-# every link the app hands to `openExternal` still needs the wrapper. `--password-store=gnome-libsecret` forces
-# the file cookie store (no keyring in the cage) so a login survives a relaunch.
+# every link the app hands to `openExternal` still needs the wrapper. `--password-store=gnome-libsecret`
+# names the in-cage keyring a `dbus = true` portal now starts (Chromium picks its backend
+# from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a login survives a relaunch.
 #
 # WHAT DOES NOT WORK IN THE CAGE, and why. OpenWork-MANAGED OAuth — the flow that connects a
 # third-party service (Google Workspace, Microsoft 365) through OpenWork rather than through your own
 # key — refuses to start: it derives its vault key from Electron's `safeStorage` and rejects the
-# `basic_text` backend outright ("A secure Linux password store is required"), which is the only
-# backend available with no keyring in the cage. Nothing else depends on it — the vault key is loaded
-# lazily, the first time you opt into that flow. Your own provider keys, the Den login and the
-# workspace itself are unaffected.
+# `basic_text` backend outright ("A secure Linux password store is required"), which was the only
+# backend available before a cage carried a keyring. This profile declares `dbus = true` and now
+# names `gnome-libsecret`, so the Secret Service the flow demands is present — whether that lifts
+# the refusal is UNMEASURED on this app. Nothing else depends on it: the vault key is loaded lazily,
+# the first time you opt into that flow, and your own provider keys, the Den login and the workspace
+# itself are unaffected.
 cmd = [
     "openwork",
     "--no-sandbox",

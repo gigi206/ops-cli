@@ -68,8 +68,10 @@
 # IN-CAGE Chromium — the provider consent page and the loopback callback both resolve inside the
 # sandbox, no host browser, no `forward`. Same pattern as aionui / claude-desktop. HEAVY: it pulls
 # the Chromium closure into the store on first launch (see [packages]). Each provider's OWN login hosts must be in [network] — add them from
-# `sbx net logs -a t3code` on your first login attempt. `--password-store=gnome-libsecret` forces the file cookie
-# store (no keyring in the cage) so a login survives a relaunch. If every agent you use is configured
+# `sbx net logs -a t3code` on your first login attempt. `--password-store=gnome-libsecret` names the
+# in-cage keyring a `dbus = true` portal now starts (Chromium picks its backend
+# from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a login survives a relaunch. If every agent
+# you use is configured
 # with an API KEY instead of OAuth (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY in its own config), you
 # can drop the `[open]` table + the chromium package.
 # A plain argv, not a `bash -c`: nothing here derives a value, tests a path or writes a file, so a

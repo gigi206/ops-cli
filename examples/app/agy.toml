@@ -40,7 +40,7 @@
 #
 # CAVEATS (honest, still to be proven with your Google account):
 #   * Keyring — Antigravity is documented to store its credential in the system keyring
-#     (Secret Service / dbus), which the hermetic cage does NOT provide. If it cannot fall
+#     (Secret Service / dbus), which a cage with `dbus = true` now provides. If it cannot fall
 #     back to a token FILE under the isolated home, the login will not persist across
 #     launches (or may fail outright). This is the one unproven blocker; test it with your
 #     account before relying on the profile.

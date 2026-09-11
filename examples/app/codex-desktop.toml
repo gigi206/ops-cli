@@ -141,7 +141,7 @@
 #     window may not quit. Press **Ctrl+C twice within 2s** to force-quit the session (sbx
 #     terminates the cage), or `sbx session stop <id>` from another terminal.
 #   * Credential persistence — confirm the login survives a relaunch. The app may want the system
-#     keyring, which the hermetic cage does not provide, and should fall back to a file under the
+#     keyring, which a cage with `dbus = true` now provides, and should fall back to a file under the
 #     isolated home.
 #   * If the app signs in but comes back EMPTY — no settings, no thread list, no Codex sessions —
 #     while ordinary chat works, that is sbx refusing to carry a credential toward a host it was not

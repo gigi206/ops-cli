@@ -64,7 +64,9 @@
 # notifications, and follows your host light/dark theme. The Electron flags: `--no-sandbox` is
 # mandatory and acceptable (bubblewrap + seccomp + the empty netns IS the boundary); `--ozone-platform=
 # wayland` selects Wayland; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`;
-# `--password-store=gnome-libsecret` forces the file cookie/token store (no keyring in the cage) so a login
+# `--password-store=gnome-libsecret` names the in-cage keyring a
+# `dbus = true` portal now starts (Chromium picks its backend
+# from `XDG_CURRENT_DESKTOP`, which a cage does not set) so a login
 # survives a relaunch.
 #
 # CREDENTIAL POSTURE — a Cursor ACCOUNT login (NOT a header-injectable key), wired via an in-cage
