@@ -18,9 +18,21 @@
 //! throughout — no host session bus, no host portal, or a home that cannot be written simply leaves
 //! the app on its at-launch theme (the seed), never blocking the launch.
 //!
+//! **Under WSL the source is not a bus.** The desktop whose preference this mirrors runs on the
+//! Windows side, which owns no portal and emits no signal a Linux subscriber can hear. It does
+//! notify, though: `RegNotifyChangeKeyValue` blocks until the theme value is written and returns
+//! within milliseconds of it, so the relay follows Windows through one long-lived interop process
+//! whose output it reads ([`WATCH_SCRIPT`]) rather than by asking again on a timer. Which source a
+//! launch follows is decided the way the seed decides it ([`read_host_color_scheme`]): the portal
+//! when it answers, Windows when it does not and the kernel is a WSL one.
+//!
 //! Lifecycle mirrors [`super::notify_relay`]: [`ThemeRelay::start`] spawns a dedicated thread driving
 //! the async work with `async_io::block_on` (no tokio); the guard's `Drop` closes a shutdown channel
-//! and joins the thread.
+//! and joins the thread. The WSL body waits on a pipe instead of that channel, so `Drop` also ends
+//! the watcher process, which is what closes the pipe. That watcher is started only after
+//! [`WATCH_START_DELAY`], because starting it competes with the launch it runs alongside, and a
+//! cage can end before the delay elapses: [`WatchSlot`] is what carries the stop across that
+//! window, so the process is killed whichever of the two arrives first.
 
 use crate::diag;
 use futures_util::{FutureExt, StreamExt};
@@ -64,16 +76,8 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// signal: the value read once at launch and the values mirrored afterwards must be the same
 /// setting read the same way, or the app would open on one interpretation and switch to another.
 pub(crate) fn read_host_color_scheme() -> Option<String> {
-    let from_portal = async_io::block_on(async {
-        futures_util::select! {
-            scheme = current_color_scheme().fuse() => scheme,
-            // `Timer` is both a `Future` and a `Stream`, so name the trait rather than let
-            // `.fuse()` resolve to the stream one.
-            _ = FutureExt::fuse(async_io::Timer::after(READ_TIMEOUT)) => None,
-        }
-    });
-    if from_portal.is_some() {
-        return from_portal;
+    if let Some(from_portal) = portal_color_scheme() {
+        return Some(from_portal);
     }
     // No portal answered. Under WSL that is the normal case rather than a failure — the desktop
     // whose preference this is runs on the Windows side, which answers through a registry value
@@ -81,6 +85,23 @@ pub(crate) fn read_host_color_scheme() -> Option<String> {
     // the read gives up, exactly as before: the branch is gated on the kernel being a WSL one, so a
     // Linux host with no portal reaches no process spawn it did not reach yesterday.
     windows_fallback(host_is_wsl(), read_windows_color_scheme)
+}
+
+/// The bounded portal read on its own, because the relay must ask the **same** question the seed
+/// asked before choosing what to follow.
+///
+/// A launch that seeded from the portal has a portal to subscribe to; one that seeded from Windows
+/// does not, and following the other source would correct the cage to a value read a second way.
+/// Sharing the read is what keeps the seed and the relay on one interpretation.
+fn portal_color_scheme() -> Option<String> {
+    async_io::block_on(async {
+        futures_util::select! {
+            scheme = current_color_scheme().fuse() => scheme,
+            // `Timer` is both a `Future` and a `Stream`, so name the trait rather than let
+            // `.fuse()` resolve to the stream one.
+            _ = FutureExt::fuse(async_io::Timer::after(READ_TIMEOUT)) => None,
+        }
+    })
 }
 
 /// The fallback itself, with its gate and its reader passed in so both halves are testable: the
@@ -102,15 +123,16 @@ fn windows_fallback(is_wsl: bool, read: impl FnOnce() -> Option<String>) -> Opti
 /// on this side that promises it returns. The budget is the portal read's, so a host that answers
 /// through neither channel costs one launch the same wait twice rather than an unbounded one.
 ///
-/// This serves the launch seed alone. The relay that mirrors a **later** switch stays on the bus
-/// signal it subscribes to, and WSL offers no such signal: following live here would mean polling
-/// Windows, which is an interop round-trip per poll for a value that changes twice a day. A cage
-/// therefore opens in the desktop's theme and keeps it for the session.
+/// This serves the launch seed alone: one question, one answer. A **later** switch is followed by
+/// the relay, which under WSL watches the same value through [`WATCH_SCRIPT`] instead of asking
+/// again — Windows notifies on a write to the key, so following it costs one long-lived process
+/// and no repeated round-trip.
 fn read_windows_color_scheme() -> Option<String> {
-    // Interop is still a program looked up on `PATH`, so it goes through the one search that reads
-    // absolute entries only: an empty element resolves from the current directory, which here is
-    // the project tree the cage writes.
-    let reg = crate::pathfind::find_on_path("reg.exe")?;
+    // Interop is still a program looked up on `PATH`, so it goes through the search that reads
+    // absolute entries only — an empty element resolves from the current directory, which here is
+    // the project tree the cage writes — and that weighs each match's owner and mode. `None` leaves
+    // the cage on the default theme, this function's existing answer for a host with no registry.
+    let reg = crate::store::find_trusted_on_path("reg.exe")?;
     let mut child = std::process::Command::new(reg)
         .args([
             "query",
@@ -219,11 +241,216 @@ pub(crate) async fn color_scheme_of(settings: &HostSettingsProxy<'_>) -> Option<
     extract_u32(&value).map(|n| super::portal::color_scheme_name(n).to_string())
 }
 
+/// How long the relay waits before starting the Windows-side watcher, on WSL only.
+///
+/// Starting it costs the launch it runs alongside, and the cost is not the spawn: a `spawn` of a
+/// Windows program returns in tens of milliseconds, but the program it starts then runs on the
+/// Windows side of the same machine. A `powershell.exe` that prints nothing takes about two
+/// seconds of wall time for no measurable CPU on the Linux side, because the work is a .NET
+/// startup happening beyond that boundary, and under WSL that boundary is inside the same host.
+/// Measured on a two-CPU virtual machine, a cage launch with `dbus = true` went from about 2.5
+/// seconds to about 4.5 when the watcher started with it, and stripping the interop entries out
+/// of `PATH` restored it exactly.
+///
+/// The wait is the remedy because the watcher's work is **independent of the launch**. It only
+/// has to be running soon, not now: what it exists to catch is a theme switch made while an app
+/// is open, and a switch inside the first seconds of a cage's life is not worth charging every
+/// launch for. The value clears a `gui` + `dbus` launch on the machine it was sized against
+/// (setup measured at 2.5 to 4 seconds there) with room to spare; re-measure before changing it,
+/// and re-measure the launch itself, since that is what it is sized against.
+///
+/// It is not a configuration field: a value nobody can size without the measurement above is
+/// surface without a user.
+const WATCH_START_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The Windows-side watcher the relay runs under WSL: block until the theme value is written, print
+/// what it became, repeat. Handed to `powershell.exe` as a single `-Command` argument, the way the
+/// toast sink hands it one, so no shell parses it on the way.
+///
+/// `RegNotifyChangeKeyValue` with `fAsynchronous = false` **blocks** its caller until the key is
+/// written. That is what makes this a notification and not a poll: between two switches the process
+/// waits in the kernel and costs nothing, and it returns within milliseconds of the write. It is
+/// the only Win32 call here, reached through `Add-Type` because PowerShell binds no wrapper for it.
+///
+/// Each change is printed in the shape `reg.exe query` prints, so a watcher line and a seed read go
+/// through [`windows_scheme_name`] — the one place the inverted scales are reconciled. Printing any
+/// other shape would put that mapping in two places, which is how a cage ends up opening in one
+/// theme and being corrected into the opposite one.
+const WATCH_SCRIPT: &str = r#"$sig = @'
+[DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+public static extern int RegOpenKeyExW(IntPtr hKey, string subKey, int opts, int sam, out IntPtr res);
+[DllImport("advapi32.dll", SetLastError=true)]
+public static extern int RegNotifyChangeKeyValue(IntPtr hKey, bool subtree, int filter, IntPtr hEvent, bool async);
+'@
+$api = Add-Type -MemberDefinition $sig -Name SbxRegWatch -Namespace Sbx -PassThru
+$key = 'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+$h = [IntPtr]::Zero
+if ($api::RegOpenKeyExW([IntPtr]::new(-2147483647), $key, 0, 0x10, [ref]$h) -ne 0) { exit 1 }
+while ($true) {
+  if ($api::RegNotifyChangeKeyValue($h, $false, 0x4, [IntPtr]::Zero, $false) -ne 0) { exit 1 }
+  $v = (Get-ItemProperty -Path ('HKCU:\' + $key) -Name AppsUseLightTheme -EA SilentlyContinue).AppsUseLightTheme
+  if ($null -ne $v) {
+    [Console]::Out.WriteLine('    AppsUseLightTheme    REG_DWORD    0x' + ('{0:x}' -f [int]$v))
+    [Console]::Out.Flush()
+  }
+}"#;
+
+/// Whether this relay follows Windows rather than a host bus, from the two facts that decide it.
+///
+/// Pure, and named for the reason [`windows_fallback`] is: what matters is the process that does
+/// **not** start off WSL, and an absence is only provable against a decision that can be asked
+/// without a bus or a registry to stand up first.
+fn relay_follows_windows(portal_answered: bool, is_wsl: bool) -> bool {
+    !portal_answered && is_wsl
+}
+
+/// Whether a watcher that has just started may be published into the shared slot, or must be
+/// killed on the spot.
+///
+/// Pure and named for the reason [`relay_follows_windows`] is: the case worth asserting is the one
+/// that is hard to reach on purpose — the relay ended while the thread was waiting out its delay,
+/// so the process it then starts belongs to a cage that is gone. A thread that published it anyway
+/// would go on to read a pipe nothing will close, and the `join` in [`ThemeRelay::drop`] would wait
+/// on that read for as long as the process lived.
+fn may_publish(stopping: bool) -> bool {
+    !stopping
+}
+
+/// Start the Windows-side watcher, or `None` on a host with no interop to start it with.
+///
+/// Same `PATH` posture as [`read_windows_color_scheme`]: interop is a program lookup like any
+/// other, so it takes the search that refuses a relative entry and weighs each match's owner and
+/// mode, rather than running whatever `powershell.exe` the `PATH` happens to reach first.
+fn spawn_windows_watcher() -> Option<std::process::Child> {
+    let powershell = crate::store::find_trusted_on_path("powershell.exe")?;
+    std::process::Command::new(powershell)
+        .args(["-NoProfile", "-Command", WATCH_SCRIPT])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Mirror each watcher line into the in-cage keyfile, until the watcher's output ends.
+///
+/// Blocking rather than async, and deliberately: this loop's only wait is the pipe, and what ends
+/// it is [`ThemeRelay::drop`] killing the watcher — which closes the pipe and ends the read. A
+/// shutdown channel to select against would duplicate a stop the kill already performs.
+///
+/// A line that does not parse is skipped rather than ending the loop: the watcher prints one shape,
+/// but a PowerShell that wrote anything else to its output would otherwise cost the rest of the
+/// session's changes over a line that costs nothing to ignore.
+fn run_windows_watch(home: &Path, stdout: std::process::ChildStdout) {
+    use std::io::BufRead;
+    for line in std::io::BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+    {
+        if let Some(scheme) = windows_scheme_name(&line) {
+            write_keyfile(home, scheme);
+        }
+    }
+}
+
+/// The relay thread's body: follow the source the seed followed.
+///
+/// Split from [`ThemeRelay::start`] so the thread closure stays one call, and because the two
+/// sources fail differently — a bus that goes away is a teardown race worth swallowing, while a
+/// watcher that will not start is a capability this launch loses and says so once.
+fn run_relay(
+    home: PathBuf,
+    shutdown: async_channel::Receiver<()>,
+    watcher: &std::sync::Mutex<WatchSlot>,
+) {
+    if !relay_follows_windows(portal_color_scheme().is_some(), host_is_wsl()) {
+        if let Err(e) = async_io::block_on(run_portal(home, shutdown)) {
+            // A connection error is almost always the session ending (the host bus went away)
+            // — a benign teardown race, not worth alarming the user. Only a genuinely
+            // unexpected failure warns.
+            let msg = e.to_string();
+            if !msg.contains("Connection refused")
+                && !msg.contains("Broken pipe")
+                && !msg.contains("reset by peer")
+            {
+                diag::warn(&format!(
+                    "`dbus = true`: the live-theme relay stopped ({e}) — the app keeps its \
+                     at-launch theme"
+                ));
+            }
+        }
+        return;
+    }
+    // The wait is on the shutdown channel rather than the clock, because a cage can end before it
+    // elapses: a short command finishes in milliseconds, `Drop` runs while this thread is still
+    // waiting, and a sleep would wake to start a watcher for a cage that no longer exists. Waiting
+    // on the channel makes an early end of the launch the other way out of the delay. A closed
+    // channel returns immediately, which is that same case seen one moment later.
+    let ended = async_io::block_on(async {
+        futures_util::select! {
+            _ = shutdown.recv().fuse() => true,
+            _ = FutureExt::fuse(async_io::Timer::after(WATCH_START_DELAY)) => false,
+        }
+    });
+    if ended {
+        return;
+    }
+    let Some(mut child) = spawn_windows_watcher() else {
+        diag::warn(
+            "`dbus = true`: no interop to watch the Windows theme with — the app keeps its \
+             at-launch theme",
+        );
+        return;
+    };
+    // Take the pipe before the process is handed over: the reader holds one end while `Drop` holds
+    // the process, and those are the two halves of the same stop.
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    // Publishing the child and reading `stopping` under one lock is what closes the window between
+    // them. `Drop` can still arrive between the wait above and this line; it then leaves `stopping`
+    // set and finds no child to kill, so the child born a moment later is killed here instead. The
+    // reverse order has `Drop` kill it. Without the flag this thread would go on to read a pipe
+    // nothing will ever close, and the `join` in `Drop` would wait on it forever.
+    match watcher.lock() {
+        Ok(mut slot) if may_publish(slot.stopping) => slot.child = Some(child),
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+    }
+    run_windows_watch(&home, stdout);
+}
+
+/// What [`ThemeRelay`] and its thread share about the Windows-side watcher: the process once it
+/// exists, and whether the relay has been told to stop.
+///
+/// Both under one lock, because the two facts are only useful together. The watcher is started
+/// after a delay, so there is a window in which the relay has ended and the process it would own
+/// does not exist yet; a slot holding only the process cannot express that, and the thread would
+/// start a watcher for a cage that is gone and then block reading it forever.
+#[derive(Default)]
+struct WatchSlot {
+    /// Set by [`ThemeRelay::drop`]. A thread that finds it set kills whatever it just started
+    /// instead of publishing it.
+    stopping: bool,
+    /// The watcher, once started and published. `None` before that, and on a host that follows the
+    /// bus instead.
+    child: Option<std::process::Child>,
+}
+
 /// A running theme relay: the shutdown channel signalling its thread to stop, and the thread handle.
 /// Dropping it closes the channel (breaking the relay's loop) and joins the thread.
 pub(crate) struct ThemeRelay {
     shutdown: async_channel::Sender<()>,
     handle: Option<JoinHandle<()>>,
+    /// The Windows-side watcher, on a launch that follows Windows rather than a bus. Held because
+    /// its reader waits on a pipe that no channel reaches: ending the process is what closes the
+    /// pipe, so `Drop` needs the process itself. Untouched on every other host.
+    watcher: std::sync::Arc<std::sync::Mutex<WatchSlot>>,
 }
 
 impl ThemeRelay {
@@ -237,42 +464,46 @@ impl ThemeRelay {
     /// at-launch theme (best-effort).
     pub(crate) fn start(home: PathBuf) -> ThemeRelay {
         let (shutdown, rx) = async_channel::bounded::<()>(1);
+        let watcher = std::sync::Arc::new(std::sync::Mutex::new(WatchSlot::default()));
+        let theirs = std::sync::Arc::clone(&watcher);
         let handle = std::thread::Builder::new()
             .name("sbx-theme-relay".to_string())
-            .spawn(move || {
-                if let Err(e) = async_io::block_on(run(home, rx)) {
-                    // A connection error is almost always the session ending (the host bus went away)
-                    // — a benign teardown race, not worth alarming the user. Only a genuinely
-                    // unexpected failure warns.
-                    let msg = e.to_string();
-                    if !msg.contains("Connection refused")
-                        && !msg.contains("Broken pipe")
-                        && !msg.contains("reset by peer")
-                    {
-                        diag::warn(&format!(
-                            "`dbus = true`: the live-theme relay stopped ({e}) — the app keeps its \
-                             at-launch theme"
-                        ));
-                    }
-                }
-            })
+            .spawn(move || run_relay(home, rx, &theirs))
             .ok();
-        ThemeRelay { shutdown, handle }
+        ThemeRelay {
+            shutdown,
+            handle,
+            watcher,
+        }
     }
 }
 
 impl Drop for ThemeRelay {
     fn drop(&mut self) {
         self.shutdown.close();
+        // The two bodies wait on different things, so both are ended here: the bus loop selects on
+        // the channel above, while the WSL loop is blocked reading the watcher's pipe and only
+        // the watcher's death closes it. Killing first, then joining, is what keeps the join from
+        // waiting on a read that nothing would ever end.
+        if let Ok(mut slot) = self.watcher.lock() {
+            // The flag first, and it matters even when there is a child to kill: the thread may be
+            // between its wait and publishing one, and this is what tells it not to.
+            slot.stopping = true;
+            if let Some(child) = slot.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 }
 
-/// The relay body: connect to the host session bus, subscribe to the appearance color-scheme signal,
-/// and mirror each change into the in-cage keyfile until shutdown.
-async fn run(
+/// The bus body: connect to the host session bus, subscribe to the appearance color-scheme signal,
+/// and mirror each change into the in-cage keyfile until shutdown. The source every host but WSL
+/// follows, and WSL too when a portal answers there.
+async fn run_portal(
     home: PathBuf,
     shutdown: async_channel::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -631,6 +862,90 @@ mod tests {
         assert_eq!(
             super::windows_scheme_name("    AppsUseLightTheme    REG_DWORD    zzz"),
             None
+        );
+    }
+
+    /// The gate decides whether an interop process starts, so it is asserted on all four
+    /// combinations rather than the one that happens to hold here: the case that matters is the
+    /// process that must NOT start off WSL, and that is only provable by naming it.
+    #[test]
+    fn only_a_wsl_host_whose_portal_stayed_silent_follows_windows() {
+        assert!(
+            super::relay_follows_windows(false, true),
+            "a WSL host with no portal has Windows as its only source"
+        );
+        assert!(
+            !super::relay_follows_windows(true, true),
+            "a WSL host whose portal answered is followed on the bus, so the seed and the relay \
+             read the same source"
+        );
+        assert!(
+            !super::relay_follows_windows(false, false),
+            "a Linux host with no portal starts no interop process — there is none to start"
+        );
+        assert!(!super::relay_follows_windows(true, false));
+    }
+
+    /// The watcher and the launch seed feed the SAME parser, which is the one place the inverted
+    /// scales are reconciled. This pins that contract from both ends: the shape the script prints,
+    /// and the parser reading it. Changing the script's output format fails here rather than in a
+    /// cage that silently stops following the theme.
+    #[test]
+    fn the_watcher_prints_the_shape_the_seed_parser_reads() {
+        assert!(
+            super::WATCH_SCRIPT.contains("'    AppsUseLightTheme    REG_DWORD    0x'"),
+            "the watcher must print a `reg.exe query` line, not a shape of its own"
+        );
+        assert_eq!(
+            super::windows_scheme_name("    AppsUseLightTheme    REG_DWORD    0x0"),
+            Some("prefer-dark"),
+            "a single watcher line parses like the multi-line read it imitates"
+        );
+        assert_eq!(
+            super::windows_scheme_name("    AppsUseLightTheme    REG_DWORD    0x1"),
+            Some("prefer-light")
+        );
+    }
+
+    /// `RegNotifyChangeKeyValue`'s last argument is what separates a notification from a poll: with
+    /// `fAsynchronous` true the call returns at once and the loop would spin. It is asserted here
+    /// because the difference is invisible in a review of the script's shape.
+    #[test]
+    fn the_watcher_blocks_rather_than_spinning() {
+        assert!(
+            super::WATCH_SCRIPT.contains("$false, 0x4, [IntPtr]::Zero, $false"),
+            "the notify call must be synchronous (fAsynchronous = $false) and filtered on \
+             REG_NOTIFY_CHANGE_LAST_SET"
+        );
+    }
+
+    /// The window the delay opens: a cage can end before the watcher is started, and then the
+    /// process must not be adopted. Both orders are asserted because only one of them is the one
+    /// that used to hang, and a test that covered the easy order would have passed on the defect.
+    #[test]
+    fn a_relay_that_ended_first_refuses_the_watcher_started_after_it() {
+        let slot = std::sync::Mutex::new(super::WatchSlot::default());
+
+        // The ordinary order: the thread publishes, and `Drop` later finds the process to kill.
+        {
+            let guard = slot.lock().unwrap();
+            assert!(
+                super::may_publish(guard.stopping),
+                "a live relay adopts the watcher it started"
+            );
+        }
+
+        // The order that hung: `Drop` ran during the delay, found no child, and set the flag. The
+        // thread wakes afterwards and must kill what it started rather than read it forever.
+        slot.lock().unwrap().stopping = true;
+        let guard = slot.lock().unwrap();
+        assert!(
+            !super::may_publish(guard.stopping),
+            "a relay that already ended must not adopt a watcher started after it"
+        );
+        assert!(
+            guard.child.is_none(),
+            "and `Drop` had nothing to kill, which is exactly why the flag has to carry the stop"
         );
     }
 }
