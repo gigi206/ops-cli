@@ -33,21 +33,29 @@ lock.
 ## The upgrade targets
 
 ```sh
-sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|distro|provision]
+sbx upgrade [all|nix|mise|distro|provision] [-a <name>]
 ```
 
 | Target | Rolls forward |
 |---|---|
+| `all` | every backend below (the default), plus the bundles' install steps under their own guards |
 | `nix` | the nixpkgs channel: the base userland and native `nix:` packages |
 | `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the declared operations' tool pool |
-| `flake` | the project's and apps' `flake:` packages |
-| `deb` | the project's and apps' `deb:` packages |
-| `appimage` | the project's and apps' `appimage:` packages |
-| `tarball` | the project's and apps' `tarball:` packages |
-| `binary` | the project's and apps' `binary:` packages |
 | `distro` | the declared [`distro`](../configuration/distro) image, re-resolved to the digest the registry serves now |
-| `all` | every lock-rewriting target above (the default), plus the bundles' install steps under their own guards |
 | `provision` | re-runs the apps' bundle install steps in-cage, one cage per app, regardless of their guards |
+
+The package backends (`flake:`, `deb:`, `appimage:`, `tarball:`, `binary:`) have **no
+target of their own**. `all` rolls every one of them, and to advance a single app you
+name the app rather than its backend:
+
+```sh
+sbx upgrade --app <name>
+```
+
+That narrows the roll to the app's own layer across every backend it rides, and leaves
+what belongs to the project alone: the mise engine, the project's `nix:` tools, the task
+pool, the baseline's packages, and the image. What each backend does when a roll reaches
+it is the table in [What each backend does on upgrade](#what-each-backend-does-on-upgrade).
 
 See [`sbx upgrade`](../cli/upgrade) for the flags (`-a <name>`, `--project <path>`) and
 the per-target behavior.

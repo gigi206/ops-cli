@@ -1,9 +1,13 @@
-//! `sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|distro|provision] [--project <path>]`: roll the
-//! managed channels and `[packages]` backends forward by re-resolving and rewriting their locks, so
-//! versions advance only on an explicit upgrade, never on an sbx binary update. `--project`
-//! retargets every roll at another project, exactly as running the command from that directory
-//! would. The lock-rewriting parts need nix to resolve but not the sandbox boundary; the in-cage
-//! `mise:` roll needs the cage and degrades to a warning where it is unavailable.
+//! `sbx upgrade [all|nix|mise|distro|provision] [-a <name>] [--project <path>]`: roll the managed
+//! channels and `[packages]` backends forward by re-resolving and rewriting their locks, so
+//! versions advance only on an explicit upgrade, never on an sbx binary update. `-a` narrows the
+//! whole roll to one app, across every backend that app rides; `--project` retargets it at another
+//! project, exactly as running the command from that directory would. The lock-rewriting parts need
+//! nix to resolve but not the sandbox boundary; the in-cage `mise:` roll needs the cage and degrades
+//! to a warning where it is unavailable.
+//!
+//! The five package backends are rolled by `all` and are not targets of their own: the unit a user
+//! narrows by is the app, not the backend its profile happens to declare. See [`TARGETS`].
 //!
 //! `provision` is the odd one out: an agent its bundle INSTALLS has no lock to rewrite, so what
 //! advances it is running that install again, in the app's own cage. `all` runs those steps too —
@@ -153,16 +157,16 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
     ParsedArgs::Run { what, project, app }
 }
 
-/// `sbx upgrade [all|nix|mise] [--project <path>]`: roll managed channels forward by
-/// re-resolving and rewriting their locks, so versions advance only here, never on an sbx
-/// binary update. `nix` rolls the nixpkgs channel the target directory tracks (a trusted
-/// project pin, else the global channel) — base and native `nix:` `[packages]`. `mise` rolls
-/// the mise engine (its own dedicated lock), the project's `nix:` tools, and the project's and
-/// apps' `mise:` `[packages]` (the last in-cage). `all` rolls every one of them and runs the
-/// bundles' install steps under their own guards. `--project <path>`
-/// runs the whole thing against another project instead of the current directory. The
-/// lock-rewriting parts need nix (to resolve) but not the sandbox boundary; the in-cage `mise:`
-/// roll needs the sandbox and degrades to a warning where it is unavailable.
+/// `sbx upgrade [all|nix|mise|distro|provision] [-a <name>] [--project <path>]`: parse, then hand
+/// the roll to [`run_upgrade`].
+///
+/// `nix` rolls the nixpkgs channel the target directory tracks (a trusted project pin, else the
+/// global channel) — base and native `nix:` `[packages]`. `mise` rolls the mise engine (its own
+/// dedicated lock), the project's `nix:` tools, and the project's and apps' `mise:` `[packages]`
+/// (the last in-cage). `distro` re-resolves the declared image. `all` rolls every one of them,
+/// every package backend, and the bundles' install steps under their own guards. `-a <name>`
+/// narrows all of that to one app; `--project <path>` runs it against another project instead of
+/// the current directory.
 pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
     // Parse an optional target word and an optional `--project <path>`, in any order, before
     // touching anything so a typo fails cleanly.

@@ -29,7 +29,7 @@ The consequence is the property the design calls **"seeded, not baked"**:
 > Tool versions move **only** on an explicit `sbx upgrade`. Updating the `sbx`
 > binary never changes what versions your projects get.
 
-`sbx upgrade [all|nix|mise|flake]` re-resolves the relevant channel and rewrites its
+`sbx upgrade [all|nix|mise|distro]` re-resolves the relevant channel and rewrites its
 lock; a launch reads the lock that `upgrade` wrote. See
 [Upgrading](../housekeeping/upgrade) and the [`sbx upgrade` reference](../cli/upgrade).
 
