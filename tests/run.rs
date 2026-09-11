@@ -5065,11 +5065,11 @@ fn a_deb_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated() {
 }
 
 #[test]
-fn sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage() {
-    // `sbx upgrade deb` is the whole point of `deb:resolve` (the `apps-must-be-upgradable` rule): it
+fn the_deb_roll_runs_a_deb_resolve_command_through_the_upgrade_cage() {
+    // The `deb:` roll is the whole point of `deb:resolve` (the `apps-must-be-upgradable` rule): it
     // must build its OWN resolver cage (`build_resolve_cage_parts` + `has_resolve_ref`, a code path
     // DISTINCT from the launch-time provisioning above) and re-run the command. The provisioning e2e
-    // does not exercise that path, so this one drives `sbx upgrade deb` directly. A `deb:resolve` that
+    // does not exercise that path, so this one drives `sbx upgrade` directly. A `deb:resolve` that
     // `printf`s an INVALID URL makes the upgrade FAIL, naming the token in the roll summary's
     // `re-resolve failed` line — which can only happen if the upgrade cage ran the command and
     // validated its stdout. Network-light: validation rejects before any `.deb` prefetch; only the
@@ -5108,12 +5108,7 @@ fn sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage() {
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["upgrade", "deb"],
-    );
+    let out = sbx_in(project.path(), data.path(), state.path(), &["upgrade"]);
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -5205,9 +5200,9 @@ fn an_appimage_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validat
 }
 
 #[test]
-fn sbx_upgrade_appimage_runs_an_appimage_resolve_command_through_the_upgrade_cage() {
+fn the_appimage_roll_runs_an_appimage_resolve_command_through_the_upgrade_cage() {
     // The `appimage:` twin of `sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage`:
-    // `sbx upgrade appimage` must build its OWN resolver cage (appimage's `build_resolve_cage_parts` +
+    // The `appimage:` roll must build its OWN resolver cage (appimage's `build_resolve_cage_parts` +
     // `has_resolve_ref`, distinct code from the launch-time provisioning) and re-run the command. An
     // `appimage:resolve` that `printf`s an INVALID URL makes the upgrade FAIL, naming the token in the
     // roll summary's `re-resolve failed` line. Network-light: validation rejects before any prefetch.
@@ -5243,12 +5238,7 @@ fn sbx_upgrade_appimage_runs_an_appimage_resolve_command_through_the_upgrade_cag
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["upgrade", "appimage"],
-    );
+    let out = sbx_in(project.path(), data.path(), state.path(), &["upgrade"]);
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -6415,7 +6405,7 @@ fn project_package_out_link_target(data: &Path, name: &str) -> Option<PathBuf> {
 #[test]
 fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
     // The host-side locked-launch proof — the pin path, distinct from the floating one the
-    // `..._builds_host_side_into_the_shared_store...` e2e proves. After `sbx upgrade flake` pins a
+    // `..._builds_host_side_into_the_shared_store...` e2e proves. After `sbx upgrade` pins a
     // `flake:` package, a launch reads the per-project lock and builds the *locked* (narHash'd,
     // immutable) reference host-side into the shared store, rooted like a `nix:` tool. Teeth:
     // (1) `hello` prints "Hello, world!", proving the locked narHash ref (a different ref string than
@@ -6460,12 +6450,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
     );
 
     // pin the flake package to its current revision (a host-side lock rewrite).
-    let pinned = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["upgrade", "flake"],
-    );
+    let pinned = sbx_in(project.path(), data.path(), state.path(), &["upgrade"]);
     let pin_log = format!(
         "{}{}",
         String::from_utf8_lossy(&pinned.stderr),
@@ -8796,7 +8781,7 @@ fn upgrade_hints_at_reclaimable_superseded_builds() {
     // `upgrade flake` on a project with no `flake:` packages rolls nothing (offline, lock untouched),
     // so the current revision's base stays built and the end-of-upgrade hint runs against it.
     let out = sbx()
-        .args(["upgrade", "flake"])
+        .args(["upgrade"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .output()

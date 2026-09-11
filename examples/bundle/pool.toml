@@ -15,7 +15,7 @@
 # The profile used to run Poolside's own `curl … | bash` installer inside the cage on first launch;
 # what it fetched is a plain archive holding one statically linked Go binary, which is a shape the
 # install phase already wrapped. Moving it to `tarball:resolve` puts the download host-side, keeps
-# the version under `sbx upgrade tarball` instead of a one-shot `POOL_SBX_UPDATE=1` re-run, and
+# the version under `sbx upgrade` instead of a one-shot `POOL_SBX_UPDATE=1` re-run, and
 # leaves the profile's `cmd` as the agent alone.
 #
 # THE ARTIFACT. `pool-linux-amd64`, a statically linked Go binary alone at the archive root. The

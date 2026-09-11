@@ -5,7 +5,7 @@ description: "Roll managed toolchains forward by re-resolving and rewriting thei
 # `sbx upgrade`
 
 ```
-sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|distro|provision] [-a <name>] [--project <path>]
+sbx upgrade [all|nix|mise|distro|provision] [-a <name>] [--project <path>]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
@@ -16,24 +16,24 @@ advance **only here**, never on an `sbx` binary update.
 | `all` | every channel, and the bundles' install steps under their own guards (the default) |
 | `nix` | the nixpkgs channel (base userland + native `nix:` packages) |
 | `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the [task tool pool](../tasks/execution#the-task-tool-pool) |
-| `flake` | the project's and apps' `flake:` packages |
-| `deb` | the project's and apps' `deb:` packages |
-| `appimage` | the project's and apps' `appimage:` packages |
-| `tarball` | the project's and apps' `tarball:` packages |
-| `binary` | the project's and apps' `binary:` packages |
 | `distro` | the declared [`distro`](../configuration/distro) image, re-resolved to the digest the registry serves now |
 | `provision` | re-run the apps' [bundle install steps](../configuration/bundles#the-install-step) in-cage, regardless of their guards |
 
 | Flag | Effect |
 |---|---|
-| `-a, --app <name>` | narrow `nix`, `mise` or `provision` to one app (`--app=<name>` also accepted) |
+| `-a, --app <name>` | narrow the roll to one app, across every channel it rides (`--app=<name>` also accepted) |
 | `--project <path>` | roll another project instead of the current directory (`--project=<path>` also accepted) |
 
-This page is organised by **channel**, which is the right shape when you know which one
-you want. To advance a single app without working that out first, use
-[`sbx app upgrade <name>`](app#advancing-an-app): it reads what the app declares, rolls
-the two channels whose unit of work is that app's own cage, and names the project-wide
-ones rather than rolling them.
+The five package backends (`flake`, `deb`, `appimage`, `tarball` and `binary`) are
+**not targets**. `all` rolls every one of them, and to advance a single app you name the
+app rather than its backend: `sbx upgrade --app <name>`, or
+[`sbx app upgrade <name>`](app#advancing-an-app), which is the same roll under its own
+name. They were targets only while there was no per-app unit to narrow by, which made
+advancing one app start with reading its profile to learn which backend it rode.
+
+What stays typable is the work **no app carries**: the nixpkgs revision, the mise engine
+with the project's tools and task pool, and the distribution image. Plus `provision`,
+which is not a backend at all but the forcing of an install step.
 
 See also: [Upgrading toolchains](../housekeeping/upgrade) · [Provisioning](../concepts/provisioning) · [`nixpkgs`](../configuration/nixpkgs) · [`packages`](../configuration/packages).
 
@@ -48,7 +48,6 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
 - `sbx upgrade mise` rolls the mise engine + the project's `nix:` tools + `mise:`
   packages (an in-cage `mise upgrade` per home) + the declared operations' tool pool
   (host-side, under a `task pool` line), leaving `nixpkgs.lock` intact.
-- `sbx upgrade flake` re-pins the project's and apps' `flake:` packages.
 - `sbx upgrade provision` re-runs the bundle install steps, one cage per app, with
   `SBX_UPGRADE=1` so each step installs whatever its guard would have said. `all` runs
   the same steps without it, leaving each guard to decide, so an agent whose guard
@@ -110,23 +109,33 @@ no channel to roll.
 
 ### Rolling one app
 
-`-a, --app <name>` narrows a roll to a single app:
+`-a, --app <name>` narrows the roll to a single app, across **every channel that app
+rides**:
 
 ```
-sbx upgrade provision --app trae
-sbx upgrade mise --app openfox
-sbx upgrade nix --app openfox
+sbx upgrade --app freebuff-desktop   # everything this app declares
+sbx upgrade provision --app trae     # just its install step
+sbx upgrade mise --app openfox       # just its mise: packages
 ```
 
-It applies to the two **in-cage** rolls, `provision` and `mise`, whose unit of work is
-already one app's own cage; and to `nix`, because an app resolves the base channel
-against a lock of its own. The remaining targets rewrite a project-wide lock host-side,
-where there is no per-app unit to select, so naming an app there is a usage error rather
-than a flag that quietly rolls the whole project.
+What a narrowed roll reaches is the app's own layer (its `[packages]` and the
+[bundles](../configuration/bundles) folded under it), plus its install steps and the
+`mise:` set its cage equips. What it leaves alone is everything project-wide: the mise
+engine, the project's `nix:` tools, the task tool pool, the project baseline's packages,
+and the distribution image, which no app can declare.
 
-Under `--app`, `mise` rolls that app's `mise:` packages and nothing else: not the engine,
-not the project's `nix:` tools, not the project baseline. All three are project-wide, and
-rolling them would make a per-app flag do project-wide work.
+It also **prunes nothing**. Dropping a lock entry that no layer declares any more is a
+statement about the project, and a roll narrowed to one app never makes one, so another
+app's pin is never touched.
+
+An app name that selects no work is refused with the reason: unknown, unlaunchable,
+declaring nothing of its own, or not riding the channel you typed. None of them reports
+a clean roll of nothing.
+
+Naming one app also **forces** the install step, exactly as `sbx upgrade provision` does:
+a user who typed the name is asking for that app to be re-installed, not polled. Only an
+unscoped `all` leaves each step's own guard in charge, because forcing there would mean a
+cage and a download for every app in the project.
 
 ### An app's base channel
 
@@ -172,8 +181,8 @@ when no project pin, and the mise engine) roll the same regardless.
 sbx upgrade                        # roll everything, current directory
 sbx upgrade nix                    # just the nixpkgs channel
 sbx upgrade mise                   # the mise engine + tools/packages
+sbx upgrade --app freebuff-desktop # roll one app, whatever it rides
 sbx upgrade --project ~/work/api   # roll everything for another project
-sbx upgrade deb --project ~/work/api   # just its deb: packages
 sbx upgrade distro                 # re-resolve the declared image's tag
 ```
 

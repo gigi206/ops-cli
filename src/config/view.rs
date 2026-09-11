@@ -329,7 +329,7 @@ pub(crate) struct PackageView {
     pub(crate) trusted: bool,
     /// Why it was withheld, when it was (`None` for a trusted, admitted package).
     pub(crate) withheld_reason: Option<String>,
-    /// The locked revision when this is a `flake:` package `sbx upgrade flake` has pinned; `None`
+    /// The locked revision when this is a `flake:` package `sbx upgrade` has pinned; `None`
     /// for a floating flake package (no lock entry) or any non-flake backend.
     pub(crate) pinned_rev: Option<String>,
 }

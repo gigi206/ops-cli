@@ -22,7 +22,7 @@
 # DISTINCT FROM THE `freebuff` BUNDLE, which carries the CLI. This one carries the desktop
 # `.AppImage`, auto-upgraded through the resolver below: the vendor's download endpoint is a stable
 # 302 to the current versioned asset, so the resolver asks curl for the redirect TARGET rather than
-# following it to a time-limited storage URL. `sbx upgrade appimage` re-runs it.
+# following it to a time-limited storage URL. `sbx upgrade` re-runs it.
 #
 # THE ALLOW LIST IS A STARTING POINT, grounded on a real run's logs. The definitive list is what
 # the app actually calls: watch `sbx net logs -a <app>` on the first launch and login.

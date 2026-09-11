@@ -24,7 +24,7 @@
 # guess. `main` below is the answer. The launcher finds its siblings relative to itself, so the
 # whole tree lands together, which is exactly what `tarball:` installs.
 #
-# UPGRADE. `sbx upgrade tarball` re-runs the resolver below, and re-fetches only when the URL it
+# UPGRADE. `sbx upgrade` re-runs the resolver below, and re-fetches only when the URL it
 # prints actually changed. The login lives in the app home and is untouched by a roll.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
@@ -46,7 +46,7 @@ allow = [
 ]
 
 [packages]
-# The agent itself, pinned on first use and rolled by `sbx upgrade tarball`.
+# The agent itself, pinned on first use and rolled by `sbx upgrade`.
 cursor-agent = "tarball:resolve"
 
 [env]

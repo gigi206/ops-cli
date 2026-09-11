@@ -73,7 +73,7 @@ atomic-agent = "tarball:resolve"
 # The startup version check, off. It is a plain GET to the GitHub releases API and it only
 # notifies — but what it offers cannot be taken: the update it invokes re-runs the vendor's
 # `install.sh` against the directory holding `process.execPath`, and under sbx that directory is a
-# read-only store path. `sbx upgrade tarball` is the verb that rolls this agent forward, and the
+# read-only store path. `sbx upgrade` is the verb that rolls this agent forward, and the
 # artifact you pinned is the artifact that runs.
 ATOMIC_AGENT_UPDATE_CHECK_ON_STARTUP = "false"
 # Chromium's own SUID/userns sandbox cannot come up in the cage (sbx's seccomp denylist blocks

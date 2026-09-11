@@ -47,7 +47,7 @@ leaves the config.
 
 `sbx` roots every version it provisions into a project's store, and a newer build's root
 never displaces the older one. So old base-channel revisions, rebuilt tools, rolled-forward
-`flake:` builds (each [`sbx upgrade flake`](upgrade) re-points the name-keyed out-link,
+`flake:` builds (each [`sbx upgrade`](upgrade) re-points the name-keyed out-link,
 leaving the old build) and rolled-forward GUI app builds (multiple
 `chromium`/`electron`/desktop versions) pile up, and a plain sweep, seeing them all rooted,
 frees nothing.

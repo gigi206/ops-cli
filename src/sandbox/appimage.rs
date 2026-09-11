@@ -267,21 +267,22 @@ impl prebuilt::Kind for AppImage {
     }
 }
 
-/// `sbx upgrade appimage`: roll a project's declared `appimage:` packages forward. See
-/// [`prebuilt::upgrade_project`].
+/// The `appimage:` half of `sbx upgrade`: roll a project's declared `appimage:` packages
+/// forward. See [`prebuilt::upgrade_project`].
 pub(crate) fn upgrade_project(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
+    only: Option<&str>,
 ) -> io::Result<Vec<AppImageUpgrade>> {
-    prebuilt::upgrade_project(&AppImage, nix, layout, project, cfg)
+    prebuilt::upgrade_project(&AppImage, nix, layout, project, cfg, only)
 }
 
 /// How many declared `appimage:` packages are withheld for being untrusted. See
 /// [`prebuilt::withheld`].
-pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
-    prebuilt::withheld(&AppImage, cfg)
+pub(crate) fn withheld(cfg: &crate::config::Resolved, only: Option<&str>) -> usize {
+    prebuilt::withheld(&AppImage, cfg, only)
 }
 
 #[cfg(test)]
@@ -549,15 +550,15 @@ mod tests {
             )],
         );
         // baseline first, then the app's new url; the duplicate and the untrusted one are gone.
-        let keys: Vec<String> = prebuilt::declared(&AppImage, &cfg)
+        let keys: Vec<String> = prebuilt::declared(&AppImage, &cfg, None)
             .trusted
             .iter()
             .map(prebuilt::Ref::key)
             .collect();
         assert_eq!(keys, vec!["https://e/a.AppImage", "https://e/b.AppImage"]);
         // the prune universe keeps the untrusted url (so `sbx upgrade` never unpins a withheld pin).
-        let universe = prebuilt::declared(&AppImage, &cfg).all;
+        let universe = prebuilt::declared(&AppImage, &cfg, None).all;
         assert!(universe.contains("https://e/evil.AppImage"));
-        assert_eq!(withheld(&cfg), 1);
+        assert_eq!(withheld(&cfg, None), 1);
     }
 }

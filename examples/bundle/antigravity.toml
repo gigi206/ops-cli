@@ -19,7 +19,7 @@
 # it cannot display or log into.
 #
 # THE TARBALL IS AUTO-UPGRADED. `tarball:resolve` plus the resolver below re-derives the current
-# download URL from Google's own auto-updater version API, so `sbx upgrade tarball` rolls it
+# download URL from Google's own auto-updater version API, so `sbx upgrade` rolls it
 # forward. The resolver travels with the package it resolves, which is why it belongs here.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
@@ -69,7 +69,7 @@ mute = [
     "playwright-akamai.azureedge.net",  # …and its two CDN fallback mirrors
     "playwright-verizon.azureedge.net",
     # The IN-APP self-updater — inert in the cage (a self-downloaded binary is not autoPatchelf'd);
-    # `sbx upgrade tarball` is the real upgrade path. Its version API and the gvt1 download CDN are
+    # `sbx upgrade` is the real upgrade path. Its version API and the gvt1 download CDN are
     # reached HOST-SIDE by the resolver below, not through a cage allowlist.
     "antigravity-ide-auto-updater-974169037036.us-central1.run.app",
     "edgedl.me.gvt1.com",

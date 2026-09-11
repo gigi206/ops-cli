@@ -210,9 +210,10 @@ truncating a known-good lock.
 
 ```sh
 sbx upgrade              # roll everything the current context tracks
+sbx upgrade --app kiro   # roll one app, whatever backends it rides
 sbx upgrade nix          # just the nixpkgs channel
 sbx upgrade mise         # the mise engine + this project's mise-managed tools
-sbx upgrade flake        # re-pin flake: packages
+sbx upgrade distro       # re-resolve the declared image's tag
 ```
 
 After a `flake:` upgrade, run [`sbx gc`](gc) to reclaim the build the roll superseded

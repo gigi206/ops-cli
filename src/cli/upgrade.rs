@@ -22,43 +22,20 @@ use crate::{config, diag, help, layout_or_fail, sandbox, short_rev, store, style
 /// The known upgrade targets. Kept as one list so the parser and the error message cannot drift.
 /// Visible to the sibling modules so the completion tests can walk it and assert the page offers
 /// every target the parser accepts.
-pub(crate) const TARGETS: &[&str] = &[
-    "all",
-    "nix",
-    "mise",
-    "flake",
-    "deb",
-    "appimage",
-    "tarball",
-    "binary",
-    "distro",
-    "provision",
-];
+///
+/// The five package backends — `flake`, `deb`, `appimage`, `tarball`, `binary` — are deliberately
+/// **not** here, and `all` still rolls every one of them. They existed as targets only because
+/// there was no per-app unit to narrow by, so a user who wanted to advance one app had to know
+/// which backend it rode. `--app <name>` is that unit now, and narrowing by app is the question a
+/// user actually has; narrowing by backend was a way of spelling it that required reading the
+/// app's profile first. What remains is what names work no app carries: the nixpkgs revision, the
+/// mise engine with the project's `nix:` tools and task pool, and the distribution image — plus
+/// `provision`, which is not a backend at all but the forcing of an install step.
+pub(crate) const TARGETS: &[&str] = &["all", "nix", "mise", "distro", "provision"];
 
 /// Map a target word to its `'static` spelling, so a parsed target outlives the borrowed argv.
 fn known_target(s: &str) -> Option<&'static str> {
     TARGETS.iter().copied().find(|&t| t == s)
-}
-
-/// The targets `--app <name>` narrows, and each is narrowable for its own reason.
-///
-/// `provision` and `mise` are the in-cage rolls, whose unit of work is already one app's own cage.
-/// `nix` is not one of those — it is a host-side lock rewrite — but an app resolves the base channel
-/// against a lock of its own, so there is a per-app unit to select there too. Every other target
-/// rewrites a project-wide lock with no such unit, so naming an app there is a usage error rather
-/// than a flag that reads as "only this app" while rolling the whole project.
-const APP_SCOPED_TARGETS: &[&str] = &["provision", "mise", "nix"];
-
-/// A list of names as prose: `a`, `a and b`, `a, b and c`.
-///
-/// `join(" and ")` is right for two and renders three as "provision and mise and nix", which is how
-/// the `--app` refusal below reached the user.
-fn prose_list(items: &[&str]) -> String {
-    match items {
-        [] => String::new(),
-        [only] => (*only).to_string(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    }
 }
 
 /// The outcome of parsing `sbx upgrade`'s arguments: show help, run with a resolved target, an
@@ -155,24 +132,24 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
                 i += 1;
             }
             _ => {
+                // The word is not a target, and the likeliest reason is that it is an APP name:
+                // "advance this one thing" is the common request, and a target list alone answers
+                // it with eight words that are not what was typed. Naming the selector costs no
+                // I/O, which is what lets this stay in a parser that reads no config — it cannot
+                // know whether the word IS an app, so it says what to do with one either way.
                 return ParsedArgs::Error(format!(
-                    "sbx: unknown upgrade target '{}' (known: {})",
+                    "sbx: unknown upgrade target '{}' (known: {}) — to advance one app, \
+                     `sbx upgrade --app {0}`.",
                     arg.to_string_lossy(),
                     TARGETS.join(", ")
                 ));
             }
         }
     }
-    // The compatibility check runs on the RESOLVED target, not on the word that was typed: `sbx
-    // upgrade --app x` defaults to `all`, and rejecting only an explicit target would let the
-    // selector through on the one target that ignores it.
+    // Every remaining target takes `--app`, so the grammar has nothing left to refuse here. Which
+    // targets select no work for a GIVEN app is a different question, answered against the resolved
+    // config by `app_selector_refusal` — this parser reads no config and must not pretend to.
     let what = what.unwrap_or("all");
-    if app.is_some() && !APP_SCOPED_TARGETS.contains(&what) {
-        return ParsedArgs::Error(format!(
-            "sbx: upgrade: --app narrows {} only — `{what}` has no per-app unit to select.",
-            prose_list(APP_SCOPED_TARGETS)
-        ));
-    }
     ParsedArgs::Run { what, project, app }
 }
 
@@ -197,28 +174,29 @@ pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    run_upgrade("upgrade", what, project_arg.as_deref(), app_arg.as_deref())
+}
 
-    let layout = match layout_or_fail() {
-        Ok(l) => l,
-        Err(code) => return code,
-    };
-    let nix = match store::try_resolve_nix(Some(&layout)) {
-        Ok(nix) => nix,
-        // Not always "not found": an override sbx refused leaves the engine installed at the path
-        // the variable names, and saying it is missing points at the wrong remedy.
-        Err(miss) => {
-            diag::error(&format!(
-                "sbx: {} — cannot upgrade. See `sbx doctor`.",
-                miss.clause("nix")
-            ));
-            return ExitCode::FAILURE;
-        }
-    };
+/// The roll itself, behind both spellings that reach it: `sbx upgrade [target] [--app <name>]` and
+/// `sbx app upgrade <name>`, which is that command with the target defaulted and the app named.
+///
+/// One body rather than two, because the two commands answer the same question and a second
+/// implementation of it is a second set of answers waiting to diverge — which is exactly what the
+/// per-app verb had become: it rolled two channels and *named* the rest, while `--app` on the same
+/// app rolled whichever channel was typed.
+///
+/// `verb` is what precedes the colon in a refusal, so each spelling names itself.
+fn run_upgrade(
+    verb: &'static str,
+    what: &'static str,
+    project_arg: Option<&std::ffi::OsStr>,
+    app_arg: Option<&str>,
+) -> ExitCode {
     // `--project <path>` retargets the whole upgrade at another project — exactly as `cd <path>
     // && sbx upgrade` would: the path is canonicalized (so the per-project lock derivation matches
     // a launch from there) and every roll below reads its config and rewrites its locks. Default
     // is the current directory.
-    let cwd = match &project_arg {
+    let cwd = match project_arg {
         Some(path) => match std::fs::canonicalize(path) {
             Ok(canon) if canon.is_dir() => canon,
             Ok(canon) => {
@@ -254,13 +232,34 @@ pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
     // selects no work must say which of the three ways it selects none, since each has a different
     // answer, and it must say so instead of printing a clean "nothing to roll" that reads as
     // success.
-    if let Some(name) = &app_arg
-        && let Some(message) = app_selector_refusal(&cfg, name, what)
+    if let Some(name) = app_arg
+        && let Some(message) = app_selector_refusal(&cfg, name, what, verb)
     {
         diag::error(&message);
         return ExitCode::from(2);
     }
-    let only = app_arg.as_deref();
+    let only = app_arg;
+
+    // The store and the engine are resolved only now, AFTER the name has been judged. A name that
+    // selects no work is a question the config alone answers, and answering it first is what keeps
+    // a typo from being reported as a broken installation on a host whose data directory or nix is
+    // unusable. Nothing above this line touches either.
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    let nix = match store::try_resolve_nix(Some(&layout)) {
+        Ok(nix) => nix,
+        // Not always "not found": an override sbx refused leaves the engine installed at the path
+        // the variable names, and saying it is missing points at the wrong remedy.
+        Err(miss) => {
+            diag::error(&format!(
+                "sbx: {} — cannot upgrade. See `sbx doctor`.",
+                miss.clause("nix")
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
 
     // `all` rolls every managed channel and reports the worst exit — a tool that fails to
     // re-resolve must not be masked by a clean roll elsewhere. `mise` rolls three distinct
@@ -301,40 +300,45 @@ pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
         // sandbox-free), and the cage is built against `cwd` so `--project` retargets it too.
         ok &= sandbox::upgrade_mise_packages(&cwd, &cfg, &pal, only);
     }
-    if matches!(what, "flake" | "all") {
+    if matches!(what, "all") {
         // The project's and apps' `flake:` `[packages]` re-resolve to a fixed revision and the
         // per-project flake lock is rewritten — a host-side lock rewrite (the new pin builds
         // in-cage at the next launch), like the `nix:` tools.
-        let roll = upgrade_flake_packages(&nix, &layout, &cwd, &cfg, &pal);
+        let roll = upgrade_flake_packages(&nix, &layout, &cwd, &cfg, only, &pal);
         ok &= roll.ok;
         moved_store_paths |= roll.moved;
     }
-    if matches!(what, "deb" | "all") {
+    if matches!(what, "all") {
         // The project's and apps' `deb:` `[packages]` re-resolve their `.deb` URL to a new content
         // hash and the per-project deb lock is rewritten — a host-side lock rewrite (the new hash
         // builds host-side at the next launch), like the `nix:` tools and `flake:` packages.
-        ok &= upgrade_deb_packages(&nix, &layout, &cwd, &cfg, &pal);
+        ok &= upgrade_deb_packages(&nix, &layout, &cwd, &cfg, only, &pal);
     }
-    if matches!(what, "appimage" | "all") {
+    if matches!(what, "all") {
         // The project's and apps' `appimage:` `[packages]` re-resolve their `.AppImage` URL to a new
         // content hash and the per-project appimage lock is rewritten — the exact `deb:` shape.
-        ok &= upgrade_appimage_packages(&nix, &layout, &cwd, &cfg, &pal);
+        ok &= upgrade_appimage_packages(&nix, &layout, &cwd, &cfg, only, &pal);
     }
-    if matches!(what, "binary" | "all") {
+    if matches!(what, "all") {
         // The project's and apps' `binary:` `[packages]` re-resolve to a new content hash and the
         // per-project binary lock is rewritten — the same shape as the three archive backends.
-        ok &= upgrade_binary_packages(&nix, &layout, &cwd, &cfg, &pal);
+        ok &= upgrade_binary_packages(&nix, &layout, &cwd, &cfg, only, &pal);
     }
-    if matches!(what, "distro" | "all") {
+    if matches!(what, "distro" | "all") && only.is_none() {
         // The declared distribution image: its tag is re-resolved to whatever digest the registry
         // serves now and the lock is rewritten — a host-side lock rewrite like the channels above,
         // and the new root filesystem is unpacked at the next launch.
+        //
+        // Left alone under `--app`, and this is the one target for which that is structural rather
+        // than a choice: `ResolvedApp` carries no `distro` field, so the image is the project's and
+        // there is no per-app unit to select. `sbx upgrade distro --app <name>` is refused before
+        // this point; what this guard covers is the defaulted `all`.
         ok &= upgrade_distro(&layout, &cwd, &cfg, &pal);
     }
-    if matches!(what, "tarball" | "all") {
+    if matches!(what, "all") {
         // The project's and apps' `tarball:` `[packages]` re-resolve their `.tar.gz` URL to a new
         // content hash and the per-project tarball lock is rewritten — the exact `deb:` shape.
-        ok &= upgrade_tarball_packages(&nix, &layout, &cwd, &cfg, &pal);
+        ok &= upgrade_tarball_packages(&nix, &layout, &cwd, &cfg, only, &pal);
     }
     // The bundles' install steps: an agent with no `[packages]` backend has no lock to rewrite, so
     // what advances it is running its install again. Part of `all`, because "bring everything up to
@@ -350,7 +354,21 @@ pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
     // thing that advances an agent whose guard cannot tell — a checkout of a branch has no version
     // to compare — and the way to re-install over a guard that is wrong.
     if matches!(what, "provision" | "all") {
-        ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, only, what == "provision");
+        // ONE rule for forcing, written once. Naming a single app is a request to re-install it,
+        // not to poll it: the user who typed the name has already decided, and that is the same
+        // reading the `provision` verb carries. So `sbx upgrade provision`, `sbx upgrade --app
+        // <name>` and `sbx app upgrade <name>` all force, and only an unscoped `all` leaves each
+        // step's own guard in charge — where forcing would mean a cage and a download per app
+        // across the project.
+        let force = what == "provision" || only.is_some();
+        // Named BEFORE the cage is built, not reported after it: under a selector this step is the
+        // one part of the run that costs a download, and it runs without a flag to gate it.
+        if let Some(name) = only
+            && cfg.apps.get(name).is_some_and(|a| !a.provisions.is_empty())
+        {
+            println!("{}", install_step_notice(name, &cfg, &pal));
+        }
+        ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, only, force);
     }
     match closing_note(what, moved_store_paths) {
         ClosingNote::StoreMoved => store_moved_hint(&cfg, only, &pal),
@@ -446,20 +464,50 @@ fn launchable_app<'a>(
 /// only one of them is a typo. The first two come from [`launchable_app`], which the per-app verb
 /// shares; the per-target arms below are this command's alone. Pure over the resolved config, so
 /// the taxonomy is unit-tested.
-fn app_selector_refusal(cfg: &config::Resolved, name: &str, what: &str) -> Option<String> {
-    let app = match launchable_app(cfg, name, "upgrade") {
+fn app_selector_refusal(
+    cfg: &config::Resolved,
+    name: &str,
+    what: &str,
+    verb: &str,
+) -> Option<String> {
+    let app = match launchable_app(cfg, name, verb) {
         Ok(app) => app,
         Err(refusal) => return Some(refusal),
     };
     match what {
         "provision" if app.provisions.is_empty() => Some(format!(
-            "sbx: upgrade: app `{name}` declares no install step — it rides a `[packages]` \
-             backend, so `sbx upgrade all` is what advances it."
+            "sbx: {verb}: app `{name}` declares no install step — it rides a `[packages]` \
+             backend, so `sbx upgrade --app {name}` advances it."
         )),
         "mise" if !declares_mise_package(cfg, app) => Some(format!(
-            "sbx: upgrade: app `{name}` declares no `mise:` package — `sbx upgrade all` rolls the \
-             backends it does declare."
+            "sbx: {verb}: app `{name}` declares no `mise:` package — `sbx upgrade --app {name}` \
+             rolls the backends it does declare."
         )),
+        // The one target with no per-app unit at all, and structurally so: `ResolvedApp` carries no
+        // `distro` field, so the distribution image is the project's and no app can name one of its
+        // own. This is a different answer from the two above — they say "not this app", this one
+        // says "not any app" — so it names the command without the selector rather than a narrower
+        // one that would refuse in turn.
+        "distro" => Some(format!(
+            "sbx: {verb}: the distribution image is the project's — no app declares one, so there \
+             is nothing for `--app {name}` to select. `sbx upgrade distro` rolls it."
+        )),
+        // The defaulted target, which is what `sbx upgrade --app <name>` and `sbx app upgrade
+        // <name>` both resolve to. An app that declares nothing and installs nothing would
+        // otherwise print a header, roll nothing and exit 0 — a clean report of work that never
+        // existed. Measured over what a narrowed roll can reach: the app's own layer (its
+        // `[packages]` and the bundles folded under it), its install steps, and the `mise:` set its
+        // cage equips, which is the one of the three that folds the baseline in.
+        "all"
+            if app.packages.is_empty()
+                && app.provisions.is_empty()
+                && !declares_mise_package(cfg, app) =>
+        {
+            Some(format!(
+                "sbx: {verb}: app `{name}` declares no packages and no install step — there is \
+                 nothing of its own to advance. `sbx upgrade` rolls the project it launches in."
+            ))
+        }
         _ => None,
     }
 }
@@ -483,283 +531,65 @@ fn declares_mise_package(cfg: &config::Resolved, app: &config::ResolvedApp) -> b
     !sandbox::mise_packages(&merged.packages).is_empty()
 }
 
-/// What advances one declared package, seen from a single app.
-///
-/// This is the whole judgement `sbx app upgrade` rests on: it decides what the verb *runs* and what
-/// it only *names*, so it is a type rather than a string test.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Advance {
-    /// Rolled inside the app's own cage. The unit of work is already one app, so a per-app verb
-    /// runs it — the in-cage rolls among the targets `APP_SCOPED_TARGETS` lets `--app` narrow.
-    PerApp,
-    /// Rewritten in a project-wide lock, host-side. Named by the per-app verb, never rolled by it:
-    /// there is no per-app unit to select, so rolling it here would make a command that reads as
-    /// "only this app" advance every app in the project.
-    ProjectWide(&'static str),
-    /// Neither. An inline `[flakes.<name>]` pins its inputs inside its own source and rebuilds when
-    /// that source changes, so no channel advances it — and `sbx upgrade flake` deliberately skips
-    /// it (`sandbox::packages::flake_packages` excludes the variant). Naming `flake` for one would
-    /// send the reader to a command that cannot move it.
-    Floating,
-}
-
-/// Which of the three [`Advance`] answers a backend gets.
-///
-/// Spelled out variant by variant rather than swept by `_`, on the precedent of the provisioning
-/// walk: a new `Backend` landing in a catch-all would compile clean, run clean, and be reported to
-/// the user under whichever answer the wildcard happened to give — most likely a channel command
-/// that does not roll it. The compiler is the guard here; the unit test below only pins the answers.
-fn advance_of(backend: &config::Backend) -> Advance {
-    match backend {
-        config::Backend::Mise(_) => Advance::PerApp,
-        config::Backend::Nix(_) => Advance::ProjectWide("nix"),
-        config::Backend::Flake(_) => Advance::ProjectWide("flake"),
-        config::Backend::Deb(_) | config::Backend::DebResolve { .. } => Advance::ProjectWide("deb"),
-        config::Backend::AppImage(_) | config::Backend::AppImageResolve { .. } => {
-            Advance::ProjectWide("appimage")
-        }
-        config::Backend::Tarball(_) | config::Backend::TarballResolve { .. } => {
-            Advance::ProjectWide("tarball")
-        }
-        config::Backend::Binary(_) | config::Backend::BinaryResolve { .. } => {
-            Advance::ProjectWide("binary")
-        }
-        config::Backend::FlakeInline { .. } => Advance::Floating,
-    }
-}
-
-/// What `sbx app upgrade <name>` will do for one app, and what it will only name.
-#[derive(Debug, PartialEq, Eq, Default)]
-struct AppUpgradePlan {
-    /// The app's cage equips a `mise:` package, so the in-cage roll runs.
-    mise: bool,
-    /// The app's bundle carries an install step, so it re-runs in the app's own cage.
-    provision: bool,
-    /// The channels that advance with the project rather than with this app — named with the
-    /// command that rolls them, never rolled here. Sorted and deduplicated.
-    project_wide: Vec<&'static str>,
-    /// The app declares an inline flake, which no channel advances.
-    floating: bool,
-    /// Packages an untrusted layer declared, so the cage does not equip them.
-    ///
-    /// Counted because without it an untrusted project reads as "nothing advances this app", which
-    /// is the wrong answer to the only question this verb exists to answer. The trust verdict is a
-    /// different fact from the channel, so it gets its own line rather than silently removing one.
-    withheld: usize,
-}
-
-/// Decide that plan from what the app declares, over both layers its cage equips.
-///
-/// Pure over the resolved config — no nix, no sandbox — so the dispatch table is unit-tested the
-/// way [`closing_note`] is. Two rules differ on purpose:
-///
-/// * `mise` asks [`declares_mise_package`], which counts only what the cage *equips*, because it
-///   gates a roll that would otherwise print "nothing rolled".
-/// * `project_wide` counts every declared package whatever its trust, because it gates no work at
-///   all — it answers "where does a package like this advance?", and that answer does not change
-///   when a layer is untrusted. The withheld count says the rest.
-fn plan_app_upgrade(cfg: &config::Resolved, app: &config::ResolvedApp) -> AppUpgradePlan {
-    let mut plan = AppUpgradePlan {
-        mise: declares_mise_package(cfg, app),
-        provision: !app.provisions.is_empty(),
-        ..AppUpgradePlan::default()
-    };
-    // Both layers: an app's cage equips the project baseline's packages as well as its own, so a
-    // baseline `deb:` is as much a part of "how does this app advance" as one the app declares.
-    //
-    // Merged by name before being walked, the way `Resolved::merge_app` merges them for the launch
-    // the plan describes: the app's declaration overrides the baseline's of that name rather than
-    // joining it, so one effective package is one package here. Walking the two lists in sequence
-    // counted a re-declared name twice, and `withheld` is a count -- it reported two untrusted
-    // packages where the cage equips one.
-    let mut effective: std::collections::BTreeMap<&str, &config::Package> =
-        std::collections::BTreeMap::new();
-    for pkg in cfg.packages.iter().chain(app.packages.iter()) {
-        effective.insert(pkg.name.as_str(), pkg);
-    }
-    for pkg in effective.into_values() {
-        if pkg.state != trust::TrustState::Trusted {
-            plan.withheld += 1;
-        }
-        match advance_of(&pkg.backend) {
-            Advance::PerApp => {}
-            Advance::ProjectWide(channel) => plan.project_wide.push(channel),
-            Advance::Floating => plan.floating = true,
-        }
-    }
-    plan.project_wide.sort_unstable();
-    plan.project_wide.dedup();
-    plan
-}
-
-/// What the verb owes the reader beyond the rolls it just ran: where the rest of this app's
-/// packages advance, and what it could not equip.
-///
-/// Pure, so every combination is unit-tested without nix or a cage. Deliberately written to hold
-/// whether or not a roll ran above it — the sentences state where a kind of package advances, which
-/// is the same fact either way, so the verb never has to choose between two phrasings of it.
-fn app_upgrade_notes(name: &str, plan: &AppUpgradePlan, pal: &style::Palette) -> Vec<String> {
-    let (dim, warn, r) = (pal.dim, pal.warn, pal.reset);
-    let mut notes = Vec::new();
-    // The honest limit of a per-app verb, and the reason it is worth saying rather than hiding: a
-    // project-wide lock has no per-app unit, so this names the command instead of pretending to a
-    // granularity that does not exist.
-    if !plan.project_wide.is_empty() {
-        let backends = plan
-            .project_wide
-            .iter()
-            .map(|c| format!("`{c}:`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let commands = plan
-            .project_wide
-            .iter()
-            .map(|c| format!("`sbx upgrade {c}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        notes.push(style::prose(
-            &format!(
-                "  {dim}{backends} packages advance with the project, not with one app: \
-                 {commands}.{r}"
-            ),
-            pal,
-        ));
-    }
-    if plan.floating {
-        notes.push(style::prose(
-            &format!(
-                "  {dim}an inline flake pins its inputs in its own source, so no channel advances \
-                 it — it rebuilds when that source changes.{r}"
-            ),
-            pal,
-        ));
-    }
-    if plan.withheld > 0 {
-        notes.push(style::prose(
-            &format!(
-                "  {warn}{} package(s) withheld (untrusted){r} {dim}— not equipped, so not rolled; \
-                 run `sbx trust`.{r}",
-                plan.withheld
-            ),
-            pal,
-        ));
-    }
-    // An app that declares nothing at all would otherwise print a bare header and exit 0, which
-    // reads as a roll that happened. Say the thing that is true instead.
-    if notes.is_empty() && !plan.mise && !plan.provision {
-        notes.push(style::prose(
-            &format!(
-                "  {dim}{name} declares no packages and no install step — there is nothing to \
-                 advance.{r}"
-            ),
-            pal,
-        ));
-    }
-    notes
-}
-
 /// What the install step is about to cost, said before it is paid.
 ///
-/// This verb runs the step without a flag to gate it, which is only defensible if the reader is told
-/// what is starting: a cage and a download, not a lock rewrite. So the line goes out *before*
-/// [`sandbox::upgrade_provision_steps`] rather than describing it afterwards, and it names the
-/// narrower command for the times the packages are all that was wanted.
+/// Naming one app runs the step without a flag to gate it, and FORCES it past its own guard, which
+/// is only defensible if the reader is told what is starting: a cage and a download, not a lock
+/// rewrite. So the line goes out *before* [`sandbox::upgrade_provision_steps`] rather than
+/// describing it afterwards, and it names the narrower command for the times the packages are all
+/// that was wanted.
+///
+/// "regardless of its guard" is load-bearing rather than decorative. An unscoped `sbx upgrade`
+/// leaves each guard in charge, so a reader who has only ever run that one has been trained to
+/// expect a cheap channel read; under a selector the same step installs whatever the guard would
+/// have said, and this line is the only place that difference is visible before the download
+/// starts.
 ///
 /// The narrower command is named **only when it would work**. `sbx upgrade mise --app <name>`
 /// refuses an app that declares no `mise:` package, and for five of the shipped profiles the
 /// install step is the whole of what advances them — offering an escape hatch there would send the
-/// reader to a refusal, which is the failure this verb exists to remove, reintroduced one line
+/// reader to a refusal, which is the failure this notice exists to remove, reintroduced one line
 /// above the work.
 ///
-/// Pure, so the wording is pinned by a test rather than by a reading of the code.
-fn install_step_notice(name: &str, plan: &AppUpgradePlan, pal: &style::Palette) -> String {
+/// Pure over the resolved config, so the wording is pinned by a test rather than by a reading of
+/// the code.
+fn install_step_notice(name: &str, cfg: &config::Resolved, pal: &style::Palette) -> String {
     let (dim, r) = (pal.dim, pal.reset);
-    let cheaper = if plan.mise {
+    let rolls_mise = cfg
+        .apps
+        .get(name)
+        .is_some_and(|app| declares_mise_package(cfg, app));
+    let cheaper = if rolls_mise {
         format!(" — `sbx upgrade mise --app {name}` rolls only the packages.")
     } else {
         ".".to_string()
     };
     style::prose(
         &format!(
-            "  {dim}the install step below re-runs in {name}'s own cage, which downloads \
-             again{cheaper}{r}"
+            "  {dim}the install step below re-runs in {name}'s own cage regardless of its guard, \
+             which downloads again{cheaper}{r}"
         ),
         pal,
     )
 }
 
-/// `sbx app upgrade <name>`: advance one app, dispatching on what the app **declares** instead of
-/// asking the user which channel it rides.
+/// `sbx app upgrade <name>`: advance one app — every channel it rides, not a chosen one.
 ///
-/// The two rolls whose unit of work is already one app's cage run here — its `mise:` packages and
-/// its bundle's install step — against the app's own home, exactly as `sbx upgrade mise --app
-/// <name>` and `sbx upgrade provision --app <name>` do. Everything else is **named, not rolled**:
-/// the other backends rewrite a project-wide lock host-side, so advancing one from a per-app verb
-/// would move every app in the project under a command that reads as "only this one".
+/// The same roll as `sbx upgrade --app <name>`, reached through [`run_upgrade`] with the target
+/// defaulted to `all`. It exists as its own spelling because "advance this app" is the question a
+/// user actually has, and answering it should not require knowing which backend the app's profile
+/// declares.
 ///
-/// The install step runs without a further flag, unlike under `sbx upgrade all`, and the difference
-/// is the selector: `all` is unscoped, so its steps would launch a cage per app across the project,
-/// whereas here the user named the one app whose cage is about to be built. For five of the shipped
-/// profiles that step is the *only* thing that advances them, so gating it would make the verb
-/// fail the apps it exists for. To roll the cheap half alone, `sbx upgrade mise --app <name>` is
-/// still the command — no flag is added here for a shape the surface already has.
+/// It used to roll two channels and merely *name* the rest, on the ground that the other backends
+/// rewrite a project-wide lock. That limit is gone: the roll takes a selector now, so a narrowed
+/// run resolves only what the named app declares and leaves the lock's other entries — and its
+/// prune — alone.
 pub(crate) fn app_upgrade_cmd(args: &[OsString]) -> ExitCode {
     let name = match crate::cli::one_name(args, &["app", "upgrade"], &[], "name an app") {
         Ok((name, _)) => name,
         Err(code) => return code,
     };
-    let cwd = match crate::config_cwd() {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
-    let cfg = config::load(&cwd);
-    for warning in &cfg.warnings {
-        diag::warn_config(warning);
-    }
-    let app = match launchable_app(&cfg, name, "app upgrade") {
-        Ok(app) => app,
-        Err(refusal) => {
-            diag::error(&refusal);
-            return ExitCode::from(2);
-        }
-    };
-    let plan = plan_app_upgrade(&cfg, app);
-
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    let (h, r) = (pal.head, pal.reset);
-    println!("{h}sbx app upgrade — {name}{r}");
-    let mut ok = true;
-    if plan.mise {
-        ok &= sandbox::upgrade_mise_packages(&cwd, &cfg, &pal, Some(name));
-    }
-    if plan.provision {
-        // Announced before the cage is built, not reported after it: the step is the one part of
-        // this verb that costs a download, and it runs without a flag to gate it.
-        println!("{}", install_step_notice(name, &plan, &pal));
-        // `sbx app upgrade` is the per-app form of the `provision` verb, so it forces: a user
-        // naming one agent is asking for that agent to be re-installed, not polled.
-        ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, Some(name), true);
-    }
-    for note in app_upgrade_notes(name, &plan, &pal) {
-        println!("{note}");
-    }
-    // A re-run of an install step supersedes what the previous one built, so the same reclaim hint
-    // the channel command closes with applies here. Asked for only when a roll actually ran: with
-    // nothing rolled there is nothing to supersede, and resolving the data directory would be this
-    // run's only reason to touch it — a routing answer that needs no store would otherwise carry
-    // that directory's refusal beside a complete and correct reply.
-    if (plan.mise || plan.provision)
-        && let Some(layout) = store::Layout::from_env()
-    {
-        // This verb is one app by construction, so the hint measures against that app's revision.
-        sandbox::superseded_reclaimable_hint(&layout, &cwd, &cfg, Some(name), &pal);
-    }
-
-    if ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    run_upgrade("app upgrade", "all", None, Some(name))
 }
 
 /// The launchable apps whose bundles carry an install step, named once and in a stable order.
@@ -1148,16 +978,17 @@ fn upgrade_flake_packages(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    only: Option<&str>,
     pal: &style::Palette,
 ) -> Roll {
-    let outcomes = match sandbox::upgrade_flake(nix, layout, cwd, cfg) {
+    let outcomes = match sandbox::upgrade_flake(nix, layout, cwd, cfg, only) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the flake packages: {e}"));
             return Roll::FAILED;
         }
     };
-    for line in flake_upgrade_summary(&outcomes, sandbox::withheld_flake_packages(cfg), pal) {
+    for line in flake_upgrade_summary(&outcomes, sandbox::withheld_flake_packages(cfg, only), pal) {
         println!("{line}");
     }
     Roll {
@@ -1255,17 +1086,22 @@ fn upgrade_deb_packages(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    only: Option<&str>,
     pal: &style::Palette,
 ) -> bool {
-    let outcomes = match sandbox::upgrade_deb(nix, layout, cwd, cfg) {
+    let outcomes = match sandbox::upgrade_deb(nix, layout, cwd, cfg, only) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the deb packages: {e}"));
             return false;
         }
     };
-    for line in prebuilt_upgrade_summary("deb", &outcomes, sandbox::withheld_deb_packages(cfg), pal)
-    {
+    for line in prebuilt_upgrade_summary(
+        "deb",
+        &outcomes,
+        sandbox::withheld_deb_packages(cfg, only),
+        pal,
+    ) {
         println!("{line}");
     }
     !outcomes
@@ -1353,9 +1189,10 @@ fn upgrade_appimage_packages(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    only: Option<&str>,
     pal: &style::Palette,
 ) -> bool {
-    let outcomes = match sandbox::upgrade_appimage(nix, layout, cwd, cfg) {
+    let outcomes = match sandbox::upgrade_appimage(nix, layout, cwd, cfg, only) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the appimage packages: {e}"));
@@ -1365,7 +1202,7 @@ fn upgrade_appimage_packages(
     for line in prebuilt_upgrade_summary(
         "appimage",
         &outcomes,
-        sandbox::withheld_appimage_packages(cfg),
+        sandbox::withheld_appimage_packages(cfg, only),
         pal,
     ) {
         println!("{line}");
@@ -1383,9 +1220,10 @@ fn upgrade_binary_packages(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    only: Option<&str>,
     pal: &style::Palette,
 ) -> bool {
-    let outcomes = match sandbox::upgrade_binary(nix, layout, cwd, cfg) {
+    let outcomes = match sandbox::upgrade_binary(nix, layout, cwd, cfg, only) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the binary packages: {e}"));
@@ -1395,7 +1233,7 @@ fn upgrade_binary_packages(
     for line in prebuilt_upgrade_summary(
         "binary",
         &outcomes,
-        sandbox::withheld_binary_packages(cfg),
+        sandbox::withheld_binary_packages(cfg, only),
         pal,
     ) {
         println!("{line}");
@@ -1413,9 +1251,10 @@ fn upgrade_tarball_packages(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    only: Option<&str>,
     pal: &style::Palette,
 ) -> bool {
-    let outcomes = match sandbox::upgrade_tarball(nix, layout, cwd, cfg) {
+    let outcomes = match sandbox::upgrade_tarball(nix, layout, cwd, cfg, only) {
         Ok(o) => o,
         Err(e) => {
             diag::error(&format!("sbx: cannot roll the tarball packages: {e}"));
@@ -1425,7 +1264,7 @@ fn upgrade_tarball_packages(
     for line in prebuilt_upgrade_summary(
         "tarball",
         &outcomes,
-        sandbox::withheld_tarball_packages(cfg),
+        sandbox::withheld_tarball_packages(cfg, only),
         pal,
     ) {
         println!("{line}");
@@ -1805,23 +1644,23 @@ mod tests {
     #[test]
     fn parse_reads_project_in_both_forms_and_either_order() {
         let want = ParsedArgs::Run {
-            what: "deb",
+            what: "distro",
             project: Some(OsString::from("/some/dir")),
             app: None,
         };
         // space form, target first
         assert_eq!(
-            parse_upgrade_args(&os(&["deb", "--project", "/some/dir"])),
+            parse_upgrade_args(&os(&["distro", "--project", "/some/dir"])),
             want
         );
         // space form, flag first
         assert_eq!(
-            parse_upgrade_args(&os(&["--project", "/some/dir", "deb"])),
+            parse_upgrade_args(&os(&["--project", "/some/dir", "distro"])),
             want
         );
         // inline form
         assert_eq!(
-            parse_upgrade_args(&os(&["deb", "--project=/some/dir"])),
+            parse_upgrade_args(&os(&["distro", "--project=/some/dir"])),
             want
         );
         // `--project` alone keeps the default `all` target
@@ -1835,10 +1674,11 @@ mod tests {
         );
     }
 
-    /// `--app` narrows the two in-cage rolls and is refused on every other target — including the
-    /// one nobody types, since `all` is what a bare `sbx upgrade --app x` resolves to.
+    /// `--app` is read in every spelling and accepted on every target — including the one nobody
+    /// types, since `all` is what a bare `sbx upgrade --app x` resolves to, and that is the case
+    /// the flag exists for.
     #[test]
-    fn parse_reads_app_in_both_forms_and_refuses_it_on_a_project_wide_target() {
+    fn parse_reads_app_in_both_forms_and_offers_it_on_every_target() {
         for args in [
             os(&["provision", "--app", "demo-app"]),
             os(&["--app", "demo-app", "provision"]),
@@ -1855,7 +1695,7 @@ mod tests {
                 "{args:?}"
             );
         }
-        // The other in-cage roll takes it too, and it composes with `--project`.
+        // It composes with `--project`.
         assert_eq!(
             parse_upgrade_args(&os(&["mise", "--app", "demo-app", "--project=/some/dir"])),
             ParsedArgs::Run {
@@ -1864,55 +1704,50 @@ mod tests {
                 app: Some("demo-app".to_string()),
             }
         );
-        // And the base channel, since an app has its own lock: spelled out rather than derived from
-        // `APP_SCOPED_TARGETS`, so removing `nix` from that list fails here instead of quietly
-        // moving `nix` into the refusing loop below and leaving the suite green.
+
+        // EVERY target takes the selector — the invariant the surface now rests on, walked over
+        // `TARGETS` itself so a target added later is covered without touching this test. The
+        // grammar refuses nothing here: which targets select no work for a GIVEN app is a question
+        // about the resolved config, answered by `app_selector_refusal`, and a parser that reads no
+        // config must not pre-empt it.
+        for t in TARGETS {
+            assert_eq!(
+                parse_upgrade_args(&os(&[t, "--app", "demo-app"])),
+                ParsedArgs::Run {
+                    what: t,
+                    project: None,
+                    app: Some("demo-app".to_string()),
+                },
+                "`{t}` must accept --app"
+            );
+        }
+
+        // The defaulted target carries the selector too: `sbx upgrade --app x` is `all` narrowed to
+        // one app, which is the whole point of the flag and used to be the one case that refused.
         assert_eq!(
-            parse_upgrade_args(&os(&["nix", "--app", "demo-app"])),
+            parse_upgrade_args(&os(&["--app", "demo-app"])),
             ParsedArgs::Run {
-                what: "nix",
+                what: "all",
                 project: None,
                 app: Some("demo-app".to_string()),
             }
         );
 
-        // Every project-wide target refuses it, and the message says why rather than just "no".
-        for t in TARGETS.iter().filter(|t| !APP_SCOPED_TARGETS.contains(t)) {
-            let ParsedArgs::Error(message) = parse_upgrade_args(&os(&[t, "--app", "demo-app"]))
-            else {
-                panic!("`{t}` must refuse --app");
+        // The five package backends are no longer targets, and the refusal a user meets when they
+        // type one — or, far likelier, an app name — names the selector. Spelled out rather than
+        // derived from `TARGETS`, so re-adding one of them fails here instead of quietly passing.
+        for gone in ["flake", "deb", "appimage", "tarball", "binary"] {
+            let ParsedArgs::Error(message) = parse_upgrade_args(&os(&[gone])) else {
+                panic!("`{gone}` must no longer be a target");
             };
-            assert!(message.contains("--app narrows"), "{message}");
-            assert!(
-                message.contains(t),
-                "the refusal names the target: {message}"
-            );
-            // The list of narrowable targets is prose, not a `join(" and ")`: a three-element
-            // constant rendered as "provision and mise and nix", which reads as a display bug in
-            // the one sentence that has to be read carefully. And the second clause describes the
-            // target the user typed rather than claiming host-side lock rewrites are never
-            // app-scoped — `nix` is one, and it is in the list this very sentence just gave.
-            assert!(
-                message.contains("provision, mise and nix"),
-                "the narrowable targets read as a list: {message}"
-            );
-            assert!(
-                !message.contains("rewrites a project-wide lock host-side"),
-                "the refusal must not deny what it has just listed: {message}"
-            );
+            assert!(message.contains("unknown upgrade target"), "{message}");
         }
-        // The defaulted target is checked too: this resolves to `all`, which is project-wide.
-        assert!(matches!(
-            parse_upgrade_args(&os(&["--app", "demo-app"])),
-            ParsedArgs::Error(_)
-        ));
-        // The helper the refusal is built from, at every arity it can meet.
-        assert_eq!(prose_list(&[]), "");
-        assert_eq!(prose_list(&["nix"]), "nix");
-        assert_eq!(prose_list(&["mise", "nix"]), "mise and nix");
-        assert_eq!(
-            prose_list(&["provision", "mise", "nix"]),
-            "provision, mise and nix"
+        let ParsedArgs::Error(typo) = parse_upgrade_args(&os(&["freebuff-desktop"])) else {
+            panic!("an app name is not a target");
+        };
+        assert!(
+            typo.contains("sbx upgrade --app freebuff-desktop"),
+            "the refusal must name what to do with an app name: {typo}"
         );
 
         // Value forms that carry no name, and a repeat.
@@ -1946,24 +1781,28 @@ mod tests {
         cfg.apps.insert("ghost".into(), unlaunchable);
 
         // The app that has a step: no refusal, the roll runs.
-        assert!(app_selector_refusal(&cfg, "trae", "provision").is_none());
+        assert!(app_selector_refusal(&cfg, "trae", "provision", "upgrade").is_none());
 
         // A name no app carries — the typo case, pointed at the listing.
-        let unknown = app_selector_refusal(&cfg, "nope", "provision").expect("unknown is refused");
+        let unknown =
+            app_selector_refusal(&cfg, "nope", "provision", "upgrade").expect("unknown is refused");
         assert!(unknown.contains("no app named"), "{unknown}");
         assert!(unknown.contains("sbx app ls"), "{unknown}");
 
         // An app that cannot launch is its own case: it is not "declares none", it can never run.
-        let dead = app_selector_refusal(&cfg, "ghost", "provision").expect("unlaunchable refused");
+        let dead = app_selector_refusal(&cfg, "ghost", "provision", "upgrade")
+            .expect("unlaunchable refused");
         assert!(dead.contains("no command"), "{dead}");
 
         // An app that rides a backend instead: named with the command that DOES advance it.
-        let backend = app_selector_refusal(&cfg, "plain", "provision").expect("no step refused");
+        let backend =
+            app_selector_refusal(&cfg, "plain", "provision", "upgrade").expect("no step refused");
         assert!(backend.contains("no install step"), "{backend}");
-        assert!(backend.contains("sbx upgrade all"), "{backend}");
+        assert!(backend.contains("sbx upgrade --app plain"), "{backend}");
 
         // The same taxonomy for the other in-cage roll: no `mise:` package, no work.
-        let no_mise = app_selector_refusal(&cfg, "trae", "mise").expect("no mise package refused");
+        let no_mise =
+            app_selector_refusal(&cfg, "trae", "mise", "upgrade").expect("no mise package refused");
         assert!(no_mise.contains("no `mise:` package"), "{no_mise}");
 
         // An app whose only `mise:` package is withheld for being untrusted has nothing to roll
@@ -1979,7 +1818,8 @@ mod tests {
             main: String::new(),
         }];
         cfg.apps.insert("shady".into(), untrusted);
-        let withheld = app_selector_refusal(&cfg, "shady", "mise").expect("withheld-only refused");
+        let withheld =
+            app_selector_refusal(&cfg, "shady", "mise", "upgrade").expect("withheld-only refused");
         assert!(withheld.contains("no `mise:` package"), "{withheld}");
 
         // The layers meet by *name*, so an app that re-declares a baseline `mise:` tool under
@@ -1991,9 +1831,38 @@ mod tests {
         let mut overrides = crate::testutil::app_with(vec![]);
         overrides.packages = vec![pkg("tool", config::Backend::Nix("hello".into()))];
         baseline.apps.insert("swapped".into(), overrides);
-        let shadowed =
-            app_selector_refusal(&baseline, "swapped", "mise").expect("an overridden tool is gone");
+        let shadowed = app_selector_refusal(&baseline, "swapped", "mise", "upgrade")
+            .expect("an overridden tool is gone");
         assert!(shadowed.contains("no `mise:` package"), "{shadowed}");
+
+        // The image is the project's, and no app can declare one: a different answer from the two
+        // above, so it names the command WITHOUT the selector rather than a narrower one that
+        // would refuse in turn.
+        let image = app_selector_refusal(&cfg, "trae", "distro", "upgrade")
+            .expect("no app declares a distribution image");
+        assert!(image.contains("the project's"), "{image}");
+        assert!(image.contains("sbx upgrade distro"), "{image}");
+        assert!(
+            !image.contains("sbx upgrade distro --app"),
+            "the way out must not carry the selector it just refused: {image}"
+        );
+
+        // The defaulted target, which both `sbx upgrade --app x` and `sbx app upgrade x` resolve
+        // to. An app that declares nothing and installs nothing would otherwise print a header,
+        // roll nothing and exit 0 — a clean report of work that never existed.
+        let empty = app_selector_refusal(&cfg, "plain", "all", "upgrade")
+            .expect("an app with nothing of its own is refused");
+        assert!(empty.contains("no packages and no install step"), "{empty}");
+        // And the control: an app that has a step is not refused on the defaulted target.
+        assert!(app_selector_refusal(&cfg, "trae", "all", "upgrade").is_none());
+
+        // Each spelling names itself. One definition, two verbs.
+        let via_app_verb = app_selector_refusal(&cfg, "plain", "all", "app upgrade")
+            .expect("the per-app verb refuses it too");
+        assert!(
+            via_app_verb.starts_with("sbx: app upgrade:"),
+            "{via_app_verb}"
+        );
 
         // The control, one name apart: an app that adds its own tool beside the baseline's still
         // has work, and so does one that inherits the baseline's untouched.
@@ -2001,8 +1870,41 @@ mod tests {
         beside.packages = vec![pkg("other", config::Backend::Nix("hello".into()))];
         baseline.apps.insert("beside".into(), beside);
         assert!(
-            app_selector_refusal(&baseline, "beside", "mise").is_none(),
+            app_selector_refusal(&baseline, "beside", "mise", "upgrade").is_none(),
             "the baseline's tool is still equipped when the app names a different one"
+        );
+    }
+
+    /// An inline flake rides no channel at all: the `flake:` roll's own selector skips it.
+    ///
+    /// Asserted against that selector rather than against a second copy of the rule —
+    /// [`sandbox::flake_packages`] is what the roll walks, and it returns nothing for an inline
+    /// flake, which pins itself in its own source and rebuilds when that source changes. It
+    /// matters to the per-app roll too: `sbx upgrade --app <name>` narrows the same selector, so an
+    /// app whose only package is an inline flake rolls nothing here and is not told otherwise.
+    #[test]
+    fn an_inline_flake_is_not_selected_by_the_roll_that_skips_it() {
+        let inline = pkg(
+            "gizmo",
+            config::Backend::FlakeInline {
+                content: "{ outputs = _: {}; }".into(),
+                attr: "default".into(),
+            },
+        );
+        assert!(
+            sandbox::flake_packages(std::slice::from_ref(&inline)).is_empty(),
+            "the `flake:` roll does not select an inline flake"
+        );
+
+        // The counter-case, so this does not pass by selecting no flake at all: a remote reference
+        // IS what that roll advances.
+        let remote = pkg(
+            "remote",
+            config::Backend::Flake("github:owner/repo#attr".into()),
+        );
+        assert_eq!(
+            sandbox::flake_packages(std::slice::from_ref(&remote)).len(),
+            1
         );
     }
 
@@ -2023,296 +1925,29 @@ mod tests {
     /// what this adds is the *content* of the answer: a variant swept into the wrong arm of an
     /// existing group compiles fine and would send the reader to a command that does not roll it.
     #[test]
-    fn every_backend_lands_on_the_answer_that_matches_how_it_advances() {
-        use config::Backend::*;
-        let cases: &[(config::Backend, Advance)] = &[
-            (Mise("aqua:owner/tool".into()), Advance::PerApp),
-            (Nix("hello".into()), Advance::ProjectWide("nix")),
-            (
-                Flake("github:owner/repo#attr".into()),
-                Advance::ProjectWide("flake"),
-            ),
-            (Deb("https://x/y.deb".into()), Advance::ProjectWide("deb")),
-            (
-                DebResolve {
-                    command: vec!["true".into()],
-                },
-                Advance::ProjectWide("deb"),
-            ),
-            (
-                AppImage("https://x/y.AppImage".into()),
-                Advance::ProjectWide("appimage"),
-            ),
-            (
-                AppImageResolve {
-                    command: vec!["true".into()],
-                },
-                Advance::ProjectWide("appimage"),
-            ),
-            (
-                Tarball("https://x/y.tar.gz".into()),
-                Advance::ProjectWide("tarball"),
-            ),
-            (
-                TarballResolve {
-                    command: vec!["true".into()],
-                },
-                Advance::ProjectWide("tarball"),
-            ),
-            (Binary("https://x/y".into()), Advance::ProjectWide("binary")),
-            (
-                BinaryResolve {
-                    command: vec!["true".into()],
-                },
-                Advance::ProjectWide("binary"),
-            ),
-            (
-                FlakeInline {
-                    content: "{}".into(),
-                    attr: "default".into(),
-                },
-                Advance::Floating,
-            ),
-        ];
-        for (backend, want) in cases {
-            assert_eq!(advance_of(backend), *want, "{backend:?}");
-        }
-        // Every channel this verb sends a reader to must be one `sbx upgrade` actually accepts —
-        // otherwise the note names a command that does not exist.
-        for (backend, answer) in cases {
-            if let Advance::ProjectWide(channel) = answer {
-                assert!(
-                    TARGETS.contains(channel),
-                    "{backend:?} is routed to `sbx upgrade {channel}`, which is not a target"
-                );
-            }
-        }
-    }
-
-    /// The inline flake is not offered the `flake` channel, because that channel skips it.
-    ///
-    /// Asserted against the roll's own selector rather than against a second copy of the rule:
-    /// `sbx upgrade flake` rolls exactly what [`sandbox::flake_packages`] returns, and it returns
-    /// nothing for an inline flake. A classification that said `ProjectWide("flake")` here would be
-    /// a note pointing at a command that cannot move the package — the failure this pins.
-    #[test]
-    fn an_inline_flake_is_not_sent_to_a_channel_that_skips_it() {
-        let inline = pkg(
-            "gizmo",
-            config::Backend::FlakeInline {
-                content: "{ outputs = _: {}; }".into(),
-                attr: "default".into(),
-            },
-        );
-        assert!(
-            sandbox::flake_packages(std::slice::from_ref(&inline)).is_empty(),
-            "`sbx upgrade flake` does not select an inline flake"
-        );
-        assert_eq!(advance_of(&inline.backend), Advance::Floating);
-
-        // The counter-case, so this does not pass by classifying every flake as floating: a remote
-        // reference IS what that channel rolls.
-        let remote = pkg(
-            "remote",
-            config::Backend::Flake("github:owner/repo#attr".into()),
-        );
-        assert_eq!(
-            sandbox::flake_packages(std::slice::from_ref(&remote)).len(),
-            1
-        );
-        assert_eq!(advance_of(&remote.backend), Advance::ProjectWide("flake"));
-    }
-
-    /// The plan runs what is per-app and only names the rest, over both layers the cage equips.
-    #[test]
-    fn the_plan_rolls_what_is_per_app_and_only_names_the_project_wide_rest() {
-        // The baseline carries a `nix:` tool; the app its own `mise:` and `deb:` packages. An app's
-        // cage equips both layers, so the plan must see both.
-        let mut app = crate::testutil::app_with(vec![
-            pkg("tool", config::Backend::Mise("aqua:owner/tool".into())),
-            pkg("editor", config::Backend::Deb("https://x/y.deb".into())),
-        ]);
-        app.provisions = vec![config::BundleProvision {
-            bundle: "demo".into(),
-            argv: vec!["true".into()],
-        }];
-        let cfg = crate::testutil::resolved(
-            vec![pkg("toolkit", config::Backend::Nix("hello".into()))],
-            vec![("demo", app)],
-        );
-        let plan = plan_app_upgrade(&cfg, &cfg.apps["demo"]);
-        assert_eq!(
-            plan,
-            AppUpgradePlan {
-                mise: true,
-                provision: true,
-                // Sorted and deduplicated, and `mise` is absent — it is rolled, not named.
-                project_wide: vec!["deb", "nix"],
-                floating: false,
-                withheld: 0,
-            }
-        );
-
-        // The routing-only shape: no `mise:` package and no install step, so nothing runs in this
-        // app's cage and the whole answer is where its packages advance instead. Sixteen of the
-        // shipped profiles are this shape, so it is the common case, not the corner.
-        let routing = crate::testutil::resolved(
-            vec![],
-            vec![(
-                "reader",
-                crate::testutil::app_with(vec![
-                    pkg("app", config::Backend::Tarball("https://x/y.tgz".into())),
-                    pkg("libs", config::Backend::Nix("hello".into())),
-                ]),
-            )],
-        );
-        let plan = plan_app_upgrade(&routing, &routing.apps["reader"]);
-        assert!(!plan.mise && !plan.provision);
-        assert_eq!(plan.project_wide, vec!["nix", "tarball"]);
-    }
-
-    /// A name both layers declare is one package, and the app's declaration is the one that decides.
-    ///
-    /// `Resolved::merge_app` overrides by name for the launch this plan describes, so the plan has
-    /// to merge the same way. Walking the two lists in sequence counted a re-declared name twice --
-    /// two untrusted packages reported where the cage equips one -- and let the baseline's backend
-    /// name a channel the app's declaration had replaced.
-    #[test]
-    fn a_package_both_layers_declare_is_counted_once_and_the_app_decides() {
-        let mut baseline = pkg("tool", config::Backend::Nix("hello".into()));
-        baseline.state = crate::trust::TrustState::Untrusted;
-        let mut own = pkg("tool", config::Backend::Mise("aqua:owner/tool".into()));
-        own.state = crate::trust::TrustState::Untrusted;
-        let cfg = crate::testutil::resolved(
-            vec![baseline],
-            vec![("demo", crate::testutil::app_with(vec![own]))],
-        );
-        let plan = plan_app_upgrade(&cfg, &cfg.apps["demo"]);
-        assert_eq!(
-            plan.withheld, 1,
-            "one effective package, one withheld count"
-        );
-        assert!(
-            plan.project_wide.is_empty(),
-            "the app's `mise:` replaces the baseline's `nix:`, so no project-wide channel is \
-             named: {:?}",
-            plan.project_wide
-        );
-    }
-
-    /// A package an untrusted layer declared is counted, not silently dropped.
-    ///
-    /// Without the count, an untrusted project reads as "nothing advances this app" — the wrong
-    /// answer to the one question the verb exists to answer, and one the user cannot act on because
-    /// nothing points at `sbx trust`.
-    #[test]
-    fn a_withheld_package_is_counted_rather_than_vanishing() {
-        let mut untrusted = pkg("tool", config::Backend::Mise("aqua:owner/tool".into()));
-        untrusted.state = crate::trust::TrustState::Untrusted;
-        let cfg = crate::testutil::resolved(
-            vec![],
-            vec![("demo", crate::testutil::app_with(vec![untrusted]))],
-        );
-        let plan = plan_app_upgrade(&cfg, &cfg.apps["demo"]);
-        assert!(
-            !plan.mise,
-            "the cage does not equip it, so the roll must not be gated open"
-        );
-        assert_eq!(plan.withheld, 1);
-
-        let notes = app_upgrade_notes("demo", &plan, &style::Palette::plain()).join("\n");
-        assert!(notes.contains("withheld (untrusted)"), "{notes}");
-        assert!(notes.contains("sbx trust"), "{notes}");
-        assert!(
-            !notes.contains("nothing to advance"),
-            "a withheld package is not an app that declares nothing: {notes}"
-        );
-    }
-
-    /// The notes say where a kind of package advances, and say so the same way whether or not a
-    /// roll ran above them — plus the one case where the honest answer is "nothing".
-    #[test]
-    fn the_notes_name_where_a_package_advances_and_say_when_nothing_does() {
-        let plain = style::Palette::plain();
-        let routed = AppUpgradePlan {
-            project_wide: vec!["deb", "nix"],
-            ..AppUpgradePlan::default()
-        };
-        let notes = app_upgrade_notes("demo", &routed, &plain).join("\n");
-        assert!(notes.contains("`deb:`, `nix:`"), "{notes}");
-        assert!(
-            notes.contains("`sbx upgrade deb`, `sbx upgrade nix`"),
-            "{notes}"
-        );
-        assert!(notes.contains("not with one app"), "{notes}");
-
-        // The same sentence when a roll DID run above it: the fact does not change, so neither does
-        // the phrasing — the verb never has to choose between two wordings of one truth.
-        let rolled = AppUpgradePlan {
-            mise: true,
-            project_wide: routed.project_wide.clone(),
-            ..AppUpgradePlan::default()
-        };
-        assert_eq!(
-            app_upgrade_notes("demo", &rolled, &plain),
-            app_upgrade_notes("demo", &routed, &plain)
-        );
-
-        // An inline flake has no channel at all, so it is named apart rather than routed.
-        let floating = AppUpgradePlan {
-            floating: true,
-            ..AppUpgradePlan::default()
-        };
-        let notes = app_upgrade_notes("demo", &floating, &plain).join("\n");
-        assert!(notes.contains("inline flake"), "{notes}");
-        assert!(
-            !notes.contains("sbx upgrade flake"),
-            "the channel that skips it must not be offered: {notes}"
-        );
-
-        // Declares nothing at all: an empty plan would otherwise print a bare header and exit 0,
-        // which reads as a roll that happened.
-        let empty = AppUpgradePlan::default();
-        let notes = app_upgrade_notes("demo", &empty, &plain).join("\n");
-        assert!(notes.contains("nothing to advance"), "{notes}");
-        assert!(notes.contains("demo"), "{notes}");
-
-        // But an app whose whole plan is per-app work owes no note: the rolls above said it all.
-        let all_per_app = AppUpgradePlan {
-            mise: true,
-            provision: true,
-            ..AppUpgradePlan::default()
-        };
-        assert!(app_upgrade_notes("demo", &all_per_app, &plain).is_empty());
-    }
-
-    /// The install step announces its cost before it is paid, and names the narrower command.
-    ///
-    /// This verb runs that step without a flag to gate it, so the announcement is what makes the
-    /// choice defensible: a reader who did not want a download has to learn that one is starting
-    /// *before* the cage is built, not from a summary after it.
-    #[test]
     fn the_install_step_says_what_it_costs_before_it_runs() {
         let plain = style::Palette::plain();
-        let with_packages = AppUpgradePlan {
-            mise: true,
-            provision: true,
-            ..AppUpgradePlan::default()
-        };
-        let line = install_step_notice("junie", &with_packages, &plain);
+        let mut cfg = crate::testutil::resolved(vec![], vec![]);
+        let mut with_mise = crate::testutil::app_with(vec![]);
+        with_mise.packages = vec![pkg("tool", config::Backend::Mise("aqua:demo/tool".into()))];
+        cfg.apps.insert("junie".into(), with_mise);
+        cfg.apps
+            .insert("trae".into(), crate::testutil::app_with(vec![]));
+
+        let line = install_step_notice("junie", &cfg, &plain);
         assert!(line.contains("re-runs in junie's own cage"), "{line}");
         assert!(line.contains("downloads again"), "{line}");
+        // The forcing is named, not implied. An unscoped `sbx upgrade` leaves each guard in
+        // charge; under a selector the step installs regardless, and this is the only line a
+        // reader sees before the download starts.
+        assert!(line.contains("regardless of its guard"), "{line}");
         // The escape hatch, named rather than implied: the surface already has the narrower verb.
         assert!(line.contains("sbx upgrade mise --app junie"), "{line}");
 
         // But not offered where it would refuse. `sbx upgrade mise --app trae` answers "declares no
         // `mise:` package" for an app the install step is the whole of, and pointing a reader at a
-        // refusal one line before the work is this verb's own failure mode, reintroduced.
-        let install_only = AppUpgradePlan {
-            provision: true,
-            ..AppUpgradePlan::default()
-        };
-        let line = install_step_notice("trae", &install_only, &plain);
+        // refusal one line before the work is this notice's own failure mode, reintroduced.
+        let line = install_step_notice("trae", &cfg, &plain);
         assert!(line.contains("downloads again."), "{line}");
         assert!(
             !line.contains("sbx upgrade mise"),
@@ -2334,7 +1969,7 @@ mod tests {
         cfg.apps.insert("ghost".into(), unlaunchable);
 
         for name in ["nope", "ghost"] {
-            let via_channel = app_selector_refusal(&cfg, name, "mise").expect("refused");
+            let via_channel = app_selector_refusal(&cfg, name, "mise", "upgrade").expect("refused");
             let Err(via_app_verb) = launchable_app(&cfg, name, "app upgrade") else {
                 panic!("`{name}` must be refused by the per-app verb too");
             };

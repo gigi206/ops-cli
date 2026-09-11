@@ -91,7 +91,7 @@ pub(crate) enum Backend {
     /// paired with a `[deb.<name>]` table (see [`RawResolve`]) carrying a `resolve` **command** that
     /// prints the newest release's `.deb` download URL. sbx runs the command sandboxed, validates the
     /// printed URL (`is_valid_deb_url`), prefetches its hash, and pins it — so it builds exactly like
-    /// the direct `deb:` form, but `sbx upgrade deb` can re-run the command and roll the pin forward.
+    /// the direct `deb:` form, but `sbx upgrade` can re-run the command and roll the pin forward.
     /// Arbitrary code, so it comes only from a trusted layer and never runs for an untrusted one.
     DebResolve { command: Vec<String> },
     /// `appimage:resolve` — the auto-upgrade form of [`Backend::AppImage`], the exact `appimage:`
@@ -100,7 +100,7 @@ pub(crate) enum Backend {
     /// [`RawResolve`]) carrying a `resolve` **command** that prints the newest release's `.AppImage`
     /// download URL. sbx runs the command sandboxed, validates the printed URL
     /// (`is_valid_appimage_url`), prefetches its hash, and pins it — so it builds exactly like the
-    /// direct `appimage:` form, but `sbx upgrade appimage` can re-run the command and roll the pin
+    /// direct `appimage:` form, but `sbx upgrade` can re-run the command and roll the pin
     /// forward. Arbitrary code, so it comes only from a trusted layer and never runs for an untrusted
     /// one.
     AppImageResolve { command: Vec<String> },

@@ -36,8 +36,8 @@
 # VERSIONS — automatic. Goose's `.deb` filename embeds the version (`goose_<v>_amd64.deb`), so there
 # is no stable URL to hard-code; this profile names the REPO instead (`deb:github:aaif-goose/goose`,
 # below) and sbx pins the newest release's version-stamped asset. A warm launch reuses that pin
-# offline; `sbx upgrade deb` re-queries GitHub and rolls it forward (the rebuilt app lands at the
-# next launch). No manual version bump.
+# offline; `sbx upgrade --app goose-desktop` re-queries GitHub and rolls it forward (the rebuilt app lands
+# at the next launch). No manual version bump.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
@@ -134,7 +134,7 @@ allow = [
 # with the package that reads them (`sbx bundle goose-desktop`). What is left here is your provider
 # choice. (The app's own electron-updater still probes GitHub releases, allowed by the built-in
 # github allow-set and harmless: the pinned build in the store is read-only, so an update it found
-# could not apply; sbx manages upgrades via `sbx upgrade deb`.)
+# could not apply; sbx manages upgrades via `sbx upgrade --app goose-desktop`.)
 
 # --- Provider example (commented) — uncomment ONE block to inject a key host-side instead of
 # entering it in the GUI. ---

@@ -23,7 +23,7 @@
 # an archive whose program lands on `$out/bin/<name>` — the wrapper's own destination. It now moves
 # such a program aside and wraps it from there, so the install left the cage and `cmd` went back to
 # being the agent alone. `devin update` still works in-cage (its manifest host is allowed); the two
-# paths are independent, and `sbx upgrade tarball` is the one that moves the pinned artifact.
+# paths are independent, and `sbx upgrade --app devin` is the one that moves the pinned artifact.
 #
 # CREDENTIAL POSTURE — three paths, headless-first (this profile is for the empty netns):
 #

@@ -32,7 +32,7 @@
 # no `…/latest/…` alias, so a fixed `deb:<url>` would freeze at one version. Instead this profile uses
 # `deb:resolve` paired with the `[deb.cursor]` table below: sbx runs its `resolve` command in a
 # hermetic sandbox to query Cursor's download API for the CURRENT `.deb` URL, pins it per project on
-# first launch, and `sbx upgrade deb` re-runs it to roll forward — no manual URL bump. The API
+# first launch, and `sbx upgrade --app cursor` re-runs it to roll forward — no manual URL bump. The API
 # (`https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable`) returns
 # {"downloadUrl":…, "debUrl":…, "version":…}; the command extracts its `debUrl`.
 #

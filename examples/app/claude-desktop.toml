@@ -34,9 +34,9 @@
 # VERSIONS — tracked automatically. Anthropic's apt pool has **no "latest" URL** (each `.deb` is
 # version-stamped `claude-desktop_<ver>_amd64.deb`), so instead of hand-pinning one version this
 # profile uses the `deb:apt:` backend pointed at the pool's `Packages` index: sbx reads the index,
-# picks the **newest** version's `.deb`, and pins it per project on first launch. `sbx upgrade deb`
-# re-reads the index and **rolls forward** to the newest — no manual URL bump. (sbx does no GPG/
-# InRelease signature check and expects this single-application pool — the same TLS-plus-unpack trust
+# picks the **newest** version's `.deb`, and pins it per project on first launch. `sbx upgrade --app
+# claude-desktop` re-reads the index and **rolls forward** to the newest — no manual URL bump. (sbx does no
+# GPG/ InRelease signature check and expects this single-application pool — the same TLS-plus-unpack trust
 # level as a direct `deb:` URL.) ARCH: the index below is `binary-amd64` (x86_64); on arm64 point it
 # at `.../binary-arm64/Packages` instead.
 #

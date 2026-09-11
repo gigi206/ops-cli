@@ -28,14 +28,14 @@
 #
 # `reasonix-launcher` is deliberately not the entry point: it resolves the shell through a writable
 # `current.json` install layout it manages itself (the vendor's own updater), while versions move
-# through `sbx upgrade deb` here.
+# through `sbx upgrade --app reasonix-desktop` here.
 #
 # UPGRADES — `deb:resolve`, because this repo publishes TWO release trains from one repository (the
 # CLI as `v<x>` and the desktop as `desktop-v<x>`), so `/releases/latest` alternates between them
 # and a `deb:github:` locator would find no `.deb` at all whenever the CLI release is the newer one.
 # The command below picks the newest `desktop-v*` tag explicitly. sbx runs it in a hermetic sandbox
 # (its own base tools — `curl`, `jq`, `sed`, … — on PATH), re-validates the URL it prints, and pins
-# it with its content hash; `sbx upgrade deb` re-runs it to roll forward.
+# it with its content hash; `sbx upgrade --app reasonix-desktop` re-runs it to roll forward.
 #
 # DISPLAY — `gui = "wayland"` binds the host compositor socket read-only and provisions fonts;
 # `gpu = true` opens hardware rendering (mesa into sbx's own store, the render node under /dev/dri,

@@ -33,7 +33,7 @@
 #
 # FIRST LAUNCH resolves the current release, fetches the AppImage and builds it host-side — a large
 # Electron artifact, a couple of minutes, over your HOST network (the build does NOT use the cage
-# allowlist). Later launches reuse the pinned build offline. `sbx upgrade appimage` rolls the pin
+# allowlist). Later launches reuse the pinned build offline. `sbx upgrade --app openwork` rolls the pin
 # forward; the app's own electron-updater cannot: sbx serves it from a read-only store, which is the
 # point — the artifact you audited is the artifact that runs. That updater still CHECKS on startup:
 # a launch fetches the release manifest from GitHub, which sbx's built-in allow-set already covers,

@@ -16,7 +16,7 @@
 # linked Go binary alone inside a per-platform archive, plus a bare text file naming the current
 # version — the same one their `curl … | bash` installer reads. The bundle declares it
 # `tarball:resolve`, so sbx composes the URL host-side, pins it with its own content hash, and
-# `sbx upgrade tarball` rolls it forward.
+# `sbx upgrade --app pool` rolls it forward.
 #
 # This profile used to run that installer inside the cage on first launch, with a one-shot
 # `POOL_SBX_UPDATE=1` to advance the version. Nothing about the artifact required it: a lone

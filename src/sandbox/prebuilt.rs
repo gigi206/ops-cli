@@ -896,28 +896,51 @@ pub(crate) struct Declared {
 /// name order, first occurrence kept. The two forms share **one** `seen` set, so a locator spelled
 /// literally `resolve:foo` and a resolver named `foo` collide on their single lock key rather than
 /// both claiming it.
-pub(crate) fn declared(kind: &dyn Kind, cfg: &crate::config::Resolved) -> Declared {
+///
+/// `only` is `sbx upgrade --app <name>`, and it narrows the **roll set alone**. What it selects is
+/// that app's own layer — its `[packages]` and the bundles folded under it at load — and not the
+/// project baseline, on the rule the `mise:` roll already applies to its baseline group: a selector
+/// that reads "only this app" must not do project-wide work. What decides it here is the lock
+/// rather than the home. This backend keeps **one lock per project**, shared by every app, so
+/// rolling a baseline reference under the selector would advance a pin every other app reads.
+///
+/// The prune universe stays the whole project either way, and that is the load-bearing half: it is
+/// what says which lock entries are still declared, so narrowing it alongside the roll set would
+/// make a per-app roll delete every other app's pin. [`upgrade`] also declines to prune at all
+/// under a selector; the two guards are deliberate, since only one of them fails safe.
+pub(crate) fn declared(
+    kind: &dyn Kind,
+    cfg: &crate::config::Resolved,
+    only: Option<&str>,
+) -> Declared {
     let mut seen = std::collections::BTreeSet::new();
     let mut trusted = Vec::new();
     let mut all = std::collections::BTreeSet::new();
-    let mut absorb = |pkgs: &[crate::config::Package]| {
-        for (_, locator) in kind.packages(pkgs) {
-            if seen.insert(locator.clone()) {
-                trusted.push(Ref::Locator(locator));
+    // `roll` says whether this layer joins the roll set; every layer joins the prune universe
+    // whatever the selector, which is what keeps the two views from narrowing together.
+    let mut absorb = |pkgs: &[crate::config::Package], roll: bool| {
+        if roll {
+            for (_, locator) in kind.packages(pkgs) {
+                if seen.insert(locator.clone()) {
+                    trusted.push(Ref::Locator(locator));
+                }
             }
-        }
-        for (name, command) in kind.resolve_packages(pkgs) {
-            if seen.insert(resolve_key(&name)) {
-                trusted.push(Ref::Resolve { name, command });
+            for (name, command) in kind.resolve_packages(pkgs) {
+                if seen.insert(resolve_key(&name)) {
+                    trusted.push(Ref::Resolve { name, command });
+                }
             }
         }
         all.extend(pkgs.iter().filter_map(|p| kind.lock_key(p)));
     };
-    absorb(&cfg.packages);
-    for app in cfg.apps.values() {
+    absorb(&cfg.packages, only.is_none());
+    for (name, app) in &cfg.apps {
         let mut merged = cfg.clone();
         merged.merge_app(app.clone());
-        absorb(&merged.packages);
+        absorb(&merged.packages, only.is_none());
+        if only == Some(name.as_str()) {
+            absorb(&app.packages, true);
+        }
     }
     Declared { trusted, all }
 }
@@ -927,30 +950,53 @@ pub(crate) fn declared(kind: &dyn Kind, cfg: &crate::config::Resolved) -> Declar
 /// warned on the launch path), so `sbx upgrade` does not read as "none declared" when an untrusted
 /// project declares one. Each app is counted on its **own** package list rather than on the merged
 /// overlay, so a baseline package is not re-counted once per app.
-pub(crate) fn withheld(kind: &dyn Kind, cfg: &crate::config::Resolved) -> usize {
+pub(crate) fn withheld(
+    kind: &dyn Kind,
+    cfg: &crate::config::Resolved,
+    only: Option<&str>,
+) -> usize {
     let untrusted = |pkgs: &[crate::config::Package]| {
         pkgs.iter()
             .filter(|p| kind.lock_key(p).is_some() && p.state != crate::trust::TrustState::Trusted)
             .count()
     };
-    untrusted(&cfg.packages)
-        + cfg
-            .apps
-            .values()
-            .map(|app| untrusted(&app.packages))
-            .sum::<usize>()
+    // Under `--app`, count exactly what that roll would have equipped and nothing else: its own
+    // layer, since [`declared`] leaves the baseline out of a narrowed roll set. Reporting the
+    // project's total here would attribute another app's withheld package to this roll.
+    match only {
+        Some(name) => cfg.apps.get(name).map_or(0, |app| untrusted(&app.packages)),
+        None => {
+            untrusted(&cfg.packages)
+                + cfg
+                    .apps
+                    .values()
+                    .map(|app| untrusted(&app.packages))
+                    .sum::<usize>()
+        }
+    }
 }
 
 /// Whether the project (baseline or any app) declares a trusted `<backend>:resolve` package — so the
 /// upgrade path builds the (heavy) resolver sandbox only when it is actually needed.
-pub(crate) fn has_resolve_ref(kind: &dyn Kind, cfg: &crate::config::Resolved) -> bool {
+pub(crate) fn has_resolve_ref(
+    kind: &dyn Kind,
+    cfg: &crate::config::Resolved,
+    only: Option<&str>,
+) -> bool {
     let any = |pkgs: &[crate::config::Package]| !kind.resolve_packages(pkgs).is_empty();
-    any(&cfg.packages)
-        || cfg.apps.values().any(|app| {
-            let mut merged = cfg.clone();
-            merged.merge_app(app.clone());
-            any(&merged.packages)
-        })
+    // Asked of the set this roll will actually resolve, so a selector that names an app with no
+    // resolver reference does not pay for a cage it never enters.
+    match only {
+        Some(name) => cfg.apps.get(name).is_some_and(|app| any(&app.packages)),
+        None => {
+            any(&cfg.packages)
+                || cfg.apps.values().any(|app| {
+                    let mut merged = cfg.clone();
+                    merged.merge_app(app.clone());
+                    any(&merged.packages)
+                })
+        }
+    }
 }
 
 /// One backend's per-project lock file name, derived from [`Kind::name`] — see [`lock_path`].
@@ -1192,6 +1238,7 @@ pub(crate) fn upgrade(
     project: &Path,
     cfg: &crate::config::Resolved,
     cage: Option<&super::resolve::ResolveCage>,
+    only: Option<&str>,
 ) -> io::Result<Vec<Upgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
     let project_id = project_id.as_str();
@@ -1200,7 +1247,7 @@ pub(crate) fn upgrade(
     let Declared {
         trusted: declared,
         all: universe,
-    } = declared(kind, cfg);
+    } = declared(kind, cfg, only);
     let system = super::current_system();
     // The lock as it stood before any network work: what each reference is compared against, and
     // what the reconcile at the end treats as this roll's (by then possibly stale) knowledge.
@@ -1212,10 +1259,18 @@ pub(crate) fn upgrade(
 
     // Prune entries whose locator is no longer declared (across ALL layers regardless of trust, so a
     // withheld project's still-declared package keeps its pin rather than being silently unpinned).
-    for (key, pin) in &snapshot {
-        if !universe.contains(key.as_str()) {
-            pruned.push((key.clone(), pin.clone()));
-            outcomes.push(Upgrade::Pruned { url: key.clone() });
+    //
+    // Not under a selector. Pruning is a statement about the **project** — "no layer declares this
+    // any more" — and a roll narrowed to one app makes no such statement. The universe above is
+    // project-wide whatever the selector, so this gate is not what stops a narrowed roll from
+    // deleting another app's pin; it is what stops it from reconciling a lock it was not asked
+    // about.
+    if only.is_none() {
+        for (key, pin) in &snapshot {
+            if !universe.contains(key.as_str()) {
+                pruned.push((key.clone(), pin.clone()));
+                outcomes.push(Upgrade::Pruned { url: key.clone() });
+            }
         }
     }
 
@@ -1307,14 +1362,15 @@ pub(crate) fn upgrade_project(
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
+    only: Option<&str>,
 ) -> io::Result<Vec<Upgrade>> {
-    let held = if has_resolve_ref(kind, cfg) {
+    let held = if has_resolve_ref(kind, cfg, only) {
         super::resolve::UpgradeCage::build(nix, layout, project, cfg)
     } else {
         None
     };
     let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
-    upgrade(kind, nix, layout, project, cfg, cage.as_ref())
+    upgrade(kind, nix, layout, project, cfg, cage.as_ref(), only)
 }
 
 #[cfg(test)]
@@ -1552,6 +1608,7 @@ mod tests {
             project.path(),
             &cfg,
             None,
+            None,
         )
         .expect("the roll writes its lock");
 
@@ -1650,6 +1707,7 @@ mod tests {
             project.path(),
             &cfg,
             None,
+            None,
         )
         .expect("the roll reconciles its lock");
 
@@ -1707,6 +1765,7 @@ mod tests {
             project.path(),
             &cfg,
             None,
+            None,
         )
         .expect("the roll still rewrites its lock");
 
@@ -1762,6 +1821,56 @@ mod tests {
             libs: Vec::new(),
             main: String::new(),
         }
+    }
+
+    /// `--app <name>` narrows the roll set and leaves the prune universe whole.
+    ///
+    /// The two halves are asserted separately because only one of them fails safe. A narrowed roll
+    /// set is a smaller upgrade; a narrowed prune universe is a lock that forgets every pin the
+    /// selected app did not declare, which [`upgrade`] would then delete — every other app's
+    /// package, silently unpinned, on a command that reads as "only this one".
+    ///
+    /// The baseline's absence from the narrowed roll set is the second claim: this backend keeps
+    /// one lock per project, so advancing a baseline reference under the selector would move a pin
+    /// every app reads.
+    #[test]
+    fn a_selector_narrows_the_roll_set_but_never_the_prune_universe() {
+        let mut cfg = crate::testutil::resolved(vec![], vec![]);
+        cfg.packages = vec![pkg(
+            "base",
+            crate::config::Backend::Tarball("https://example.invalid/base.tar.gz".into()),
+            true,
+        )];
+        for (app, url) in [
+            ("alpha", "https://example.invalid/alpha.tar.gz"),
+            ("beta", "https://example.invalid/beta.tar.gz"),
+        ] {
+            let mut a = crate::testutil::app_with(vec![]);
+            a.packages = vec![pkg(app, crate::config::Backend::Tarball(url.into()), true)];
+            cfg.apps.insert(app.into(), a);
+        }
+
+        let whole = declared(&Tarball, &cfg, None);
+        let keys: Vec<String> = whole.trusted.iter().map(Ref::key).collect();
+        assert_eq!(keys.len(), 3, "unnarrowed, every layer rolls: {keys:?}");
+
+        let narrowed = declared(&Tarball, &cfg, Some("alpha"));
+        let rolled: Vec<String> = narrowed.trusted.iter().map(Ref::key).collect();
+        assert_eq!(
+            rolled,
+            vec!["https://example.invalid/alpha.tar.gz".to_string()],
+            "the roll set is the named app's own layer, baseline included nowhere: {rolled:?}"
+        );
+        assert_eq!(
+            narrowed.all, whole.all,
+            "the prune universe is the whole project whatever the selector"
+        );
+
+        // A name no app carries selects nothing to roll — and still does not shrink the universe,
+        // which is what keeps a typo from unpinning the project.
+        let typo = declared(&Tarball, &cfg, Some("nope"));
+        assert!(typo.trusted.is_empty(), "a typo rolls nothing");
+        assert_eq!(typo.all, whole.all, "a typo prunes nothing either");
     }
 
     /// The trust filter lives in the two admitted-package lists and nowhere else — [`Kind::lock_key`]

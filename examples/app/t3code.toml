@@ -36,7 +36,7 @@
 # is HOST-SIDE (an AppImage runs no maintainer script, so evaluating it host-side is safe), seeded into
 # the store, and offline-reusable after the first launch.
 #
-# UPGRADES — automatic, like the `deb:` apps. `sbx upgrade appimage` re-queries GitHub and rolls the
+# UPGRADES — automatic, like the `deb:` apps. `sbx upgrade --app t3code` re-queries GitHub and rolls the
 # pin forward to the newest release (the rebuilt app lands at the next launch); the launch hot path
 # never touches GitHub. No manual version bump.
 #
@@ -173,7 +173,7 @@ https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-sto
 
 [packages]
 # The T3 Code desktop app, tracked from the latest GitHub release's linux `.AppImage` automatically
-# (see "THE `appimage:` BACKEND" above). `sbx upgrade appimage` rolls it forward; no manual version.
+# (see "THE `appimage:` BACKEND" above). `sbx upgrade --app t3code` rolls it forward; no manual version.
 t3code = "appimage:github:pingdotgg/t3code"
 
 # In-cage Chromium for the sub-agents' OAuth login flow (see "IN-CAGE BROWSER" above). HEAVY — pulls a

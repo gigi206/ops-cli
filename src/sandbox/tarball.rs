@@ -258,21 +258,22 @@ impl prebuilt::Kind for Tarball {
     }
 }
 
-/// `sbx upgrade tarball`: roll a project's declared `tarball:` packages forward. See
-/// [`prebuilt::upgrade_project`].
+/// The `tarball:` half of `sbx upgrade`: roll a project's declared `tarball:` packages
+/// forward. See [`prebuilt::upgrade_project`].
 pub(crate) fn upgrade_project(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
+    only: Option<&str>,
 ) -> io::Result<Vec<TarballUpgrade>> {
-    prebuilt::upgrade_project(&Tarball, nix, layout, project, cfg)
+    prebuilt::upgrade_project(&Tarball, nix, layout, project, cfg, only)
 }
 
 /// How many declared `tarball:` packages are withheld for being untrusted. See
 /// [`prebuilt::withheld`].
-pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
-    prebuilt::withheld(&Tarball, cfg)
+pub(crate) fn withheld(cfg: &crate::config::Resolved, only: Option<&str>) -> usize {
+    prebuilt::withheld(&Tarball, cfg, only)
 }
 
 #[cfg(test)]
@@ -641,7 +642,7 @@ mod tests {
         );
         // Both `tarball:` forms are collected, baseline first (direct, then resolver), then the app's
         // new url; the duplicate and the untrusted one are gone.
-        let keys: Vec<String> = prebuilt::declared(&Tarball, &cfg)
+        let keys: Vec<String> = prebuilt::declared(&Tarball, &cfg, None)
             .trusted
             .iter()
             .map(prebuilt::Ref::key)
@@ -671,7 +672,7 @@ mod tests {
         );
         // The prune universe keeps every declared key regardless of trust, so `sbx upgrade` on a
         // Changed project never unpins a still-declared package.
-        let universe = prebuilt::declared(&Tarball, &cfg).all;
+        let universe = prebuilt::declared(&Tarball, &cfg, None).all;
         assert!(universe.contains("https://e/a.tar.gz"));
         assert!(
             universe.contains("https://e/evil.tar.gz"),
@@ -681,7 +682,7 @@ mod tests {
         assert!(universe.contains("https://e/c.tar.gz"));
         // `withheld` counts every untrusted tarball package (both forms), across baseline and apps.
         assert_eq!(
-            withheld(&cfg),
+            withheld(&cfg, None),
             3,
             "two untrusted baseline packages + one untrusted app package"
         );
@@ -690,17 +691,17 @@ mod tests {
     #[test]
     fn has_resolve_ref_detects_a_declared_resolver_in_the_baseline_or_an_app() {
         let baseline = resolved(vec![tarball_resolve_pkg("r", &["print"], true)], vec![]);
-        assert!(prebuilt::has_resolve_ref(&Tarball, &baseline));
+        assert!(prebuilt::has_resolve_ref(&Tarball, &baseline, None));
 
         let direct_only = resolved(vec![tarball_pkg("d", "https://e/d.tar.gz", true)], vec![]);
-        assert!(!prebuilt::has_resolve_ref(&Tarball, &direct_only));
+        assert!(!prebuilt::has_resolve_ref(&Tarball, &direct_only, None));
 
         let in_app = resolved(
             vec![],
             vec![("a", app_with(vec![tarball_resolve_pkg("ar", &["p"], true)]))],
         );
         assert!(
-            prebuilt::has_resolve_ref(&Tarball, &in_app),
+            prebuilt::has_resolve_ref(&Tarball, &in_app, None),
             "a resolver declared only inside an app overlay is still detected"
         );
     }

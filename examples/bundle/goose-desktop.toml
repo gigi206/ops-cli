@@ -19,7 +19,7 @@
 # environment variables below cut the rest at the source.
 #
 # DISTINCT FROM THE `goose` BUNDLE, which carries the CLI (`mise:`). This one carries the desktop
-# `.deb`, whose `github:` form tracks the repo's latest release so `sbx upgrade deb` rolls it
+# `.deb`, whose `github:` form tracks the repo's latest release so `sbx upgrade` rolls it
 # forward with no hand-pinned version.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a

@@ -40,8 +40,8 @@
 # FIRST LAUNCH resolves the release asset (pinning URL + hash in the per-project deb lock) and builds
 # it host-side, pulling the Electron closure (hundreds of MiB) — a couple of minutes, over your host
 # network (the build does NOT use the cage allowlist). Later launches reuse the pinned build offline
-# and never query GitHub. `sbx upgrade deb` re-queries the repo and rolls the pin forward to the
-# newest release (the rebuilt app lands at the next launch). No manual version bump.
+# and never query GitHub. `sbx upgrade --app opencode-desktop` re-queries the repo and rolls the pin forward
+# to the newest release (the rebuilt app lands at the next launch). No manual version bump.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS

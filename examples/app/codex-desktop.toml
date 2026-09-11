@@ -28,8 +28,8 @@
 # build script; the result is seeded into the store and offline-reusable. FIRST LAUNCH resolves and
 # builds it, and this artifact is LARGE — several hundred megabytes of `.deb` unpacking to a
 # multi-gigabyte tree, plus the Electron and Chromium closures, over your host network and NOT the
-# cage allowlist. Later launches reuse the pinned build offline. Versions move on `sbx upgrade deb`,
-# which re-reads the vendor's apt index; see the bundle's header for how that pin is attested.
+# cage allowlist. Later launches reuse the pinned build offline. Versions move on `sbx upgrade --app
+# codex-desktop`, which re-reads the vendor's apt index; see the bundle's header for how that pin is attested.
 #
 # THE BUILD IS PROVEN, and it needed three extra library attributes to get there. Run against the
 # shipped `.deb`, the generated derivation wraps `usr/lib/chatgpt/ChatGPT` (the Electron binary) as

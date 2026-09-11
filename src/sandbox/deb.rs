@@ -350,7 +350,7 @@ enum Attested {
 ///
 /// **Trust on first use, deliberately.** A first pin has no authenticity: the fingerprint is read
 /// from the signature itself and the key is fetched by it, so whoever served the index chose both.
-/// Its value is the pin it establishes — every later `sbx upgrade deb` must present a signature by
+/// Its value is the pin it establishes — every later `sbx upgrade` must present a signature by
 /// that same key, so a repository that is re-keyed, or an index served by someone else, is refused
 /// rather than resolved. This is the trust model [`crate::plugins::stores`] already applies to a
 /// plugin store, for the same reason.
@@ -498,7 +498,7 @@ fn attest_index(
         && expired(until)
     {
         // A warning, not a refusal. `Valid-Until` is a staleness signal, and this check runs on a
-        // first pin and on `sbx upgrade deb`, never on the launch hot path — so a machine that has
+        // first pin and on `sbx upgrade`, never on the launch hot path — so a machine that has
         // been offline past the window still resolves, while a repository that has stopped being
         // republished is named.
         crate::diag::warn(&format!(
@@ -832,20 +832,21 @@ impl prebuilt::Kind for Deb {
     }
 }
 
-/// `sbx upgrade deb`: roll a project's declared `deb:` packages forward. See
+/// The `deb:` half of `sbx upgrade`: roll a project's declared `deb:` packages forward. See
 /// [`prebuilt::upgrade_project`].
 pub(crate) fn upgrade_project(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
+    only: Option<&str>,
 ) -> io::Result<Vec<DebUpgrade>> {
-    prebuilt::upgrade_project(&Deb, nix, layout, project, cfg)
+    prebuilt::upgrade_project(&Deb, nix, layout, project, cfg, only)
 }
 
 /// How many declared `deb:` packages are withheld for being untrusted. See [`prebuilt::withheld`].
-pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
-    prebuilt::withheld(&Deb, cfg)
+pub(crate) fn withheld(cfg: &crate::config::Resolved, only: Option<&str>) -> usize {
+    prebuilt::withheld(&Deb, cfg, only)
 }
 
 #[cfg(test)]
@@ -1165,7 +1166,7 @@ mod tests {
             ],
         );
         // baseline first, then the app's new url; the duplicate and the untrusted one are gone.
-        let keys: Vec<String> = prebuilt::declared(&Deb, &cfg)
+        let keys: Vec<String> = prebuilt::declared(&Deb, &cfg, None)
             .trusted
             .iter()
             .map(prebuilt::Ref::key)
@@ -1176,7 +1177,7 @@ mod tests {
     #[test]
     fn the_prune_universe_keeps_untrusted_so_upgrade_never_prunes_a_withheld_pin() {
         // The prune universe must NOT drop a still-declared url just because the project is
-        // untrusted — else `sbx upgrade deb` on a Changed project unpins it. Unlike the trusted roll
+        // untrusted — else `sbx upgrade` on a Changed project unpins it. Unlike the trusted roll
         // set, `declared().all` keeps the untrusted url; `withheld` counts it so the summary is honest.
         let cfg = resolved(
             vec![
@@ -1188,7 +1189,7 @@ mod tests {
                 app_with(vec![deb_pkg("c", "https://e/c.deb", false)]),
             )],
         );
-        let universe = prebuilt::declared(&Deb, &cfg).all;
+        let universe = prebuilt::declared(&Deb, &cfg, None).all;
         assert!(universe.contains("https://e/a.deb"));
         assert!(
             universe.contains("https://e/evil.deb"),
@@ -1196,7 +1197,7 @@ mod tests {
         );
         assert!(universe.contains("https://e/c.deb"));
         assert_eq!(
-            withheld(&cfg),
+            withheld(&cfg, None),
             2,
             "the two untrusted deb packages are counted"
         );

@@ -57,21 +57,25 @@ struct Page {
 /// path.
 ///
 /// It exists for a page whose option list is mostly one repeated shape. `sbx upgrade` is the case:
-/// seven of its ten rows are a channel name, each a way to narrow the roll to one backend, and
-/// listing them at the same level as the default made the command read as a choice to make when the
-/// answer is almost always `sbx upgrade` with no argument at all. Folding them says which rows are
-/// the decision and which are the narrowing, without taking a capability away.
+/// three of its seven rows are a channel name, each a way to narrow the roll to one piece of
+/// project-wide work, and listing them at the same level as the default made the command read as a
+/// choice to make when the answer is almost always `sbx upgrade` with no argument at all. Folding
+/// them says which rows are the decision and which are the narrowing, without taking a capability
+/// away.
+///
+/// The group carried eight members until the five package backends stopped being targets at all
+/// (see [`crate::cli::upgrade::TARGETS`]): a roll narrows by app now, so there is nothing left to
+/// type per backend. The counts above are this page's — the guard in `tests.rs` walks the same
+/// members, so a stale one fails rather than reads wrong.
 ///
 /// It governs the RENDERING only. The rows stay in [`Page::options`], which is what
 /// [`options_of`] answers and what completion walks — so a folded target still completes, and the
-/// help/completion parity guards still see one page with ten rows. A member named here that the
+/// help/completion parity guards still see one page with every row. A member named here that the
 /// page does not carry is simply not folded; the table cannot invent a row.
 const OPTION_GROUPS: &[(&[&str], &str, &[&str])] = &[(
     &["upgrade"],
     "narrow to one channel",
-    &[
-        "nix", "mise", "flake", "deb", "appimage", "tarball", "binary", "distro",
-    ],
+    &["nix", "mise", "distro"],
 )];
 
 /// The heading and members folded on this page, or `None` when it folds nothing.

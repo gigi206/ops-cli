@@ -35,7 +35,7 @@
 # Both packages are remote `flake:` refs, which sbx builds HOST-SIDE into its shared store (like
 # `nix:`) and seeds per project — so the build uses the HOST network and is unaffected by the cage's
 # egress allowlist below, which governs only what the running agent may reach. The first launch is a
-# multi-GiB, multi-minute build; later launches reuse it. `sbx upgrade flake` rolls both forward.
+# multi-GiB, multi-minute build; later launches reuse it. `sbx upgrade --app hermes-webui` rolls both forward.
 #
 # CREDENTIAL POSTURE — BYOK, multi-provider. Hermes WebUI exposes a provider/model picker (OpenAI,
 # Anthropic, Google, DeepSeek, OpenRouter, Nous Portal, …) and reads provider config from the agent's
@@ -58,8 +58,8 @@
 #
 # The genuine upstream caveat is separate: the WebUI imports the agent's modules and reads its state
 # layout directly, so upstream states the two "should be upgraded together; running mismatched
-# versions is untested and unsupported". `sbx upgrade flake` rolls BOTH packages, which is how to
-# keep them in step.
+# versions is untested and unsupported". `sbx upgrade --app hermes-webui` rolls BOTH packages, which is how
+# to keep them in step.
 #
 # BROWSER-SIDE ASSETS. The page's CSP allows `cdn.jsdelivr.net` (scripts/worker), plus Google Fonts
 # for styles. Those are fetched by your HOST browser, not from inside the cage, so they need no
@@ -227,7 +227,7 @@ enable = { env = "HERMES_WEBUI_SBX_GATEWAY", not = "0" }
 [packages]
 # The WebUI itself, from its own upstream flake (`bin/hermes-webui` — a wrapper that runs bootstrap
 # with `--foreground --no-browser --skip-agent-install`, and carries the WebUI's own pyyaml +
-# cryptography). Built host-side into sbx's shared store; rolled by `sbx upgrade flake`.
+# cryptography). Built host-side into sbx's shared store; rolled by `sbx upgrade --app hermes-webui`.
 hermes-webui = "flake:github:nesquena/hermes-webui#default"
 # The agent the WebUI imports and runs in-process. The SAME `#default` output as the `hermes`,
 # `hermes-web`, and `hermes-desktop` profiles, so the heavy build is shared with them rather than

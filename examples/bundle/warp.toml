@@ -19,7 +19,7 @@
 # is a lone `warp-tui-stable` executable at the archive root beside its `resources/` tree, which is
 # the shape the shared install phase wraps under the `[packages]` KEY. The wrapper execs the real
 # binary in place, so the `resources/` it resolves relative to its own location are still beside it.
-# `sbx upgrade tarball` re-runs the resolver and rolls the version forward.
+# `sbx upgrade` re-runs the resolver and rolls the version forward.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would

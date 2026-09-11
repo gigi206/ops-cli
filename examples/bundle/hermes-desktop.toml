@@ -104,7 +104,7 @@ mute = [
 # and names the real method — `nixos`, a supported Tier-2 platform, which also yields the correct
 # nix update hint. Unlike `HERMES_MANAGED=nixos`, this marker has NO managed-mode side effect (which
 # would block the app from writing its own config). Harmless regardless: sbx manages updates via
-# `sbx upgrade flake`, so Hermes' own self-updater never runs here.
+# `sbx upgrade`, so Hermes' own self-updater never runs here.
 #
 # The step is gated on the marker being absent, and yields to `SBX_UPGRADE` so that
 # `sbx upgrade provision` genuinely rewrites it rather than reporting a re-install that did
@@ -128,7 +128,7 @@ fi
 shared_credential = [["*.nousresearch.com", "*.privy.io"]]
 
 [packages]
-# Hermes Desktop via the flake's `#desktop` output, built host-side — so `sbx upgrade flake` rolls
+# Hermes Desktop via the flake's `#desktop` output, built host-side — so `sbx upgrade` rolls
 # it forward.
 hermes-desktop = "flake:github:NousResearch/hermes-agent#desktop"
 # An in-cage Chromium, used for two things: the OAuth device-code login (the hermetic cage has no

@@ -44,8 +44,8 @@
 # `…/latest/…` alias, so a fixed `tarball:<url>` would freeze. Instead this profile uses
 # `tarball:resolve` paired with the `[tarball.kiro]` table below: sbx runs its `resolve` command in a
 # hermetic sandbox to read Kiro's release metadata JSON and print the CURRENT signed `.tar.gz` URL
-# (the metadata's own `releases[].url`), pins it per project on first launch, and `sbx upgrade tarball`
-# re-runs it to roll forward — no manual URL bump.
+# (the metadata's own `releases[].url`), pins it per project on first launch, and `sbx upgrade --app
+# kiro-desktop` re-runs it to roll forward — no manual URL bump.
 #
 # FIRST LAUNCH resolves + builds the `.deb` host-side, pulling the Electron closure (hundreds of MiB —
 # a couple of minutes, over your HOST network, NOT the cage allowlist). Later launches reuse the

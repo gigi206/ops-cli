@@ -16,7 +16,7 @@
 # `releases.warp.dev/.../warp-tui-stable-<os>-<arch>.tar.gz`, whose payload is a lone
 # `warp-tui-stable` executable beside a `resources/` tree the binary resolves relative to its own
 # location. The bundle declares it `tarball:resolve` with a resolver that reads that redirect
-# host-side, so `sbx upgrade tarball` rolls the version forward.
+# host-side, so `sbx upgrade --app warp` rolls the version forward.
 #
 # This profile used to run that download from its own `cmd`, with a background-updater dance in the
 # isolated home. Nothing about the artifact required it: a lone executable at an archive root is

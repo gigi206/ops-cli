@@ -250,7 +250,7 @@ nixpkgs attribute. sbx builds a remote `flake:` ref **host-side** into its share
 host-side it uses the **host** network: its fetch hosts do not need to be in `allow`, which governs
 only what the running tool may reach. That also removes an old wall, since a build step fetching
 with its own client rather than through nix's fetcher no longer has to honour the cage proxy and its
-CA. A floating ref freezes at its first build until `sbx upgrade flake` re-resolves and pins it.
+CA. A floating ref freezes at its first build until `sbx upgrade` re-resolves and pins it.
 
 When the flake is one you author yourself, write the whole `flake.nix` **inline** in a
 `[flakes.<name>]` table instead of hosting a separate repo. Unlike a remote ref, an inline flake

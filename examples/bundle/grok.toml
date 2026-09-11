@@ -45,7 +45,7 @@ GROK_DISABLE_AUTOUPDATER = "1"  # sbx owns upgrades; the CLI must not replace it
 #
 # `binary:resolve` answers both halves. The artifact is a bare executable rather than an archive,
 # which is exactly what that backend is for, and the `resolve` command below asks the vendor what
-# the current version is, so `sbx upgrade binary` rolls this agent forward like every other.
+# the current version is, so `sbx upgrade` rolls this agent forward like every other.
 grok = "binary:resolve"
 
 # The vendor's own version source, and the whole of what sbx knows about xAI: the backend itself is

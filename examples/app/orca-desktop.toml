@@ -36,8 +36,8 @@
 # on Linux is the GNOME screen reader, which is why the cage only ever calls it `orca-ide` or, on
 # PATH, the wrapped `orca-desktop`); the derivation wraps it generically from its `resources/`
 # signature. The build is HOST-SIDE and offline-reusable; pin-on-first-use, rolled forward by
-# `sbx upgrade deb`. No manual version bump, no community flake. First launch pulls the Electron
-# closure over your host network (a couple of minutes); later launches reuse the pinned build.
+# `sbx upgrade --app orca-desktop`. No manual version bump, no community flake. First launch pulls the
+# Electron closure over your host network (a couple of minutes); later launches reuse the pinned build.
 # Orca's own auto-update checks (GitHub releases) ride the built-in github allow-set; sbx owns
 # the version here.
 #

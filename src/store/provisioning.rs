@@ -333,7 +333,7 @@ fn source_path_from_metadata(stdout: &str) -> Option<PathBuf> {
 /// hit that never re-resolves; but a **floating** `flake:` target (no revision — e.g. `…#default`) would
 /// re-resolve the flake's latest revision after nix's `tarball-ttl` and silently roll the tool. Keying a
 /// `<gcroot>.expr` stamp on the *target string* and reusing the built output when the target is unchanged
-/// **freezes a floating flake at its first build** until `sbx upgrade flake` pins it (which changes the
+/// **freezes a floating flake at its first build** until `sbx upgrade` pins it (which changes the
 /// target to a locked ref → a rebuild), and makes a pinned flake a warm no-op until a roll changes its
 /// locked ref. The reuse also lets a warm launch — and a fresh project seeding the shared build — skip
 /// nix entirely, so it works offline.

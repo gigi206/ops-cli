@@ -32,7 +32,7 @@
 # anchored name pattern. sbx runs that command in a HERMETIC sandbox (sbx's own base tools — curl,
 # jq; a shared network to reach the API; sbx's own CA bundle for TLS), re-validates the URL it
 # prints, resolves it to a content hash, and pins BOTH in the per-project appimage lock.
-# `sbx upgrade appimage` re-runs it and rolls the pin forward when upstream publishes; a warm launch
+# `sbx upgrade` re-runs it and rolls the pin forward when upstream publishes; a warm launch
 # reuses the pin WITHOUT re-running it (offline). No manual version bump, no third party.
 #
 # The pattern is anchored at both ends (`^openwork-linux-x86_64-<version>.AppImage$`), so a future

@@ -2,14 +2,14 @@
 //!
 //! A `flake:<ref>` package is a remote reference, so it is built **host-side** into sbx's store
 //! and seeded per project, the way a `nix:` tool is; only an inline `[flakes.<name>]` builds in
-//! the cage. By default the ref *floats* — each cold launch resolves the flake's latest revision. `sbx upgrade flake` pins
+//! the cage. By default the ref *floats* — each cold launch resolves the flake's latest revision. `sbx upgrade` pins
 //! it: it resolves each declared ref to its current immutable revision with `nix flake
 //! metadata` and records `(declared ref → revision, locked ref)` in a per-project lock. A launch
 //! then builds the *locked* ref rather than the declared one (`packages::realise`), host-side into
 //! the shared store under the package's own project gcroot — so a lock change changes the build
 //! target, the next launch builds the new revision and the gcroot moves to it, with no home
 //! enumerated: the host-side lock rewrite is the whole roll. A package with no lock entry keeps the
-//! floating behaviour, so a project that never runs `sbx upgrade flake` is unchanged.
+//! floating behaviour, so a project that never runs `sbx upgrade` is unchanged.
 //!
 //! The revision is recorded and displayed, not used as a path: nothing here is keyed by it. Only an
 //! **inline** flake has a content-keyed out-link (`binds::flake_out_link_hash`), because it builds
@@ -202,7 +202,7 @@ pub(crate) enum FlakeUpgrade {
     },
 }
 
-/// The two views `sbx upgrade flake` needs of a project's declared `flake:` references, collected
+/// The two views `sbx upgrade` needs of a project's declared `flake:` references, collected
 /// in one pass over the baseline and each app overlay (see [`declared`]).
 struct Declared {
     /// Deterministic, deduplicated, **trusted-only** — the set to roll forward (baseline first,
@@ -217,14 +217,22 @@ struct Declared {
 /// Collect both views in a single walk of the layers. Each app overlay is materialized once (a
 /// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
 /// universe — so `sbx upgrade` walks the apps once, not twice.
-fn declared(cfg: &crate::config::Resolved) -> Declared {
+///
+/// `only` is `sbx upgrade --app <name>`, and it narrows the **roll set alone**, exactly as
+/// [`super::prebuilt::declared`] does and for the same reason: the `flake:` lock is one per
+/// project, so the selected app contributes its own layer (its `[packages]` and the bundles folded
+/// under it) while the project baseline stays out, and the prune universe stays project-wide so a
+/// narrowed roll can never unpin another app's reference.
+fn declared(cfg: &crate::config::Resolved, only: Option<&str>) -> Declared {
     let mut seen = std::collections::BTreeSet::new();
     let mut trusted = Vec::new();
     let mut all = std::collections::BTreeSet::new();
-    let mut absorb = |pkgs: &[crate::config::Package]| {
-        for (_, reference) in super::packages::flake_packages(pkgs) {
-            if seen.insert(reference.clone()) {
-                trusted.push(reference);
+    let mut absorb = |pkgs: &[crate::config::Package], roll: bool| {
+        if roll {
+            for (_, reference) in super::packages::flake_packages(pkgs) {
+                if seen.insert(reference.clone()) {
+                    trusted.push(reference);
+                }
             }
         }
         for p in pkgs {
@@ -233,11 +241,14 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
             }
         }
     };
-    absorb(&cfg.packages);
-    for app in cfg.apps.values() {
+    absorb(&cfg.packages, only.is_none());
+    for (name, app) in &cfg.apps {
         let mut merged = cfg.clone();
         merged.merge_app(app.clone());
-        absorb(&merged.packages);
+        absorb(&merged.packages, only.is_none());
+        if only == Some(name.as_str()) {
+            absorb(&app.packages, true);
+        }
     }
     Declared { trusted, all }
 }
@@ -245,7 +256,7 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
 /// How many declared `flake:` packages are withheld for being untrusted — across the project
 /// baseline and each app's own overlay. A count only: the per-package withholding reason is
 /// already warned on the launch path, so `sbx upgrade` just needs to not read as "none declared".
-pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
+pub(crate) fn withheld(cfg: &crate::config::Resolved, only: Option<&str>) -> usize {
     let untrusted_flake = |pkgs: &[crate::config::Package]| {
         pkgs.iter()
             .filter(|p| {
@@ -254,12 +265,22 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
             })
             .count()
     };
-    untrusted_flake(&cfg.packages)
-        + cfg
+    // Under `--app`, count what that roll would have equipped and nothing else — its own layer,
+    // since [`declared`] leaves the baseline out of a narrowed roll set.
+    match only {
+        Some(name) => cfg
             .apps
-            .values()
-            .map(|app| untrusted_flake(&app.packages))
-            .sum::<usize>()
+            .get(name)
+            .map_or(0, |app| untrusted_flake(&app.packages)),
+        None => {
+            untrusted_flake(&cfg.packages)
+                + cfg
+                    .apps
+                    .values()
+                    .map(|app| untrusted_flake(&app.packages))
+                    .sum::<usize>()
+        }
+    }
 }
 
 /// Re-resolve a project's declared `flake:` references against their upstreams and rewrite the
@@ -273,6 +294,7 @@ pub(crate) fn upgrade(
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
+    only: Option<&str>,
 ) -> io::Result<Vec<FlakeUpgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
     let project_id = project_id.as_str();
@@ -280,7 +302,7 @@ pub(crate) fn upgrade(
     let Declared {
         trusted: declared,
         all: prune_universe,
-    } = declared(cfg);
+    } = declared(cfg, only);
     let mut lock = pins(layout, project_id);
     let mut outcomes = Vec::new();
 
@@ -290,11 +312,17 @@ pub(crate) fn upgrade(
     // package's pin, silently unpinning it — a later re-trust would then float to the latest
     // upstream revision, exactly the movement the pin model forbids. Re-resolution below stays
     // trusted-only (over `declared`); pruning is state-agnostic.
-    let stale: Vec<String> = lock
-        .keys()
-        .filter(|k| !prune_universe.contains(k.as_str()))
-        .cloned()
-        .collect();
+    //
+    // Not under a selector: pruning says "no layer declares this any more", which is a statement
+    // about the project that a roll narrowed to one app never makes.
+    let stale: Vec<String> = if only.is_some() {
+        Vec::new()
+    } else {
+        lock.keys()
+            .filter(|k| !prune_universe.contains(k.as_str()))
+            .cloned()
+            .collect()
+    };
     for reference in stale {
         lock.remove(&reference);
         outcomes.push(FlakeUpgrade::Pruned { reference });
@@ -399,7 +427,7 @@ mod tests {
                 ("beta", app_with(vec![])), // no flake package: contributes nothing
             ],
         );
-        let refs = declared(&cfg).trusted;
+        let refs = declared(&cfg, None).trusted;
         // Baseline first, then the app's new ref; the duplicate and the untrusted one are gone.
         assert_eq!(refs, vec!["github:o/a#default", "github:o/b#default"]);
     }
@@ -407,7 +435,7 @@ mod tests {
     #[test]
     fn the_prune_universe_keeps_untrusted_refs_so_upgrade_never_prunes_a_withheld_pin() {
         // The prune universe must NOT drop a still-declared ref just because the project is
-        // untrusted — otherwise `sbx upgrade flake` on a Changed project unpins it and a later
+        // untrusted — otherwise `sbx upgrade` on a Changed project unpins it and a later
         // re-trust floats to latest. Unlike the trusted roll set, `declared().all` keeps the ref.
         let cfg = resolved(
             vec![
@@ -416,7 +444,7 @@ mod tests {
             ],
             vec![],
         );
-        let universe = declared(&cfg).all;
+        let universe = declared(&cfg, None).all;
         assert!(universe.contains("github:o/a#default"));
         assert!(
             universe.contains("github:o/evil#x"),
@@ -457,7 +485,7 @@ mod tests {
 
     #[test]
     fn a_pin_is_keyed_by_the_real_project_runtime_id() {
-        // `sbx upgrade flake` (the writer) and `sbx config`/launch (the readers, via `pinned_revs`)
+        // `sbx upgrade` (the writer) and `sbx config`/launch (the readers, via `pinned_revs`)
         // both key the per-project lock by `binds::project_runtime_id(cwd)` — the same function on
         // the same project path — so a pin written for a project is read back for it, and never for
         // a different one. Exercise that shared keying through the real id derivation (no nix, no

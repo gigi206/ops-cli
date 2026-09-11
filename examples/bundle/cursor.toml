@@ -24,7 +24,7 @@
 # see the profile).
 #
 # THE `.deb` IS AUTO-UPGRADED. `deb:resolve` plus the resolver below re-derives the current `.deb`
-# URL from Cursor's download API, so `sbx upgrade deb` rolls it forward with no manual URL bump.
+# URL from Cursor's download API, so `sbx upgrade` rolls it forward with no manual URL bump.
 # The resolver travels with the package it resolves, which is why it belongs here rather than in
 # the app.
 #

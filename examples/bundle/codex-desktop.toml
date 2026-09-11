@@ -20,7 +20,7 @@
 #
 # THE `.deb` VERSION IS TRACKED, not hand-pinned. OpenAI publishes a real apt repository, and
 # `deb:apt:` points at its `Packages` index: sbx picks the newest version's `.deb`, pins it per
-# project, and `sbx upgrade deb` re-reads the index and rolls forward. The vendor also serves a
+# project, and `sbx upgrade` re-reads the index and rolls forward. The vendor also serves a
 # `.../deb/latest/chatgpt_amd64.deb` alias; it is deliberately NOT used, because a pin is a content
 # hash and a moving URL breaks the next launch with a hash mismatch the moment upstream releases.
 # ARCH: the index below is `binary-amd64` (x86_64); on arm64 point it at `.../binary-arm64/Packages`
@@ -28,7 +28,7 @@
 #
 # THE INDEX IS ATTESTED. The pool publishes a signed `InRelease` covering the index, so sbx verifies
 # it and pins the signing key the first time, naming the fingerprint on stderr. The first pin is
-# trust on first use and proves nothing by itself; every later resolve and `sbx upgrade deb` must
+# trust on first use and proves nothing by itself; every later resolve and `sbx upgrade` must
 # present a signature by that same key, and a re-keyed pool is refused rather than resolved. The
 # key the signature names is served by keys.openpgp.org, so the first pin resolves rather than
 # falling back to TLS-only trust, and the `.deb`'s own postinst ships the same key inline under the

@@ -8,7 +8,7 @@
 //! project. The **`mise:`** ones are not realised here — they are equipped in-cage at launch
 //! by `mise use -g` ([`mise_packages`] collects the tokens); an inline `[flakes.<name>]` is
 //! built in-cage too (local content). [`flake_packages`] still names the remote `(name, ref)`
-//! flake packages for `sbx upgrade flake`'s pin resolution.
+//! flake packages for `sbx upgrade`'s pin resolution.
 //!
 //! Admission is a security decision for every backend: provisioning a tool can fetch or
 //! build, so an untrusted project's packages are withheld until the project is trusted.
@@ -94,7 +94,7 @@ pub(crate) fn provision(
     // A `flake:` package builds host-side into the shared store like a `nix:` one (built once,
     // content-addressed → a second project is a cache hit; seeded per project). The pin selects the
     // immutable build target — the locked ref when `flake-packages.lock` pins it, else the declared
-    // ref (which floats, frozen warm until `sbx upgrade flake`, like a floating `mise:` tool).
+    // ref (which floats, frozen warm until `sbx upgrade`, like a floating `mise:` tool).
     let flake_pins = super::flake::pins(layout, &id);
 
     let mut bins = Vec::with_capacity(admitted.len());
@@ -215,7 +215,7 @@ pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
 }
 
 /// The `(name, ref)` of the *admitted* remote `flake:` packages — the trusted references
-/// `sbx upgrade flake` re-resolves and pins (see [`super::flake`]). Trusted-only, like the host-side
+/// `sbx upgrade` re-resolves and pins (see [`super::flake`]). Trusted-only, like the host-side
 /// `nix:` path and the global `mise:` one: an untrusted project's `flake:` package is dropped here
 /// (its withholding is warned once by [`provision`]'s admission, so this stays a quiet pure filter).
 /// The name is the package name; the ref is the flake reference. The build itself is host-side (see

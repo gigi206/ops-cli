@@ -12,7 +12,7 @@
 # requirements silently falls behind the agent.
 #
 # Hermes ships as a nix flake, and sbx equips it via the flake's `#default` output —
-# `flake:github:NousResearch/hermes-agent#default` in its bundle — so `sbx upgrade flake` rolls it
+# `flake:github:NousResearch/hermes-agent#default` in its bundle — so `sbx upgrade --app hermes` rolls it
 # forward. That output bundles everything in one package: the Python agent (built with uv2nix, its
 # own interpreter — no separate `nix:python`), the node-based TUI/web front-ends, and all the
 # optional extras (voice, edge-tts, mcp, exa, firecrawl, …), each wired by the derivation's own
@@ -86,8 +86,8 @@ gui = "offscreen"
 use = ["hermes"]
 
 [packages]
-# Hermes via the flake's `#default` output, built host-side — so `sbx upgrade flake` rolls it forward.
-# One package supplies the interpreter, the node TUI/web front-ends, and every optional extra
+# Hermes via the flake's `#default` output, built host-side — so `sbx upgrade --app hermes` rolls it
+# forward. One package supplies the interpreter, the node TUI/web front-ends, and every optional extra
 # (voice/edge-tts/mcp/exa/firecrawl/…); there is no separate `nix:uv`/`nix:python`/`nix:nodejs` and
 # no launch-time `pip install`. Trusted-only [packages]; this profile is trusted by location once
 # imported. First launch builds it (~2 GiB, minutes) over the HOST network, outside the cage's

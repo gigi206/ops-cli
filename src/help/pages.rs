@@ -213,15 +213,16 @@ pub(super) const PAGES: &[Page] = &[
             `SBX_NOTIFY`, `SBX_NIXPKGS`,\n\
             `SBX_BIND`,\n\
             `SBX_FORWARD`, `SBX_LIMIT_<key>`, `SBX_PACKAGE_<name>`, `SBX_SECCOMP`, `SBX_DEVICE`,\n\
-            `SBX_GPU`, `SBX_AUDIO`, `SBX_DBUS`.\n\
+            `SBX_FS`, `SBX_GPU`, `SBX_AUDIO`, `SBX_DBUS`.\n\
             Precedence, lowest to highest:\n\
             `SBX_CONFIG < SBX_* typed < --config < --* typed` — the command line always beats the\n\
             environment, and a typed flag beats the blob. Scalars\n\
             (`net`/`gui`/`proc`/`notify`/`nixpkgs`/`gpu`/`audio`/`dbus`)\n\
             replace;\n\
-            collections (`env`/`bind`/`forward`/`limit`/`package`/`seccomp`/`device`) union — `forward`\n\
-            keyed by its cage port, so naming one already forwarded moves it rather than opening a\n\
-            second hole. An override\n\
+            collections (`env`/`bind`/`forward`/`limit`/`package`/`seccomp`/`device`/`fs`) union —\n\
+            `forward` keyed by its cage port, so naming one already forwarded moves it rather than\n\
+            opening a second hole, and `fs` alone accumulates with its own `SBX_FS` rather than\n\
+            beating it, because a mask only ever takes access away. An override\n\
             is the final word: it beats a trusted project config and an app's own posture — including\n\
             `--seccomp`/`--device`, which relax the denylist and grant a device a config file gates\n\
             trusted-only (the invoker outranks any config layer, so it may set exactly what a trusted\n\
@@ -1794,7 +1795,7 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|distro|provision] [-a <name>] [--project <path>]",
+        synopsis: "sbx upgrade [all|nix|mise|distro|provision] [-a <name>] [--project <path>]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             (
@@ -1809,11 +1810,6 @@ pub(super) const PAGES: &[Page] = &[
                 "mise",
                 "the mise engine, the project's nix: tools, mise: packages, and the task tool pool",
             ),
-            ("flake", "the project's and apps' flake: packages"),
-            ("deb", "the project's and apps' deb: packages"),
-            ("appimage", "the project's and apps' appimage: packages"),
-            ("tarball", "the project's and apps' tarball: packages"),
-            ("binary", "the project's and apps' binary: packages"),
             (
                 "distro",
                 "the declared distribution image (re-resolves its tag to the digest served now)",
@@ -1824,7 +1820,7 @@ pub(super) const PAGES: &[Page] = &[
             ),
             (
                 "-a, --app <name>",
-                "narrow `nix`, `mise` or `provision` to one app (leaves the engine, the project's nix: tools and the baseline alone)",
+                "narrow the roll to one app — every channel it rides (leaves the engine, the project's nix: tools, the baseline and the image alone)",
             ),
             (
                 "--project <path>",
@@ -1853,19 +1849,37 @@ pub(super) const PAGES: &[Page] = &[
             that already carries a digest resolves to itself and reports no change. The new root\n\
             filesystem is unpacked at the next launch, not here. The lock is the project's when a\n\
             project declared the image and the shared one otherwise, which is the rule the nixpkgs\n\
-            channel follows.\n\
+            channel follows. It is the one target `--app` cannot narrow, and structurally so: an\n\
+            app profile has no `distro` field, so the image is the project's and there is no\n\
+            per-app unit to select.\n\
             \n\
-            `-a, --app <name>` narrows a roll to one app. It applies to the two in-cage rolls,\n\
-            `provision` and `mise`, whose unit of work is already one app's own cage — and to\n\
-            `nix`, because an app resolves the base channel against a lock of its own: its\n\
-            revision moves when you roll that app, and a plain `sbx upgrade nix` leaves it where\n\
-            it is. The remaining targets rewrite a project-wide lock host-side, where there is no\n\
-            per-app unit to select, and naming one there is a usage error rather than a flag that\n\
-            quietly rolls the project. Under `--app`, `mise` rolls that app's `mise:` packages and\n\
-            NOTHING else: not the engine, not the project's `nix:` tools, not the project\n\
-            baseline, all of which are project-wide. An app name that selects no work is refused\n\
-            with the reason — unknown, unlaunchable, or riding a backend instead — rather than\n\
-            reported as a clean roll of nothing.\n\
+            `-a, --app <name>` narrows the roll to ONE app, across every channel that app rides.\n\
+            It is the answer to \"advance this one thing\", and it is deliberately not spelled as a\n\
+            backend: which of them an app declares is in its profile, not in the user's head.\n\
+            `sbx app upgrade <name>` is the same roll under its own name.\n\
+            \n\
+            What a narrowed roll reaches is the app's own layer — its `[packages]` and the\n\
+            bundles folded under it — plus its bundles' install steps and the `mise:` set its\n\
+            cage equips. What it leaves alone is everything project-wide: the mise engine, the\n\
+            project's `nix:` tools, the task tool pool, the project baseline's packages and the\n\
+            distribution image. It also prunes nothing — dropping a lock entry no layer declares\n\
+            any more is a statement about the project, which a roll narrowed to one app never\n\
+            makes. An app name that selects no work is refused with the reason — unknown,\n\
+            unlaunchable, declaring nothing of its own, or not riding the channel you typed —\n\
+            rather than reported as a clean roll of nothing.\n\
+            \n\
+            Naming ONE app also FORCES the install step, exactly as the `provision` verb does: a\n\
+            user who typed the name is asking for that app to be re-installed, not polled. Only\n\
+            an unscoped `all` leaves each step's own guard in charge, because forcing there would\n\
+            mean a cage and a download for every app in the project.\n\
+            \n\
+            THE PACKAGE BACKENDS ARE NOT TARGETS. `flake`, `deb`, `appimage`, `tarball` and\n\
+            `binary` are rolled by `all` and cannot be typed. They were targets only because\n\
+            there was no per-app unit to narrow by, so advancing one app meant first reading its\n\
+            profile to learn which backend it rode. `--app` is that unit, and it asks the\n\
+            question a user actually has. What remains typable is the work no app carries: the\n\
+            nixpkgs revision, the mise engine with the project's tools and task pool, and the\n\
+            distribution image — plus `provision`, which is not a backend at all.\n\
             \n\
             `nix --app <name>` is refused in a project that pins `nixpkgs`. A pin outranks an\n\
             app's own lock, because an app launch builds the project's declared packages too and\n\

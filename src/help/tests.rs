@@ -39,9 +39,11 @@ fn colored_render_balances_every_span() {
 fn a_folded_option_group_moves_the_row_without_removing_it() {
     let page = find(&["upgrade"]).expect("upgrade page");
     let rendered = render(page, &Palette::plain());
-    let folded = [
-        "nix", "mise", "flake", "deb", "appimage", "tarball", "binary",
-    ];
+    // Spelled out rather than read back from `OPTION_GROUPS`, so this asserts the members instead
+    // of restating the table — and every one of them, `distro` included. The literal was short of
+    // `distro` while the group carried eight, so a regression that gave that one row a line of its
+    // own would have passed green.
+    let folded = ["nix", "mise", "distro"];
 
     assert!(
         rendered.contains("narrow to one channel:"),

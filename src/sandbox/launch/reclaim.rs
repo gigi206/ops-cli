@@ -336,7 +336,7 @@ fn gc_live_session_refusal(
 /// Reclaim the current project's own writable store.
 ///
 /// The agent self-equips into a per-project store — `flake:` builds, in-cage installs — and over
-/// time a flake revision rolled forward by `sbx upgrade flake` (or a package removed outright)
+/// time a flake revision rolled forward by `sbx upgrade` (or a package removed outright)
 /// leaves the previous build behind. This reclaims it. Everything the project still needs is
 /// gc-rooted by a **host-resolvable** root (one whose target is a `/nix/store/<hash>` path, which
 /// the relocated store reads both in-cage and host-side): the seeded base and `nix:` tools are

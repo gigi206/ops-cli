@@ -38,9 +38,9 @@
 # `[appimage.freebuff]` table below. sbx runs its `resolve` command in a HERMETIC sandbox (sbx's own base
 # tools — curl; a shared network to reach the vendor; sbx's own CA bundle for TLS), the command prints the
 # CURRENT `.AppImage` URL by following the redirect, and sbx re-validates that URL, resolves it to a
-# content hash, and pins BOTH in the per-project appimage lock. `sbx upgrade appimage` re-runs the command
-# and rolls the pin forward when the vendor bumps the version; a warm launch reuses the pin WITHOUT
-# re-running it (offline). No manual version bump, no third party.
+# content hash, and pins BOTH in the per-project appimage lock. `sbx upgrade --app freebuff-desktop` re-runs
+# the command and rolls the pin forward when the vendor bumps the version; a warm launch reuses the pin
+# WITHOUT re-running it (offline). No manual version bump, no third party.
 #
 # The AppImage is EXTRACTED at BUILD time, never self-mounted at runtime: `appimage-run`/`wrapType2`/the
 # raw AppImage all need a runtime FUSE/namespace mount the cage's seccomp denylist blocks, so sbx unpacks

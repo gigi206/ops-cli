@@ -47,8 +47,8 @@
 # form resolves to nothing and neither a launch nor an upgrade can provision the app. The direct
 # asset URL below is what keeps it runnable, at the cost of freezing it at that release.
 #
-# UPGRADES — none, until upstream resumes. `sbx upgrade deb` re-resolves this URL and finds the same
-# bytes, so the pin never moves. THE TRIGGER THAT REMOVES THE HARD PIN: upstream attaches a
+# UPGRADES — none, until upstream resumes. `sbx upgrade --app aionui` re-resolves this URL and finds the
+# same bytes, so the pin never moves. THE TRIGGER THAT REMOVES THE HARD PIN: upstream attaches a
 # linux-amd64 `.deb` to a release again, at which point the declaration goes back to
 # `deb:github:iOfficeAI/AionUi` and rolls forward on its own with no other change. Check with
 # `curl -s https://api.github.com/repos/iOfficeAI/AionUi/releases/latest | grep -c '\.deb'`.
@@ -117,7 +117,7 @@ cmd = [
 
 # AionCore's bundled Node runtime, staged WRITABLE out of the read-only store (see the note above).
 # The app root is derived from the launcher on PATH, never hard-coded: the `.deb` is rebuilt at a new
-# content-addressed path on every `sbx upgrade deb`.
+# content-addressed path on every `sbx upgrade --app aionui`.
 APPROOT=$(dirname "$(dirname "$(command -v aionui)")")
 NODESRC="$APPROOT/opt/AionUi/resources/bundled-aioncore/linux-x64/managed-resources/node"
 NODEDEST="$HOME/.config/AionUi/aionui/runtime/node"
@@ -265,7 +265,7 @@ allow = [
 # other telemetry host AionUi probes.
 mute = [
     "*.sentry.io",        # crash/usage telemetry
-    "static.aionui.com",  # AionUi's own auto-update feed — the .deb is managed by `sbx upgrade deb`, not in-cage
+    "static.aionui.com",  # AionUi's own auto-update feed — the .deb is managed by `sbx upgrade`, not in-cage
 ]
 
 # AUTHENTICATION — no [secret]/[env] block. AionUi stores each provider's API key locally (entered

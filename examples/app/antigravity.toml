@@ -97,7 +97,7 @@
 #     (`--password-store=basic` forces Chromium's file store). Confirm the login survives a relaunch.
 #   * In-app self-update — the IDE self-updates in the background from the same updater API + gvt1 CDN.
 #     A self-downloaded binary is NOT autoPatchelf'd, so it cannot run in the cage — the in-app updater
-#     is inert; **`sbx upgrade tarball` is the real upgrade path**. Those hosts are muted below.
+#     is inert; **`sbx upgrade --app antigravity` is the real upgrade path**. Those hosts are muted below.
 #   * The real build + launch + Google login with your account is the pending live validation, as for
 #     every GUI profile (heavy build; not a per-run committed test).
 #

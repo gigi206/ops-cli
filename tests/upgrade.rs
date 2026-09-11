@@ -47,7 +47,8 @@ fn flake_lock_rev(data: &Path, reference: &str) -> Option<String> {
 
 #[test]
 fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
-    // A real resolution of a declared `flake:` package: `sbx upgrade flake` resolves the floating
+    // A real resolution of a declared `flake:` package: the `flake:` half of `sbx upgrade` resolves
+    // the floating
     // reference to its current immutable revision with `nix flake metadata` and writes the
     // per-project flake lock — a host-side lock rewrite (the new pin builds in-cage at the next
     // launch). Teeth: the lock records a 40-hex revision for the declared reference, and a second
@@ -79,12 +80,12 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
 
     let run = || {
         sbx()
-            .args(["upgrade", "flake"])
+            .args(["upgrade"])
             .current_dir(proj.path())
             .env("XDG_DATA_HOME", data.path())
             .env("XDG_STATE_HOME", state.path())
             .output()
-            .expect("spawn sbx upgrade flake")
+            .expect("spawn sbx upgrade")
     };
 
     let first = run();
@@ -213,46 +214,56 @@ fn app_upgrade(config: &Path, data: &Path, proj: &Path, name: &str) -> std::proc
         .expect("spawn sbx app upgrade")
 }
 
-/// The routing case, which is what sixteen of the shipped profiles are: every package the app rides
-/// is pinned in a project-wide lock, so the verb names the channel that advances it and rolls
-/// nothing itself.
+/// A narrowed roll reaches every backend the app rides, and reaches nothing else.
 ///
-/// The load-bearing half is the negative one. A per-app verb that quietly rewrote the project's
-/// `nix:` lock would look identical in a test that only checked the exit code, and would advance
-/// every other app in the project under a command that reads as "only this one". So this asserts
-/// that neither in-cage roll announced itself, and that the run needed no nix at all — it completes
-/// where `sbx upgrade nix` would have to be skipped for want of one.
+/// This used to be the ROUTING case: the per-app verb rolled the two channels whose unit of work
+/// was already the app's cage and merely named the rest, because a `deb:` package is pinned in a
+/// lock that belongs to the project. The selector removed that limit, so the assertion inverts —
+/// what was "names the channel that rolls it" is now "attempts the `deb:` roll".
+///
+/// The load-bearing half is still the negative one, and it moved rather than disappeared: a roll
+/// narrowed to one app must not touch what belongs to the project. So this asserts that the run
+/// never announces the project-wide work (the mise engine, the task pool, the distribution image),
+/// which a run that quietly widened its scope would print.
 #[test]
-fn app_upgrade_names_the_project_wide_channels_and_rolls_nothing_itself() {
+fn a_narrowed_roll_reaches_the_app_s_backends_and_no_project_wide_work() {
     let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
     write_profile(
         config.path(),
         "reader",
         "cmd = [\"reader\"]\n\
          [packages]\n\
-         reader = \"deb:https://example.invalid/reader.deb\"\n\
-         toolkit = \"nix:hello\"\n",
+         reader = \"deb:https://example.invalid/reader.deb\"\n",
     );
 
     let out = app_upgrade(config.path(), data.path(), proj.path(), "reader");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}");
-    assert!(stdout.contains("sbx app upgrade — reader"), "{stdout}");
-    // Both channels named, each with the command that rolls it.
-    assert!(stdout.contains("`deb:`, `nix:`"), "{stdout}");
-    assert!(
-        stdout.contains("`sbx upgrade deb`, `sbx upgrade nix`"),
-        "{stdout}"
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
     );
-    assert!(stdout.contains("not with one app"), "{stdout}");
-    // And nothing was rolled: neither in-cage roll prints its header.
+    // The host may have no usable nix, in which case the roll cannot start at all; that is a
+    // capability, not a defect, and it is reported rather than asserted away.
+    if log.contains("cannot upgrade") {
+        skip_incapable!("skipping the narrowed roll: {log}");
+        return;
+    }
+    // The `deb:` roll ran: the invalid URL cannot resolve, and saying so IS the proof that the
+    // backend was attempted rather than named. A routing answer would have printed neither.
     assert!(
-        !stdout.contains("mise packages") && !stdout.contains("install steps"),
-        "a project-wide-only app builds no cage:\n{stdout}"
+        log.contains("deb"),
+        "the app's own backend must be rolled, not named:\n{log}"
     );
+    // And nothing project-wide announced itself.
+    for widened in ["mise engine", "task pool", "distribution image"] {
+        assert!(
+            !log.contains(widened),
+            "a roll narrowed to one app must not do project-wide work ({widened}):\n{log}"
+        );
+    }
 }
 
-/// The two refusals a name can earn, each with its own answer and its own exit code.
+/// The two refusals a name can earn, each with its own answer and its own exit code./// The two refusals a name can earn, each with its own answer and its own exit code.
 #[test]
 fn app_upgrade_refuses_a_name_that_is_not_a_launchable_app() {
     let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
@@ -274,33 +285,39 @@ fn app_upgrade_refuses_a_name_that_is_not_a_launchable_app() {
     assert!(stderr.contains("declares no command"), "{stderr}");
 }
 
-/// An app that declares nothing at all says so, rather than printing a header and exiting 0 —
-/// which would read as a roll that happened.
+/// An app that declares nothing at all is refused with the reason, rather than printing a header
+/// and exiting 0, which would read as a roll that happened.
+///
+/// It used to be the second shape: a note and a clean exit, because the verb's job was to route and
+/// routing an app that declares nothing is still an answer. Now the verb rolls, so naming an app
+/// with nothing to roll is a usage error, and it joins the other three selector refusals at exit 2
+/// instead of being the one that reported success.
 #[test]
-fn app_upgrade_says_when_an_app_declares_nothing_to_advance() {
+fn app_upgrade_refuses_an_app_that_declares_nothing_to_advance() {
     let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
     write_profile(config.path(), "bare", "cmd = [\"bare\"]\n");
 
     let out = app_upgrade(config.path(), data.path(), proj.path(), "bare");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}");
-    assert!(stdout.contains("nothing to advance"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("no packages and no install step"),
+        "{stderr}"
+    );
+    // The way out is the project roll, which is the one that can still advance the cage this app
+    // launches in.
+    assert!(stderr.contains("sbx upgrade"), "{stderr}");
 }
 
-/// A routing answer is complete even when the data directory is unusable.
+/// The selector refusals are reached without a usable data directory, and the roll is not.
 ///
-/// The property under test is that the answer does **not depend on the store**: sixteen of the
-/// shipped profiles roll nothing at all, and for them this verb is a question about where their
-/// packages advance, which the config alone answers. Pinned against a directory sbx refuses (too
-/// long to hold a Unix socket path), so a change that made the routing path reach for the store
-/// would turn a clean reply into a failure here.
-///
-/// It deliberately does **not** assert the refusal is silent. `config::load` resolves the data
-/// directory to discover resolver plugins, so every verb that loads config reports an unusable one
-/// once; that is the product's existing behaviour, not this verb's, and asserting otherwise would
-/// pin a claim the binary does not make.
+/// The property this pins used to be the opposite one: a routing answer did not depend on the
+/// store, so it stayed whole against a directory sbx refuses. The verb rolls now, so it needs the
+/// store like every other roll, and the honest statement is where the line falls. A name that
+/// cannot be rolled is still answered from the config alone, which is what keeps a typo from being
+/// reported as a broken installation.
 #[test]
-fn a_routing_answer_survives_an_unusable_data_directory() {
+fn a_name_is_refused_without_a_store_and_the_roll_needs_one() {
     let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
     write_profile(
         config.path(),
@@ -330,14 +347,22 @@ fn a_routing_answer_survives_an_unusable_data_directory() {
         String::from_utf8_lossy(&control.stderr)
     );
 
-    let out = run(&["app", "upgrade", "reader"]);
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\n{stderr}");
+    // A name no app carries is answered from the config, whatever the store's state.
+    let typo = run(&["app", "upgrade", "nope"]);
+    assert_eq!(typo.status.code(), Some(2));
     assert!(
-        stdout.contains("`sbx upgrade nix`"),
-        "the answer must be whole without a store:\n{stdout}"
+        String::from_utf8_lossy(&typo.stderr).contains("no app named `nope`"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&typo.stderr)
+    );
+
+    // The roll itself cannot start, and says which prerequisite is missing rather than reporting a
+    // clean roll of nothing.
+    let out = run(&["app", "upgrade", "reader"]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("data directory"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

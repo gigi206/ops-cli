@@ -19,9 +19,9 @@
 # side-by-side previews, a file browser, settings — no terminal.
 #
 # sbx equips Hermes via the flake's `#default` output —
-# `flake:github:NousResearch/hermes-agent#default` in the `hermes` bundle — so `sbx upgrade flake` rolls it
-# forward. That one package bundles the Python agent (uv2nix, its own interpreter), the node
-# front-ends, the web dashboard assets (`web_dist`), and every optional extra (web/voice/edge-tts/
+# `flake:github:NousResearch/hermes-agent#default` in the `hermes` bundle — so `sbx upgrade --app
+# hermes-web` rolls it forward. That one package bundles the Python agent (uv2nix, its own interpreter), the
+# node front-ends, the web dashboard assets (`web_dist`), and every optional extra (web/voice/edge-tts/
 # mcp/…), all wired by the derivation's own wrapper (it sets HERMES_WEB_DIST / HERMES_TUI_DIR /
 # HERMES_NODE) — so the dashboard's server AND its `/chat` node terminal work with no manual
 # `nix:nodejs`/`HERMES_TUI_DIR` plumbing. sbx builds a remote `flake:` ref HOST-SIDE with `nix build`
@@ -98,9 +98,9 @@ gui = "offscreen"
 use = ["hermes"]
 
 [packages]
-# Hermes via the flake's `#default` output, built host-side — so `sbx upgrade flake` rolls it forward.
-# One package supplies the interpreter, the node runtime, the web dashboard assets, the `/chat` tab's
-# embedded TUI, and every optional extra — so there is no separate `nix:uv`/`nix:python`/`nix:nodejs`
+# Hermes via the flake's `#default` output, built host-side — so `sbx upgrade --app hermes-web` rolls it
+# forward. One package supplies the interpreter, the node runtime, the web dashboard assets, the `/chat`
+# tab's embedded TUI, and every optional extra — so there is no separate `nix:uv`/`nix:python`/`nix:nodejs`
 # and no launch-time `pip install`, and the `/chat` node terminal that used to need a manual
 # `nix:nodejs` + `HERMES_TUI_DIR` sentinel now works natively (the derivation's wrapper sets both).
 # Trusted-only [packages]; this profile is trusted by location once imported. First launch builds it

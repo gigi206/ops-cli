@@ -19,7 +19,7 @@
 //!   auto-upgrade form, and the one this backend is really for. sbx runs the command in a hermetic
 //!   bubblewrap cage (sbx's base tools plus the app's `nix:` bins on `PATH`, sbx's store + CA bundle
 //!   bound, shared network so it can reach a vendor version API), captures the URL it prints,
-//!   validates it, and pins it, so `sbx upgrade binary` rolls the package forward automatically. The
+//!   validates it, and pins it, so `sbx upgrade` rolls the package forward automatically. The
 //!   command is arbitrary code — honored only from a trusted layer, never run for an untrusted one —
 //!   and its printed URL is re-validated by [`is_valid_binary_url`] before any fetch.
 //!
@@ -225,20 +225,21 @@ impl prebuilt::Kind for Binary {
     }
 }
 
-/// `sbx upgrade binary`: roll a project's declared `binary:` packages forward. See
-/// [`prebuilt::upgrade_project`].
+/// The `binary:` half of `sbx upgrade`: roll a project's declared `binary:` packages
+/// forward. See [`prebuilt::upgrade_project`].
 pub(crate) fn upgrade_project(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
+    only: Option<&str>,
 ) -> io::Result<Vec<BinaryUpgrade>> {
-    prebuilt::upgrade_project(&Binary, nix, layout, project, cfg)
+    prebuilt::upgrade_project(&Binary, nix, layout, project, cfg, only)
 }
 
 /// How many declared `binary:` packages are withheld for being untrusted. See [`prebuilt::withheld`].
-pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
-    prebuilt::withheld(&Binary, cfg)
+pub(crate) fn withheld(cfg: &crate::config::Resolved, only: Option<&str>) -> usize {
+    prebuilt::withheld(&Binary, cfg, only)
 }
 
 #[cfg(test)]

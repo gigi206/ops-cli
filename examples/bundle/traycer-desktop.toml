@@ -15,7 +15,7 @@
 # gets a package it cannot display.
 #
 # DISTINCT FROM THE `traycer` BUNDLE, deliberately. That one carries the CLI (`mise:npm:`); this one
-# carries the desktop artifact, a GitHub-release `.deb` that `sbx upgrade deb` rolls forward. It
+# carries the desktop artifact, a GitHub-release `.deb` that `sbx upgrade` rolls forward. It
 # needs no node and no npm registry of its own: the desktop ships its own copy of the CLI and
 # delegates the host's lifecycle to it, which is why their egress is the same shape.
 #

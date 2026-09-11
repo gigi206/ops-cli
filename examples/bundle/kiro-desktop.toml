@@ -23,7 +23,7 @@
 # auth dependency rather than telemetry.
 #
 # THE TARBALL IS AUTO-UPGRADED. `tarball:resolve` plus the resolver below reads the current signed
-# `.tar.gz` URL out of Kiro's release metadata, so `sbx upgrade tarball` rolls it forward with no
+# `.tar.gz` URL out of Kiro's release metadata, so `sbx upgrade` rolls it forward with no
 # manual URL bump. The resolver travels with the package it resolves.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a

@@ -31,7 +31,7 @@ See also: [The app framework](../apps/) · [`[app.<name>]`](../configuration/app
 | `--proc-learn[=name\|path]` | run under the app's real posture, then add the programs it ran to the app's `[proc] allow` list and set `mode = "ask"` (default level `name`); see [Learning what an app runs](#learning-what-an-app-runs---proc-learn) |
 | `-g, --global` / `-l, --local` | with `--net-learn`/`--proc-learn`: write the learned rules to the global app profile / the project config (default local); refused without a learning flag |
 | `--dry-run` | with `--net-learn`/`--proc-learn`: print the rules that would be added without writing them; refused without a learning flag |
-| `--config` / `--env` / `--net` / `--gui` / `--proc` / `--notify` / `--nixpkgs` / `--bind` / `--forward` / `--limit` / `--package` / `--seccomp` / `--device` / `--gpu` / `--audio` / `--dbus` | typed one-shot [overrides](../configuration/overrides), applied **after** the app's overlay (the final word); value-taking flags also accept `--flag=value` |
+| `--config` / `--env` / `--net` / `--gui` / `--proc` / `--notify` / `--nixpkgs` / `--bind` / `--forward` / `--limit` / `--package` / `--seccomp` / `--device` / `--fs` / `--gpu` / `--audio` / `--dbus` | typed one-shot [overrides](../configuration/overrides), applied **after** the app's overlay (the final word); value-taking flags also accept `--flag=value` |
 | `-- <args>...` | appended to the app's declared command |
 
 `--detach`, `--observe` and `--dry-run` take no value: `--detach=x` is refused (usage, exit 2).
@@ -146,40 +146,31 @@ app's egress and its programs in one launch, writing both to the same profile.
 ## Advancing an app
 
 `sbx app upgrade <name>` moves one app forward without making you work out which
-channel it rides first. sbx reads what the app declares and dispatches on that.
-
-Two kinds of work exist, and the verb treats them differently because they differ in
-scope, not in importance.
+channel it rides first. sbx reads what the app declares and rolls all of it. It is the
+same roll as [`sbx upgrade --app <name>`](upgrade#rolling-one-app), under its own name.
 
 | What the app declares | What `sbx app upgrade` does |
 |---|---|
 | `mise:` packages | rolls them, in the app's own cage |
-| a bundle [install step](../configuration/bundles#the-install-step) | re-runs it, in the app's own cage |
-| `flake:` / `deb:` / `appimage:` / `tarball:` / `binary:` packages | names the channel that rolls them, and rolls none |
-| `nix:` packages | names the channel too: they ride the app's own nixpkgs lock, which only [`sbx upgrade nix --app <name>`](upgrade#an-apps-base-channel) advances |
-| an inline [`[flakes.<name>]`](../configuration/packages#flakes-an-inline-nix-flake) | names it as floating: no channel advances it |
+| a bundle [install step](../configuration/bundles#the-install-step) | re-runs it, in the app's own cage, forced |
+| `flake:` / `deb:` / `appimage:` / `tarball:` / `binary:` packages | re-resolves the app's own, and rewrites only their entries in the project lock |
+| `nix:` packages | rolls them against the [app's own nixpkgs lock](upgrade#an-apps-base-channel) |
+| an inline [`[flakes.<name>]`](../configuration/packages#flakes-an-inline-nix-flake) | nothing: it pins its inputs in its own source, so no channel advances it |
 
-The first two are rolled here because their unit of work is already one app's cage. The
-rest are named rather than rolled. A `flake:` / `deb:` / `appimage:` / `tarball:` /
-`binary:` package is pinned in a lock that belongs to the **project**, so rolling one
-from a per-app verb would advance every app that rides it, under a command that reads as
-though it touched only this one. A `nix:` package has the opposite shape: it resolves
-against the **app's own** nixpkgs lock, and advancing that lock re-resolves the channel
-and rebuilds the base userland, a download this verb does not take on unasked. Either way
-the roll belongs to the channel command:
+What the roll does **not** touch is everything that belongs to the project rather than to
+this app: the mise engine, the project's `nix:` tools, the
+[task tool pool](../tasks/execution#the-task-tool-pool), the project baseline's packages,
+and the [`distro`](../configuration/distro) image, which no app can declare.
 
-```
-  `deb:`, `nix:` packages advance with the project, not with one app: `sbx upgrade deb`, `sbx upgrade nix`.
-```
+It also **prunes nothing**. Dropping a lock entry that no layer declares any more is a
+statement about the project, and a roll narrowed to one app never makes one, so another
+app's pin is never touched.
 
-That is the honest limit of the verb: what it removes is the question "which channel?",
-not the scope of the locks behind each answer. See [`sbx upgrade`](upgrade) for the
-channels themselves, and [an app's base channel](upgrade#an-apps-base-channel) for the
-per-app roll.
-
-An inline flake is named apart because it has no channel at all. It pins its inputs
-inside its own `flake.nix` source and rebuilds when that source changes, and
-`sbx upgrade flake` deliberately skips it.
+This is newer than the verb. `sbx app upgrade` used to roll the two channels whose unit
+of work was already the app's cage and merely **name** the rest, because a `deb:` or
+`appimage:` package is pinned in a lock that belongs to the project. What removed the
+limit was giving the roll a selector: it now resolves only what the named app declares
+and leaves the lock's other entries alone.
 
 A package a layer you have not trusted declared is counted rather than dropped, so an
 untrusted project never reads as "nothing advances this app":
@@ -190,11 +181,11 @@ untrusted project never reads as "nothing advances this app":
 
 ### The install step runs here
 
-`sbx upgrade all` leaves the bundle install steps alone and says so, because it is
-unscoped: its steps would launch one cage per app across the whole project and re-run a
-clone, a build or a vendor script in each. Naming one app removes that reason. The cost
-is one cage, for the app you asked about, so `sbx app upgrade <name>` runs the step
-without a further flag.
+An unscoped `sbx upgrade` leaves each install step's own guard in charge, because its
+steps would launch one cage per app across the whole project and re-run a clone, a build
+or a vendor script in each. Naming one app removes that reason: a user who typed the name
+is asking for that app to be re-installed, not polled. So naming one app **forces** the
+step, whichever spelling you use, and the cost is one cage, for the app you asked about.
 
 That matters for the apps a bundle **installs** rather than pins: they ride no
 `[packages]` backend, so re-running the install is the only thing that advances them.
@@ -204,7 +195,7 @@ Because nothing gates it, the cost is named **before** the cage is built rather 
 reported after it:
 
 ```
-  the install step below re-runs in junie's own cage, which downloads again — `sbx upgrade mise --app junie` rolls only the packages.
+  the install step below re-runs in junie's own cage regardless of its guard, which downloads again — `sbx upgrade mise --app junie` rolls only the packages.
 ```
 
 That second clause appears only for an app that has packages to roll. `sbx upgrade mise

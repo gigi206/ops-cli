@@ -20,7 +20,7 @@
 #
 # DISTINCT FROM THE `opencode` BUNDLE, deliberately. That one carries the CLI (`mise:opencode`);
 # this one carries the desktop artifact, a GitHub-release `.deb` whose version-stamped asset
-# `sbx upgrade deb` rolls forward. Both wrap the same opencode server, which is why their egress
+# `sbx upgrade` rolls forward. Both wrap the same opencode server, which is why their egress
 # is the same shape.
 #
 # NO PROVIDER KEY. opencode is multi-provider: the gateway path needs only the hosts below, and a
@@ -47,5 +47,5 @@ mute = [
 
 [packages]
 # Track the latest GitHub release's linux-amd64 `.deb` automatically — the pin is the release's
-# version-stamped asset, rolled by `sbx upgrade deb`.
+# version-stamped asset, rolled by `sbx upgrade`.
 opencode-desktop = "deb:github:anomalyco/opencode"

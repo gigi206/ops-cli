@@ -23,7 +23,7 @@
 # package (the npm package literally named `cursor-agent` is an UNRELATED third-party package by
 # another author — using it would install the wrong thing). What there IS is a resolvable versioned
 # URL, so the bundle rides `tarball:resolve`: the version is read out of the install script, the
-# artifact is pinned by content hash, and `sbx upgrade tarball` rolls it.
+# artifact is pinned by content hash, and `sbx upgrade --app cursor-agent` rolls it.
 #
 # That archive needs one thing the three layout searches cannot supply. It unpacks to a
 # `dist-package/` tree whose root holds sixteen executables — the launcher, its own `node`, `rg`,

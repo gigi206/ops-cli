@@ -22,7 +22,7 @@
 # fix — inside a per-platform tarball laid out as `bin/devin` plus `share/devin/docs/` and
 # `share/man/`. The vendor publishes a live manifest naming the current version, each platform URL
 # and its sha256; the resolver below reads it, and sbx pins the URL with its own content hash.
-# `sbx upgrade tarball` re-runs the resolver and re-fetches only when the URL actually changed.
+# `sbx upgrade` re-runs the resolver and re-fetches only when the URL actually changed.
 #
 # ARCHITECTURE: the resolver names the `x86_64-unknown-linux` build. On aarch64 change that key to
 # `aarch64-unknown-linux` — the manifest carries both.
@@ -38,7 +38,7 @@ allow = [
     # The vendor's CDN. The INSTALL no longer needs it — the resolver and the download run
     # host-side, outside any cage allowlist — but the CLI's own `devin update` reads the same
     # manifest from inside the cage, so it stays open read-only. Drop it in the consuming app to
-    # make `sbx upgrade tarball` the only path that moves the version.
+    # make `sbx upgrade` the only path that moves the version.
     "{GET} https://static.devin.ai",
 ]
 mute = [

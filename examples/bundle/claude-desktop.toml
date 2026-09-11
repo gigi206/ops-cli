@@ -21,11 +21,11 @@
 #
 # THE `.deb` VERSION IS TRACKED, not hand-pinned: `deb:apt:` points at Anthropic's apt `Packages`
 # index (their pool publishes versioned filenames with no `latest` alias), sbx picks the newest
-# version's `.deb` and pins it per project, and `sbx upgrade deb` re-reads the index.
+# version's `.deb` and pins it per project, and `sbx upgrade` re-reads the index.
 #
 # THE INDEX IS ATTESTED. That pool publishes a signed `InRelease` covering the index, so sbx verifies
 # it and pins the signing key the first time, naming the fingerprint on stderr. The first pin is
-# trust on first use and proves nothing by itself; every later resolve and `sbx upgrade deb` must
+# trust on first use and proves nothing by itself; every later resolve and `sbx upgrade` must
 # present a signature by that same key, and a re-keyed pool is refused rather than resolved. To pin
 # again from scratch, delete the repository's file under `apt-keys/` in sbx's data directory.
 #

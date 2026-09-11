@@ -169,7 +169,7 @@ pub(crate) use nixhub::{ToolUpgrade, current_system, parse_nix_tools, upgrade_to
 /// outside this module, and a second definition of the rule is how the two would come to disagree.
 pub(crate) use observe_feed::sanitize;
 /// The sibling selector, exported for one guard rather than for a caller: `sbx app upgrade` decides
-/// that an inline `[flakes.<name>]` gets no channel *because* this is what `sbx upgrade flake`
+/// that an inline `[flakes.<name>]` gets no channel *because* this is what `sbx upgrade`
 /// rolls, and the test that pins the decision asserts it against this function rather than against
 /// a restatement of the rule.
 #[cfg(test)]

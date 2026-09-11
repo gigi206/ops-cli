@@ -21,7 +21,7 @@
 # an unversioned request finds none — the launch failed before the agent was reached. The bundle
 # declares it as `binary:resolve` instead: the artifact is a bare executable rather than an archive,
 # and the bundle's `resolve` command reads the vendor's own channel file for the current version, so
-# `sbx upgrade binary` rolls this agent forward like every other. The version is pinned per project
+# `sbx upgrade --app grok` rolls this agent forward like every other. The version is pinned per project
 # with its content hash, and a warm launch reuses that pin offline.
 #
 # TWO AUTHENTICATION PATHS, and they use DIFFERENT hosts — pick one and open only its host:
@@ -91,7 +91,7 @@ allow = [
 mute = []
 
 [env]
-# sbx owns upgrades (`sbx upgrade binary`), so tell the CLI not to replace its own binary underneath
+# sbx owns upgrades (`sbx upgrade --app grok`), so tell the CLI not to replace its own binary underneath
 # the pinned install. Belt and braces: even if the value is not honored, the package is built
 # host-side into a read-only store path the cage cannot write, and a warm launch reuses the pin
 # offline.

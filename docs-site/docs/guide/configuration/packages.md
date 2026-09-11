@@ -38,11 +38,11 @@ nix.
 |---|---|---|---|
 | `nix:<attribute>` | host-side, into the shared store | tracks the nixpkgs channel | yes (seeded, durable) |
 | `mise:<token>` | in-cage, via `mise use -g` | upstream-direct, fetched at launch | first launch needs network |
-| `flake:<ref>` | host-side, via `nix build` | floats, or pinned by `sbx upgrade flake` | yes (seeded, durable) |
-| `deb:<url>` · `deb:github:…` · `deb:apt:…` · `deb:resolve` (+ `[deb.<name>]`) | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade deb` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
-| `appimage:<url>` · `appimage:github:…` · `appimage:resolve` (+ `[appimage.<name>]`) | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade appimage` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
-| `tarball:<url>` · `tarball:resolve` (+ `[tarball.<name>]`) | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade tarball` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
-| `binary:<url>` · `binary:resolve` (+ `[binary.<name>]`) | host-side, from a program downloaded as itself | pin-on-first-use, rolled by `sbx upgrade binary` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
+| `flake:<ref>` | host-side, via `nix build` | floats, or pinned by `sbx upgrade` | yes (seeded, durable) |
+| `deb:<url>` · `deb:github:…` · `deb:apt:…` · `deb:resolve` (+ `[deb.<name>]`) | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
+| `appimage:<url>` · `appimage:github:…` · `appimage:resolve` (+ `[appimage.<name>]`) | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
+| `tarball:<url>` · `tarball:resolve` (+ `[tarball.<name>]`) | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
+| `binary:<url>` · `binary:resolve` (+ `[binary.<name>]`) | host-side, from a program downloaded as itself | pin-on-first-use, rolled by `sbx upgrade` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 
 ### `nix:`: a nixpkgs attribute
 
@@ -245,7 +245,7 @@ config cannot aim the build at a host path. The build fetches its inputs over th
 network (not the cage allowlist), so a flake whose build self-fetches with its own HTTP
 client (e.g. `bun install`) builds fine: the cage allowlist governs only the app's
 **runtime** egress. Pins advance with
-[`sbx upgrade flake`](../housekeeping/upgrade).
+[`sbx upgrade`](../housekeeping/upgrade).
 
 Resolving a `flake:` ref to its current pin (`nix flake metadata`) is bounded at **five
 minutes**, and so is resolving a nixpkgs channel. That is not a target: nix fetches the
@@ -305,7 +305,7 @@ content hash (pinned in a per-project `deb-packages.lock`), and builds a generat
 `dpkg-deb -x`-unpacks the `.deb` and `autoPatchelfHook`s its Electron/Chromium binaries against a
 curated library set, **host-side** (like `nix:`, seeded and offline-reusable), because a `.deb`
 runs no build script so evaluating it host-side is safe. The build uses the **host** network (not
-the cage allowlist), and `sbx upgrade deb` re-resolves each source forward.
+the cage allowlist), and `sbx upgrade` re-resolves each source forward.
 
 Four source forms:
 
@@ -378,7 +378,7 @@ hermetic sandbox** (its own base tools, `curl`/`coreutils`/`grep`/`sed`/`awk`, p
 `nix:` `[packages]`; the host network for the API, sbx's own CA bundle for TLS), captures the URL it
 prints, **re-validates** it (`https://`, ending `.deb`, injection-free) before any fetch, and pins it
 + its content hash in `deb-packages.lock`. A warm launch reuses the pin offline and does **not** run
-the command; `sbx upgrade deb` re-runs it and re-fetches the `.deb` only when the URL actually
+the command; `sbx upgrade` re-runs it and re-fetches the `.deb` only when the URL actually
 changed. Because the command is arbitrary code it is honored **only from a trusted source** and
 **never runs for an untrusted layer**.
 
@@ -418,7 +418,7 @@ resolve = ["sh", "-c", "curl -fsSL https://updates.example.com/api | sed -n 's/.
 sbx runs it in the same hermetic sandbox as the other `*:resolve` forms (base tools + the app's own
 `nix:` `[packages]`, host network, sbx's own CA bundle), re-validates the printed URL (`https://`,
 ending `.AppImage`, injection-free) before any fetch, and pins it in `appimage-packages.lock`. A warm
-launch reuses the pin offline; `sbx upgrade appimage` re-runs the command and re-fetches the
+launch reuses the pin offline; `sbx upgrade` re-runs the command and re-fetches the
 `.AppImage` only when the URL actually changed, so a command that prints a stable URL never rolls.
 Honored **only from a trusted source** and **never run for an untrusted layer**.
 
@@ -509,7 +509,7 @@ Two forms:
   version-stamped vendor URL does not roll forward on its own (the version is in the path); `sbx
   upgrade tarball` only re-resolves the same URL.
 - **Auto-upgrade**, `tarball:resolve`, paired with a `[tarball.<name>]` table carrying a `resolve`
-  **command** that prints the newest release's download URL, so `sbx upgrade tarball` can roll the app
+  **command** that prints the newest release's download URL, so `sbx upgrade` can roll the app
   forward automatically (the direct form's version-stamped URL cannot). Use this when there is no
   stable "latest" download alias:
 
@@ -524,7 +524,7 @@ Two forms:
 
   The `[packages]` entry stays the canonical tool list (the `tarball:resolve` sentinel is the opt-in);
   the `[tarball.<name>]` table, keyed by the same package name, carries the resolver command. On the
-  first launch (and on `sbx upgrade tarball`) sbx runs that command **in a hermetic sandbox**, captures
+  first launch (and on `sbx upgrade`) sbx runs that command **in a hermetic sandbox**, captures
   the URL it prints, validates it, and pins it + its content hash; a warm launch reuses the pin offline
   and does **not** run the command. An upgrade re-runs the command and re-fetches the tarball only when
   the URL actually changed: a no-op upgrade never re-downloads a large asset.
@@ -573,7 +573,7 @@ resolve = ["sh", "-c", "v=$(curl -fsSL https://host/path/stable); echo https://h
 `binary:resolve` is therefore the form this backend is really for, and it behaves exactly like the
 other `*:resolve` forms: sbx runs the command in the same hermetic sandbox (base tools plus the app's
 own `nix:` packages, host network, sbx's CA bundle), re-validates the printed URL before any fetch,
-pins it, and `sbx upgrade binary` re-runs the command and rolls the pin forward. Honored **only from
+pins it, and `sbx upgrade` re-runs the command and rolls the pin forward. Honored **only from
 a trusted source** and **never run for an untrusted layer**.
 
 **What the URL check here can and cannot do.** The three archive backends require their extension,
@@ -789,12 +789,12 @@ the fingerprint when it pins:
 
 ```
 sbx: note: pinned the signing key of the apt repository at https://example.com/apt/dists/stable/InRelease
-(A1B2C3...); every later `sbx upgrade deb` must present a signature by this key
+(A1B2C3...); every later `sbx upgrade` must present a signature by this key
 ```
 
 That first pin proves nothing by itself, and it is not meant to. Whoever served the index chose both
 the signature and the fingerprint in it, so a repository that was already hostile stays hostile. What
-the pin buys is everything after: each later resolve, and every `sbx upgrade deb`, has to present a
+the pin buys is everything after: each later resolve, and every `sbx upgrade`, has to present a
 signature by that same key. A repository that is re-keyed, or an index served by somebody else, is
 **refused** rather than resolved. It is the trust model `sbx` already applies to a
 [signed plugin store](../plugins/stores), for the same reason.

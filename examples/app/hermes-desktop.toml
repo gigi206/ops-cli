@@ -25,8 +25,8 @@
 # opencode-desktop (a prebuilt .deb), Hermes Desktop has NO prebuilt binary — but it IS a nix flake
 # output (`#desktop`), so sbx builds it from source rather than from a downloaded foreign binary.
 #
-# HOW IT RUNS — the flake's `#desktop` output, rolled by `sbx upgrade flake`. `#desktop` is nixpkgs'
-# own Electron (already patchelf'd for the store — so none of the ~95 system libs a stock/foreign
+# HOW IT RUNS — the flake's `#desktop` output, rolled by `sbx upgrade --app hermes-desktop`. `#desktop` is
+# nixpkgs' own Electron (already patchelf'd for the store — so none of the ~95 system libs a stock/foreign
 # Electron needs, which the hermetic cage lacks) wrapped around the from-source-built renderer, with
 # the Python backend WIRED IN: the derivation sets `HERMES_DESKTOP_HERMES` to the flake's own
 # fully-equipped `hermes`, so the desktop app spawns that as its backend (no venv, no repo clone, no
