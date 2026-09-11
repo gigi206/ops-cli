@@ -693,6 +693,126 @@ fn every_upgrade_target_has_a_row_in_its_reference_page() {
     );
 }
 
+/// The words one document offers as `sbx upgrade` targets, read in the two shapes that make the
+/// offer structural rather than incidental.
+///
+/// * A **synopsis**: the alternatives of a bracketed group after `sbx upgrade`, read only when the
+///   group actually alternates (it contains a `|`). A bracket holding one word is an optional
+///   operand, `[target]` or `[--project <path>]`, and reading those would report a metavariable as
+///   a stale target. Bounded to the line the bracket opens on, because a synopsis never wraps and
+///   an unbounded scan would run past the end of a Rust string literal to whatever `]` came next.
+/// * A **target table**: the first cell of every row under a header row whose first column is
+///   `Target`. That is the shape a reference table takes, and the shape a stale one keeps after the
+///   word it names stops being accepted.
+///
+/// A bare `sbx upgrade <word>` in prose is deliberately NOT read. The word after the command is
+/// ordinary English at least as often as it is a target (``sbx upgrade`` rolls the project), so a
+/// check that guessed would fail on sentences instead of on claims, and a guard that cries wolf is
+/// removed rather than obeyed.
+fn offered_upgrade_targets(text: &str) -> BTreeSet<String> {
+    const OPEN: &str = "sbx upgrade [";
+    let mut out = BTreeSet::new();
+    for line in text.lines() {
+        for (at, _) in line.match_indices(OPEN) {
+            let rest = &line[at + OPEN.len()..];
+            let Some(end) = rest.find(']') else {
+                continue;
+            };
+            let group = &rest[..end];
+            if !group.contains('|') {
+                continue;
+            }
+            out.extend(
+                group
+                    .split('|')
+                    .map(|word| word.trim().trim_matches('`').trim())
+                    .filter(|word| !word.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    let mut in_target_table = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(body) = trimmed.strip_prefix('|') else {
+            in_target_table = false;
+            continue;
+        };
+        let first = body.split('|').next().unwrap_or_default().trim();
+        if first.eq_ignore_ascii_case("target") {
+            in_target_table = true;
+            continue;
+        }
+        // The alignment row that separates a header from its body carries no cell.
+        if !first.is_empty() && first.chars().all(|c| c == '-' || c == ':') {
+            continue;
+        }
+        if in_target_table {
+            let word = first.trim_matches('`').trim();
+            if !word.is_empty() {
+                out.insert(word.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// No document offers a word as an `sbx upgrade` target that the parser refuses.
+///
+/// The other direction of [`every_upgrade_target_has_a_row_in_its_reference_page`], and the one
+/// nothing held. That guard asks whether every target is documented, which a REMOVAL satisfies for
+/// free: a word struck from `TARGETS` keeps every row and every synopsis it already had, and the
+/// suite stays green while the pages go on offering it.
+///
+/// It is not a hypothetical. When the five package backends stopped being targets, three
+/// statements of the surface survived the sweep that removed the command form, each in a shape a
+/// `grep` for `sbx upgrade <backend>` could not see: a table of bare backend names headed `Target`,
+/// a synopsis in a module header, and a synopsis in a concepts page. The first was found by
+/// reading, not by a check.
+///
+/// Rust sources are scanned beside the guide because one of the three was a module header. A
+/// reader opening `src/cli/upgrade.rs` meets that line first, and no documentation guard had ever
+/// reached it.
+#[test]
+fn no_document_offers_an_upgrade_target_the_parser_refuses() {
+    let known: BTreeSet<&str> = crate::cli::upgrade::TARGETS.iter().copied().collect();
+    let documents: Vec<(String, String)> = guide_pages()
+        .into_iter()
+        .map(|(path, text)| (path.display().to_string(), text))
+        .chain(crate_and_test_sources())
+        .collect();
+
+    // The control, and it is not decoration: the extractor must be shown to read something before
+    // its silence is read as a verdict. The reference page states the whole set in both shapes, so
+    // a reader that returned nothing at all would satisfy the assertion below on emptiness alone.
+    let reference = std::fs::read_to_string(guide().join("cli/upgrade.md"))
+        .expect("docs-site/docs/guide/cli/upgrade.md must exist");
+    let found = offered_upgrade_targets(&reference);
+    for target in &known {
+        assert!(
+            found.contains(*target),
+            "the reader found no offer of `{target}` on the reference page, so its silence \
+             elsewhere proves nothing: {found:?}"
+        );
+    }
+
+    let mut offenders: Vec<String> = Vec::new();
+    for (where_, text) in &documents {
+        for word in offered_upgrade_targets(text) {
+            if !known.contains(word.as_str()) {
+                offenders.push(format!("{where_}: `{word}`"));
+            }
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "these offer an `sbx upgrade` target the parser refuses (known: {:?}):\n  {}",
+        crate::cli::upgrade::TARGETS,
+        offenders.join("\n  ")
+    );
+}
+
 /// The `sbx app` subcommand family is enumerated in prose twice, and both enumerations are the real
 /// set, in the real order.
 ///
