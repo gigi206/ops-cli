@@ -18,8 +18,9 @@ fn session_verb_confirmations_are_plain_text_when_uncolored() {
     );
     assert_eq!(
         render_gui_stop_hint("demo-app", 4242, &p),
-        "sbx: demo-app is graphical — press Ctrl+C twice here to quit (closing its window may only \
-         hide it — a tray app keeps running); `sbx session stop 4242` also stops it."
+        "sbx: demo-app is graphical — close its window to quit, unless it hides to a tray \
+         instead, which this cage provides none of; press Ctrl+C twice here to quit it anyway, or \
+         `sbx session stop 4242` from another terminal."
     );
     assert_eq!(
         render_stop_outcome(

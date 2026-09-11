@@ -45,18 +45,21 @@ pub(super) fn launch_display_name(runtime: &binds::Runtime, cmd: &[OsString]) ->
 }
 
 /// The line a foreground graphical launch prints (stderr) so the user knows how to stop it: its UI
-/// is the window, and a single Ctrl+C — though forwarded — is ignored by a GUI app (and a tray-backed
-/// window may not quit on close), so the escape hatches are named: a double Ctrl+C force-quits the
-/// session, and `sbx session stop <pid>` works from any other terminal. The app name is the identifier
-/// (cyan); the rest is plain, matching the restraint of the attach announcements.
+/// is the window, so closing that window is named first, and the caveat that costs a user the most
+/// time is named with it — an app that hides to a tray keeps running, and the cage provides no tray
+/// to bring it back from. Then the two escape hatches, because a single Ctrl+C — though forwarded —
+/// is ignored by a GUI app: a double Ctrl+C force-quits the session, and `sbx session stop <pid>`
+/// works from any other terminal. The app name is the identifier (cyan); the rest is plain, matching
+/// the restraint of the attach announcements.
 pub(super) fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> String {
     let (n, r) = (pal.name, pal.reset);
     format!(
         "sbx: {n}{name}{r} {}",
         crate::style::prose(
             &format!(
-                "is graphical — press Ctrl+C twice here to quit (closing its window may only \
-                 hide it — a tray app keeps running); `sbx session stop {pid}` also stops it."
+                "is graphical — close its window to quit, unless it hides to a tray instead, \
+                 which this cage provides none of; press Ctrl+C twice here to quit it anyway, or \
+                 `sbx session stop {pid}` from another terminal."
             ),
             pal
         )
