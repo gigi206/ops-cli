@@ -85,9 +85,12 @@ impl UpgradeCage {
         cfg: &crate::config::Resolved,
     ) -> Option<Self> {
         let bwrap = crate::store::resolve_bwrap(Some(layout))?.path;
-        // The project's channel, never an app's: the prebuilt backends this cage serves are not
-        // app-scoped (`sbx upgrade --app` narrows the in-cage rolls only), so there is no app whose
-        // lock could apply. A resolver command runs against the same base its project does.
+        // The project's channel, never an app's, and the reason is the CAGE rather than the roll.
+        // `sbx upgrade --app` does narrow the prebuilt backends now, so an app's lock exists and
+        // could be resolved against — but what runs in here is a resolver command asking a vendor
+        // for a URL, under base tools and a shared network. Nothing it does depends on which
+        // revision built its `curl`, so binding it to the named app's lock would buy a cage per app
+        // and change no answer. A resolver command runs against the same base its project does.
         let nixpkgs = super::launch::effective_lock_target(project, layout, cfg, None)
             .ok()?
             .resolve(nix, layout)

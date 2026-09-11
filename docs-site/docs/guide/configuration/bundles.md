@@ -134,10 +134,12 @@ for a step to state the path it produces. Until then, the step owns its guard.
 ### Rolling an install step forward
 
 A step's guard is what keeps a launch from re-installing, which also means the agent it
-installs never moves. Two commands run it again, in the app's own cage and with
-`SBX_UPGRADE=1` set: [`sbx app upgrade <name>`](../cli/app#advancing-an-app) for one app,
-and [`sbx upgrade provision`](../cli/upgrade) for every app in the project. So the guard is
-written to yield to it:
+installs never moves. One rule runs it again anyway, in the app's own cage and with
+`SBX_UPGRADE=1` set: naming a single app, as
+[`sbx app upgrade <name>`](../cli/app#advancing-an-app) or
+[`sbx upgrade --app <name>`](../cli/upgrade#rolling-one-app), or asking for every app in the
+project with [`sbx upgrade provision`](../cli/upgrade). So the guard is written to yield to
+it:
 
 ```toml
 provision = ["bash", "-c", "[ -e \"$HOME/.local/bin/tool\" ] && [ -z \"${SBX_UPGRADE:-}\" ] || install-tool"]

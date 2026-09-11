@@ -2157,29 +2157,34 @@ pub(super) const PAGES: &[Page] = &[
     Page {
         path: &["app", "upgrade"],
         synopsis: "sbx app upgrade <name>",
-        summary: "advance one app, dispatching on what it declares",
+        summary: "advance one app: every channel it rides",
         options: &[("<name>", "the app to advance")],
-        details: "Advances a named app without asking which channel it rides: sbx reads what the app\n\
-            declares and rolls the parts whose unit of work is the app's own cage — its `mise:`\n\
-            packages and its bundle's install step.\n\n\
-            What it does not do is hide the rest. A `flake:`, `deb:`, `appimage:`, `tarball:` or\n\
-            `binary:` package is pinned in a lock that belongs to the **project**, not to one app,\n\
-            so rolling it here would advance every app under a command that reads as \"only this\n\
-            one\". Those are named instead, with the channel command that rolls them. An inline\n\
-            `[flakes.<name>]` pins its inputs in its own source and has no channel at all; it\n\
-            rebuilds when that source changes.\n\n\
-            The app's **base channel** is the one exception to that reasoning, and it is left out\n\
-            for a different reason: an app does have its own nixpkgs lock, so there is a per-app\n\
-            revision to roll — but rolling it re-resolves the channel and rebuilds the base\n\
-            userland, which is a download this verb does not take on unasked. It is\n\
-            `sbx upgrade nix --app <name>`, and until it is run the app stays on the revision it\n\
-            has: a global `sbx upgrade nix` does not move it.\n\n\
-            The bundle install step runs here without a further flag, unlike under `sbx upgrade\n\
-            all`: `all` is unscoped, so its steps would launch a cage per app across the project,\n\
-            while naming one app bounds the cost to the cage you asked about. Nothing gates it, so\n\
-            it names its cost before the cage is built rather than after. To roll only the cheap\n\
-            half, use `sbx upgrade mise --app <name>` — which the notice points at only for an app\n\
-            that has packages to roll, since it refuses one that declares none.",
+        details: "Advances a named app without asking which channel it rides: sbx reads what the\n\
+            app declares and rolls all of it. The same roll as `sbx upgrade --app <name>`, under\n\
+            its own name, because \"advance this app\" is the question a user actually has and\n\
+            answering it should not start with reading the app's profile.\n\n\
+            What a narrowed roll reaches is the app's OWN layer — its `[packages]` and the bundles\n\
+            folded under it — plus its bundles' install steps and the `mise:` set its cage equips.\n\
+            Its `nix:` packages roll against the app's own nixpkgs lock, which a global\n\
+            `sbx upgrade nix` does not move. An inline `[flakes.<name>]` rolls nowhere: it pins its\n\
+            inputs in its own source and rebuilds when that source changes, so no channel advances\n\
+            it.\n\n\
+            What it leaves alone is everything that belongs to the project rather than to this\n\
+            app: the mise engine, the project's `nix:` tools, the task tool pool, the baseline's\n\
+            packages, and the distribution image, which no app can declare. It also prunes\n\
+            nothing — dropping a lock entry no layer declares any more is a statement about the\n\
+            project, and a roll narrowed to one app never makes one, so another app's pin is never\n\
+            touched.\n\n\
+            The install step runs without a further flag and is FORCED past its own guard: naming\n\
+            one app is a request to re-install it, not to poll it. Only an unscoped `sbx upgrade`\n\
+            leaves each guard in charge, where forcing would mean a cage and a download for every\n\
+            app in the project. Nothing gates it, so the cost is named before the cage is built\n\
+            rather than after. To roll only the cheap half, use `sbx upgrade mise --app <name>` —\n\
+            which the notice points at only for an app that has packages to roll, since it refuses\n\
+            one that declares none.\n\n\
+            An app name that selects no work is refused with the reason rather than reported as a\n\
+            clean roll of nothing: unknown, never launchable, or declaring no packages and no\n\
+            install step of its own.",
     },
     Page {
         path: &["app", "import"],

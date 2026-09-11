@@ -493,7 +493,8 @@ fn provision_groups(cfg: &crate::config::Resolved, only: Option<&str>) -> Vec<Pr
 /// nothing to do, which is all it can honestly say.
 ///
 /// **`force = true`** raises `SBX_UPGRADE=1` in the cage, which every shipped guard is written to
-/// yield to, and is what the `provision` verb and `sbx app upgrade` ask for. That is the only thing
+/// yield to. One rule decides it, and it has three spellings: the `provision` verb, and naming a
+/// single app with `sbx upgrade --app <name>` or `sbx app upgrade <name>`. That is the only thing
 /// that advances an agent whose guard *cannot* tell — a checkout of a branch, with no version to
 /// compare — and the way to re-install over a guard that is simply wrong.
 ///

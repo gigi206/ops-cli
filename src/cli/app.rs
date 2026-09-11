@@ -1,5 +1,5 @@
 //! `sbx app <subcommand>`: launch and manage named application profiles — `run <name>` (launch an
-//! app inside the project sandbox), `upgrade <name>` (advance it, dispatching on what it declares)
+//! app inside the project sandbox), `upgrade <name>` (advance every channel it rides)
 //! and `import`/`export`/`rm`/`list`/`show`/`prune` (manage the profiles and their per-app isolated
 //! homes). The launch verb is mandatory, so the first token is always a subcommand and an app name
 //! can never collide with one. The shared confirmation renderers
