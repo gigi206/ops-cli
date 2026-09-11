@@ -39,7 +39,9 @@
 # `gui = "wayland"` cage, sbx seeds its per-session MITM CA into the cage's NSS db automatically
 # (Chromium ignores the CA-file env vars other tools honour), so HTTPS to console.mistral.ai
 # succeeds — `--use-system-ca` tells Chromium to consult that store, and `--password-store=basic`
-# keeps the SSO cookies in a file store (no keyring in the cage) so the session survives a relaunch.
+# keeps the SSO cookies in a file store so the session survives a relaunch. A cage with `dbus = true`
+# now carries its own keyring and those profiles name `gnome-libsecret` instead; this profile declares
+# no bus, so there is no Secret Service to name and the file store is what it has.
 # Chromium's output goes to `~/.sbx-open.log` in the isolated home, in case a launch ever fails.
 #
 # Why no `BROWSER` variable, and why `gui` is load-bearing beyond the window: with `BROWSER` unset,

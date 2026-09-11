@@ -92,8 +92,22 @@ mute = [
     "statsigapi.net",
     # Segment's analytics loader.
     "cdn.segment.com",
+    # Telemetrie et tiers que l'app sollicite sans en dependre : refuses, mais sans
+    # notification. Le demarrage a ete mesure au meme taux avec et sans eux.
+    "bzr.openai.com",
+    "cdn.auth0.com",
+    "www.gstatic.com",
     # The in-cage Chromium's own background services — irrelevant to the sign-in it is there for.
     "@chromium-background",
+    # The app's client-event telemetry, on the legacy domain. Scoped to the exact path rather than
+    # the host: `chat.openai.com` is where ChatGPT lived before `chatgpt.com`, so a refusal there for
+    # anything else is worth seeing rather than swallowing. The app also gates this stream on its own
+    # `analytics.enabled`, which is the place to turn it off at the source.
+    "{POST} chat.openai.com/ces/v1/telemetry/intake",
+    # The Google account bar the sign-in page renders, polled while the window is open. Scoped to
+    # their paths for the same reason: a real sign-in refused on another path stays visible.
+    "{POST} accounts.google.com/ListAccounts",
+    "{GET} www.google.com/async/folae",
 ]
 
 [packages]
@@ -103,6 +117,14 @@ codex-desktop = "deb:apt:https://persistent.oaistatic.com/codex-app-prod/linux/d
 # An in-cage Chromium for the browser half of the sign-in. HEAVY — a large nixpkgs closure on first
 # launch, shared with every other Chromium profile in your store.
 chromium = "nix:chromium"
+# The app downloads a second component at startup — its "primary runtime", a `.tar.xz` fetched from
+# `persistent.oaistatic.com` (already allowed above) — and unpacks it by spawning `tar -xf … -C …`.
+# Neither `tar` nor the `xz` it delegates decompression to is part of the cage's base toolset, so
+# without these the download succeeds and the extraction fails with `spawn tar ENOENT`, leaving the
+# runtime uninstalled. The app used to tolerate that and start anyway; it no longer does, and the
+# window stops at its error screen instead.
+tar = "nix:gnutar"
+xz = "nix:xz"
 
 # Three attributes the shared prebuilt library set does not carry, added for THIS package only so no
 # other Electron app pays for their closures. Without them the `.deb` build fails outright, naming
