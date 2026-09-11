@@ -103,7 +103,8 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
                 project = Some(OsString::from(val));
                 i += 1;
             }
-            // `-a <name>` / `--app <name>`: narrow an in-cage roll to one app's cage. UTF-8 only —
+            // `-a <name>` / `--app <name>`: narrow the whole roll to one app, across every channel
+            // that app rides. UTF-8 only —
             // an app name is validated against a narrow character set before it can ever name a
             // profile, so a non-UTF-8 word here cannot be one.
             Some("--app" | "-a") => {
