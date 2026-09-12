@@ -2689,15 +2689,20 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    // The cage script probes the private bus: the FileChooser version (the in-cage portal serves it)
-    // and the keyring (must be refused). Both markers in one run, so a false "no bus" cannot pass.
+    // The cage script probes the private bus: the FileChooser version (the in-cage portal serves it),
+    // the Secret Service (the cage's OWN, which must answer), and where that service keeps its
+    // keyring file (which is what says whose it is). Three markers in one run, so a false "no bus"
+    // cannot pass and neither can a keyring that answers because it is the host's.
     let script = "gdbus call --session --dest org.freedesktop.portal.Desktop \
          --object-path /org/freedesktop/portal/desktop \
          --method org.freedesktop.DBus.Properties.Get \
          org.freedesktop.portal.FileChooser version 2>&1 | sed 's/^/FILECHOOSER: /'; \
          gdbus call --session --dest org.freedesktop.secrets \
          --object-path /org/freedesktop/secrets \
-         --method org.freedesktop.DBus.Peer.Ping 2>&1 | sed 's/^/KEYRING: /'";
+         --method org.freedesktop.DBus.Peer.Ping 2>&1 | sed 's/^/KEYRING: /'; \
+         if [ -n \"$(ls -A \"$HOME/.local/share/keyrings\" 2>/dev/null)\" ]; \
+         then echo 'CAGEKEYRING: in the isolated home'; \
+         else echo 'CAGEKEYRING: nothing under the isolated home'; fi";
     let out = sbx_in(
         project.path(),
         data.path(),
@@ -2716,10 +2721,21 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
         stdout.contains("FILECHOOSER: (<uint32 "),
         "the in-cage portal did not serve a FileChooser version on the private bus: {log}"
     );
-    // Isolation teeth: the keyring is not on the private bus (the raw host bus is never exposed).
+    // A Secret Service answered. `()` is `Ping`'s empty reply, so this is the positive: an Electron
+    // app asking `safeStorage` where to keep its token finds somewhere to keep it, which is the
+    // whole reason sbx starts `gnome-keyring-daemon --components=secrets` behind the private bus.
     assert!(
-        stdout.contains("KEYRING:") && !stdout.contains("KEYRING: ()"),
-        "the login keyring must be absent from the in-cage portal's private bus: {log}"
+        stdout.contains("KEYRING: ()"),
+        "the cage's own Secret Service must answer on the private bus: {log}"
+    );
+    // Isolation teeth, and they are about WHOSE service answered, not whether one did: a host
+    // keyring leaking onto the bus and a cage daemon of its own both reply `()` to a `Ping`, so the
+    // reply cannot separate them. What can is that the cage's `$HOME` is a fresh tmpfs — nothing
+    // but the cage's own `gnome-keyring-daemon` can leave a file under it, so a keyring file there
+    // is one this launch created and no host state reached.
+    assert!(
+        stdout.contains("CAGEKEYRING: in the isolated home"),
+        "the answering Secret Service must be the cage's own, keyring file and all: {log}"
     );
 }
 
@@ -8172,10 +8188,20 @@ fn cage_scope_tasks_max(launcher: u32) -> Option<String> {
 /// bubblewrap has created its namespaces, so `sbx session attach` will find a live process to enter. Used to
 /// wait deterministically for the background cage to come up, rather than sleeping a fixed guess.
 fn cage_userns_ready(session_pid: u32) -> bool {
+    cage_inside_pid(session_pid).is_some()
+}
+
+/// The first descendant of `session_pid` living in a *child* user namespace — a process whose
+/// `/proc/<pid>/root` is the cage's own filesystem view, so the host can read what the cage sees.
+///
+/// The namespaces exist before the payload's first command runs, which is why a caller that needs
+/// the payload's own work cannot stop at [`cage_userns_ready`]: it has to wait on the thing it is
+/// about to assert. Returning the pid is what makes that wait possible.
+fn cage_inside_pid(session_pid: u32) -> Option<u32> {
     let host = std::fs::read_link("/proc/self/ns/user").ok();
     let mut children: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
+        return None;
     };
     for e in entries.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
@@ -8194,13 +8220,13 @@ fn cage_userns_ready(session_pid: u32) -> bool {
     while let Some(pid) = queue.pop() {
         let ns = std::fs::read_link(format!("/proc/{pid}/ns/user")).ok();
         if ns.is_some() && ns != host {
-            return true;
+            return Some(pid);
         }
         if let Some(kids) = children.get(&pid) {
             queue.extend(kids);
         }
     }
-    false
+    None
 }
 
 /// `sbx session attach <id>` joins a **running** cage and opens a shell *inside* it — the real thing, not a
@@ -8260,12 +8286,27 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
         .expect("spawn the background sbx run");
     let session_pid = agent.id();
 
-    // Wait deterministically for the cage's namespaces to exist before attaching.
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while !cage_userns_ready(session_pid) && Instant::now() < deadline {
+    // Wait for the marker itself, not for the namespaces. The namespaces exist as soon as bubblewrap
+    // has unshared them, which is *before* the payload's first command runs — and on a host that is
+    // still populating its store for this launch, the gap between the two is seconds. Attaching in
+    // that gap reads an empty `/tmp` and reports a true join of the running cage as a failure to
+    // join it, which is the opposite of what this test exists to say. The cage's own view is
+    // readable through the `/proc/<pid>/root` of any process inside it.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut inside = None;
+    while Instant::now() < deadline {
+        inside = cage_inside_pid(session_pid);
+        // `metadata` rather than a read: the file exists before its bytes land, and what this wait
+        // needs to know is that the payload has started writing, not what it wrote. The joined
+        // shell's own `cat` is what reads it, and `echo` is one write.
+        if inside.is_some_and(|pid| {
+            std::fs::metadata(format!("/proc/{pid}/root/tmp/attach-marker")).is_ok()
+        }) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(150));
     }
-    if !cage_userns_ready(session_pid) {
+    if inside.is_none() {
         let _ = agent.kill();
         let _ = agent.wait();
         skip_incapable!(

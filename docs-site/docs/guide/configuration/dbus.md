@@ -62,8 +62,10 @@ The app probes *that* portal and gets three things:
   expiry of `0`, both of which sbx declines for its own toasts as well). A caged app's ordinary
   notification is unaffected.
 
-The keyring (`org.freedesktop.secrets`) is **never** exposed: the private bus carries only sbx's own
-portal and relays, and touches no host socket.
+The **host's** keyring is never exposed: the private bus carries only sbx's own portal, relays
+and services, and touches no host socket. What answers `org.freedesktop.secrets` there is a
+Secret Service of the cage's own, whose keyring file lives in the isolated `$HOME` and holds
+nothing the host keyring holds; [Scope](#scope) says what that buys and what it costs.
 
 This posture:
 
