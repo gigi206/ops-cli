@@ -227,13 +227,21 @@ pub(crate) const WSL_COMPUTE_NODE: &str = "/dev/dxg";
 /// of both and are granted there, which is why this answer is only consulted beside it.
 ///
 /// The whole store is granted rather than the subdirectory that serves a given card, and that is a
-/// deliberate limit. The store holds a vendor package per driver, few of which carry Linux shared
-/// objects at all, and the one that serves a card is named by a content hash: no rule short of
-/// "the packages holding shared objects" names it without hardcoding that hash. Narrowing to such
-/// a rule needs an answer this does not have, which is whether a loader reads anything else in the
+/// deliberate limit. The store holds a package per Windows driver, typically a single one of which
+/// carries Linux shared objects, and that one is named by a content hash: no rule short of "the
+/// packages holding shared objects" names it without hardcoding that hash. Narrowing to such a
+/// rule needs an answer this does not have, which is whether a loader reads anything else in the
 /// store across vendors and driver versions. A reader who obtains that answer can narrow this to
 /// what it names. The bind is read-only and copies nothing; the store holds the host's shipped
 /// drivers and no secret of the user's.
+///
+/// The store half is keyed on the directory existing and not on it holding driver code, which is
+/// the one place this differs from [`wsl_bridge`] and its single named library. Proving the
+/// content would mean walking a large tree on a network filesystem at every launch, to answer a
+/// question the bridge beside it has already answered for the host as a whole. The residue is
+/// narrow and worth naming: on a WSL host whose store carries no Linux libraries, the node is
+/// granted against nothing, and CUDA then fails inside the cage exactly as it fails outside one.
+/// Nothing is opened that such a host could not already reach.
 pub(crate) fn wsl_compute() -> Option<WslCompute> {
     wsl_compute_in(Path::new("/"))
 }
@@ -248,6 +256,10 @@ pub(crate) struct WslCompute {
 }
 
 /// [`wsl_compute`] under a named root, so a host without either half is testable.
+///
+/// The two halves are granted at two sites: the store is bound beside [`wsl_bridge`]'s libraries,
+/// the node joins the device list beside [`render_nodes`]. One answer feeds both, which is what
+/// keeps them from drifting apart.
 pub(crate) fn wsl_compute_in(root: &Path) -> Option<WslCompute> {
     let store = root.join(WSL_DRIVER_STORE.trim_start_matches('/'));
     let node = root.join(WSL_COMPUTE_NODE.trim_start_matches('/'));
@@ -686,6 +698,21 @@ mod tests {
             staged(wsl_compute_in(root.path())),
             Some((store, node)),
             "both halves, and only then, are the grant"
+        );
+    }
+
+    #[test]
+    fn a_store_holding_no_driver_code_still_answers_and_the_doc_says_why() {
+        let root = crate::testutil::TmpDir::new();
+        std::fs::create_dir_all(root.join("usr/lib/wsl/drivers")).expect("stage an empty store");
+        std::fs::create_dir_all(root.join("dev")).expect("stage /dev");
+        std::fs::write(root.join("dev/dxg"), b"").expect("stage the node");
+
+        assert!(
+            wsl_compute_in(root.path()).is_some(),
+            "the store half is keyed on the directory and not on its content, so an empty one is \
+             still an answer: the grant then reaches a host that could not use the card anyway, \
+             which is the residue the doc names rather than a case to widen the check for"
         );
     }
 

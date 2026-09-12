@@ -44,6 +44,33 @@ Each piece is **best-effort**: if mesa cannot be provisioned (no network on a fi
 or a render node is absent, the app still runs and falls back to software rendering rather
 than failing the launch.
 
+## Under WSL: the dxgkrnl node and the Windows driver store
+
+A WSL distribution publishes no DRM node at all. There is no `/dev/dri`, and the whole of the
+guest's access to the GPU is the `dxgkrnl` character device `/dev/dxg`, served by Windows. The
+three pieces above therefore find no render node to grant, and `gpu = true` adds two different
+ones instead:
+
+1. **The bridge libraries** under `/usr/lib/wsl/lib`, which Windows provides rather than nixpkgs,
+   bound read-only and placed on the loader search path. mesa's `d3d12` driver reaches the GPU
+   through them. Both halves are needed: bound without the loader path, the cage still reports
+   that it cannot open the shared objects; on the path without the bind, there is nothing to open.
+2. **`/dev/dxg` together with the Windows driver store** under `/usr/lib/wsl/drivers`, the store
+   bound read-only and the node granted through the same device-bind mechanism as a render node.
+
+Those two go together or not at all, and that is the point worth knowing. Under WSL `libcuda.so.1`
+is a stub that reaches the real driver through the driver store, so a cage holding the node and the
+stub alone enumerates no device, and a cage holding the store without the node has no device to
+enumerate. Either way a CUDA workload initializes against nothing. sbx grants them as one answer.
+
+`/dev/dxg` is granted on the same terms as a render node and not on a `card*` primary node's: it
+carries no modesetting and no display, because a WSL desktop reaches its screen over RDP and never
+through this device. The whole store is bound rather than the one package that serves a given card,
+because that package is named by a content hash and nothing short of its content identifies it.
+
+On a host that is not WSL none of this applies: neither piece exists, and `gpu = true` behaves
+exactly as described above.
+
 ## Scope: mesa GPUs, and the NVIDIA bridge
 
 The three pieces above cover **mesa-supported GPUs, Intel, AMD, and nouveau**, whose
@@ -113,7 +140,8 @@ the question does not arise.
 paired with `gui = "wayland"`. For a Chromium/Electron desktop app that means dropping
 `--disable-gpu` from the app's `cmd` (that flag forces the software path). A compute use
 with no display at all is equally supported: `gpu = true` with `gui = "none"` still grants the
-devices and the driver libraries, which is what a CUDA workload in a cage needs.
+devices and the driver libraries, which is what a CUDA workload in a cage needs. That holds under
+WSL too, through [the pieces described above](#under-wsl-the-dxgkrnl-node-and-the-windows-driver-store).
 
 ## Why it is trusted-only
 

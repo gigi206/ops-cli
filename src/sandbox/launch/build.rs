@@ -1936,8 +1936,9 @@ fn gpu_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
             // The compute half, nested here because a driver store without the bridge libraries
             // is inert: `libcuda.so.1` under WSL is a stub that reaches the real driver through
             // the Windows driver store, so a cage holding the stub and the device node but not
-            // the store still enumerates no device. Its companion device grant is made with the
-            // render nodes, where the `[devices]` list is resolved.
+            // the store still enumerates no device. Its companion device grant, `/dev/dxg`, is
+            // made where the `[devices]` list is resolved, from the same `wsl_compute` answer:
+            // one answer, two sites, so the halves cannot be granted apart.
             if let Some(compute) = crate::sandbox::gpu::wsl_compute() {
                 mounts.push(binds::ExtraBind {
                     src: compute.store.clone(),
@@ -2724,7 +2725,8 @@ pub(super) fn build(
     // it carries no modesetting and no display, a WSL desktop reaching its screen over RDP and
     // never through this device. It is granted only where its driver store is too, which is the
     // condition [`crate::sandbox::gpu::wsl_compute`] answers, because either half alone leaves the
-    // cage with no device to enumerate.
+    // cage with no device to enumerate. The store half of that same answer is bound in
+    // `gpu_binds`, beside the WSL bridge libraries it is inert without.
     // Deduped: a trusted `[devices] allow = [...]` alongside `gpu = true` must not emit a bind twice.
     let mut devices = prep.cfg.devices.clone();
     if prep.cfg.gpu {
