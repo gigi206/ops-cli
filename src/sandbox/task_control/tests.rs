@@ -511,11 +511,19 @@ fn a_dead_sessions_directory_is_neither_listed_nor_left_behind() {
     let live = std::process::id();
 
     // A directory stamped with an incarnation that is not this process's: whatever pid wrote it,
-    // that incarnation is gone. Pid 1 is certain to exist and equally certain not to have this
-    // start time, so the pair fails while the bare pid would have passed.
+    // that incarnation is gone. Pid 1 is certain to exist, so the pair is what fails here while the
+    // bare pid would have passed.
+    //
+    // The stamp is `u64::MAX` rather than a small number, and that is the whole of what makes the
+    // fixture sound. A start time counts clock ticks since boot, so a process that started in the
+    // first tick of one carries `1` — on a host booted moments earlier, which a freshly
+    // provisioned machine is, `"1"` is pid 1's *true* incarnation and the directory is then
+    // correctly kept. No running process can carry `u64::MAX`, and it still parses as the `u64` the
+    // reader expects, so the exact branch applies rather than the weaker one taken for a stamp that
+    // cannot be read.
     let dead = task_dir(data.path(), 1);
     std::fs::create_dir_all(&dead).unwrap();
-    std::fs::write(dead.join("incarnation"), "1").unwrap();
+    std::fs::write(dead.join("incarnation"), u64::MAX.to_string()).unwrap();
     std::fs::write(dead.join("control.sock"), "not really a socket").unwrap();
 
     let mine = task_dir(data.path(), live);
