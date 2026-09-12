@@ -965,6 +965,49 @@ impl Resolved {
         }
     }
 
+    /// What a bare network posture is about to drop, or `None` when nothing is lost.
+    ///
+    /// A posture with no rules of its own replaces the whole table rather than merging into it, which
+    /// is the documented rule and the right one: a one-shot posture that inherited a project's lists
+    /// would not be the posture the operator asked for. The cost is that the lists go silently, and
+    /// the first symptom is a refusal naming a host the app had allowed for itself.
+    ///
+    /// Counts rather than names: a table's lists run to dozens of entries, and a diagnostic that
+    /// printed them would bury the one sentence that matters under the thing it is warning about.
+    fn bare_posture_drops_a_table(
+        outgoing: &NetworkPolicy,
+        incoming: &NetworkPolicy,
+    ) -> Option<String> {
+        let NetworkPolicy::Allowlist(had) = outgoing else {
+            return None;
+        };
+        if let NetworkPolicy::Allowlist(gets) = incoming
+            && !(gets.allow_rules().is_empty()
+                && gets.deny_rules().is_empty()
+                && gets.mute_rules().is_empty())
+        {
+            return None;
+        }
+        let counts = [
+            (had.allow_rules().len(), "allow"),
+            (had.deny_rules().len(), "deny"),
+            (had.mute_rules().len(), "mute"),
+        ];
+        let named: Vec<String> = counts
+            .iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{n} {what}"))
+            .collect();
+        if named.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "a bare network posture replaces the whole `[network]` table, so its rules are dropped for \
+         this launch ({}): restate any you still need through `--config`",
+            named.join(", ")
+        ))
+    }
+
     /// Apply a one-shot override as the authoritative **final word** on this resolved configuration
     /// — after the project layer (for `sbx run`) or after a named app's overlay (for
     /// `sbx app`), so it beats both. Consumes the override. The nixpkgs channel is handled earlier
@@ -1200,6 +1243,14 @@ impl Resolved {
         if let Some((policy, stats)) = new_network {
             if let Some(b) = stats {
                 self.egress_stats = b;
+            }
+            // A posture carrying no rules of its own replaces a table that had some, and that is
+            // the case worth naming: the operator asked for a posture and lost a list they never
+            // mentioned. The refusals that follow then name hosts the app's own rules had covered,
+            // which reads as a bug in the app rather than as the consequence of the flag just
+            // typed. A replacement that brings its own rules is a deliberate swap and says nothing.
+            if let Some(note) = Self::bare_posture_drops_a_table(&self.network, &policy) {
+                self.warnings.push(note);
             }
             self.network = policy;
             self.network_origin = Provenance::Override;

@@ -322,12 +322,19 @@ fn apply_launch_override(
     cfg: &mut crate::config::Resolved,
     ov: crate::config::Override,
 ) -> Result<(), ExitCode> {
-    cfg.apply_override(ov).map_err(|errs| {
+    let before = cfg.warnings.len();
+    let applied = cfg.apply_override(ov).map_err(|errs| {
         for e in errs {
             crate::diag::error(&format!("sbx: {e}"));
         }
         ExitCode::from(2)
-    })
+    });
+    // Print the warnings this step produced, the way the app overlay prints its own: a step that
+    // adds to the vector after the load already drained it is a step whose warnings nobody sees.
+    for w in &cfg.warnings[before..] {
+        crate::diag::warn_config(w);
+    }
+    applied
 }
 
 /// Build the cage, register it, and run it — either in the foreground (this process becomes or

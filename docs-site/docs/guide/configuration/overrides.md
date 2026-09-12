@@ -199,6 +199,19 @@ set](../networking/modes#the-built-in-self-equip-set). Bare `ask` likewise carri
 `ask_timeout`, so a parked request waits **indefinitely**. To keep or add rules, and to
 bound `ask`, put the mode and its table together in one `--config` blob.
 
+sbx says so at the launch that does it, counting what goes:
+
+```text
+sbx: warning: a bare network posture replaces the whole `[network]` table, so its rules are
+dropped for this launch (11 allow, 2 deny, 16 mute): restate any you still need through `--config`
+```
+
+The line appears only when something is actually lost: a bare posture over a project with no
+rules of its own says nothing, and neither does a `--config` blob that brings its own table,
+which is a deliberate swap rather than a silent loss. Without it the first symptom was a refusal
+naming a host the app's own rules had covered, which reads as a fault in the app instead of the
+consequence of the flag just typed.
+
 The `allow=`/`deny=` **list shorthands** build the common one-shot egress shapes:
 
 - `allow=host1,host2` → a default-**deny** allowlist (only `host1,host2` reach).

@@ -94,12 +94,19 @@ fn resolved_for(
             diag::error(&format!("sbx: {verb}: {e}"));
             ExitCode::from(2)
         })?;
-    resolved.apply_override(ov).map_err(|errs| {
+    let before = resolved.warnings.len();
+    let applied = resolved.apply_override(ov).map_err(|errs| {
         for e in &errs {
             diag::error(&format!("sbx: {verb}: {e}"));
         }
         ExitCode::from(2)
-    })?;
+    });
+    // The same rule as the launch path: the load's warnings were printed above, so the ones this
+    // step adds are printed by this step or by nobody.
+    for w in &resolved.warnings[before..] {
+        diag::warn_config(w);
+    }
+    applied?;
     Ok(resolved)
 }
 

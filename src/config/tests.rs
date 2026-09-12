@@ -12970,3 +12970,51 @@ fn an_untrusted_project_may_not_bring_its_own_registry_credential() {
     );
     assert_eq!(r.distro_origin, Provenance::Global);
 }
+
+#[test]
+fn a_bare_posture_names_the_table_it_drops_and_stays_quiet_when_it_drops_nothing() {
+    use crate::allowlist::{EgressPolicy, classify};
+    use crate::config::types::NetworkPolicy;
+
+    let bare = NetworkPolicy::Allowlist(Box::default());
+    let furnished = NetworkPolicy::Allowlist(Box::new(
+        EgressPolicy::new(
+            vec![
+                classify("github.com").unwrap(),
+                classify("api.test").unwrap(),
+            ],
+            vec![classify("tracker.test").unwrap()],
+        )
+        .with_mute(vec![classify("noisy.test").unwrap()]),
+    ));
+
+    // The case the operator hits: a posture with no rules of its own, over a table that had some.
+    let note = Resolved::bare_posture_drops_a_table(&furnished, &bare)
+        .expect("dropping a populated table must be named");
+    assert!(
+        note.contains("2 allow") && note.contains("1 deny") && note.contains("1 mute"),
+        "the note must count each list it drops: {note}"
+    );
+
+    // Nothing to lose: an empty table replaced by a bare posture says nothing, because nothing
+    // went. A warning here would fire on every ordinary `--net` of a project with no rules.
+    assert!(
+        Resolved::bare_posture_drops_a_table(&bare, &bare).is_none(),
+        "an empty table dropped is not a loss worth a line"
+    );
+
+    // A deliberate swap: the incoming posture brings its own rules, so the replacement is what was
+    // asked for and needs no warning.
+    assert!(
+        Resolved::bare_posture_drops_a_table(&furnished, &furnished).is_none(),
+        "a replacement that carries rules is a swap, not a silent loss"
+    );
+
+    // The postures that carry no table at all cannot lose one.
+    for empty_handed in [NetworkPolicy::Isolated, NetworkPolicy::Shared] {
+        assert!(
+            Resolved::bare_posture_drops_a_table(&empty_handed, &bare).is_none(),
+            "a posture with no table to start from drops nothing"
+        );
+    }
+}
