@@ -1920,13 +1920,12 @@ fn gpu_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
                 writable: false,
             });
         }
-        // Under WSL the render node above is real and its driver is mesa's `d3d12`, which reaches
-        // the GPU through libraries Windows provides in this directory rather than nixpkgs. Both
-        // halves are needed and neither works alone: bound and not on the loader path, the cage
-        // still answers `cannot open shared object file`; on the path and not bound, there is
-        // nothing to open. `LD_LIBRARY_PATH` is in the same reserved class as the driver-path
-        // variables above, for the same reason — it loads code, so it is sbx's to set and an
-        // untrusted `[env]` may not.
+        // Under WSL the GPU is reached through libraries Windows provides in this directory rather
+        // than nixpkgs, and mesa's `d3d12` driver goes through them. Both halves are needed and
+        // neither works alone: bound and not on the loader path, the cage still answers `cannot
+        // open shared object file`; on the path and not bound, there is nothing to open.
+        // `LD_LIBRARY_PATH` is in the same reserved class as the driver-path variables above, for
+        // the same reason — it loads code, so it is sbx's to set and an untrusted `[env]` may not.
         if let Some(bridge) = crate::sandbox::gpu::wsl_bridge() {
             env.push(("LD_LIBRARY_PATH".to_string(), bridge.display().to_string()));
             mounts.push(binds::ExtraBind {
@@ -1934,6 +1933,18 @@ fn gpu_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
                 dest: bridge,
                 writable: false,
             });
+            // The compute half, nested here because a driver store without the bridge libraries
+            // is inert: `libcuda.so.1` under WSL is a stub that reaches the real driver through
+            // the Windows driver store, so a cage holding the stub and the device node but not
+            // the store still enumerates no device. Its companion device grant is made with the
+            // render nodes, where the `[devices]` list is resolved.
+            if let Some(compute) = crate::sandbox::gpu::wsl_compute() {
+                mounts.push(binds::ExtraBind {
+                    src: compute.store.clone(),
+                    dest: compute.store,
+                    writable: false,
+                });
+            }
         }
 
         // The NVIDIA bridge: this host's proprietary userspace, which is version-locked to its
@@ -2707,13 +2718,24 @@ pub(super) fn build(
     // and a GEM flink namespace, neither of which offscreen rendering needs. See
     // [`crate::sandbox::gpu::render_nodes`]. A `card*` node reaches a cage only when a trusted config names
     // it under `[devices]`.
+    //
+    // Under WSL there are no DRM nodes at all and `/dev/dxg` is the whole of the guest's access to
+    // the GPU, so it joins this list on the same terms as a render node rather than on a `card*`'s:
+    // it carries no modesetting and no display, a WSL desktop reaching its screen over RDP and
+    // never through this device. It is granted only where its driver store is too, which is the
+    // condition [`crate::sandbox::gpu::wsl_compute`] answers, because either half alone leaves the
+    // cage with no device to enumerate.
     // Deduped: a trusted `[devices] allow = [...]` alongside `gpu = true` must not emit a bind twice.
     let mut devices = prep.cfg.devices.clone();
     if prep.cfg.gpu {
         let nvidia_nodes = hw.nvidia.iter().flat_map(|nv| nv.devices.iter().cloned());
+        let wsl_node = crate::sandbox::gpu::wsl_compute()
+            .into_iter()
+            .map(|compute| compute.node);
         for node in crate::sandbox::gpu::render_nodes()
             .into_iter()
             .chain(nvidia_nodes)
+            .chain(wsl_node)
         {
             if !devices.contains(&node) {
                 devices.push(node);

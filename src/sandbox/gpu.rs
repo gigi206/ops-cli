@@ -188,9 +188,11 @@ const WSL_BRIDGE_LIB: &str = "libdxcore.so";
 ///
 /// It grants libraries and not a device. The WSL this was measured on publishes no DRM node at
 /// all — no `/dev/dri`, only the `dxgkrnl` character device `/dev/dxg` — so [`render_nodes`] finds
-/// nothing there and a `--gpu` cage reaches it without any device node. Binding `/dev/dxg` was
-/// measured too and moved no renderer, because that host answers `swrast` outside any cage as
-/// well; the grant would buy nothing. Whether another WSL publishes a `renderD*` is untested.
+/// nothing there and this bridge names no device of its own. Binding `/dev/dxg` moves no
+/// **renderer**, because that host answers `swrast` outside any cage as well; for rendering the
+/// grant buys nothing. **Compute is the other answer**, and [`wsl_compute`] carries it: CUDA needs
+/// the node, and the node is not enough on its own. Whether another WSL publishes a `renderD*` is
+/// untested.
 ///
 /// `None` on any host without it, which is every host that is not WSL — the GPU hole is then
 /// exactly what it was.
@@ -202,6 +204,54 @@ pub(crate) fn wsl_bridge() -> Option<PathBuf> {
 pub(crate) fn wsl_bridge_in(root: &Path) -> Option<PathBuf> {
     let dir = root.join(WSL_LIB_DIR.trim_start_matches('/'));
     dir.join(WSL_BRIDGE_LIB).exists().then_some(dir)
+}
+
+/// The directory a WSL distribution exposes the Windows driver store under. Not itself the grant:
+/// [`wsl_compute_in`] answers whether this host can offer compute at all.
+pub(crate) const WSL_DRIVER_STORE: &str = "/usr/lib/wsl/drivers";
+
+/// The `dxgkrnl` character device, which is the whole of a WSL guest's access to the GPU. It is
+/// what a DRM render node is elsewhere, not what a `card*` primary node is: it carries no
+/// modesetting and no display, because a WSL desktop reaches its screen over RDP and never
+/// through this device.
+pub(crate) const WSL_COMPUTE_NODE: &str = "/dev/dxg";
+
+/// The two halves a WSL cage needs to reach the GPU for **compute**, or `None`.
+///
+/// They are returned together because neither is worth anything alone, and a caller handed two
+/// separate options could grant one and believe it had granted access. The node is the device
+/// half. The store is the code half: `libcuda.so.1` under WSL is a stub that reaches the real
+/// driver through the Windows driver store, so a cage holding the node and the stub alone still
+/// enumerates no device, and a cage holding the store without the node has no device to enumerate.
+/// Either way CUDA initialises against nothing. The libraries of [`wsl_bridge`] are needed on top
+/// of both and are granted there, which is why this answer is only consulted beside it.
+///
+/// The whole store is granted rather than the subdirectory that serves a given card, and that is a
+/// deliberate limit. The store holds a vendor package per driver, few of which carry Linux shared
+/// objects at all, and the one that serves a card is named by a content hash: no rule short of
+/// "the packages holding shared objects" names it without hardcoding that hash. Narrowing to such
+/// a rule needs an answer this does not have, which is whether a loader reads anything else in the
+/// store across vendors and driver versions. A reader who obtains that answer can narrow this to
+/// what it names. The bind is read-only and copies nothing; the store holds the host's shipped
+/// drivers and no secret of the user's.
+pub(crate) fn wsl_compute() -> Option<WslCompute> {
+    wsl_compute_in(Path::new("/"))
+}
+
+/// The device node and the driver store a WSL cage needs for compute, granted as one or not
+/// at all. See [`wsl_compute`] for why they are inseparable.
+pub(crate) struct WslCompute {
+    /// The Windows driver store to bind read-only, the code half.
+    pub(crate) store: PathBuf,
+    /// The `dxgkrnl` node to grant, the device half.
+    pub(crate) node: PathBuf,
+}
+
+/// [`wsl_compute`] under a named root, so a host without either half is testable.
+pub(crate) fn wsl_compute_in(root: &Path) -> Option<WslCompute> {
+    let store = root.join(WSL_DRIVER_STORE.trim_start_matches('/'));
+    let node = root.join(WSL_COMPUTE_NODE.trim_start_matches('/'));
+    (store.is_dir() && node.exists()).then_some(WslCompute { store, node })
 }
 
 /// The fixed cage path the host's NVIDIA driver userspace is bound under (parity with the other
@@ -599,6 +649,60 @@ mod tests {
     /// and a GPU hole that started binding a directory there would be granting on a guess. The
     /// empty-directory arm is not hypothetical either — a distribution can carry `/usr/lib/wsl`
     /// without the bridge, and a directory is not a driver.
+    #[test]
+    fn compute_is_granted_only_when_both_of_its_halves_are_there() {
+        let root = crate::testutil::TmpDir::new();
+        let store = root.join("usr/lib/wsl/drivers");
+        let node = root.join("dev/dxg");
+
+        let staged = |compute: Option<WslCompute>| compute.map(|c| (c.store, c.node));
+
+        assert_eq!(
+            staged(wsl_compute_in(root.path())),
+            None,
+            "an ordinary Linux host has neither half and is offered nothing"
+        );
+
+        std::fs::create_dir_all(&store).expect("stage the driver store");
+        assert_eq!(
+            staged(wsl_compute_in(root.path())),
+            None,
+            "the store without the node: the cage holds the driver code and no device to \
+             enumerate"
+        );
+
+        std::fs::remove_dir_all(&store).expect("unstage the driver store");
+        std::fs::create_dir_all(node.parent().expect("dev has a parent")).expect("stage /dev");
+        std::fs::write(&node, b"").expect("stage the node");
+        assert_eq!(
+            staged(wsl_compute_in(root.path())),
+            None,
+            "the node without the store: the stub reaches no real driver, the same emptiness \
+             from the other side"
+        );
+
+        std::fs::create_dir_all(&store).expect("re-stage the driver store");
+        assert_eq!(
+            staged(wsl_compute_in(root.path())),
+            Some((store, node)),
+            "both halves, and only then, are the grant"
+        );
+    }
+
+    #[test]
+    fn a_file_where_the_driver_store_belongs_is_not_a_store() {
+        let root = crate::testutil::TmpDir::new();
+        std::fs::create_dir_all(root.join("usr/lib/wsl")).expect("stage the parent");
+        std::fs::write(root.join("usr/lib/wsl/drivers"), b"").expect("stage a file, not a dir");
+        std::fs::create_dir_all(root.join("dev")).expect("stage /dev");
+        std::fs::write(root.join("dev/dxg"), b"").expect("stage the node");
+
+        assert!(
+            wsl_compute_in(root.path()).is_none(),
+            "the store half is a directory to bind, so a plain file at that path grants nothing"
+        );
+    }
+
     #[test]
     fn the_wsl_bridge_is_found_by_its_library_and_not_by_its_path() {
         let root = crate::testutil::TmpDir::new();
