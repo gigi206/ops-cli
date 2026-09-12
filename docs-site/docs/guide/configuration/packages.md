@@ -313,7 +313,7 @@ Four source forms:
 | --- | --- |
 | `deb:<https url ending in .deb>` | a fixed `.deb`. A `…/releases/latest/download/…` URL rolls forward via its redirect; a version-stamped URL does not. |
 | `deb:github:<owner>/<repo>` | the repo's newest GitHub release, sbx selects its linux `.deb` asset (so a version-embedding asset name still rolls). |
-| `deb:apt:<https Packages-index url>` | an apt repository's newest `.deb`, sbx reads the uncompressed `Packages` index, picks the highest version, and derives its `.deb` URL. For a vendor pool with **no `latest` alias** (e.g. `claude-desktop`). |
+| `deb:apt:<https Packages-index url>` | an apt repository's newest `.deb` **for the machine sbx runs on**, sbx reads the uncompressed `Packages` index, picks the highest version, and derives its `.deb` URL. For a vendor pool with **no `latest` alias** (e.g. `claude-desktop`). |
 | `deb:resolve` (+ `[deb.<name>]`) | a `resolve` **command** you supply that prints the newest `.deb` URL, for a vendor with a download **API** but no `latest`/apt form (e.g. `cursor`). See below. |
 
 For `deb:github:` and `deb:apt:` the URL sbx derives from the remote index/release is
@@ -322,6 +322,21 @@ so a compromised index cannot inject a URL. `deb:apt:` reads the **uncompressed*
 and expects a **single-application** repo, not a general Debian mirror; its version order is plain
 dotted-decimal (a non-numeric version is refused rather than mis-ordered). The index it reads is
 checked against the repository's signed `InRelease`; see [Signed apt indexes](#signed-apt-indexes).
+
+**You do not write the architecture.** A Debian repository publishes one index per architecture at
+`<root>/dists/<suite>/<component>/binary-<arch>/Packages`, and that segment belongs to the layout
+rather than to the vendor, so a declaration names an index and sbx reads the sibling for the
+machine it is running on, exactly as `apt` itself does. The same repository, the same `InRelease`,
+the same signing key; only the artifact changes, to the one that can run here. A URL with no
+`/dists/` segment is taken as declared, because a repository laid out some other way says nothing
+about where its other architectures live.
+
+Inside the index, a stanza's `Architecture:` field decides whether it is eligible to win, so a
+repository that publishes several architectures in one index cannot hand back a `.deb` built for
+another machine. `all` is architecture-independent and always eligible, and a stanza that declares
+no architecture stays eligible too: a single-architecture index offers no choice to get wrong. A
+repository that publishes nothing for this machine is refused by name rather than resolving to
+bytes that cannot execute.
 
 Pairs with [`gui = "wayland"`](gui) for the display; sbx seeds its MITM CA into the cage's NSS
 store so the Chromium app trusts a filtering posture's proxy.

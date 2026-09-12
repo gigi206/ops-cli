@@ -14,9 +14,12 @@
 //!     URL already rolls forward via the redirect; a version-embedding URL does not.
 //!   * `deb:github:<owner>/<repo>` — query the repo's latest release and select its linux `.deb`
 //!     asset, so even a project whose asset name embeds the version rolls forward.
-//!   * `deb:apt:<https Packages-index url>` — track an apt repository's highest-version `.deb`, for a
-//!     vendor pool that publishes versioned filenames with no `latest` alias (so a hand-pinned URL
-//!     goes stale). sbx fetches the uncompressed `Packages` index, **checks those very bytes
+//!   * `deb:apt:<https Packages-index url>` — track an apt repository's highest-version `.deb` **for
+//!     the machine sbx runs on**, for a vendor pool that publishes versioned filenames with no
+//!     `latest` alias (so a hand-pinned URL goes stale). The declaration names one architecture's
+//!     index and sbx reads the sibling for this host ([`index_for_host_arch`]), because that segment
+//!     belongs to the repository layout rather than to the vendor. sbx fetches the uncompressed
+//!     `Packages` index, **checks those very bytes
 //!     against the repository's clearsigned `InRelease`** ([`attest_index`]), picks the newest
 //!     version, and **re-validates the derived `.deb` URL** through the same charset check a
 //!     hand-written `deb:` URL passes. The signing key is pinned on first encounter, and a
@@ -52,15 +55,51 @@ enum DebSource {
     /// `github:<owner>/<repo>` — resolved via the repo's latest release.
     Github { owner: String, repo: String },
     /// `apt:<packages-index-url>` — resolved via an apt repository's uncompressed `Packages` index
-    /// (its highest-version `.deb`), for a vendor pool with no `latest` alias.
+    /// (its highest-version `.deb` that runs on this host), for a vendor pool with no `latest`
+    /// alias. The URL held here is the host's, already rewritten from the declared one by
+    /// [`index_for_host_arch`]; the declared locator stays the lock key, so the pin records which
+    /// index a launch actually read.
     Apt { packages_url: String },
+}
+
+/// The `Packages` index for the architecture sbx is running on, given the one a profile declared.
+///
+/// A Debian repository publishes one index per architecture, at
+/// `<root>/dists/<suite>/<component>/binary-<arch>/Packages`. That segment is fixed by the
+/// repository layout, not chosen by the vendor — which is why it is sbx's to fill in rather than a
+/// profile author's to spell, and why `apt` itself never asks anyone to write it. A declaration
+/// names an index; sbx reads the sibling for this host. Same repository, same `InRelease`, same
+/// signing key: only the artifact changes, to the one that can run here.
+///
+/// Only a `binary-…` segment **inside** the `/dists/` tree is rewritten, so a host or pool path
+/// that happens to carry the word is untouched. A URL with no `/dists/` segment is returned
+/// verbatim: a repository laid out some other way offers nothing to be sure about, and
+/// [`resolve_apt_deb_url`] refuses it by name a moment later anyway.
+fn index_for_host_arch(packages_url: &str) -> String {
+    let Some(at) = packages_url.find("/dists/") else {
+        return packages_url.to_string();
+    };
+    let arch = prebuilt::arch_label(&super::current_system());
+    let (root, tail) = packages_url.split_at(at);
+    let tail = tail
+        .split('/')
+        .map(|seg| {
+            if seg.starts_with("binary-") {
+                format!("binary-{arch}")
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{root}{tail}")
 }
 
 /// Parse a declared locator (already validated by `config::parse_backend`) into its [`DebSource`].
 fn parse_source(locator: &str) -> DebSource {
     if let Some(url) = locator.strip_prefix("apt:") {
         return DebSource::Apt {
-            packages_url: url.to_string(),
+            packages_url: index_for_host_arch(url),
         };
     }
     if let Some((owner, repo)) = prebuilt::github_locator(locator) {
@@ -611,6 +650,18 @@ fn parse_valid_until(stamp: &str) -> Option<u64> {
     Some((days - 719_468) * 86_400 + h * 3_600 + m * 60 + sec)
 }
 
+/// One `Packages` stanza, reduced to the five fields the selection reads. Named rather than a
+/// tuple because the last two are both optional strings that mean entirely different things, and a
+/// positional `.3`/`.4` at the call site is exactly how they get swapped.
+struct Stanza {
+    package: String,
+    version: String,
+    filename: String,
+    sha256: Option<String>,
+    /// The architecture the stanza declares, or `None` when it declares none.
+    architecture: Option<String>,
+}
+
 /// Select the newest package's `.deb` from an apt `Packages` index. The index is RFC822-style
 /// stanzas separated by blank lines, each carrying `Package:`, `Version:`, and `Filename:` fields.
 /// sbx targets a **single-application** apt repo (a vendor's own pool), so every stanza must name the
@@ -628,10 +679,11 @@ fn parse_valid_until(stamp: &str) -> Option<u64> {
 /// `.deb` pinned on whatever the `pool/` tree served — commonly a different bucket from the signed
 /// `dists/`.
 fn select_latest_apt_deb(index: &str) -> Result<(String, String, Option<String>), String> {
-    let mut stanzas: Vec<(String, String, String, Option<String>)> = Vec::new();
+    let mut stanzas: Vec<Stanza> = Vec::new();
     let (mut pkg, mut ver, mut file): (Option<String>, Option<String>, Option<String>) =
         (None, None, None);
     let mut sha: Option<String> = None;
+    let mut arch: Option<String> = None;
     // Group RFC822 stanzas on blank lines by iterating `lines()` (which strips both `\n` and `\r\n`)
     // rather than splitting on `"\n\n"` — so an apt `Packages` served with CRLF still parses into
     // separate stanzas instead of collapsing into one. A trailing sentinel flushes the final stanza
@@ -639,12 +691,19 @@ fn select_latest_apt_deb(index: &str) -> Result<(String, String, Option<String>)
     for line in index.lines().chain(std::iter::once("")) {
         if line.trim().is_empty() {
             let digest = sha.take().filter(|d| !d.is_empty());
+            let declared_arch = arch.take().filter(|a| !a.is_empty());
             if let (Some(p), Some(v), Some(f)) = (pkg.take(), ver.take(), file.take())
                 && !p.is_empty()
                 && !v.is_empty()
                 && !f.is_empty()
             {
-                stanzas.push((p, v, f, digest));
+                stanzas.push(Stanza {
+                    package: p,
+                    version: v,
+                    filename: f,
+                    sha256: digest,
+                    architecture: declared_arch,
+                });
             }
         } else if let Some(v) = line.strip_prefix("Package:") {
             pkg = Some(v.trim().to_string());
@@ -654,13 +713,15 @@ fn select_latest_apt_deb(index: &str) -> Result<(String, String, Option<String>)
             file = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("SHA256:") {
             sha = Some(v.trim().to_ascii_lowercase());
+        } else if let Some(v) = line.strip_prefix("Architecture:") {
+            arch = Some(v.trim().to_string());
         }
     }
     let first = stanzas
         .first()
         .ok_or("no package stanza (Package/Version/Filename) found")?;
-    let name = first.0.clone();
-    if stanzas.iter().any(|(p, _, _, _)| *p != name) {
+    let name = first.package.clone();
+    if stanzas.iter().any(|s| s.package != name) {
         return Err(format!(
             "the index names more than one package (e.g. `{name}`); `deb:apt:` tracks a \
              single-application repo"
@@ -668,20 +729,38 @@ fn select_latest_apt_deb(index: &str) -> Result<(String, String, Option<String>)
     }
     // Parse EVERY version (so a non-numeric one anywhere is refused, not just the winner) and keep
     // the index of the highest — dotted-decimal order, so `1.21459.0` > `1.18286.2`.
+    //
+    // Only a stanza this host can run is eligible to WIN, which is a separate question from which
+    // versions are read: an index carrying several architectures would otherwise be ordered on
+    // version alone and hand back a `.deb` built for another machine, with nothing to say so until
+    // the program failed to execute. `Architecture:` is compared against the host's own Debian
+    // spelling; `all` is architecture-independent by definition and stays eligible, and so does a
+    // stanza that declares nothing — an index that names no architecture offers no choice to get
+    // wrong, and refusing it would break every single-architecture repository that omits the field.
     let bad = |v: &str| {
         format!("version `{v}` is not a plain dotted-decimal version `deb:apt:` can order")
     };
-    let mut best_idx = 0usize;
-    let mut best_ver = parse_numeric_version(&stanzas[0].1).ok_or_else(|| bad(&stanzas[0].1))?;
-    for (i, stanza) in stanzas.iter().enumerate().skip(1) {
-        let ver = parse_numeric_version(&stanza.1).ok_or_else(|| bad(&stanza.1))?;
-        if ver > best_ver {
-            best_ver = ver;
-            best_idx = i;
+    let arch = prebuilt::arch_label(&super::current_system());
+    let mut best: Option<(usize, Vec<u64>)> = None;
+    for (i, stanza) in stanzas.iter().enumerate() {
+        let ver = parse_numeric_version(&stanza.version).ok_or_else(|| bad(&stanza.version))?;
+        let runs_here = stanza
+            .architecture
+            .as_deref()
+            .is_none_or(|a| a == arch || a == "all");
+        if runs_here && best.as_ref().is_none_or(|(_, best)| ver > *best) {
+            best = Some((i, ver));
         }
     }
+    let (best_idx, _) = best.ok_or_else(|| {
+        format!("the index names no `{arch}` package: this repository publishes none for this host")
+    })?;
     let winner = &stanzas[best_idx];
-    Ok((winner.1.clone(), winner.2.clone(), winner.3.clone()))
+    Ok((
+        winner.version.clone(),
+        winner.filename.clone(),
+        winner.sha256.clone(),
+    ))
 }
 
 /// Parse a dotted-decimal version (`1.21459.0`) into comparable numeric components. Returns `None` if
@@ -1232,6 +1311,103 @@ Version: 1.17377.0
 Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
 SHA256: 3333333333333333333333333333333333333333333333333333333333333333
 ";
+
+    /// The host's own Debian architecture label, as both the rewrite and the selection spell it.
+    /// Read rather than written, so these tests assert the same thing on an x86_64 runner and on an
+    /// aarch64 one instead of passing on whichever machine they were authored on.
+    fn host_arch() -> &'static str {
+        prebuilt::arch_label(&crate::sandbox::current_system())
+    }
+
+    /// A declaration names one architecture's index; sbx reads the sibling for the host. The
+    /// declared segment here is deliberately an architecture that exists nowhere, so this fails
+    /// the moment the URL is passed through as written — which is what it did before, and what
+    /// left an aarch64 host fetching an amd64 `.deb`.
+    #[test]
+    fn an_apt_index_is_read_for_the_host_not_for_the_architecture_declared() {
+        let declared = "https://h/repo/dists/stable/main/binary-s390x/Packages";
+        assert_eq!(
+            index_for_host_arch(declared),
+            format!(
+                "https://h/repo/dists/stable/main/binary-{}/Packages",
+                host_arch()
+            )
+        );
+        // And the locator reaches the source through the same path, so the rewrite is not something
+        // only a direct caller sees.
+        match parse_source(&format!("apt:{declared}")) {
+            DebSource::Apt { packages_url } => assert!(
+                packages_url.ends_with(&format!("binary-{}/Packages", host_arch())),
+                "parse_source handed on {packages_url}"
+            ),
+            _ => panic!("an apt locator must parse as an apt source"),
+        }
+    }
+
+    /// Only the `/dists/` tree is rewritten. A repository laid out some other way is left exactly
+    /// as declared — there is nothing there sbx can be sure about — and a `binary-` word before
+    /// `/dists/` belongs to the vendor's own path, not to the layout.
+    #[test]
+    fn a_url_outside_the_dists_tree_is_left_as_declared() {
+        let no_dists = "https://h/binary-amd64/Packages";
+        assert_eq!(index_for_host_arch(no_dists), no_dists);
+        let before = "https://h/binary-amd64/repo/dists/stable/main/binary-s390x/Packages";
+        assert_eq!(
+            index_for_host_arch(before),
+            format!(
+                "https://h/binary-amd64/repo/dists/stable/main/binary-{}/Packages",
+                host_arch()
+            )
+        );
+    }
+
+    /// An index carrying several architectures is ordered on version alone unless the selection
+    /// asks which machine each stanza is for. Here the FOREIGN stanza holds the higher version, so
+    /// a selection that reads only `Version:` returns it — the defect this covers, and one that
+    /// bites on x86_64 exactly as it does on aarch64.
+    #[test]
+    fn a_mixed_index_yields_the_hosts_architecture_not_the_highest_version() {
+        let index = format!(
+            "Package: demo-app\nVersion: 1.0.0\nArchitecture: {}\nFilename: pool/host.deb\nSHA256: {}\n\n\
+             Package: demo-app\nVersion: 9.0.0\nArchitecture: s390x\nFilename: pool/foreign.deb\nSHA256: {}\n",
+            host_arch(),
+            "1".repeat(64),
+            "2".repeat(64)
+        );
+        let (version, filename, _) = select_latest_apt_deb(&index).expect("resolves");
+        assert_eq!(filename, "pool/host.deb");
+        assert_eq!(version, "1.0.0");
+    }
+
+    /// `all` is architecture-independent by definition, so it runs here whatever `here` is.
+    #[test]
+    fn an_architecture_independent_stanza_is_eligible() {
+        let index =
+            "Package: demo-app\nVersion: 2.0.0\nArchitecture: all\nFilename: pool/any.deb\n";
+        let (_, filename, _) = select_latest_apt_deb(index).expect("resolves");
+        assert_eq!(filename, "pool/any.deb");
+    }
+
+    /// A repository that publishes nothing for this host is refused by name, rather than resolving
+    /// to bytes that cannot execute and failing later with something about a broken binary.
+    #[test]
+    fn an_index_with_no_stanza_for_this_host_is_refused_naming_the_architecture() {
+        let index =
+            "Package: demo-app\nVersion: 1.0.0\nArchitecture: s390x\nFilename: pool/f.deb\n";
+        let err = select_latest_apt_deb(index).expect_err("must refuse");
+        assert!(
+            err.contains(host_arch()),
+            "the refusal must name the architecture: {err}"
+        );
+    }
+
+    /// A single-architecture index that omits `Architecture:` keeps resolving: the field is how a
+    /// mixed index is disambiguated, not a new requirement placed on every repository.
+    #[test]
+    fn a_stanza_without_an_architecture_field_still_resolves() {
+        let (version, _, _) = select_latest_apt_deb(APT_INDEX).expect("resolves");
+        assert_eq!(version, "1.21459.0");
+    }
 
     #[test]
     fn select_latest_apt_deb_picks_the_highest_version_not_the_last_line() {

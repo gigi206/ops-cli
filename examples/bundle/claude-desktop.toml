@@ -23,6 +23,11 @@
 # index (their pool publishes versioned filenames with no `latest` alias), sbx picks the newest
 # version's `.deb` and pins it per project, and `sbx upgrade` re-reads the index.
 #
+# THE ARCHITECTURE IS NOT THIS LINE'S TO CHOOSE. The `binary-<arch>` segment belongs to the
+# Debian layout, so sbx reads the sibling index for the machine it runs on and this declaration
+# serves x86_64 and aarch64 alike. Anthropic's pool publishes both (`Architectures: amd64 arm64`
+# in its `InRelease`), signed by the same key, so nothing about the attestation above changes.
+#
 # THE INDEX IS ATTESTED. That pool publishes a signed `InRelease` covering the index, so sbx verifies
 # it and pins the signing key the first time, naming the fingerprint on stderr. The first pin is
 # trust on first use and proves nothing by itself; every later resolve and `sbx upgrade` must

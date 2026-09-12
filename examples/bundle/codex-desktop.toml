@@ -112,7 +112,10 @@ mute = [
 
 [packages]
 # OpenAI's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron, no source build). The
-# apt pool publishes one package, `chatgpt`, whose payload is the Codex desktop app.
+# apt pool publishes one package, `chatgpt`, whose payload is the Codex desktop app. The
+# `binary-<arch>` segment belongs to the Debian layout rather than to this declaration: sbx reads
+# the sibling index for the machine it runs on, and the pool publishes both architectures under
+# the same `InRelease`.
 codex-desktop = "deb:apt:https://persistent.oaistatic.com/codex-app-prod/linux/deb/dists/stable/main/binary-amd64/Packages"
 # An in-cage Chromium for the browser half of the sign-in. HEAVY — a large nixpkgs closure on first
 # launch, shared with every other Chromium profile in your store.
