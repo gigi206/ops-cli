@@ -33,8 +33,17 @@ struct Engine {
     feature_env: &'static str,
     /// Env var supplying the path to the prebuilt static binary (e.g. `SBX_BUNDLED_NIX`).
     src_env: &'static str,
-    /// The SHA-256 the supplied binary's bytes must match.
-    expected_sha: &'static str,
+    /// The SHA-256 the supplied binary's bytes must match, per target architecture.
+    ///
+    /// Per architecture and not one value, because the engine is a *binary*: the same pinned
+    /// nixpkgs attribute realises different bytes for each architecture it is built for. An
+    /// architecture absent from this table has no pinned engine and the build says so, rather than
+    /// comparing against another one's hash and reporting a drift that is not one.
+    ///
+    /// Keyed on the architecture rather than the full target triple because that is what the
+    /// engine actually varies with: it is a statically linked binary of its own, so a glibc and a
+    /// musl build of sbx on the same machine embed the very same bytes.
+    expected_sha: &'static [(&'static str, &'static str)],
     /// Basename of the generated blob/module (`bundled_nix` → `bundled_nix.bin`/`.rs`).
     stem: &'static str,
     /// Name of the generated `pub static … : &[u8]` bytes constant (e.g. `NIX_BIN`).
@@ -45,15 +54,28 @@ struct Engine {
     human: &'static str,
 }
 
-/// The engines sbx can embed. Each `expected_sha` is the SHA-256 of the static binary
-/// `mise run static-<engine>` realises from the pinned nixpkgs ref recorded in `mise.toml`;
-/// bump the ref and this hash together. `nix` is 2.34.7, `bwrap` (bubblewrap) is 0.11.2,
-/// both x86_64 static musl.
+/// The engines sbx can embed. Each entry of `expected_sha` is the SHA-256 of the static binary
+/// realised from the pinned nixpkgs ref recorded in `mise.toml`, for one Rust target; bump the ref
+/// and every hash together. `nix` is 2.34.7 and `bwrap` (bubblewrap) is 0.11.2, both static musl.
+///
+/// `mise run static-<engine>` realises the attribute for the **host's** system, so a local
+/// `build-bundled` produces the host architecture's engine and no other. The hashes for a target
+/// that is not the host's come from the publishing workflow, which realises each engine on a
+/// runner of the target's own architecture and prints its SHA-256 before building.
 const ENGINES: &[Engine] = &[
     Engine {
         feature_env: "CARGO_FEATURE_BUNDLED_NIX",
         src_env: "SBX_BUNDLED_NIX",
-        expected_sha: "8ebec57b2f50bd10e62ac2e4ae27058a22019f8840ae278e2da9a7efe16faf80",
+        expected_sha: &[
+            (
+                "x86_64",
+                "8ebec57b2f50bd10e62ac2e4ae27058a22019f8840ae278e2da9a7efe16faf80",
+            ),
+            (
+                "aarch64",
+                "3c29872b3a6258417ce5388529d8c07c0b78523f625cf5fbb28d8c7cfa6ceef2",
+            ),
+        ],
         stem: "bundled_nix",
         bytes_const: "NIX_BIN",
         sha_const: "NIX_SHA256",
@@ -62,7 +84,10 @@ const ENGINES: &[Engine] = &[
     Engine {
         feature_env: "CARGO_FEATURE_BUNDLED_BWRAP",
         src_env: "SBX_BUNDLED_BWRAP",
-        expected_sha: "9c58a5a4e81e2295b235cd5179e948b758a430607befd446766665ebb46badaa",
+        expected_sha: &[(
+            "x86_64",
+            "9c58a5a4e81e2295b235cd5179e948b758a430607befd446766665ebb46badaa",
+        )],
         stem: "bundled_bwrap",
         bytes_const: "BWRAP_BIN",
         sha_const: "BWRAP_SHA256",
@@ -157,14 +182,31 @@ fn emit_proc_shim(manifest: &Path, out_dir: &Path) {
 
 /// Embed `engine`'s static binary when its feature is on, writing the module its `store`
 /// resolver includes (the bytes constant + their hash). The binary is read from the path in
-/// `engine.src_env` and verified against `engine.expected_sha`. With the feature off (the
-/// default), this is a no-op: sbx resolves the engine from its override env / `PATH`.
+/// `engine.src_env` and verified against the `engine.expected_sha` entry for the target being
+/// built. With the feature off (the default), this is a no-op: sbx resolves the engine from its
+/// override env / `PATH`.
 fn emit_bundled_engine(out_dir: &Path, engine: &Engine) {
     // Re-run if the supplying var changes, so a re-point re-embeds.
     println!("cargo:rerun-if-env-changed={}", engine.src_env);
     if env::var_os(engine.feature_env).is_none() {
         return;
     }
+    // The architecture being built *for*, not the host's: a build script runs on the host, so
+    // `cfg!` here would describe the wrong machine. Cargo passes the target's architecture in this
+    // variable, which is the granularity the engines vary with.
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("cargo sets the target architecture");
+    let expected = engine
+        .expected_sha
+        .iter()
+        .find_map(|(a, sha)| (*a == arch).then_some(*sha))
+        .unwrap_or_else(|| {
+            panic!(
+                "no pinned {0} engine for {arch} — the bundled-{0} feature embeds a binary, so \
+                 each published architecture carries its own hash in build.rs. Realise the engine \
+                 on a host of that architecture and add its SHA-256 to the table.",
+                engine.human,
+            )
+        });
     let src = env::var_os(engine.src_env).unwrap_or_else(|| {
         panic!(
             "the bundled-{0} feature is enabled but {1} is unset — point it at a static \
@@ -179,14 +221,13 @@ fn emit_bundled_engine(out_dir: &Path, engine: &Engine) {
     let got = sha256_hex(&bytes);
     assert_eq!(
         got,
-        engine.expected_sha,
-        "bundled {human} sha256 mismatch — {src_env} ({src}) is not the pinned engine \
-         (got {got}, expected {expected}); rebuild it from the pinned nixpkgs ref or bump \
+        expected,
+        "bundled {human} sha256 mismatch for {arch} — {src_env} ({src}) is not the pinned \
+         engine (got {got}, expected {expected}); rebuild it from the pinned nixpkgs ref or bump \
          the pin in build.rs",
         human = engine.human,
         src_env = engine.src_env,
         src = src.display(),
-        expected = engine.expected_sha,
     );
     let bin = out_dir.join(format!("{}.bin", engine.stem));
     fs::write(&bin, &bytes).unwrap();
@@ -198,7 +239,7 @@ fn emit_bundled_engine(out_dir: &Path, engine: &Engine) {
         bytes_const = engine.bytes_const,
         path = bin.to_str().expect("OUT_DIR path is valid UTF-8"),
         sha_const = engine.sha_const,
-        sha = engine.expected_sha,
+        sha = expected,
     );
     fs::write(out_dir.join(format!("{}.rs", engine.stem)), generated).unwrap();
 }

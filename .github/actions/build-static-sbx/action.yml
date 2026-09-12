@@ -110,6 +110,22 @@ runs:
         done
         echo "no bin/bwrap in the pkgsStatic.bubblewrap outputs" >&2; exit 1
 
+    # The hashes `build.rs` pins, printed before it asserts them. They are per target, because the
+    # same pinned attribute realises different bytes per architecture — so a bumped nixpkgs ref, or
+    # a target whose engines no host here has ever realised, reads its expected values from this
+    # step rather than from a failed assertion. Printing costs nothing and is the only place some
+    # of these bytes are ever hashed.
+    - name: The engines' SHA-256, as build.rs will hash them
+      shell: bash
+      env:
+        NIX_ENGINE: ${{ steps.nix.outputs.path }}
+        BWRAP_ENGINE: ${{ steps.bwrap.outputs.path }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        echo "pinned engine hashes for ${TARGET}:"
+        sha256sum "$NIX_ENGINE" "$BWRAP_ENGINE"
+
     # Sanity gate: the default-feature unit suite must pass before minutes are spent bundling
     # engines. The sandbox e2e skip on a hosted runner, so this proves the unit surface only.
     # `-D warnings` here matches what `ci.yml` compiles under: the three publish paths previously
