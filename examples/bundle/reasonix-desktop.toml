@@ -57,11 +57,17 @@ WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS = "1"
 # icons, the desktop schemas GTK reads, and `gnome-themes-extra` for the `Adwaita-dark` theme the
 # portal names when your desktop is in dark mode — GTK ships only the light Adwaita itself, so
 # without it the shell stays light on a dark desktop.
+#
+# ARCHITECTURE: amd64 only, and the resolver says so rather than fetching the wrong bytes. Upstream
+# does build the desktop app for arm64, but publishes it there as a tarball and attaches the `.deb`
+# for amd64 alone — and a `deb:` package cannot take a tarball. Moving the whole declaration to
+# `tarball:` is what would open aarch64, at the cost of the dpkg unpacking and the autoPatchelf pass
+# this backend performs; it is not done here because the amd64 `.deb` is what upstream tests.
 [deb.reasonix-desktop]
 resolve = [
     "sh",
     "-c",
-    "curl -fsSL 'https://api.github.com/repos/esengine/DeepSeek-Reasonix/releases?per_page=30' | jq -r '[.[] | select(.tag_name | startswith(\"desktop-v\"))][0].assets[] | select(.name==\"Reasonix-linux-amd64.deb\") | .browser_download_url'",
+    "case \"$(uname -m)\" in x86_64) ;; *) echo \"reasonix-desktop: upstream ships the .deb for amd64 only — its $(uname -m) build is a tarball, which this backend cannot take\" >&2; exit 1 ;; esac; curl -fsSL 'https://api.github.com/repos/esengine/DeepSeek-Reasonix/releases?per_page=30' | jq -r '[.[] | select(.tag_name | startswith(\"desktop-v\"))][0].assets[] | select(.name==\"Reasonix-linux-amd64.deb\") | .browser_download_url'",
 ]
 libs = [
     "webkitgtk_4_1",

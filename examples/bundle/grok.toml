@@ -61,9 +61,13 @@ grok = "binary:resolve"
 #
 # This runs host-side in sbx's hermetic resolve cage, not in the agent's cage, so it uses the host
 # network rather than the `allow` list above — that list governs the agent's own egress at runtime.
+#
+# ARCHITECTURE: the vendor's template ends in the architecture spelled the way `uname -m` spells it
+# (`x86_64`, `aarch64`), so the resolver substitutes the host's own answer. One it does not build
+# yields a URL that 404s, which the fetch reports by name.
 [binary.grok]
 resolve = [
     "sh",
     "-c",
-    'v=$(curl -fsSL https://storage.googleapis.com/grok-build-public-artifacts/cli/stable | tr -d "\r\n"); [ -n "$v" ] || { echo "grok: the vendor channel named no version" >&2; exit 1; }; echo "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-$v-linux-x86_64"',
+    'v=$(curl -fsSL https://storage.googleapis.com/grok-build-public-artifacts/cli/stable | tr -d "\r\n"); [ -n "$v" ] || { echo "grok: the vendor channel named no version" >&2; exit 1; }; echo "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-$v-linux-$(uname -m)"',
 ]

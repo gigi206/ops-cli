@@ -121,7 +121,11 @@ NODE_USE_ENV_PROXY = "1"
 # `.deb` URL embeds a version and build hash with no `…/latest/…` alias, so a direct `deb:<url>`
 # would freeze; this queries the download API for the CURRENT `debUrl` instead. `curl -fsSL` fails
 # closed on an HTTP error; the printed URL is re-validated as a `.deb` URL before it is fetched.
+#
+# ARCHITECTURE: the API takes a platform slug in the vendor's own spelling (`linux-x64`/
+# `linux-arm64`), so the resolver maps `uname -m` onto it and refuses anything else by name.
 [deb.cursor]
 resolve = ["sh", "-c", '''
-curl -fsSL "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable" | sed -n 's/.*"debUrl":"\([^"]*\)".*/\1/p'
+case "$(uname -m)" in x86_64) p=linux-x64 ;; aarch64) p=linux-arm64 ;; *) echo "cursor: the vendor publishes no $(uname -m) build" >&2; exit 1 ;; esac
+curl -fsSL "https://www.cursor.com/api/download?platform=$p&releaseTrack=stable" | sed -n 's/.*"debUrl":"\([^"]*\)".*/\1/p'
 ''']

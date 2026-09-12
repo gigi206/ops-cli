@@ -22,8 +22,9 @@
 # install phase wraps a lone root executable under the `[packages]` KEY, so the command a profile
 # writes stays `pool` whatever the vendor named the file. Nothing to autoPatchelf: it is static.
 #
-# ARCHITECTURE: the resolver names the `amd64` build, following the vendor's own naming
-# (`uname -m` → `amd64`/`arm64`). On aarch64 change that one token to `arm64`.
+# ARCHITECTURE: the resolver branches on `uname -m` and follows the vendor's own naming
+# (`amd64`/`arm64`). Any other architecture is refused by name rather than sent to a URL the
+# vendor does not publish.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
@@ -48,5 +49,5 @@ pool = "tarball:resolve"
 resolve = [
     "sh",
     "-c",
-    "v=$(curl -fsS https://downloads.poolside.ai/pool/pool-latest-version.txt | tr -d '[:space:]'); printf 'https://downloads.poolside.ai/pool/%s/pool-linux-amd64.tar.gz' \"$v\"",
+    "case \"$(uname -m)\" in x86_64) a=amd64 ;; aarch64) a=arm64 ;; *) echo \"pool: the vendor publishes no $(uname -m) build\" >&2; exit 1 ;; esac; v=$(curl -fsS https://downloads.poolside.ai/pool/pool-latest-version.txt | tr -d '[:space:]'); printf 'https://downloads.poolside.ai/pool/%s/pool-linux-%s.tar.gz' \"$v\" \"$a\"",
 ]

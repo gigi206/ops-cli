@@ -64,9 +64,13 @@ warp = "tarball:resolve"
 # URL it prints, validates it is an https `.tar.gz`, and pins it with its content hash. The vendor
 # exposes a stable artifact endpoint that 302s to the current versioned tarball, so the resolver
 # asks curl for the redirect TARGET (first hop only) rather than following it.
+#
+# ARCHITECTURE: the endpoint takes it as a query parameter and spells it the way `uname -m` does,
+# so the resolver passes the host's own answer through. An architecture the vendor does not build
+# redirects nowhere, and the empty result fails the https `.tar.gz` check above.
 [tarball.warp]
 resolve = [
     "sh",
     "-c",
-    "curl -fsS -o /dev/null -w '%{redirect_url}' 'https://app.warp.dev/download/agent-cli/artifact?os=linux&arch=x86_64'",
+    "curl -fsS -o /dev/null -w '%{redirect_url}' \"https://app.warp.dev/download/agent-cli/artifact?os=linux&arch=$(uname -m)\"",
 ]
