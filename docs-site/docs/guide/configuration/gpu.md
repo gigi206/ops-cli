@@ -71,6 +71,23 @@ because that package is named by a content hash and nothing short of its content
 On a host that is not WSL none of this applies: neither piece exists, and `gpu = true` behaves
 exactly as described above.
 
+## Under Lima on macOS: there is no GPU to grant
+
+A Lima guest created from the template this repository ships runs under `vmType: vz`, which
+presents the guest with no GPU at all. There is no `/dev/dri`, no render node, and no bridge
+device standing in for one, so the three pieces above find nothing to grant and `gpu = true`
+falls back to software rendering. That is the same best-effort degradation as a Linux host
+with no render node, and it is reported rather than fatal: the launch proceeds.
+
+This is a property of the virtual machine and not of `sbx`, and it is the half of a trade
+rather than an oversight. The virtio-GPU route that does expose a GPU to a Linux guest on
+Apple Silicon, through Venus and Vulkan, opens no screen for the guest, while the driver that
+opens the window presents no GPU. The template takes the window, because the scope it commits
+to is CLI plus GUI. See [Running under Lima](../getting-started/installation).
+
+CUDA is out of reach on a Mac by any route, and no configuration changes that: Apple Silicon
+carries no NVIDIA hardware for a driver to reach.
+
 ## Scope: mesa GPUs, and the NVIDIA bridge
 
 The three pieces above cover **mesa-supported GPUs, Intel, AMD, and nouveau**, whose
