@@ -32,6 +32,13 @@ through `pipewire-pulse`, and a native PulseAudio host creates directly) is boun
 into the cage at a fixed path and named through `PULSE_SERVER`. Same-uid, so a read-only bind
 still permits `connect()` (exactly like the Wayland socket).
 
+Under WSL the audio host is Windows, and the socket it serves is
+`/mnt/wslg/runtime-dir/pulse/native`. WSLg usually drops a symlink at the runtime-dir path above, so
+the ordinary lookup reaches it; that link is created by a third party, though, so it is absent
+before the first WSLg client runs and on a distro that never publishes it. sbx therefore tries the
+runtime-dir path first, and falls back to WSLg's own path when the kernel is a WSL one. A distro
+publishing its own socket still answers for itself, because the runtime-dir candidate comes first.
+
 **For a native PulseAudio client** (Chromium/Electron): the **PulseAudio client library**
 (`libpulse.so.0`) is provisioned into sbx's own store and put on the app's loader search path
 (`LD_LIBRARY_PATH`). Chromium loads it by soname, and it is absent from a packaged app's own

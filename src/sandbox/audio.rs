@@ -264,13 +264,30 @@ fn stage_atomically(dir: &Path, name: &str, content: &str) -> io::Result<PathBuf
     Ok(file)
 }
 
-/// The host PulseAudio socket to bind, derived from the host `$XDG_RUNTIME_DIR`. A PipeWire host
-/// exposes it through `pipewire-pulse`; a native PulseAudio host creates the same path. Pure over the
-/// runtime dir so it is unit-tested. Returns `None` when `$XDG_RUNTIME_DIR` is unset or empty (the
-/// socket cannot be located) — the caller then degrades to a cage without audio.
-pub(crate) fn host_socket(runtime_dir: Option<&str>) -> Option<PathBuf> {
-    let dir = runtime_dir.filter(|d| !d.is_empty())?;
-    Some(PathBuf::from(dir).join("pulse/native"))
+/// Where WSLg publishes the host PulseAudio socket.
+///
+/// Under WSL the audio host is Windows, and this is the path it serves. `$XDG_RUNTIME_DIR/pulse/native`
+/// usually *reaches* it — WSLg drops a symlink there — but that link is created by a third party, so
+/// it is absent before the first WSLg client runs and on a distro that never publishes it. Naming the
+/// real path is what makes audio work in those cases rather than silently not.
+pub(crate) const WSLG_SOCK: &str = "/mnt/wslg/runtime-dir/pulse/native";
+
+/// The host PulseAudio sockets to try, in order. A PipeWire host exposes the runtime-dir path through
+/// `pipewire-pulse`; a native PulseAudio host creates the same path; under WSL, [`WSLG_SOCK`] is the
+/// one Windows actually serves. Pure over the runtime dir and the WSL flag so it is unit-tested.
+///
+/// Empty when there is nothing to try (`$XDG_RUNTIME_DIR` unset or empty, off WSL) — the caller then
+/// degrades to a cage without audio. The runtime-dir candidate comes first even on WSL, because a
+/// distro that publishes its own socket there is answering for itself.
+pub(crate) fn host_sockets(runtime_dir: Option<&str>, is_wsl: bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(dir) = runtime_dir.filter(|d| !d.is_empty()) {
+        out.push(PathBuf::from(dir).join("pulse/native"));
+    }
+    if is_wsl {
+        out.push(PathBuf::from(WSLG_SOCK));
+    }
+    out
 }
 
 /// The audio env: always point clients at the bound socket (`PULSE_SERVER`); and, when the userspace
@@ -366,14 +383,28 @@ mod tests {
     }
 
     #[test]
-    fn host_socket_locates_pulse_native_under_the_runtime_dir() {
+    fn host_sockets_lists_the_runtime_dir_path_and_nothing_else_off_wsl() {
         assert_eq!(
-            host_socket(Some("/run/user/1000")),
-            Some(PathBuf::from("/run/user/1000/pulse/native"))
+            host_sockets(Some("/run/user/1000"), false),
+            vec![PathBuf::from("/run/user/1000/pulse/native")]
         );
-        // An unset or empty runtime dir cannot locate the socket → no audio (best-effort).
-        assert_eq!(host_socket(None), None);
-        assert_eq!(host_socket(Some("")), None);
+        assert_eq!(host_sockets(None, false), Vec::<PathBuf>::new());
+        assert_eq!(host_sockets(Some(""), false), Vec::<PathBuf>::new());
+    }
+
+    /// Under WSL the runtime-dir path is tried first — a distro publishing its own socket answers for
+    /// itself — and WSLg's path backs it up, which is what makes audio work before the symlink exists.
+    #[test]
+    fn host_sockets_backs_the_runtime_dir_with_wslgs_own_path_under_wsl() {
+        assert_eq!(
+            host_sockets(Some("/run/user/1000"), true),
+            vec![
+                PathBuf::from("/run/user/1000/pulse/native"),
+                PathBuf::from(WSLG_SOCK)
+            ]
+        );
+        // A WSL shell with no runtime dir still reaches Windows' own socket.
+        assert_eq!(host_sockets(None, true), vec![PathBuf::from(WSLG_SOCK)]);
     }
 
     #[test]
