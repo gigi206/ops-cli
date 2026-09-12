@@ -55,6 +55,54 @@ struct NetTestArgs<'a> {
 ///
 /// A `-`-prefixed token is refused rather than taken for the target. Without that check the first
 /// unknown flag became the URL and the *next* argument was blamed, so
+/// The configuration a `sbx test` verb reports against: the project's, plus a named app's overlay,
+/// plus the ambient one-shot override.
+///
+/// One function for the three verbs because they answer one question in three places, and the
+/// override was missing from all three at once. A `test` verb exists to predict what a launch
+/// would do, so it has to be resolved the way a launch resolves it: the app overlay first, the
+/// override after, which is the order [`crate::config::Resolved::apply_override`] documents and
+/// the reason an override beats an overlay.
+///
+/// Only the ambient `SBX_*` variables are folded, never command-line values: those reach a launch
+/// through flags this verb does not take, and inventing them here would be reporting on a launch
+/// nobody asked for.
+///
+/// Folding an environment-supplied policy into a diagnostic widens nothing. The variables read
+/// here are the ones a launch from the same shell would read, so the verb discloses only what its
+/// caller could learn by launching, and an override remains trusted by invocation exactly as it
+/// is at launch. What changes is that the answer stops disagreeing with the launch it predicts. Fail-closed like a launch: a malformed blob or an unreadable `@file` is
+/// reported and nothing is tested, rather than a verdict computed from a policy that would never
+/// have run.
+fn resolved_for(
+    verb: &str,
+    cwd: &Path,
+    app: Option<&String>,
+) -> Result<config::Resolved, ExitCode> {
+    let mut resolved = config::load(cwd);
+    for w in &resolved.warnings {
+        diag::warn_config(w);
+    }
+    if let Some(name) = app
+        && let Err(e) = fold_app_overlay(&mut resolved, name)
+    {
+        diag::error(&format!("sbx: {verb}: {e}"));
+        return Err(ExitCode::from(2));
+    }
+    let ov =
+        config::overrides::collect(&config::overrides::CliOverrides::default()).map_err(|e| {
+            diag::error(&format!("sbx: {verb}: {e}"));
+            ExitCode::from(2)
+        })?;
+    resolved.apply_override(ov).map_err(|errs| {
+        for e in &errs {
+            diag::error(&format!("sbx: {verb}: {e}"));
+        }
+        ExitCode::from(2)
+    })?;
+    Ok(resolved)
+}
+
 /// `sbx test net --app=claude https://api.anthropic.com` reported the one argument that was
 /// correct — and the `--app=` spelling is one `sbx upgrade` accepts, so reaching for it here is an
 /// ordinary mistake rather than a contrived one.
@@ -137,19 +185,10 @@ fn net_test(args: &[OsString]) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let mut resolved = config::load(&cwd);
-    for w in &resolved.warnings {
-        diag::warn_config(w);
-    }
-    // Fold a named app's overlay onto the baseline so the URL is tested against the *effective*
-    // policy `sbx app <name>` would launch with (its own posture, allow/deny rules, credentials),
-    // not the bare baseline.
-    if let Some(name) = &app
-        && let Err(e) = fold_app_overlay(&mut resolved, name)
-    {
-        diag::error(&format!("sbx: test net: {e}"));
-        return ExitCode::from(2);
-    }
+    let resolved = match resolved_for("test net", &cwd, app.as_ref()) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
 
     // A bare host (no scheme) is completed to https — the common case for a quick check.
     let url = if target.contains("://") {
@@ -765,16 +804,10 @@ fn proc_test(args: &[OsString]) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let mut resolved = config::load(&cwd);
-    for w in &resolved.warnings {
-        diag::warn_config(w);
-    }
-    if let Some(name) = &app
-        && let Err(e) = fold_app_overlay(&mut resolved, name)
-    {
-        diag::error(&format!("sbx: test proc: {e}"));
-        return ExitCode::from(2);
-    }
+    let resolved = match resolved_for("test proc", &cwd, app.as_ref()) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, r) = (pal.head, pal.reset);
@@ -962,16 +995,10 @@ fn fs_test(args: &[OsString]) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let mut resolved = config::load(&cwd);
-    for w in &resolved.warnings {
-        diag::warn_config(w);
-    }
-    if let Some(name) = &app
-        && let Err(e) = fold_app_overlay(&mut resolved, name)
-    {
-        diag::error(&format!("sbx: test fs: {e}"));
-        return ExitCode::from(2);
-    }
+    let resolved = match resolved_for("test fs", &cwd, app.as_ref()) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
 
     let policy = &resolved.fs;
     let expanded = crate::sandbox::fsmask::expand(&cwd, policy);

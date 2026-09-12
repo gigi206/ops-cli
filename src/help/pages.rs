@@ -428,7 +428,13 @@ pub(super) const PAGES: &[Page] = &[
         summary: "check whether an access would be allowed, and why",
         options: &[],
         details: "A diagnostic surface meant to grow with sbx's access controls. No launch, no nix,\n\
-            no network — it reports a verdict against the resolved policy.",
+            no network — it reports a verdict against the resolved policy.\n\
+            \n\
+            Every subcommand resolves that policy the way a launch resolves it: a named app's\n\
+            overlay first, then the ambient `SBX_*` one-shot override, which beats the overlay\n\
+            exactly as it does at launch. A verdict read while the shell carries an override is\n\
+            therefore the verdict that launch would get. Command-line override flags belong to the\n\
+            launching verbs and are not taken here.",
     },
     Page {
         path: &["net"],

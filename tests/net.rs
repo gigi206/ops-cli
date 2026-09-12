@@ -2419,6 +2419,61 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
 // ── `sbx test net` enrichments: app targeting, launch fidelity, scheme-optional ─────────────────
 
 #[test]
+fn a_test_verb_answers_under_the_one_shot_override_a_launch_would_carry() {
+    // `sbx test net` exists to predict a launch, and a launch honors the ambient `SBX_*` override.
+    // A verb that reported the project's posture while the shell carried an override answered a
+    // question nobody asked: the operator tests, reads DENIED, launches, and reaches the host.
+    let fx = Project::new("net");
+    fx.write_global("[network]\nmode = \"deny\"\n");
+
+    let base = fx.run(&["test", "net", "https://example.test/x"]);
+    let b = String::from_utf8_lossy(&base.stdout);
+    assert!(
+        b.contains("DENIED"),
+        "the project posture denies, with nothing in the environment:\n{b}"
+    );
+
+    let under = fx
+        .cmd(&["test", "net", "https://example.test/x"])
+        .env("SBX_NET", "allow")
+        .output()
+        .expect("spawn sbx");
+    let u = String::from_utf8_lossy(&under.stdout);
+    assert!(
+        u.contains("ALLOWED"),
+        "the same URL under the override a launch would carry must report what that launch \
+         serves:\n{u}"
+    );
+}
+
+#[test]
+fn the_override_reaches_every_test_verb_and_not_only_the_one_that_wanted_it() {
+    // The three verbs resolve their configuration through one function, so the override cannot
+    // reach `test net` and miss the others. `test fs` is the witness: its mask arrives by a whole
+    // schema blob rather than a typed flag, which is the other shape an override takes.
+    let fx = Project::new("net");
+    std::fs::write(fx.proj.path().join("secret.txt"), b"").expect("stage the file the mask names");
+
+    let base = fx.run(&["test", "fs", "./secret.txt"]);
+    let b = String::from_utf8_lossy(&base.stdout);
+    assert!(
+        b.contains("OPEN"),
+        "nothing closes the file with an empty project:\n{b}"
+    );
+
+    let under = fx
+        .cmd(&["test", "fs", "./secret.txt"])
+        .env("SBX_CONFIG", "[fs]\ndeny = [\"secret.txt\"]\n")
+        .output()
+        .expect("spawn sbx");
+    let u = String::from_utf8_lossy(&under.stdout);
+    assert!(
+        u.contains("DENIED") && u.contains("secret.txt"),
+        "the blob's mask must reach `test fs` the way it reaches a launch:\n{u}"
+    );
+}
+
+#[test]
 fn test_net_targets_an_app_effective_policy() {
     let fx = Project::new("net");
     // A global config (trusted by location, so no `sbx trust` needed): a baseline allowlist that

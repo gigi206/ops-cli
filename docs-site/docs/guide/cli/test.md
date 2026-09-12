@@ -17,6 +17,13 @@ Each kind answers by calling the **same** decision the enforcing path calls, rat
 re-deriving a verdict of its own. A tester carrying its own copy of the rule would eventually
 disagree with what the cage does, and it would disagree silently.
 
+For the same reason, each kind resolves its policy the way a launch resolves it: a named app's
+overlay first, then the ambient `SBX_*` [one-shot override](../configuration/overrides), which
+beats that overlay exactly as it does at launch. A verdict read while the shell carries an
+override is therefore the verdict that launch would get. Override flags on the command line
+belong to the launching verbs, so `sbx test` does not take them; export the variable instead if
+you want to ask about a posture you have not written to the file.
+
 See also: [`sbx net`](net) · [`sbx fs`](fs) · [`sbx proc`](proc) · [the `[fs]` table](../configuration/fs) · [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Egress observability](../networking/observability).
 
 ## `sbx test net`
