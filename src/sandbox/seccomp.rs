@@ -59,7 +59,7 @@
 
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
-    SeccompRule, TargetArch, sock_filter,
+    SeccompRule, TargetArch,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -74,6 +74,17 @@ compile_error!("sbx's seccomp denylist is implemented only for x86_64 and aarch6
 const TARGET_ARCH: TargetArch = TargetArch::x86_64;
 #[cfg(target_arch = "aarch64")]
 const TARGET_ARCH: TargetArch = TargetArch::aarch64;
+
+/// `kexec_file_load`, whose number this has to spell out on aarch64.
+///
+/// The call exists on every architecture sbx builds for, but the `libc` crate defines the constant
+/// only for x86_64 under musl (it has it for aarch64 under glibc, as 294). Dropping the entry where
+/// the constant is missing would take the call off the denylist on that target, so the number is
+/// written here instead: an unnamed kernel interface is still a kernel interface.
+#[cfg(target_arch = "aarch64")]
+const SYS_KEXEC_FILE_LOAD: i64 = 294;
+#[cfg(target_arch = "x86_64")]
+const SYS_KEXEC_FILE_LOAD: i64 = libc::SYS_kexec_file_load;
 
 /// `clone`/`unshare` flag for a new user namespace.
 const CLONE_NEWUSER: u64 = 0x1000_0000;
@@ -128,7 +139,7 @@ fn arg1_is(request: u64) -> SeccompRule {
 /// re-permit can never drift from the set the filter denies. Names are the canonical Linux
 /// syscall names — the exact tokens `[seccomp] allow` accepts.
 fn eperm_unconditional_named() -> Vec<(&'static str, i64)> {
-    let mut v = vec![
+    let v = vec![
         // process inspection/patching of siblings
         ("ptrace", libc::SYS_ptrace),
         ("process_vm_readv", libc::SYS_process_vm_readv),
@@ -139,7 +150,7 @@ fn eperm_unconditional_named() -> Vec<(&'static str, i64)> {
         ("delete_module", libc::SYS_delete_module),
         // kexec / reboot
         ("kexec_load", libc::SYS_kexec_load),
-        ("kexec_file_load", libc::SYS_kexec_file_load),
+        ("kexec_file_load", SYS_KEXEC_FILE_LOAD),
         ("reboot", libc::SYS_reboot),
         // introspection / perf / async-IO that hides syscalls from a filter
         ("bpf", libc::SYS_bpf),
@@ -168,9 +179,14 @@ fn eperm_unconditional_named() -> Vec<(&'static str, i64)> {
         ("pivot_root", libc::SYS_pivot_root),
         ("chroot", libc::SYS_chroot),
     ];
-    // I/O-port access exists only on x86.
+    // I/O-port access exists only on x86. The rebinding carries the same `cfg` as the
+    // extension it serves, so no target declares a mutability it never uses.
     #[cfg(target_arch = "x86_64")]
-    v.extend_from_slice(&[("ioperm", libc::SYS_ioperm), ("iopl", libc::SYS_iopl)]);
+    let v = {
+        let mut v = v;
+        v.extend_from_slice(&[("ioperm", libc::SYS_ioperm), ("iopl", libc::SYS_iopl)]);
+        v
+    };
     v
 }
 
@@ -295,6 +311,8 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 /// developer happened to have is not a guard.
 #[cfg(target_arch = "x86_64")]
 fn refuse_x32(program: &mut BpfProgram) {
+    use seccompiler::sock_filter;
+
     const LD_W_ABS: u16 = 0x20;
     const JMP_JGE_K: u16 = 0x35;
     const RET_K: u16 = 0x06;
@@ -701,6 +719,30 @@ mod tests {
 
     use std::io::Read;
 
+    /// `kexec_file_load` is denied on every architecture sbx builds for, under its own number.
+    ///
+    /// The `libc` crate does not name this constant on every target (see [`SYS_KEXEC_FILE_LOAD`]),
+    /// and where the name is missing the compiler proposes `SYS_kexec_load` as a near-match. Taking
+    /// that suggestion, or dropping the entry, leaves the denylist naming a call it does not deny —
+    /// both are silent, and both are what this refuses.
+    #[test]
+    fn kexec_file_load_is_denied_under_its_own_number() {
+        let named = eperm_unconditional_named();
+        let nr = named
+            .iter()
+            .find_map(|(name, nr)| (*name == "kexec_file_load").then_some(*nr))
+            .expect("`kexec_file_load` is on the mandatory denylist");
+        assert_ne!(
+            nr,
+            libc::SYS_kexec_load,
+            "`kexec_file_load` carries `kexec_load`'s number; one of the two calls is unfiltered"
+        );
+        assert!(eperm_rules(&SeccompPolicy::default()).contains_key(&nr));
+        // Where `libc` names it, its own constant is the oracle for the number written here.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(nr, libc::SYS_kexec_file_load);
+    }
+
     #[test]
     fn the_two_denylists_are_disjoint() {
         let eperm = eperm_rules(&SeccompPolicy::default());
@@ -1085,7 +1127,9 @@ mod tests {
         assert_eq!(argv[3], files[1].as_raw_fd().to_string().as_str());
     }
 
-    /// `bwrap` plus a capability-bearing user namespace, or `None` to skip.
+    /// `bwrap` plus a capability-bearing user namespace, or `None` to skip. x86_64-only, like
+    /// the real-cage probes it serves.
+    #[cfg(target_arch = "x86_64")]
     fn sandbox_prereq() -> Option<std::path::PathBuf> {
         let bwrap = crate::pathfind::find_on_path("bwrap")?;
         matches!(crate::probe_userns(), crate::Userns::Ok).then_some(bwrap)
