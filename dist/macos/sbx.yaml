@@ -1,0 +1,140 @@
+# sbx under Lima: a Linux guest for a macOS host, not a port of sbx to macOS.
+#
+# WHAT THIS IS. sbx rests on capability-bearing unprivileged user namespaces, and `sbx doctor`
+# hard-fails rather than emulating when they are absent. macOS has none of that, so what runs
+# here is an ordinary Linux sbx inside an ordinary Linux kernel; macOS is the host at the end of
+# the bridges, the same way Windows is for a WSL2 distribution. Nothing in sbx is macOS-aware.
+#
+# WHAT IS NOT MEASURED. This template has not been booted. The environment it was written in has
+# no KVM and no Mac, so nothing below was observed: not the user namespaces, not the mount
+# semantics, not the window, not the sound. `sbx doctor` inside the guest is what decides, and
+# `.github/workflows/macos.yml` is what runs it.
+
+param:
+  # The host subtree the guest can see. Everything outside it is absent from the guest, and
+  # therefore absent from every cage the guest builds.
+  #
+  # Lima's own default mounts the whole of `~`. That is the opposite of sbx's posture, where the
+  # project is read-write and nothing above it exists at all, so this narrows it to one subtree
+  # and asks you to name yours. Override at creation:
+  #
+  #   limactl create --name sbx --param projects=code dist/macos/sbx.yaml
+  #
+  # Relative to the host home, because `location` interpolates `{{.Home}}` itself and composing
+  # the two avoids depending on when `~` is expanded.
+  projects: "Projects"
+
+vmType: "vz"
+
+mounts:
+  - location: "{{.Home}}/{{.Param.projects}}"
+    # The guest sees this at the same absolute path the Mac does, which is Lima's default
+    # (`mountPoint` defaults to `location`) and is what lets a shell keep its working directory
+    # across the boundary without translating anything.
+    #
+    # `writable` defaults to false. A cage that cannot write the project is not a sandbox for
+    # working in, so this has to be true; and it is also what makes the subtree above worth
+    # narrowing, since this is the hole through which the guest reaches the Mac's disk.
+    writable: true
+
+video:
+  # A native macOS window, keyboard and pointer included. Lima's `default.yaml` documents this
+  # field with QEMU's values and omits `vz`, but the VZ driver accepts `vz`, `default` and `none`
+  # (pkg/driver/vz/vz_driver_darwin.go), and only `vz` or `default` opens a window at all.
+  #
+  # The window shows the guest's whole screen at a fixed 1920x1200, not one window per
+  # application the way WSLg does. There is no VNC here and sbx writes no display code: a
+  # compositor runs in the guest, and Lima draws its framebuffer.
+  display: "vz"
+
+audio:
+  # virtio-sound. Muted by default, and Lima warns that the field is experimental.
+  device: "vz"
+
+provision:
+  # Lima's own documentation: provisioning scripts "need to be idempotent because they might be
+  # called multiple times, e.g. when the host VM is being restarted". Both scripts below are
+  # written to be re-entrant rather than one-shot.
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      # Ubuntu has shipped `kernel.apparmor_restrict_unprivileged_userns=1` since 24.04, which
+      # leaves a user namespace creatable but stripped of the capabilities bubblewrap needs.
+      # Lima does nothing about it. Written to /etc/sysctl.d so it survives a reboot, and applied
+      # now so the first launch does not have to wait for one.
+      #
+      # Not measured: whether this image restricts them, and whether clearing it is sufficient,
+      # is what `sbx doctor` reports inside the guest.
+      install -m 0644 /dev/stdin /etc/sysctl.d/99-sbx-userns.conf <<'EOF'
+      kernel.apparmor_restrict_unprivileged_userns = 0
+      EOF
+      sysctl -q --system
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      # sbx itself. The image boots a bare Ubuntu, so the binary is fetched from the published
+      # release and verified against the `.sha256` published beside it before it is installed.
+      # This is the rule build.rs already applies to the embedded bwrap: bytes that have not been
+      # identified are not executed.
+      #
+      # Three honest limits, none of them hidden:
+      #
+      #  - The `latest` release is rolling: it is overwritten on every push to `ops-v2` and
+      #    `main`, so its digest cannot be pinned here and is fetched at provisioning time.
+      #  - Because Lima re-runs provisioning on every restart, a restarted guest converges on
+      #    whatever `latest` currently is. That is what keeps the guest and this repository in
+      #    step, and it also means a long-running guest can fall behind it.
+      #  - Fetching the binary and its digest from the same HTTPS origin catches a truncated or
+      #    corrupted transfer. It does not catch a compromised release, and it is therefore
+      #    weaker than build.rs's pinned constant. Saying so is the point.
+      base="https://github.com/gigi206/ops-cli/releases/download/latest"
+      case "$(uname -m)" in
+        aarch64) asset="sbx-linux-aarch64" ;;
+        x86_64)  asset="sbx-linux-x86_64" ;;
+        *) echo "no published sbx asset for $(uname -m)" >&2; exit 1 ;;
+      esac
+
+      tmp="$(mktemp -d)"
+      trap 'rm -rf "$tmp"' EXIT
+      marker="/usr/local/lib/sbx/installed.sha256"
+
+      # The digest is 65 bytes and the binary is fifty megabytes, so the digest decides whether
+      # the binary is worth fetching at all. Without this, every restart would re-download it.
+      curl -fsSL --retry 3 -o "$tmp/want" "$base/$asset.sha256"
+      want="$(tr -d '[:space:]' < "$tmp/want")"
+      if [ -x /usr/local/bin/sbx ] && [ "$(cat "$marker" 2>/dev/null)" = "$want" ]; then
+        exit 0
+      fi
+
+      curl -fsSL --retry 3 -o "$tmp/sbx" "$base/$asset"
+
+      # The published `.sha256` is a bare digest with no filename, so `sha256sum -c` cannot read
+      # it as it stands: the check line is built here instead.
+      got="$(sha256sum "$tmp/sbx" | cut -d' ' -f1)"
+      if [ "$want" != "$got" ]; then
+        echo "$asset sha256 mismatch (got $got, expected $want); the rolling release may have" >&2
+        echo "been rewritten between the two fetches, so re-run the provisioning rather than" >&2
+        echo "trusting these bytes" >&2
+        exit 1
+      fi
+
+      install -D -m 0755 "$tmp/sbx" /usr/local/bin/sbx
+      install -D -m 0644 /dev/stdin "$marker" <<EOF
+      $got
+      EOF
+      # Read by the wrapper to say when a long-running guest has fallen behind the release.
+      date -I > /usr/local/lib/sbx/installed.date
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      # bubblewrap is the sandbox engine and is not part of a fresh image. nix drives the store.
+      # A release can embed static copies of both; installing the distribution's own keeps the
+      # guest working with a build that does not.
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq bubblewrap ca-certificates
