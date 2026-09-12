@@ -23,7 +23,7 @@
 # that is a deliberate, and useful, contradiction: it sees the project directory and **only** the
 # hosts you list below, so it can reason about your repository's infrastructure code without holding
 # your cloud credentials. Anything that needs the host's Docker socket, your kubeconfig, or a cloud
-# provider's API will simply not be there. Grant those on purpose — a `[binds]` entry for a config
+# provider's API will simply not be there. Grant those on purpose — a `binds` entry for a config
 # directory, an `allow` line for a provider's API — or run its read-only mode:
 # `stakpak --tool-mode local` needs no key and makes no remote call at all.
 #
