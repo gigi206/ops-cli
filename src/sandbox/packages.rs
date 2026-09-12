@@ -565,4 +565,125 @@ mod tests {
             )]
         );
     }
+
+    /// Names the packages a layer carries, so a walk can be asserted as a transcript.
+    fn names(pkgs: &[Package]) -> Vec<String> {
+        pkgs.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// A three-layer project, baseline plus two apps, each declaring one package of its own.
+    fn three_layers() -> crate::config::Resolved {
+        let mut cfg = crate::testutil::resolved(vec![], vec![]);
+        cfg.packages = vec![package("base", "pkgs.base", TrustState::Trusted)];
+        for app in ["alpha", "beta"] {
+            let mut a = crate::testutil::app_with(vec![]);
+            a.packages = vec![package(app, &format!("pkgs.{app}"), TrustState::Trusted)];
+            cfg.apps.insert(app.into(), a);
+        }
+        cfg
+    }
+
+    /// A selector changes which layers roll, never which layers are visited.
+    ///
+    /// Asserted as a transcript rather than as two counts, because both halves are load-bearing and
+    /// they fail in opposite directions. A layer dropped from the walk shrinks the prune universe a
+    /// caller builds from the same pass, and a lock pruned against a narrowed universe forgets every
+    /// pin the selected app did not declare. A layer that rolls when it should not advances a pin
+    /// every other app reads, since the backends sharing this walk keep one lock per project.
+    ///
+    /// The order is part of the contract: the baseline first, then the apps in name order. Callers
+    /// deduplicate on first occurrence, so a different order is a different set of references.
+    #[test]
+    fn a_selector_changes_which_layers_roll_and_never_which_are_visited() {
+        let cfg = three_layers();
+
+        let mut whole = Vec::new();
+        walk_roll_layers(&cfg, None, |pkgs, roll| whole.push((names(pkgs), roll)));
+        assert_eq!(
+            whole,
+            vec![
+                (vec!["base".to_string()], true),
+                (vec!["base".to_string(), "alpha".to_string()], true),
+                (vec!["base".to_string(), "beta".to_string()], true),
+            ],
+            "unnarrowed, every layer is visited and every layer rolls"
+        );
+
+        let mut narrowed = Vec::new();
+        walk_roll_layers(&cfg, Some("alpha"), |pkgs, roll| {
+            narrowed.push((names(pkgs), roll))
+        });
+        assert_eq!(
+            narrowed,
+            vec![
+                (vec!["base".to_string()], false),
+                (vec!["base".to_string(), "alpha".to_string()], false),
+                (vec!["alpha".to_string()], true),
+                (vec!["base".to_string(), "beta".to_string()], false),
+            ],
+            "under a selector the same layers are visited, and the only one that rolls is the \
+             named app's own layer — the baseline it folds in stays out"
+        );
+
+        // A name no app carries selects nothing to roll, and still visits every layer: that is what
+        // keeps a typo from shrinking the universe a caller prunes against.
+        let mut typo = Vec::new();
+        walk_roll_layers(&cfg, Some("nope"), |pkgs, roll| {
+            typo.push((names(pkgs), roll))
+        });
+        assert_eq!(typo.len(), whole.len(), "a typo drops no layer");
+        assert!(!typo.iter().any(|(_, roll)| *roll), "a typo rolls nothing");
+    }
+
+    /// The count follows the roll set: the named app's own layer alone, and never the baseline.
+    ///
+    /// Each app is counted on its **own** list rather than on the merged overlay, so a baseline
+    /// package is not re-counted once per app. The `mise:` roll counts differently on purpose — its
+    /// packages are equipped in-cage from the merged set — and that divergence is why this rule is
+    /// asserted here rather than assumed to be the only one.
+    #[test]
+    fn a_narrowed_count_is_the_named_apps_own_layer_and_never_the_baseline() {
+        let cfg = three_layers();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let counter = |pkgs: &[Package]| {
+            seen.borrow_mut().push(names(pkgs));
+            pkgs.len()
+        };
+
+        assert_eq!(
+            count_in_roll_layers(&cfg, None, counter),
+            3,
+            "unnarrowed, the baseline and each app's own list count once each"
+        );
+        assert_eq!(
+            seen.replace(Vec::new()),
+            vec![
+                vec!["base".to_string()],
+                vec!["alpha".to_string()],
+                vec!["beta".to_string()],
+            ],
+            "no app is counted on its merged overlay, so the baseline is not re-counted per app"
+        );
+
+        assert_eq!(
+            count_in_roll_layers(&cfg, Some("alpha"), counter),
+            1,
+            "under a selector only the named app's own layer counts"
+        );
+        assert_eq!(
+            seen.replace(Vec::new()),
+            vec![vec!["alpha".to_string()]],
+            "the baseline is not even offered to the counter under a selector"
+        );
+
+        assert_eq!(
+            count_in_roll_layers(&cfg, Some("nope"), counter),
+            0,
+            "a name no app carries counts nothing"
+        );
+        assert!(
+            seen.borrow().is_empty(),
+            "and reaches the counter with no layer at all"
+        );
+    }
 }
