@@ -15,6 +15,11 @@
 //! A declared `nix:` tool is a stated requirement, so a failure to realise an *admitted*
 //! one is a hard error naming the attribute — never a silent drop, unlike a best-effort
 //! bind.
+//!
+//! One rule here is about layers rather than backends: which of the project baseline and the app
+//! overlays a roll visits, and which of them `sbx upgrade --app` still offers for rolling. Every
+//! locked backend asks it, so [`walk_roll_layers`] and [`count_in_roll_layers`] answer it once
+//! instead of once per backend.
 
 use crate::config::{Backend, PROJECT_CONFIG, Package, untrusted_reason};
 use crate::store::{self, Layout};
@@ -319,8 +324,8 @@ pub(crate) fn flake_inline_packages(packages: &[Package]) -> Vec<(String, String
 ///
 /// `only` is `sbx upgrade --app <name>`, and it narrows the roll set **alone**. What it selects is
 /// that app's own layer — its `[packages]` and the bundles folded under it at load — and not the
-/// project baseline, on the rule the `mise:` roll already applies to its baseline group: a selector
-/// that reads "only this app" must not do project-wide work. Every layer is still offered whatever
+/// project baseline, on the rule the `mise:` roll already applies to *which layers it rolls*: a
+/// selector that reads "only this app" must not do project-wide work. Every layer is still offered whatever
 /// the selector, which is what lets a caller keep a trust-agnostic prune universe that does not
 /// narrow alongside the roll set. That is the load-bearing half: a narrowed universe would make a
 /// per-app roll delete every other app's pin.

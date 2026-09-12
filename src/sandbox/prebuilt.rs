@@ -954,6 +954,11 @@ pub(crate) fn withheld(
 
 /// Whether the project (baseline or any app) declares a trusted `<backend>:resolve` package — so the
 /// upgrade path builds the (heavy) resolver sandbox only when it is actually needed.
+///
+/// The layers asked are the ones [`super::packages::walk_roll_layers`] visits, and a change to that
+/// rule belongs here too — but they are asked as a short-circuiting `any` rather than through the
+/// walk. The point of the question is to avoid work, and running the walk would materialise every
+/// app overlay after the answer is already settled.
 pub(crate) fn has_resolve_ref(
     kind: &dyn Kind,
     cfg: &crate::config::Resolved,

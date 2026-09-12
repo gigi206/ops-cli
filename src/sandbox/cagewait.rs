@@ -1,8 +1,8 @@
 //! Waiting for a cage to finish, under a ceiling it cannot outlive.
 //!
-//! Four runs wait on a bubblewrap child: the pool's install, a distribution build, a captured
-//! launch, and the smoke probe. Each gives its run a budget of its own and polls at a cadence of
-//! its own, but what happens when the budget runs out is one rule, and it is stated here once.
+//! The runners that wait on a bubblewrap child — the pool's install, a distribution build, a
+//! captured launch, the smoke probe — each give their run a budget of their own and poll at a
+//! cadence of their own. What happens when the budget runs out is one rule, stated here once.
 //!
 //! That rule is to kill the cage's `bwrap`. It is the pid-namespace init for everything inside, so
 //! killing it tears the cage down with it and nothing the run started outlives the ceiling. A
