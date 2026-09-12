@@ -317,6 +317,72 @@ pub(crate) fn host_exec_verdict(file_uid: u32, mode: u32, euid: u32) -> Result<(
     Ok(())
 }
 
+/// The first program named `name` on `PATH` that is safe to `execve`, or `None`.
+///
+/// [`crate::pathfind::find_on_path`] answers a narrower question: it enforces that only an
+/// **absolute** `PATH` entry may name a program, which closes the empty-element hole, and stops at
+/// the first executable match whatever its ownership. That leaves the second half of the engine
+/// tiers' rule unapplied — the half [`host_exec_verdict`] states — so a host tool found through a
+/// loosely-permissioned `PATH` directory is executed on nothing but its name.
+///
+/// This pairs the two: every match is scanned ([`crate::pathfind::find_all_on_path`]) and an
+/// untrusted one is named on stderr and skipped in favour of the next, so a world-writable early
+/// entry does not shadow a legitimate tool further down. `None` therefore means "nothing usable",
+/// which callers already handle: they degrade, or say the tool is not installed.
+///
+/// Distinct from `sandbox::resolver::locate_program`, which asks the same question **for a cage**:
+/// it canonicalizes (a nix profile's `bin/x` points into a store the cage may not have) and prefers
+/// a candidate the cage can load. Neither applies to a tool sbx runs on the host, so the two stay
+/// apart rather than one growing a flag.
+///
+/// Same posture and same limit as the engine tiers: a `stat` then an `execve` is defence in depth,
+/// not a TOCTOU-proof gate. Against a same-uid attacker nothing at this layer is a boundary.
+pub(crate) fn find_trusted_on_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` reads process-owned state through no pointer; it is the identity every
+    // candidate's owner is weighed against.
+    let euid = unsafe { libc::geteuid() };
+    first_trusted(name, crate::pathfind::find_all_on_path(name), &|cand| {
+        match std::fs::metadata(cand) {
+            Ok(meta) => host_exec_verdict(meta.uid(), meta.mode(), euid).err(),
+            // Gone between the listing and the `stat`: not a refusal to report, just a candidate
+            // that is no longer one.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Some(String::new()),
+            // Anything else is a fact about this candidate worth saying. `EACCES` here means a
+            // `PATH` directory whose contents cannot be read — the loosely-permissioned `PATH` this
+            // function exists to notice — and `ELOOP` a symlink cycle where a program should be.
+            // Swallowing those would skip in the one case the skip is the interesting event.
+            Err(e) => Some(format!("cannot be read: {e}")),
+        }
+    })
+}
+
+/// The scan [`find_trusted_on_path`] performs, with the per-candidate verdict injected.
+///
+/// Split for the reason `pick_engine_bin` is: the ordering rule — take the first candidate that
+/// passes, name and skip the ones that do not — is the part worth a test, and it can be exercised
+/// on a list rather than on the process `PATH`, which a test would have to mutate under the shared
+/// `env_lock` and which another thread's spawn reads at the same time.
+///
+/// `verdict` returns `Some(why)` to reject. An empty `why` rejects silently: a candidate that
+/// vanished between the listing and the check was never refused, it just stopped existing.
+fn first_trusted(
+    name: &str,
+    candidates: Vec<std::path::PathBuf>,
+    verdict: &dyn Fn(&Path) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    for cand in candidates {
+        match verdict(&cand) {
+            None => return Some(cand),
+            Some(why) if why.is_empty() => {}
+            Some(why) => {
+                crate::diag::warn(&format!("ignoring {} for `{name}` ({why})", cand.display()));
+            }
+        }
+    }
+    None
+}
+
 /// Probe a candidate engine path: absent, present-but-untrusted, or trusted. Metadata is read
 /// through the path — following a symlink, since that is what `execve` runs (e.g. the
 /// `nix-store -> nix` multi-call link). A present-but-untrusted binary at a resolved tier is
@@ -617,8 +683,13 @@ fn pick_bwrap(
 /// Locate the `git` binary that fetches a remote plugin store. Resolved from `PATH`;
 /// needed only by `sbx plugins store` (a remote store is a git repository), not by a
 /// launch — so its absence is a feature gap, never a boundary failure.
+///
+/// Trusted rather than merely found ([`find_trusted_on_path`]): this binary is handed a remote URL
+/// and writes the tree the plugin loader then reads, so an untrusted early match is named and
+/// skipped in favour of a later sound one. `None` keeps the meaning its caller already handles —
+/// no remote store can be fetched — and `sbx doctor` names the same three causes.
 pub(crate) fn resolve_git() -> Option<PathBuf> {
-    crate::pathfind::find_on_path("git")
+    find_trusted_on_path("git")
 }
 
 #[cfg(test)]
@@ -876,6 +947,82 @@ mod tests {
         assert_eq!(
             pick_engine_bin("nix", None, None, &all_untrusted, &two),
             Err(EngineMiss::NotFound)
+        );
+    }
+
+    /// A `stat` that fails for a reason other than absence is named, not swallowed.
+    ///
+    /// Split from the ordering test because it asks a different question: not *which* candidate
+    /// wins, but whether a candidate that could not be read at all reaches stderr. The two failures
+    /// differ only in the reason string, so the result alone cannot tell them apart.
+    #[test]
+    fn a_candidate_that_cannot_be_read_carries_a_reason_and_a_missing_one_does_not() {
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let unreadable = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let reason = |e: &std::io::Error| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                String::new()
+            } else {
+                format!("cannot be read: {e}")
+            }
+        };
+        assert!(
+            reason(&gone).is_empty(),
+            "a candidate that is simply absent was never refused, so it stays off stderr"
+        );
+        assert!(
+            !reason(&unreadable).is_empty(),
+            "an unreadable candidate is the loosely-permissioned `PATH` this scan exists to \
+             notice; skipping it in silence is the one case where silence is wrong"
+        );
+    }
+
+    /// The trusted `PATH` scan takes the first candidate that passes and skips the rest.
+    ///
+    /// The same ordering `pick_engine_bin` applies to an engine, on the host tools that had only
+    /// the absolute-entry half of the rule: a world-writable early match must not shadow a sound
+    /// later one, and a list with nothing sound must resolve to nothing rather than to its first
+    /// entry. The verdict is injected, so the process `PATH` is never touched.
+    #[test]
+    fn the_trusted_path_scan_skips_an_untrusted_match_for_a_later_sound_one() {
+        let early = PathBuf::from("/early/nft");
+        let late = PathBuf::from("/late/nft");
+        let two = vec![early.clone(), late.clone()];
+
+        let early_bad = |p: &Path| (p == early).then(|| "world-writable".to_string());
+        assert_eq!(
+            first_trusted("nft", two.clone(), &early_bad),
+            Some(late.clone()),
+            "a poisoned early entry must not shadow a sound later one"
+        );
+
+        let all_bad = |_: &Path| Some("world-writable".to_string());
+        assert_eq!(
+            first_trusted("nft", two.clone(), &all_bad),
+            None,
+            "every candidate refused must resolve to nothing, not to the first"
+        );
+
+        let all_good = |_: &Path| None;
+        assert_eq!(
+            first_trusted("nft", two.clone(), &all_good),
+            Some(early.clone()),
+            "with nothing to skip, the first candidate wins"
+        );
+
+        // The third arm: a candidate that vanished between the listing and the check is skipped in
+        // silence, because it was never refused. Without the empty-`why` guard this still resolves
+        // to `late` and the only difference is a stray `ignoring … ()` on stderr, so the assertion
+        // that discriminates is the one on the reason, not on the result.
+        let early_gone = |p: &Path| (p == early).then(String::new);
+        assert_eq!(
+            first_trusted("nft", two, &early_gone),
+            Some(late),
+            "a candidate that disappeared is skipped like any other"
+        );
+        assert!(
+            early_gone(&early).is_some_and(|why| why.is_empty()),
+            "a vanished candidate carries no reason, which is what keeps it off stderr"
         );
     }
 

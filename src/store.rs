@@ -43,8 +43,9 @@ pub(crate) use channel::{
 #[cfg(test)]
 pub(crate) use engine::embedded_proc_shim;
 pub(crate) use engine::{
-    EngineMiss, ensure_proc_shim, host_exec_verdict, resolve_bwrap, resolve_git, resolve_nix,
-    resolve_nix_store, try_resolve_bwrap, try_resolve_nix, try_resolve_nix_store,
+    EngineMiss, ensure_proc_shim, find_trusted_on_path, host_exec_verdict, resolve_bwrap,
+    resolve_git, resolve_nix, resolve_nix_store, try_resolve_bwrap, try_resolve_nix,
+    try_resolve_nix_store,
 };
 pub(crate) use layout::{
     BROKER_NAME_MAX, Layout, data_dir_overridden, data_dir_refused, ensure, physical_path,
