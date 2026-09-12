@@ -156,6 +156,18 @@ sees that row; what it bounds is an agent walking through thousands of destinati
 since the destination is chosen inside the sandbox and a refused request is counted like
 any other.
 
+One line under the table counts something that is **not** a decision: how many names the
+sandbox resolved through the [transparent capture
+tap](../configuration/network#clients-that-ignore-the-proxy-variables). `--json` carries
+it under a `resolutions` key, which is `null` when the tap answered
+nothing. A resolution gets no host row and enters none of the three columns, because the
+tap answers every name without consulting the policy; reading one as a permission would
+be wrong in exactly the case that matters, a name resolved and never called. It is
+counted here all the same because `sbx net logs` is a bounded ring: a sandbox that asks
+for enough names carries its own earlier entries off the end of that log, and this
+number is what is left to say it happened. Which names they were is the log's to tell,
+for as long as it still holds them.
+
 ---
 
 ## `sbx net logs`

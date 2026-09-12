@@ -6803,11 +6803,14 @@ fn a_session_injected_allow_makes_a_request_proceed_without_parking() {
         std::thread::spawn(move || {
             let _ = control::serve(
                 listener,
-                pending,
-                served_manual,
-                log,
-                flows,
-                None,
+                control::Planes {
+                    state: pending,
+                    manual: served_manual,
+                    log,
+                    flows,
+                    capture: None,
+                    stats: None,
+                },
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             );
         });

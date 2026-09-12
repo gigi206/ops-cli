@@ -100,6 +100,9 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
                 "blocked": tally.overflow.blocked,
             })
         });
+        // Present on the same terms as the fold above: absent when the tap answered nothing, so a
+        // session that never ran one renders the shape it always rendered.
+        let resolutions = (tally.resolutions > 0).then_some(tally.resolutions);
         println!(
             "{}",
             serde_json::json!({
@@ -107,6 +110,7 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
                 "app": app,
                 "stats": rows,
                 "overflow": overflow,
+                "resolutions": resolutions,
             })
         );
         return ExitCode::SUCCESS;
@@ -185,6 +189,16 @@ fn render_stats(
             o,
             "  {dim}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}",
             FOLD_LABEL, folded.allow, folded.deny, folded.blocked
+        );
+    }
+    // Below the table rather than a column in it: a resolution is not a decision, so it belongs in
+    // none of the three the rows add up. Shown only when the tap answered something, so a session
+    // that ran none prints what it printed before this line existed.
+    if tally.resolutions > 0 {
+        let _ = writeln!(
+            o,
+            "  {dim}names the cage resolved through the capture tap:{r} {}",
+            tally.resolutions
         );
     }
     o
@@ -270,6 +284,7 @@ mod tests {
                 deny: 44,
                 blocked: 2,
             },
+            resolutions: 0,
         };
         let out = render_stats("/home/u/proj", None, &tally, &p);
         let folded = out
@@ -317,6 +332,7 @@ mod tests {
                 deny: 44,
                 blocked: 2,
             },
+            resolutions: 0,
         };
         let out = render_stats("/home/u/proj", None, &tally, &p);
         let row = |needle: &str| -> String {

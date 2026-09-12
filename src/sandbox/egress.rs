@@ -959,15 +959,19 @@ pub(crate) fn start(
         let control_listener = UnixListener::bind(&control_uds)?;
         let control_log = log.clone();
         let control_capture = capture;
+        let control_stats = stats.clone();
         let control_stop = stop.clone();
         std::thread::spawn(move || {
             let _ = super::control::serve(
                 control_listener,
-                pending,
-                manual,
-                control_log,
-                flows,
-                control_capture,
+                super::control::Planes {
+                    state: pending,
+                    manual,
+                    log: control_log,
+                    flows,
+                    capture: control_capture,
+                    stats: control_stats,
+                },
                 control_stop,
             );
         });

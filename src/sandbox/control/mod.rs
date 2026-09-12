@@ -358,9 +358,16 @@ pub(crate) const LOG_RING_CAP: usize = 1000;
 /// a request the policy permitted but that could not complete (DNS failed, the host was unreachable,
 /// its certificate was rejected). Keeping `error` distinct from `blocked` (a *refusal*) is the point:
 /// "allowed but it failed" reads differently from "we said no", which is the question the log exists
-/// to answer. It also carries `resolved`, which is outside that taxonomy for a second reason:
-/// `sbx net stats` counts the proxy's decisions and is fed by the proxy alone, and a name the
-/// capture tap answered is not a decision.
+/// to answer. It also carries `resolved`, which is outside that taxonomy for a second reason: a name
+/// the capture tap answered is not a decision, so it belongs in none of the three columns
+/// `sbx net stats` adds up, and those stay the proxy's alone.
+///
+/// The durable register does carry one fact about a resolution all the same — how many there were
+/// (`resolutions` in [`super::egress_stats::Tally`]) — because this ring is bounded and a name is
+/// the one thing a cage can push through it without the proxy deciding anything. A flood of names
+/// can therefore carry a decision off the end of the live log; the count is what is left to say it
+/// happened. It is a number, never a list: naming them is this log's job, for as long as it holds
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogVerdict {
     /// The request was permitted and egressed.
@@ -1291,16 +1298,34 @@ impl FlowRegistry {
     }
 }
 
+/// Everything a control command is served against, shared in from the proxy that holds them.
+///
+/// One value rather than a parameter each, because they travel as a set: `serve` clones the whole
+/// set onto every connection's thread, and the dispatcher reaches for a different member per verb.
+/// The two `Option`s are the planes a launch may not have configured, and a verb that writes to one
+/// must keep answering when it is absent — a tap does not stop reporting because no register was
+/// asked for.
+pub(crate) struct Planes {
+    /// The `ask` queue a decision is parked in.
+    pub(crate) state: Arc<PendingState>,
+    /// The live rule overlay `REMEMBER` writes to.
+    pub(crate) manual: Arc<ManualRules>,
+    /// The bounded event ring `sbx net logs` reads.
+    pub(crate) log: Arc<LogRing>,
+    /// The open-tunnel registry `sbx net live` reads.
+    pub(crate) flows: Arc<FlowRegistry>,
+    /// The head/body ring, when `[network] capture` asked for one.
+    pub(crate) capture: Option<Arc<CaptureRing>>,
+    /// The durable counters, when the launch keeps them.
+    pub(crate) stats: Option<Arc<super::egress_stats::EgressStats>>,
+}
+
 /// Serve the control socket: one short-lived thread per connection, each handling exactly one
 /// command. A per-connection error is that connection's problem, never the server's. The pending
 /// queue, the manual-rule overlay, and the event log are shared in (the same ones the proxy holds).
 pub(crate) fn serve(
     listener: UnixListener,
-    state: Arc<PendingState>,
-    manual: Arc<ManualRules>,
-    log: Arc<LogRing>,
-    flows: Arc<FlowRegistry>,
-    capture: Option<Arc<CaptureRing>>,
+    planes: Planes,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     for stream in listener.incoming() {
@@ -1327,13 +1352,22 @@ pub(crate) fn serve(
                 continue;
             }
         };
-        let state = state.clone();
-        let manual = manual.clone();
-        let log = log.clone();
-        let flows = flows.clone();
-        let capture = capture.clone();
+        let state = planes.state.clone();
+        let manual = planes.manual.clone();
+        let log = planes.log.clone();
+        let flows = planes.flows.clone();
+        let capture = planes.capture.clone();
+        let stats = planes.stats.clone();
         super::conncap::spawn_conn("egress control", move || {
-            let _ = handle(stream, &state, &manual, &log, &flows, capture.as_deref());
+            let _ = handle(
+                stream,
+                &state,
+                &manual,
+                &log,
+                &flows,
+                capture.as_deref(),
+                stats.as_deref(),
+            );
         });
     }
     Ok(())
@@ -1367,6 +1401,7 @@ fn handle(
     log: &LogRing,
     flows: &FlowRegistry,
     capture: Option<&CaptureRing>,
+    stats: Option<&super::egress_stats::EgressStats>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -1380,7 +1415,7 @@ fn handle(
     // ([`client`]), where a partial host would be persisted by `--save`.
     let response = match n as u64 >= CMD_MAX && !line.ends_with('\n') {
         true => "err bad-request\n".to_string(),
-        false => dispatch(line.trim(), state, manual, log, flows, capture),
+        false => dispatch(line.trim(), state, manual, log, flows, capture, stats),
     };
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
@@ -1413,6 +1448,7 @@ fn dispatch(
     log: &LogRing,
     flows: &FlowRegistry,
     capture: Option<&CaptureRing>,
+    stats: Option<&super::egress_stats::EgressStats>,
 ) -> String {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
@@ -1556,6 +1592,12 @@ fn dispatch(
                 RpcKind::None,
                 Plane::Agent,
             );
+            // Counted as well as logged. The ring above is bounded, so a cage that asks for enough
+            // names carries its own earlier entries off the end of it; this is the one number that
+            // survives that, and it is why the durable register hears from the tap at all.
+            if let Some(stats) = stats {
+                stats.record_resolution();
+            }
             "ok\n".to_string()
         }
         Some("BYPASSED") => {
@@ -2016,7 +2058,15 @@ mod tests {
         let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
         let seq = wait_for_one(&state);
         assert_eq!(
-            dispatch(&format!("ALLOW {seq}"), &state, &manual, &log, &flows, None),
+            dispatch(
+                &format!("ALLOW {seq}"),
+                &state,
+                &manual,
+                &log,
+                &flows,
+                None,
+                None
+            ),
             "ok host=api.test count=1\n"
         );
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
@@ -2036,12 +2086,13 @@ mod tests {
             &log,
             &flows,
             None,
+            None,
         );
         parked.join().unwrap();
         assert_eq!(manual.snapshot().0.len(), 1, "`… session` must remember");
         // And `RULES` reports the remembered rule with its exact port.
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows, None)
+            dispatch("RULES", &state, &manual, &log, &flows, None, None)
                 .contains("manual allow https://api.test:8080"),
             "RULES must list the remembered host:port"
         );
@@ -2067,12 +2118,13 @@ mod tests {
                 &manual,
                 &log,
                 &flows,
+                None,
                 None
             ),
             "ok\n"
         );
 
-        let out = dispatch("LOG", &state, &manual, &log, &flows, None);
+        let out = dispatch("LOG", &state, &manual, &log, &flows, None, None);
         let line = out
             .lines()
             .find(|l| l.starts_with("event "))
@@ -2089,6 +2141,65 @@ mod tests {
         // this one cannot be, so the reader is owed a different word for a different remedy.
         assert_eq!(fields.get("reason"), Some(&"dns-bypassed"), "{line}");
         assert_eq!(fields.get("proto"), Some(&"tcp"), "{line}");
+    }
+
+    /// The live log this `RESOLVED` lands in is bounded, so a cage that asks for enough names
+    /// carries its own earlier entries off the end of it. The durable count is what survives that,
+    /// which is why the verb reaches the stats register at all — and why it must keep working when
+    /// there is no register to reach (stats are a configurable field, and a launch without one is
+    /// not a launch that stops answering the tap).
+    #[test]
+    fn a_reported_resolution_reaches_the_durable_count_and_is_a_no_op_without_one() {
+        use crate::sandbox::egress_stats::EgressStats;
+        use crate::testutil::TmpDir;
+        let state = PendingState::new();
+        let manual = ManualRules::new();
+        let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
+
+        // No register: the verb still answers, and nothing panics on the way.
+        assert_eq!(
+            dispatch(
+                "RESOLVED unregistered.test",
+                &state,
+                &manual,
+                &log,
+                &flows,
+                None,
+                None
+            ),
+            "ok\n"
+        );
+
+        let dir = TmpDir::new();
+        let path = dir.path().join("stats-1-11");
+        let stats = EgressStats::new(path.clone(), "/home/u/proj".into(), None);
+        for host in ["a.test", "b.test"] {
+            assert_eq!(
+                dispatch(
+                    &format!("RESOLVED {host}"),
+                    &state,
+                    &manual,
+                    &log,
+                    &flows,
+                    None,
+                    Some(&stats)
+                ),
+                "ok\n"
+            );
+        }
+        stats.flush_final();
+
+        let body = std::fs::read_to_string(&path).expect("the register was written");
+        assert!(
+            body.contains("resolutions=2"),
+            "both resolutions counted: {body:?}"
+        );
+        // Counted, never listed: naming them is the live log's job, for as long as it holds them.
+        assert!(
+            !body.contains("a.test"),
+            "no row for a resolved name: {body:?}"
+        );
     }
 
     /// Held to a type, not merely sanitised. The two tap verbs are the only ones whose argument
@@ -2114,13 +2225,13 @@ mod tests {
             "BYPASSED ::1 443",
         ] {
             assert_eq!(
-                dispatch(bad, &state, &manual, &log, &flows, None),
+                dispatch(bad, &state, &manual, &log, &flows, None, None),
                 "err bad-request\n",
                 "`{bad}` must be refused"
             );
         }
         assert!(
-            !dispatch("LOG", &state, &manual, &log, &flows, None).contains("event "),
+            !dispatch("LOG", &state, &manual, &log, &flows, None, None).contains("event "),
             "a refused report must leave no row"
         );
     }
@@ -2142,23 +2253,32 @@ mod tests {
                 &manual,
                 &log,
                 &flows,
+                None,
                 None
             ),
             "ok\n"
         );
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows, None)
+            dispatch("RULES", &state, &manual, &log, &flows, None, None)
                 .contains("manual allow https://*.foo.test"),
             "REMEMBER must load the rule"
         );
 
         // A malformed rule (a `*` catch-all) and a missing kind/rule are `err bad-request`.
         assert_eq!(
-            dispatch("REMEMBER ALLOW *", &state, &manual, &log, &flows, None),
+            dispatch(
+                "REMEMBER ALLOW *",
+                &state,
+                &manual,
+                &log,
+                &flows,
+                None,
+                None
+            ),
             "err bad-request\n"
         );
         assert_eq!(
-            dispatch("REMEMBER ALLOW", &state, &manual, &log, &flows, None),
+            dispatch("REMEMBER ALLOW", &state, &manual, &log, &flows, None, None),
             "err bad-request\n"
         );
 
@@ -2171,6 +2291,7 @@ mod tests {
                 &manual,
                 &log,
                 &flows,
+                None,
                 None
             ),
             "ok\n"
@@ -2195,7 +2316,7 @@ mod tests {
         // …and `RULES` reports it as a `manual mute` line, so `sbx net rules --source session` lists
         // a live mute (distinct from the allow/deny lines).
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows, None)
+            dispatch("RULES", &state, &manual, &log, &flows, None, None)
                 .contains("manual mute https://play.googleapis.com"),
             "RULES must list a live mute"
         );
@@ -2340,7 +2461,7 @@ mod tests {
         g.up.fetch_add(100, Ordering::Relaxed);
         g.down.fetch_add(200, Ordering::Relaxed);
 
-        let resp = dispatch("FLOWS", &state, &manual, &log, &flows, None);
+        let resp = dispatch("FLOWS", &state, &manual, &log, &flows, None, None);
         assert!(resp.ends_with("ok\n"), "the reply ends with ok: {resp:?}");
         let parsed: Vec<FlowSnapshot> = resp.lines().filter_map(parse_flow_line).collect();
         assert_eq!(parsed.len(), 1, "one open flow is listed");
@@ -2353,7 +2474,7 @@ mod tests {
         // An empty registry lists no flow, just `ok`.
         drop(g);
         assert_eq!(
-            dispatch("FLOWS", &state, &manual, &log, &flows, None),
+            dispatch("FLOWS", &state, &manual, &log, &flows, None, None),
             "ok\n"
         );
     }
@@ -2379,11 +2500,14 @@ mod tests {
         thread::spawn(move || {
             let _ = serve(
                 listener,
-                Arc::new(PendingState::new()),
-                served_manual,
-                Arc::new(LogRing::new(LOG_RING_CAP)),
-                Arc::new(FlowRegistry::new()),
-                None,
+                Planes {
+                    state: Arc::new(PendingState::new()),
+                    manual: served_manual,
+                    log: Arc::new(LogRing::new(LOG_RING_CAP)),
+                    flows: Arc::new(FlowRegistry::new()),
+                    capture: None,
+                    stats: None,
+                },
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             );
         });
@@ -2423,11 +2547,14 @@ mod tests {
         thread::spawn(move || {
             let _ = serve(
                 listener,
-                pending,
-                served_manual,
-                log,
-                flows,
-                None,
+                Planes {
+                    state: pending,
+                    manual: served_manual,
+                    log,
+                    flows,
+                    capture: None,
+                    stats: None,
+                },
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             );
         });
@@ -2468,11 +2595,14 @@ mod tests {
             thread::spawn(move || {
                 let _ = serve(
                     listener,
-                    pending,
-                    manual,
-                    log,
-                    flows,
-                    None,
+                    Planes {
+                        state: pending,
+                        manual,
+                        log,
+                        flows,
+                        capture: None,
+                        stats: None,
+                    },
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );
             });
@@ -2645,7 +2775,7 @@ mod tests {
             )
         });
         wait_for_one(&state);
-        let response = dispatch("LIST", &state, &manual, &log, &flows, None);
+        let response = dispatch("LIST", &state, &manual, &log, &flows, None, None);
         let line = response.lines().next().expect("the pending line");
 
         // The reader's own contract, applied here so the assertion is the parse and not a guess at
@@ -2719,7 +2849,7 @@ mod tests {
         // response lines come back in a deterministic oldest-first order.
         let _ = park_next(&state, "x.test", 8080, 0);
         let _ = park_next(&state, "y.test", 8080, 1);
-        let response = dispatch("DENY *", &state, &manual, &log, &flows, None);
+        let response = dispatch("DENY *", &state, &manual, &log, &flows, None, None);
         assert_eq!(response, "answered host=x.test\nanswered host=y.test\nok\n");
         assert!(
             manual.snapshot().1.is_empty(),
@@ -2729,13 +2859,13 @@ mod tests {
         // `ALLOW * session` drains and remembers each host:port as a manual rule.
         let _ = park_next(&state, "p.test", 8080, 0);
         let _ = park_next(&state, "q.test", 8080, 1);
-        let _ = dispatch("ALLOW * session", &state, &manual, &log, &flows, None);
+        let _ = dispatch("ALLOW * session", &state, &manual, &log, &flows, None, None);
         let (allow, _) = manual.snapshot();
         assert_eq!(allow.len(), 2, "`* session` remembers each answered host");
 
         // An empty queue replies a clean `ok` with no `answered` lines.
         assert_eq!(
-            dispatch("ALLOW *", &state, &manual, &log, &flows, None),
+            dispatch("ALLOW *", &state, &manual, &log, &flows, None, None),
             "ok\n"
         );
     }
@@ -2762,11 +2892,14 @@ mod tests {
             thread::spawn(move || {
                 let _ = serve(
                     listener,
-                    pending,
-                    manual,
-                    log,
-                    flows,
-                    None,
+                    Planes {
+                        state: pending,
+                        manual,
+                        log,
+                        flows,
+                        capture: None,
+                        stats: None,
+                    },
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );
             });
@@ -3230,11 +3363,14 @@ mod tests {
             thread::spawn(move || {
                 let _ = serve(
                     listener,
-                    pending,
-                    manual,
-                    log,
-                    flows,
-                    None,
+                    Planes {
+                        state: pending,
+                        manual,
+                        log,
+                        flows,
+                        capture: None,
+                        stats: None,
+                    },
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );
             });

@@ -126,13 +126,21 @@ pub(crate) struct Tally {
     /// `sbx net stats` adds up is still every request the proxy decided; *which* hosts they were is
     /// deliberately not remembered, since remembering is what the cap exists to stop.
     pub(crate) overflow: Counts,
+    /// How many names the capture tap answered for this session.
+    ///
+    /// One number and not a row per name, deliberately: a name the cage asks for is a name the cage
+    /// chose, so rows would let it spend the [`MAX_HOSTS`] budget on its own resolutions and leave
+    /// none for the destinations the proxy actually decided about. The count answers what the
+    /// register is for — whether this session resolved more names than its bounded live log can
+    /// still be holding — and naming them is the live log's job, for as long as it has them.
+    pub(crate) resolutions: u64,
 }
 
 /// The line prefixes the session-file format reserves for its own lines: the two identity headers
 /// and the folded-counter line. [`parse`] recognises a line by these, so a destination whose name
 /// begins with one would write a row that reads back as that line instead of as a counter row —
 /// see [`Tally::bump`], which is where a name that could spell one is refused a row.
-const RESERVED_PREFIXES: [&str; 3] = ["project=", "app=", "overflow="];
+const RESERVED_PREFIXES: [&str; 4] = ["project=", "app=", "overflow=", "resolutions="];
 
 impl Tally {
     /// Count one request for `host`, giving it a row while there is room and folding it into
@@ -176,12 +184,13 @@ impl Tally {
             }
         }
         self.overflow.add(&other.overflow);
+        self.resolutions += other.resolutions;
     }
 
     /// Whether nothing has been recorded at all — the "nothing recorded yet" case, which the
     /// overflow has to be part of or a tally holding only folded counts would read as empty.
     pub(crate) fn is_empty(&self) -> bool {
-        self.hosts.is_empty() && self.overflow.total() == 0
+        self.hosts.is_empty() && self.overflow.total() == 0 && self.resolutions == 0
     }
 }
 
@@ -256,15 +265,28 @@ impl EgressStats {
         }
     }
 
-    /// Record one request's outcome for `host` and flush the session file. The flush is best-effort:
-    /// a write error must never break egress, so it is dropped (the next decision rewrites the file
-    /// anyway). The snapshot is taken under the lock and written outside it, so a burst of
-    /// concurrent decisions does not serialise on file I/O; the counters are monotonic, so a lost
-    /// flush race is at most an off-by-a-few that the next decision corrects.
+    /// Record one request's outcome for `host` and flush the session file.
     pub(crate) fn record(&self, host: &str, kind: StatKind) {
+        self.mutate(|tally| tally.bump(host, kind));
+    }
+
+    /// Record one name the capture tap answered. No host and no [`StatKind`]: a resolution is not a
+    /// decision and gets no row, so it shares [`Self::record`]'s debounce and flush but not its
+    /// taxonomy.
+    pub(crate) fn record_resolution(&self) {
+        self.mutate(|tally| tally.resolutions += 1);
+    }
+
+    /// Apply `change` to the tally and flush the session file — the terms both recorders share.
+    ///
+    /// The flush is best-effort: a write error must never break egress, so it is dropped (the next
+    /// record rewrites the file anyway). The snapshot is taken under the lock and written outside
+    /// it, so a burst of concurrent records does not serialise on file I/O; the counters are
+    /// monotonic, so a lost flush race is at most an off-by-a-few that the next record corrects.
+    fn mutate(&self, change: impl FnOnce(&mut Tally)) {
         let snapshot = {
             let mut tally = locked(&self.inner);
-            tally.bump(host, kind);
+            change(&mut tally);
             if !self.due_to_write() {
                 self.pending.store(true, Ordering::Relaxed);
                 return;
@@ -369,6 +391,11 @@ fn serialize(project: &str, app: Option<&str>, tally: &Tally) -> String {
             o.allow, o.deny, o.blocked
         ));
     }
+    // Written on the same terms as the fold, and for the same reason: a session whose tap answered
+    // nothing writes the file it wrote before this line existed.
+    if tally.resolutions > 0 {
+        out.push_str(&format!("resolutions={}\n", tally.resolutions));
+    }
     out
 }
 
@@ -413,9 +440,22 @@ fn parse(contents: &str) -> Option<SessionStats> {
                 deny,
                 blocked,
             });
+        } else if let Some(rest) = line.strip_prefix("resolutions=") {
+            // One number, and a malformed one skipped rather than fatal — the rule every other line
+            // of this format follows. A destination that could spell this prefix is refused a row by
+            // [`Tally::bump`], so a line here is either the tap's count or damage.
+            let Ok(n) = rest.parse::<u64>() else {
+                continue;
+            };
+            tally.resolutions += n;
         } else {
             let mut f = line.split('\t');
-            let (Some(host), Some(a), Some(d), Some(b)) = (f.next(), f.next(), f.next(), f.next())
+            // The trailing `None` holds this branch to the same shape as `overflow=` above: four
+            // fields exactly. Without it a row carrying a fifth was accepted and the field silently
+            // dropped, so a file the writer could never produce read back as counters rather than as
+            // the damage it is.
+            let (Some(host), Some(a), Some(d), Some(b), None) =
+                (f.next(), f.next(), f.next(), f.next(), f.next())
             else {
                 continue;
             };
@@ -1504,6 +1544,114 @@ mod tests {
         only_folded.overflow.bump(StatKind::Deny);
         assert!(!only_folded.is_empty());
         assert!(Tally::default().is_empty());
+    }
+
+    /// The tap's count travels the format on the same terms as the fold: written only when there is
+    /// one, read back on its own line, and a malformed one skipped rather than fatal. The first
+    /// assertion is the compatibility one — a session whose tap answered nothing writes the bytes it
+    /// wrote before this line existed.
+    #[test]
+    fn the_resolution_count_round_trips_and_only_appears_when_the_tap_answered() {
+        let plain = Tally {
+            hosts: [(
+                "a.test".to_string(),
+                Counts {
+                    allow: 5,
+                    deny: 1,
+                    blocked: 0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Tally::default()
+        };
+        let body = serialize("/p", None, &plain);
+        assert_eq!(body, "project=/p\na.test\t5\t1\t0\n");
+
+        let resolved = Tally {
+            resolutions: 1500,
+            ..plain.clone()
+        };
+        let body = serialize("/p", None, &resolved);
+        assert_eq!(body, "project=/p\na.test\t5\t1\t0\nresolutions=1500\n");
+        assert_eq!(parse(&body).unwrap().tally, resolved);
+
+        let parsed = parse("project=/p\na.test\t5\t1\t0\nresolutions=abc\n").unwrap();
+        assert_eq!(parsed.tally, plain);
+    }
+
+    /// A session that resolved names and reached nothing is not "nothing recorded yet" — that is
+    /// exactly the session the count exists to describe, since a flood of names is what carries the
+    /// live log's earlier entries off its end.
+    #[test]
+    fn a_tally_holding_only_resolutions_is_not_empty() {
+        let only_resolved = Tally {
+            resolutions: 1,
+            ..Tally::default()
+        };
+        assert!(!only_resolved.is_empty());
+    }
+
+    /// Folding sessions into a rollup has to carry the count, or a flood spread over several
+    /// sessions would add up to nothing.
+    #[test]
+    fn merging_sums_the_resolution_counts() {
+        let mut a = Tally {
+            resolutions: 7,
+            ..Tally::default()
+        };
+        a.merge(&Tally {
+            resolutions: 11,
+            ..Tally::default()
+        });
+        assert_eq!(a.resolutions, 18);
+    }
+
+    /// `resolutions=` is a line prefix like the three before it, so a destination that spells one is
+    /// refused a row and folded — otherwise a cage could write a count of its own choosing into the
+    /// one number that says how many names it asked for.
+    #[test]
+    fn a_destination_named_like_the_resolution_line_is_refused_a_row() {
+        let mut tally = Tally::default();
+        tally.bump("resolutions=999999", StatKind::Deny);
+        assert!(tally.hosts.is_empty(), "{:?}", tally.hosts);
+        assert_eq!(tally.overflow.deny, 1);
+        assert_eq!(tally.resolutions, 0);
+    }
+
+    /// A counter row carries four fields exactly. One with a fifth is damage the writer cannot
+    /// produce, and reading it as a row would have silently dropped whatever the extra field said.
+    #[test]
+    fn a_counter_row_with_a_fifth_field_is_skipped_rather_than_half_read() {
+        let parsed = parse("project=/p\nok.test\t1\t0\t0\na.test\t5\t1\t0\t9\n").unwrap();
+        assert_eq!(
+            parsed.tally.hosts.keys().collect::<Vec<_>>(),
+            vec!["ok.test"],
+            "{:?}",
+            parsed.tally.hosts
+        );
+    }
+
+    /// The recorder the capture tap reaches: it adds to the count, gives no host a row, and reaches
+    /// the session file like any decision does.
+    #[test]
+    fn recording_a_resolution_counts_it_and_creates_no_row() {
+        let dir = TmpDir::new();
+        let path = dir.path().join("stats-1-11");
+        let stats = EgressStats::new(path.clone(), "/home/u/proj".into(), None);
+        stats.record("api.example.com", StatKind::Allow);
+        stats.record_resolution();
+        stats.record_resolution();
+        stats.flush_final();
+
+        let parsed = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.tally.resolutions, 2);
+        assert_eq!(
+            parsed.tally.hosts.keys().collect::<Vec<_>>(),
+            vec!["api.example.com"],
+            "a resolution gets no row of its own: {:?}",
+            parsed.tally.hosts
+        );
     }
 
     #[test]
