@@ -21,6 +21,10 @@
 # GPU is not asserted either, and that one is not a gap to be closed: `vz` provides no GPU to the
 # guest at all, and the scope this template commits to is CLI plus GUI.
 #
+# THIS IS THE REPOSITORY'S FIRST SELF-HOSTED RUNNER. Every other workflow here runs on labels
+# GitHub hosts, so this is the only one whose result depends on a machine someone maintains, and
+# the only one that reports nothing until such a machine is attached.
+#
 # WHY THE FIRST JOB EXISTS. `runs-on: [self-hosted, macOS]` matches nothing until someone registers
 # a runner, and GitHub leaves a job whose labels nothing answers queued rather than failing it, for
 # far longer than a CI signal is useful. A workflow that hangs instead of reporting is the silent
