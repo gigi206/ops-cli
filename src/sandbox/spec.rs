@@ -50,8 +50,8 @@ impl Mount {
     /// The in-cage destination this mount occupies; every variant has exactly one.
     ///
     /// Read by the distribution-userland filter, which drops the synthetic FHS an image supplies
-    /// itself, and by the test that pins the structural-mount destination list against what
-    /// `assemble` emits.
+    /// itself, by the task engine building a task cage's mounts, and by the test that pins the
+    /// structural-mount destination list against what `assemble` emits.
     pub(crate) fn dest(&self) -> &std::path::Path {
         match self {
             Mount::RoBind { dest, .. }

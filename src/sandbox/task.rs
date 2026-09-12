@@ -2238,10 +2238,10 @@ fn read_capped(pipe: &mut impl Read, cap: usize, margin: usize) -> io::Result<(V
 fn task_mounts(cage: &[Mount], shared_store_nix: &Path) -> Vec<Mount> {
     let mut out: Vec<Mount> = super::binds::substrate(cage)
         .into_iter()
-        .filter(|m| mount_dest(m) != Path::new("/tmp"))
+        .filter(|m| m.dest() != Path::new("/tmp"))
         .collect();
     for mount in cage {
-        let dest = mount_dest(mount);
+        let dest = mount.dest();
         if !KEPT_DESTS.contains(&dest.to_string_lossy().as_ref()) {
             continue;
         }
@@ -2262,21 +2262,6 @@ fn task_mounts(cage: &[Mount], shared_store_nix: &Path) -> Vec<Mount> {
         });
     }
     out
-}
-
-/// The in-cage destination of a mount. (The spec's own accessor is test-only, so the engine keeps
-/// its own read-only view of the same mapping.)
-fn mount_dest(mount: &Mount) -> &Path {
-    match mount {
-        Mount::RoBind { dest, .. }
-        | Mount::RoBindTry { dest, .. }
-        | Mount::Bind { dest, .. }
-        | Mount::Symlink { dest, .. }
-        | Mount::Proc { dest }
-        | Mount::Dev { dest }
-        | Mount::DevBind { dest, .. }
-        | Mount::Tmpfs { dest } => dest,
-    }
 }
 
 /// The environment a task cage starts from: the agent cage's, filtered through [`KEPT_ENV`].

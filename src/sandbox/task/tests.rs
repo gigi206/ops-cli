@@ -471,7 +471,7 @@ fn the_task_cage_keeps_the_skeleton_and_drops_every_channel() {
     let out = task_mounts(&agent, Path::new("/data/shared/store/nix"));
     assert!(
         !out.iter().any(|m| {
-            let d = mount_dest(m);
+            let d = m.dest();
             d == Path::new(super::super::task_control::CAGE_TASK_UDS)
                 || d == Path::new(super::super::task_control::TASK_SHIM_INCAGE)
         }),
@@ -558,8 +558,7 @@ fn a_task_cage_keeps_the_substrate_the_launch_declared() {
         "{out:?}"
     );
     assert!(
-        out.iter()
-            .any(|m| mount_dest(m) == Path::new("/etc/passwd")),
+        out.iter().any(|m| m.dest() == Path::new("/etc/passwd")),
         "{out:?}"
     );
 }
@@ -623,7 +622,7 @@ fn a_foreign_binarys_loader_survives_with_its_environment() {
     ];
     let kept: Vec<PathBuf> = task_mounts(&agent, Path::new("/shared/nix"))
         .iter()
-        .map(|m| mount_dest(m).to_path_buf())
+        .map(|m| m.dest().to_path_buf())
         .collect();
     assert_eq!(
         kept,
@@ -666,7 +665,7 @@ fn the_zone_the_session_resolves_is_the_zone_a_task_resolves() {
     ];
     let kept: Vec<PathBuf> = task_mounts(&agent, Path::new("/shared/nix"))
         .iter()
-        .map(|m| mount_dest(m).to_path_buf())
+        .map(|m| m.dest().to_path_buf())
         .collect();
     assert_eq!(
         kept,
@@ -1423,7 +1422,7 @@ fn a_networked_task_resolves_through_a_hosts_file_of_its_own() {
         .mounts()
         .iter()
         .enumerate()
-        .filter(|(_, m)| mount_dest(m) == Path::new("/etc/hosts"))
+        .filter(|(_, m)| m.dest() == Path::new("/etc/hosts"))
         .collect();
     assert_eq!(
         hosts_mounts.len(),
@@ -1472,7 +1471,7 @@ fn a_task_with_nothing_to_map_keeps_the_inherited_hosts_file() {
     assert_eq!(
         spec.mounts()
             .iter()
-            .filter(|m| mount_dest(m) == Path::new("/etc/hosts"))
+            .filter(|m| m.dest() == Path::new("/etc/hosts"))
             .count(),
         1,
         "no destination to map means no second hosts file: {:?}",
@@ -1604,7 +1603,7 @@ fn a_task_declaring_no_tool_gets_no_pool_mount() {
         !spec
             .mounts()
             .iter()
-            .any(|m| mount_dest(m) == Path::new(super::super::taskpool::POOL_INCAGE)),
+            .any(|m| m.dest() == Path::new(super::super::taskpool::POOL_INCAGE)),
         "a task with no declared tool must not see the pool"
     );
     assert!(engine.pool_bins(&task).is_none());
