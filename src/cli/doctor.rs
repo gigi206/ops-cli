@@ -250,7 +250,8 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
         None => rep.check(
             "warn",
             "git",
-            "not found on PATH — optional, needed only for `sbx plugins store`",
+            "not installed, not on PATH, or refused for its ownership or mode (named above) — \
+             optional, needed only for `sbx plugins store`",
         ),
     }
 

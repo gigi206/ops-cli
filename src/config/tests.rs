@@ -1147,6 +1147,7 @@ fn a_header_secret() -> HeaderSecret {
         value_type: Some("bearer".into()),
         prefix: None,
         sign: None,
+        optional: None,
     };
     validate(raw).unwrap()
 }
@@ -8250,6 +8251,7 @@ fn raw_secret(
             value_type: ty.map(String::from),
             prefix: prefix.map(String::from),
             sign: None,
+            optional: None,
         },
     )
 }
@@ -8325,6 +8327,7 @@ fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
         value_type: Some("bearer".into()),
         prefix: None,
         sign: None,
+        optional: None,
     }
 }
 
@@ -9665,6 +9668,7 @@ fn terse(key: &str) -> RawHostSecret {
         value_type: Some("bearer".into()),
         prefix: None,
         sign: None,
+        optional: None,
     }
 }
 
@@ -9681,6 +9685,7 @@ fn terse_bare(key: &str) -> RawHostSecret {
         value_type: None,
         prefix: None,
         sign: None,
+        optional: None,
     }
 }
 
@@ -10146,6 +10151,7 @@ fn secret_signed_by(name: &str) -> RawHostSecret {
         value_type: None,
         prefix: None,
         sign: Some(name.to_string()),
+        optional: None,
     }
 }
 
@@ -11011,6 +11017,7 @@ fn an_untrusted_project_secret_section_steers_nothing() {
                 value_type: Some("bearer".into()),
                 prefix: None,
                 sign: None,
+                optional: None,
             }),
         );
         hosts.insert(

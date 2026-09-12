@@ -581,8 +581,10 @@ fn app_detail_secrets(
         for s in &view.secrets {
             let _ = writeln!(
                 o,
-                "    {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
-                s.header, s.to, s.shape, s.sources
+                "    {n}{}{r} -> {n}{}{r}  {dim}({}){r}",
+                s.header,
+                s.to,
+                s.detail()
             );
         }
     }
@@ -1022,12 +1024,14 @@ fn filled_app_detail_view() -> config::view::AppDetailView {
                 to: "api.example.com".into(),
                 shape: "bearer".into(),
                 sources: "env:DEMO_TOKEN".into(),
+                optional: false,
             },
             SecretView {
                 header: "X-Api-Key".into(),
                 to: "registry.example.org".into(),
                 shape: "raw".into(),
                 sources: "file:~/.demo/key".into(),
+                optional: false,
             },
         ],
         secrets_inherited: 1,

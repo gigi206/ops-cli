@@ -281,11 +281,22 @@ fn enforceable_properties(delegated: &[String], limits: &Limits) -> Vec<String> 
 
 /// The single decision both the launch path ([`wrap`]) and the `doctor` probe
 /// ([`probe`]) consult: the `systemd-run` launcher and the enforceable unit
-/// properties when resource limits can be applied on this host, or `None` for
-/// graceful degradation. Routing both consumers through here means `doctor` can
-/// never report a posture a launch would not actually take.
-fn limiter(limits: &Limits) -> Option<(PathBuf, Vec<String>)> {
-    let systemd_run = crate::pathfind::find_on_path("systemd-run")?;
+/// properties when resource limits can be applied on this host, or the reason
+/// none can be — [`LimiterMiss`] — for graceful degradation. Routing both consumers
+/// through here means `doctor` can never report a posture a launch would not
+/// actually take, and carrying the reason means it need not search a second time
+/// to say which posture it is.
+fn limiter(limits: &Limits) -> Result<(PathBuf, Vec<String>), LimiterMiss> {
+    let Some(systemd_run) = crate::store::find_trusted_on_path("systemd-run") else {
+        // Reached only when nothing usable was found, so the ordinary launch pays for one search.
+        // The second is the unweighed one on purpose: telling "absent" from "refused" is exactly
+        // the distinction weighing removes, and it is the one `doctor` has to report.
+        return Err(if crate::pathfind::find_on_path("systemd-run").is_some() {
+            LimiterMiss::Refused
+        } else {
+            LimiterMiss::Absent
+        });
+    };
     // `systemd-run --user` needs a *reachable* user manager, not merely a named
     // runtime dir: a detached, cron, or post-logout context can inherit
     // `XDG_RUNTIME_DIR` while the session bus is gone. Require the bus socket to
@@ -293,15 +304,51 @@ fn limiter(limits: &Limits) -> Option<(PathBuf, Vec<String>)> {
     // launch on a `systemd-run` that cannot register a scope — the launch must
     // never regress where it previously worked. (A stale socket left by a crashed
     // manager is the residual: rare, and then the failure names `systemd-run`.)
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return Err(LimiterMiss::NoScope);
+    };
     if !Path::new(&runtime).join("bus").exists() {
-        return None;
+        return Err(LimiterMiss::NoScope);
     }
     let props = enforceable_properties(&delegated_controllers(), limits);
     if props.is_empty() {
-        return None;
+        return Err(LimiterMiss::NoScope);
     }
-    Some((systemd_run, props))
+    Ok((systemd_run, props))
+}
+
+/// Why [`limiter`] produced no launcher, carried back so `doctor` can say which of the three it
+/// was without searching again.
+///
+/// The report used to re-derive this: it called [`limiter`], then ran the trusted lookup a second
+/// time to choose its sentence, which printed that lookup's refusal line twice for one note. A
+/// decision that has already been made travels with its reason instead.
+enum LimiterMiss {
+    /// Nothing named `systemd-run` on `PATH`.
+    Absent,
+    /// One was found and refused for its ownership or mode. The refusal is already on stderr,
+    /// named by the lookup that made it, so the note points at it rather than restating it.
+    Refused,
+    /// A usable `systemd-run`, but no reachable session to register a transient scope with, or no
+    /// delegated controller able to carry any of the asked-for limits.
+    NoScope,
+}
+
+impl LimiterMiss {
+    /// The one line `doctor` reports for a host where no limit can be applied.
+    fn note(&self) -> &'static str {
+        match self {
+            LimiterMiss::Absent => "systemd-run not found; the cage runs without resource limits",
+            LimiterMiss::Refused => {
+                "systemd-run refused for its ownership or mode (named above); \
+                 the cage runs without resource limits"
+            }
+            LimiterMiss::NoScope => {
+                "no reachable systemd user session or delegated controller; \
+                 the cage runs without resource limits"
+            }
+        }
+    }
 }
 
 /// The `systemd-run` launcher and the argv prefix (ending with `--`) that wraps a
@@ -314,7 +361,9 @@ fn limiter(limits: &Limits) -> Option<(PathBuf, Vec<String>)> {
 /// which admits one — while the command past `--` is protected by asking the launcher not to
 /// substitute at all.
 fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsString>)> {
-    let (systemd_run, props) = limiter(limits)?;
+    let Ok((systemd_run, props)) = limiter(limits) else {
+        return None;
+    };
     let prefix = scope_prefix(&systemd_run, &props, cage_slug);
     Some((systemd_run, prefix))
 }
@@ -586,7 +635,9 @@ fn is_reclaimable(launcher_alive: bool, occupancy: Occupancy) -> bool {
 pub(crate) fn sweep_stale_scopes() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let Some(systemctl) = crate::pathfind::find_on_path("systemctl") else {
+        // An untrusted match is skipped for a later sound one. Nothing usable leaves the stale
+        // scopes in place, which is already this sweep's answer on a host without systemd.
+        let Some(systemctl) = crate::store::find_trusted_on_path("systemctl") else {
             return;
         };
         let stale: Vec<OsString> = cage_scope_dirs()
@@ -682,18 +733,17 @@ pub(crate) fn probe(limits: &Limits) -> LimitReport {
     // the live scope confirm they actually work. Passing the effective `limits`
     // means the live scope also validates a config override, surfacing a bad value
     // in `doctor` rather than at a launch.
-    let Some((systemd_run, props)) = limiter(limits) else {
-        let note = if crate::pathfind::find_on_path("systemd-run").is_none() {
-            "systemd-run not found; the cage runs without resource limits"
-        } else {
-            "no reachable systemd user session or delegated controller; \
-             the cage runs without resource limits"
-        };
-        return LimitReport {
-            properties: Vec::new(),
-            verified: false,
-            note: Some(note.into()),
-        };
+    let (systemd_run, props) = match limiter(limits) {
+        Ok(pair) => pair,
+        // Three ways to arrive here and the note must not collapse them, but the distinction is
+        // `limiter`'s to make: it already searched, and it already reported any refusal.
+        Err(miss) => {
+            return LimitReport {
+                properties: Vec::new(),
+                verified: false,
+                note: Some(miss.note().into()),
+            };
+        }
     };
 
     let mut cmd = std::process::Command::new(&systemd_run);
@@ -1542,6 +1592,32 @@ mod tests {
         // The ordinary values are untouched, so the bound cannot be satisfied by refusing suffixes.
         for ok in ["2G", "512M", "1.5G", "8T", "1E", "infinity", "50%"] {
             assert!(is_valid_memory_value(ok), "{ok} is a value systemd takes");
+        }
+    }
+
+    /// The three ways `limiter` declines are three different things for the reader to do, so the
+    /// note must keep them apart — and each must still state the consequence, because a reader who
+    /// learns only that something is missing has not been told the cage runs unlimited.
+    #[test]
+    fn each_way_the_limiter_declines_carries_its_own_note() {
+        let notes = [
+            LimiterMiss::Absent.note(),
+            LimiterMiss::Refused.note(),
+            LimiterMiss::NoScope.note(),
+        ];
+        const CONSEQUENCE: &str = "the cage runs without resource limits";
+        for (i, note) in notes.iter().enumerate() {
+            assert!(
+                note.ends_with(CONSEQUENCE),
+                "a note that does not say what follows: {note:?}"
+            );
+            assert!(
+                note.len() > CONSEQUENCE.len(),
+                "a note that is only the consequence names no cause: {note:?}"
+            );
+            for other in &notes[i + 1..] {
+                assert_ne!(note, other, "two of the three declines read the same");
+            }
         }
     }
 }

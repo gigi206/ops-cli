@@ -233,6 +233,10 @@ pub(super) fn validate_host_secret(
         header,
         shape,
         signer,
+        // Absent means the fail-closed answer, which is also the one every declaration written
+        // before this field expects: refuse the launch rather than stand a cage up without a
+        // credential its configuration said it needs.
+        optional: raw.optional.unwrap_or(false),
     })
 }
 

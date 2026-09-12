@@ -1011,9 +1011,18 @@ fn lock_image(image: &Path) -> io::Result<ImageLock> {
 ///
 /// `udisks` is the one piece sbx genuinely cannot ship: it is a system daemon, and the polkit
 /// privilege lives with it rather than with any binary.
+///
+/// The lookup weighs each match's owner and mode and continues past an untrusted one
+/// ([`crate::store::find_trusted_on_path`]), which names the refusal on stderr as it happens. The
+/// error therefore covers three causes rather than one, and points at the line that gave the
+/// reason instead of restating it.
 fn tool(name: &str, provided_by: &str) -> Result<PathBuf, String> {
-    crate::pathfind::find_on_path(name)
-        .ok_or_else(|| format!("{name} not found on PATH — install {provided_by}"))
+    crate::store::find_trusted_on_path(name).ok_or_else(|| {
+        format!(
+            "{name} not on PATH, or refused for its ownership or mode (named above) — \
+             install {provided_by}"
+        )
+    })
 }
 
 /// How `mkfs.btrfs` will be run.
@@ -1050,7 +1059,10 @@ impl Mkfs {
 /// Only ever needed to *create* a volume. Using one needs no `btrfs` binary at all —
 /// compression rides an extended attribute and space accounting an ioctl.
 pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
-    if let Some(host) = crate::pathfind::find_on_path("mkfs.btrfs") {
+    // The host copy is a shortcut, so a match that fails the owner/mode check is not an error
+    // here: it is skipped like any other, and nothing usable falls through to provisioning sbx's
+    // own `btrfs-progs` below — the path a host without `btrfs-progs` already takes.
+    if let Some(host) = crate::store::find_trusted_on_path("mkfs.btrfs") {
         return Ok(Mkfs::Host(host));
     }
     let layout = crate::store::Layout::from_env()
@@ -1529,7 +1541,9 @@ impl Preflight {
         Self {
             kernel_btrfs: kernel_supports_btrfs(),
             loop_control: Path::new("/dev/loop-control").exists(),
-            udisks: crate::pathfind::find_on_path("udisksctl").is_some(),
+            // The lookup `tool` performs, so this cannot report a `udisksctl` the loop-attach
+            // would then refuse.
+            udisks: crate::store::find_trusted_on_path("udisksctl").is_some(),
             host_fs,
             // Measured only for a filesystem this does not recognize, where there is no table to
             // consult — so the ordinary case writes nothing. A probe that could not be carried out

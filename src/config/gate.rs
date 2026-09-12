@@ -184,3 +184,149 @@ pub(super) fn dropped_binds_warning(state: TrustState, count: usize) -> String {
         ),
     }
 }
+
+/// Tests that the layering engine still reaches every field a configuration layer can carry.
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// A source file of the config plane, read the way a reader would open it.
+    fn config_source(name: &str) -> String {
+        let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/config")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is readable: {e}", path.display()))
+    }
+
+    /// Every field of `RawConfig`, taken from the one list the **compiler** keeps current.
+    ///
+    /// Not parsed out of the struct: `overlay_into`'s destructuring is exhaustive, so a field added
+    /// to `RawConfig` and not added here fails the build. Reading the population from a
+    /// compiler-checked site is what keeps this test from going stale in the same way the thing it
+    /// guards would. A field is written either bare (`env,`) or dropped on purpose (`distro: _,`),
+    /// and both spellings count: what is asked below is whether the engine *reaches* the field, not
+    /// what the override plane decides to do with it.
+    fn raw_config_fields() -> Vec<String> {
+        let src = config_source("overrides.rs");
+        let from = src
+            .find("fn overlay_into")
+            .expect("`overlay_into` is the exhaustive destructuring this test reads");
+        let open = src[from..]
+            .find("let RawConfig {")
+            .map(|i| from + i)
+            .expect("`overlay_into` destructures `RawConfig`");
+        let close = src[open..]
+            .find("} = higher;")
+            .map(|i| open + i)
+            .expect("the destructuring closes on `higher`");
+
+        let mut out = Vec::new();
+        for line in src[open..close].lines().skip(1) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let name = line
+                .strip_suffix(',')
+                .map(|n| n.split(':').next().unwrap_or(n).trim())
+                .unwrap_or_default();
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                out.push(name.to_string());
+            }
+        }
+        assert!(
+            out.len() > 30,
+            "the destructuring parse found only {} field(s), so it has stopped matching the \
+             source's shape and would pass vacuously",
+            out.len()
+        );
+        out
+    }
+
+    /// The body of one function, by brace matching from its signature.
+    ///
+    /// The *function*, not the file: `apply_override` — one of the exhaustive destructurings that
+    /// already name every field — lives in `config/mod.rs` beside the engine, so a whole-file
+    /// search is satisfied by the very list this test must not read, and would pass over any
+    /// omission. Measured: with a probe field added to `RawConfig`, the file-wide form stayed
+    /// green.
+    ///
+    /// The counter is sound only while no literal carries an unbalanced brace inside either body.
+    /// Checked when this was written: the two `{{`/`}}` sequences in these files
+    /// (`apps.rs:194`'s `{{GET,HEAD}}` and `mod.rs:4602`'s `{{500}}`) are balanced *and* sit
+    /// outside both bodies, and neither file holds a `'{'` or `'}'` char literal. An unbalanced one
+    /// added later would truncate a body early rather than fail, which is what the size floor at
+    /// the call site is for.
+    fn body_of(source: &str, signature: &str) -> String {
+        let at = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` is in this source"));
+        let open = at + source[at..].find('{').expect("the signature opens a body");
+        let mut depth = 0usize;
+        for (i, c) in source[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[open..open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{signature}` never closes its body");
+    }
+
+    /// The layering engine names every field a layer can carry.
+    ///
+    /// This is the guard this module's header says does not exist. `apply_override`, `overlay_into`
+    /// and `push_env_source_notices` are exhaustive, so the **override** plane cannot forget a
+    /// field: the compiler refuses. The engine next door has no such destructuring — `resolve` and
+    /// `resolve_app` reach their fields by hand-written lines, and `RawApp` is not destructured at
+    /// all — so a field nobody writes a line for is simply never read from a layer, silently, and
+    /// a security field that is never read is one an untrusted layer was never asked about.
+    ///
+    /// What it checks is **presence**, not correctness: that each engine function names the field
+    /// somewhere in its body, not that it gates it rightly. A field can only be gated where it is
+    /// named, so a name absent from both bodies is a field the engine cannot be reading — which is
+    /// the failure this exists to make loud. Judging *how* it is read stays a reading.
+    #[test]
+    fn the_layering_engine_names_every_field_a_layer_can_carry() {
+        // Floors per body, not on the pair: a truncation in one would otherwise hide behind the
+        // other's size. Measured 2026-09-11 at 52,020 and 31,633 bytes; the floors sit near half,
+        // low enough that an honest shrink of either function passes and high enough that a brace
+        // counter that stopped early does not.
+        let resolve = body_of(&config_source("mod.rs"), "fn resolve(");
+        let resolve_app = body_of(&config_source("apps.rs"), "fn resolve_app(");
+        for (what, body, floor) in [
+            ("resolve", &resolve, 25_000),
+            ("resolve_app", &resolve_app, 15_000),
+        ] {
+            assert!(
+                body.len() > floor,
+                "`{what}`'s body read as {} bytes, under the {floor} floor, so the extraction has \
+                 stopped matching the source's shape and this test would pass vacuously",
+                body.len()
+            );
+        }
+        let engine = resolve + &resolve_app;
+        let named: BTreeSet<&str> = engine
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        let unreached: Vec<String> = raw_config_fields()
+            .into_iter()
+            .filter(|f| !named.contains(f.as_str()))
+            .collect();
+        assert!(
+            unreached.is_empty(),
+            "these `RawConfig` fields are named nowhere in the layering engine's own bodies \
+             (`resolve` in src/config/mod.rs, `resolve_app` in src/config/apps.rs), so no layer \
+             can be setting them and no gate can be refusing them: {unreached:?}"
+        );
+    }
+}

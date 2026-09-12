@@ -270,7 +270,11 @@ impl CaptureSupport {
 /// `exe` is sbx's own path — the probe runs as `<exe> __net-probe <nft>`, because the question
 /// cannot be answered in-process (`unshare` is not something `doctor` may do to itself).
 pub(crate) fn probe_capture(exe: &Path) -> CaptureSupport {
-    let Some(nft) = crate::pathfind::find_on_path("nft") else {
+    // Trusted form: `nft` writes the redirect that puts every outbound connection in front of the
+    // proxy, so a binary anyone may replace would decide where a cage's traffic goes. An untrusted
+    // match is named and skipped, and finding nothing usable reads as "no nft" — the posture a host
+    // without it already has.
+    let Some(nft) = crate::store::find_trusted_on_path("nft") else {
         return CaptureSupport::NoNft;
     };
     let out = std::process::Command::new(exe)

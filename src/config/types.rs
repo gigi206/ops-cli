@@ -344,6 +344,11 @@ pub(crate) struct HeaderSecret {
     /// other field here, and an un-boxed one would make every secret pay its size. `None` is the
     /// ordinary case, where [`Self::shape`] formed the value once at launch.
     pub(crate) signer: Option<Box<crate::plugins::signer::SignerPlugin>>,
+    /// Whether a launch proceeds when this credential does not resolve, with [`Self::to`] denied
+    /// for the run. `false` — the default — refuses the launch instead. Either way the
+    /// destination is never reached without the header it was declared to carry: the two answers
+    /// differ in blast radius, never in what may leave.
+    pub(crate) optional: bool,
 }
 
 impl HeaderSecret {

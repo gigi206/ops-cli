@@ -692,6 +692,11 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
     // The shell is located through the one `PATH` search, which reads absolute entries only: an
     // empty element means the current directory to `execvp`, and this verb runs from whatever tree
     // the user is standing in, a project's included.
+    //
+    // Deliberately not the owner/mode-checking lookup the host tools elsewhere take. This `sh` is
+    // the interpreter every `$EDITOR` invocation already runs through, so an untrusted one is a
+    // condition of the machine rather than of this verb: refusing here would close nothing that is
+    // not already open, and would block editing a configuration file — a repair path — on it.
     let Some(shell) = crate::pathfind::find_on_path("sh") else {
         diag::error(&format!(
             "sbx: config: could not launch the editor `{editor}`: no `sh` on PATH"

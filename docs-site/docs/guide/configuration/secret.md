@@ -64,6 +64,7 @@ host ``) and in the `sbx config show --json` view, so the two spellings meet the
 | `type` | how to shape the value: `bearer`, `basic`, or `raw` |
 | `prefix` | override the type's default prefix (`Bearer ` / `Basic ` / empty) |
 | `sign` | a [signer plugin](../plugins/signer) that forms the credential **per request** |
+| `optional` | whether a launch may proceed when this credential does not resolve, its destination denied for the run; default `false`, which refuses the launch |
 
 A secret must have **exactly one** of `key` or `from`. It must have a `header` and a
 `type`, either on itself or from `[secret.defaults]`: a secret that names neither is
@@ -79,6 +80,37 @@ one host. What differs is what the wildcard ranges over: `*.domain` ranges acros
 host you do not control could ask for the credential, while `:*` stays on the single host you
 named, whose ports are one machine under one administration. The egress allowlist still decides
 which of those ports the cage may reach at all, so one you never allowed never sees the header.
+
+### `optional`: what an unresolvable credential costs
+
+A credential is read host-side at launch, and a source can be missing: an unset variable,
+a vault that is locked, an OAuth session that expired. By default the launch is **refused**,
+before anything is stood up, because the configuration said the cage needs that credential
+to do its work.
+
+```toml
+[secret."api.example.com"]
+from     = "vault://kv/app#token"
+header   = "Authorization"
+type     = "bearer"
+optional = true
+```
+
+With `optional = true` the launch proceeds and **that destination alone is denied** for the
+run. It is not a permission to send the request without the header: the header is the reason
+the configuration reaches that host at all, so a run that could not form it does not reach it.
+Every other credential still resolves, and every other destination still works.
+
+The case it exists for is a credential the session must be able to **renew**. When the thing
+that re-issues the token lives inside the cage, a login for instance, refusing the launch over
+the expired token also refuses the only way to replace it. Marking the declaration breaks that
+deadlock without widening what may leave.
+
+Two things are unaffected. A batch roll (`sbx upgrade`) already denies rather than refuses,
+for every declaration, because it runs one captured command per app and a credential that
+command never sends must not decide whether the app is upgraded. And a credential denied at
+launch stays denied for that run: re-seeding its source mid-session does not re-open the
+destination, which takes a relaunch.
 
 ### `sign`: a credential computed from the request
 
@@ -238,6 +270,6 @@ is re-derived from what was declared, not from what the baseline posture cleared
 
 ```sh
 sbx config show           # "secrets: N injected host-side" (the value is never shown)
-sbx config show --details # each credential by destination host and source
+sbx config show --details # each credential by destination host, source, and whether it is optional
 sbx test net <url>        # notes a declared injection for that host (by header/source)
 ```

@@ -1701,6 +1701,7 @@ mod tests {
                 value_type: Some("bearer".into()),
                 prefix: None,
                 sign: None,
+                optional: None,
             }),
         )]
         .into_iter()
@@ -1769,6 +1770,7 @@ mod tests {
             value_type: Some("bearer".into()),
             prefix: None,
             sign: None,
+            optional: None,
         };
 
         // Two secrets under one host, both defaulting to the same header.
@@ -1858,6 +1860,7 @@ mod tests {
             value_type: None,
             prefix: None,
             sign: Some(name.to_string()),
+            optional: None,
         };
         let task = |plugins: &PluginRegistry| {
             let mut raw = raw_task();

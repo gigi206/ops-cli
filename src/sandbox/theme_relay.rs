@@ -162,10 +162,7 @@ fn read_windows_color_scheme() -> Option<String> {
     windows_scheme_name(&String::from_utf8_lossy(out.stdout.as_slice())).map(str::to_string)
 }
 
-// The predicate moved to `super::wsl`, which three subjects now share. Re-exported here because
-// `notify_sink` still names it through this module; point that call site at `wsl::host_is_wsl` and
-// this line goes away.
-pub(crate) use super::wsl::host_is_wsl;
+use super::wsl::host_is_wsl;
 
 /// The keyfile value a Windows `AppsUseLightTheme` word means, from the line `reg.exe` prints for
 /// it. Pure, and the one place the two scales are reconciled.

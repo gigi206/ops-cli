@@ -231,4 +231,59 @@ mod tests {
             offenders.join("\n  ")
         );
     }
+
+    /// Every production `PATH` search that skips the trust check is named here, with its reason.
+    ///
+    /// [`find_on_path`] answers "what would `execvp` run"; [`crate::store::find_trusted_on_path`]
+    /// adds the owner and mode verdict the engine tiers apply, skipping an untrusted match for a
+    /// later sound one. Host tools take the second. The few sites that do not each have a reason
+    /// that is not "nobody looked", so a new one fails here until it is named rather than joining
+    /// them by default. The inventory is checked both ways: a stale entry fails too, because a
+    /// list that keeps naming a site it no longer describes stops being read.
+    #[test]
+    fn every_production_path_search_that_skips_the_trust_check_is_accounted_for() {
+        const ACCOUNTED: &[(&str, &str)] = &[
+            (
+                "src/cli/config/edit.rs",
+                "`sh` is the interpreter every `$EDITOR` invocation already runs through, so an \
+                 untrusted one is a condition of the machine rather than of this verb",
+            ),
+            (
+                "src/sandbox/cgroup.rs",
+                "the `doctor` note tells `no systemd-run at all` from `one found but refused`, \
+                 which is a distinction only the unweighed search can still make",
+            ),
+        ];
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+        let declared_test_only = crate::testutil::test_only_sources();
+        let mut found: Vec<String> = Vec::new();
+        for file in crate::testutil::crate_sources() {
+            if crate::testutil::is_test_only_source(&file) || declared_test_only.contains(&file) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            if !crate::testutil::production_half(&text).contains("pathfind::find_on_path(") {
+                continue;
+            }
+            found.push(file.display().to_string().replacen(&root, "", 1));
+        }
+        let unaccounted: Vec<&String> = found
+            .iter()
+            .filter(|f| !ACCOUNTED.iter().any(|(named, _)| *named == f.as_str()))
+            .collect();
+        assert!(
+            unaccounted.is_empty(),
+            "these search `PATH` without weighing the match, and none says why:\n  {:?}",
+            unaccounted
+        );
+        let stale: Vec<&str> = ACCOUNTED
+            .iter()
+            .map(|(named, _)| *named)
+            .filter(|named| !found.iter().any(|f| f == named))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "no longer search `PATH` bare:\n  {stale:?}"
+        );
+    }
 }

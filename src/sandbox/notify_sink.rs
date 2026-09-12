@@ -257,9 +257,12 @@ fn toast_script(title: &str, body: &str) -> String {
 /// looks, so this is read once per launch and reported once, rather than left to be discovered by
 /// a refusal that seemed not to happen.
 fn toast_is_visible() -> Option<bool> {
-    // See `read_windows_color_scheme`: interop is a `PATH` lookup like any other, and the one
-    // search refuses the relative entry that would resolve it from the project tree.
-    let powershell = crate::pathfind::find_on_path("powershell.exe")?;
+    // See `read_windows_color_scheme`: interop is a `PATH` lookup like any other, so it takes the
+    // search that refuses the relative entry which would resolve it from the project tree, and
+    // that weighs each match's owner and mode. WSL presents the Windows drive with the mount's own
+    // `uid=` and a mode following the caller's write access, so a binary shipped under `System32`
+    // is owned by this user and not world-writable, while one planted beside it is not.
+    let powershell = crate::store::find_trusted_on_path("powershell.exe")?;
     let ask = |script: &str| -> Option<u32> {
         let out = std::process::Command::new(&powershell)
             .args(["-NoProfile", "-Command", script])
@@ -289,6 +292,16 @@ struct WslToastSink {
     /// inside it lost its refusal entirely. Measured — a cage that refused a request and exited
     /// announced nothing at all.
     diagnosed: bool,
+    /// The interop launcher, searched for once and kept — including the answer "there is none",
+    /// which is `Some(None)`, so a host without one does not pay for a search per announcement
+    /// either.
+    ///
+    /// Filled on the first delivery rather than at construction, for the reason `diagnosed` gives
+    /// above: work placed in front of the first announcement is work a short launch never gets
+    /// past. Worth keeping at all because the search weighs each match's owner and mode, which
+    /// costs a `stat` per candidate, and under WSL several `PATH` entries are on the Windows
+    /// drive — once per sink, not once per toast.
+    powershell: Option<Option<std::path::PathBuf>>,
     /// The toasts already handed to Windows, kept so they can be reaped.
     ///
     /// A toast is spawned and never waited on, deliberately: an announcement must not cost a
@@ -322,7 +335,12 @@ impl Sink for WslToastSink {
         // gone either — the stderr half above is the delivery that always lands — so this sink
         // never asks to be replaced.
         reap_finished(&mut self.pending);
-        if let Some(powershell) = crate::pathfind::find_on_path("powershell.exe")
+        // The lookup the visibility probe takes, so a binary that probe refused is never the one
+        // a toast is spawned from.
+        if self.powershell.is_none() {
+            self.powershell = Some(crate::store::find_trusted_on_path("powershell.exe"));
+        }
+        if let Some(powershell) = self.powershell.as_ref().and_then(Option::as_ref)
             && let Ok(child) = std::process::Command::new(powershell)
                 .args(["-NoProfile", "-Command", &toast_script(summary, body)])
                 .stdin(std::process::Stdio::null())
@@ -739,9 +757,10 @@ impl Notifier {
                     // failure — the desktop these announcements are for is the Windows one, which
                     // takes them through its own toast API — so the announcement goes there as
                     // well as to stderr. Everywhere else this is the stderr fallback it always was.
-                    None if crate::sandbox::theme_relay::host_is_wsl() => Box::new(WslToastSink {
+                    None if crate::sandbox::wsl::host_is_wsl() => Box::new(WslToastSink {
                         context: context.clone(),
                         diagnosed: false,
+                        powershell: None,
                         pending: Vec::new(),
                     }),
                     None => {
@@ -1915,5 +1934,54 @@ mod tests {
         assert_eq!(pending[0].id(), alive);
         let _ = pending[0].kill();
         let _ = pending[0].wait();
+    }
+
+    /// The interop launcher is searched for once per sink, and the answer is what later toasts
+    /// use — including the answer "there is none", which is an answer and not a reason to look
+    /// again. The search weighs every candidate's owner and mode, and on WSL several of those
+    /// candidates are on the Windows drive, so repeating it per announcement is the defect.
+    #[test]
+    fn the_toast_launcher_is_resolved_once_and_then_reused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut sink = WslToastSink {
+            context: "test".into(),
+            // Already made, so the delivery does not also run the two interop round-trips of the
+            // visibility probe, which this test is not about.
+            diagnosed: true,
+            powershell: None,
+            pending: Vec::new(),
+        };
+
+        // The invariant is that the slot is filled, not what it was filled with: `Some(None)` —
+        // searched and there is none — is as much an answer as a path, and asserting which one
+        // would be asserting whether this host is WSL.
+        assert!(sink.deliver("first", "body", None).is_ok());
+        assert!(
+            sink.powershell.is_some(),
+            "the first delivery must record that it searched, whatever it found"
+        );
+
+        // Stand a launcher in the remembered slot. If the delivery searched again it would find
+        // nothing here too, and spawn nothing; a child proves it used what was kept.
+        let tmp = crate::testutil::TmpDir::new();
+        let fake = tmp.join("launcher");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sink.powershell = Some(Some(fake.clone()));
+
+        assert!(sink.deliver("second", "body", None).is_ok());
+        assert_eq!(
+            sink.powershell.as_ref().and_then(Option::as_ref),
+            Some(&fake),
+            "a delivery must not overwrite the launcher it was given"
+        );
+        assert_eq!(
+            sink.pending.len(),
+            1,
+            "the kept launcher is the one a toast is spawned from"
+        );
+        for child in &mut sink.pending {
+            let _ = child.wait();
+        }
     }
 }

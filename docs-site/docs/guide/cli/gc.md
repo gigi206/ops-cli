@@ -33,6 +33,21 @@ See also: [`sbx store`](store) · [`sbx projects`](projects) · [Garbage collect
   channel revision still roots: under an exclusive lock, and sweeps the **per-launch
   runtime files** of launches that are gone (see below).
 
+## When the session registry cannot be read
+
+Both sweeps below are gated on which sessions are live, and an unreadable registry is not
+an empty one. So `sbx gc` fails closed, differently per scope, and says which on stderr:
+
+- **this project's store**: the collection is refused outright, because a live sandbox
+  holding this project cannot be ruled out. The same refusal appears when a sandbox really
+  is running here: stop it first, see [`sbx session`](session).
+- **`--all`**: the per-launch runtime files and the distribution trees are left alone, for
+  the same reason. The **shared** store is still collected, because it is keyed by what the
+  nix roots hold rather than by which project is live.
+
+The verbs that only report are not gated: [`sbx projects`](projects) still lists every
+tree, with the state `unknown` in place of a `live`/`idle` finding nothing established.
+
 ## Runtime files
 
 A launch stands up per-launch plumbing under the data directory: the egress MITM CA and

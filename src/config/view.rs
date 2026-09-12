@@ -727,6 +727,28 @@ pub(crate) struct SecretView {
     pub(crate) to: String,
     pub(crate) shape: String,
     pub(crate) sources: String,
+    /// Whether a launch proceeds when this credential does not resolve, its destination denied.
+    /// Shown because it changes what a failure costs, and a reader who cannot see it here would
+    /// have to open the file that declared the credential to learn it.
+    pub(crate) optional: bool,
+}
+
+impl SecretView {
+    /// The parenthesised detail the three listings share: how the value is formed, where it is
+    /// read from, and — when it is not the default — what an unresolvable credential costs.
+    ///
+    /// One definition for the same reason [`secret_views`] is one projection: the baseline, the
+    /// roster and the app detail are what a reader compares, and a field rendered in one of them
+    /// and not the others shows the same credential two different ways.
+    pub(crate) fn detail(&self) -> String {
+        let mut detail = format!("{}, from {}", self.shape, self.sources);
+        if self.optional {
+            // Named with its consequence: `optional` alone reads as "the request goes out without
+            // it", which is the one thing that never happens.
+            detail.push_str(", optional (destination denied)");
+        }
+        detail
+    }
 }
 
 /// One install step an app's bundles contribute, as a launch would run it. Both halves are shown:
@@ -1600,6 +1622,7 @@ fn secret_views(secrets: &[super::HeaderSecret]) -> Vec<SecretView> {
             to: s.to.to_string(),
             shape: s.shape_label(),
             sources: s.describe_sources(),
+            optional: s.optional,
         })
         .collect()
 }
@@ -2243,6 +2266,7 @@ mod tests {
                     to: "api.example.com".into(),
                     shape: "raw".into(),
                     sources: "env DEMO_API_KEY".into(),
+                    optional: false,
                 }],
                 notes: vec![],
             }],
@@ -2457,6 +2481,7 @@ mod tests {
             header: "Authorization".into(),
             shape: crate::config::HeaderShape::new("Bearer ", false),
             signer: None,
+            optional: false,
         }
     }
 

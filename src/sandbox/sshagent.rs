@@ -269,15 +269,23 @@ impl Confirmer {
     fn search(from_env: Option<PathBuf>, names: &[&str], paths: &[&str]) -> Option<PathBuf> {
         // An `$SSH_ASKPASS` naming nothing is not taken on trust: a helper that cannot start would
         // fail every confirmation, and the fall-through to a real one keeps a stale variable from
-        // turning the feature off in practice.
+        // turning the feature off in practice. It is weighed no further: the variable is read from
+        // sbx's own process environment, so setting it already means being this user.
         if let Some(path) = from_env.filter(|p| p.is_file()) {
             return Some(path);
         }
+        // The one arm where the user holds neither the contents nor the mode of what is found, and
+        // what is found decides whether a key gets used — so each match is weighed for owner and
+        // mode, and an untrusted one is named on stderr and skipped for a later sound one. Nothing
+        // usable here falls through to the fixed paths rather than ending the search, and a host
+        // whose only helper is untrusted reaches `None`, which refuses the grant whole.
         for name in names {
-            if let Some(found) = crate::pathfind::find_on_path(name) {
+            if let Some(found) = crate::store::find_trusted_on_path(name) {
                 return Some(found);
             }
         }
+        // System paths owned by root, where that verdict would be tautological: whether the file is
+        // there at all is the whole question left.
         paths.iter().map(PathBuf::from).find(|p| p.is_file())
     }
 

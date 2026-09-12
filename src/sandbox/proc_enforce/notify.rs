@@ -112,8 +112,12 @@ static ADDFD_UNAVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 ///
 /// `srcfd` is the supervisor's own descriptor for the inode it examined; the kernel duplicates it
 /// into the target and leaves ours alone. Returns `false` when the kernel does not offer the
-/// operation (`SECCOMP_ADDFD_FLAG_SEND` landed in 5.9), leaving the caller to fall back on the
-/// answer every kernel before it had.
+/// operation, leaving the caller to fall back on the answer every kernel before it had.
+///
+/// The two versions are not the same, and the difference is the width of that fallback:
+/// `SECCOMP_IOCTL_NOTIF_ADDFD` landed in 5.9, the `SEND` flag only in **5.14**. On 5.9 to 5.13 the
+/// ioctl is therefore present and rejects the flag, which is why the band that answers `CONTINUE`
+/// is five releases wider than the ioctl's own version suggests.
 pub(super) fn respond_with_fd(
     notif_fd: libc::c_int,
     id: u64,
@@ -162,7 +166,7 @@ pub(super) fn respond_with_fd(
         if !ADDFD_UNAVAILABLE.swap(true, Ordering::Relaxed) {
             crate::diag::warn(
                 "this kernel does not offer the seccomp operation that hands the cage the very \
-                 descriptor `[fs] scan` examined (it landed in 5.9), so an allowed open is re-run \
+                 descriptor `[fs] scan` examined (it landed in 5.14), so an allowed open is re-run \
                  from its arguments and what the cage receives may not be what was scanned",
             );
         }

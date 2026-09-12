@@ -33,6 +33,7 @@ See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [O
 | `--forward <port\|host:cage[,…]>` | one-shot host loopback forward into the cage: a port (`1455`, an OAuth callback) or a `host:cage` remap (`9200:9119`); repeatable, folds onto the config by cage port |
 | `--seccomp <token[,token…]>` | one-shot relaxation of the syscall denylist (e.g. `ptrace`, `clone:newuser`); repeatable |
 | `--device <path>` | one-shot host device grant, one path per flag (e.g. `/dev/kvm`); repeatable |
+| `--fs <mask>` | one-shot filesystem mask, `deny=<path>` or `readonly=<path>`, one per flag (e.g. `deny=prod.key`); repeatable, and it adds to the configured masks rather than replacing them |
 | `--gpu[=true\|false]` | one-shot GPU posture (bare `--gpu` = true; `=false` disables) |
 | `--audio[=true\|false]` | one-shot audio posture (bare `--audio` = true; `=false` disables) |
 | `--dbus[=true\|false]` | one-shot in-cage desktop portal (bare `--dbus` = true) |

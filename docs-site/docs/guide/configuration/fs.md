@@ -217,8 +217,10 @@ being looked up a second time once something has been moved into place behind it
 
 Two gaps are left, and the second one **is** a shape a cage can arrange.
 
-The first is a kernel older than 5.9, which does not offer the operation at all; there `scan`
-behaves as it did before, swap included. That fallback is not silent. The first allowed open the
+The first is a kernel older than 5.14, which does not offer the operation in the form `scan` needs;
+there `scan` behaves as it did before, swap included. (The `ADDFD` ioctl itself arrived in 5.9, but
+the flag that installs the descriptor and answers the call in one step arrived in 5.14, so a 5.9 to
+5.13 kernel falls back too.) That fallback is not silent. The first allowed open the
 kernel declines to serve this way prints a warning naming the missing operation, once for the
 session, so a weaker `scan` is something you are told about rather than something you have to infer
 from a kernel version.

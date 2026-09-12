@@ -703,8 +703,10 @@ fn secrets_section(secrets: &[config::view::SecretView], pal: &style::Palette) -
     for s in secrets {
         let _ = writeln!(
             o,
-            "    {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
-            s.header, s.to, s.shape, s.sources
+            "    {n}{}{r} -> {n}{}{r}  {dim}({}){r}",
+            s.header,
+            s.to,
+            s.detail()
         );
     }
     Some(o)
@@ -1238,8 +1240,10 @@ fn app_row_secrets(
             for s in &app.secrets {
                 let _ = writeln!(
                     o,
-                    "        {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
-                    s.header, s.to, s.shape, s.sources
+                    "        {n}{}{r} -> {n}{}{r}  {dim}({}){r}",
+                    s.header,
+                    s.to,
+                    s.detail()
                 );
             }
         } else {
@@ -1680,12 +1684,14 @@ mod tests {
                     to: "api.example.com".into(),
                     shape: "bearer".into(),
                     sources: "env:DEMO_TOKEN".into(),
+                    optional: false,
                 },
                 SecretView {
                     header: "X-Api-Key".into(),
                     to: "registry.example.org".into(),
                     shape: "raw".into(),
                     sources: "file:~/.demo/key".into(),
+                    optional: false,
                 },
             ],
             notes: vec![
@@ -1858,6 +1864,7 @@ mod tests {
             to: "https://api.example.com".into(),
             shape: "bearer".into(),
             sources: "env EXAMPLE_TOKEN".into(),
+            optional: false,
         }];
         assert_eq!(
             secrets_section(&secrets, &plain).expect("a declared secret is listed"),
@@ -2576,12 +2583,14 @@ mod tests {
                         to: "api.example.com".into(),
                         shape: "raw".into(),
                         sources: "env DEMO_API_KEY".into(),
+                        optional: false,
                     },
                     SecretView {
                         header: "authorization".into(),
                         to: "api2.example.com".into(),
                         shape: "bearer".into(),
                         sources: "env DEMO_TOKEN".into(),
+                        optional: false,
                     },
                 ],
                 ..blank_app_view("demo-app")

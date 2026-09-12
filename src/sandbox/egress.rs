@@ -742,19 +742,20 @@ pub(crate) fn start(
     // come from the same resolved values, so they cannot disagree with the injections. A
     // relative `sops` file resolves against the project root (the `.sbx.toml`'s directory). A
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
-    let (injections, redactions, resolved) = match unresolved {
-        Unresolved::Abort => {
-            let (injections, redactions) =
-                resolve_injections(secrets, project_root, bwrap, redact_min_len, brokers, &[])?;
-            (injections, redactions, secrets.to_vec())
-        }
-        Unresolved::DenyDestination => {
-            let kept = resolve_or_deny(secrets, project_root, bwrap, redact_min_len, brokers);
-            // Applied before the proxy is built, so no request is ever served against the policy
-            // as it stood while a credential was still expected to resolve.
-            policy.deny_also(kept.denied);
-            (kept.injections, kept.redactions, kept.declarations)
-        }
+    let (injections, redactions, resolved) = {
+        let kept = resolve_or_deny(
+            secrets,
+            project_root,
+            bwrap,
+            redact_min_len,
+            brokers,
+            unresolved,
+        )?;
+        // Applied before the proxy is built, so no request is ever served against the policy as it
+        // stood while a credential was still expected to resolve. Empty under an aborting launch
+        // whose declarations are all required — the case that used to have its own branch here.
+        policy.deny_also(kept.denied);
+        (kept.injections, kept.redactions, kept.declarations)
     };
 
     // The credential state the proxy will read, built here so the refresher can hold the same one
@@ -1134,7 +1135,16 @@ fn resolve_injections(
             min_len,
             brokers,
             standing.get(i),
-        )?;
+        )
+        .map_err(|e| {
+            // Named here rather than at the launch site: this error is also what a mid-session
+            // refresh reports, and the site that prints it knows only that the proxy would not
+            // stand up — not which declaration is behind it.
+            io::Error::other(format!(
+                "{} — `sbx config show` lists the declaration",
+                credential_failure(secret, &e)
+            ))
+        })?;
         injections.push(injection);
         redactions.extend(needles);
     }
@@ -1157,22 +1167,52 @@ pub(crate) enum Unresolved {
     DenyDestination,
 }
 
-/// Resolve every declared credential, denying the destination of any that does not resolve instead
-/// of refusing the whole launch.
+/// The statement both answers to an unresolvable credential are built on: which declaration failed,
+/// and why.
 ///
-/// The fail-closed property of [`resolve_injections`] is kept rather than traded away: the header a
+/// Stated once because the two paths differ in their *consequence*, never in the fact — a launch
+/// that refuses and a roll that denies the destination report the same thing, and a reader who met
+/// one has to recognise the other. Each caller appends what its own answer costs.
+///
+/// The subject is the **destination**, not the header: the header is what a request carries, the
+/// destination is what the configuration named and what a remedy acts on — and the reason already
+/// names the header, so carrying it here would say it twice. A `name` is added only when it says
+/// more than the destination does: it defaults to the destination, and repeating it would name
+/// nothing.
+fn credential_failure(secret: &HeaderSecret, why: &io::Error) -> String {
+    let host = secret.to.concrete_host().unwrap_or(secret.name.as_str());
+    let subject = if secret.name == host {
+        format!("the credential for `{host}`")
+    } else {
+        format!("the credential `{}` for `{host}`", secret.name)
+    };
+    format!("{subject} did not resolve ({why})")
+}
+
+/// Resolve every declared credential, answering each failure the way that declaration and this
+/// launch asked for: deny the destination and carry on, or refuse the launch.
+///
+/// The fail-closed property is kept rather than traded away under either answer: the header a
 /// destination was declared to carry is the reason the configuration named it, so a destination
-/// whose credential did not resolve is denied outright and no request reaches it bare. What changes
-/// is only which failures are fatal. Each secret is resolved on its own — the failure of one says
-/// nothing about the next, and a chain that aborted the set would hide every credential behind the
-/// first unreadable one.
+/// whose credential did not resolve is denied outright and no request reaches it bare. What the
+/// answers differ in is blast radius — one destination, or the launch.
+///
+/// The choice is read **per secret**, not once for the set. `unresolved` is what the launch kind
+/// asks for (a roll denies, an interactive launch refuses), and [`HeaderSecret::optional`] is what
+/// one declaration asks for regardless of the launch kind. Either saying "deny" is enough, because
+/// both are saying the same thing about the same credential and neither can make a denial less
+/// safe than a refusal.
+///
+/// Each secret is resolved on its own — the failure of one says nothing about the next, and a
+/// chain that aborted the set would hide every credential behind the first unreadable one.
 fn resolve_or_deny(
     secrets: &[HeaderSecret],
     project_root: &Path,
     bwrap: &Path,
     min_len: usize,
     brokers: &[super::broker::Reachable],
-) -> Kept {
+    unresolved: Unresolved,
+) -> io::Result<Kept> {
     let mut injections = Vec::with_capacity(secrets.len());
     let mut redactions = Vec::new();
     let mut declarations = Vec::with_capacity(secrets.len());
@@ -1187,25 +1227,32 @@ fn resolve_or_deny(
                 redactions.extend(needles);
                 declarations.push(secret.clone());
             }
-            Err(e) => {
+            Err(e) if secret.optional || unresolved == Unresolved::DenyDestination => {
                 // Named, never silent: the run is about to behave differently from what the
                 // configuration declared, and the destination is what the user has to recognise.
                 crate::diag::warn(&format!(
-                    "the credential for `{}` did not resolve ({e}) — {} is denied for this \
-                     run rather than reached without the header it was declared to carry",
-                    secret.name,
+                    "{} — {} is denied for this run rather than reached without the header it \
+                     was declared to carry",
+                    credential_failure(secret, &e),
                     secret.to.concrete_host().unwrap_or(secret.name.as_str())
                 ));
                 denied.push(secret.to.clone());
             }
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "{} — `sbx config show` lists the declaration, and `optional = true` on it \
+                     denies this destination for the run instead of refusing the launch",
+                    credential_failure(secret, &e)
+                )));
+            }
         }
     }
-    Kept {
+    Ok(Kept {
         injections,
         redactions,
         declarations,
         denied,
-    }
+    })
 }
 
 /// What survived a [`resolve_or_deny`] pass, and what the failures cost.
@@ -1448,8 +1495,11 @@ fn read_source(
                 // Located through the one `PATH` search, which reads absolute entries only. An
                 // empty element means the current directory to `execvp`, and the current directory
                 // here is the project tree: without this, a repository could ship the `sops` that
-                // is handed its own encrypted file to decrypt.
-                Ok(true) => match crate::pathfind::find_on_path("sops") {
+                // is handed its own encrypted file to decrypt. The trusted form applies the second
+                // half of the same rule — the binary must also be a regular file owned by us or
+                // root and not world-writable — because this is the one host tool a launch hands a
+                // key to, and a loosely-permissioned directory on `PATH` would otherwise choose it.
+                Ok(true) => match crate::store::find_trusted_on_path("sops") {
                     Some(sops) => run_sops(
                         &sops,
                         &path,
@@ -1457,8 +1507,12 @@ fn read_source(
                         header,
                         super::resolver::HOST_RESOLUTION_DEADLINE,
                     ),
+                    // Three causes now, not two: the trusted lookup also declines a match it
+                    // found. That one is already named on stderr with its reason, so this says
+                    // there is one rather than repeating it.
                     None => Err(io::Error::other(format!(
-                        "the secret for `{header}` needs sops, which is not installed or not on PATH"
+                        "the secret for `{header}` needs sops, which is not installed, not on \
+                         PATH, or was refused for its ownership or mode (named above)"
                     ))),
                 },
                 Err(e) => Err(io::Error::other(format!(
@@ -2527,6 +2581,7 @@ mod tests {
             header: header.to_string(),
             shape,
             signer: None,
+            optional: false,
         }
     }
 
@@ -2674,12 +2729,26 @@ mod tests {
         )
     }
 
-    /// Write an executable fake `sops` to `dir/sops` that runs `body` (a bash script with the
-    /// invocation's args in `$@`), so a test can exercise [`run_sops`] hermetically without the
-    /// real sops or any decryption key — and without mutating PATH (the binary path is passed in).
+    /// Write an executable fake `sops` to `dir/sops` that runs `body` (a POSIX shell script with
+    /// the invocation's args in `$@`), so a test can exercise [`run_sops`] hermetically without the
+    /// real sops or any decryption key — and without reading PATH (the binary path is passed in).
+    ///
+    /// The interpreter is named **absolutely**, and that is the whole point. A
+    /// `#!/usr/bin/env <interp>` shebang resolves its interpreter through the *process*
+    /// environment, which the tests below deliberately narrow: the one that proves only an absolute
+    /// PATH entry may name a program sets `PATH` to a relative entry while it runs. Rust's harness
+    /// runs tests as threads of one process, so the shared `env_lock` serialises those
+    /// writers against each other but cannot stop a spawner that does not take it — and a fixture
+    /// launched in that window failed with `env: 'bash': No such file or directory`, at about one
+    /// run in twenty-five. Resolving the interpreter through PATH at write time would only narrow
+    /// that window; naming it absolutely removes it, and leaves no way for a later test to
+    /// reintroduce the coupling by forgetting a lock.
+    ///
+    /// `/bin/sh` rather than a bash found somewhere: the bodies below are POSIX, so the one
+    /// interpreter every host is required to have at a fixed path is enough.
     fn fake_sops(dir: &TmpDir, body: &str) -> PathBuf {
         let path = dir.join("sops");
-        std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -2779,7 +2848,9 @@ mod tests {
         let sops = fake_sops(
             &dir,
             &format!(
-                "printf '%s\\n' \"$*\" > {}\necho -n 'ghp-the-secret-value'",
+                // `printf '%s'` rather than `echo -n`: the `-n` flag is not POSIX, and this
+                // script now runs under `/bin/sh`.
+                "printf '%s\\n' \"$*\" > {}\nprintf '%s' 'ghp-the-secret-value'",
                 args_log.display()
             ),
         );
@@ -2945,10 +3016,7 @@ mod tests {
             read()
         };
         let err = refused.expect_err("a relative entry never names the decrypting binary");
-        assert!(
-            err.to_string().contains("not installed or not on PATH"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("not on PATH"), "{err}");
 
         // The witness: the same file, named absolutely, is found and run. The host's own entries
         // stay behind it, since the planted script's shebang needs an interpreter and first match
@@ -3015,7 +3083,9 @@ mod tests {
         );
     }
 
-    /// [`resolve_or_deny`] at the same throwaway root [`resolve_injections_at_root`] resolves at.
+    /// [`resolve_or_deny`] at the same throwaway root [`resolve_injections_at_root`] resolves at,
+    /// under the answer a roll asks for — where no declaration can refuse the launch, so the
+    /// `Result` cannot be an `Err` and unwrapping it here asserts exactly that.
     fn resolve_or_deny_at_root(secrets: &[HeaderSecret]) -> Kept {
         resolve_or_deny(
             secrets,
@@ -3023,7 +3093,74 @@ mod tests {
             Path::new(UNUSED_BWRAP),
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
+            Unresolved::DenyDestination,
         )
+        .expect("a denying pass never refuses the launch")
+    }
+
+    /// [`resolve_or_deny`] at that same root under the answer an interactive launch asks for,
+    /// where a declaration's own `optional` is the only thing that can spare the launch.
+    fn resolve_aborting_at_root(secrets: &[HeaderSecret]) -> io::Result<Kept> {
+        resolve_or_deny(
+            secrets,
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            Unresolved::Abort,
+        )
+    }
+
+    /// `optional = true` answers for its own declaration, whatever the launch kind asks for.
+    ///
+    /// Which answer an unresolvable credential got used to be a property of the launch alone: an
+    /// interactive launch refused, a batch roll denied. That made a credential the session has to
+    /// be able to **re-obtain** a deadlock — a login that re-issues the token lives inside the app,
+    /// so a launch refused over the expired token is a launch that cannot reach the login either.
+    /// The field lifts the refusal for that one declaration and nothing more: its destination is
+    /// still denied, and every other credential still resolves or still refuses.
+    #[test]
+    fn an_optional_credential_is_denied_where_a_required_one_refuses_the_launch() {
+        let _lock = env_lock();
+        let (_guards, mut secrets) = a_set_with_one_unreadable_credential();
+        // Matched rather than `expect_err`, which would print the whole `Kept` on failure — and
+        // that set holds the credentials that did resolve.
+        let refusal = match resolve_aborting_at_root(&secrets) {
+            Ok(_) => panic!("a required credential must refuse an aborting launch"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            refusal.contains("absent.test"),
+            "and names the declaration behind it: {refusal}"
+        );
+
+        secrets[1].optional = true;
+        let kept =
+            resolve_aborting_at_root(&secrets).expect("an optional one lets the launch proceed");
+        assert_eq!(
+            kept.denied,
+            vec![crate::allowlist::classify("absent.test").unwrap()],
+            "its destination is denied rather than reached without the header"
+        );
+        assert_eq!(
+            kept.declarations.len(),
+            2,
+            "the credentials that resolved are kept, aligned with their injections"
+        );
+        assert_eq!(kept.injections.len(), kept.declarations.len());
+
+        // The opt-out is per declaration: another unreadable one still refuses the launch.
+        secrets[0] = secret(
+            SecretSource::Env("SBX_TEST_EGRESS_DENY_ALSO_ABSENT".into()),
+            "other.test",
+            "Authorization",
+            crate::config::HeaderShape::new("Bearer ", false),
+        );
+        let _guard = EnvVar::unset("SBX_TEST_EGRESS_DENY_ALSO_ABSENT");
+        assert!(
+            resolve_aborting_at_root(&secrets).is_err(),
+            "a second unreadable credential, not marked, still refuses"
+        );
     }
 
     /// The declaration set the denying tests share: one credential that resolves, one whose source
@@ -3058,6 +3195,41 @@ mod tests {
             ),
         ];
         (guards, secrets)
+    }
+
+    /// Both answers to an unresolvable credential name the same declaration.
+    ///
+    /// The refusing form used to name the header alone, which is the one field that says nothing
+    /// about *which* declaration failed: a launch declaring two `Authorization` credentials
+    /// reported the same sentence whichever of them was unreadable — which is why the fixture's
+    /// three declarations all carry that header. Both answers are now built on
+    /// [`credential_failure`], so the destination is named either way and a reader who met one
+    /// recognises the other.
+    #[test]
+    fn a_refusal_names_the_destination_the_denial_names() {
+        let _lock = env_lock();
+        let (_guards, secrets) = a_set_with_one_unreadable_credential();
+        let refusal = resolve_injections_at_root(&secrets)
+            .unwrap_err()
+            .to_string();
+        for named in ["absent.test", "sbx config show"] {
+            assert!(
+                refusal.contains(named),
+                "the refusal must name {named}: {refusal}"
+            );
+        }
+        assert!(
+            !refusal.contains("first.test") && !refusal.contains("last.test"),
+            "and only the declaration that failed: {refusal}"
+        );
+        // The set is not printed on failure: it carries the resolved injections, and a credential
+        // has no business in a test report. The count is what this asserts.
+        let kept = resolve_or_deny_at_root(&secrets);
+        assert_eq!(
+            kept.denied,
+            vec![crate::allowlist::classify("absent.test").unwrap()],
+            "the denying answer names the destination the refusal named"
+        );
     }
 
     /// A credential that cannot be read costs its own destination and nothing else.

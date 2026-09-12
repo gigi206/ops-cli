@@ -1463,8 +1463,15 @@ pub(crate) struct RawSecretSection {
     pub(crate) hosts: BTreeMap<String, RawHostSecrets>,
 }
 
+// The single-table variant is far larger than the vector one, and deliberately so, for the reason
+// `NetworkField` above keeps its own flat shape: this is a deserialization form, built once per
+// config layer and consumed immediately into a resolved `HeaderSecret`. Boxing it would put an
+// indirection on every field read of every declared credential to save a stack copy that happens a
+// handful of times per launch. Written above the doc block rather than under it: a `//` between
+// the `///` and the item severs the two, and the item then reads as undocumented.
 /// The secret(s) declared for one host: a single table (`[secret."host"]`) or an array of
 /// tables (`[[secret."host"]]`) for several credentials (different headers) to that host.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum RawHostSecrets {
@@ -1513,6 +1520,20 @@ pub(crate) struct RawHostSecret {
     /// request carries and how they are formed is the plugin's manifest to say, and a declaration
     /// that stated both would state two answers to one question.
     pub(crate) sign: Option<String>,
+    /// Whether a launch may proceed when this credential does not resolve. Default `false`: the
+    /// launch is refused, which is what an interactive session wants for a credential it cannot
+    /// work without.
+    ///
+    /// **`true` does not mean the request goes out bare.** The destination is *denied* for the
+    /// run, exactly as it is for a batch roll: the header this declaration was named for is the
+    /// reason the configuration reaches that host at all, so a run that could not form it does
+    /// not reach it. What `true` buys is the rest of the launch — the cage still starts, and
+    /// everything not behind this credential still works.
+    ///
+    /// The case it is for: a credential the session must be able to **recover**. A login that
+    /// re-issues the token lives inside the app, and a launch refused for the expired token is a
+    /// launch that cannot reach the login either.
+    pub(crate) optional: Option<bool>,
 }
 
 /// The defaults declared once under `[secret.defaults]`: the resolver order and per-resolver

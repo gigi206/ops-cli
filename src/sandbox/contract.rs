@@ -594,6 +594,7 @@ mod tests {
                     base64: false,
                 },
                 signer: None,
+                optional: false,
             }],
             env: Default::default(),
             env_allow: vec![],
