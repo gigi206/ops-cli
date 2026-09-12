@@ -218,16 +218,16 @@ struct Declared {
 /// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
 /// universe — so `sbx upgrade` walks the apps once, not twice.
 ///
-/// `only` is `sbx upgrade --app <name>`, and it narrows the **roll set alone**, exactly as
-/// [`super::prebuilt::declared`] does and for the same reason: the `flake:` lock is one per
-/// project, so the selected app contributes its own layer (its `[packages]` and the bundles folded
-/// under it) while the project baseline stays out, and the prune universe stays project-wide so a
-/// narrowed roll can never unpin another app's reference.
+/// Which layers are visited, and which of them `sbx upgrade --app <name>` still offers for
+/// rolling, is [`super::packages::walk_roll_layers`]'s rule — the same walk the prebuilt backends
+/// run. It applies here for the same reason: the `flake:` lock is one per project, so a narrowed
+/// roll must leave the baseline alone while the prune universe stays project-wide, and no per-app
+/// roll can unpin another app's reference.
 fn declared(cfg: &crate::config::Resolved, only: Option<&str>) -> Declared {
     let mut seen = std::collections::BTreeSet::new();
     let mut trusted = Vec::new();
     let mut all = std::collections::BTreeSet::new();
-    let mut absorb = |pkgs: &[crate::config::Package], roll: bool| {
+    super::packages::walk_roll_layers(cfg, only, |pkgs, roll| {
         if roll {
             for (_, reference) in super::packages::flake_packages(pkgs) {
                 if seen.insert(reference.clone()) {
@@ -240,16 +240,7 @@ fn declared(cfg: &crate::config::Resolved, only: Option<&str>) -> Declared {
                 all.insert(reference.clone());
             }
         }
-    };
-    absorb(&cfg.packages, only.is_none());
-    for (name, app) in &cfg.apps {
-        let mut merged = cfg.clone();
-        merged.merge_app(app.clone());
-        absorb(&merged.packages, only.is_none());
-        if only == Some(name.as_str()) {
-            absorb(&app.packages, true);
-        }
-    }
+    });
     Declared { trusted, all }
 }
 
@@ -265,22 +256,7 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved, only: Option<&str>) -> usi
             })
             .count()
     };
-    // Under `--app`, count what that roll would have equipped and nothing else — its own layer,
-    // since [`declared`] leaves the baseline out of a narrowed roll set.
-    match only {
-        Some(name) => cfg
-            .apps
-            .get(name)
-            .map_or(0, |app| untrusted_flake(&app.packages)),
-        None => {
-            untrusted_flake(&cfg.packages)
-                + cfg
-                    .apps
-                    .values()
-                    .map(|app| untrusted_flake(&app.packages))
-                    .sum::<usize>()
-        }
-    }
+    super::packages::count_in_roll_layers(cfg, only, untrusted_flake)
 }
 
 /// Re-resolve a project's declared `flake:` references against their upstreams and rewrite the

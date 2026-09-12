@@ -312,6 +312,67 @@ pub(crate) fn flake_inline_packages(packages: &[Package]) -> Vec<(String, String
         .collect()
 }
 
+/// Walk the config layers one roll visits, telling each whether it joins the **roll set**.
+///
+/// The project baseline first, then the apps in name order, each app's overlay materialised once
+/// (a `merge_app` clone) so a caller collecting several views walks the apps once, not twice.
+///
+/// `only` is `sbx upgrade --app <name>`, and it narrows the roll set **alone**. What it selects is
+/// that app's own layer — its `[packages]` and the bundles folded under it at load — and not the
+/// project baseline, on the rule the `mise:` roll already applies to its baseline group: a selector
+/// that reads "only this app" must not do project-wide work. Every layer is still offered whatever
+/// the selector, which is what lets a caller keep a trust-agnostic prune universe that does not
+/// narrow alongside the roll set. That is the load-bearing half: a narrowed universe would make a
+/// per-app roll delete every other app's pin.
+///
+/// What a layer contributes is the caller's. A locator, a flake reference and a resolver command
+/// are not the same thing, while which layers a roll visits is the same for all of them.
+pub(crate) fn walk_roll_layers(
+    cfg: &crate::config::Resolved,
+    only: Option<&str>,
+    mut absorb: impl FnMut(&[Package], bool),
+) {
+    absorb(&cfg.packages, only.is_none());
+    for (name, app) in &cfg.apps {
+        let mut merged = cfg.clone();
+        merged.merge_app(app.clone());
+        absorb(&merged.packages, only.is_none());
+        if only == Some(name.as_str()) {
+            absorb(&app.packages, true);
+        }
+    }
+}
+
+/// Count across the layers a roll would have equipped, on the rule [`walk_roll_layers`] applies.
+///
+/// Under `--app <name>` that is the app's own layer and nothing else: the baseline stays out,
+/// because a narrowed roll of a per-project lock leaves it out too, and reporting the project's
+/// total would attribute another app's withheld package to this roll. Without a selector every
+/// layer counts, each app on its **own** list rather than on the merged overlay, so a baseline
+/// package is not re-counted once per app.
+///
+/// The `mise:` roll counts differently, and deliberately: its packages are equipped in-cage from
+/// the *merged* set, so a narrowed count there includes the baseline the app folds in. A backend
+/// whose lock is per project cannot borrow that rule, and one whose packages are per cage cannot
+/// borrow this one.
+pub(crate) fn count_in_roll_layers(
+    cfg: &crate::config::Resolved,
+    only: Option<&str>,
+    count: impl Fn(&[Package]) -> usize,
+) -> usize {
+    match only {
+        Some(name) => cfg.apps.get(name).map_or(0, |app| count(&app.packages)),
+        None => {
+            count(&cfg.packages)
+                + cfg
+                    .apps
+                    .values()
+                    .map(|app| count(&app.packages))
+                    .sum::<usize>()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

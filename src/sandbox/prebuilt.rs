@@ -897,16 +897,14 @@ pub(crate) struct Declared {
 /// literally `resolve:foo` and a resolver named `foo` collide on their single lock key rather than
 /// both claiming it.
 ///
-/// `only` is `sbx upgrade --app <name>`, and it narrows the **roll set alone**. What it selects is
-/// that app's own layer — its `[packages]` and the bundles folded under it at load — and not the
-/// project baseline, on the rule the `mise:` roll already applies to its baseline group: a selector
-/// that reads "only this app" must not do project-wide work. What decides it here is the lock
-/// rather than the home. This backend keeps **one lock per project**, shared by every app, so
-/// rolling a baseline reference under the selector would advance a pin every other app reads.
+/// Which layers are visited, and which of them `sbx upgrade --app <name>` still offers for
+/// rolling, is [`super::packages::walk_roll_layers`]'s rule — shared with the `flake:` roll. What
+/// decides it for this backend is the lock rather than the home: **one lock per project**, shared
+/// by every app, so rolling a baseline reference under the selector would advance a pin every
+/// other app reads.
 ///
 /// The prune universe stays the whole project either way, and that is the load-bearing half: it is
-/// what says which lock entries are still declared, so narrowing it alongside the roll set would
-/// make a per-app roll delete every other app's pin. [`upgrade`] also declines to prune at all
+/// what says which lock entries are still declared. [`upgrade`] also declines to prune at all
 /// under a selector; the two guards are deliberate, since only one of them fails safe.
 pub(crate) fn declared(
     kind: &dyn Kind,
@@ -918,7 +916,7 @@ pub(crate) fn declared(
     let mut all = std::collections::BTreeSet::new();
     // `roll` says whether this layer joins the roll set; every layer joins the prune universe
     // whatever the selector, which is what keeps the two views from narrowing together.
-    let mut absorb = |pkgs: &[crate::config::Package], roll: bool| {
+    super::packages::walk_roll_layers(cfg, only, |pkgs, roll| {
         if roll {
             for (_, locator) in kind.packages(pkgs) {
                 if seen.insert(locator.clone()) {
@@ -932,24 +930,15 @@ pub(crate) fn declared(
             }
         }
         all.extend(pkgs.iter().filter_map(|p| kind.lock_key(p)));
-    };
-    absorb(&cfg.packages, only.is_none());
-    for (name, app) in &cfg.apps {
-        let mut merged = cfg.clone();
-        merged.merge_app(app.clone());
-        absorb(&merged.packages, only.is_none());
-        if only == Some(name.as_str()) {
-            absorb(&app.packages, true);
-        }
-    }
+    });
     Declared { trusted, all }
 }
 
 /// How many of this backend's declared packages are withheld for being untrusted — across the
 /// project baseline and each app's own overlay. A count only (the per-package reason is already
 /// warned on the launch path), so `sbx upgrade` does not read as "none declared" when an untrusted
-/// project declares one. Each app is counted on its **own** package list rather than on the merged
-/// overlay, so a baseline package is not re-counted once per app.
+/// project declares one. Which layers are counted, and what `--app` narrows that to, is
+/// [`super::packages::count_in_roll_layers`]'s rule.
 pub(crate) fn withheld(
     kind: &dyn Kind,
     cfg: &crate::config::Resolved,
@@ -960,20 +949,7 @@ pub(crate) fn withheld(
             .filter(|p| kind.lock_key(p).is_some() && p.state != crate::trust::TrustState::Trusted)
             .count()
     };
-    // Under `--app`, count exactly what that roll would have equipped and nothing else: its own
-    // layer, since [`declared`] leaves the baseline out of a narrowed roll set. Reporting the
-    // project's total here would attribute another app's withheld package to this roll.
-    match only {
-        Some(name) => cfg.apps.get(name).map_or(0, |app| untrusted(&app.packages)),
-        None => {
-            untrusted(&cfg.packages)
-                + cfg
-                    .apps
-                    .values()
-                    .map(|app| untrusted(&app.packages))
-                    .sum::<usize>()
-        }
-    }
+    super::packages::count_in_roll_layers(cfg, only, untrusted)
 }
 
 /// Whether the project (baseline or any app) declares a trusted `<backend>:resolve` package — so the
