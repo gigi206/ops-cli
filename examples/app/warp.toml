@@ -49,8 +49,9 @@
 #
 # UNVERIFIED: the device-code login itself and the authenticated conversation transport (both
 # need a real Warp account), the wire header for `WARP_API_KEY` (see the credentials section),
-# and in-cage BYOK (no system keyring — the CLI's own log reports
-# `no secret service provider or dbus session found`). VERIFIED live in this cage: the full
+# and in-cage BYOK (no system keyring here — this profile declares no bus, so the CLI's own log
+# reports `no secret service provider or dbus session found`; a cage with `dbus = true` does carry
+# a Secret Service, which is what the Electron profiles name with `--password-store=gnome-libsecret`). VERIFIED live in this cage: the full
 # bootstrap (download, payload validation, install) and the TUI launch — it starts, initializes
 # its server stack, loads its bundled skills, and logs its expected endpoints
 # (`app.warp.dev` + `wss://rtc.app.warp.dev/graphql/v2` + `wss://sessions.app.warp.dev`), with
