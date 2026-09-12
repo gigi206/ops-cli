@@ -129,7 +129,12 @@ NODE_USE_ENV_PROXY = "1"
 # release metadata JSON lists the signed `.tar.gz` under `releases[].url`, and the command extracts
 # that URL directly rather than reconstructing a path. `curl -fsSL` fails closed on an HTTP error,
 # `head -1` keeps a single URL, and sbx re-validates that it is an https `.tar.gz` before fetching.
+#
+# ARCHITECTURE: x64 only. The vendor serves no `metadata-linux-arm64-stable.json` (it answers 403),
+# so there is nothing to branch onto — the resolver says so rather than handing an aarch64 host an
+# x64 build it cannot run.
 [tarball.kiro]
 resolve = ["sh", "-c", '''
+case "$(uname -m)" in x86_64) ;; *) echo "kiro: the vendor publishes its Linux metadata for x64 only" >&2; exit 1 ;; esac
 curl -fsSL "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json" | grep -oE 'https://[^"]*kiro-ide-[^"]*-linux-x64\.tar\.gz' | head -1
 ''']

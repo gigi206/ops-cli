@@ -100,8 +100,13 @@ chromium = "nix:chromium"
 # `version` and `execution_id` from element [0] with base tools (no jq), and builds the download
 # URL on Google's official Edge CDN. `printf` rather than `echo`, so the URL carries no trailing
 # newline.
+#
+# ARCHITECTURE: x86_64 only. The CDN path carries the architecture, and the `linux-arm64` sibling
+# of the build it names answers 404 — Google publishes the Linux IDE for x86_64 alone. The resolver
+# stops on any other host rather than pinning bytes that cannot run there.
 [tarball.antigravity-ide]
 resolve = ["sh", "-c", '''
+case "$(uname -m)" in x86_64) ;; *) echo "antigravity-ide: Google publishes the Linux IDE for x86_64 only" >&2; exit 1 ;; esac
 api="https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases"
 data=$(curl -fsS "$api")
 ver=$(printf '%s' "$data" | grep -oE '"version":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
