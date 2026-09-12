@@ -84,10 +84,16 @@ const ENGINES: &[Engine] = &[
     Engine {
         feature_env: "CARGO_FEATURE_BUNDLED_BWRAP",
         src_env: "SBX_BUNDLED_BWRAP",
-        expected_sha: &[(
-            "x86_64",
-            "9c58a5a4e81e2295b235cd5179e948b758a430607befd446766665ebb46badaa",
-        )],
+        expected_sha: &[
+            (
+                "x86_64",
+                "9c58a5a4e81e2295b235cd5179e948b758a430607befd446766665ebb46badaa",
+            ),
+            (
+                "aarch64",
+                "23c6d1a87566847f0f89f0c524230c1e51e366c4cb001984f94a4aa73062d389",
+            ),
+        ],
         stem: "bundled_bwrap",
         bytes_const: "BWRAP_BIN",
         sha_const: "BWRAP_SHA256",
