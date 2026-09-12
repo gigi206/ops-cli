@@ -102,16 +102,16 @@ whole login closes inside the cage. `openwork` needs one step more: its sign-in 
 custom-scheme deep link, so its wrapper registers the app itself as that scheme's handler and
 the grant reaches the running instance.
 
-One entry in this table does not track upstream. `aionui` names a fixed release asset instead of the
-repository, because upstream stopped attaching assets to its releases after `v2.1.47-final`: the
-repository form resolves through the latest release, finds nothing to select, and the app can be
-neither launched nor upgraded. The pin keeps it runnable and freezes it there. The profile carries
-the trigger that removes the pin, which is upstream attaching a linux-amd64 `.deb` to a release
-again.
+`aionui` reaches its `.deb` somewhere other than a GitHub release. Upstream stopped attaching
+assets to its releases after `v2.1.47-final` and moved Linux distribution to its own release store,
+which is where the vendor's own site sends every download. The profile's `resolve` command reads the
+version off the release upstream still tags, composes that store's URL for the machine sbx runs on,
+and confirms the object is there before pinning it, so `sbx upgrade` rolls the app forward like
+every other entry here.
 
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
-| `aionui` | `deb:` pinned to `v2.1.47-final` (+ `nix:chromium`) | multi-provider (BYOK) |
+| `aionui` | `deb:resolve` against the vendor's release store (+ `nix:chromium`) | multi-provider (BYOK) |
 | `antigravity` | `tarball:resolve` (+ `nix:chromium`) | `cloudcode-pa.googleapis.com` (Google account) |
 | `claude-desktop` | `deb:apt:downloads.claude.ai/…` (+ `nix:chromium`) | `api.anthropic.com` / `claude.ai` (Anthropic account) |
 | `codex-desktop` | `deb:apt:persistent.oaistatic.com/…` (+ `nix:chromium`) | `chatgpt.com` / `api.openai.com` (ChatGPT account, or `OPENAI_API_KEY` BYOK) |

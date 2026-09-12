@@ -39,19 +39,20 @@
 # evaluating it host-side is safe), seeded into the store, and offline-reusable after the first
 # launch.
 #
-# THE PIN IS A HARD ONE, AND THIS IS THE LIMIT IT CARRIES. Every other `deb:` app in this catalogue
-# rolls forward on its own. This one cannot: the profile named the repository
-# (`deb:github:iOfficeAI/AionUi`), which resolves through the LATEST release's linux-amd64 asset,
-# and upstream stopped attaching assets to its releases. `v2.1.47-final` (2026-08-05) is the newest
-# release that carries a `.deb`; the eleven published since carry none at all, so the repository
-# form resolves to nothing and neither a launch nor an upgrade can provision the app. The direct
-# asset URL below is what keeps it runnable, at the cost of freezing it at that release.
+# WHERE THE `.deb` COMES FROM, and why it is not a GitHub release. Upstream stopped attaching assets
+# to its releases after `v2.1.47-final` (2026-08-05) — the ones published since carry none at all,
+# so `deb:github:iOfficeAI/AionUi` resolves to nothing. It did not stop publishing for Linux: it
+# moved distribution to its own release store at `static.aionui.com`, which is where the vendor's
+# site sends every download and which this profile already allows for the in-app update feed. The
+# `resolve` command at the end of this file reads the version off the release upstream tags,
+# composes that store's URL for the machine sbx runs on, and confirms the object is there before
+# handing it over, so a tagged release with no build published yet fails by name instead of pinning
+# a 404. `sbx upgrade --app aionui` re-runs it and rolls the app forward like every other `deb:`
+# app in this catalogue.
 #
-# UPGRADES — none, until upstream resumes. `sbx upgrade --app aionui` re-resolves this URL and finds the
-# same bytes, so the pin never moves. THE TRIGGER THAT REMOVES THE HARD PIN: upstream attaches a
-# linux-amd64 `.deb` to a release again, at which point the declaration goes back to
-# `deb:github:iOfficeAI/AionUi` and rolls forward on its own with no other change. Check with
-# `curl -s https://api.github.com/repos/iOfficeAI/AionUi/releases/latest | grep -c '\.deb'`.
+# WHAT THE STORE DOES NOT CARRY. It is plain HTTPS pinned by content hash on first use, exactly like
+# the GitHub release asset it replaces, and unlike the `deb:apt:` pools whose signed `InRelease` sbx
+# verifies. The resolver buys a current version, not a stronger chain.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
@@ -202,9 +203,8 @@ http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-stor
 https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=gnome-libsecret", "--no-first-run", "--no-default-browser-check"]
 
 [packages]
-# Pinned to the newest release that still carries a linux-amd64 `.deb` — see "THE PIN IS A HARD ONE"
-# above for why, and for the trigger that puts `deb:github:iOfficeAI/AionUi` back here.
-aionui = "deb:https://github.com/iOfficeAI/AionUi/releases/download/v2.1.47-final/AionUi-2.1.47-linux-amd64.deb"
+# The vendor's own release store, read at resolve time — see "WHERE THE `.deb` COMES FROM" above.
+aionui = "deb:resolve"
 
 # In-cage Chromium for the OAuth/login flow (see the `[open]` table above). HEAVY — pulls a large
 # nixpkgs closure into the project store on first launch. Drop this (and the table) if you only use
@@ -278,3 +278,23 @@ mute = [
 # provider's key host-side and keep it out of the cage entirely, add a `[secret."<host>"]` block +
 # an in-cage placeholder like the `codex`/`cline` CLI profiles — but AionUi's multi-key GUI is the
 # intended path.)
+
+# The `deb:resolve` command for the `aionui` package above. sbx runs it in a hermetic sandbox (base
+# tools only, host network to reach the vendor) and pins the `.deb` URL it prints with its content
+# hash; a warm launch reuses that pin offline and never re-runs this.
+#
+# The version comes off the release upstream tags — the tags keep coming, only the assets stopped —
+# with its leading `v` removed, because the store spells the version bare. The architecture follows
+# the vendor's own naming (`amd64`/`arm64`), and an architecture it does not build is refused by
+# name rather than composing a URL that 404s later. The final check is what separates "upstream has
+# not published this version for Linux yet" from "sbx pinned something that is not there": the
+# store is asked for the object before the URL is handed over.
+[deb.aionui]
+resolve = ["sh", "-c", '''
+case "$(uname -m)" in x86_64) a=amd64 ;; aarch64) a=arm64 ;; *) echo "aionui: the vendor publishes no $(uname -m) build" >&2; exit 1 ;; esac
+v=$(curl -fsSL https://api.github.com/repos/iOfficeAI/AionUi/releases/latest | jq -r .tag_name | sed 's/^v//')
+[ -n "$v" ] && [ "$v" != null ] || { echo "aionui: the vendor named no current version" >&2; exit 1; }
+u="https://static.aionui.com/releases/$v/AionUi-$v-linux-$a.deb"
+curl -fsS -o /dev/null -I "$u" || { echo "aionui: release $v carries no linux-$a build in the vendor store" >&2; exit 1; }
+printf '%s' "$u"
+''']
