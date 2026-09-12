@@ -2728,6 +2728,13 @@ pub(super) fn build(
     // cage with no device to enumerate. The store half of that same answer is bound in
     // `gpu_binds`, beside the WSL bridge libraries it is inert without.
     // Deduped: a trusted `[devices] allow = [...]` alongside `gpu = true` must not emit a bind twice.
+    // The rule stops here and does not carry over to the `ExtraBind` list, which is not an
+    // oversight: a device grant is a set of paths, so two entries naming one path are the same
+    // request, while a bind is a path *and* a mode, so two entries naming one destination may be
+    // two different requests and dropping either would silently pick a mode for the caller. Two
+    // byte-identical binds do stack — `--gpu` beside an explicit `--bind` of the same directory is
+    // the reachable case — and a read-only mount laid over itself grants nothing the first did
+    // not.
     let mut devices = prep.cfg.devices.clone();
     if prep.cfg.gpu {
         let nvidia_nodes = hw.nvidia.iter().flat_map(|nv| nv.devices.iter().cloned());
