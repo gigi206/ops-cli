@@ -290,6 +290,32 @@ pub(crate) fn host_sockets(runtime_dir: Option<&str>, is_wsl: bool) -> Vec<PathB
     out
 }
 
+/// What to say when [`host_sockets`] named candidates and none of them existed.
+///
+/// Built from the very list that was searched rather than from a literal, so it can neither name a
+/// path this launch did not try nor omit one it did. The two spellings each carried a hand-written
+/// sentence before, and a third candidate added to the search would have left both saying something
+/// false with nothing to catch it.
+///
+/// An empty list is its own answer, and a different fact from having looked and found nothing: a
+/// host with no `$XDG_RUNTIME_DIR`, off WSL, is told there was nothing to look for rather than being
+/// sent to a path that was never a candidate.
+pub(crate) fn no_socket_warning(candidates: &[PathBuf]) -> String {
+    if candidates.is_empty() {
+        return "`audio = true` but there was no PulseAudio socket to look for: \
+                `XDG_RUNTIME_DIR` is unset and this host is not WSL — the app runs without audio"
+            .to_string();
+    }
+    let named = candidates
+        .iter()
+        .map(|p| format!("`{}`", p.display()))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    format!(
+        "`audio = true` but no PulseAudio socket was found at {named} — the app runs without audio"
+    )
+}
+
 /// The audio env: always point clients at the bound socket (`PULSE_SERVER`); and, when the userspace
 /// was provisioned, add the client libraries to the loader path (`LD_LIBRARY_PATH`) and point ALSA at
 /// its base config (`ALSA_CONFIG_DIR`) and the pulse plugin (`ALSA_PLUGIN_DIR`). Pure over the layer
@@ -405,6 +431,68 @@ mod tests {
         );
         // A WSL shell with no runtime dir still reaches Windows' own socket.
         assert_eq!(host_sockets(None, true), vec![PathBuf::from(WSLG_SOCK)]);
+    }
+
+    /// The warning names every path the search tried, and no path it did not.
+    ///
+    /// This is the guard the two hand-written sentences could not have: a candidate added to
+    /// [`host_sockets`] and forgotten in the message fails here rather than shipping a warning that
+    /// sends a reader to the wrong place — or omits the only place their socket could have been.
+    #[test]
+    fn the_warning_names_what_was_searched_and_nothing_else() {
+        for (dir, wsl) in [
+            (Some("/run/user/1000"), false),
+            (Some("/run/user/1000"), true),
+            (None, true),
+            (None, false),
+            (Some(""), true),
+        ] {
+            let candidates = host_sockets(dir, wsl);
+            let msg = no_socket_warning(&candidates);
+            for p in &candidates {
+                assert!(
+                    msg.contains(&p.display().to_string()),
+                    "for {dir:?}/{wsl} the warning omits `{}`, a path the search tried: {msg}",
+                    p.display()
+                );
+            }
+            assert_eq!(
+                msg.contains(WSLG_SOCK),
+                candidates.iter().any(|p| p.as_os_str() == WSLG_SOCK),
+                "for {dir:?}/{wsl} WSLg's path is named exactly when it was searched: {msg}"
+            );
+        }
+    }
+
+    /// Two candidates are offered as alternatives, one is offered alone, and none is its own answer.
+    ///
+    /// "Nothing was searched" and "everything searched came up empty" are different facts, and a
+    /// reader acts on them differently: the first is a host that publishes no runtime dir, the
+    /// second a socket that is genuinely not there.
+    #[test]
+    fn the_warning_tells_an_empty_search_from_a_fruitless_one() {
+        let both = no_socket_warning(&host_sockets(Some("/run/user/1000"), true));
+        assert!(
+            both.contains("`/run/user/1000/pulse/native` or `/mnt/wslg/runtime-dir/pulse/native`"),
+            "both candidates are offered as alternatives: {both}"
+        );
+
+        let one = no_socket_warning(&host_sockets(Some("/run/user/1000"), false));
+        assert!(one.contains("`/run/user/1000/pulse/native`"), "{one}");
+        assert!(
+            !one.contains(" or "),
+            "a lone candidate is not offered as a choice: {one}"
+        );
+
+        let none = no_socket_warning(&host_sockets(None, false));
+        assert!(
+            none.contains("no PulseAudio socket to look for"),
+            "an empty search says so rather than naming a path: {none}"
+        );
+        assert!(
+            !none.contains("pulse/native"),
+            "and names no path at all: {none}"
+        );
     }
 
     #[test]

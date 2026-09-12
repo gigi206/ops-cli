@@ -2005,14 +2005,11 @@ fn audio_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
         // Under WSL the audio host is Windows: `$XDG_RUNTIME_DIR/pulse/native` is a symlink WSLg
         // drops, so it is absent before the first WSLg client and on a distro that never publishes
         // it. `host_sockets` backs that path with the one Windows actually serves.
-        let is_wsl = crate::sandbox::wsl::host_is_wsl();
-        let host_socket = crate::sandbox::audio::host_sockets(
+        let candidates = crate::sandbox::audio::host_sockets(
             std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
-            is_wsl,
-        )
-        .into_iter()
-        .find(|p| p.exists());
-        match host_socket {
+            crate::sandbox::wsl::host_is_wsl(),
+        );
+        match candidates.iter().find(|p| p.exists()).cloned() {
             Some(sock) => {
                 // The socket bind + `PULSE_SERVER` are firm (independent of the userspace provision);
                 // the client libraries, the ALSA→pulse shim's `asound.conf`, and its env are added
@@ -2047,17 +2044,9 @@ fn audio_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
                     &prep.userland.foreign_lib_paths,
                 ));
             }
-            // Name every path that was tried, so a WSL host is not told to look at a runtime dir
-            // its audio never lived in.
-            None if is_wsl => crate::diag::warn(
-                "`audio = true` but no PulseAudio socket was found at \
-                 `$XDG_RUNTIME_DIR/pulse/native` or `/mnt/wslg/runtime-dir/pulse/native` — \
-                 the app runs without audio",
-            ),
-            None => crate::diag::warn(
-                "`audio = true` but no PulseAudio socket was found at \
-                 `$XDG_RUNTIME_DIR/pulse/native` — the app runs without audio",
-            ),
+            // Named from the list that was searched, so a WSL host is not sent to a runtime dir its
+            // audio never lived in, and no host is sent to a path this launch never tried.
+            None => crate::diag::warn(&crate::sandbox::audio::no_socket_warning(&candidates)),
         }
     }
 
