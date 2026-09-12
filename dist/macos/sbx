@@ -1,0 +1,72 @@
+#!/bin/sh
+# sbx on a Mac: run the guest's sbx from a macOS shell, with the working directory carried over.
+#
+# sbx itself is a Linux program and stays one. This removes the friction of reaching it: an
+# instance that is stopped is started, the directory you are standing in becomes the directory
+# the cage is built around, and the three ways that can go wrong say so instead of failing
+# obscurely.
+#
+# NOT MEASURED. This has not been run against a Mac or a booted instance. What it asserts about
+# limactl comes from reading Lima's source, not from watching it work.
+
+set -eu
+
+: "${SBX_LIMA_INSTANCE:=sbx}"
+: "${LIMACTL:=limactl}"
+
+# How old a guest's sbx may get before the staleness note is printed. The release this guest
+# installs from is rolling, and Lima re-runs provisioning on restart, so a restart is what
+# converges the two; this only says when that is worth doing.
+: "${SBX_LIMA_STALE_DAYS:=14}"
+
+if ! command -v "$LIMACTL" >/dev/null 2>&1; then
+  printf 'sbx: %s is not on PATH\n' "$LIMACTL" >&2
+  printf '     install Lima (`brew install lima`), then create the guest with\n' >&2
+  printf '     `limactl create --name %s dist/macos/sbx.yaml`\n' "$SBX_LIMA_INSTANCE" >&2
+  exit 1
+fi
+
+# `limactl shell` errors out on a stopped instance unless it is told otherwise, and it only asks
+# interactively when it has a tty. `--start` is what makes a stopped guest a warm one rather
+# than an error, and it is the whole of the friction this wrapper exists to remove.
+#
+# `--workdir` is deliberately not used. Lima runs `cd <workdir> || exit 1` when it is set and
+# `cd <host cwd> || cd <guest home>` when it is not, and that second fallback is silent: a
+# directory the guest cannot see would land the shell in the guest's home, where `sbx run` would
+# build a cage around the wrong tree without a word. The cd is done below instead, so the
+# failure is named.
+exec "$LIMACTL" shell --start "$SBX_LIMA_INSTANCE" sh -c '
+  dir=$1; stale_days=$2; inst=$3; shift 3
+
+  if ! cd "$dir" 2>/dev/null; then
+    printf "sbx: %s is not visible inside the %s guest\n" "$dir" "$inst" >&2
+    printf "     the guest mounts one subtree of your home and nothing else, which is what\n" >&2
+    printf "     keeps the rest of the Mac out of every cage it builds\n" >&2
+    printf "     move the project under that subtree, or recreate the guest naming yours:\n" >&2
+    printf "       limactl delete %s && limactl create --name %s --param projects=<dir> dist/macos/sbx.yaml\n" "$inst" "$inst" >&2
+    exit 1
+  fi
+
+  if ! command -v sbx >/dev/null 2>&1; then
+    printf "sbx: the %s guest has no sbx installed\n" "$inst" >&2
+    printf "     provisioning installs it, so this means provisioning did not finish:\n" >&2
+    printf "       limactl stop %s && limactl start %s\n" "$inst" "$inst" >&2
+    printf "     and read the provisioning output rather than retrying through this wrapper\n" >&2
+    exit 1
+  fi
+
+  # The guest and the release it came from drift apart while the guest keeps running, because
+  # the release is rewritten on every push and provisioning only re-runs on restart. Said here,
+  # once, on stderr: it is a note about the guest, never a reason to refuse a command.
+  stamp=/usr/local/lib/sbx/installed.date
+  if [ -r "$stamp" ]; then
+    then_s=$(date -d "$(cat "$stamp")" +%s 2>/dev/null || echo "")
+    now_s=$(date +%s)
+    if [ -n "$then_s" ] && [ $(( (now_s - then_s) / 86400 )) -ge "$stale_days" ]; then
+      printf "sbx: this guest installed sbx on %s, and the published build has moved since\n" "$(cat "$stamp")" >&2
+      printf "     restarting converges it: limactl stop %s && limactl start %s\n" "$inst" "$inst" >&2
+    fi
+  fi
+
+  exec sbx "$@"
+' _ "$PWD" "$SBX_LIMA_STALE_DAYS" "$SBX_LIMA_INSTANCE" "$@"
