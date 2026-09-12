@@ -159,6 +159,94 @@ fn stop_all_with_no_sessions_is_a_no_op_success() {
 }
 
 /// Run `sbx <args>` to completion in `project` with isolated data/state, returning its output.
+#[test]
+fn stop_takes_the_name_the_listing_leads_with() {
+    // The defect: `session ls` printed NAME in its first column, `session stop` matched only the
+    // pid, and its refusal sent the reader back to the listing they had copied the name from.
+    // The unit tests cover the predicate; this one covers the wiring, because the predicate was
+    // right in four places that each had their own copy of the comparison.
+    let project = TmpDir::prefixed("s", "byname-proj");
+    let data = TmpDir::prefixed("s", "byname-data");
+    let state = TmpDir::prefixed("s", "byname-state");
+    let _sweep = FingerprintCleanup(vec!["4172"]);
+
+    if !sandbox_probe(project.path(), data.path(), state.path())
+        .status
+        .success()
+    {
+        skip_incapable!("skipping stop-by-name e2e: host cannot sandbox");
+        return;
+    }
+
+    let started = sbx_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--detach", "--", "sleep", "4172"],
+    );
+    assert!(
+        started.status.success(),
+        "the detached run must start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let Some(pid) = parse_detach_pid(&started.stderr) else {
+        skip_incapable!("skipping stop-by-name e2e: the detached run printed no session pid");
+        return;
+    };
+    if wait_for_session(data.path(), pid, Instant::now() + Duration::from_secs(20)).is_none() {
+        skip_incapable!("skipping stop-by-name e2e: the session never registered");
+        return;
+    }
+
+    // The name as the operator reads it: the first column of the listing's one data row.
+    let listed = sbx_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["session", "ls"],
+    );
+    let text = String::from_utf8_lossy(&listed.stdout).to_string();
+    let name = text
+        .lines()
+        .find(|l| l.contains(&pid.to_string()))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("the listing must carry a row for the session it just registered")
+        .to_string();
+    assert!(
+        name.starts_with("sbx-"),
+        "the first column must be the cage name: {name}"
+    );
+
+    let stopped = sbx_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["session", "stop", "--delay", "0", &name],
+    );
+    assert!(
+        stopped.status.success(),
+        "stop must accept the name its own listing leads with, got: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&stopped.stderr).contains("no live session"),
+        "the name must resolve, not be refused: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    let after = sbx_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["session", "ls"],
+    );
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("no active"),
+        "the session must be gone after a stop by name: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+}
+
 fn sbx_run(project: &Path, data: &Path, state: &Path, args: &[&str]) -> std::process::Output {
     sbx()
         .args(args)

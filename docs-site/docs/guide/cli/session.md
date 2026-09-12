@@ -22,12 +22,16 @@ See also: [Sessions](../housekeeping/sessions) · [`sbx projects`](projects) · 
 ## Which session a command acts on
 
 `sbx session ls` is the machine inventory: every live session, whatever project started it, with its
-PID and its project beside it. That is where a PID comes from, and it is what lets the rest of the
-CLI narrow to one project without losing reach.
+NAME, its PID and its project beside it. That is where an id comes from, and it is what lets the
+rest of the CLI narrow to one project without losing reach. Either column names a session for the
+verbs that address one: [`attach`](#attach), [`stop`](#stop), [`logs`](#logs) and the
+[`sbx proc`](proc) family take the NAME the listing leads with
+as readily as the PID it carries further along. A `--session <id>` elsewhere, such as
+[`sbx task`](task)'s, still wants the PID.
 
 Three rules, and each verb follows the one that fits it:
 
-| The command | With no id | With a PID |
+| The command | With no id | With an id |
 |---|---|---|
 | resolves **one** session ([`sbx logs`](logs) and its per-lens siblings, [`sbx proc ls`](proc), [`sbx proc live`](proc)) | this project's sole live session, or (the `logs` views) its records | that live session, whatever project it belongs to |
 | loads a **live rule** ([`sbx net allow`](net), [`sbx proc deny`](proc), [`sbx proc rules`](proc)) | this project's sessions; `--all` widens to every project | not taken |
@@ -62,8 +66,9 @@ sbx session ls
 # sbx-web    shell         foreground  12377   1m   /home/me/web
 ```
 
-The `PID` column is the `<id>` used by `sbx session attach <id>`, `sbx session logs <id>` and
-`sbx session stop <id>`.
+The `NAME` and `PID` columns are both the `<id>` used by `sbx session attach <id>`,
+`sbx session logs <id>` and `sbx session stop <id>`. A name is the friendlier of the two to type
+and the one the listing shows first; a PID is what a script already holds.
 
 `--json` emits the same listing as a document, which is what a script wants: it carries the
 registry's own values rather than this table's, so the age is a number of seconds instead of `2m`
@@ -100,7 +105,7 @@ hundred detached launches.
 
 | Operand / flag | Meaning |
 |---|---|
-| `<id>` | the PID reported when the session was detached (required) |
+| `<id>` | the session's NAME, or the PID reported when it was detached (required) |
 | `-f`, `--follow` | keep streaming until the session exits |
 | `-n, --lines <N>` | show only the last N lines of the initial listing |
 | `--all` | show every session that wrote to this log, not just the most recent |

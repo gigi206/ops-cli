@@ -151,15 +151,12 @@ fn resolve_session_target<'a>(
     project: &Path,
 ) -> Result<&'a session::Session, ExitCode> {
     match id {
-        Some(id) => sessions
-            .iter()
-            .find(|s| s.pid.to_string() == id)
-            .ok_or_else(|| {
-                diag::error(&format!(
-                    "sbx: {verb}: no live session '{id}' — run `sbx session ls` to list them."
-                ));
-                ExitCode::from(2)
-            }),
+        Some(id) => sessions.iter().find(|s| s.answers_to(id)).ok_or_else(|| {
+            diag::error(&format!(
+                "sbx: {verb}: no live session '{id}' — run `sbx session ls` to list them."
+            ));
+            ExitCode::from(2)
+        }),
         None => match sessions_of_project(sessions, project).as_slice() {
             [one] => Ok(one),
             [] => {

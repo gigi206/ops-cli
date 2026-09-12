@@ -188,6 +188,23 @@ impl Session {
         }
     }
 
+    /// Whether `id` names this session, by either of the two things a listing shows for it.
+    ///
+    /// `sbx session ls` leads with NAME, the cage's own `sbx-<slug>`, and carries PID further
+    /// along. A verb that took only the pid refused the column its own listing put first, and
+    /// answered by pointing back at that listing — so the operator read the name, was told no
+    /// such session existed, and was sent to the place they had just read it from.
+    ///
+    /// The name is derived rather than stored: it is what [`crate::sandbox::cage_name`] makes of
+    /// this session's app and project, which is the same call the listing renders. Deriving it in
+    /// one place is what keeps the two from drifting into naming a session differently.
+    ///
+    /// A pid is unique among live processes and a cage name is unique among live cages, so this
+    /// stays a 0-or-1 match either way.
+    pub(crate) fn answers_to(&self, id: &str) -> bool {
+        self.pid.to_string() == id || crate::sandbox::cage_name(self.app(), &self.project) == id
+    }
+
     /// Stop this session's process: SIGTERM, then SIGKILL if it has not exited within `grace`.
     ///
     /// Signalling goes through a **pidfd**, not a bare pid, for two reasons that matter here. A
@@ -907,6 +924,46 @@ mod tests {
     /// the caller may signal — so the pid reads as **live** — and which `pidfd_open` refuses with
     /// `EINVAL`, the errno that now means "could not look", not "gone".
     const PID_ABOVE_CEILING: u32 = 1 << 30;
+
+    #[test]
+    fn a_session_answers_to_the_name_its_listing_leads_with_and_to_its_pid() {
+        // The defect this pins: `sbx session ls` printed NAME first, every addressing verb took
+        // only the pid, and the refusal sent the reader back to the listing they had just copied
+        // the name from.
+        let s = session_at("/home/me/web", 12377, 7, Kind::Shell);
+        let name = crate::sandbox::cage_name(s.app(), &s.project);
+
+        assert!(s.answers_to("12377"), "the pid has always named a session");
+        assert!(
+            s.answers_to(&name),
+            "the name the listing leads with must name it too: {name}"
+        );
+
+        for stranger in ["12378", "sbx-other", "", "sbx-", &name[..name.len() - 1]] {
+            assert!(
+                !s.answers_to(stranger),
+                "nothing else may match, including a prefix of the name: {stranger}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_app_session_answers_to_the_name_its_app_gives_it() {
+        // A cage name folds in the app, so an app session and a plain one in the same project do
+        // not answer to each other's name. Two sessions, one project, one pid apart.
+        let mut app = session_at("/home/me/web", 12378, 8, Kind::Shell);
+        app.runtime = SessionRuntime::GlobalApp("demo".to_string());
+        let plain = session_at("/home/me/web", 12377, 7, Kind::Shell);
+
+        let app_name = crate::sandbox::cage_name(app.app(), &app.project);
+        let plain_name = crate::sandbox::cage_name(plain.app(), &plain.project);
+        assert_ne!(
+            app_name, plain_name,
+            "the two must not share a name, or addressing by name would be ambiguous"
+        );
+        assert!(app.answers_to(&app_name) && !app.answers_to(&plain_name));
+        assert!(plain.answers_to(&plain_name) && !plain.answers_to(&app_name));
+    }
 
     fn session_at(project: &str, pid: u32, start: u64, kind: Kind) -> Session {
         Session {

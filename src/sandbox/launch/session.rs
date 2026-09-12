@@ -91,9 +91,10 @@ pub(crate) fn attach(id: &str, cmd: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // A pid is unique among live processes, so this is a 0-or-1 match. Resolve the target before
-    // the terminal check, so an unknown id is reported even without a tty.
-    let Some(target) = sessions.into_iter().find(|s| s.pid.to_string() == id) else {
+    // A pid is unique among live processes and a cage name among live cages, so this is a 0-or-1
+    // match whichever of the two the listing's reader typed. Resolve the target before the
+    // terminal check, so an unknown id is reported even without a tty.
+    let Some(target) = sessions.into_iter().find(|s| s.answers_to(id)) else {
         crate::diag::error(&format!(
             "sbx session attach: no live session '{id}' — run `sbx session ls` to list them."
         ));
@@ -389,7 +390,7 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let mut any_missing = false;
     let mut any_unstopped = false;
     for id in ids {
-        let Some(target) = sessions.iter().find(|s| s.pid.to_string() == *id) else {
+        let Some(target) = sessions.iter().find(|s| s.answers_to(id)) else {
             crate::diag::error(&format!(
                 "sbx session stop: no live session '{id}' — run `sbx session ls` to list them."
             ));

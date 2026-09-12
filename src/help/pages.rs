@@ -490,7 +490,7 @@ pub(super) const PAGES: &[Page] = &[
         details: "Shows the tree of processes the agent has spawned inside the cage, read host-side from\n\
             `/proc` — the launcher (or bubblewrap on the exec path) is the root, and every cage\n\
             process is one of its descendants. No privilege, no cage cooperation, no launch. With no\n\
-            id this project's sole live session is used; otherwise name one by its PID, which\n\
+            id this project's sole live session is used; otherwise name one by the NAME or PID\n\
             `sbx session ls` shows for every project.",
     },
     Page {
@@ -517,7 +517,7 @@ pub(super) const PAGES: &[Page] = &[
             see processes start and finish in real time. Requires a terminal; `--json` streams one\n\
             snapshot per tick and works in a pipe. Read-only and host-side — it just polls `/proc`.\n\
             With no id this project's sole live session is used, the same scope `sbx proc logs`\n\
-            resolves; otherwise name one by its PID, which `sbx session ls` shows for every\n\
+            resolves; otherwise name one by the NAME or PID `sbx session ls` shows for every\n\
             project.",
     },
     Page {
@@ -544,7 +544,7 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             It is the way to watch an observed session from another terminal — and the only way to\n\
             watch a detached (`--detach`) one, which has no terminal for the inline feed. With no id\n\
-            this project's sole live session is used; otherwise name one by its PID.\n\
+            this project's sole live session is used; otherwise name one by its NAME or PID.\n\
             \n\
             A session that has **ended** is read too, when it ran under `[observe] record` — its\n\
             events are on disk rather than in the supervisor's memory. With none of this project's\n\
@@ -949,7 +949,7 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             It is the way to watch an observed session from another terminal — and the only way to\n\
             watch a detached (`--detach`) one. With no id this project's sole live session is used;\n\
-            otherwise name one by its PID.\n\
+            otherwise name one by its NAME or PID.\n\
             \n\
             Scope: only the project tree is watched. The per-project nix store and the app home are\n\
             excluded as provisioning/state noise, build/VCS/vendor trees (`.git`, `node_modules`,\n\
@@ -1403,7 +1403,10 @@ pub(super) const PAGES: &[Page] = &[
         synopsis: "sbx session attach <id> [-- command [args...]]",
         summary: "run a shell or a command inside a running session's live cage",
         options: &[
-            ("<id>", "the PID `sbx session ls` shows for the session"),
+            (
+                "<id>",
+                "the NAME or the PID `sbx session ls` shows for the session",
+            ),
             (
                 "-- command [args...]",
                 "run this command in the cage instead of an interactive shell",
@@ -1427,7 +1430,7 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>...",
-                "the PIDs `sbx session ls` shows for the sessions to stop",
+                "the NAME or the PID `sbx session ls` shows, for each session to stop",
             ),
             (
                 "--all",

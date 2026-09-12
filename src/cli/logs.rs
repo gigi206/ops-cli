@@ -195,7 +195,7 @@ fn resolve_source(
     project: &str,
 ) -> Result<Source, ExitCode> {
     if let Some(id) = id {
-        if let Some(live) = sessions.iter().find(|s| s.pid.to_string() == id) {
+        if let Some(live) = sessions.iter().find(|s| s.answers_to(id)) {
             return Ok(Source::Live {
                 pid: live.pid,
                 header: format!(
