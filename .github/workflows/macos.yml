@@ -1,0 +1,225 @@
+# macOS — proves the cage runs in a Lima guest on a Mac, and says clearly when no Mac answered.
+#
+# WHAT PROBLEM THIS SOLVES. sbx rests on capability-bearing unprivileged user namespaces and
+# `doctor` hard-fails rather than emulating when they are absent, so macOS is not a host it runs
+# on: it is a host it is reached from, through a Linux guest, the same way Windows is. Nothing in
+# that arrangement is exercised by any other workflow here, and all of it can rot without a commit
+# in this repository: Lima changes, the VZ driver changes, the image the template boots changes,
+# and the rolling release the guest installs from is rewritten on every push.
+#
+# WHAT THIS RUN ASSERTS. That `dist/macos/sbx.yaml` still produces a guest whose user namespaces
+# carry capabilities, that `dist/macos/sbx` still reaches it from a Mac shell with the working
+# directory carried over, and that the Mac's own filesystem is absent from the cage the guest
+# builds. The preflight assertion is in two halves and the order matters: `doctor`'s exit status
+# first, then the evidence line. `doctor` prints "capability-bearing" on its success line, on its
+# cannot-prove line, and on the line that blames bubblewrap for a failed launch, and its
+# remediation text contains the phrase too. Grepping for it alone would read a red as a green.
+#
+# WHAT IS DELIBERATELY NOT ASSERTED. The window. `video.display: vz` opens a native macOS window
+# showing the guest's whole screen, and a runner has no one looking at it: an arm added here would
+# start a compositor, watch it exit zero, and prove nothing about whether anything was drawn. The
+# GPU is not asserted either, and that one is not a gap to be closed: `vz` provides no GPU to the
+# guest at all, and the scope this template commits to is CLI plus GUI.
+#
+# WHY THE FIRST JOB EXISTS. `runs-on: [self-hosted, macOS]` matches nothing until someone registers
+# a runner, and GitHub leaves a job whose labels nothing answers queued rather than failing it, for
+# far longer than a CI signal is useful. A workflow that hangs instead of reporting is the silent
+# skip this repository refuses elsewhere, so the job below watches for the arm being picked up and
+# fails the run by name when it is not.
+
+name: macos
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, an hour after `wsl`. Lima, the VZ driver, the guest image and the release the guest
+    # installs from all move underneath this without a commit here.
+    - cron: "0 5 * * 1"
+  push:
+    paths:
+      - .github/workflows/macos.yml
+      - dist/macos/**
+
+permissions:
+  contents: read
+  # The guard job reads this run's own jobs to see whether the macOS arm was picked up.
+  actions: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runner:
+    name: a macOS runner must answer, or this run says so
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: Fail by name if the macOS arm is never picked up
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Polls until the acceptance job leaves `queued`, so this costs seconds when a runner
+          # exists and bounded minutes when none does. An API that does not answer is reported
+          # rather than treated as either verdict: the two causes are told apart at the end.
+          deadline=$(( $(date +%s) + 15 * 60 ))
+          seen=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            status=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+              --jq '.jobs[] | select(.name | contains("Lima guest")) | .status' 2>/dev/null || true)
+            case "$status" in
+              "")
+                echo "::notice::the jobs API did not name the acceptance job yet"
+                ;;
+              queued)
+                seen="queued"
+                ;;
+              *)
+                echo "the macOS arm reached '$status': a runner answered"
+                exit 0
+                ;;
+            esac
+            sleep 30
+          done
+          if [ "$seen" = "queued" ]; then
+            echo "no runner labelled 'self-hosted, macOS' picked the acceptance job up within 15" >&2
+            echo "minutes, so it is still queued and this run would otherwise hang rather than" >&2
+            echo "report; register a macOS runner with those labels, or run this workflow only" >&2
+            echo "when one is attached" >&2
+          else
+            echo "the jobs API never reported the acceptance job's status, so whether a runner" >&2
+            echo "answered is unknown; this fails rather than passing on something it did not see" >&2
+          fi
+          exit 1
+
+  acceptance:
+    name: exercise the cage in a Lima guest
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Report what this host can do
+        # The report is written whatever happens next, so a failing assertion below lands beside
+        # the platform it failed on rather than beside a guess about it.
+        run: |
+          set -uo pipefail
+          {
+            echo "### host"
+            echo
+            echo '```'
+            sw_vers 2>/dev/null || true
+            echo "arch: $(uname -m)"
+            limactl --version 2>/dev/null || echo "limactl: absent"
+            echo '```'
+          } | tee "$HOME/summary.md"
+          command -v limactl >/dev/null 2>&1 || {
+            echo "this runner has no limactl, and the guest is the whole of what is measured here"
+            exit 1
+          }
+
+      - name: Create the guest from the template this repository ships
+        run: |
+          set -euo pipefail
+          # A project under the host home, named by the same parameter a user would pass, so the
+          # mount this exercises is the one the template documents rather than a CI-only shape.
+          mkdir -p "$HOME/ci-projects/project"
+          # Two witnesses for the absence assertions further down, both written rather than
+          # assumed: a path that does not exist on the host is "absent" from the cage trivially,
+          # which would make that assertion pass while measuring nothing.
+          #   - inside the mount but outside the project: the guest sees it, the cage must not.
+          #   - outside the mount: neither the guest nor the cage may see it.
+          echo "witness" > "$HOME/ci-projects/beside-the-project"
+          echo "witness" > "$HOME/outside-the-mount"
+          limactl delete --force sbx-ci 2>/dev/null || true
+          limactl create --tty=false --name sbx-ci --param projects=ci-projects \
+            "$GITHUB_WORKSPACE/dist/macos/sbx.yaml"
+          limactl start --tty=false sbx-ci
+
+      - name: The preflight must pass inside the guest
+        run: |
+          set -uo pipefail
+          cd "$HOME/ci-projects/project"
+          "$GITHUB_WORKSPACE/dist/macos/sbx" doctor 2>&1 | tee "$HOME/doctor.txt"
+          status=${PIPESTATUS[0]}
+          {
+            echo "### doctor"
+            echo
+            echo '```'
+            cat "$HOME/doctor.txt"
+            echo '```'
+          } >> "$HOME/summary.md"
+          [ "$status" -eq 0 ] || { echo "doctor exited $status"; exit 1; }
+          # The boundary itself, which never degrades. Checked only after the exit status above,
+          # because three of doctor's lines carry this phrase and two of them are failures.
+          grep -q "capability-bearing" "$HOME/doctor.txt" \
+            || { echo "doctor passed without proving capability-bearing namespaces"; exit 1; }
+
+      - name: A real cage must launch, as the sandbox user, in the directory the Mac stood in
+        # The preflight is not the product. This also proves the wrapper carried the working
+        # directory across: `sbx run` builds the cage around the cwd, so a wrapper that silently
+        # landed in the guest home would report a different project here.
+        run: |
+          set -uo pipefail
+          cd "$HOME/ci-projects/project"
+          "$GITHUB_WORKSPACE/dist/macos/sbx" run -- sh -c 'id; pwd' 2>&1 | tee "$HOME/run.txt"
+          status=${PIPESTATUS[0]}
+          {
+            echo "### a real cage launch"
+            echo
+            echo '```'
+            cat "$HOME/run.txt"
+            echo '```'
+          } >> "$HOME/summary.md"
+          [ "$status" -eq 0 ] || { echo "the launch exited $status"; exit 1; }
+          grep -q "uid=$(id -u)(sandbox)" "$HOME/run.txt" \
+            || { echo "the cage did not report the sandbox name on the caller's uid"; exit 1; }
+          grep -q "$HOME/ci-projects/project" "$HOME/run.txt" \
+            || { echo "the cage was not built around the directory the Mac stood in"; exit 1; }
+
+      - name: The Mac's filesystem must be absent from the cage
+        # Confidentiality by absence is the model. The guest mounts one subtree of the host home,
+        # so everything else on the Mac has two chances to leak: it can be visible to the guest, or
+        # visible to the cage the guest builds. Both are asked here.
+        run: |
+          set -uo pipefail
+          cd "$HOME/ci-projects/project"
+          # Asked as a predicate the cage answers, so the verdict is a word rather than a phrase:
+          # an error mentioning the path would satisfy a text match while meaning the opposite.
+          # Three branches, not two: a launch that never ran also exits non-zero, and reading that
+          # as "the path is absent" would turn a broken probe into a passing assertion.
+          probe() {
+            "$GITHUB_WORKSPACE/dist/macos/sbx" run -- \
+              sh -c "if [ -e '$1' ]; then echo VISIBLE; else echo ABSENT; fi" 2>&1
+          }
+          # Both witnesses were written on the host by the creation step, so ABSENT here is a
+          # measurement rather than a path that never existed.
+          for path in "$HOME/ci-projects/beside-the-project" "$HOME/outside-the-mount"; do
+            out=$(probe "$path")
+            case "$out" in
+              *VISIBLE*) echo "$path is reachable inside the cage"; exit 1 ;;
+              *ABSENT*)  echo "$path absent from the cage, as the model requires" ;;
+              *)         echo "the probe for $path did not run: $out"; exit 1 ;;
+            esac
+          done
+          # And the converse, so the probe is shown to be able to say VISIBLE at all: the project
+          # itself is mounted read-write, and a probe that answered ABSENT for everything would
+          # pass the loop above while proving nothing.
+          out=$(probe "$HOME/ci-projects/project")
+          case "$out" in
+            *VISIBLE*) echo "the project is visible, so the probe can tell the two apart" ;;
+            *) echo "the project itself did not read as visible, so the probe is broken: $out"; exit 1 ;;
+          esac
+
+      - name: Publish the report
+        if: always()
+        run: |
+          cat "$HOME/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Remove the guest
+        # A self-hosted runner keeps its disk between runs, so the instance is this run's to clean
+        # up rather than the next run's to discover.
+        if: always()
+        run: |
+          limactl delete --force sbx-ci 2>/dev/null || true
