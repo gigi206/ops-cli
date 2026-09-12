@@ -2005,7 +2005,7 @@ fn audio_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
         // Under WSL the audio host is Windows: `$XDG_RUNTIME_DIR/pulse/native` is a symlink WSLg
         // drops, so it is absent before the first WSLg client and on a distro that never publishes
         // it. `host_sockets` backs that path with the one Windows actually serves.
-        let is_wsl = crate::sandbox::theme_relay::host_is_wsl();
+        let is_wsl = crate::sandbox::wsl::host_is_wsl();
         let host_socket = crate::sandbox::audio::host_sockets(
             std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
             is_wsl,

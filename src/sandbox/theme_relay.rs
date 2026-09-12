@@ -162,22 +162,10 @@ fn read_windows_color_scheme() -> Option<String> {
     windows_scheme_name(&String::from_utf8_lossy(out.stdout.as_slice())).map(str::to_string)
 }
 
-/// Whether this kernel is a WSL one, from what `/proc/sys/kernel/osrelease` holds. Pure.
-///
-/// Microsoft's own marker: a WSL2 kernel names itself `…-microsoft-standard-WSL2`. Read as a
-/// substring rather than a suffix because the release carries a version prefix that changes, and
-/// case-insensitively because the spelling has changed across WSL generations.
-pub(crate) fn is_wsl_release(osrelease: &str) -> bool {
-    osrelease.to_ascii_lowercase().contains("microsoft")
-}
-
-/// Whether the kernel this launch runs on is a WSL one, read from `/proc/sys/kernel/osrelease`.
-/// A file that cannot be read answers `false`, which keeps the fallback shut on a host whose
-/// `/proc` is not the one this expects rather than opening it on a guess.
-pub(crate) fn host_is_wsl() -> bool {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .is_ok_and(|release| is_wsl_release(&release))
-}
+// The predicate moved to `super::wsl`, which three subjects now share. Re-exported here because
+// `notify_sink` still names it through this module; point that call site at `wsl::host_is_wsl` and
+// this line goes away.
+pub(crate) use super::wsl::host_is_wsl;
 
 /// The keyfile value a Windows `AppsUseLightTheme` word means, from the line `reg.exe` prints for
 /// it. Pure, and the one place the two scales are reconciled.
@@ -822,15 +810,6 @@ mod tests {
             Some("prefer-dark".to_string())
         );
         assert!(called.get(), "a WSL host asks Windows");
-    }
-
-    /// The marker Microsoft writes, and the shapes that are not it.
-    #[test]
-    fn a_wsl_kernel_is_told_from_an_ordinary_one() {
-        assert!(super::is_wsl_release("6.18.33.2-microsoft-standard-WSL2"));
-        assert!(super::is_wsl_release("5.15.0-MICROSOFT-standard"));
-        assert!(!super::is_wsl_release("6.11.0-19-generic"));
-        assert!(!super::is_wsl_release("6.6.87.1-lts"));
     }
 
     /// The two scales are inverted, so this asserts the NAME rather than the number: reading the

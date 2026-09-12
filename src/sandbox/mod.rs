@@ -119,6 +119,7 @@ mod notify_relay;
 mod notify_sink;
 mod portal;
 mod theme_relay;
+mod wsl;
 
 // Session lifecycle & introspection.
 mod attach;
