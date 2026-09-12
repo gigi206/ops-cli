@@ -70,6 +70,13 @@ fn shell_quoted(value: &str) -> String {
 /// diagnose a broken launch path was the one that hung on it, with no output to say why.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often the probe is checked for exit while [`PROBE_TIMEOUT`] runs.
+///
+/// Finer than the cadence a build or a download is polled at: the probe reads a few lines of
+/// `/proc` and is expected back in well under a second, so a coarse one would spend more of
+/// `doctor`'s answer sleeping than the probe spends running.
+const PROBE_POLL: Duration = Duration::from_millis(20);
+
 /// Launch the minimal hardened probe via `bwrap` and report what the kernel saw.
 ///
 /// Errors only when the probe could not be run at all (the spec is constant and
@@ -105,23 +112,16 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
     let deadline = Instant::now() + PROBE_TIMEOUT;
-    loop {
-        match child.try_wait()? {
-            Some(_) => break,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(held);
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "the sandbox probe did not finish within {}s",
-                        PROBE_TIMEOUT.as_secs()
-                    ),
-                ));
-            }
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
+    let (_, timed_out) = super::cagewait::wait_capped(&mut child, deadline, PROBE_POLL)?;
+    if timed_out {
+        drop(held);
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the sandbox probe did not finish within {}s",
+                PROBE_TIMEOUT.as_secs()
+            ),
+        ));
     }
     let out = child.wait_with_output()?;
     drop(held);

@@ -653,20 +653,7 @@ fn run(
     let reader = std::thread::spawn(move || tee_to_stderr(&mut err_pipe));
 
     let deadline = Instant::now() + INSTALL_TIMEOUT;
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                // Killing bwrap tears the cage down with it: it is the pid-namespace init for
-                // everything inside, so a wedged download does not outlive the ceiling.
-                timed_out = true;
-                let _ = child.kill();
-                break child.wait()?;
-            }
-            None => std::thread::sleep(POLL_INTERVAL),
-        }
-    };
+    let (status, timed_out) = super::cagewait::wait_capped(&mut child, deadline, POLL_INTERVAL)?;
     let mut stderr = reader.join().unwrap_or_default();
     // Joined so the forwarding thread cannot outlive the run and interleave into a later message —
     // and its tail is kept, not dropped: it is the half a wrapped backend writes its failure to.

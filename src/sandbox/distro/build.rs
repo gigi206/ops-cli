@@ -261,20 +261,8 @@ fn one(
         .map_err(|e| io::Error::other(format!("running `{command}`: {e}")))?;
 
     let deadline = Instant::now() + BUILD_TIMEOUT;
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                // Killing bwrap tears the cage down with it: it is the pid-namespace init for
-                // everything inside, so a wedged command does not outlive the ceiling.
-                timed_out = true;
-                let _ = child.kill();
-                break child.wait()?;
-            }
-            None => std::thread::sleep(POLL_INTERVAL),
-        }
-    };
+    let (status, timed_out) =
+        crate::sandbox::cagewait::wait_capped(&mut child, deadline, POLL_INTERVAL)?;
     drop(held);
     if timed_out {
         return Err(io::Error::other(format!(

@@ -18,6 +18,9 @@ mod binds;
 // Making a directory under a tree the cage can write, with symlinks refused — the rule several
 // host-side placements share, stated once.
 mod cagedir;
+// Waiting on a cage under a ceiling it cannot outlive — what every host-side runner does when the
+// budget runs out, stated once.
+mod cagewait;
 // The ceiling every host-side accept loop applies to the connections it will serve at once.
 mod conncap;
 pub(crate) mod deadline;

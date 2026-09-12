@@ -165,24 +165,11 @@ pub(super) fn run_captured(
     let err_reader = std::thread::spawn(move || drain_capped(&mut err_pipe, CAPTURED_CAP));
 
     let deadline = std::time::Instant::now() + CAPTURED_TIMEOUT;
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                // Killing bwrap tears the whole cage down with it: it is the pid-namespace init
-                // for everything inside, so nothing outlives the ceiling.
-                timed_out = true;
-                let _ = child.kill();
-                match child.wait() {
-                    Ok(status) => break status,
-                    Err(e) => return (1, format!("cannot reap the sandbox: {e}")),
-                }
-            }
-            Ok(None) => std::thread::sleep(CAPTURED_POLL),
+    let (status, timed_out) =
+        match crate::sandbox::cagewait::wait_capped(&mut child, deadline, CAPTURED_POLL) {
+            Ok(waited) => waited,
             Err(e) => return (1, format!("cannot wait for the sandbox: {e}")),
-        }
-    };
+        };
     // A reader thread that panicked leaves no bytes rather than taking the upgrade down: the exit
     // status is the part the report most needs, and losing a stream is the safe direction.
     let (stdout, out_cut) = out_reader.join().unwrap_or_default();
