@@ -1,7 +1,7 @@
 name: Build the self-contained static sbx
 description: >
   Build the static musl `sbx` with its own `nix` and `bwrap` bundled in, and write it to the
-  workspace as `sbx-linux-x86_64` beside `sbx-linux-x86_64.sha256`.
+  workspace under the caller's asset name, beside its `.sha256`.
 
 # WHY THIS IS AN ACTION AND NOT THREE COPIES.
 #
@@ -12,9 +12,18 @@ description: >
 # repository resolved locally, and nothing failed to report it, because a differently built binary
 # is still a binary. The build is written once here; what each workflow keeps is its own publish.
 #
-# The contract with the caller is the two files named above, left in the workspace. The caller
+# The contract with the caller is the two files named by `asset`, left in the workspace. The caller
 # checks out first (this action does not, so a workflow that needs `fetch-depth: 0` for a tag push
 # can ask for it) and publishes after.
+#
+# WHY THE TARGET IS AN INPUT AND THE RUNNER IS THE CALLER'S.
+#
+# The published binary exists for two architectures, and the build is the same one twice — so the
+# target travels as an input rather than forking the action. What does not travel is the runner:
+# each architecture builds on a host of its own kind, because the `Unit tests` step below runs the
+# suite for the *host*, not for `target`. Cross-building `aarch64` from an `x86_64` runner would
+# publish an ARM binary on which no test had run, and the seccomp denylist is one of the places
+# where the two architectures genuinely differ.
 
 inputs:
   nixpkgs-rev:
@@ -22,6 +31,20 @@ inputs:
       The nixpkgs revision the bundled engines are realised from. Passed rather than read from the
       environment so the value a workflow uses is visible at its call site.
     required: true
+  target:
+    description: >
+      The Rust target triple to build. The caller pairs it with a runner of the same architecture
+      (see the note above); building a target the runner cannot execute leaves the unit gate
+      measuring the wrong thing.
+    required: false
+    default: x86_64-unknown-linux-musl
+  asset:
+    description: >
+      The file name the built binary is written to, beside `<asset>.sha256`. Named by the caller
+      rather than derived from `target`, so the file a release publishes is readable at the call
+      site — the same reason `nixpkgs-rev` is passed in.
+    required: false
+    default: sbx-linux-x86_64
   skip-test:
     description: >
       The one unit test excluded from the pre-build gate. It asserts the behaviour of the host's
@@ -36,7 +59,7 @@ runs:
     - name: Install Rust (with the musl target)
       uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
       with:
-        targets: x86_64-unknown-linux-musl
+        targets: ${{ inputs.target }}
 
     - name: Install zig (linker for the musl target)
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -91,6 +114,10 @@ runs:
     # engines. The sandbox e2e skip on a hosted runner, so this proves the unit surface only.
     # `-D warnings` here matches what `ci.yml` compiles under: the three publish paths previously
     # disagreed about it, and the loosest of them decided what shipped.
+    #
+    # This runs for the runner's own architecture, which is why the caller pairs runner and target.
+    # `ci.yml` is x86_64 only, so on an ARM runner this is the sole gate that compiles and runs the
+    # `#[cfg(target_arch = "aarch64")]` branches at all.
     - name: Unit tests (default features)
       shell: bash
       env:
@@ -104,9 +131,11 @@ runs:
       env:
         SBX_BUNDLED_NIX: ${{ steps.nix.outputs.path }}
         SBX_BUNDLED_BWRAP: ${{ steps.bwrap.outputs.path }}
+        TARGET: ${{ inputs.target }}
+        ASSET: ${{ inputs.asset }}
       run: |
         set -euo pipefail
-        cargo zigbuild --release --target x86_64-unknown-linux-musl \
+        cargo zigbuild --release --target "$TARGET" \
           --features bundled-nix,bundled-bwrap
-        cp target/x86_64-unknown-linux-musl/release/sbx sbx-linux-x86_64
-        sha256sum sbx-linux-x86_64 | cut -d' ' -f1 > sbx-linux-x86_64.sha256
+        cp "target/$TARGET/release/sbx" "$ASSET"
+        sha256sum "$ASSET" | cut -d' ' -f1 > "$ASSET.sha256"

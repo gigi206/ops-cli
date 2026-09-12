@@ -149,7 +149,13 @@ mise run build      # cargo zigbuild --release --target x86_64-unknown-linux-mus
 ```
 
 The resulting binary is self-contained and can be copied to another x86_64 Linux
-host.
+host. That task builds x86_64 only. A published release carries two assets,
+`sbx-linux-x86_64` and `sbx-linux-aarch64`, each built on a runner of its own
+architecture; to build the other one here, name its target instead:
+
+```sh
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+```
 
 ### Self-contained engines (optional)
 

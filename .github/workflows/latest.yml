@@ -2,12 +2,16 @@
 # develop branch (ops-v2) and `main`.
 #
 # On every push to `ops-v2` or `main` we rebuild the self-contained (nix+bwrap
-# bundled) static musl binary and OVERWRITE the `latest` release: the `latest`
+# bundled) static musl binaries and OVERWRITE the `latest` release: the `latest`
 # git tag is force-moved onto the current commit and the existing release (with
 # its old assets) is deleted and recreated as a pre-release. `make_latest` is
 # disabled so it never shadows a real versioned release.
 #
 # Consumers that want "always the newest build" pin to the `latest` tag.
+#
+# Two architectures, one build definition: the matrix below pairs each target with a
+# runner of that same architecture, because the action's unit gate runs the suite for
+# the *host*. See the note in `.github/actions/build-static-sbx/action.yml`.
 
 name: Latest
 
@@ -32,21 +36,65 @@ env:
 
 jobs:
   build:
-    name: build + overwrite latest release
-    # Pinned rather than `ubuntu-latest`: GitHub migrates that label to the next LTS over a month or
-    # two, so a run pinned to nothing changes host without anyone deciding to. Cage keeps a
-    # `ubuntu-24.04` arm, so the older systemd stays covered.
-    runs-on: ubuntu-26.04
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    strategy:
+      # One architecture failing must not hide the other's result.
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned rather than `ubuntu-latest`: GitHub migrates that label to the next LTS over a
+          # month or two, so a run pinned to nothing changes host without anyone deciding to. Cage
+          # keeps a `ubuntu-24.04` arm, so the older systemd stays covered.
+          - runner: ubuntu-26.04
+            target: x86_64-unknown-linux-musl
+            asset: sbx-linux-x86_64
+          # `ubuntu-24.04-arm` and not the 26.04 ARM label: that one is still a public preview,
+          # and the architecture is what this arm is here to cover, not the distribution version.
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: sbx-linux-aarch64
     steps:
+      # No history needed here: the tag is moved by `publish`, which checks out for itself.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
 
       - name: Build the self-contained static musl binary
         uses: ./.github/actions/build-static-sbx
         with:
           nixpkgs-rev: ${{ env.NIXPKGS_REV }}
+          target: ${{ matrix.target }}
+          asset: ${{ matrix.asset }}
+
+      # Named after the asset, not after the workflow: two matrix arms uploading under one
+      # name is a conflict, and the name is what `publish` globs for below.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          retention-days: 1
+
+  publish:
+    name: overwrite the latest release
+    # Every arm, so the rolling tag never moves onto a commit whose binaries do not all exist.
+    # This is a stronger guarantee than the single-job shape it replaces: the tag is now moved
+    # after both builds have succeeded, not before either has been published.
+    needs: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      # First, so the checkout does not land on top of the downloaded assets.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Collect every architecture's asset
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sbx-linux-*
+          merge-multiple: true
 
       - name: Force-move the latest tag onto this commit
         run: |
@@ -61,6 +109,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Every asset must be in hand before the old release is deleted: a missing file
+          # here would replace a complete release with a partial one.
+          for f in sbx-linux-x86_64 sbx-linux-x86_64.sha256 \
+                   sbx-linux-aarch64 sbx-linux-aarch64.sha256; do
+            test -f "$f" || { echo "missing release asset: $f"; exit 1; }
+          done
           gh release delete latest --yes || true
           NOTES="Rolling build of ${GITHUB_REF_NAME} @ ${GITHUB_SHA::8}."$'\n'"\n"$'\n'"Built from: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
           gh release create latest \
@@ -69,4 +123,6 @@ jobs:
             --title "latest (rolling, tracks ops-v2 + main)" \
             --notes "$NOTES" \
             sbx-linux-x86_64 \
-            sbx-linux-x86_64.sha256
+            sbx-linux-x86_64.sha256 \
+            sbx-linux-aarch64 \
+            sbx-linux-aarch64.sha256
