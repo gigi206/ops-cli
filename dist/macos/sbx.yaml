@@ -10,6 +10,14 @@
 # semantics, not the window, not the sound. `sbx doctor` inside the guest is what decides, and
 # `.github/workflows/macos.yml` is what runs it.
 
+# Ubuntu images, and those alone. Lima's `default.yaml` inherits `_images/ubuntu` and
+# `_default/mounts` together, and that second one mounts the whole of `~`: inheriting it would
+# put the host home back into the guest alongside the subtree below, which is the one decision
+# this template exists to make differently. An image has no builtin default, so inheriting
+# nothing at all is not an option either.
+base:
+- template:_images/ubuntu
+
 param:
   # The host subtree the guest can see. Everything outside it is absent from the guest, and
   # therefore absent from every cage the guest builds.
@@ -23,6 +31,11 @@ param:
   # Relative to the host home, because `location` interpolates `{{.Home}}` itself and composing
   # the two avoids depending on when `~` is expanded.
   projects: "Projects"
+
+  # Which published release the guest installs from. `latest` is rewritten on every push to
+  # `ops-v2` and `main`, so a guest built from it is not reproducible: pass a real tag
+  # (`--param release=v1.2.3`) when that matters more than being current.
+  release: "latest"
 
 vmType: "vz"
 
@@ -59,13 +72,30 @@ provision:
     script: |
       #!/bin/bash
       set -euo pipefail
-      # Ubuntu has shipped `kernel.apparmor_restrict_unprivileged_userns=1` since 24.04, which
+      # Ubuntu has shipped `kernel.apparmor_restrict_unprivileged_userns=1` since 23.10, which
       # leaves a user namespace creatable but stripped of the capabilities bubblewrap needs.
-      # Lima does nothing about it. Written to /etc/sysctl.d so it survives a reboot, and applied
-      # now so the first launch does not have to wait for one.
+      # Lima does nothing about it.
       #
-      # Not measured: whether this image restricts them, and whether clearing it is sufficient,
-      # is what `sbx doctor` reports inside the guest.
+      # Why clearing it is necessary rather than merely convenient, which the sbx sources settle
+      # without anything having to be booted: the AppArmor profile Ubuntu ships attaches its
+      # `userns` grant by path, to `/usr/bin/bwrap` (see the note on APPARMOR_USERNS_RESTRICT in
+      # `src/store/engine.rs`), and sbx answers that by preferring the host engine over its own
+      # bundled one whenever the restriction is in force. That covers bwrap. It does not cover
+      # sbx: `probe_userns` in `src/main.rs` forks and calls `unshare(CLONE_NEWUSER)` in the sbx
+      # process itself, every launch is gated on it in `src/sandbox/launch/mod.rs` before bwrap is
+      # ever executed, and the sbx binary is not the path the profile names. So the launch is
+      # refused under the restriction even though bwrap alone would have been permitted.
+      #
+      # The cost is stated rather than hidden: this clears the restriction for the whole guest,
+      # not for sbx alone. `doctor` names a narrower second remedy, an AppArmor profile granting
+      # unprivileged userns to sbx, which a guest dedicated to running sbx does not need and
+      # which would have to track the binary's path. The guest is the boundary here; the Mac is
+      # on the other side of it.
+      #
+      # Written to /etc/sysctl.d so it survives a reboot, and applied now so the first launch
+      # does not have to wait for one. What is not measured is whether this image ships the
+      # restriction enabled at all, and whether clearing it is sufficient: `sbx doctor` inside
+      # the guest is what answers both.
       install -m 0644 /dev/stdin /etc/sysctl.d/99-sbx-userns.conf <<'EOF'
       kernel.apparmor_restrict_unprivileged_userns = 0
       EOF
@@ -90,7 +120,7 @@ provision:
       #  - Fetching the binary and its digest from the same HTTPS origin catches a truncated or
       #    corrupted transfer. It does not catch a compromised release, and it is therefore
       #    weaker than build.rs's pinned constant. Saying so is the point.
-      base="https://github.com/gigi206/ops-cli/releases/download/latest"
+      base="https://github.com/gigi206/ops-cli/releases/download/{{.Param.release}}"
       case "$(uname -m)" in
         aarch64) asset="sbx-linux-aarch64" ;;
         x86_64)  asset="sbx-linux-x86_64" ;;
@@ -103,13 +133,13 @@ provision:
 
       # The digest is 65 bytes and the binary is fifty megabytes, so the digest decides whether
       # the binary is worth fetching at all. Without this, every restart would re-download it.
-      curl -fsSL --retry 3 -o "$tmp/want" "$base/$asset.sha256"
+      curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 -o "$tmp/want" "$base/$asset.sha256"
       want="$(tr -d '[:space:]' < "$tmp/want")"
       if [ -x /usr/local/bin/sbx ] && [ "$(cat "$marker" 2>/dev/null)" = "$want" ]; then
         exit 0
       fi
 
-      curl -fsSL --retry 3 -o "$tmp/sbx" "$base/$asset"
+      curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 -o "$tmp/sbx" "$base/$asset"
 
       # The published `.sha256` is a bare digest with no filename, so `sha256sum -c` cannot read
       # it as it stands: the check line is built here instead.
@@ -118,6 +148,17 @@ provision:
         echo "$asset sha256 mismatch (got $got, expected $want); the rolling release may have" >&2
         echo "been rewritten between the two fetches, so re-run the provisioning rather than" >&2
         echo "trusting these bytes" >&2
+        exit 1
+      fi
+
+      # The release is deleted and recreated rather than edited when it is rewritten, so there is
+      # a window in which it 404s and a wider one in which the digest and the binary come from
+      # different builds. Re-reading the digest after the download closes the second: a release
+      # that moved underneath this fetch is refused rather than installed half from each build.
+      curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 -o "$tmp/want2" "$base/$asset.sha256"
+      if [ "$want" != "$(tr -d '[:space:]' < "$tmp/want2")" ]; then
+        echo "$asset moved while it was being fetched, so the bytes and the digest may come" >&2
+        echo "from different builds; re-run rather than installing them" >&2
         exit 1
       fi
 
@@ -132,9 +173,11 @@ provision:
     script: |
       #!/bin/bash
       set -euo pipefail
-      # bubblewrap is the sandbox engine and is not part of a fresh image. nix drives the store.
-      # A release can embed static copies of both; installing the distribution's own keeps the
-      # guest working with a build that does not.
+      # bubblewrap from the distribution, deliberately and not only as a fallback: the published
+      # binary embeds its own static bwrap, but under the AppArmor restriction above only the
+      # bwrap at the path the profile names can create a namespace, and sbx prefers the host
+      # engine for exactly that reason. `ca-certificates` is the other package the bundled
+      # engines still need, because the store is realised over TLS from the binary cache.
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq
       apt-get install -y -qq bubblewrap ca-certificates
