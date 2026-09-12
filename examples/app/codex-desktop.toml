@@ -137,9 +137,11 @@
 #     callback and the issuer are read out of the shipped artifact, but which of the app's sign-in
 #     paths a first run actually takes is not. If a login stalls, watch `sbx net logs -a
 #     codex-desktop` and the launch's stderr — an unrouted scheme is printed rather than opened.
-#   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT) and closing the
-#     window may not quit. Press **Ctrl+C twice within 2s** to force-quit the session (sbx
-#     terminates the cage), or `sbx session stop <id>` from another terminal.
+#   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT), but closing the
+#     window quits: this app hides to a tray only when it has one to hide to, and the cage exposes
+#     none. If the window ever does leave it running, press **Ctrl+C twice within 2s** to force-quit
+#     the session (sbx terminates the cage), or `sbx session stop <id>` from another terminal. The
+#     launch prints the same hint.
 #   * Credential persistence — confirm the login survives a relaunch. The app may want the system
 #     keyring, which a cage with `dbus = true` now provides, and should fall back to a file under the
 #     isolated home.
