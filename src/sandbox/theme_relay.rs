@@ -338,6 +338,22 @@ fn run_windows_watch(home: &Path, stdout: std::process::ChildStdout) {
     }
 }
 
+/// Whether a bus error is the session ending rather than a failure worth naming.
+///
+/// A connection error on the host bus is almost always the session going away underneath a cage
+/// that outlived it, which is a teardown race and not something the user can act on. A warning
+/// there trains its reader to ignore the one that matters, so the three shapes that race names
+/// are swallowed and everything else is reported.
+///
+/// A free function because the decision is the testable half of a thread whose emission is not:
+/// proving the warning reaches a terminal would mean capturing `diag::warn` across the relay
+/// thread with a live bus behind it. The predicate is where the judgement lives, so it is the part
+/// a test can hold to its word.
+fn bus_error_is_a_teardown_race(msg: &str) -> bool {
+    const TEARDOWN: [&str; 3] = ["Connection refused", "Broken pipe", "reset by peer"];
+    TEARDOWN.iter().any(|shape| msg.contains(shape))
+}
+
 /// The relay thread's body: follow the source the seed followed.
 ///
 /// Split from [`ThemeRelay::start`] so the thread closure stays one call, and because the two
@@ -349,20 +365,13 @@ fn run_relay(
     watcher: &std::sync::Mutex<WatchSlot>,
 ) {
     if !relay_follows_windows(portal_color_scheme().is_some(), host_is_wsl()) {
-        if let Err(e) = async_io::block_on(run_portal(home, shutdown)) {
-            // A connection error is almost always the session ending (the host bus went away)
-            // — a benign teardown race, not worth alarming the user. Only a genuinely
-            // unexpected failure warns.
-            let msg = e.to_string();
-            if !msg.contains("Connection refused")
-                && !msg.contains("Broken pipe")
-                && !msg.contains("reset by peer")
-            {
-                diag::warn(&format!(
-                    "`dbus = true`: the live-theme relay stopped ({e}) — the app keeps its \
-                     at-launch theme"
-                ));
-            }
+        if let Err(e) = async_io::block_on(run_portal(home, shutdown))
+            && !bus_error_is_a_teardown_race(&e.to_string())
+        {
+            diag::warn(&format!(
+                "`dbus = true`: the live-theme relay stopped ({e}) — the app keeps its \
+                 at-launch theme"
+            ));
         }
         return;
     }
@@ -844,6 +853,38 @@ mod tests {
     /// The gate decides whether an interop process starts, so it is asserted on all four
     /// combinations rather than the one that happens to hold here: the case that matters is the
     /// process that must NOT start off WSL, and that is only provable by naming it.
+    #[test]
+    fn a_bus_error_warns_unless_it_is_the_session_going_away() {
+        // The three shapes a teardown race takes, as the bus reports them. Each must stay silent:
+        // a cage outliving its session cannot act on any of them, and a warning there is noise
+        // that teaches its reader to skip the next one.
+        for quiet in [
+            "Connection refused (os error 111)",
+            "Broken pipe (os error 32)",
+            "Connection reset by peer (os error 104)",
+        ] {
+            assert!(
+                bus_error_is_a_teardown_race(quiet),
+                "the relay must swallow a teardown race: {quiet}"
+            );
+        }
+
+        // Anything else is a capability this launch lost and the user can do something about,
+        // so it is named. The permission case is the one that matters: a bus that refuses this
+        // cage is a policy the operator wrote, not a race.
+        for loud in [
+            "Permission denied (os error 13)",
+            "No such file or directory (os error 2)",
+            "The name org.freedesktop.portal.Desktop was not provided by any .service files",
+            "Timed out waiting for a reply",
+        ] {
+            assert!(
+                !bus_error_is_a_teardown_race(loud),
+                "the relay must name a failure that is not a teardown race: {loud}"
+            );
+        }
+    }
+
     #[test]
     fn only_a_wsl_host_whose_portal_stayed_silent_follows_windows() {
         assert!(
