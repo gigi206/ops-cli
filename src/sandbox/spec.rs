@@ -341,6 +341,44 @@ impl SandboxSpec {
     }
 }
 
+/// The canonical minimal userland: host `/usr` bound read-only so a distro's own interpreter runs,
+/// the three FHS symlinks onto it, and fresh `/proc`, `/dev` and `/tmp`.
+///
+/// This is the smallest mount set a probe needs to execute anything at all, and it is deliberately
+/// *not* the hardening: `to_argv` adds that unconditionally, so a caller composing this set gets a
+/// userland and nothing else. Callers that need more append to it — the smoke probe adds its
+/// throwaway rw workdir — which is why this returns the vector rather than a whole spec.
+pub(crate) fn minimal_userland_mounts() -> Vec<Mount> {
+    use std::path::PathBuf;
+    vec![
+        Mount::RoBind {
+            src: PathBuf::from("/usr"),
+            dest: PathBuf::from("/usr"),
+        },
+        Mount::Symlink {
+            target: PathBuf::from("usr/lib"),
+            dest: PathBuf::from("/lib"),
+        },
+        Mount::Symlink {
+            target: PathBuf::from("usr/lib64"),
+            dest: PathBuf::from("/lib64"),
+        },
+        Mount::Symlink {
+            target: PathBuf::from("usr/bin"),
+            dest: PathBuf::from("/bin"),
+        },
+        Mount::Proc {
+            dest: PathBuf::from("/proc"),
+        },
+        Mount::Dev {
+            dest: PathBuf::from("/dev"),
+        },
+        Mount::Tmpfs {
+            dest: PathBuf::from("/tmp"),
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -141,37 +141,12 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
 /// workdir. The hardening itself is added unconditionally by `to_argv`, so this
 /// only supplies the userland the probe runs in.
 fn probe_spec(work: &Path, script: String) -> io::Result<SandboxSpec> {
-    let mounts = vec![
-        Mount::RoBind {
-            src: PathBuf::from("/usr"),
-            dest: PathBuf::from("/usr"),
-        },
-        Mount::Symlink {
-            target: PathBuf::from("usr/lib"),
-            dest: PathBuf::from("/lib"),
-        },
-        Mount::Symlink {
-            target: PathBuf::from("usr/lib64"),
-            dest: PathBuf::from("/lib64"),
-        },
-        Mount::Symlink {
-            target: PathBuf::from("usr/bin"),
-            dest: PathBuf::from("/bin"),
-        },
-        Mount::Proc {
-            dest: PathBuf::from("/proc"),
-        },
-        Mount::Dev {
-            dest: PathBuf::from("/dev"),
-        },
-        Mount::Tmpfs {
-            dest: PathBuf::from("/tmp"),
-        },
-        Mount::Bind {
-            src: work.to_path_buf(),
-            dest: PathBuf::from("/work"),
-        },
-    ];
+    // The userland is the canonical minimal set; the probe adds only its throwaway rw workdir.
+    let mut mounts = super::spec::minimal_userland_mounts();
+    mounts.push(Mount::Bind {
+        src: work.to_path_buf(),
+        dest: PathBuf::from("/work"),
+    });
     let env = vec![
         ("HOME".to_string(), "/work".to_string()),
         ("PATH".to_string(), "/usr/bin:/bin".to_string()),

@@ -1096,35 +1096,9 @@ mod tests {
     /// (the probes trigger raw syscalls by number).
     #[cfg(target_arch = "x86_64")]
     fn probe_spec(probe: &str) -> super::super::spec::SandboxSpec {
-        use super::super::spec::{Mount, NetPolicy, SandboxSpec};
+        use super::super::spec::{NetPolicy, SandboxSpec};
         use std::path::PathBuf;
-        let mounts = vec![
-            Mount::RoBind {
-                src: PathBuf::from("/usr"),
-                dest: PathBuf::from("/usr"),
-            },
-            Mount::Symlink {
-                target: PathBuf::from("usr/lib"),
-                dest: PathBuf::from("/lib"),
-            },
-            Mount::Symlink {
-                target: PathBuf::from("usr/lib64"),
-                dest: PathBuf::from("/lib64"),
-            },
-            Mount::Symlink {
-                target: PathBuf::from("usr/bin"),
-                dest: PathBuf::from("/bin"),
-            },
-            Mount::Proc {
-                dest: PathBuf::from("/proc"),
-            },
-            Mount::Dev {
-                dest: PathBuf::from("/dev"),
-            },
-            Mount::Tmpfs {
-                dest: PathBuf::from("/tmp"),
-            },
-        ];
+        let mounts = super::super::spec::minimal_userland_mounts();
         SandboxSpec::new(
             PathBuf::from("/tmp"),
             mounts,
