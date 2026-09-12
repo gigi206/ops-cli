@@ -1665,3 +1665,186 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
         "expected the enumerating profiles to be checked, saw {enumerating}"
     );
 }
+
+/// The version a URL path names, if it names one: the first run of digits and dots that carries a
+/// dot, so `AionUi-2.1.47-final-linux-amd64.deb` answers `2.1.47` and
+/// `binary-amd64/Packages` answers nothing.
+///
+/// The dot is what separates a version from an architecture or an API generation: `amd64`, `x86_64`
+/// and a `/v1/` path prefix all carry digits and none of them moves when the vendor ships. Only the
+/// path is read, never the host, so `s3.us-west-2.amazonaws.com` cannot be mistaken for one.
+fn version_named_in(path: &str) -> Option<String> {
+    let bytes: Vec<char> = path.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == '.') {
+            i += 1;
+        }
+        let run: String = bytes[start..i].iter().collect();
+        if run.contains('.') && run.trim_end_matches('.').contains('.') {
+            return Some(run.trim_end_matches('.').to_string());
+        }
+    }
+    None
+}
+
+/// Why a declared package can never reach a version newer than the one it names, or `None` when
+/// something moves it.
+///
+/// **The question the freshness guard does not ask.** `catalogue_freshness` asks whether a package
+/// can still be *found*; a URL naming a fixed artifact answers yes forever. `aionui` named one and
+/// resolved perfectly for five weeks, to a release five weeks old, while upstream shipped twelve
+/// more. A file cannot say that what it points at has been overtaken — but it can say that nothing
+/// in the declaration will ever point anywhere else, and that is what this reads.
+///
+/// **Three shapes freeze.** A `deb:`/`appimage:`/`tarball:`/`binary:` locator that is a URL with a
+/// version in its path (the `github:`, `apt:` and `resolve` forms all ask a vendor at every
+/// resolve, so they move); a `mise:` token carrying `<tool>@<version>`, which pins mise's own
+/// selection; and a `flake:` reference carrying a revision, which pins the input. Everything else
+/// moves by construction: `nix:` follows the channel's nixpkgs revision, and an inline
+/// `[flakes.<name>]` names no version at all.
+///
+/// **What it cannot see.** A `resolve` command whose vendor quietly stopped advancing still looks
+/// like it moves, because the declaration does. That case needs the vendor asked, which is
+/// `catalogue_freshness`'s half of the job; this one runs offline and catches the shape at the
+/// moment it is written instead of five weeks later.
+fn frozen_at_the_version_it_names(locator: &str) -> Option<String> {
+    let (backend, rest) = locator.split_once(':')?;
+    match backend {
+        "deb" | "appimage" | "tarball" | "binary" => {
+            if rest == "resolve" || rest.starts_with("github:") || rest.starts_with("apt:") {
+                return None;
+            }
+            // The path only: a host carries digits that never move.
+            let after_scheme = rest.split_once("//")?.1;
+            let path = after_scheme.split_once('/')?.1;
+            version_named_in(path).map(|v| {
+                format!("the URL names version `{v}` and nothing in the declaration moves it")
+            })
+        }
+        "mise" => {
+            // mise spells a version `<tool>@<version>`, and an npm scope spells an `@` that is not
+            // one — so only the segment past the last `/` is read, where a scope's `@` cannot be.
+            let last = rest.rsplit('/').next().unwrap_or(rest);
+            let (_, after) = last.split_once('@')?;
+            after
+                .starts_with(|c: char| c.is_ascii_digit())
+                .then(|| format!("the token pins mise to version `{after}`"))
+        }
+        "flake" => {
+            // `github:<owner>/<repo>` follows the repo; a third segment, or a `rev=` parameter,
+            // pins it to one commit.
+            let reference = rest.split('#').next().unwrap_or(rest);
+            if reference.contains("rev=") {
+                return Some("the flake reference pins a revision".to_string());
+            }
+            let (_scheme, path) = reference.split_once(':')?;
+            (path.split('/').count() > 2)
+                .then(|| "the flake reference names a revision after the repository".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The predicate above, held to the shapes this catalogue has actually shipped — including the two
+/// that went stale in production, spelled as they were written.
+#[test]
+fn the_frozen_declaration_predicate_answers_on_shapes_this_catalogue_has_shipped() {
+    // Frozen, and each of these was a real declaration in this repository.
+    for (locator, why) in [
+        (
+            "deb:https://github.com/iOfficeAI/AionUi/releases/download/v2.1.47-final/AionUi-2.1.47-final-linux-amd64.deb",
+            "2.1.47",
+        ),
+        (
+            "binary:https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-1.0.4-linux-x86_64",
+            "1.0.4",
+        ),
+        ("mise:npm:cline@3.0.55", "3.0.55"),
+        (
+            "flake:github:NousResearch/hermes-agent/1a2b3c4#default",
+            "revision",
+        ),
+    ] {
+        let answer = frozen_at_the_version_it_names(locator)
+            .unwrap_or_else(|| panic!("{locator} is frozen and must be reported"));
+        assert!(
+            answer.contains(why),
+            "{locator}: the reason must name what pins it, saw {answer}"
+        );
+    }
+    // Moving, and each of these is a live declaration or the documented rolling form.
+    for locator in [
+        "deb:resolve",
+        "deb:github:iOfficeAI/AionUi",
+        "deb:apt:https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages",
+        "deb:https://github.com/o/r/releases/latest/download/app-x86_64.deb",
+        "tarball:resolve",
+        "binary:resolve",
+        "mise:npm:@ampcode/cli",
+        "mise:aqua:x.ai/cli/grok",
+        "nix:chromium",
+        "flake:github:NousResearch/hermes-agent#default",
+    ] {
+        assert_eq!(
+            frozen_at_the_version_it_names(locator),
+            None,
+            "{locator} moves and must not be reported"
+        );
+    }
+}
+
+/// Every package the catalogue ships can reach a newer version than the one it names.
+///
+/// An app that can only ever run one hand-pinned version is not shipped, and the rule had been
+/// broken once without anything noticing: the only guard that asks a vendor anything asks whether
+/// the package can still be *found*, and a fixed URL answers yes for as long as the bytes are
+/// served. This one asks whether it can be *left*, which a file can answer on its own.
+#[test]
+fn no_shipped_package_is_frozen_at_the_version_it_names() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0;
+    for dir in ["examples/bundle", "examples/app"] {
+        for entry in std::fs::read_dir(root.join(dir))
+            .unwrap_or_else(|e| panic!("{dir}/ dir exists: {e}"))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read the file");
+            let packages = if dir == "examples/bundle" {
+                shipped_bundle(&path).packages
+            } else {
+                schema::parse_app(&bytes)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                    .packages
+            };
+            for (name, locator) in &packages {
+                assert_eq!(
+                    frozen_at_the_version_it_names(locator),
+                    None,
+                    "{dir}/{}: `{name}` cannot roll forward — {}. Declare a form that asks the \
+                     vendor at each resolve: `<backend>:resolve` with a command that prints the \
+                     current URL, `github:<owner>/<repo>`, or `apt:<index>`.",
+                    path.file_name().unwrap().to_string_lossy(),
+                    frozen_at_the_version_it_names(locator).unwrap_or_default()
+                );
+                checked += 1;
+            }
+        }
+    }
+    // The catalogue's own size calibrates the walk: one that stopped finding files would pass while
+    // checking nothing. The floor is well under today's count, so adding a profile never fails it
+    // and deleting the directory always does.
+    assert!(
+        checked >= 140,
+        "expected the whole catalogue to be read, saw {checked} package declarations"
+    );
+}
