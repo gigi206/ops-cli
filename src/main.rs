@@ -38,6 +38,8 @@ mod observe;
 mod open_policy;
 mod pathfind;
 mod paths;
+#[cfg(test)]
+mod pin_coverage;
 mod plugins;
 mod proc_policy;
 mod sandbox;
