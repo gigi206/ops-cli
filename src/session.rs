@@ -800,24 +800,42 @@ fn parse_record(path: &Path) -> Option<Session> {
 /// enough, so the decisive test is always the start-time match — only the original incarnation
 /// has it.
 ///
-/// One harmless transient: a just-exited `sbx run` not yet reaped by its parent is
-/// a zombie whose `/proc/<pid>/stat` still carries the original start time, so it
-/// reads as alive for that brief window. Treating the zombie state as dead would
-/// remove it, but the window is short and self-clears on the next listing.
+/// The start time alone cannot see a process that has *finished*: a zombie's
+/// `/proc/<pid>/stat` still carries the original one, so the match holds for a
+/// session that ended. [`pid_is_live`] is what excludes it, and why it reads the
+/// state rather than only signalling — this was once judged a brief transient
+/// that self-clears on the next listing, which is true only where something
+/// reaps. A detached session's daemon is orphaned to init by design, so where
+/// init does not reap, nothing clears it.
 fn is_alive(session: &Session) -> bool {
     pid_is_live(session.pid) && read_start_ticks(session.pid) == Some(session.start_ticks)
 }
 
-/// Whether *some* process currently holds `pid` — the cheap pre-filter half of [`is_alive`],
-/// exposed for the callers that have only a pid to go on.
+/// Whether `pid` names a process that is still **running** — the cheap pre-filter half of
+/// [`is_alive`], exposed for the callers that have only a pid to go on.
 ///
 /// `ESRCH` means the pid is gone and `EPERM` means it now belongs to another user (so the
 /// original is gone either way); both read as dead. An unexpected errno is inconclusive and reads
 /// as live, which is the conservative direction for a caller that deletes what reads as dead.
 ///
-/// This answers *"is the pid taken"*, not *"is it the same process"* — a reused pid reads as live.
-/// A caller that recorded a start time must pair this with that match ([`is_alive`] does); one
-/// keyed by a bare pid cannot, and merely keeps a stale entry a while longer.
+/// `kill(2)` alone does not answer this, and that is the second half. A **zombie** holds its pid
+/// and its `/proc` entry until somebody reaps it, so signal `0` answers for a process that has
+/// already exited. Who reaps it decides how long that lasts: a process this one forked is reaped
+/// by the `wait` that follows, but a process orphaned to init is reaped only if init reaps, and a
+/// container's pid 1 frequently does not. A detached session's daemon is orphaned by design (the
+/// detach path says why its parent must not wait on it), so on such a host
+/// the zombie is permanent and everything keyed on this — the session listing, the record prune,
+/// the scope reclaim, the runtime sweeps — would hold a finished session open forever. The state
+/// is therefore read, and a positively-read `Z` reads as dead. A state that cannot be read at all
+/// stays live, which keeps the conservative direction above.
+///
+/// This still answers *"is a process running under this pid"*, not *"is it the same process"* — a
+/// reused pid reads as live. A caller that recorded a start time must pair this with that match
+/// ([`is_alive`] does); one keyed by a bare pid cannot, and merely keeps a stale entry a while
+/// longer.
+///
+/// The cost is one small `/proc` read for a pid that passed the signal check, which is what
+/// [`read_start_ticks`] already spends beside it on the `is_alive` path.
 pub(crate) fn pid_is_live(pid: u32) -> bool {
     // SAFETY: `kill` takes two integers and no pointer, and signal `0` performs only the existence
     // and permission check — nothing is delivered, whatever process `pid` currently names.
@@ -827,7 +845,7 @@ pub(crate) fn pid_is_live(pid: u32) -> bool {
     {
         return false;
     }
-    true
+    read_state(pid) != Some('Z')
 }
 
 /// The start time (clock ticks since boot) of `pid`, or `None` if it is gone.
@@ -852,6 +870,22 @@ pub(crate) fn current_start_ticks() -> Option<u64> {
 fn parse_start_ticks(stat: &str) -> Option<u64> {
     let after = &stat[stat.rfind(')')? + 1..];
     after.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// The process state `/proc/<pid>/stat` reports: `R`/`S`/`D` for one that is still a process, `Z`
+/// for a corpse nobody has reaped, `None` once the entry is gone.
+///
+/// Read by [`pid_is_live`] to tell a finished process from a running one, which `kill(2)` cannot.
+pub(crate) fn read_state(pid: u32) -> Option<char> {
+    parse_state(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Extract field 3 (state) from the contents of `/proc/<pid>/stat`, by the same rule
+/// [`parse_start_ticks`] follows: the fields after the *final* `)` start at field 3, so the state
+/// is the first of them.
+fn parse_state(stat: &str) -> Option<char> {
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().next()?.chars().next()
 }
 
 /// Lower-case hex encoding of raw bytes.
@@ -1329,6 +1363,47 @@ mod tests {
             Some(libc::SIGKILL),
             "the recorded incarnation is signalled"
         );
+    }
+
+    /// A process that has exited but not been reaped is not a live session.
+    ///
+    /// Both halves of `is_alive` answer for a zombie on their own: its pid is still taken, so
+    /// `kill(pid, 0)` succeeds, and its `/proc/<pid>/stat` still carries the original start time,
+    /// so the reuse guard matches. Read that way, a finished session stays in the listing, its
+    /// record is never pruned, `sbx gc` keeps skipping the project as in use, and `sbx storage`
+    /// keeps refusing — with nothing to clear it, because who reaps decides that and a detached
+    /// daemon is orphaned to init by design. The state is what separates the two, and this pins it
+    /// with the zombie held open rather than raced against.
+    #[test]
+    fn a_process_that_exited_without_being_reaped_is_not_a_live_session() {
+        let (mut child, s) = spawn_session("sleep", &["30"]);
+        assert!(is_alive(&s), "the precondition: it is running first");
+
+        // Signalled directly and deliberately not waited on, so the corpse stays in the table for
+        // the length of this test. `wait` at the end is what reaps it.
+        // SAFETY: the pid names the child spawned just above, which is not reaped until below.
+        unsafe { libc::kill(s.pid as libc::pid_t, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while read_state(s.pid) != Some('Z') && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            read_state(s.pid),
+            Some('Z'),
+            "the witness: an unreaped child is a zombie"
+        );
+
+        // The two halves that cannot see it, asserted so a regression names which one came back.
+        assert_eq!(
+            read_start_ticks(s.pid),
+            Some(s.start_ticks),
+            "a zombie still carries the recorded start time, so the reuse guard matches"
+        );
+        assert!(!pid_is_live(s.pid), "but it is not a running process");
+        assert!(!is_alive(&s), "and so not a live session");
+
+        let _ = child.wait();
+        assert!(!is_alive(&s), "still gone once reaped");
     }
 
     #[test]

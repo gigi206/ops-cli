@@ -1892,7 +1892,7 @@ mod tests {
         // calls on its way in. The exited child is measured in the process table before and after:
         // a `Z` state is precisely the leak, one entry per announcement, in a supervisor that
         // outlives the session.
-        use crate::testutil::process_state as state_of;
+        use crate::session::read_state as state_of;
         let sh = crate::pathfind::find_on_path("sh").expect("a shell on PATH");
         let spawn = |script: &str| {
             std::process::Command::new(&sh)

@@ -2872,7 +2872,7 @@ mod tests {
         // it is inherited by whatever init the host runs, and an init that does not reap leaves a
         // zombie whose pid answers `kill(pid, 0)` for as long as the test binary lives. The group
         // kill would then look like it had done nothing, on a host where it had done exactly what
-        // it promises. [`crate::testutil::pid_is_running`] asks the question this actually means.
+        // it promises. [`crate::session::pid_is_live`] reads the state for that reason.
         let forked: u32 = std::fs::read_to_string(&marker)
             .expect("the stub records what it forked")
             .trim()
@@ -2880,7 +2880,7 @@ mod tests {
             .expect("a pid");
         let mut running = true;
         for _ in 0..50 {
-            if !crate::testutil::pid_is_running(forked) {
+            if !crate::session::pid_is_live(forked) {
                 running = false;
                 break;
             }

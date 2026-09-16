@@ -103,35 +103,6 @@ impl Drop for TmpDir {
     }
 }
 
-/// The process state character `/proc/<pid>/stat` reports: `R`/`S`/`D` for a process that still
-/// exists as one, `Z` for a corpse nobody has reaped, `None` once the entry is gone.
-///
-/// The command name sits in parentheses and may itself hold spaces and parentheses, so the state
-/// is read as the field after the **last** closing one.
-pub(crate) fn process_state(pid: u32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .next()?
-        .chars()
-        .next()
-}
-
-/// Whether `pid` names a process that is still **running**, as distinct from one that still has an
-/// entry in the process table.
-///
-/// `kill(pid, 0)` cannot answer this, and neither can [`crate::session::pid_is_live`], which is
-/// built on it and documents itself as answering "is the pid taken": a zombie's pid is taken, so a
-/// process that was killed and not yet reaped reads as alive through either. Whether that matters
-/// depends on who reaps. A test that kills a process it did not fork hands the corpse to whatever
-/// inherits it, and where that is an init which does not reap — a container's PID 1 is often one —
-/// the zombie stays in the table for the life of the test binary and the pid reads as alive
-/// forever. Asking for the state instead makes the answer the same on every host.
-pub(crate) fn pid_is_running(pid: u32) -> bool {
-    !matches!(process_state(pid), None | Some('Z'))
-}
-
 /// Every `.rs` source under `dir`, sorted, subdirectories included. The walk descends because a
 /// module that outgrew one file keeps its root in `<name>.rs` and everything else in a `<name>/`
 /// beside it: a flat listing would read the root, skip the children, and report the silence as a
