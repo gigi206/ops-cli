@@ -179,31 +179,32 @@ pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Opt
 /// The exception exists for a target the operator deliberately named; a rule nobody wrote names
 /// nothing, so the built-in lane can only ever reach a public address.
 ///
-/// [`Rule`] records no author, so the lane is identified by its **reach** rather than by an origin
-/// flag: `Rule`'s equality is its match (kind, methods, layer), and a rule whose match is a built-in
-/// entry's grants exactly what the always-on lane already grants — nothing the exception could be
-/// honouring. A written rule can be rewritten into that shape: under an app profile whose
-/// `default_methods` is `{GET,HEAD}`, a bare `allow github.com` becomes `{GET,HEAD} github.com:443`,
-/// which is the built-in entry itself, and the guard then refuses the private address rather than
-/// guessing who wrote it. That is the one ambiguity this comparison has, and it fails closed at it.
-/// An operator who means an internal target writes a rule that says more than the built-in lane
-/// already does — `allow {*} github.com`, `allow github.com:*`, or any verb set that is not
-/// `{GET,HEAD}` — and the exception applies again. The comparison is reached only for an address
-/// already classified private whose rule already names the host, so it costs nothing on any live
-/// path.
+/// The lane is identified by [`Rule::builtin`], the flag
+/// [`builtin_allow_rules`](super::builtin_allow_rules) stamps on the entries it builds and nothing
+/// else sets. Authorship is what the exception turns on, so authorship is what the rule records.
+///
+/// Asking the rule's **reach** instead — comparing it against the built-in set by value — answers
+/// the wrong question wherever the two shapes coincide. `Rule`'s equality is its match (kind,
+/// methods, layer), and a written rule is rewritten into a built-in entry's shape by an ordinary
+/// configuration: under an app profile whose `default_methods` is `{GET,HEAD}`, a bare
+/// `allow github.com` becomes `{GET,HEAD} github.com:443`, which is the built-in entry byte for
+/// byte. A value comparison then withheld the exception from a rule the operator had written, and
+/// the only way back was to write something the built-in lane does not already say.
+///
+/// The flag has no such ambiguity, and it needs no tie-break either: the built-ins are appended
+/// *after* the user's rules ([`union_with_builtin`](super::union_with_builtin)) and the matcher
+/// returns the first rule that matches, so where both would match, the deciding rule is the
+/// written one and carries `builtin: false`. Reading a flag is also cheaper than rebuilding the
+/// built-in set per call, though the path is reached only for an address already classified
+/// private whose rule already names the host.
 pub(crate) fn opens_private_address(host: &str, deciding: Option<&Rule>) -> bool {
     names_exact_host(host, deciding) && !decided_by_builtin(deciding)
 }
 
-/// Whether the deciding rule matches exactly what one of the always-on self-equip entries matches.
-/// See [`opens_private_address`] for why reach, and not authorship, is what this can ask.
+/// Whether the deciding rule is one of the always-on self-equip entries rather than one somebody
+/// wrote. See [`opens_private_address`] for why authorship is the question.
 fn decided_by_builtin(deciding: Option<&Rule>) -> bool {
-    let Some(rule) = deciding else {
-        return false;
-    };
-    super::builtin_allow_rules()
-        .iter()
-        .any(|builtin| builtin == rule)
+    deciding.is_some_and(|rule| rule.builtin)
 }
 
 /// Whether the proxy may connect to `ip` for a request to `host` the policy permitted via
@@ -563,17 +564,20 @@ mod tests {
         );
     }
 
-    /// The built-in lane is recognised by what a rule matches, so a written rule narrowed onto the
-    /// lane's own shape is read as the lane — and a rule that reaches further is not.
+    /// A written rule keeps the exception even where a rewrite gives it the built-in lane's shape.
     ///
-    /// An app profile's `default_methods` rewrite turns a bare `allow github.com` into
-    /// `{GET,HEAD} github.com:443`, which is the built-in entry itself. The guard has no authorship
-    /// to read, so it refuses the private address there rather than granting the exception to a
-    /// shape the always-on lane also has. The second half is what keeps that from being a blanket
-    /// refusal of the host: a rule that opens more than the built-in lane survives the same rewrite
-    /// as something else, and keeps the exception.
+    /// This is what the origin flag buys over a value comparison. An app profile's
+    /// `default_methods` rewrite turns a bare `allow github.com` into `{GET,HEAD} github.com:443`,
+    /// which is the built-in entry byte for byte, and `Rule`'s equality is its match. Identifying
+    /// the lane by reach therefore withheld the exception from a rule the operator had written,
+    /// for no reason they could see and with no remedy but writing something the built-in lane
+    /// does not already say. [`Rule::builtin`] records who wrote it instead, so the rewrite is
+    /// irrelevant.
+    ///
+    /// The rules that reach further are asserted beside it, so a regression that granted the
+    /// exception to everything would not pass as this property.
     #[test]
-    fn a_written_rule_narrowed_onto_the_built_in_shape_is_read_as_the_built_in_lane() {
+    fn a_written_rule_keeps_the_exception_in_the_built_in_lanes_own_shape() {
         use crate::allowlist::{EgressPolicy, Methods};
 
         let private: IpAddr = "10.0.0.5".parse().unwrap();
@@ -594,19 +598,54 @@ mod tests {
             "the rewrite is what puts the written rule on the built-in lane's shape"
         );
         assert!(
-            matches!(
-                ip_refusal(private, "github.com", Some(&allow[0])),
-                Some(AddrRefusal::PrivateWithoutExactHost)
-            ),
-            "a rule matching exactly what the built-in entry matches reaches no private address"
+            super::super::builtin_allow_rules()
+                .iter()
+                .any(|builtin| *builtin == allow[0]),
+            "and it equals a built-in entry, which is what a value comparison could not tell apart"
+        );
+        assert!(
+            !allow[0].builtin,
+            "the rewrite changes the rule's methods, never who wrote it"
+        );
+        assert!(
+            ip_refusal(private, "github.com", Some(&allow[0])).is_none(),
+            "a rule the operator wrote keeps the exception whatever shape the rewrite gave it"
         );
         assert!(
             ip_refusal(private, "api.github.com", Some(&allow[1])).is_none(),
-            "an explicit `{{*}}` opens more than the built-in lane, so it keeps the exception"
+            "an explicit `{{*}}` is written too, so it keeps the exception"
         );
         assert!(
             ip_refusal(private, "codeload.github.com", Some(&allow[2])).is_none(),
-            "a wider port set opens more than the built-in lane, so it keeps the exception"
+            "and so does a wider port set"
+        );
+    }
+
+    /// Where a written rule and a built-in entry both match, the written one decides.
+    ///
+    /// The flag is only as good as the rule the matcher hands the guard, and the two sets are
+    /// concatenated rather than merged: [`union_with_builtin`](super::super::union_with_builtin)
+    /// appends the built-ins after the user's rules and the matcher returns the first match. A
+    /// union that put them the other way round would hand the guard a `builtin: true` rule for a
+    /// host the operator had named, and the exception would go missing again.
+    #[test]
+    fn a_written_rule_outranks_the_built_in_entry_it_duplicates() {
+        use crate::allowlist::{Decision, EgressPolicy};
+
+        let policy = super::super::union_with_builtin(EgressPolicy::new(
+            vec![allowlist::classify("{GET,HEAD} github.com:443").unwrap()],
+            Vec::new(),
+        ));
+        let Decision::AllowedBy(deciding) = policy.explain("github.com", 443, "/x", "GET") else {
+            panic!("the rule permits this request");
+        };
+        assert!(
+            !deciding.builtin,
+            "the written rule comes first, so it is the one the guard weighs"
+        );
+        assert!(
+            ip_refusal("10.0.0.5".parse().unwrap(), "github.com", Some(deciding)).is_none(),
+            "so the private address the operator named is reachable"
         );
     }
 

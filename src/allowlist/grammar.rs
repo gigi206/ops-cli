@@ -111,6 +111,7 @@ pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
             methods,
             layer: Layer::L7,
             group: None,
+            builtin: false,
         });
     }
     let (layer, body) = split_scheme(rest)?;
@@ -144,6 +145,7 @@ pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
         methods,
         layer,
         group: None,
+        builtin: false,
     })
 }
 

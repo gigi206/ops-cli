@@ -474,9 +474,14 @@ rebound DNS answer for it) resolving to an **internal** address would be a
 server-side-request-forgery vector. After resolving, the proxy classifies the target
 IP: a public address is reachable subject to policy; a **private/loopback/CGNAT**
 address is refused **unless** the deciding rule names that *exact* host (an explicit
-IP-literal or exact-host allow: a deliberate internal target). A `*.domain`, regex,
-or built-in match does not grant the internal exception, and **cloud-metadata and
-link-local** addresses are *always* refused (no exception, ever). "Private" covers the
+IP-literal or exact-host allow: a deliberate internal target). A `*.domain` or regex
+match does not grant the internal exception, and neither does the always-on
+[self-equip allow set](modes#the-built-in-self-equip-set), which names hosts nobody
+wrote down. That last exclusion is by authorship, not by shape: a rule you wrote for
+one of those same hosts keeps the exception, including where an app profile's
+`default_methods` narrows it to `{GET,HEAD}` and it ends up matching exactly what the
+built-in entry matches. **Cloud-metadata and link-local** addresses are *always*
+refused (no exception, ever). "Private" covers the
 RFC 1918 ranges, loopback, the CGNAT shared range `100.64.0.0/10`, the TEST-NET
 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), the
 benchmarking range `198.18.0.0/15`, the reserved `240.0.0.0/4`, ULA `fc00::/7` and

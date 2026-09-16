@@ -106,11 +106,25 @@ pub(crate) struct Rule {
     /// behavior. It travels with the rule: `apply_default_methods` mutates methods in place and
     /// `merge_app` moves the whole policy, so the origin survives to the point it is rendered.
     pub(crate) group: Option<String>,
+    /// Whether this rule is one of the always-on self-equip entries
+    /// ([`builtin_allow_rules`](crate::sandbox::builtin_allow_rules)) rather than one somebody
+    /// wrote. Set where that set is built and nowhere else, so every other path leaves it `false`.
+    ///
+    /// Excluded from equality for the same reason [`Rule::group`] is — a rule's identity is its
+    /// match — but, unlike `group`, it is not display-only: the SSRF guard's private-address
+    /// exception is for a target the operator deliberately named, and the built-in lane names
+    /// nothing, so the proxy's SSRF guard (`opens_private_address`) reads this to tell the two
+    /// apart. Asking the rule's *shape* instead cannot: an app profile whose `default_methods` is
+    /// `{GET,HEAD}` rewrites a written `allow github.com` into the built-in entry byte for byte.
+    ///
+    /// It travels with the rule the way `group` does: `apply_default_methods` mutates methods in
+    /// place and `merge_app` moves the whole policy.
+    pub(crate) builtin: bool,
 }
 
-/// Equality ignores [`Rule::group`] — a rule's identity is what it matches (kind, methods, layer),
-/// not which group it was expanded from — so provenance never affects matching, dedup, or the
-/// derived equality of an [`EgressPolicy`] built from these rules.
+/// Equality ignores [`Rule::group`] and [`Rule::builtin`] — a rule's identity is what it matches
+/// (kind, methods, layer), not where it came from — so provenance never affects matching, dedup, or
+/// the derived equality of an [`EgressPolicy`] built from these rules.
 impl PartialEq for Rule {
     fn eq(&self, other: &Self) -> bool {
         self.kind == other.kind && self.methods == other.methods && self.layer == other.layer
@@ -1889,6 +1903,7 @@ pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
         methods: Methods::Unspecified,
         layer: Layer::L7,
         group: None,
+        builtin: false,
     }
 }
 

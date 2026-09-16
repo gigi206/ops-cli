@@ -57,10 +57,20 @@ pub(crate) fn builtin_allow_hosts() -> &'static [&'static str] {
 /// release host) stay per-profile. Unioned into every policy regardless of trust (a user `deny`
 /// can still carve it). The exact set is refined empirically against a real self-equip and is
 /// shown in `sbx config`, so it is never a silent allowance.
+///
+/// Each rule is stamped [`Rule::builtin`] here, and this is the only place that stamps it. The SSRF
+/// guard's private-address exception is for a target the operator deliberately named; these name
+/// nothing, so [`ssrf::opens_private_address`](super::ssrf::opens_private_address) withholds the
+/// exception from them by that flag.
 pub(crate) fn builtin_allow_rules() -> Vec<Rule> {
     builtin_allow_hosts()
         .iter()
-        .map(|e| allowlist::classify(e).expect("a built-in self-equip entry must be a valid rule"))
+        .map(|e| {
+            let mut rule =
+                allowlist::classify(e).expect("a built-in self-equip entry must be a valid rule");
+            rule.builtin = true;
+            rule
+        })
         .collect()
 }
 

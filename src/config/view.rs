@@ -2477,6 +2477,7 @@ mod tests {
                 methods: crate::allowlist::Methods::Any,
                 layer: crate::allowlist::Layer::L7,
                 group: None,
+                builtin: false,
             },
             header: "Authorization".into(),
             shape: crate::config::HeaderShape::new("Bearer ", false),
