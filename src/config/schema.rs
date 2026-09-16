@@ -2289,14 +2289,37 @@ fn locate_type_error<T: serde::de::DeserializeOwned>(
         if keys.len() > LOCATE_MAX_KEYS {
             break;
         }
-        // Nothing at this level is the mistake on its own when the table's own *shape* is what is
-        // wrong — a `packages` written as a table does not become a list by losing an entry — so
-        // the path found so far is as fine as the blame gets. Giving up outright here would throw
-        // away a perfectly good `task.deploy.packages` for want of a fifth step.
-        let Some(culprit) = keys.into_iter().find(|key| {
-            let mut trial = doc.clone();
-            remove_at(&mut trial, &path, key) && toml::from_str::<T>(&trial.to_string()).is_ok()
-        }) else {
+        let culprit = keys
+            .iter()
+            .find(|key| {
+                let mut trial = doc.clone();
+                remove_at(&mut trial, &path, key) && toml::from_str::<T>(&trial.to_string()).is_ok()
+            })
+            .cloned();
+        let Some(culprit) = culprit else {
+            // Nothing at this level is the mistake on its own, which is two situations and they
+            // must not be answered alike.
+            //
+            // The table's own *shape* may be what is wrong — a `packages` written as a table does
+            // not become a list by losing an entry — and then the path found so far is as fine as
+            // the blame gets, so it is kept: a perfectly good `task.deploy.packages` must not be
+            // thrown away for want of a finer step.
+            //
+            // Or the table is the right shape and holds *several* independent mistakes. Removing
+            // it then takes the correct settings beside them, which for a security table is the
+            // permissive direction: a `[proc]` whose `allow` and `deny` were both written as
+            // strings would lose the `mode = "enforce"` above them and launch with the lens off.
+            // That is the case [`crate::config::load::read_global`] says must cost the file, so
+            // the layer is refused rather than recovered.
+            //
+            // The two are told apart by emptying the table: if the document parses without its
+            // children, the children were the mistake and the correct ones among them would be
+            // collateral; if it still does not, the table itself is.
+            let mut emptied = doc.clone();
+            let cleared = keys.iter().all(|key| remove_at(&mut emptied, &path, key));
+            if cleared && toml::from_str::<T>(&emptied.to_string()).is_ok() {
+                return None;
+            }
             break;
         };
         path.push(culprit);
@@ -2669,6 +2692,51 @@ allow = \"github.com\"
         let mut dropped = Vec::new();
         assert!(parse_layer(b"network = 42\ngui = 7\n", &mut dropped).is_err());
         assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
+    /// Two mistyped values **inside a section** cost the file too, rather than costing the section.
+    ///
+    /// The sibling above pins the top-level case, which stops at depth 0 and was never in doubt.
+    /// This is the one the search can reach: removing `[proc]` does make the document parse, so
+    /// elimination finds it at depth 0 and descends into it, and nothing inside it is the mistake
+    /// on its own. Blaming the path found so far would drop the whole table — taking the
+    /// `mode = "enforce"` that was written correctly and launching with the lens `Off`, since
+    /// [`crate::proc_policy::ProcMode`] defaults there. A layer that cannot be read must cost the
+    /// file so a launch refuses, which is what `read_global` promises and what the permissive
+    /// defaults behind `[proc]`, `[network]` and `[fs]` make load-bearing.
+    ///
+    /// The recovery this must not take away is asserted beside it: a section whose *own* shape is
+    /// wrong is still named and dropped, because removing it loses nothing that was right.
+    #[test]
+    fn two_mistyped_values_inside_a_section_cost_the_file_not_the_section() {
+        let mut dropped = Vec::new();
+        let err = parse_layer(
+            b"[proc]\nmode = \"enforce\"\nallow = \"curl\"\ndeny = \"sh\"\n",
+            &mut dropped,
+        );
+        assert!(
+            err.is_err(),
+            "a section holding two mistakes is not recovered by dropping the section"
+        );
+        assert!(
+            dropped.is_empty(),
+            "and nothing is dropped behind the reader's back: {dropped:?}"
+        );
+
+        let mut dropped = Vec::new();
+        assert!(
+            parse_layer(
+                b"[task.deploy]\ncmd = [\"ssh\"]\n\n[task.deploy.packages]\nx = \"nix:x\"\n",
+                &mut dropped,
+            )
+            .is_ok(),
+            "a section whose own shape is wrong is still recovered"
+        );
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(
+            dropped[0].contains("task.deploy.packages"),
+            "and named: {dropped:?}"
+        );
     }
 
     /// A syntax error is not a type error: nothing is located, because the document cannot even be
