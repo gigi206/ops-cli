@@ -8780,9 +8780,10 @@ fn gc_prune_drops_a_superseded_seed_root_and_keeps_the_current_base() {
 }
 
 /// `sbx upgrade` ends by hinting how many superseded builds the project's store is holding, pointing
-/// at `sbx gc --prune`. Uses `upgrade flake` on a package-less project so the roll is a no-op (no
-/// network, the current revision's base stays built so the keep-set guard is met) and only the hint
-/// is exercised. Skips (never fails) where the host cannot sandbox or the cache is unreachable.
+/// at `sbx gc --prune`. Uses `upgrade distro` on a project that declares no image so the roll is a
+/// no-op (no network, the lock untouched, the current revision's base stays built so the keep-set
+/// guard is met) and only the hint is exercised. Skips (never fails) where the host cannot sandbox
+/// or the cache is unreachable.
 #[test]
 fn upgrade_hints_at_reclaimable_superseded_builds() {
     let project = TmpDir::prefixed("r", "uphint-proj");
@@ -8819,10 +8820,11 @@ fn upgrade_hints_at_reclaimable_superseded_builds() {
     )
     .expect("inject superseded root");
 
-    // `upgrade flake` on a project with no `flake:` packages rolls nothing (offline, lock untouched),
-    // so the current revision's base stays built and the end-of-upgrade hint runs against it.
+    // `upgrade distro` on a project that declares no image returns before it reads anything
+    // (offline, lock untouched), so the current revision's base stays built and the end-of-upgrade
+    // hint, which runs whatever the target, runs against it.
     let out = sbx()
-        .args(["upgrade"])
+        .args(["upgrade", "distro"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .output()

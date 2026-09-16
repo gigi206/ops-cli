@@ -993,8 +993,16 @@ fn prepare_engines(
         );
         return Err(ExitCode::FAILURE);
     }
-    // A cage is going to run, so this is where the scopes of the cages that already finished are
-    // reclaimed. Every launch path reaches this function, and the sweep runs once per process.
+    // The scopes of the cages that already finished are reclaimed here, once per process. Every
+    // launch path reaches this function, and so does the reclaim preparation (`Purpose::Reclaim`,
+    // through `prepare_to_reclaim`), which means a `sbx gc` dry run performs it too. That is
+    // deliberate rather than an oversight: `is_reclaimable` stops only a scope whose launcher is
+    // dead and whose cgroup is empty or holds a stillborn init — units systemd's own collection
+    // should already have taken, and which gc never lists or counts, so a dry run still reports
+    // exactly what a real one would remove.
+    //
+    // The runtime-directory sweep is the one that must stay out of `prepare` for that reason, and
+    // does: it would delete what gc reports as merely reclaimable. This one reports nothing.
     super::cgroup::sweep_stale_scopes();
     let nix = match crate::store::try_resolve_nix(Some(&layout)) {
         Ok(nix) => nix,

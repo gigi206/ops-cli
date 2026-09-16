@@ -120,7 +120,8 @@ fn config_show_reflects_and_tags_an_ambient_override() {
     // `sbx config show` must reflect an ambient `SBX_CONFIG` — otherwise it would lie about what a
     // launch in this environment does — and tag the overridden value's provenance as `override`
     // (distinct from the persisted `default`/`global`/`project`). No project config, so the baseline
-    // network is the default `shared`; the ambient override isolates it.
+    // network is the built-in deny-by-default allowlist, rendered `deny`; the ambient override
+    // isolates it.
     let fx = Project::new("cfg");
     let out = fx
         .cmd(&["config", "show"])
@@ -265,7 +266,8 @@ fn config_show_app_reflects_an_ambient_override() {
 fn config_show_reflects_an_ambient_typed_override() {
     // The typed ambient variables (`SBX_NET` here) must reach `sbx config show` too — it reads the
     // same `collect` the launch does, so a stale `SBX_NET` cannot silently change a launch's posture
-    // without the view admitting it. No project config, so the baseline network is `shared`.
+    // without the view admitting it. No project config, so the baseline network is the built-in
+    // deny-by-default allowlist.
     let fx = Project::new("cfg");
     let out = fx
         .cmd(&["config", "show"])
@@ -2238,9 +2240,13 @@ fn an_imported_profile_is_a_trusted_by_location_app() {
 fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     let fx = Project::new("cfg");
     // A profile (trusted by location) whose allowlist lives in the app overlay — the common case,
-    // since the baseline stays `shared`. The compact view shows the rule counts; `--details`
-    // expands the individual rules plus the always-allowed built-in set (which the
-    // baseline `network` section never prints here, because the baseline is not an allowlist).
+    // since the baseline carries no rules of its own. The compact view shows the rule counts;
+    // `--details` expands the individual rules plus the always-allowed built-in set under the app.
+    //
+    // The baseline `network` section prints a built-in roster of its own, in both views, so an
+    // assertion on the bare words "built-in" and "cache.nixos.org" is satisfied whether or not the
+    // app's roster expanded at all. The app's is distinguished by its indentation, which is what
+    // the assertions below anchor on.
     fx.write_profile(
         "demo-app",
         "cmd = \"demo-app\"\n[network]\nmode = \"deny\"\n\
@@ -2259,6 +2265,11 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
         !stdout.contains("allow {GET,HEAD} https://api.example.com"),
         "the default must not expand the rules:\n{stdout}"
     );
+    assert!(
+        !stdout.contains("          allow {GET,HEAD} https://cache.nixos.org"),
+        "nor the app's built-in roster — the baseline prints one of its own at a shallower \
+         indent, which is why this names the app's:\n{stdout}"
+    );
 
     // --details: the rules themselves, the deny carve-out, and the built-in set.
     let out = fx.run(&["config", "show", "--details"]);
@@ -2276,8 +2287,9 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
         "--details must list the deny rule:\n{stdout}"
     );
     assert!(
-        stdout.contains("built-in") && stdout.contains("cache.nixos.org"),
-        "--details must surface the always-allowed built-in set:\n{stdout}"
+        stdout.contains("          allow {GET,HEAD} https://cache.nixos.org"),
+        "--details must surface the always-allowed built-in set under the app, at the app \
+         roster's own indent:\n{stdout}"
     );
 }
 
@@ -3502,8 +3514,10 @@ fn the_shipped_profiles_import_and_resolve() {
         // text, so this names no profile. A top-level scalar `network = "shared"|"none"` must resolve
         // to that exact posture (a profile like `t3code`, whose proxy-blind Node backend cannot be
         // filtered, ships `shared` on purpose — see its header); a `[network]` filtering table must
-        // resolve to an allowlist. The regression this guards is a silently dropped `[network]`, which
-        // would fail OPEN to the default `shared` — caught for every profile that declares a table.
+        // resolve to an allowlist. The regression this guards is a silently dropped `[network]`: the
+        // profile's own rules would go missing and the launch would fall back to the ruleless
+        // deny-by-default baseline, which opens nothing the profile asked for — caught for every
+        // profile that declares a table.
         let declared_scalar_net = text
             .lines()
             .map(str::trim_start)

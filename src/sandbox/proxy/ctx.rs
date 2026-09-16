@@ -548,9 +548,10 @@ impl ProxyCtx {
 
     /// Push one event into the live log **without** touching the stat counters — for the outcomes the
     /// coarse stats taxonomy does not count but the diagnostic log should: a permitted request that
-    /// failed downstream (`Error` — DNS/unreachable/cert) and a request sbx declined before any
-    /// verdict (`Blocked` — an IP-literal target or a malformed/smuggling request). Stats stay a
-    /// pure allow/deny/blocked policy counter; the log is the richer record.
+    /// failed downstream (`Error` — DNS/unreachable/cert) and a request sbx declined on something
+    /// other than a policy verdict (`Blocked` — an IP-literal target, or a malformed/smuggling
+    /// request, which on a streaming chunked body is found after the allow was already recorded).
+    /// Stats stay a pure allow/deny/blocked policy counter; the log is the richer record.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn push_log(
         &self,

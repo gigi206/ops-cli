@@ -262,7 +262,10 @@ pub(crate) fn verify_key(
     let dir = layout.store_path(name);
     let tmp = dir.join(format!(".store-toml-{}-{}", std::process::id(), unique()));
     let _ = std::fs::remove_file(&tmp);
-    write_owner_only(&tmp, store_toml(&cfg.url, &cfg.pubkey, false)?.as_bytes())?;
+    if let Err(e) = write_owner_only(&tmp, store_toml(&cfg.url, &cfg.pubkey, false)?.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Err(e) = std::fs::rename(&tmp, dir.join(STORE_TOML)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("cannot record the confirmation: {e}"));

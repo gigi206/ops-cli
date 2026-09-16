@@ -8149,10 +8149,18 @@ fn an_untrusted_project_allowlist_is_dropped_with_a_warning() {
 
 #[test]
 fn a_trusted_project_deny_carves_out_of_allow() {
-    // deny always wins: a broad allow with a deny carve-out blocks the carve-out.
+    // deny always wins: a broad allow with a deny carve-out blocks the carve-out. The table is the
+    // *project* layer, which is what this test is named for and what its sibling
+    // `a_trusted_project_allowlist_is_classified` also feeds; passing it as the global layer left
+    // the project argument an inert `RawConfig::default()`, so the branch under test never ran and
+    // the assertions were satisfied by the global one — which
+    // `a_malformed_entry_in_either_list_is_dropped_keeping_the_valid_ones` covers below.
     let r = resolve_no_plugins(
-        raw_network_table(&["*.nixos.org"], &["evil.nixos.org"]),
-        Some((RawConfig::default(), TrustState::Trusted)),
+        RawConfig::default(),
+        Some((
+            raw_network_table(&["*.nixos.org"], &["evil.nixos.org"]),
+            TrustState::Trusted,
+        )),
     );
     match &r.network {
         NetworkPolicy::Allowlist(a) => {

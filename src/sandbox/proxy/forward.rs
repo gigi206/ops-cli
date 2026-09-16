@@ -341,7 +341,10 @@ pub(super) fn handle_https_forward(
         Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, &e),
     };
 
-    // The request is permitted and the upstream TLS handshake is validated — record the one `allow`.
+    // The request is permitted and the upstream TLS handshake is validated — record the one
+    // `allow`. As on the tunnel plane, this falls before a streaming chunked body's framing is
+    // known to be well-formed, so a refusal below leaves the allow standing with a `blocked` log
+    // line and no matching stat; see the note at the same point in `tunnel.rs`.
     let allow_seq = ctx.outcome_l7(
         crate::sandbox::control::Proto::Https,
         crate::sandbox::control::HttpVer::H1,

@@ -117,7 +117,7 @@
 //! | `405` | `method-not-allowed`     | a non-CONNECT request that is neither a routable `http://` nor `https://` absolute-form (a bare origin-form has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
-//! | `502` | `upstream-cert-rejected` | the upstream TLS certificate failed validation (never downgraded) |
+//! | `502` | `upstream-cert-rejected` | the upstream TLS handshake or certificate validation failed (never downgraded). The name states the usual cause rather than the whole class: a reached upstream that speaks no TLS, or answers the ClientHello too slowly, fails here too — every one of them a refusal, none of them a downgrade |
 //! | `502` | `upstream-http2-unsupported` | a `[network] http2` host will not speak HTTP/2. gRPC is HTTP/2 end to end and this plane does not translate, so it fails closed. Reported whether the upstream refuses the ALPN offer or ignores ALPN and negotiates nothing: both are the same fact about the server, and neither is a certificate problem |
 //! | `502` | `interim-head-cap`       | the upstream answered with more interim `1xx` heads than one exchange carries ([`INTERIM_HEAD_MAX`]). Each is relayed and read past on a leg whose read bound the response stream has already lifted, so an unbounded run holds a proxy thread and pours bytes into the cage; the count is what is bounded, and the wait between heads is the one a slowly streamed body also gets |
 //! | `502` | `upstream-head-too-large` | the upstream sent more than [`HEAD_MAX`] bytes of response head without the blank line that ends it. Relaying what fits would cut one byte stream in two — the head's mask runs over its own bytes and the body's carry starts empty, so a reflected secret straddling the cut is masked by neither — and the truncation already broke the exchange, since the rest of the head would cross as body. Distinct from `bad-request:head`, which is the same shape in the request the cage sent |
@@ -930,7 +930,8 @@ fn refuse_upstream<W: Write>(
         UpstreamError::CertRejected => (
             "upstream-cert-rejected",
             format!(
-                "the TLS certificate presented by `{host}` was rejected (upstream validation failed)"
+                "the TLS handshake with `{host}` failed (upstream certificate validation is the \
+                 usual cause)"
             ),
         ),
     };

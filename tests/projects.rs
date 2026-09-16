@@ -71,15 +71,23 @@ fn text(out: &std::process::Output) -> String {
 fn a_pruned_session_record_does_not_land_in_the_json_document() {
     let fx = Project::new("projects");
     fx.make_tree("aaaaaaaaaaaaaaaa", Some(fx.proj.path()));
-    // A record for a pid that cannot be live: pid 0 is the scheduler, never a session.
+    // A record for a pid that cannot be live: pid 0 is the scheduler, never a session — it reads
+    // dead by the start-tick mismatch rather than by a signal. `project` is hex-encoded because
+    // that is the on-disk format every writer produces and `parse_record` decodes; a raw path is
+    // pruned as a *corrupt* record instead, which would take this fixture past the reason it names.
     let sessions = fx.data_home.path().join("sbx/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
+    let project: String = fx
+        .proj
+        .path()
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     std::fs::write(
         sessions.join("0-1"),
-        format!(
-            "kind=run\npid=0\nstart=1\nruntime=project\ndetached=false\nproject={}\n",
-            fx.proj.path().display()
-        ),
+        format!("kind=run\npid=0\nstart=1\nruntime=project\ndetached=false\nproject={project}\n"),
     )
     .unwrap();
 
@@ -164,8 +172,13 @@ fn show_reports_store_roots_and_declared_but_not_built() {
         s.contains("store roots") && s.contains("built"),
         "the realized package should be a store root:\n{s}"
     );
+    // Anchored on text only the breakdown lines carry. `store ` alone was implied by the
+    // `store roots` assertion above, so the conjunct could not fail and the two figures whose
+    // saturating arithmetic it was meant to guard were unwatched.
     assert!(
-        s.contains("store ") && s.contains("home "),
+        s.contains("seeded from the shared store")
+            && s.contains("built here")
+            && s.contains("home "),
         "size breakdown:\n{s}"
     );
     // The unrealized declared package shows as `not built yet` (trusted, so not `withheld`).
@@ -787,8 +800,14 @@ fn gc_sweeps_dead_launch_runtime_files_but_never_on_a_dry_run() {
     std::fs::create_dir_all(&portal).unwrap();
 
     // What a launch leaves when it ends on a signal: the MITM CA and its two sockets, plus the
-    // portal's runtime directory. The stats file shares the directory but must survive both passes —
-    // it outlives its session as the data `sbx net stats` aggregates.
+    // portal's runtime directory. The stats file shares the directory and is what this test guards
+    // the sweep against: the sweep classifies by name and pid alone, so it must never claim a
+    // `stats-*` entry however dead that pid is.
+    //
+    // Folding a stats file into the rollup `sbx net stats` reads is a separate pass of the same
+    // command, with its own coverage. The body written below is deliberately unparseable so that
+    // pass leaves the file where it is, which keeps this test about the sweep and keeps it from
+    // turning into a false alarm if the parser is ever loosened.
     let ca = egress.join(format!("ca-{pid}.pem"));
     let proxy = egress.join(format!("proxy-{pid}.sock"));
     let control = egress.join(format!("control-{pid}.sock"));
@@ -825,7 +844,7 @@ fn gc_sweeps_dead_launch_runtime_files_but_never_on_a_dry_run() {
     }
     assert!(
         stats.exists(),
-        "the session's stats outlive it — `sbx net stats` reads them:\n{}",
+        "the sweep must never claim a `stats-*` name, whatever the pid:\n{}",
         text(&out)
     );
 }

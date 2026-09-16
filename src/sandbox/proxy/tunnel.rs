@@ -538,9 +538,18 @@ pub(super) fn serve_tunneled_request(
         }
     };
 
-    // The request is permitted and the upstream is up — it will now egress. Record the one `allow`
-    // outcome here (a single count per request: a refusal above already returned, and the steps
-    // below are I/O, not policy verdicts, so this is the sole place a forwarded request is counted).
+    // The request is permitted and the upstream is up. Record the one `allow` outcome here: the
+    // policy verdict has passed and a connection has been spent, which is what the counter is
+    // about.
+    //
+    // It is counted before the body is known to be well-formed, so the count is not a promise that
+    // bytes reached the upstream. A streaming chunked body whose framing is malformed is refused
+    // below with `400 bad-request:chunked`, after this line, and leaves the allow standing with a
+    // `blocked` log line beside it — a log without a matching stat, which is the shape every
+    // declined-after-verdict refusal has here. The held path avoids it by de-chunking the identical
+    // body earlier, before this point; a body that takes the streaming path is de-chunked only as
+    // it is forwarded, and moving that earlier would reorder body buffering against the upstream
+    // handshake on both planes for one counter.
     let allow_seq = ctx.outcome_l7(
         crate::sandbox::control::Proto::Https,
         crate::sandbox::control::HttpVer::H1,
