@@ -384,7 +384,12 @@ fn the_shipped_counts_the_guide_states_are_the_real_ones() {
         let at = path.display().to_string();
         for (noun, want) in [("profiles", profiles), ("bundles", bundles)] {
             for (i, _) in flat.match_indices(noun) {
-                let head = &flat[i.saturating_sub(40)..i];
+                // `i` is a byte index, and the guide writes characters that are several bytes
+                // wide, so the window before the noun is counted in characters: subtracting a
+                // byte count could land inside one and panic.
+                let before = &flat[..i];
+                let start = before.char_indices().rev().nth(39).map_or(0, |(b, _)| b);
+                let head = &before[start..];
                 if !head.contains("shipped") && !head.contains("importable") {
                     continue;
                 }

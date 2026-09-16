@@ -171,7 +171,7 @@ jobs:
           if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
             echo "::warning::base '$BASE' is not in this clone — running the full test suite"
             CORE_CHANGED=1
-          elif ! DIFF=$(git diff --name-only "$BASE" HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock' 'build.rs'); then
+          elif ! DIFF=$(git diff --name-only "$BASE" HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock' 'build.rs' 'proc-shim/**'); then
             echo "::warning::cannot diff against '$BASE' — running the full test suite"
             CORE_CHANGED=1
           else
@@ -181,7 +181,15 @@ jobs:
           for f in "${CHANGED[@]:-}"; do
             [ -z "$f" ] && continue
             case "$f" in
-              Cargo.toml|Cargo.lock|build.rs|src/*)
+              Cargo.toml|Cargo.lock|build.rs|src/*|proc-shim/*)
+                # `build.rs` compiles `proc-shim/` and embeds it in every binary, so a change
+                # there changes what the integration suites exercise exactly as `src/` does.
+                CORE_CHANGED=1
+                ;;
+              tests/*/*)
+                # Anything below `tests/` is a shared helper module (`tests/common/`), not a
+                # test target: `--test common/mod` is not a name cargo accepts, and a helper
+                # can feed any suite. Widen rather than guess which ones.
                 CORE_CHANGED=1
                 ;;
               tests/*.rs)
@@ -198,7 +206,7 @@ jobs:
           {
             echo "### Test scope"
             if [ "$CORE_CHANGED" -eq 1 ]; then
-              echo "Full suite: a core change, or the diff could not be read."
+              echo "Full suite: a core or shared-test-helper change, or the diff could not be read."
             elif [ "${#TESTS_CHANGED[@]}" -gt 0 ]; then
               echo "Unit tests (\`--bins\`), plus the integration suites that changed: ${TESTS_CHANGED[*]}."
             else
@@ -213,7 +221,7 @@ jobs:
           rc=0
 
           if [ "$CORE_CHANGED" -eq 1 ]; then
-            echo "::notice::core change detected — running the full test suite"
+            echo "::notice::core or shared-test-helper change detected — running the full test suite"
             # See the comment below: the systemd `systemd-run` dollar-escape test
             # is host-dependent and fails on the ubuntu-24.04 hosted runner.
             cargo test --no-fail-fast -- --skip sandbox::cgroup::tests::a_dollar_argument_reaches_the_program_verbatim || rc=$?

@@ -28,9 +28,11 @@
 # is not already executable; node-pty is in `trustedDependencies` so npm's
 # build-script check is satisfied) — mise's npm backend installs with
 # `--ignore-scripts=true` and skips it, which is SAFE here because node-pty@1.1.0
-# publishes its prebuilt `spawn-helper` already executable. The wrapper below
-# `chmod +x` defensively in case the host (or a future node-pty version) ships
-# the helper without the bit.
+# publishes its prebuilt `spawn-helper` already executable. Nothing in this
+# profile or in its bundle restores that bit, so a host (or a future node-pty
+# version) that ships the helper without it fails the TUI's PTY at launch; the
+# repair belongs in the bundle's `provision`, which runs once at install time,
+# rather than in `cmd`, which is replayed at every launch.
 #
 # DEPENDENCIES — heavy (verified 28 runtime deps): `ink` (React TUI), `sharp`
 # (image processing for screenshots), `node-pty` (PTY for the TUI), `qrcode`
@@ -75,12 +77,11 @@
 # you actually configure (the cage's deny-default is the point).
 #
 # UNVERIFIED (like every profile until run with a real account): the live
-# equip + first prompt under the allowlist, the `autohand` TUI on a real
-# project, and the postinstall-skip chmod fallback. Grounded here: the npm
-# packaging (bin aliases, engines `>= 22`, 28 deps, postinstall + trusted
-# list — read out of `package.json`), the host set (read out of
-# `dist/index.js` + the bundled chunks), the env-var overrides (read out of
-# the `dev` script), and the Apache-2.0 license.
+# equip + first prompt under the allowlist and the `autohand` TUI on a real
+# project. Grounded here: the npm packaging (bin aliases, engines `>= 22`, 28
+# deps, postinstall + trusted list — read out of `package.json`), the host set
+# (read out of `dist/index.js` + the bundled chunks), the env-var overrides
+# (read out of the `dev` script), and the Apache-2.0 license.
 cmd = "autohand"
 
 # Your host Autohand config/auth, mounted read-write at its real absolute paths.

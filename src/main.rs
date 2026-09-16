@@ -137,9 +137,17 @@ fn sessions_of_project<'a>(
         .collect()
 }
 
-/// Resolve the session a `proc` subcommand acts on: an explicit PID (a 0-or-1 match among the live
-/// set), or this project's sole live session when no id is given. On ambiguity or absence it prints
-/// guidance (tagged with `verb`) and returns the exit code the caller should propagate.
+/// Resolve the session a `proc` subcommand acts on: an explicit id — a PID or the cage name the
+/// listing leads with — or this project's sole live session when no id is given. On ambiguity or
+/// absence it prints guidance (tagged with `verb`) and returns the exit code the caller should
+/// propagate.
+///
+/// An id is resolved through [`session::answering`], which weighs every live session rather than
+/// taking the first hit: a PID is unique among live processes, but a cage name is derived from the
+/// app or the project's basename, so two sessions of the same project — or of two projects that
+/// share a basename — answer to the same name. Picking one of them silently would act on a session
+/// the caller did not choose, so a name several sessions answer to is refused with the candidates
+/// listed, the way the no-id path already refuses when a project holds more than one.
 ///
 /// The scope of the no-id path is [`sessions_of_project`], the same one `sbx proc logs` resolves
 /// through: a family whose verbs disagreed about which session "no id" means would make the answer
@@ -151,10 +159,14 @@ fn resolve_session_target<'a>(
     project: &Path,
 ) -> Result<&'a session::Session, ExitCode> {
     match id {
-        Some(id) => sessions.iter().find(|s| s.answers_to(id)).ok_or_else(|| {
-            diag::error(&format!(
-                "sbx: {verb}: no live session '{id}' — run `sbx session ls` to list them."
-            ));
+        Some(id) => session::answering(sessions, id).map_err(|many| {
+            if many.is_empty() {
+                diag::error(&format!(
+                    "sbx: {verb}: no live session '{id}' — run `sbx session ls` to list them."
+                ));
+            } else {
+                session::report_ambiguous_id(verb, id, &many);
+            }
             ExitCode::from(2)
         }),
         None => match sessions_of_project(sessions, project).as_slice() {
@@ -1441,8 +1453,13 @@ fn persist_learned_proc_rules(
     let written =
         manage::add_learned_proc_rules(&path, app_key, rules).map_err(|e| (2, e.to_string()))?;
 
+    // One verdict for "the file changed", shared by the re-trust, the summary line and the
+    // re-trust notice: setting the posture rewrites the document even when every rule was already
+    // listed.
+    let wrote_anything = written.outcome.wrote_anything();
+
     if let Some(store) = &store
-        && written.outcome.wrote_anything()
+        && wrote_anything
     {
         trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
             (
@@ -1463,7 +1480,10 @@ fn persist_learned_proc_rules(
     } = written.outcome;
     let mut msg = match (added.len(), already_present) {
         (0, 0) => format!("no exec rules to add to {target}"),
-        (0, n) => format!("all {n} learned exec rule(s) were already in {target} — no change"),
+        (0, n) if !wrote_anything => {
+            format!("all {n} learned exec rule(s) were already in {target} — no change")
+        }
+        (0, n) => format!("all {n} learned exec rule(s) were already in {target}"),
         (n, 0) => format!("added {n} exec rule(s) to {target}"),
         (n, already) => {
             format!("added {n} exec rule(s) to {target} ({already} already present)")
@@ -1481,7 +1501,7 @@ fn persist_learned_proc_rules(
              `sbx proc allow`/`deny` instead of running"
         ));
     }
-    if gated && !added.is_empty() {
+    if gated && wrote_anything {
         msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
     }
     Ok(msg)
@@ -2097,6 +2117,46 @@ mod tests {
                 .ok()
                 .map(|s| s.pid),
             Some(4242)
+        );
+    }
+
+    /// A cage name carries no per-session component — it is the sanitized app or project basename —
+    /// so two live sessions can answer to one name. Addressing by it must refuse rather than act on
+    /// whichever the registry happened to list first.
+    #[test]
+    fn an_id_several_live_sessions_answer_to_is_refused() {
+        use session::{Kind, Session, SessionRuntime};
+
+        let here = PathBuf::from("/tmp/one/demo-app");
+        let session = |project: &Path, pid: u32| Session {
+            project: project.to_path_buf(),
+            pid,
+            start_ticks: 7,
+            kind: Kind::Run,
+            runtime: SessionRuntime::Project,
+            detached: false,
+        };
+
+        let twins = [
+            session(&here, 4242),
+            session(Path::new("/tmp/two/demo-app"), 4243),
+        ];
+        let name = sandbox::cage_name(twins[0].app(), &twins[0].project);
+        assert!(
+            twins.iter().all(|s| s.answers_to(&name)),
+            "both sessions must answer to the shared name for this to test anything"
+        );
+        assert!(
+            resolve_session_target(&twins, Some(&name), "proc", &here).is_err(),
+            "a name two live sessions answer to must be refused, not resolved to one of them"
+        );
+
+        // The pid stays a 0-or-1 match, so it still resolves among the same two.
+        assert_eq!(
+            resolve_session_target(&twins, Some("4243"), "proc", &here)
+                .ok()
+                .map(|s| s.pid),
+            Some(4243)
         );
     }
 

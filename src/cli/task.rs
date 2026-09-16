@@ -574,20 +574,10 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
         .map(|row| {
             let mut fields = row.split('\t');
             let name = fields.next().unwrap_or_default().to_string();
-            let rest: Vec<&str> = fields.collect();
-            let (map, tail) = {
-                let mut map = BTreeMap::new();
-                let mut tail = String::new();
-                for field in &rest {
-                    match field.split_once('=') {
-                        Some((k, v)) => {
-                            map.insert(k, v);
-                        }
-                        None => tail = (*field).to_string(),
-                    }
-                }
-                (map, tail)
-            };
+            // The trailing field is the description (or, for an injection, the delivery note) and
+            // may itself contain `=`, so the row is split by position rather than parsed.
+            let rest: Vec<String> = fields.map(str::to_string).collect();
+            let (map, tail) = split_fields(&rest);
             let (delivery, description) = match tail.strip_prefix("wire-injected for ") {
                 Some(to) => (format!("wire -> {to}"), String::new()),
                 None => (

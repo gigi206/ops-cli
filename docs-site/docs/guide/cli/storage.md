@@ -148,6 +148,18 @@ volume would leave that behind, not move it.
        pass --force to adopt an empty volume anyway.
 ```
 
+It refuses for the same reason when sbx **already follows another volume**. The data directory
+then holds only the pointer, so the check above finds nothing at risk; the store, projects and app
+homes live in the adopted volume, and repointing hides them just as silently, with `unuse`
+afterwards returning to the plain directory rather than to them:
+
+```console
+$ sbx storage use --image /mnt/other.btrfs
+sbx storage: sbx already uses /run/media/you/sbx-storage.btrfs — adopting another volume would
+leave its store, projects and app homes behind, not move them.
+       `sbx storage unuse` first if you meant to switch, or pass --force.
+```
+
 The image is created **beside** the data directory (`<xdg-data>/sbx-storage.btrfs`), never
 inside it, the volume is what that directory becomes. `--image <path>` puts it elsewhere, on
 another disk for instance; it must be absolute, and is refused before anything mounts otherwise.

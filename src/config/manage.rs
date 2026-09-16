@@ -800,6 +800,22 @@ pub(crate) fn admit_egress_rule(rule: &str, slot: crate::allowlist::Slot) -> Res
         .map_err(|e| format!("invalid rule {rule:?}: {}", crate::sandbox::sanitize(&e)))
 }
 
+/// Turn a resolver's own drop warning into the refusal an edit reports, or `Ok` when it dropped
+/// nothing. The warning already names the entry and the reason, so it is reused rather than
+/// restated: what is stripped is the empty source label [`validate_layer`] passes and the
+/// "ignoring" the loader leads with, which a refusal contradicts — nothing is ignored here, the
+/// write does not happen.
+fn refuse_dropped_entry(dropped: Vec<String>) -> Result<(), String> {
+    let Some(why) = dropped.into_iter().next() else {
+        return Ok(());
+    };
+    let why = why.trim_start_matches(':').trim();
+    let why = why.strip_prefix("ignoring ").unwrap_or(why);
+    Err(format!(
+        "{why} — it would be dropped at load, and the value never applied"
+    ))
+}
+
 /// Whether the edited document still parses as a config layer **and** says what it appears to say.
 /// A `set`/`unset` that leaves the layer unparseable is worse than a no-op: the loader drops the
 /// WHOLE layer with only a warning, silently reverting every security field it carried, so a write
@@ -824,6 +840,13 @@ pub(crate) fn admit_egress_rule(rule: &str, slot: crate::allowlist::Slot) -> Res
 /// only list `sbx config add` reaches that had no admission at all: `sbx config add seccomp.allow
 /// 'bad!!!'` reported the entry as added, and the launch then dropped it, leaving a cage the config
 /// says reopened a syscall and the kernel says did not.
+///
+/// `[devices] allow`, `[ssh_agent] allow` and the `[network]` table's `http2` and
+/// `shared_credential` are the fifth, and they close the sentence above: each is a list the schema
+/// types broadly enough to hold what the resolver then drops with a warning — a path outside
+/// `/dev/`, a wildcard where a key must be named, a host that is not a host, a credential group
+/// naming one host and no wildcard. Each is checked through the resolver's own function, whose
+/// warning already names the entry and the reason, so no copy of those rules lives here either.
 fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
     let raw = super::schema::parse(doc.to_string().as_bytes())?;
     // The rule lists, baseline and per app. `sbx net allow` and `sbx proc allow` admit a rule
@@ -847,6 +870,14 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
                 })?;
             }
         }
+        // The table's other two free-form lists, through the resolver that reads them: a `http2`
+        // entry it cannot read as a host leaves that host on HTTP/1.1, and a `shared_credential`
+        // group it refuses leaves the tripwire with the per-host exemption it had — both silent
+        // once written, both a value the writer was told had been set.
+        let mut dropped = Vec::new();
+        super::parse_http2_hosts(&mut dropped, "", t.http2.clone());
+        super::parse_shared_credential(&mut dropped, "", t.shared_credential.clone());
+        refuse_dropped_entry(dropped)?;
     }
     let app_procs = raw.app.values().filter_map(|a| a.proc.as_ref());
     for field in raw.proc.iter().chain(app_procs) {
@@ -876,6 +907,22 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
                 })?;
             }
         }
+    }
+    // `[devices] allow` and `[ssh_agent] allow`, baseline and per app, through the two resolvers
+    // that read them. Both grant host access and both drop a malformed entry with a warning, so a
+    // device the cage never gets and a key it can never sign with were written, reported, and — for
+    // a `--local` file — re-trusted, with nothing to show for it at the next launch.
+    let app_devices = raw.app.values().filter_map(|a| a.devices.as_ref());
+    for devices in raw.devices.iter().chain(app_devices) {
+        let mut dropped = Vec::new();
+        super::apply_devices(&mut dropped, "", Some(devices.clone()));
+        refuse_dropped_entry(dropped)?;
+    }
+    let app_ssh = raw.app.values().filter_map(|a| a.ssh_agent.as_ref());
+    for ssh in raw.ssh_agent.iter().chain(app_ssh) {
+        let mut dropped = Vec::new();
+        super::apply_ssh_agent(&mut dropped, "", Some(ssh.clone()));
+        refuse_dropped_entry(dropped)?;
     }
     let apps = raw.app.values().filter_map(|a| a.forward.as_ref());
     for entry in raw.forward.iter().chain(apps).flatten() {
@@ -1442,7 +1489,12 @@ pub(crate) fn remove_proc_rule(
 /// Shorter than its two siblings because the table it edits has no posture: [`add_proc_rule`] must
 /// bootstrap a mode and refuse a rule that would sit inert under the one already there, and the
 /// egress path does the same. A mask only ever takes access away, so there is no state in which
-/// writing one is a no-op the writer did not ask for, and nothing to refuse.
+/// writing one is a no-op the writer did not ask for, and no posture to refuse.
+///
+/// The edit is still validated before it commits, on [`validate_layer`]'s own terms: those siblings
+/// admit their rule against the resolver's grammar first, and a mask this one committed that
+/// [`super::apply_fs`] then dropped would be reported as written over a path that stays open to the
+/// cage.
 pub(crate) fn add_fs_mask(
     path: &Path,
     app: Option<&str>,
@@ -1490,6 +1542,12 @@ pub(crate) fn add_fs_mask(
         Some(_) => return Err(ManageError::MalformedFs("not a table".into())),
     };
 
+    if let Err(detail) = validate_layer(&doc) {
+        return Err(ManageError::InvalidValue(
+            format!("[fs] {}", list.key()),
+            detail,
+        ));
+    }
     let text = commit_rule(path, &doc, &outcome)?;
     Ok(Written { outcome, text })
 }
@@ -3467,6 +3525,92 @@ mod tests {
             add_egress_rule(&p, None, EgressList::Allow, "x.com", Inherited::Nothing),
             Err(ManageError::MalformedNetwork(_))
         ));
+    }
+
+    /// The fifth group `validate_layer` checks, and the last of the fields whose schema type is
+    /// broad enough to hold what the resolver drops: a device outside `/dev/`, an ssh grant spelled
+    /// as a wildcard or a truncated fingerprint, an `http2` entry naming no host or no port a port
+    /// number can hold. Each parsed, committed and was reported as added, and the next launch
+    /// dropped it with a warning on stderr — a device the cage never got, a key it could never sign
+    /// with, a host that stayed on HTTP/1.1.
+    #[test]
+    fn a_device_ssh_or_http2_entry_the_resolver_would_drop_is_refused_before_it_commits() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[devices]\nallow = [\"/dev/dri\"]\n");
+        let before = std::fs::read_to_string(&p).unwrap();
+        for (key, bad) in [
+            ("devices.allow", "/tmp/x"),
+            ("devices.allow", "/dev/../etc/shadow"),
+            ("ssh_agent.allow", "*"),
+            ("ssh_agent.allow", "SHA256:short"),
+            ("network.http2", "api.example.com:70000"),
+            ("network.http2", "*."),
+        ] {
+            assert!(
+                matches!(add(&p, key, bad), Err(ManageError::InvalidValue(_, _))),
+                "`{key} += {bad}` must be refused rather than dropped at load"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a refused entry must leave the file byte-for-byte unchanged"
+        );
+
+        // And everything the resolver accepts still goes through, or the gate would be refusing
+        // the field rather than validating it.
+        assert!(add(&p, "devices.allow", "/dev/kvm").unwrap().outcome);
+        assert!(
+            add(
+                &p,
+                "ssh_agent.allow",
+                "SHA256:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+            )
+            .unwrap()
+            .outcome
+        );
+        assert!(add(&p, "ssh_agent.allow", "deploy key").unwrap().outcome);
+        assert!(
+            add(&p, "network.http2", "grpc.example.com")
+                .unwrap()
+                .outcome
+        );
+    }
+
+    /// `sbx fs deny|readonly` writes the same list `sbx config add fs.deny` does, and reached it
+    /// without the gate: the mask was committed, reported as added and (for a project file)
+    /// re-trusted, and `apply_fs` dropped it at the next load — the user was told a path was closed
+    /// that stayed open to the cage.
+    #[test]
+    fn add_fs_mask_refuses_an_entry_the_resolver_would_drop() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[fs]\ndeny = [\".env\"]\n");
+        let before = std::fs::read_to_string(&p).unwrap();
+        for (app, list, bad) in [
+            (None, FsList::Deny, "/etc/shadow"),
+            (None, FsList::Deny, "secrets/**"),
+            (Some("demo"), FsList::Readonly, "../outside"),
+        ] {
+            assert!(
+                matches!(
+                    add_fs_mask(&p, app, list, bad),
+                    Err(ManageError::InvalidValue(_, _))
+                ),
+                "`{bad}` must be refused rather than reported as written"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a refused mask must leave the file byte-for-byte unchanged"
+        );
+        // A mask the resolver honors is still written.
+        assert_eq!(
+            add_fs_mask(&p, None, FsList::Deny, "secrets/prod.key")
+                .unwrap()
+                .outcome,
+            AddOutcome::Added { created_mode: None }
+        );
     }
 
     #[test]

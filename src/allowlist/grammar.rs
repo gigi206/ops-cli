@@ -456,18 +456,25 @@ fn parse_port(s: &str) -> Result<u16, String> {
 /// Split an http(s) URL naming one **request** into the `(host, port, path)` the matcher
 /// tests: `host` lowercased (an IPv6 host bracketed in the URL, returned bare), `port` from an
 /// explicit `:port` or the scheme default, `path` everything after the authority (the root `/`
-/// if none) **including any query string**. The host must be a hostname, an IPv4 literal, or a
-/// bracketed IPv6 literal (`https://[::1]:8080/x`). This is the *request* parser — a request is
-/// a concrete connection, so it keeps the scheme (which sets the port). Its callers are the
-/// `sbx test net` tester and the proxy's two absolute-form paths (`http://` cleartext and the
+/// if none) **including any query string**. The authority ends at the first `/`, `?`, or `#`, so
+/// a URL whose query or fragment precedes any `/` names the root path and keeps what follows
+/// (`https://h.test?x=1` is host `h.test`, path `/?x=1`). The host must be a hostname, an IPv4
+/// literal, or a bracketed IPv6 literal (`https://[::1]:8080/x`). This is the *request* parser — a
+/// request is a concrete connection, so it keeps the scheme (which sets the port). Its callers are
+/// the `sbx test net` tester and the proxy's two absolute-form paths (`http://` cleartext and the
 /// `https://` forward). Allow/deny *rules* are scheme-free and parsed by [`classify`].
 pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), String> {
     let Some((scheme_len, default_port)) = scheme_of(url) else {
         return Err(format!("`{url}` is not an http(s) URL"));
     };
     let after = &url[scheme_len..];
-    let (authority, path) = match after.find('/') {
-        Some(i) => (&after[..i], after[i..].to_string()),
+    // The authority runs to the first `/`, `?`, or `#`: a URL may carry a query or a fragment with
+    // no path at all, and gluing either onto the host would make a valid request unparseable.
+    let (authority, path) = match after.find(['/', '?', '#']) {
+        Some(i) if after.as_bytes()[i] == b'/' => (&after[..i], after[i..].to_string()),
+        // An empty path with a query or fragment is the root path, which is what the origin is
+        // asked for and what the matcher canonicalizes.
+        Some(i) => (&after[..i], format!("/{}", &after[i..])),
         None => (after, "/".to_string()),
     };
     if authority.is_empty() {
@@ -619,6 +626,23 @@ fn parse_path_rule(
         return Err(format!(
             "entry `{s}` writes a query string in a path rule — a rule matches the path only, so \
              this would open `{before}` with any query at all. Use `re:` to constrain a query"
+        ));
+    }
+    // A `#fragment` and a segment's `;parameters` are cut from the rule's own path by
+    // `canonical_segments` exactly as they are from a request's, so a rule carrying either matches
+    // the bare path while displaying a form that names something narrower. That is the same
+    // widening the query refusal above exists to prevent, so it is refused the same way.
+    if let Some((before, _)) = path.split_once('#') {
+        return Err(format!(
+            "entry `{s}` writes a fragment in a path rule — a rule matches the path only, so this \
+             would open `{before}` with any fragment at all. Use `re:` to constrain a fragment"
+        ));
+    }
+    if let Some((before, _)) = path.split_once(';') {
+        return Err(format!(
+            "entry `{s}` writes `;parameters` in a path rule — a rule matches the path segments \
+             only, so this would open `{before}` with any parameters at all. Use `re:` to \
+             constrain them"
         ));
     }
     let subtree = path.ends_with("/*");

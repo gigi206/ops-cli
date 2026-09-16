@@ -180,7 +180,10 @@ pub(crate) fn record(
     // one orphaned by a hand-removed plugin) is replaced rather than kept.
     let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), unique()));
     let _ = std::fs::remove_file(&tmp);
-    write_owner_only(&tmp, text.as_bytes())?;
+    if let Err(e) = write_owner_only(&tmp, text.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Err(e) = std::fs::rename(&tmp, path_of(layout, plugin)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("cannot record the plugin's origin: {e}"));

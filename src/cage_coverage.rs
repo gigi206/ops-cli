@@ -157,8 +157,9 @@ fn test_paths_named_by_ci() -> Vec<(String, String)> {
 /// the whole of it: a test that keeps its name and moves to another module leaves the filter
 /// excluding nothing, which is the same silence this guard exists for. The module a source file
 /// declares is derived from its path under `src/` — the crate is a binary, so that path *is* the
-/// module path — and a `tests` segment anywhere in the filter is dropped before the comparison,
-/// since a test module's own nesting is not visible from the file tree.
+/// module path — and a `tests` segment is dropped from both sides before the comparison, from the
+/// filter because a test module's own nesting is not visible from the file tree, and from the
+/// declared path because a module written as `<name>/tests.rs` spells that segment in the tree.
 #[test]
 fn every_test_a_ci_file_names_exists() {
     // Every `fn` a source declares, with the module its file spells. `mod.rs` names the directory
@@ -186,7 +187,10 @@ fn every_test_a_ci_file_names_exists() {
             .collect();
         let hit = declared.iter().any(|(module, name)| {
             name == leaf && {
-                let have: Vec<&str> = module.split("::").filter(|s| !s.is_empty()).collect();
+                let have: Vec<&str> = module
+                    .split("::")
+                    .filter(|s| !s.is_empty() && *s != "tests")
+                    .collect();
                 // The filter may name the module from any depth (`cgroup::tests::x` and
                 // `sandbox::cgroup::tests::x` both reach it), so a suffix match is the question.
                 named.is_empty() || have.ends_with(&named[..])
@@ -196,7 +200,10 @@ fn every_test_a_ci_file_names_exists() {
             let where_it_is: Vec<String> = declared
                 .iter()
                 .filter(|(_, name)| name == leaf)
-                .map(|(module, name)| format!("{module}::tests::{name}"))
+                .map(|(module, name)| match module.ends_with("tests") {
+                    true => format!("{module}::{name}"),
+                    false => format!("{module}::tests::{name}"),
+                })
                 .collect();
             missing.push(match where_it_is.as_slice() {
                 [] => format!("  {file} names `{path}`, and no test is called `{leaf}`"),

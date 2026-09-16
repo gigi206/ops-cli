@@ -2248,9 +2248,12 @@ pub(crate) enum NotifyEvents {
     Map(BTreeMap<String, String>),
 }
 
-/// How deep [`locate_type_error`] will go looking for the key at fault. Three levels reach a
-/// `[task.<name>].<field>` and an `[app.<name>].<field>`, which is as nested as this schema gets.
-const LOCATE_DEPTH: usize = 3;
+/// How deep [`locate_type_error`] will go looking for the key at fault. The schema nests further
+/// than a `[task.<name>].<field>`: an `[app.<name>.network].<field>` is four steps and an
+/// `[app.<name>.task.<t>.exec.<program>].spawn` — the deepest value it takes — is seven. A ceiling
+/// short of that costs the whole sub-table it stopped on, so a mistyped `allow` under an app's
+/// `[network]` took the `mode` beside it, which is the opposite of the rule this search serves.
+const LOCATE_DEPTH: usize = 7;
 
 /// The most keys [`locate_type_error`] will test at one level. The search re-parses the document
 /// once per candidate, so this bounds the work on a large config; a document wider than this simply
@@ -2273,28 +2276,54 @@ const LOCATE_MAX_KEYS: usize = 128;
 /// guess is worse than the parser's own message.
 fn locate_type_error<T: serde::de::DeserializeOwned>(
     text: &str,
-) -> Option<(String, Option<usize>)> {
+) -> Option<(Vec<String>, Option<usize>)> {
     let doc: toml_edit::DocumentMut = text.parse().ok()?;
     let mut path: Vec<String> = Vec::new();
 
     for _ in 0..LOCATE_DEPTH {
-        let keys = keys_at(&doc, &path)?;
-        if keys.len() > LOCATE_MAX_KEYS {
-            return None;
-        }
-        let culprit = keys.into_iter().find(|key| {
-            let mut trial = doc.clone();
-            remove_at(&mut trial, &path, key) && toml::from_str::<T>(&trial.to_string()).is_ok()
-        })?;
-        path.push(culprit);
         // Descend only while the blamed value is itself a table: once it is a scalar or an array,
         // it *is* the mistake and there is nothing finer to name.
-        if keys_at(&doc, &path).is_none() {
+        let Some(keys) = keys_at(&doc, &path) else {
+            break;
+        };
+        if keys.len() > LOCATE_MAX_KEYS {
             break;
         }
+        // Nothing at this level is the mistake on its own when the table's own *shape* is what is
+        // wrong — a `packages` written as a table does not become a list by losing an entry — so
+        // the path found so far is as fine as the blame gets. Giving up outright here would throw
+        // away a perfectly good `task.deploy.packages` for want of a fifth step.
+        let Some(culprit) = keys.into_iter().find(|key| {
+            let mut trial = doc.clone();
+            remove_at(&mut trial, &path, key) && toml::from_str::<T>(&trial.to_string()).is_ok()
+        }) else {
+            break;
+        };
+        path.push(culprit);
+    }
+    // Nothing located at all: the parser's own message stands, since a guess would be worse.
+    if path.is_empty() {
+        return None;
     }
 
-    Some((path.join("."), line_of(text, &path)))
+    let line = line_of(text, &path);
+    Some((path, line))
+}
+
+/// A located path as a TOML reader would write it: the steps joined with `.`, and a step carrying a
+/// `.` of its own quoted, so `[secret."api.github.com"]` reads as the one key it is rather than as
+/// three nested tables.
+fn render_path(path: &[String]) -> String {
+    path.iter()
+        .map(|step| {
+            if step.contains('.') {
+                format!("\"{step}\"")
+            } else {
+                step.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// The keys of the table at `path`, or `None` when the path does not lead to one.
@@ -2336,9 +2365,11 @@ fn line_of(text: &str, path: &[String]) -> Option<usize> {
 fn with_location<T: serde::de::DeserializeOwned>(text: &str, message: String) -> String {
     match locate_type_error::<T>(text) {
         Some((path, Some(line))) => {
+            let path = render_path(&path);
             format!("{message}\n  --> the value at `{path}` (line {line}) is the one at fault")
         }
         Some((path, None)) => {
+            let path = render_path(&path);
             format!("{message}\n  --> the value at `{path}` is the one at fault")
         }
         None => message,
@@ -2375,16 +2406,20 @@ pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<Raw
         return Err(with_location::<RawConfig>(text, first));
     };
     for _ in 0..MAX_RECOVERED_FIELDS {
-        let Some((path, line)) = locate_type_error::<RawConfig>(&doc.to_string()) else {
+        let Some((steps, line)) = locate_type_error::<RawConfig>(&doc.to_string()) else {
             break;
         };
-        let steps: Vec<String> = path.split('.').map(String::from).collect();
         let Some((key, parents)) = steps.split_last() else {
             break;
         };
         if !remove_at(&mut doc, parents, key) {
             break;
         }
+        // The steps are carried whole rather than through a dotted string: a key may contain a `.`
+        // of its own (`[secret."api.github.com"]`, a quoted app or bundle name), and re-splitting
+        // the joined form on `.` produced a path no table has, so the removal failed and the layer
+        // was dropped entire — the one outcome this recovery exists to prevent.
+        let path = render_path(&steps);
         dropped.push(match line {
             Some(n) => format!("ignoring `{path}` (line {n}): it is not the type this field takes"),
             None => format!("ignoring `{path}`: it is not the type this field takes"),
@@ -2564,6 +2599,66 @@ sshpass = \"nix:sshpass\"
         let cfg = parse_layer(good.as_bytes(), &mut none).unwrap();
         assert_eq!(cfg.env.get("KEEPME").map(String::as_str), Some("yes"));
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    /// A key may carry a `.` of its own — a quoted secret host, app or bundle name. The located
+    /// path was joined into one string and re-split on `.`, so the removal looked for tables that
+    /// do not exist, failed, and cost the file the recovery exists to save.
+    #[test]
+    fn a_mistyped_value_under_a_dotted_key_costs_the_value_and_not_the_file() {
+        let text = "\
+[env]
+KEEPME = \"yes\"
+
+[secret.\"api.github.com\"]
+header = 5
+from = \"env://T\"
+";
+        assert!(
+            parse(text.as_bytes()).is_err(),
+            "strict parsing still refuses"
+        );
+
+        let mut dropped = Vec::new();
+        let cfg = parse_layer(text.as_bytes(), &mut dropped)
+            .expect("the rest of the layer still parses once the mistyped value is out");
+        assert_eq!(cfg.env.get("KEEPME").map(String::as_str), Some("yes"));
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(
+            dropped[0].contains("header"),
+            "the field that went is the one named: {dropped:?}"
+        );
+    }
+
+    /// The schema nests deeper than a `[task.<name>].<field>`: an app's own `[network]` is four
+    /// steps down. Stopping short blamed the table, so removing it took the `mode` written beside
+    /// the mistake and the app fell back to the posture of the layer below.
+    #[test]
+    fn a_mistyped_value_in_an_apps_network_costs_the_value_and_keeps_the_mode() {
+        let text = "\
+[app.a]
+cmd = [\"x\"]
+
+[app.a.network]
+mode = \"deny\"
+allow = \"github.com\"
+";
+        let mut dropped = Vec::new();
+        let cfg = parse_layer(text.as_bytes(), &mut dropped)
+            .expect("the rest of the layer still parses once the mistyped value is out");
+        let network = cfg.app["a"]
+            .network
+            .as_ref()
+            .expect("the app keeps its own network table");
+        assert!(
+            matches!(network, NetworkField::Table(t) if t.mode.as_deref() == Some("deny")),
+            "the posture written beside the mistake survives it: {network:?}"
+        );
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(
+            dropped[0].contains("app.a.network.allow"),
+            "the value is named, not the table it sits in: {dropped:?}"
+        );
     }
 
     /// The written limit. Elimination names a culprit only when removing one key makes the document

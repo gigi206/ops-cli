@@ -5787,19 +5787,21 @@ fn every_listing_verb_that_offers_json_emits_a_document_even_when_empty() {
 /// for when a launch stops must not stop with it: `sbx config show` still answers, or the refusal
 /// would take away the way to understand it.
 ///
-/// Unreadable is reached the way a real one is: a file owned by another uid after a restore under
-/// `sudo`, or one left without read permission. The safety gate refuses both in `PermissionDenied`,
-/// which is neither `NotFound` nor a parse failure.
+/// Unreadable stands for everything the safety gate refuses in `PermissionDenied` — a file owned by
+/// another uid after a restore under `sudo`, one left without read permission, one that is not a
+/// regular file at all — none of which is `NotFound` or a parse failure, and all of which reach the
+/// launch through the same refusal.
+///
+/// It is staged here as a directory in the global config's place, because that is refused for every
+/// uid: a mode of `0o000` is simply ignored for root, which would make this test a no-op wherever
+/// the suite runs as root.
 #[test]
 fn an_unreadable_global_config_refuses_a_launch_but_not_the_verb_that_shows_it() {
-    use std::os::unix::fs::PermissionsExt;
-
     let home = TmpDir::new("gc");
     let dir = home.path().join("sbx");
     std::fs::create_dir_all(&dir).unwrap();
     let global = dir.join("sbx.toml");
-    std::fs::write(&global, b"[proc]\nmode = \"enforce\"\n").unwrap();
-    std::fs::set_permissions(&global, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::create_dir(&global).unwrap();
 
     let run = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_sbx"))
@@ -5833,8 +5835,9 @@ fn an_unreadable_global_config_refuses_a_launch_but_not_the_verb_that_shows_it()
         "a read-only verb must not inherit the launch's refusal"
     );
 
-    // And with the file readable, the launch gets past the config layer entirely.
-    std::fs::set_permissions(&global, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // And with a readable file in its place, the config layer loads without a refusal.
+    std::fs::remove_dir(&global).unwrap();
+    std::fs::write(&global, b"[proc]\nmode = \"enforce\"\n").unwrap();
     let readable = run(&["config", "show"]);
     assert!(
         readable.status.success(),

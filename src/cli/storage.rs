@@ -342,6 +342,29 @@ fn use_volume(args: Vec<OsString>) -> ExitCode {
         return fail(e);
     }
 
+    // sbx may already follow another volume, in which case the data is in that volume and not in
+    // `dir`, so the subtree check below sees nothing to lose. Repointing hides the adopted
+    // volume's store just as silently, and `unuse` then returns to the plain directory rather
+    // than to it — the pointer has to be read before it is overwritten.
+    match storage::read_pointer(&dir) {
+        Ok(Some(current)) if current == image => {}
+        Ok(Some(current)) if !opts.force => {
+            return fail(format!(
+                "sbx already uses {} — adopting another volume would leave its store, projects \
+                 and app homes behind, not move them.\n\
+                 \x20      `sbx storage unuse` first if you meant to switch, or pass --force.",
+                current.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if !opts.force => {
+            return fail(format!(
+                "cannot read the volume pointer ({e}) — refusing to adopt over it"
+            ));
+        }
+        Err(_) => {}
+    }
+
     // Mount before adopting: a pointer at a volume that will not mount would leave every
     // later command failing closed, with no obvious way back.
     let mount_point = match storage::ensure_mounted(&image) {

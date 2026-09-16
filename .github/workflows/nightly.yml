@@ -114,7 +114,7 @@ jobs:
             test -f "$f" || { echo "missing release asset: $f"; exit 1; }
           done
           gh release delete nightly --yes || true
-          NOTES="Rolling build of \`main\` @ ${GITHUB_SHA::8}."$'\n'"\n"$'\n'"Built from: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          NOTES="Rolling build of \`main\` @ ${GITHUB_SHA::8}."$'\n\n'"Built from: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
           gh release create nightly \
             --prerelease \
             --latest=false \

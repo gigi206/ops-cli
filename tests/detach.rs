@@ -49,26 +49,48 @@ fn sandbox_probe(project: &Path, data: &Path, state: &Path) -> Output {
     sbx_run(project, data, state, &["run", "--", "true"])
 }
 
-/// Whether any process on the host has `needle` in its argv. Used to see an in-cage process from
+/// Whether the fingerprinted agent is alive on the host. Used to see an in-cage process from
 /// outside the cage's pid namespace (the host still sees it).
 fn process_with_arg(needle: &str) -> bool {
-    proc_pids_with_arg(needle).next().is_some()
+    !pids_sleeping_for(needle).is_empty()
 }
 
-/// The host pids whose `/proc/<pid>/cmdline` (NUL-separated, kept intact by `from_utf8_lossy`)
-/// contains `needle`.
-fn proc_pids_with_arg(needle: &str) -> impl Iterator<Item = i32> + '_ {
-    let entries = std::fs::read_dir("/proc").ok();
-    entries
-        .into_iter()
-        .flat_map(|d| d.flatten())
-        .filter_map(move |entry| {
-            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-            let bytes = std::fs::read(entry.path().join("cmdline")).ok()?;
-            String::from_utf8_lossy(&bytes)
-                .contains(needle)
-                .then_some(pid)
-        })
+/// The pids of every process whose argv is exactly `sleep <secs>`, for the fingerprint `secs`.
+///
+/// Matched argument by argument against a `/proc/<pid>/cmdline` split on its NULs, never as a
+/// substring of the whole line. A fingerprint here is a bare number, and a substring test against
+/// every command line on the machine matches a port, a pid, a hash prefix or a timestamp that
+/// happens to contain those digits. That is a false positive for the liveness assertions and,
+/// worse, a SIGKILL of an unrelated process of the developer's in [`Cleanup`].
+fn pids_sleeping_for(secs: &str) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<&[u8]> = bytes.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+        let [program, arg] = argv[..] else {
+            continue;
+        };
+        if arg == secs.as_bytes()
+            && std::path::Path::new(&String::from_utf8_lossy(program).into_owned())
+                .file_name()
+                .is_some_and(|n| n == "sleep")
+        {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 /// Poll `cond` until it is `true` or the deadline passes; returns the final value.
@@ -108,6 +130,11 @@ fn egress_socket_exists(data: &Path) -> bool {
 /// foreground child, is reparented to init and cannot be reaped by the test. On drop it `sbx session stop`s
 /// each known session pid (the clean path, which `--die-with-parent` propagates to the cage) and
 /// then SIGKILLs any host process still carrying a fingerprint, as a backstop.
+///
+/// The match is on the whole argv, through [`pids_sleeping_for`]. A substring test against every
+/// command line on the machine would sweep far wider than this test's own children: the
+/// fingerprints are bare numbers, so any process of the developer's whose command line happened to
+/// contain those digits was signalled by a test run.
 struct Cleanup {
     data: PathBuf,
     state: PathBuf,
@@ -127,8 +154,9 @@ impl Drop for Cleanup {
             );
         }
         for fp in &self.fingerprints {
-            for pid in proc_pids_with_arg(fp) {
-                // SAFETY: a best-effort SIGKILL of a leaked test process by the unique fingerprint.
+            for pid in pids_sleeping_for(fp) {
+                // SAFETY: a best-effort SIGKILL of a leaked test process whose whole argv is
+                // `sleep <fingerprint>`; a failure (already gone) is ignored.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         }
@@ -140,19 +168,22 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     // Two apps so both daemon paths run under one provisioning: `sup` has a network allowlist (the
     // supervised path — the daemon hosts the proxy thread, the registered pid is the supervisor),
     // `plain` has none (the exec path — the daemon becomes bubblewrap). The unusual sleep durations
-    // are unique fingerprints in the host process table.
+    // are unique fingerprints in the host process table, and unique across test *binaries* too:
+    // cargo runs the suites as concurrent processes, so a duration this file shares with another
+    // would make each one's liveness assertions read the other's cage, and each one's cleanup kill
+    // it.
     let project = TmpDir::prefixed("d", "proj");
     let data = TmpDir::prefixed("d", "data");
     let state = TmpDir::prefixed("d", "state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[app.sup]\n\
-         cmd = [\"sleep\", \"31337\"]\n\
+         cmd = [\"sleep\", \"31351\"]\n\
          [app.sup.network]\n\
          mode = \"deny\"\n\
          allow = [\"cache.nixos.org\"]\n\
          [app.plain]\n\
-         cmd = [\"sleep\", \"31338\"]\n",
+         cmd = [\"sleep\", \"31352\"]\n",
     )
     .unwrap();
 
@@ -180,7 +211,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
         state: state.path().to_path_buf(),
         project: project.path().to_path_buf(),
         pids: Vec::new(),
-        fingerprints: vec!["31337", "31338"],
+        fingerprints: vec!["31351", "31352"],
     };
 
     // --- The supervised path -------------------------------------------------------------------
@@ -215,7 +246,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     // The discriminating property: the launch command has already returned, yet the agent runs.
     assert!(
         wait_until(Instant::now() + Duration::from_secs(30), || {
-            process_with_arg("31337")
+            process_with_arg("31351")
         }),
         "the detached agent never appeared — `--detach` did not start it in the background"
     );
@@ -247,7 +278,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     );
     assert!(
         wait_until(Instant::now() + Duration::from_secs(10), || {
-            !process_with_arg("31337")
+            !process_with_arg("31351")
         }),
         "the supervised cage was orphaned — stopping the supervisor did not tear it down"
     );
@@ -276,7 +307,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
 
     assert!(
         wait_until(Instant::now() + Duration::from_secs(30), || {
-            process_with_arg("31338")
+            process_with_arg("31352")
         }),
         "the detached exec-path agent never appeared"
     );
@@ -293,7 +324,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     );
     assert!(
         wait_until(Instant::now() + Duration::from_secs(10), || {
-            !process_with_arg("31338")
+            !process_with_arg("31352")
         }),
         "the exec-path cage was orphaned after stop"
     );

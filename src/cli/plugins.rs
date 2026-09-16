@@ -50,7 +50,16 @@ pub(crate) fn plugins_cmd(args: &[OsString]) -> ExitCode {
         Some("verify") => {
             match crate::cli::reject_extra(&["plugins", "verify"], args.get(2..).unwrap_or(&[])) {
                 Err(code) => code,
-                Ok(()) => plugins_verify(args.get(1).and_then(|a| a.to_str())),
+                // A name that is not text is refused by name: folded into `None` it would read as
+                // "no name given", which this verb answers by verifying every installed plugin —
+                // so an unrelated modified tree would report as the named one having changed.
+                Ok(()) => match args.get(1).map(|a| a.to_str()) {
+                    Some(None) => {
+                        diag::error("sbx: plugins verify: argument is not valid UTF-8");
+                        ExitCode::from(2)
+                    }
+                    given => plugins_verify(given.flatten()),
+                },
             }
         }
         Some("store") => plugins_store(&args[1..]),
@@ -866,7 +875,22 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
         match flag.to_str() {
             Some("--name") => name = it.next().and_then(|v| v.to_str()),
             Some("--url") => url = it.next().and_then(|v| v.to_str()),
-            Some("--key") => key = it.next().and_then(|v| v.to_str()),
+            // A `--key` with nothing usable after it is a usage error, not the absence of the flag:
+            // folded into `None` it would read as "no trust anchor given" and send the verb down the
+            // staging-clone path, which fetches the store over the network before refusing.
+            Some("--key") => match it.next().map(|v| v.to_str()) {
+                Some(Some(v)) => key = Some(v),
+                Some(None) => {
+                    diag::error("sbx: --key: the key is not valid UTF-8 (expected <hex|@file>)");
+                    eprintln!("{usage}");
+                    return ExitCode::from(2);
+                }
+                None => {
+                    diag::error("sbx: --key needs the key to pin (<hex|@file>)");
+                    eprintln!("{usage}");
+                    return ExitCode::from(2);
+                }
+            },
             Some("--trust") => trust = true,
             other => {
                 diag::error(&format!(

@@ -195,16 +195,26 @@ fn resolve_source(
     project: &str,
 ) -> Result<Source, ExitCode> {
     if let Some(id) = id {
-        if let Some(live) = sessions.iter().find(|s| s.answers_to(id)) {
-            return Ok(Source::Live {
-                pid: live.pid,
-                header: format!(
-                    "session {} [{}] {}",
-                    live.pid,
-                    live.label(),
-                    live.project.display()
-                ),
-            });
+        // Every live session is weighed, not the first match: a derived cage name is not unique
+        // among them, and answering from one of several would show another session's output under
+        // the header of the one the reader asked for.
+        match crate::session::answering(sessions, id) {
+            Ok(live) => {
+                return Ok(Source::Live {
+                    pid: live.pid,
+                    header: format!(
+                        "session {} [{}] {}",
+                        live.pid,
+                        live.label(),
+                        live.project.display()
+                    ),
+                });
+            }
+            Err(many) if !many.is_empty() => {
+                crate::session::report_ambiguous_id(verb, id, &many);
+                return Err(ExitCode::from(2));
+            }
+            Err(_) => {}
         }
         // Not live. A pid that named a record of *this* project is answered from it; one that named
         // a record of another project is not there at all, which is the same answer as a pid that

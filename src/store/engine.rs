@@ -96,6 +96,24 @@ pub(crate) fn embedded_proc_shim() -> &'static [u8] {
     proc_shim_blob::PROC_SHIM_BIN
 }
 
+/// Place `bytes` at `target` as an executable file, atomically: `tmp` (a per-pid sibling of the
+/// target) is written, made executable, then renamed over the target.
+///
+/// The temp is removed whenever any of the three steps fails, so a run that dies partway — a full
+/// disk during the write is the usual way — leaves nothing behind. Each attempt carries a fresh pid
+/// in its name and these payloads are tens of megabytes, so a temp left in place would never be
+/// reused, only added to.
+fn place_executable(tmp: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let placed = std::fs::write(tmp, bytes)
+        .and_then(|()| std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::rename(tmp, target));
+    if placed.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    placed
+}
+
 /// Materialize the embedded exec shim into the owned engine directory and return its path.
 ///
 /// Unlike the engines' best-effort placement, a failure here is returned rather than swallowed:
@@ -108,7 +126,7 @@ pub(crate) fn embedded_proc_shim() -> &'static [u8] {
 /// half-written binary. A new sbx carrying a newer shim changes the hash and replaces it; the
 /// rename leaves a running cage's shim on its old inode.
 pub(crate) fn ensure_proc_shim(layout: &Layout) -> io::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     let dir = layout.engine_dir();
     let shim = dir.join(PROC_SHIM_NAME);
     let marker = dir.join(".proc-shim.sha256");
@@ -121,9 +139,7 @@ pub(crate) fn ensure_proc_shim(layout: &Layout) -> io::Result<PathBuf> {
         .mode(0o700)
         .create(&dir)?;
     let tmp = dir.join(format!(".{PROC_SHIM_NAME}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, proc_shim_blob::PROC_SHIM_BIN)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&tmp, &shim)?;
+    place_executable(&tmp, &shim, proc_shim_blob::PROC_SHIM_BIN)?;
     std::fs::write(&marker, sha)?;
     Ok(shim)
 }
@@ -184,7 +200,7 @@ fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Result<PathBuf, En
 /// the caller to ignore.
 #[cfg(any(feature = "bundled-nix", test))]
 fn ensure_owned_engine(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     let nix = dir.join("nix");
     let store_link = dir.join("nix-store");
     let marker = dir.join(".sha256");
@@ -203,9 +219,7 @@ fn ensure_owned_engine(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()>
         .mode(0o700)
         .create(dir)?;
     let tmp = dir.join(format!(".nix.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&tmp, &nix)?;
+    place_executable(&tmp, &nix, bytes)?;
     // Place the sibling atomically too: a unique temp link renamed over `nix-store` leaves
     // no window where it is absent (a concurrent first launch would otherwise see a removed
     // link); a lost race simply discards an identical link.
@@ -610,7 +624,7 @@ fn apparmor_userns_restricted() -> bool {
 /// contract: every error is returned for the caller to ignore.
 #[cfg(any(feature = "bundled-bwrap", test))]
 fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     let bwrap = dir.join("bwrap");
     let marker = dir.join(".bwrap.sha256");
     if bwrap.is_file() && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha256) {
@@ -621,9 +635,7 @@ fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> 
         .mode(0o700)
         .create(dir)?;
     let tmp = dir.join(format!(".bwrap.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&tmp, &bwrap)?;
+    place_executable(&tmp, &bwrap, bytes)?;
     // Stamp the version last: an interrupted run leaves a stale/absent marker and
     // re-materializes next time rather than trusting a half-written engine.
     std::fs::write(&marker, sha256)?;

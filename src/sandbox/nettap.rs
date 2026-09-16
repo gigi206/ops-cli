@@ -882,8 +882,12 @@ fn serve_dns_udp(sock: &std::net::UdpSocket, table: &Mutex<FakeIps>, reporter: &
 fn serve_dns_tcp(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>, reporter: &Arc<Reporter>) {
     let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     loop {
-        let Ok((stream, _)) = listener.accept() else {
-            continue;
+        let (stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) => {
+                super::conncap::accept_backoff("net-tap-dns", &e);
+                continue;
+            }
         };
         // At the ceiling the connection is let go rather than queued: a resolver that answers late
         // is a client that hangs, and the client's own retry is the better wait.

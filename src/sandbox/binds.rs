@@ -381,7 +381,8 @@ pub(super) fn create_distro_mountpoints(rootfs: &Path) -> io::Result<()> {
 /// to land on a read-only root.
 ///
 /// [`DISTRO_TMPFS`] covers what sbx's own mount plan needs. What is left are the destinations this
-/// launch alone knows: the project at its real path, and whatever `[[binds]]` declared. Each is
+/// launch alone knows: the project at its real path, and every bind it makes — the launcher's own
+/// (the egress socket, the CA) and whatever `[[binds]]` declared, both carried in `binds`. Each is
 /// resolved by one rule, and the rule is what the three outcomes below have in common — a mount
 /// needs a writable ancestor, and only the image can say where one may be put:
 ///
@@ -398,10 +399,10 @@ pub(super) fn create_distro_mountpoints(rootfs: &Path) -> io::Result<()> {
 pub(super) fn distro_writable(
     rootfs: &Path,
     project: &Path,
-    extra_binds: &[ExtraBind],
+    binds: &[ExtraBind],
 ) -> io::Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = DISTRO_TMPFS.iter().map(PathBuf::from).collect();
-    for dest in std::iter::once(project).chain(extra_binds.iter().map(|b| b.dest.as_path())) {
+    for dest in std::iter::once(project).chain(binds.iter().map(|b| b.dest.as_path())) {
         if out.iter().any(|t| dest.starts_with(t)) || in_image(rootfs, dest) {
             continue;
         }
@@ -1780,10 +1781,28 @@ pub(crate) fn build_spec(
 
     // Under a declared distribution the cage root is read-only, so every mount this launch makes
     // needs a writable ancestor already there. Computed before the plan rather than from it: the
-    // destinations that are not sbx's own are exactly the two known here, the project and the
-    // config's binds, so one pass answers it and [`assemble`] stays pure.
+    // destinations that are not sbx's own are exactly the ones known here, the project and the
+    // binds, so one pass answers it and [`assemble`] stays pure.
+    //
+    // The config's `[[binds]]` are part of that set, not only the launcher's: `cage_mounts` emits
+    // each of them at its own absolute path, so a destination the image does not carry needs a
+    // cover for the same reason, and without one bubblewrap refuses the mount on the read-only
+    // root. They are passed in the shape `distro_writable` reads — source, destination, mode —
+    // which for a config bind is the same path on both sides.
     let distro_writable = match &userland.distro {
-        Some(root) => distro_writable(root, &project, extra_binds)?,
+        Some(root) => {
+            let binds: Vec<ExtraBind> = overlay
+                .binds
+                .iter()
+                .map(|b| ExtraBind {
+                    src: b.path.clone(),
+                    dest: b.path.clone(),
+                    writable: b.writable,
+                })
+                .chain(extra_binds.iter().cloned())
+                .collect();
+            distro_writable(root, &project, &binds)?
+        }
         None => Vec::new(),
     };
 

@@ -91,14 +91,21 @@ pub(crate) fn attach(id: &str, cmd: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // A pid is unique among live processes and a cage name among live cages, so this is a 0-or-1
-    // match whichever of the two the listing's reader typed. Resolve the target before the
-    // terminal check, so an unknown id is reported even without a tty.
-    let Some(target) = sessions.into_iter().find(|s| s.answers_to(id)) else {
-        crate::diag::error(&format!(
-            "sbx session attach: no live session '{id}' — run `sbx session ls` to list them."
-        ));
-        return ExitCode::from(2);
+    // A pid is unique among live processes but a derived cage name is not, so every session is
+    // weighed and an id several answer to is refused rather than guessed at. Resolve the target
+    // before the terminal check, so an unresolved id is reported even without a tty.
+    let target = match crate::session::answering(&sessions, id) {
+        Ok(one) => one.clone(),
+        Err(many) if many.is_empty() => {
+            crate::diag::error(&format!(
+                "sbx session attach: no live session '{id}' — run `sbx session ls` to list them."
+            ));
+            return ExitCode::from(2);
+        }
+        Err(many) => {
+            crate::session::report_ambiguous_id("session attach", id, &many);
+            return ExitCode::from(2);
+        }
     };
     // SAFETY: `isatty` only inspects fd 0. A bare attach opens an interactive shell, which needs a
     // real terminal (like `shell`); a command drives its terminal setup from this — a pty when it
@@ -390,12 +397,22 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let mut any_missing = false;
     let mut any_unstopped = false;
     for id in ids {
-        let Some(target) = sessions.iter().find(|s| s.answers_to(id)) else {
-            crate::diag::error(&format!(
-                "sbx session stop: no live session '{id}' — run `sbx session ls` to list them."
-            ));
-            any_missing = true;
-            continue;
+        // Weighed against every session, not the first match: a cage name is derived and several
+        // live sessions can answer to it, and stopping the wrong one is not recoverable.
+        let target = match crate::session::answering(&sessions, id) {
+            Ok(one) => one,
+            Err(many) if many.is_empty() => {
+                crate::diag::error(&format!(
+                    "sbx session stop: no live session '{id}' — run `sbx session ls` to list them."
+                ));
+                any_missing = true;
+                continue;
+            }
+            Err(many) => {
+                crate::session::report_ambiguous_id("session stop", id, &many);
+                any_missing = true;
+                continue;
+            }
         };
         any_unstopped |= !stop_session(&registry, target, grace, &epal);
     }

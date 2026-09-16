@@ -1038,10 +1038,10 @@ pub(super) fn validate_open(
     raw: BTreeMap<String, schema::RawOpen>,
 ) -> BTreeMap<String, OpenHandler> {
     let mut out = BTreeMap::new();
-    for (scheme, entry) in raw {
+    for (key, entry) in raw {
         // Schemes are case-insensitive per RFC 3986, and the comparison the router makes is
         // literal, so the key is folded once here rather than at every match.
-        let scheme = scheme.to_ascii_lowercase();
+        let scheme = key.to_ascii_lowercase();
         if !is_valid_uri_scheme(&scheme) {
             warnings.push(format!(
                 "{source}: ignoring `[open]` entry `{scheme}` — a key is a URI scheme (a letter, \
@@ -1080,6 +1080,16 @@ pub(super) fn validate_open(
                  character"
             ));
             continue;
+        }
+        // Two keys differing only in case are one scheme once folded, and the router holds one
+        // handler per scheme, so the later spelling takes the slot. It is reported like every
+        // other value this table loses: overwritten in silence, the displaced entry left its
+        // author believing a click on such a link reaches their program.
+        if out.contains_key(&scheme) {
+            warnings.push(format!(
+                "{source}: `[open]` entry `{key}` replaces the handler an earlier spelling \
+                 of `{scheme}` — a URI scheme is case-insensitive, so the two keys are one"
+            ));
         }
         out.insert(scheme, OpenHandler { argv, mode });
     }

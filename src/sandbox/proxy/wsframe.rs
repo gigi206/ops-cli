@@ -474,20 +474,27 @@ pub(super) struct Deflate {
 /// entry out of the list and inflating past the unknown one — which this did — decodes whatever that
 /// other extension left behind, and files it as the message's text. Reporting nothing negotiated
 /// keeps the payload as it crossed: honest about not knowing, where a wrong inflate is not.
+///
+/// The list is the whole list, and a response may split it over several `Sec-WebSocket-Extensions`
+/// fields: every one of them is read, so an entry named in a later field is not a way past the rule.
 pub(super) fn negotiated_deflate(resp_head: &[u8]) -> Deflate {
     let head = String::from_utf8_lossy(resp_head);
-    let Some(value) = head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("sec-websocket-extensions")
-            .then(|| value.trim())
-    }) else {
+    let values: Vec<&str> = head
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("sec-websocket-extensions")
+                .then(|| value.trim())
+        })
+        .collect();
+    if values.is_empty() {
         return Deflate::default();
-    };
+    }
     // One negotiated extension per comma-separated entry, and every one of them has to be the
     // deflate entry — see the doc above for why an entry beside it is not skipped past.
     let mut negotiated: Option<Deflate> = None;
-    for entry in value.split(',') {
+    for entry in values.iter().flat_map(|value| value.split(',')) {
         let mut params = entry.split(';').map(str::trim);
         if !params
             .next()
@@ -1595,6 +1602,25 @@ mod tests {
                 !got.negotiated,
                 "deflate co-negotiated with an extension this decoder cannot follow must report \
                  nothing negotiated, so the payload is captured as it crosses: {}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        // The same list, split over two header fields, which RFC 6455 §9.1 allows. Reading only the
+        // first field never examined the second, so an entry the decoder cannot follow was skipped
+        // past and the tee inflated a stream that other extension had already transformed.
+        for head in [
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+              Sec-WebSocket-Extensions: permessage-deflate\r\n\
+              Sec-WebSocket-Extensions: x-custom\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+              Sec-WebSocket-Extensions: x-custom\r\n\
+              Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+                .as_slice(),
+        ] {
+            assert!(
+                !negotiated_deflate(head).negotiated,
+                "an entry named in a second extensions field belongs to the same list: {}",
                 String::from_utf8_lossy(head)
             );
         }

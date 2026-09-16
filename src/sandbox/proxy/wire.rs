@@ -73,7 +73,7 @@ pub(super) fn parse_head(bytes: &[u8]) -> io::Result<Head> {
             if !value.is_empty() {
                 value.push(' ');
             }
-            value.push_str(line.trim());
+            value.push_str(trim_ows(line));
             continue;
         }
         if let Some((k, v)) = line.split_once(':') {
@@ -87,13 +87,24 @@ pub(super) fn parse_head(bytes: &[u8]) -> io::Result<Head> {
             if k.ends_with([' ', '\t']) {
                 return Err(invalid("whitespace before the field colon"));
             }
-            headers.push((k.trim().to_string(), v.trim().to_string()));
+            headers.push((trim_ows(k).to_string(), trim_ows(v).to_string()));
         }
     }
     Ok(Head {
         request_line,
         headers,
     })
+}
+
+/// Strip the optional whitespace a field value may be surrounded by: SP and HTAB, as RFC 9112 §5
+/// defines `OWS`, and nothing else.
+///
+/// `str::trim` strips Unicode whitespace, so it also takes off U+00A0, U+3000 and their kin. No
+/// recipient on the other side of the relay reads those bytes as whitespace — they are ordinary
+/// `obs-text` in a field value — so trimming them here would give sbx a reading of a header that
+/// nobody else owes it, which is the desync [`parse_chunk_size`] refuses the same laxity for.
+fn trim_ows(value: &str) -> &str {
+    value.trim_matches([' ', '\t'])
 }
 
 /// Whether a parsed request head carries a byte another parser could frame the message by.
@@ -215,13 +226,16 @@ pub(super) fn inspect_framing(
 /// whitespace and nothing else. `None` for everything else, including the forms Rust's integer
 /// parser accepts and HTTP does not.
 ///
+/// The surrounding whitespace is `OWS` and nothing more — see [`trim_ows`], which is why this does
+/// not reach for `str::trim`.
+///
 /// The sign is the one that matters. `"+5"` parses as `5` in Rust, so the proxy would read a
 /// five-byte body and forward the header **as written**; a server that rejects the sign and reads
 /// the message as bodiless then takes those five bytes as the head of the next request on a
 /// connection the pool may hand to another request. That is request smuggling, from a header the
 /// proxy itself normalized away the ambiguity of everywhere else.
 fn content_length(value: &str) -> Option<u64> {
-    let digits = value.trim();
+    let digits = trim_ows(value);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -1772,6 +1786,10 @@ mod tests {
     /// to the upstream exactly as the client wrote it, so the proxy would consume a five-byte body
     /// while the upstream read a bodiless request and took those bytes as the next request on a
     /// pooled connection.
+    ///
+    /// The whitespace around the value is the same case in a second spelling. `OWS` is SP and HTAB;
+    /// `str::trim` also takes off U+00A0 and U+3000, which every other parser on the relay reads as
+    /// ordinary value bytes, so trimming them here framed a body by a length nobody else agreed on.
     #[test]
     fn a_content_length_outside_the_digit_grammar_is_refused() {
         let framing = |cl: &str| {
@@ -1781,7 +1799,19 @@ mod tests {
             .unwrap();
             inspect_framing(&head, true).map(|f| f.body_len)
         };
-        for bad in ["+5", "-5", "5 5", "0x5", "５", "5.0", ""] {
+        for bad in [
+            "+5",
+            "-5",
+            "5 5",
+            "0x5",
+            "５",
+            "5.0",
+            "",
+            // Whitespace `str::trim` strips and `OWS` does not.
+            "\u{a0}5",
+            "5\u{a0}",
+            "\u{3000}5",
+        ] {
             let got = framing(bad);
             assert!(
                 matches!(
@@ -1798,6 +1828,11 @@ mod tests {
         // The grammar itself, and the whitespace the field value is allowed to carry around it.
         assert_eq!(framing("5").ok(), Some(5));
         assert_eq!(framing(" 5 ").ok(), Some(5));
+        assert_eq!(
+            framing("\t5\t").ok(),
+            Some(5),
+            "HTAB is the other half of `OWS`"
+        );
         assert_eq!(framing("0").ok(), Some(0));
 
         // The response side reads the same grammar, and answers an unreadable framing the way it
@@ -1810,6 +1845,15 @@ mod tests {
         assert!(matches!(
             response_framing(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "GET"),
             BodyFraming::Length(5)
+        ));
+        // A response head crosses to the cage as it arrived, so a length only sbx can read is the
+        // sharper half of the same desync.
+        assert!(matches!(
+            response_framing(
+                "HTTP/1.1 200 OK\r\nContent-Length:\u{a0}5\r\n\r\n".as_bytes(),
+                "GET"
+            ),
+            BodyFraming::ToEof
         ));
     }
 

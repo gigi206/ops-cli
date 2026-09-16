@@ -1340,19 +1340,21 @@ fn refusal_cost() {
     }
 }
 
-/// Bytes **this thread** has written through the write syscalls, from `/proc/thread-self/io`
-/// (`wchar`).
+/// Bytes **this process** has written through the write syscalls, from `/proc/self/io` (`wchar`).
 ///
 /// The axis a bookkeeping cost hides on. Rewriting a small file per decision is nearly invisible in
 /// a per-request time and is the whole story in what the host's storage is asked to absorb, so a
 /// measurement that reports only the clock would answer half the question.
 ///
-/// Per **thread**, not per process, and that is not a detail: `cargo test` runs these measurements
-/// concurrently by default, and a process-wide counter charges this one for every byte the others
-/// wrote. Read that way it reported four kilobytes per refusal on a path that writes none, which is
-/// the same class of wrong answer the figure exists to catch.
+/// Per **process**, not per thread, because the writes the figure exists to catch are not made on
+/// the thread that reads this. The serve loop hands every accepted connection to a thread of its
+/// own, and the per-decision stats rewrite runs there; a `/proc/thread-self/io` reading therefore
+/// saw only the few dozen request bytes this thread put on the socket, and reported a constant cost
+/// per refusal whether the stats file was rewritten per decision or not. The process-wide counter
+/// is attributable here because the module's own invocation pins `--test-threads=1`, so no other
+/// measurement is writing while this one runs.
 fn bytes_written() -> u64 {
-    std::fs::read_to_string("/proc/thread-self/io")
+    std::fs::read_to_string("/proc/self/io")
         .ok()
         .and_then(|s| {
             s.lines()

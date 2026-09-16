@@ -347,8 +347,15 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
 /// configuration instead would be inference: whether an unprivileged namespace may autoload the nat
 /// modules is not stated in any single file, and it is the question that decides this.
 fn report_transparent_capture(rep: &mut Report<'_>) {
+    // Recorded as the `capture` check rather than as a note: a note lands under whichever check
+    // was recorded last, which would file this verdict under a neighbouring probe and leave a
+    // consumer keyed on check names with no capture answer at all.
     let Ok(exe) = std::env::current_exe() else {
-        rep.note("transparent capture: unknown (sbx cannot locate its own binary)");
+        rep.check(
+            "warn",
+            "capture",
+            "unknown — sbx cannot locate its own binary",
+        );
         return;
     };
     match sandbox::probe_capture(&exe) {
@@ -411,27 +418,34 @@ fn report_resource_limits(rep: &mut Report<'_>, limits: &sandbox::cgroup::Limits
 /// hermetic nix userland has no distribution to check: a line reporting its absence would read as
 /// something missing rather than as the ordinary case.
 fn report_distro(rep: &mut Report<'_>, layout: &store::Layout) {
-    use crate::sandbox::distro::store::DISTRO_LOCK;
-    let Some((locator, Some(digest))) =
-        store::read_lock_lines(&layout.data_dir().join(DISTRO_LOCK))
+    use crate::sandbox::distro::store::{DERIVED_PREFIX, DISTRO_LOCK};
+    let Some((locator, Some(key))) = store::read_lock_lines(&layout.data_dir().join(DISTRO_LOCK))
     else {
         return;
     };
+    // The store names a tree's directory after its key with *every* colon replaced, so a derived
+    // userland's `derived:sha256:<hex>` becomes `derived-sha256-<hex>`. Replacing only the first
+    // would name a directory that never exists and report an unpacked tree as missing.
     let dir = layout
         .distro_dir()
-        .join(digest.replacen(':', "-", 1))
+        .join(key.replace(':', "-"))
         .join("rootfs");
     let state = if dir.is_dir() {
         "unpacked"
     } else {
         "not unpacked — fetched on the next launch"
     };
+    // Both prefixes come off, in that order: a derived key carries `sha256:` behind its own marker,
+    // and stripping only the registry form would leave the word `derived` where the hash belongs.
     rep.check(
         "ok",
         "distro",
         &format!(
             "{locator} @ {} ({state})",
-            short_rev(digest.trim_start_matches("sha256:"))
+            short_rev(
+                key.trim_start_matches(DERIVED_PREFIX)
+                    .trim_start_matches("sha256:")
+            )
         ),
     );
 }

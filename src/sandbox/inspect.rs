@@ -696,15 +696,22 @@ mod tests {
 
     #[test]
     fn a_link_is_never_opened() {
-        // Opening it would report a tree that is not under this home, named as if it were.
+        // Opening it would report a tree that is not under this home, named as if it were: the
+        // composition answers where this home's space went, and a link holds none of it. So the
+        // link is sized as the link it is, which leaves it with nothing to report, and the
+        // descent does not follow it either.
         let tmp = crate::testutil::TmpDir::new();
         let home = tmp.join("home");
         let outside = tmp.join("outside");
         file_of(&outside, "share/f", 100 * 1024);
-        std::fs::create_dir_all(&home).unwrap();
+        file_of(&home, ".real/f", 100 * 1024);
         std::os::unix::fs::symlink(&outside, home.join(".local")).unwrap();
         let seen: Vec<String> = home_composition(&home).into_iter().map(|e| e.rel).collect();
-        assert_eq!(seen, [".local"]);
+        assert_eq!(
+            seen,
+            [".real", ".real/f"],
+            "the link is not reported at the size of the tree it points at"
+        );
     }
 
     #[test]

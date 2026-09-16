@@ -123,12 +123,22 @@ pub(crate) fn parse_nix_tools(files: &[(String, Vec<u8>)]) -> DeclaredTools {
                         version,
                     });
                 }
-                // a `nix:` token whose package name or version cannot be safely resolved:
-                // surfaced so the declaration can be fixed.
+                // a `nix:` token whose package name or version cannot be safely resolved —
+                // a declaration carrying no version among them, since sbx resolves this one
+                // itself and has nothing to resolve: surfaced so it can be fixed.
                 Some(_) => out.malformed.push(token),
                 // any other backend (or a plain registry tool): not host-provisioned, but
-                // auto-equipped in-cage by mise — kept with its version for the install.
-                None => out.non_nix.push(MiseTool { token, version }),
+                // auto-equipped in-cage by mise — kept with its version for the install. Here a
+                // declaration carrying no version is not an error: mise is the resolver, and a
+                // versionless entry is its request for the newest.
+                None => out.non_nix.push(MiseTool {
+                    token,
+                    version: if version.is_empty() {
+                        "latest".to_string()
+                    } else {
+                        version
+                    },
+                }),
             }
         }
     }
@@ -141,6 +151,10 @@ pub(crate) fn parse_nix_tools(files: &[(String, Vec<u8>)]) -> DeclaredTools {
 /// insertion-ordered) — deterministic, and ordering among one file's own tools is not
 /// load-bearing. An unreadable or non-TOML file yields nothing — the bytes were already
 /// safety-gated and trust-hashed, so a parse failure degrades to "no tools" here.
+///
+/// A value carrying no version string (a table without `version`, a number) yields an empty
+/// request rather than being dropped: [`DeclaredTools`] promises every declared token lands in a
+/// bucket, and [`parse_nix_tools`] is where the empty request decides which one.
 fn parse_toml_tools(bytes: &[u8]) -> Vec<(String, String)> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Vec::new();
@@ -153,7 +167,7 @@ fn parse_toml_tools(bytes: &[u8]) -> Vec<(String, String)> {
     };
     tools
         .iter()
-        .filter_map(|(name, spec)| version_of(spec).map(|v| (name.clone(), v)))
+        .map(|(name, spec)| (name.clone(), version_of(spec).unwrap_or_default()))
         .collect()
 }
 
@@ -173,7 +187,8 @@ fn version_of(spec: &toml::Value) -> Option<String> {
 
 /// Extract `(tool, version)` pairs from a `.tool-versions` file: one tool per
 /// non-comment line, `<tool> <version> [more...]`, the first version taken. Blank lines
-/// and `#` comments are skipped.
+/// and `#` comments are skipped. A line naming only a tool yields an empty request rather than
+/// being dropped, for the reason given on [`parse_toml_tools`].
 fn parse_tool_versions(bytes: &[u8]) -> Vec<(String, String)> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Vec::new();
@@ -184,7 +199,7 @@ fn parse_tool_versions(bytes: &[u8]) -> Vec<(String, String)> {
         .filter_map(|l| {
             let mut parts = l.split_whitespace();
             let tool = parts.next()?;
-            let version = parts.next()?;
+            let version = parts.next().unwrap_or_default();
             Some((tool.to_string(), version.to_string()))
         })
         .collect()
@@ -1049,6 +1064,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A declaration carrying no version is still a declared token, so it lands in a bucket:
+    /// a `nix:` one among the malformed (sbx resolves those itself and has nothing to resolve),
+    /// any other backend among the tools mise equips, requesting the newest.
+    #[test]
+    fn a_declaration_without_a_version_is_bucketed_not_dropped() {
+        let f = files(&[
+            (
+                ".mise.toml",
+                "[tools]\n\"nix:go\" = { postinstall = \"true\" }\n\"nix:jq\" = 3\npnpm = {}\n",
+            ),
+            (TOOL_VERSIONS, "nodejs\n"),
+        ]);
+        let got = parse_nix_tools(&f);
+        assert!(got.nix.is_empty());
+        assert_eq!(
+            got.malformed,
+            vec!["nix:go".to_string(), "nix:jq".to_string()]
+        );
+        assert!(got.non_nix.contains(&MiseTool {
+            token: "pnpm".into(),
+            version: "latest".into()
+        }));
+        assert!(got.non_nix.contains(&MiseTool {
+            token: "nodejs".into(),
+            version: "latest".into()
+        }));
     }
 
     #[test]

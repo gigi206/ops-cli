@@ -199,8 +199,11 @@ impl Session {
     /// this session's app and project, which is the same call the listing renders. Deriving it in
     /// one place is what keeps the two from drifting into naming a session differently.
     ///
-    /// A pid is unique among live processes and a cage name is unique among live cages, so this
-    /// stays a 0-or-1 match either way.
+    /// A pid is unique among live processes, so matching one is a 0-or-1 affair. A cage name is
+    /// not: it is derived from the app or the project's basename, so two sessions of one project —
+    /// or of two projects that share a basename — answer to the same name. A caller that resolves
+    /// an operator-supplied id through this must therefore weigh every match rather than take the
+    /// first, which is what [`crate::resolve_session_target`] does.
     pub(crate) fn answers_to(&self, id: &str) -> bool {
         self.pid.to_string() == id || crate::sandbox::cage_name(self.app(), &self.project) == id
     }
@@ -259,6 +262,44 @@ impl Session {
         let outcome = stop_pinned(pidfd, &cage, grace);
         close_fd(pidfd);
         outcome
+    }
+}
+
+/// The one live session `id` names, or `Err` with the ones it could have meant.
+///
+/// Every session is weighed rather than the first match taken, because [`Session::answers_to`]
+/// matches a derived cage name as well as a pid, and a cage name is not unique among live
+/// sessions. An empty `Err` means nothing answered to `id`.
+///
+/// The verbs that take an id from the operator resolve through this, so that `attach`, `stop`,
+/// `logs` and the `proc` family agree on which session a given string names — and, more to the
+/// point, agree on refusing rather than guessing when it names several.
+pub(crate) fn answering<'a>(
+    sessions: &'a [Session],
+    id: &str,
+) -> Result<&'a Session, Vec<&'a Session>> {
+    let mut matched = sessions.iter().filter(|s| s.answers_to(id));
+    match (matched.next(), matched.next()) {
+        (Some(one), None) => Ok(one),
+        (None, _) => Err(Vec::new()),
+        (Some(first), Some(second)) => Err(std::iter::once(first)
+            .chain(std::iter::once(second))
+            .chain(matched)
+            .collect()),
+    }
+}
+
+/// Print the guidance for an id several live sessions answer to: how many, and the pid of each,
+/// which is the one thing that tells them apart.
+///
+/// `verb` is the command as the operator typed it, so the line reads back as their own invocation.
+pub(crate) fn report_ambiguous_id(verb: &str, id: &str, many: &[&Session]) {
+    eprintln!(
+        "sbx: {verb}: {} live sessions answer to '{id}' — name one by its PID:",
+        many.len()
+    );
+    for s in many {
+        eprintln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
     }
 }
 

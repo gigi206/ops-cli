@@ -403,32 +403,122 @@ fn stream_body<R: Read + std::io::BufRead, W: Write>(
     sink: &mut W,
     cap: u64,
 ) -> io::Result<u64> {
-    let too_large = || {
-        io::Error::other(format!(
-            "the response body is larger than the {cap} bytes this fetch accepts"
-        ))
-    };
     match wire::response_framing(head, "GET") {
         wire::BodyFraming::Empty => Ok(0),
         wire::BodyFraming::Length(n) => {
             if n > cap {
-                return Err(too_large());
+                return Err(body_over_cap(cap));
             }
             wire::copy_exact(reader, sink, n)?;
             Ok(n)
         }
-        wire::BodyFraming::Chunked | wire::BodyFraming::ToEof => {
-            // Neither announces a length, so the bound is the caller's. Read one byte past the cap
+        // Chunked is a framing, not content: the sink is handed the entity, so the size lines and
+        // their CRLFs are stripped here rather than written through — a blob that arrived whole
+        // would otherwise be reported as a digest mismatch.
+        wire::BodyFraming::Chunked => stream_chunked_body(reader, sink, cap),
+        wire::BodyFraming::ToEof => {
+            // Nothing announces a length, so the bound is the caller's. Read one byte past the cap
             // to tell "exactly at the cap" from "over it": a body that reaches `cap + 1` is refused
             // whole rather than silently truncated into something whose digest would then be
             // reported as a mismatch.
             let n = io::copy(&mut reader.take(cap.saturating_add(1)), sink)?;
             if n > cap {
-                return Err(too_large());
+                return Err(body_over_cap(cap));
             }
             Ok(n)
         }
     }
+}
+
+/// The refusal every framing shares once a body passes what the caller will accept.
+fn body_over_cap(cap: u64) -> io::Error {
+    io::Error::other(format!(
+        "the response body is larger than the {cap} bytes this fetch accepts"
+    ))
+}
+
+/// The ceiling on one chunk-size or trailer line, and on the number of trailer lines — the bounds
+/// [`wire::read_chunked_body`] applies on the buffered path, applied here to the streamed one: a
+/// framing line is a few bytes, and a peer that sends one without end is not serving a body.
+const CHUNK_LINE_MAX: u64 = 8 * 1024;
+const TRAILER_LINES_MAX: usize = 32;
+
+/// Copy a `Transfer-Encoding: chunked` body to `sink`, stripping its framing as it goes.
+///
+/// [`wire::read_chunked_body`] answers the same question for a body held in memory, which is what
+/// the buffered path wants and what a blob must not be: a layer is megabytes, so the chunks are
+/// decoded one at a time here and written straight through. `cap` bounds the **decoded** length —
+/// the bytes the caller receives — and a body that passes it is refused rather than truncated into
+/// something whose digest would then be reported as a mismatch.
+///
+/// Fails closed on malformed framing: a size line that is not terminated, a size that is not hex,
+/// chunk data not followed by its CRLF, or a trailer section that does not end.
+fn stream_chunked_body<R: Read + std::io::BufRead, W: Write>(
+    reader: &mut R,
+    sink: &mut W,
+    cap: u64,
+) -> io::Result<u64> {
+    let malformed =
+        |what: &str| io::Error::other(format!("malformed chunked response body: {what}"));
+    let mut written: u64 = 0;
+    loop {
+        let line = read_framing_line(reader)?;
+        let Some(text) = strip_eol(&line) else {
+            return Err(malformed("a chunk size line without its terminator"));
+        };
+        // The size is hex, optionally followed by `;extensions` this side has no use for.
+        let digits = text.split(|b| *b == b';').next().unwrap_or_default();
+        let size = std::str::from_utf8(digits)
+            .ok()
+            .map(str::trim)
+            .and_then(|d| u64::from_str_radix(d, 16).ok())
+            .ok_or_else(|| malformed("a chunk size that is not hexadecimal"))?;
+        if size == 0 {
+            // The terminal chunk: the trailer section (if any) ends at a blank line, and its lines
+            // are bounded in length and in number for the reason the size lines are.
+            for _ in 0..=TRAILER_LINES_MAX {
+                let trailer = read_framing_line(reader)?;
+                match strip_eol(&trailer) {
+                    None | Some([]) => return Ok(written),
+                    Some(_) => {}
+                }
+            }
+            return Err(malformed("a trailer section that does not end"));
+        }
+        written = written
+            .checked_add(size)
+            .filter(|total| *total <= cap)
+            .ok_or_else(|| body_over_cap(cap))?;
+        wire::copy_exact(reader, sink, size)?;
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf)?;
+        if crlf != *b"\r\n" {
+            return Err(malformed("chunk data not followed by CRLF"));
+        }
+    }
+}
+
+/// Read one `\n`-terminated framing line, bounded to [`CHUNK_LINE_MAX`] bytes so a peer that never
+/// sends a terminator is an error rather than unbounded buffering. The line comes back with its
+/// terminator; an empty return means EOF before any byte.
+fn read_framing_line<R: std::io::BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
+    use std::io::BufRead as _;
+    let mut line = Vec::new();
+    // +1 so a line of exactly the bound plus its terminator is distinguishable from an overflow.
+    let n = reader
+        .take(CHUNK_LINE_MAX + 1)
+        .read_until(b'\n', &mut line)?;
+    if n > 0 && line.len() as u64 > CHUNK_LINE_MAX {
+        return Err(io::Error::other("chunked framing line too long"));
+    }
+    Ok(line)
+}
+
+/// A framing line without its terminator, or `None` when it carries none — which at the end of a
+/// body is an EOF where framing was due, never a line to act on.
+fn strip_eol(line: &[u8]) -> Option<&[u8]> {
+    let body = line.strip_suffix(b"\n")?;
+    Some(body.strip_suffix(b"\r").unwrap_or(body))
 }
 
 #[cfg(test)]

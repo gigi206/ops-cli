@@ -2024,7 +2024,11 @@ pub(super) const PAGES: &[Page] = &[
             read back as a different path later.\n\
             \n\
             `use` refuses when the data directory already holds a store, projects or app homes:\n\
-            adopting a volume does not move them, it hides them. `migrate` is the command that\n\
+            adopting a volume does not move them, it hides them. It refuses for the same reason\n\
+            when sbx already follows another volume — there the data directory holds only the\n\
+            pointer, so nothing looks at risk, yet the adopted volume's store would be hidden just\n\
+            as silently and `unuse` would return to the plain directory rather than to it. Run\n\
+            `unuse` first to switch deliberately. `migrate` is the command that\n\
             does move them — it copies everything into the volume, checks the copy against the\n\
             original, and only then switches over, setting the old directory aside under a dated\n\
             name rather than deleting it. The original stays authoritative for the whole copy, so\n\
@@ -2507,17 +2511,17 @@ pub(super) const PAGES: &[Page] = &[
                 "one link of the chain that leads to the exec, outermost first; repeatable. Only a `[proc.callers]` graph reads it, and under one a verdict without it answers a different question",
             ),
         ],
-        details:
-            "Reports ALLOWED/DENIED/PARKED against the effective `[proc]` policy a launch enforces,
-            and names the mode that decides an unmatched program. The verdict comes from the same
-            function the supervisor calls on a real `execve`, so it cannot drift from the wire.
-            Reflects the trust gate (an untrusted project's policy is dropped). No launch, no nix.
-            
-            What it cannot answer is the part that needs a live process. On a real `execve` the
-            supervisor resolves the target through the calling process's own `/proc` entry, follows
-            a `#!` line and a dynamic loader's argument to the program they really run, and decides
-            each of them; a target it cannot read is decided by the mode's default. Here the program
-            is taken as given, so this answers what the *rules* say, not what a particular exec
+        details: "Reports ALLOWED/DENIED/PARKED against the effective `[proc]` policy a launch\n\
+            enforces, and names the mode that decides an unmatched program. The verdict comes from\n\
+            the same function the supervisor calls on a real `execve`, so it cannot drift from the\n\
+            wire. Reflects the trust gate (an untrusted project's policy is dropped). No launch, no\n\
+            nix.\n\
+            \n\
+            What it cannot answer is the part that needs a live process. On a real `execve` the\n\
+            supervisor resolves the target through the calling process's own `/proc` entry, follows\n\
+            a `#!` line and a dynamic loader's argument to the program they really run, and decides\n\
+            each of them; a target it cannot read is decided by the mode's default. Here the program\n\
+            is taken as given, so this answers what the *rules* say, not what a particular exec\n\
             would resolve to.",
     },
     // ---- net subcommands ----------------------------------------------------------

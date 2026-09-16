@@ -15,7 +15,7 @@ use crate::store::Layout;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// The cage's scratch directory (also `HOME`): a private tmpfs, so a resolve command that writes a
 /// temp file has somewhere ephemeral without any host path.
@@ -240,17 +240,31 @@ pub(crate) fn resolve_url(
     // bwrap has read them, and is read below to prepare the exec that inherits them.
     let (prog, argv, held) = super::launch::cage_command(cage.bwrap, &spec, cage.limits)?;
     let mut command = Command::new(prog);
-    command
-        .args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(argv);
     // The descriptors are close-on-exec here; this is what carries them across the one exec that
     // needs them. See [`super::memfd::write`].
     super::memfd::inherit_across_exec(&mut command, &held);
-    let out = command.output().map_err(|e| {
-        io::Error::other(format!("could not run the `{name}` resolve command: {e}"))
-    })?;
+    // Bounded like every other host-side step: the command is a profile's own — typically a `curl`
+    // over a vendor API with no deadline of its own — and a plain `output()` waits as long as the
+    // far end keeps the connection open without sending, which would hang the launch (and
+    // `sbx upgrade`, which re-runs every resolver) with nothing to report. The window is the one
+    // [`super::resolver::HOST_RESOLUTION_DEADLINE`] draws for a resolution that runs a program sbx
+    // did not write against a link it knows nothing about, and the wait ends whatever still holds
+    // the pipe.
+    let out = match super::resolver::output_within(
+        &mut command,
+        super::resolver::HOST_RESOLUTION_DEADLINE,
+        &format!("the `{name}` resolve command"),
+    ) {
+        Ok(out) => out,
+        // The timeout already names the command and what happened to it; a spawn failure does not.
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(e),
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "could not run the `{name}` resolve command: {e}"
+            )));
+        }
+    };
     if !out.status.success() {
         let detail = String::from_utf8_lossy(&out.stderr);
         let detail = detail.trim();

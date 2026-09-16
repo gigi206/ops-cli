@@ -383,6 +383,58 @@ fn a_refusal_with_no_caller_keeps_its_empty_caller() {
     assert!(out[0].caller.is_empty(), "an empty caller stays empty");
 }
 
+/// The scanner's margin never reaches the caller, and an uncut stream never loses its tail.
+///
+/// The capture keeps a margin past the ceiling so that a credential *starting* inside the cap is
+/// present whole when the scan runs. Those bytes are the scanner's, not the caller's, so they are
+/// cut back off — but the cut has to fall before any occurrence that straddles the ceiling, or the
+/// truncation hands back the prefix of a value the redaction left alone because it was not whole.
+/// And the cut belongs to the stream that was cut: taking it from a stream that ran under the
+/// ceiling is what drops the tail of an output nobody truncated.
+#[test]
+fn a_capped_stream_leaks_no_prefix_of_a_straddling_secret() {
+    let secret = b"PGPASSWORD-abcdefghij".to_vec();
+    let needles = vec![SecretNeedle::named("PGPASSWORD", secret.clone())];
+    let cap = 40;
+
+    // The value starts before the ceiling and runs past it, so the redaction leaves it alone: it
+    // is not whole inside the kept bytes. The cut must then fall at its start, not at the cap.
+    let mut raw = vec![b'.'; 32];
+    raw.extend_from_slice(&secret);
+    let (out, hits) = redact_capped(&raw, true, cap, &needles, &Placeholder::Plain);
+    assert_eq!(out, vec![b'.'; 32], "the cut falls before the occurrence");
+    assert_eq!(hits, 0, "nothing was replaced, so nothing is counted");
+    assert!(
+        !out.windows(4).any(|w| w == b"PGPA"),
+        "no prefix of the value survives the cut"
+    );
+
+    // A value that is whole inside the kept bytes is replaced, and the margin still goes.
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&secret);
+    raw.extend_from_slice(&[b'.'; 64]);
+    let (out, hits) = redact_capped(&raw, true, cap, &needles, &Placeholder::Plain);
+    assert_eq!(hits, 1);
+    assert!(out.starts_with(b"${PGPASSWORD}"), "the value is replaced");
+    assert!(
+        out.len() <= cap,
+        "the scanner's margin is not handed to the caller: {} bytes",
+        out.len()
+    );
+
+    // A stream that was never cut holds no margin, so it keeps every byte it produced — including
+    // the ones a replacement longer than the value it replaced pushed past the ceiling.
+    let mut raw = vec![b'.'; 39];
+    raw.extend_from_slice(&secret);
+    let (out, hits) = redact_capped(&raw, false, cap, &needles, &Placeholder::Plain);
+    assert_eq!(hits, 1);
+    assert_eq!(
+        out.len(),
+        39 + "${PGPASSWORD}".len(),
+        "an uncut stream keeps its tail whatever the redaction did to its length"
+    );
+}
+
 // A caller's value is re-checked against the bound at invocation, not just at declaration.
 #[test]
 fn a_value_outside_its_bound_is_refused() {

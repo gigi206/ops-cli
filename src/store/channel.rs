@@ -680,12 +680,18 @@ fn reachability(nix: &Path, layout: &Layout, rev: &str, fresh: bool) -> Reachabi
             .map(|answer| ahead_by(&answer));
     // Short-circuiting: the control question is asked only when the first one came back with
     // nothing, which is the only case where its answer changes anything.
+    //
+    // Asked uncached whatever `fresh` says, because the two requests have to share the same
+    // currency for the control to mean anything. Nothing above is a comparison that failed at the
+    // endpoint just now — nix's `tarball-ttl` cache can only ever serve a body that succeeded — so
+    // a control answered from a body fetched up to an hour ago would report the endpoint as
+    // answering while the live request that matters did not, turning a rate limit into `Absent`.
     let endpoint_answers = compared.is_some()
         || crate::sandbox::nixhub::fetch_url_json(
             nix,
             layout,
             &reachability_url(NIXPKGS_WITNESS_BRANCH),
-            fresh,
+            true,
         )
         .is_ok();
     verdict(compared, endpoint_answers)

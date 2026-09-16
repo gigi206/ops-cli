@@ -893,16 +893,11 @@ impl TaskEngine {
         // Substitution happens before anything is returned or logged, and on the raw bytes: the
         // output is arbitrary, and decoding first could split a value across a replacement
         // character and hide it from the scan.
-        let (mut out_bytes, out_hits) = redact_named(&raw.stdout, &needles, &placeholder);
-        let (mut err_bytes, err_hits) = redact_named(&raw.stderr, &needles, &placeholder);
-        // The margin was the scanner's, not the caller's: cut it back off. Only on the truncated
-        // path — an uncut stream held no margin bytes to begin with, and a redaction that grew the
-        // text past the ceiling (a short secret, a long `${name}`) is not this ceiling's business.
-        if raw.truncated {
-            let cap = task.max_output as usize;
-            out_bytes.truncate(cap);
-            err_bytes.truncate(cap);
-        }
+        let cap = task.max_output as usize;
+        let (out_bytes, out_hits) =
+            redact_capped(&raw.stdout, raw.stdout_cut, cap, &needles, &placeholder);
+        let (err_bytes, err_hits) =
+            redact_capped(&raw.stderr, raw.stderr_cut, cap, &needles, &placeholder);
         // Which side of the split each stream's count falls on is decided by whether that stream is
         // returned, one stream at a time: a declaration that shows stdout and hides stderr reports
         // what happened in the half the caller is holding, and no more.
@@ -926,7 +921,7 @@ impl TaskEngine {
                 OutputDisposition::Show => Some(String::from_utf8_lossy(&err_bytes).into_owned()),
                 OutputDisposition::Hide => None,
             },
-            truncated: raw.truncated,
+            truncated: raw.truncated(),
             redacted: out_shown + err_shown,
             redacted_withheld: out_withheld + err_withheld,
             timed_out: raw.timed_out,
@@ -1180,7 +1175,8 @@ impl TaskEngine {
                 exit: STOPPED_EXIT,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
-                truncated: false,
+                stdout_cut: false,
+                stderr_cut: false,
                 timed_out: false,
                 stopped: true,
             });
@@ -1242,7 +1238,8 @@ impl TaskEngine {
             exit: super::launch::status_code(status),
             stdout,
             stderr,
-            truncated: out_cut || err_cut,
+            stdout_cut: out_cut,
+            stderr_cut: err_cut,
             timed_out,
             stopped,
         })
@@ -2155,9 +2152,22 @@ struct RawOutput {
     exit: i32,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    truncated: bool,
+    /// Whether **stdout** hit the ceiling, and whether **stderr** did — kept apart rather than
+    /// folded into one flag, because the margin the capture kept for the scanner is a property of
+    /// the stream that was cut: a stream that ran under the ceiling holds no margin bytes, and
+    /// cutting it would take output the caller is owed.
+    stdout_cut: bool,
+    stderr_cut: bool,
     timed_out: bool,
     stopped: bool,
+}
+
+impl RawOutput {
+    /// Whether either stream was cut — what the result reports, since a truncated invocation is
+    /// one the caller must not read as complete whichever stream lost bytes.
+    fn truncated(&self) -> bool {
+        self.stdout_cut || self.stderr_cut
+    }
 }
 
 /// Spawn a cage launcher, then close this process's copies of the descriptors bwrap was told to
@@ -2201,8 +2211,8 @@ pub(super) fn spawn_launcher(
 /// surviving prefix matched nothing — the caller received it in the clear, from the one path whose
 /// whole job is that it does not. A margin of one byte less than the longest needle guarantees that
 /// any needle *starting* inside the cap is present whole when the scan runs; one starting at or past
-/// the cap is entirely in the discarded tail and never reaches anyone. The caller cuts the redacted
-/// result back to `cap`.
+/// the cap is entirely in the discarded tail and never reaches anyone. [`redact_capped`] takes the
+/// margin back off.
 ///
 /// `cut` reports what the **caller** loses, so it is `total > cap` — the margin is not output.
 fn read_capped(pipe: &mut impl Read, cap: usize, margin: usize) -> io::Result<(Vec<u8>, bool)> {
@@ -2225,6 +2235,68 @@ fn read_capped(pipe: &mut impl Read, cap: usize, margin: usize) -> io::Result<(V
         }
     }
     Ok((kept, total > cap))
+}
+
+/// Substitute the credentials out of one captured stream and return the caller's share of it,
+/// with the number of occurrences replaced in that share.
+///
+/// A stream that ran under the ceiling is returned whole: it holds no margin bytes, and a
+/// substitution that grew the text past the ceiling (a short value, a long `${name}`) is not this
+/// ceiling's business.
+///
+/// A stream that was cut carries the scanner's margin ([`read_capped`]), and the margin is removed
+/// **before** the substitution rather than after it. A placeholder is rarely the length of the
+/// value it replaces, so cutting the substituted text at `cap` cuts it at a different place in the
+/// original: every byte an earlier substitution shrank the text by slides one byte of the margin
+/// into the caller's window — bytes the scan could not see whole, and so the plaintext prefix of an
+/// occurrence that ran past the end of what was kept. Cutting first keeps the window on the bytes
+/// the ceiling names, and the scan still sees the whole occurrence that lies across it (see
+/// [`margin_cut`]).
+fn redact_capped(
+    raw: &[u8],
+    cut: bool,
+    cap: usize,
+    needles: &[SecretNeedle],
+    placeholder: &Placeholder,
+) -> (Vec<u8>, usize) {
+    let share = if cut {
+        &raw[..margin_cut(raw, cap, needles)]
+    } else {
+        raw
+    };
+    redact_named(share, needles, placeholder)
+}
+
+/// Where the caller's share of a cut stream ends: the ceiling, moved back to the start of an
+/// occurrence that spans it.
+///
+/// The margin exists so that a credential lying across the ceiling is whole when the scan runs, and
+/// what the scan then knows is that this occurrence is a credential. Returning the part of it that
+/// falls inside the ceiling would hand over a prefix of the plaintext, and returning its placeholder
+/// instead would hand over bytes the ceiling does not cover — so the share ends where the occurrence
+/// begins. An occurrence can only span the end if it starts within its own length of it, which is
+/// what the search is anchored on; the walk repeats because moving the end back can bring a longer
+/// needle's occurrence across the new one.
+fn margin_cut(raw: &[u8], cap: usize, needles: &[SecretNeedle]) -> usize {
+    let mut end = cap.min(raw.len());
+    loop {
+        let mut earliest = end;
+        for needle in needles {
+            let len = needle.as_bytes().len();
+            if len == 0 {
+                continue;
+            }
+            // From here on, any occurrence starting before `end` necessarily runs past it.
+            let from = end.saturating_sub(len - 1);
+            if let Some(at) = needle.find_in(raw, from).filter(|at| *at < end) {
+                earliest = earliest.min(at);
+            }
+        }
+        if earliest == end {
+            return end;
+        }
+        end = earliest;
+    }
 }
 
 /// Derive a task cage's mounts from the agent cage's: keep the substrate the launch declared, then

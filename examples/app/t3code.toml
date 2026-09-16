@@ -145,8 +145,8 @@ dbus = true
 #
 # claude-code is named by default so T3 is not inert; add more as you need. To actually USE one you
 # still need its own login (OAuth via the in-cage browser, or an API key in its config in the
-# isolated home). Cursor's `cursor-agent` has no bundle — it is a bootstrap download rather than a
-# package; see `examples/app/cursor-agent.toml` for that mechanism.
+# isolated home). Cursor's `cursor-agent` ships a bundle like the rest — name it in `use` (its
+# namesake profile, `examples/app/cursor-agent.toml`, is the thin half of the same pair).
 use = ["claude-code"]
 #use = ["claude-code", "codex"]      # several at once
 #use = ["opencode"]

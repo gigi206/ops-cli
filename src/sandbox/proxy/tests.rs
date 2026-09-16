@@ -5453,6 +5453,91 @@ fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
     );
 }
 
+/// A cage that will not accept the minted leaf is an attempt that failed, and it is recorded as
+/// one against the tunnel's own host.
+///
+/// The first read of a turn is also what drives the interception handshake to completion, so a
+/// client whose trust store carries no sbx CA arrives there as the TLS alert it sent rather than as
+/// the first byte of a request head. Counted among the shapes a finished tunnel ends with, it
+/// closed the connection silently and left `sbx net logs` empty for a request that never left —
+/// the one place an operator goes to find out why.
+///
+/// The other side of the same branch, a tunnel whose client is simply finished with it, still
+/// leaves nothing behind; that half is
+/// `a_tunneled_head_that_never_finished_is_logged_against_its_host`.
+#[test]
+fn a_client_that_refuses_the_minted_leaf_is_logged_rather_than_read_as_a_finished_tunnel() {
+    let log = Arc::new(crate::sandbox::control::LogRing::new(
+        crate::sandbox::control::LOG_RING_CAP,
+    ));
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            policy(&["upstream.test:*"]),
+        )
+        .unwrap()
+        .with_log(log.clone()),
+    );
+
+    let (mut test_end, cage_end) = UnixStream::pair().unwrap();
+    // A backstop only: every step below is driven by this thread, so nothing here waits on a peer
+    // that is not about to act.
+    cage_end
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let served = {
+        let c = ctx.clone();
+        thread::spawn(move || handle_client(cage_end, &c))
+    };
+    write!(test_end, "CONNECT upstream.test:443 HTTP/1.1\r\n\r\n").unwrap();
+    test_end.flush().unwrap();
+    assert!(
+        read_until_blank(&mut test_end)
+            .unwrap()
+            .contains("200 Connection established"),
+        "the CONNECT must be accepted before the handshake can be tested"
+    );
+
+    // An empty trust store is the cage that never had the session CA installed: the leaf the proxy
+    // mints for `upstream.test` has no issuer this client knows, so it answers with an alert.
+    let conn = ClientConnection::new(
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        ),
+        ServerName::try_from("upstream.test").unwrap(),
+    )
+    .unwrap();
+    let mut tls = StreamOwned::new(conn, test_end);
+    assert!(
+        tls.write_all(b"GET /path HTTP/1.1\r\nHost: upstream.test\r\n\r\n")
+            .is_err(),
+        "a client that does not trust the leaf cannot get a request through the handshake"
+    );
+    drop(tls);
+    let _ = served.join().unwrap();
+
+    let events = log.snapshot(None, None, false).events;
+    assert_eq!(
+        events.len(),
+        1,
+        "the failed handshake is one attempt, recorded once: {events:?}"
+    );
+    assert_eq!(
+        events[0].verdict,
+        crate::sandbox::control::LogVerdict::Blocked
+    );
+    assert_eq!(
+        events[0].reason, "bad-request:head",
+        "a turn whose first read failed is the head that never arrived"
+    );
+    assert_eq!(
+        events[0].host, "upstream.test",
+        "the CONNECT fixed the host before the handshake had a chance to fail"
+    );
+}
+
 #[test]
 fn read_chunked_body_dechunks_a_well_formed_body() {
     // one chunk + the terminating zero chunk, with a chunk extension on the size line (ignored).
@@ -9471,17 +9556,16 @@ fn one_capture(
     }
 }
 
-/// End to end: an upstream that reflects a configured secret inside a WebSocket frame is
-/// reported on the tunnel's own log event — and the cage still receives the frame byte for byte.
+/// End to end: `[network] websocket_secret` decides whether a frame carrying a configured secret
+/// leaves the cage — `warn` relays it, `block` stops it at the proxy.
 ///
-/// Both halves matter. The report is the whole feature: an open tunnel is relayed exactly, so
-/// unlike the two HTTP tripwires nothing is refused or masked, and telling the user is the only
-/// outcome there is. The byte-identical relay is what proves the tripwire is an observer: a
-/// tripwire that perturbed the stream would break the very protocol it is watching.
+/// Asserted on what the **upstream** received rather than on what came back, so what is measured is
+/// the outbound relay itself. The comparison is against the frame as it goes on the wire, mask and
+/// all: the plaintext appears nowhere in those bytes, so matching the whole frame is what shows the
+/// posture acted on the payload it decoded rather than on a chance byte sequence.
 ///
-/// Teeth: this ctx captures NOTHING. The scan must not ride on `[network] capture`, which is a
-/// debugging convenience a user turns on and off — a security check that followed it would be
-/// absent exactly when it was needed.
+/// Teeth: both postures run the same tunnel in one loop, so `block` cannot pass by refusing
+/// everything — the `warn` pass beside it requires the frame to cross when the posture allows it.
 #[test]
 fn a_secret_leaving_through_a_websocket_crosses_or_not_by_the_configured_posture() {
     use crate::allowlist::WebsocketSecret;
@@ -9537,6 +9621,17 @@ fn a_secret_leaving_through_a_websocket_crosses_or_not_by_the_configured_posture
     }
 }
 
+/// End to end: an upstream that reflects a configured secret inside a WebSocket frame is
+/// reported on the tunnel's own log event — and the cage still receives the frame byte for byte.
+///
+/// Both halves matter. The report is the whole feature: an open tunnel is relayed exactly, so
+/// unlike the two HTTP tripwires nothing is refused or masked, and telling the user is the only
+/// outcome there is. The byte-identical relay is what proves the tripwire is an observer: a
+/// tripwire that perturbed the stream would break the very protocol it is watching.
+///
+/// Teeth: this ctx captures NOTHING. The scan must not ride on `[network] capture`, which is a
+/// debugging convenience a user turns on and off — a security check that followed it would be
+/// absent exactly when it was needed.
 #[test]
 fn a_secret_reflected_into_a_websocket_frame_is_reported_on_its_event() {
     use crate::sandbox::control::{LOG_RING_CAP, LogRing, SecretWay};

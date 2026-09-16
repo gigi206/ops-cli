@@ -44,6 +44,15 @@ impl GroupHome {
         }
     }
 
+    /// The app this group belongs to, or `None` for the project baseline — the launch identity
+    /// a cage's channel is resolved against (see [`effective_lock_target`]).
+    fn app(&self) -> Option<&str> {
+        match self {
+            GroupHome::ProjectDefault => None,
+            GroupHome::GlobalApp(name) | GroupHome::ProjectApp(name) => Some(name),
+        }
+    }
+
     /// The bare display name for the report column and the recap list — the app name, or `project`
     /// for the baseline. Unlike [`GroupHome::label`] it carries no `app:` prefix, so a run of them
     /// aligns cleanly.
@@ -145,6 +154,25 @@ fn withheld_mise_packages(cfg: &crate::config::Resolved, only: Option<&str>) -> 
     }
 }
 
+/// Prepare one roll cage, for the launch identity `app` names (`None` for the project baseline).
+///
+/// The identity is not decoration: it selects the lock the channel resolves against
+/// ([`effective_lock_target`]), and an app resolves against its own. So a roll that walks several
+/// groups prepares once per group rather than reusing one preparation, which would provision that
+/// app's `nix:` packages — and the base userland under them — against a revision the app's own
+/// launch never runs on, the very skew [`Prepared`] documents a single channel per launch to avoid.
+///
+/// Carries the two postures every roll cage shares: the batch flag (one cage per group, so `build`'s
+/// per-cage assembly lines would bury the roll result) and the unresolved-secret rule (a roll
+/// fetches packages, so a credential that cannot be resolved now denies its own destination for
+/// this cage instead of failing the upgrade).
+fn prepare_roll_cage(cwd: &Path, app: Option<&str>) -> Result<Prepared, ExitCode> {
+    let mut prep = prepare_in(cwd.to_path_buf(), &crate::config::Override::none(), app)?;
+    prep.in_batch = true;
+    prep.unresolved_secret = crate::sandbox::egress::Unresolved::DenyDestination;
+    Ok(prep)
+}
+
 /// Roll the project's and its apps' `mise:` `[packages]` forward, in-cage. A `mise:` package is
 /// equipped by `mise use -g --pin <token>` at launch and is frozen there at the installed version —
 /// frozen *because* of the pin, which writes the resolved version into the cage's config so a later
@@ -210,8 +238,9 @@ pub(crate) fn upgrade_mise_packages(
     // Only now, with something to roll, take on the sandbox prerequisites — against `cwd`, the
     // project being upgraded, so `--project` builds the roll cage in that project's store and home
     // rather
-    // than wherever the command was invoked.
-    let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none(), only) {
+    // than wherever the command was invoked. This one carries the baseline identity (`only`, which
+    // is `None` for a project-wide roll); each app group prepares its own below.
+    let mut prep = match prepare_roll_cage(cwd, only) {
         Ok(p) => p,
         Err(_) => {
             // prepare_in already printed the pointed reason (missing bwrap/userns/nix).
@@ -219,16 +248,6 @@ pub(crate) fn upgrade_mise_packages(
             return true;
         }
     };
-
-    // One cage per app: the lines `build` prints about how it assembled each one — the equipping
-    // line, the standing broker's note — repeat for every app and bury the roll result. Silenced
-    // here, where the report names each app anyway.
-    prep.in_batch = true;
-    // A roll fetches packages; the credentials an app declares are for the traffic it makes when it
-    // actually runs. One that cannot be resolved now denies its own destination for this cage
-    // instead of failing the upgrade — the roll never sends it, and an app whose token endpoint is
-    // briefly unavailable is still an app whose tools can move forward.
-    prep.unresolved_secret = crate::sandbox::egress::Unresolved::DenyDestination;
 
     // Every group name is known up front, so the result lines are dot-leader aligned to one column
     // even though each prints live (as its cage finishes) to keep progress visible over a long
@@ -266,6 +285,26 @@ pub(crate) fn upgrade_mise_packages(
             continue;
         }
 
+        // A group whose identity is not the one the preparation above carries resolves against
+        // another lock, so it gets its own cage preparation rather than that one.
+        let mut group_prep = if home.app() == only {
+            None
+        } else {
+            match prepare_roll_cage(cwd, home.app()) {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    println!(
+                        "{}",
+                        roll_line(&name, width, &format!("{warn}failed to prepare{r}"), pal)
+                    );
+                    failed += 1;
+                    ok = false;
+                    continue;
+                }
+            }
+        };
+        let prep = group_prep.as_mut().unwrap_or(&mut prep);
+
         // Launch a cage in this group's home with its merged config so `build` sees the right
         // network/packages/home. The baseline warnings were already surfaced by `upgrade_cmd`,
         // so clear them to avoid one repeat per cage. The command is `mise upgrade <tokens>`; the
@@ -283,7 +322,7 @@ pub(crate) fn upgrade_mise_packages(
             &tokens,
         );
 
-        let (spec, guard, _) = match build(&prep, runtime, cmd) {
+        let (spec, guard, _) = match build(prep, runtime, cmd) {
             Ok(v) => v,
             Err(_) => {
                 println!(
@@ -518,8 +557,9 @@ pub(crate) fn upgrade_provision_steps(
     }
 
     // Only now, with work to do, take on the sandbox prerequisites — against `cwd`, so `--project`
-    // retargets these cages the way it retargets every other roll.
-    let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none(), only) {
+    // retargets these cages the way it retargets every other roll. Every group here is an app, so
+    // this preparation serves the roll only when one app was named; the others prepare their own.
+    let mut prep = match prepare_roll_cage(cwd, only) {
         Ok(p) => p,
         Err(_) => {
             // prepare_in already printed the pointed reason (missing bwrap/userns/nix).
@@ -527,12 +567,6 @@ pub(crate) fn upgrade_provision_steps(
             return true;
         }
     };
-    prep.in_batch = true;
-    // A roll fetches packages; the credentials an app declares are for the traffic it makes when it
-    // actually runs. One that cannot be resolved now denies its own destination for this cage
-    // instead of failing the upgrade — the roll never sends it, and an app whose token endpoint is
-    // briefly unavailable is still an app whose tools can move forward.
-    prep.unresolved_secret = crate::sandbox::egress::Unresolved::DenyDestination;
 
     let width = groups
         .iter()
@@ -561,6 +595,26 @@ pub(crate) fn upgrade_provision_steps(
             continue;
         }
 
+        // A group whose identity is not the one the preparation above carries resolves against
+        // another lock, so it gets its own cage preparation rather than that one.
+        let mut group_prep = if home.app() == only {
+            None
+        } else {
+            match prepare_roll_cage(cwd, home.app()) {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    println!(
+                        "{}",
+                        roll_line(&name, width, &format!("{warn}failed to prepare{r}"), pal)
+                    );
+                    failed += 1;
+                    ok = false;
+                    continue;
+                }
+            }
+        };
+        let prep = group_prep.as_mut().unwrap_or(&mut prep);
+
         let runtime = home.runtime();
         let mut cfg = cfg;
         cfg.warnings.clear();
@@ -571,6 +625,11 @@ pub(crate) fn upgrade_provision_steps(
         // `mise` roll above deliberately keeps its provisions: there the command is `mise upgrade`,
         // so composing the steps ahead of it is the ordinary launch behaviour, not a second copy.
         cfg.provisions.clear();
+        // The app's services are cleared for the same reason: the composition writes every enabled
+        // one — its launch and its readiness gate — ahead of the command, so a service would start
+        // before the install it depends on, die into its log, and hold the roll for the whole
+        // gate timeout. Only the install runs here; the services belong to a launch.
+        cfg.service.clear();
         // The signal the steps' guards read, and only under `force`: without it each guard answers
         // for itself, which is the whole difference between "bring what moved up to date" and
         // "re-install regardless". It rides the app's `[env]` layer, so it reaches the cage the way
@@ -580,7 +639,7 @@ pub(crate) fn upgrade_provision_steps(
         }
         prep.cfg = cfg;
 
-        let (spec, guard, _) = match build(&prep, runtime, provision_only_cmd(&steps)) {
+        let (spec, guard, _) = match build(prep, runtime, provision_only_cmd(&steps)) {
             Ok(v) => v,
             Err(_) => {
                 println!(
@@ -702,10 +761,12 @@ fn roll_task_pool(
 ) -> Result<bool, String> {
     let id = crate::sandbox::binds::project_runtime_id(cwd)
         .map_err(|e| format!("no project tree ({e})"))?;
-    // The per-app loop above leaves `prep.cfg` on whichever app it rolled last. The pool belongs to
-    // the project's declared operations, not to any app, so restore the baseline before deriving a
-    // cage from it.
+    // The loop above leaves `prep.cfg` on whichever group last ran against this preparation. The
+    // pool belongs to the project's declared operations, not to any app, so restore the baseline
+    // before deriving a cage from it — minus its warnings, which `upgrade_cmd` already surfaced and
+    // each group cleared for the same reason, so the pool's cage does not print the set once more.
     prep.cfg = cfg.clone();
+    prep.cfg.warnings.clear();
     let (spec, guard, _) = build(
         prep,
         binds::Runtime::ProjectDefault,

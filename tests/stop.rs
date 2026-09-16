@@ -591,26 +591,30 @@ fn stop_all_stops_every_session() {
 }
 
 /// The fingerprints are bare numbers, and the sweep matched them as a substring of every command
-/// line on the machine: `sleep 131341` contains `31341`, so a test run signalled a process of the
+/// line on the machine: `sleep 131399` contains `31399`, so a test run signalled a process of the
 /// developer's that had nothing to do with it, and the liveness assertions read it as one of the
 /// cage's agents still running. Matched argument by argument now, against an argv that must be
 /// exactly `sleep <fingerprint>`.
+///
+/// The fingerprint here is its own, shared with no other test in this binary: the harness runs the
+/// tests on parallel threads, so a `sleep` spawned under one of the e2e fingerprints would be seen
+/// as a surviving agent by that e2e's liveness assertions, and swept by its `FingerprintCleanup`.
 #[test]
 fn the_fingerprint_sweep_matches_a_whole_argv_and_not_a_substring_of_one() {
     let mut neighbour = std::process::Command::new("sleep")
-        .arg("131341")
+        .arg("131399")
         .spawn()
         .expect("spawn the neighbour");
     let mut ours = std::process::Command::new("sleep")
-        .arg("31341")
+        .arg("31399")
         .spawn()
         .expect("spawn the fingerprinted process");
     // Both are up before either is looked for.
     assert!(wait_until(Instant::now() + Duration::from_secs(5), || {
-        pids_sleeping_for("31341").contains(&(ours.id() as i32))
+        pids_sleeping_for("31399").contains(&(ours.id() as i32))
     }));
 
-    let matched = pids_sleeping_for("31341");
+    let matched = pids_sleeping_for("31399");
     assert!(
         matched.contains(&(ours.id() as i32)),
         "the fingerprinted process must be found: {matched:?}"

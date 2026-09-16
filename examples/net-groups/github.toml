@@ -9,7 +9,7 @@
 # The GitHub WEB runtime lane: github.com opened to EVERY verb (`{*}`) — for the apps that
 # POST to GitHub at runtime (git-forge integrations that open repos and file PRs, `git
 # clone` smart-HTTP negotiation, GitHub account sign-in). NOT the read-only INSTALL lane
-# (`@github-install` is `{GET}`-only), not the API host (separate `@api-github` fragment —
+# (`@github-install` is `{GET}`-only), not the API host (separate `@github-api` fragment —
 # a group expands into the list that references it, so an app takes the lane it needs,
 # verb-exact), and not the path-scoped device-flow pages (`github.com/login/*`), which an
 # app may keep scoped instead of taking the whole host. Groups are global-only (like

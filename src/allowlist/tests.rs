@@ -405,6 +405,32 @@ fn a_scheme_selects_the_enforcement_layer() {
     ));
 }
 
+/// A path rule may not carry a delimiter the matcher cuts away on both sides.
+///
+/// `canonical_segments` strips a `#fragment` and a segment's `;parameters` from a request's path,
+/// and from the rule's path with it, so a rule written with either matches the bare path while
+/// displaying a form that names something narrower — the operator reads a rule for one resource
+/// and has opened the whole of it. A query is refused for that reason already; these two are the
+/// same widening and are refused the same way, with the same pointer at `re:`.
+#[test]
+fn a_path_rule_may_not_carry_a_fragment_or_segment_parameters() {
+    let fragment = classify("api.test/exec#debug").unwrap_err();
+    assert!(
+        fragment.contains("fragment") && fragment.contains("re:"),
+        "the refusal names what was written and what to use instead: {fragment}"
+    );
+    let params = classify("api.test/exec;v=2").unwrap_err();
+    assert!(
+        params.contains("parameters") && params.contains("re:"),
+        "the refusal names what was written and what to use instead: {params}"
+    );
+    // The plain rule those two were trying to narrow stays accepted, and still matches the
+    // resource with any query, fragment or parameters attached.
+    let a = allow(&["api.test/exec"]);
+    assert!(a.permits("api.test", 443, "/exec"));
+    assert!(a.permits("api.test", 443, "/exec?a=1"));
+}
+
 #[test]
 fn rejects_an_unsupported_or_misplaced_scheme() {
     // An arbitrary scheme is rejected with a pointer at the supported schemes rather than
@@ -1548,6 +1574,20 @@ fn parse_url_target_extracts_host_port_and_path() {
     assert_eq!(
         parse_url_target("https://h.test:8443").unwrap(),
         ("h.test".to_string(), 8443, "/".to_string())
+    );
+    // A query or a fragment may precede any `/`. The authority ends there rather than running to
+    // the first slash, which would glue the query onto the host and refuse a valid request.
+    assert_eq!(
+        parse_url_target("https://h.test?x=1").unwrap(),
+        ("h.test".to_string(), 443, "/?x=1".to_string())
+    );
+    assert_eq!(
+        parse_url_target("https://h.test:8443?x=1").unwrap(),
+        ("h.test".to_string(), 8443, "/?x=1".to_string())
+    );
+    assert_eq!(
+        parse_url_target("https://h.test#frag").unwrap(),
+        ("h.test".to_string(), 443, "/#frag".to_string())
     );
     // a bracketed IPv6 host, with and without an explicit port
     assert_eq!(

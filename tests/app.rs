@@ -540,8 +540,9 @@ fn reset_yes_refuses_while_a_session_of_that_app_is_live() {
 fn reset_empties_every_home_and_pool_and_keeps_the_profile() {
     let fx = Project::new("app");
     let sbx_dir = fx.data_home.path().join("sbx");
-    let profile = sbx_dir.join("apps/demo/profile.toml");
-    touch_under(&profile);
+    // The declaration itself: an imported profile beside the global config, which is where an app
+    // is declared — not a file under its data home.
+    fx.write_profile("demo", &demo_profile());
     touch_under(&sbx_dir.join("apps/demo/home/.config/creds"));
     touch_under(&sbx_dir.join("apps/demo/home/.rustup/toolchain/bin/rustc"));
     // The per-project mise pool a global app self-equips into: part of "everything", or the app
@@ -569,7 +570,7 @@ fn reset_empties_every_home_and_pool_and_keeps_the_profile() {
         text(&out)
     );
     assert!(
-        profile.exists(),
+        fx.profile_path("demo").exists(),
         "a reset keeps the declaration — removing it is `app rm --purge`"
     );
     assert!(

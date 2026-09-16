@@ -242,14 +242,46 @@ fn a_streamed_body_is_refused_once_it_passes_the_cap() {
     assert_eq!(n, 64);
     assert_eq!(sink.len(), 64);
 
-    // Chunked takes the same branch, and the bytes are copied as they arrive rather than decoded —
-    // a blob served this way fails its digest, which is the caller's business. What matters here is
-    // that the cap applies to it too.
+    // Chunked is de-framed rather than copied, and the cap applies to what the framing decodes
+    // to — not to the bytes on the wire, which carry the size lines as well.
     let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
     let mut sink = Vec::new();
     assert!(
         stream_body(&mut &body[..], chunked, &mut sink, 8).is_err(),
         "a chunked body is bounded by the same cap"
+    );
+}
+
+/// A chunked body reaches the sink as the bytes it encodes, not as the framing that carried them.
+///
+/// The framing is the server's choice and a reverse proxy may impose it on a response that was
+/// served with a `Content-Length` upstream. A blob copied with its size lines intact hashes to
+/// something no digest matches, so a correctly served layer was refused with a message blaming its
+/// content — which is why this is checked on the decoded bytes rather than on the byte count alone.
+#[test]
+fn a_chunked_body_is_decoded_rather_than_copied_with_its_framing() {
+    let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    // Two chunks and the terminator: the sink holds the payload, with no size line between them.
+    let wire = b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    let mut sink = Vec::new();
+    let n = stream_body(&mut &wire[..], chunked, &mut sink, 1024).expect("within the cap");
+    assert_eq!(sink, b"abcde", "the size lines are framing, not content");
+    assert_eq!(n, 5, "the count is of the bytes written, not of the wire");
+
+    // A chunk extension is part of the size line and carries nothing for the sink either.
+    let extended = b"3;name=value\r\nabc\r\n0\r\n\r\n";
+    let mut sink = Vec::new();
+    stream_body(&mut &extended[..], chunked, &mut sink, 1024).expect("within the cap");
+    assert_eq!(sink, b"abc");
+
+    // A body that stops before its terminator is a truncated one, not a short one: answering with
+    // what arrived would hand the caller a prefix to hash.
+    let unterminated = b"3\r\nabc\r\n";
+    let mut sink = Vec::new();
+    assert!(
+        stream_body(&mut &unterminated[..], chunked, &mut sink, 1024).is_err(),
+        "a chunked body cut short of its terminator is refused"
     );
 }
 

@@ -3467,8 +3467,10 @@ fn an_app_home_scope_defaults_to_global_and_a_trusted_layer_may_set_project() {
 fn an_untrusted_project_cannot_widen_a_trusted_apps_home_scope_to_global() {
     // The integrity guard, mirroring `cmd`: a trusted app pinned to a per-project home must
     // not be flipped to the shared global home by an untrusted repo (the contamination
-    // vector). The safe direction — narrowing to `project` — and an untrusted project's own
-    // app are both allowed.
+    // vector). The refusal covers the field rather than the direction — an untrusted layer sets
+    // no `home_scope` at all on an app a trusted layer defines, narrowing included, since a
+    // profile that named no scope would otherwise take the project's word for it. An untrusted
+    // project's own app, with nothing trusted to steer, may still set either scope.
     let global = raw_with_app(
         "demo-app",
         RawApp {
@@ -3681,12 +3683,14 @@ fn an_untrusted_projects_limits_are_dropped_with_a_warning() {
 fn a_value_set_to_its_default_still_records_its_layer_not_default() {
     // The discriminating provenance property — the whole reason the feature exists. A layer
     // that sets a value *to the built-in default* is still recorded as the origin, so
-    // `sbx config` distinguishes "shared because I chose it" from "shared because nothing set
-    // it". `network = "shared"` and `gui = "none"` ARE the defaults, and `tasks_max = 16384` is
-    // the documented default task cap — all three, set explicitly, must read as `Global`, never
-    // `Default`. (If `validate_network` ever normalized "shared" to "unset", this would fail.)
+    // `sbx config` distinguishes "filtered because I chose it" from "filtered because nothing
+    // set it". `network = "deny"` is the built-in posture (the ruleless deny allowlist
+    // `NetworkPolicy::default()` carries) and `gui = "none"` is the built-in display posture,
+    // while `tasks_max = 16384` is the documented default task cap — all three, set explicitly,
+    // must read as `Global`, never `Default`. (If a layer's default-valued posture were ever
+    // folded back into "unset", this would fail.)
     let global = RawConfig {
-        network: Some(NetworkField::Posture("shared".into())),
+        network: Some(NetworkField::Posture("deny".into())),
         gui: Some("none".into()),
         limits: Some(schema::RawLimits {
             rest: Default::default(),
@@ -3699,13 +3703,13 @@ fn a_value_set_to_its_default_still_records_its_layer_not_default() {
     let r = resolve_no_plugins(global, None);
     assert_eq!(
         r.network,
-        NetworkPolicy::Shared,
-        "shared is honored as a posture"
+        NetworkPolicy::default(),
+        "the explicit posture resolves to the very value an unconfigured cage gets"
     );
     assert_eq!(
         r.network_origin,
         Provenance::Global,
-        "explicit shared is global-set"
+        "an explicit default-valued posture is still global-set"
     );
     assert_eq!(
         r.gui_origin,
@@ -4722,6 +4726,36 @@ fn a_trusted_layer_resolves_a_handler_and_its_mode() {
         Some(crate::config::OpenMode::Detach)
     );
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+}
+
+#[test]
+fn two_open_keys_that_differ_only_in_case_report_the_handler_they_displace() {
+    // A URI scheme is case-insensitive, so `HTTP` and `http` fold to one key and the router holds
+    // one handler per scheme: the later spelling takes the slot. Silently, the author of the other
+    // entry went on believing a click on such a link reached their program, against the rule this
+    // module states — every value it does not honor is named.
+    let r = resolve_no_plugins(
+        RawConfig {
+            open: BTreeMap::from([
+                ("HTTP".to_string(), open_argv(&["firefox"])),
+                ("http".to_string(), open_argv(&["chromium"])),
+            ]),
+            ..RawConfig::default()
+        },
+        None,
+    );
+    assert_eq!(r.open.len(), 1, "one scheme, one handler: {:?}", r.open);
+    assert_eq!(
+        r.open.get("http").map(|h| h.argv.clone()),
+        Some(vec!["chromium".to_string()]),
+        "the later spelling holds the scheme"
+    );
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("`[open]`") && r.warnings[0].contains("http"),
+        "the displacement is reported and names the scheme: {:?}",
+        r.warnings
+    );
 }
 
 #[test]
@@ -5840,6 +5874,49 @@ fn a_name_in_both_packages_and_flakes_warns_and_the_inline_flake_wins() {
         r.warnings
             .iter()
             .any(|w| w.contains("dup") && w.contains("both"))
+    );
+}
+
+#[test]
+fn a_resolve_sentinel_in_both_packages_and_flakes_warns_and_the_inline_flake_still_wins() {
+    // The same mistake written in the `<name> = "<backend>:resolve"` form. The collision was read
+    // from the packages *left* once the sentinels had been pulled out for the resolver pass, so it
+    // warned about nothing — and that pass runs after the flakes, so it took back the slot the
+    // contract gives the inline source.
+    let mut raw = raw_packages(&[("dup", "tarball:resolve")]);
+    raw.tarball.insert(
+        "dup".to_string(),
+        schema::RawResolve {
+            resolve: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo https://example.test/x.tar.gz".into(),
+            ],
+            ..schema::RawResolve::default()
+        },
+    );
+    raw.flakes.insert(
+        "dup".to_string(),
+        RawInlineFlake {
+            flake: FLAKE_SRC.to_string(),
+            attr: None,
+        },
+    );
+    let r = resolve_no_plugins(raw, None);
+    assert!(
+        matches!(
+            pkg(&r.packages, "dup").unwrap().backend,
+            Backend::FlakeInline { .. }
+        ),
+        "the inline flake holds the name: {:?}",
+        pkg(&r.packages, "dup").map(|p| &p.backend)
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("dup") && w.contains("both")),
+        "and the collision is named: {:?}",
+        r.warnings
     );
 }
 

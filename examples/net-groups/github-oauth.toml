@@ -10,9 +10,9 @@
 # the device-flow login pages (`github.com/login/*`, path-scoped — only the
 # login endpoints, not all of github.com, whose read-only lane the built-in allow-set already
 # provides) and the account/entitlement lookups the CLI POSTs to `api.github.com` (`/user`,
-# `/copilot_internal/*`; the built-in allow-set covers the read-only GET lane). NOT referenced
-# by any shipped profile right now — `copilot` keeps these hosts in its own `[network]` allow;
-# import this group the day a second app needs them. Install-time
+# `/copilot_internal/*`; the built-in allow-set covers the read-only GET lane). `copilot` names
+# it: `examples/app/copilot.toml` carries `"@github-oauth"` in its allow list, so import this
+# group before that profile. Install-time
 # `{GET}` fetches of github.com/api.github.com are NOT this group — they ride the built-in
 # allow-set. Groups are global-only (like bundles): an app's allow may reference one, a project
 # may not define one.

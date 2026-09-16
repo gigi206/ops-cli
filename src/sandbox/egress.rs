@@ -434,6 +434,20 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
 
     let mut plan = TcpPlan::default();
     let mut next = FIRST_CAGE_ADDR;
+    // The addresses a loopback IP literal takes for itself, collected before anything is handed
+    // out: such a rule listens *on* the address it names, so giving the same one to a named
+    // destination would put two `socat` listeners on one address and port, and the second bind
+    // fails. Collected up front rather than as they are met, because a literal may be declared
+    // after the name that would otherwise have been given its address.
+    let literal_addrs: Vec<Ipv4Addr> = policy
+        .allow_rules()
+        .iter()
+        .filter(|rule| rule.layer == Layer::L4)
+        .filter_map(|rule| match &rule.kind {
+            RuleKind::Ip(IpAddr::V4(v4), _) if v4.is_loopback() => Some(*v4),
+            _ => None,
+        })
+        .collect();
     for rule in policy.allow_rules() {
         if rule.layer != Layer::L4 {
             continue;
@@ -525,6 +539,11 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
                         }
                     }
                     continue;
+                }
+                // Skip what a loopback literal already claims: its listener binds that exact
+                // address, and a second one there would fail.
+                while next <= LAST_CAGE_ADDR && literal_addrs.contains(&Ipv4Addr::from(next)) {
+                    next += 1;
                 }
                 if next > LAST_CAGE_ADDR {
                     plan.skipped
@@ -831,9 +850,18 @@ pub(crate) fn start(
     // fifty-app roll persisted the last app's alone. Measured: an `sbx upgrade all` left one file,
     // tagged with the last app in the loop and holding no host at all, while the run's earlier
     // cages had recorded real traffic.
+    //
+    // The start-time probe can fail (a launch with no `/proc`, or a restrictive mount over it), and
+    // the fallback must not produce a name that reads as an incarnation it is not: `stats-<pid>` and
+    // the sequence below spell `stats-<pid>-<seq>`, which `egress_stats::is_finished` parses as
+    // `<pid>-<ticks>` and — the ticks never matching — reports as a session that has ended. Another
+    // launch would then fold this file's counters into the rollup and unlink it while the proxy is
+    // still writing to it, and the next flush would recreate it with its cumulative totals, so every
+    // decision made before the fold would be counted twice. A tag whose second field is not a number
+    // is a name that check does not recognise, and an unrecognised name is kept as live.
     let session_tag = crate::session::current_start_ticks()
         .map(|ticks| format!("{pid}-{ticks}"))
-        .unwrap_or_else(|| pid.to_string());
+        .unwrap_or_else(|| format!("{pid}-live"));
     let seq = PROXY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Per-host decision counters for this session, keyed by the project's canonical path (the same
@@ -985,6 +1013,22 @@ pub(crate) fn start(
     }
     let ctx = Arc::new(ctx);
 
+    // The control plane is serving from here on, and the only thing that stops its accept thread
+    // and unlinks its socket is the `Egress` guard's `Drop` — a guard this function does not build
+    // until its last statement. A failure below therefore performs that teardown itself before it
+    // propagates, in `Drop`'s order and for `Drop`'s reasons: the flag first, then one throwaway
+    // connection to unpark the `accept` the thread is blocked in, then the path. Without it a
+    // process that keeps going after a failed `start` — a batch `sbx upgrade` moving to the next
+    // app — accumulates one parked thread and one dead socket per failure.
+    let unwind_control = |e: io::Error| -> io::Error {
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(control) = &control_uds {
+            let _ = std::os::unix::net::UnixStream::connect(control);
+            let _ = std::fs::remove_file(control);
+        }
+        e
+    };
+
     // Write the CA bundle owner-only, outside every writable mount, then bind it read-only — the
     // agent gets a trust anchor it cannot rewrite. It always opens with the per-session MITM CA,
     // which is what verifies every inspected byte the cage receives.
@@ -1007,7 +1051,7 @@ pub(crate) fn start(
     // on the full file. `[network] ca_roots = false` buys that back for a cage whose tools are known
     // not to make the check — a preference the splice arm above still overrides.
     let roots_needed = splices_any || wants_ca_roots;
-    {
+    let write_ca = || -> io::Result<()> {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -1022,11 +1066,13 @@ pub(crate) fn start(
             f.write_all(b"\n")?;
             f.write_all(&roots)?;
         }
-    }
+        Ok(())
+    };
+    write_ca().map_err(&unwind_control)?;
 
     // Bind+listen happens here on the main thread, before the thread accepts, so connections
     // queue from the moment the cage can reach the socket — no first-request race.
-    let listener = UnixListener::bind(&host_uds)?;
+    let listener = UnixListener::bind(&host_uds).map_err(&unwind_control)?;
     let serve_ctx = ctx;
     let proxy_stop = stop.clone();
     std::thread::spawn(move || {
@@ -2112,6 +2158,46 @@ mod tests {
         let dest = &plan.destinations[0];
         assert_eq!(dest.cage_addr.to_string(), "127.0.0.1");
         assert!(!dest.map_name, "an address needs no `/etc/hosts` entry");
+    }
+
+    /// A loopback literal listens on the address it names, so the allocator must not hand that same
+    /// address to a name: the two listeners would bind one address and port, the second bind would
+    /// fail, and one of the declared destinations would answer nothing at all.
+    #[test]
+    fn a_named_destination_never_gets_the_address_a_literal_claims() {
+        // The literal is declared second, after the name that would otherwise be given its address.
+        let plan = tcp_destinations(&tcp_policy(&[
+            "tcp://db.internal:5432",
+            "tcp://127.0.0.2:5432",
+            "tcp://cache.internal:6379",
+        ]));
+
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        let addrs: Vec<String> = plan
+            .destinations
+            .iter()
+            .map(|d| format!("{}:{:?}", d.cage_addr, d.ports))
+            .collect();
+        let claimed: Vec<&String> = addrs
+            .iter()
+            .filter(|a| a.starts_with("127.0.0.2:"))
+            .collect();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "only the literal listens on the address it names: {addrs:?}"
+        );
+        assert_eq!(claimed[0], "127.0.0.2:[5432]");
+        let db = plan
+            .destinations
+            .iter()
+            .find(|d| d.host == "db.internal")
+            .expect("the name keeps its listener");
+        assert_ne!(
+            db.cage_addr.to_string(),
+            "127.0.0.2",
+            "the name is moved off the claimed address, not dropped"
+        );
     }
 
     /// A privileged port cannot be bound by a capability-less cage, so it gets no listener — and is

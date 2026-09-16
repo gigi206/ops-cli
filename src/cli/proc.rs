@@ -457,6 +457,23 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
         ));
         return ExitCode::from(2);
     };
+    // Every further token, flag-shaped or not: a second id or a mistyped flag would otherwise be
+    // dropped and the command would answer one exec while reading as if it had answered both.
+    if let Some(extra) = args.get(1) {
+        diag::error(&format!(
+            "sbx: proc pending {}: takes a single id, so {} is not honoured",
+            if allow { "allow" } else { "deny" },
+            match extra.to_str() {
+                Some(tok) => format!("`{tok}`"),
+                None => format!("{extra:?}"),
+            }
+        ));
+        diag::hint(&format!(
+            "       usage: {}",
+            help::synopsis_of(&["proc", "pending"])
+        ));
+        return ExitCode::from(2);
+    }
     let Some((pid_s, notif_s)) = id.split_once('.') else {
         diag::error(
             "sbx: proc pending: id must be `<session-pid>.<notif-id>` (from `sbx proc pending`)",

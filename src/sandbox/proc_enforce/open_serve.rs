@@ -78,14 +78,20 @@ pub(super) fn serve_open(
     // run. The trigger to do it is a launch that needs `openat2` opens served rather than continued,
     // measured on a host that can run the cage: until then this is a window the supervisor narrows
     // for `open`/`openat` and does not narrow for a caller that asks the kernel for a stricter walk.
-    match open_resolve(
+    //
+    // `creat(path, mode)` is the third form with no `resolve` word of its own -- it is `open` with
+    // its flags fixed -- and [`open_resolve`] answers `Some(0)` for it alongside the other two.
+    // Without that arm, every `creat` of a file the lens had already examined read as a call whose
+    // restrictions could not be established, fell back to `CONTINUE` and re-ran from its arguments,
+    // which is the window serving exists to close.
+    if open_resolve(
         req.pid,
         req.data.nr,
         &req.data.args,
         notif_of(notif_fd, req.id),
-    ) {
-        Some(0) => {}
-        _ => return false,
+    ) != Some(0)
+    {
+        return false;
     }
     // The file exists — holding a descriptor on it is the proof — so `O_CREAT|O_EXCL` is precisely
     // the case the caller asked to be told about, and the errno it expects is the sound answer.
@@ -156,13 +162,20 @@ pub(super) fn serve_open(
     // instantaneous.
     //
     // - `O_RDWR` never blocks, so it is served here like any other.
-    // - `O_WRONLY` blocks for a reader, and `O_NONBLOCK` reports `ENXIO` until one arrives — so a
-    //   retry loop is *faithful* (the caller does wait for a reader) and bounded (it gives up when
-    //   the notification stops being valid, which is when the target is gone).
-    // - `O_RDONLY` blocks for a writer, and `O_NONBLOCK` succeeds immediately without one — so a
-    //   retry loop would drift, letting the caller past and turning its first `read` into an EOF
-    //   where the open should still have been waiting. Only a blocking open is faithful there.
-    if kind.is_fifo() && flags & libc::O_ACCMODE != libc::O_RDWR {
+    // - `O_WRONLY` blocks for a reader — so a retry loop is *faithful* (the caller does wait for a
+    //   reader) and bounded (it gives up when the notification stops being valid, which is when the
+    //   target is gone).
+    // - `O_RDONLY` blocks for a writer, and only a blocking open is faithful there: a retry loop
+    //   would drift, letting the caller past and turning its first `read` into an EOF where the
+    //   open should still have been waiting.
+    //
+    // A caller that passed `O_NONBLOCK` asked for none of that waiting and is served below like any
+    // other open: the reopen carries the flag, so the kernel gives the same immediate answer the
+    // cage would have had — `ENXIO` on the write side with no reader, which
+    // [`errno_describes_the_file`] reports, and success on the read side. Parking such a call
+    // instead held a non-blocking probe in `open` until a reader happened to arrive, and then
+    // handed over a description with the flag cleared.
+    if kind.is_fifo() && flags & libc::O_ACCMODE != libc::O_RDWR && flags & libc::O_NONBLOCK == 0 {
         return park_open(notif_fd, req.id, probe, reopen, cloexec);
     }
 
@@ -411,7 +424,14 @@ pub(super) fn park_open(
     }
     // SAFETY: notif_fd is the supervisor's live notification descriptor; the copy is owned by the
     // thread below, which closes it.
-    let own_fd = unsafe { libc::dup(notif_fd) };
+    //
+    // `F_DUPFD_CLOEXEC` and not a bare `dup`, for the reason [`super::notify::recv_fd_raw`] gives
+    // about receiving the listener in the first place: a copy without `FD_CLOEXEC` is inherited by
+    // every process the supervisor forks and execs while the open is parked, and what leaks is the
+    // seccomp notification listener itself, which its holder can answer the cage's notifications
+    // through. A park can last for as long as no peer joins the FIFO, so that window is the cage's
+    // to choose.
+    let own_fd = unsafe { libc::fcntl(notif_fd, libc::F_DUPFD_CLOEXEC, 0) };
     if own_fd < 0 {
         PARKED_OPENS.fetch_sub(1, Ordering::SeqCst);
         return false;

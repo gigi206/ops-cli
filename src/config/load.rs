@@ -323,9 +323,10 @@ pub(crate) fn sbx_control_plane_roots() -> Vec<PathBuf> {
 ///   informational note names the protected paths.
 /// - The bind is unrelated to the control plane: its mode is returned unchanged.
 ///
-/// The two overlaps are checked in the above order because the root set is disjoint (no root
-/// contains another), so a bind cannot be both — but checking the read-only case first means any
-/// future overlap defaults to the safe direction.
+/// The two overlaps are checked in the above order so the safe direction wins when a bind is both:
+/// the root set is not guaranteed disjoint — the environment places each root, and
+/// `XDG_STATE_HOME` set to the config home puts the trust store under the global-config directory
+/// — so a bind at or under one root may still contain another, and it is forced read-only.
 fn control_plane_mode(
     canon: &Path,
     writable: bool,
@@ -398,9 +399,18 @@ pub(crate) fn control_plane_pins(binds: &[Bind]) -> Vec<Bind> {
 fn control_plane_pins_for(binds: &[Bind], roots: &[PathBuf]) -> Vec<Bind> {
     let mut pins: Vec<Bind> = Vec::new();
     let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    // Shallow-to-deep, because one root may contain another: the environment decides where each
+    // one lives, and `XDG_STATE_HOME` pointed at the config home puts the trust store under the
+    // global-config directory. Taken in the other order, the containing root would first be
+    // recorded as a read-write intermediate on the way to the inner one and then skipped as
+    // already seen, leaving the directory sbx trusts by location writable from the cage. Sorting
+    // also keeps the parent-before-child order the mount sequence needs.
+    let mut roots: Vec<&PathBuf> = roots.iter().collect();
+    roots.sort();
     for bind in binds.iter().filter(|b| b.writable) {
         for root in roots
             .iter()
+            .copied()
             .filter(|r| r.starts_with(&bind.path) && r.as_path() != bind.path)
         {
             // Each directory strictly between the containing bind and the root, shallow-to-deep: a
@@ -1769,11 +1779,14 @@ mod tests {
     /// whose built-in defaults are each the permissive end: `ProcMode::Off` for a file that
     /// said `enforce`. So the reason is kept and a launch weighs it, while absence stays what
     /// it is, a configured state. The gate refuses an unreadable file in `PermissionDenied`,
-    /// which is what a file restored under `sudo`, owned by another uid, produces.
+    /// which is what a file restored under `sudo`, owned by another uid, produces — and equally
+    /// what a path that is not a regular file produces.
+    ///
+    /// The unreadable state is staged as a directory in the config's place, because that is
+    /// refused for every uid: a mode of `0o000` is simply ignored for root, which would make this
+    /// test a no-op wherever the suite runs as root.
     #[test]
     fn a_global_config_that_cannot_be_read_is_refused_rather_than_defaulted() {
-        use std::os::unix::fs::PermissionsExt;
-
         let home = TmpDir::new();
         let dir = home.path().join("sbx");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1787,11 +1800,10 @@ mod tests {
         assert!(read_global(&mut warnings).1.is_none(), "{warnings:?}");
 
         // Present and unreadable: refused, and said out loud.
-        std::fs::write(&path, b"[proc]\nmode = \"enforce\"\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::create_dir(&path).unwrap();
         let mut warnings = Vec::new();
         let (cfg, refused) = read_global(&mut warnings);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir(&path).unwrap();
         assert!(
             refused
                 .as_deref()
@@ -2511,6 +2523,53 @@ mod tests {
             "the shared intermediate is deduplicated: {pins:?}"
         );
         // Parent-before-child: each pin's index is greater than every strict ancestor pin's index.
+        for (i, p) in pins.iter().enumerate() {
+            for (j, q) in pins.iter().enumerate() {
+                if p.path.starts_with(&q.path) && p.path != q.path {
+                    assert!(
+                        j < i,
+                        "ancestor {} must precede {}: {pins:?}",
+                        q.path.display(),
+                        p.path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn control_plane_pins_keeps_a_root_that_contains_another_read_only() {
+        // The root set is not disjoint: each root is placed by the environment, and
+        // `XDG_STATE_HOME` set to the config home puts the trust store under the global-config
+        // directory. The containing root must still get its own read-only pin — reached first as
+        // an intermediate on the way to the inner root, it was recorded read-write and then
+        // skipped as already seen, leaving the layer sbx trusts by location writable from the cage.
+        let roots = vec![
+            PathBuf::from("/home/u/.local/share/sbx"),
+            PathBuf::from("/home/u/.config/sbx/trusted"),
+            PathBuf::from("/home/u/.config/sbx"),
+        ];
+        let binds = vec![Bind {
+            path: PathBuf::from("/home/u"),
+            writable: true,
+        }];
+        let pins = control_plane_pins_for(&binds, &roots);
+
+        for root in &roots {
+            assert!(
+                pins.iter().any(|p| &p.path == root && !p.writable),
+                "the nested root {} is pinned read-only: {pins:?}",
+                root.display()
+            );
+        }
+        assert!(
+            pins.iter()
+                .filter(|p| p.writable)
+                .all(|p| !roots.contains(&p.path)),
+            "no root is left as a read-write intermediate: {pins:?}"
+        );
+        // Parent-before-child still holds across the nesting, so the outer root's pin is not
+        // shadowed by the inner one.
         for (i, p) in pins.iter().enumerate() {
             for (j, q) in pins.iter().enumerate() {
                 if p.path.starts_with(&q.path) && p.path != q.path {

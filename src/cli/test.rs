@@ -48,13 +48,6 @@ struct NetTestArgs<'a> {
     target: &'a str,
 }
 
-/// Parse `sbx test net`'s arguments: an optional `--app/-a <name>`, an optional `--method/-X <verb>`
-/// (the HTTP method to test, default GET), and the positional target (a URL or a bare host), in any
-/// order. Pure — it returns its refusal as the lines to print rather than printing them — so the
-/// grammar and the wording of its usage line are unit-tested.
-///
-/// A `-`-prefixed token is refused rather than taken for the target. Without that check the first
-/// unknown flag became the URL and the *next* argument was blamed, so
 /// The configuration a `sbx test` verb reports against: the project's, plus a named app's overlay,
 /// plus the ambient one-shot override.
 ///
@@ -71,9 +64,10 @@ struct NetTestArgs<'a> {
 /// Folding an environment-supplied policy into a diagnostic widens nothing. The variables read
 /// here are the ones a launch from the same shell would read, so the verb discloses only what its
 /// caller could learn by launching, and an override remains trusted by invocation exactly as it
-/// is at launch. What changes is that the answer stops disagreeing with the launch it predicts. Fail-closed like a launch: a malformed blob or an unreadable `@file` is
-/// reported and nothing is tested, rather than a verdict computed from a policy that would never
-/// have run.
+/// is at launch. What changes is that the answer stops disagreeing with the launch it predicts.
+///
+/// Fail-closed like a launch: a malformed blob or an unreadable `@file` is reported and nothing is
+/// tested, rather than a verdict computed from a policy that would never have run.
 fn resolved_for(
     verb: &str,
     cwd: &Path,
@@ -110,6 +104,13 @@ fn resolved_for(
     Ok(resolved)
 }
 
+/// Parse `sbx test net`'s arguments: an optional `--app/-a <name>`, an optional `--method/-X <verb>`
+/// (the HTTP method to test, default GET), and the positional target (a URL or a bare host), in any
+/// order. Pure — it returns its refusal as the lines to print rather than printing them — so the
+/// grammar and the wording of its usage line are unit-tested.
+///
+/// A `-`-prefixed token is refused rather than taken for the target. Without that check the first
+/// unknown flag became the URL and the *next* argument was blamed, so
 /// `sbx test net --app=claude https://api.anthropic.com` reported the one argument that was
 /// correct — and the `--app=` spelling is one `sbx upgrade` accepts, so reaching for it here is an
 /// ordinary mistake rather than a contrived one.

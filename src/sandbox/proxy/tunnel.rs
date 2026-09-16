@@ -63,9 +63,37 @@ pub(super) fn serve_tunneled_request(
     // away without a `close_notify` as an unexpected EOF), so all three end the same way, with the
     // TLS shut down cleanly so a client still watching reads an end-of-stream and not a dropped
     // socket.
-    if !matches!(br.fill_buf(), Ok([_, ..])) {
-        finish_tls(br.get_mut());
-        return Ok(Turn::Close);
+    //
+    // Only those shapes. This read is also what drives the first turn's handshake to completion, so
+    // a client that will not accept the minted leaf arrives here as the alert it sent — an attempt
+    // that failed, not a tunnel that ended. Swallowing it left a cage whose trust store has no sbx
+    // CA with nothing at all in `sbx net logs`, so anything else is handed to the head reader's own
+    // refusal, which names the host and logs the attempt.
+    //
+    // `Ok(true)` is a byte waiting, `Ok(false)` the tunnel ending, `Err` the read failing.
+    let has_request = match br.fill_buf() {
+        Ok([_, ..]) => Ok(true),
+        Ok([]) => Ok(false),
+        // `read_until` retries an interrupted read itself, so this one belongs to the head reader
+        // rather than to a decision taken in front of it.
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    };
+    match has_request {
+        Ok(true) => {}
+        Ok(false) => {
+            finish_tls(br.get_mut());
+            return Ok(Turn::Close);
+        }
+        Err(e) => return refuse_unreadable_inner_head(&mut br, ctx, connect_host, port, &e),
     }
     // The idle bound the caller may have set covered the wait for that first byte; the request it
     // begins gets the launch's own timeout back.
@@ -935,7 +963,8 @@ pub(super) fn serve_tunneled_request(
 /// A client simply finished with the tunnel never reaches this. [`serve_tunneled_request`]
 /// establishes that a byte is waiting before it reads a head at all, and answers a tunnel with
 /// nothing on it with [`Turn::Close`] and no line, which is how a persistent connection is meant to
-/// end.
+/// end. A read that *failed* there does reach this, including the TLS alert of a client that
+/// refused the minted leaf: that is an attempt, and it is logged as one.
 fn refuse_unreadable_inner_head(
     br: &mut ClientTls,
     ctx: &ProxyCtx,

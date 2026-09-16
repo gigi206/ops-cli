@@ -70,13 +70,28 @@ fn ending_supervision_denies_what_is_still_parked_before_closing_their_descripto
         pending.list()
     );
 
-    // SAFETY: both are this test's own descriptors. The first close proves `close_supervision`
-    // already closed the read end; the second releases the write end.
-    assert_eq!(
-        unsafe { libc::close(read_end) },
-        -1,
-        "the descriptor was closed by the teardown"
+    // The pipe itself carries the proof, rather than a second close of the number: the test binary
+    // runs its cases on parallel threads, so by now that number may have been reissued to another
+    // one, and closing it again would take a descriptor this test does not own. What is asked
+    // instead is whether the pipe still has a reader — the dup each park held and the number
+    // `close_supervision` closed are all of them — which Linux reports on the write end as
+    // `POLLERR`, and which no descriptor reuse elsewhere can forge.
+    let mut pfd = libc::pollfd {
+        fd: write_end,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a live single-element array, and `write_end` is this test's own descriptor.
+    assert!(
+        unsafe { libc::poll(&mut pfd, 1, 0) } >= 0,
+        "the write end polls"
     );
+    assert!(
+        pfd.revents & libc::POLLERR != 0,
+        "the teardown closed every reader of the pipe, so the write end has no peer: revents {:#x}",
+        pfd.revents
+    );
+    // SAFETY: `write_end` is this test's own descriptor, closed exactly once.
     unsafe { libc::close(write_end) };
 }
 

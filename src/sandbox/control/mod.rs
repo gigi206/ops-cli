@@ -832,6 +832,13 @@ impl std::fmt::Debug for LogRing {
 
 struct LogInner {
     next_seq: u64,
+    /// How many events the cap has evicted from `events`, and the same for `muted` together with
+    /// the newest seq that eviction took. [`LogRing::snapshot`] needs all three to report an
+    /// eviction gap: the two rings share `next_seq`, so the distance between a reader's cursor and
+    /// the oldest retained event counts seqs that muted refusals took and that `events` never held.
+    evicted: u64,
+    muted_evicted: u64,
+    muted_evicted_high: u64,
     /// The next amendment sequence [`LogRing::set_status`] will stamp — a second monotonic counter,
     /// bumped only when a status is filled in, so a follow reader can pick up retroactive statuses.
     next_amend: u64,
@@ -848,6 +855,9 @@ impl LogRing {
         LogRing {
             inner: Mutex::new(LogInner {
                 next_seq: 1,
+                evicted: 0,
+                muted_evicted: 0,
+                muted_evicted_high: 0,
                 next_amend: 1,
                 events: VecDeque::new(),
                 muted: VecDeque::new(),
@@ -951,8 +961,21 @@ impl LogRing {
             .filter(|_| !muted)
             .map(|_| event.clone());
         ring.push_back(event);
+        // Counted as they go, per ring: what a reader lost is the events the cap took out of
+        // `events`, and a seq missing from it is as often a muted refusal that was never there.
+        let mut taken = 0u64;
+        let mut highest = None;
         while ring.len() > self.cap {
-            ring.pop_front();
+            highest = ring.pop_front().map(|e| e.seq);
+            taken += 1;
+        }
+        if muted {
+            g.muted_evicted += taken;
+            if let Some(seq) = highest {
+                g.muted_evicted_high = seq;
+            }
+        } else {
+            g.evicted += taken;
         }
         drop(guard);
         if let (Some(record), Some(event)) = (&self.record, recorded) {
@@ -1129,12 +1152,32 @@ impl LogRing {
                 }
             }
         }
-        // Saturating: `a` comes off the wire unbounded, and `a + 1` at `u64::MAX` panics in debug
-        // and wraps in release — here while the ring's lock is held, so the debug panic would poison
-        // it for the rest of the launch.
-        let dropped = match (after, g.events.front()) {
-            (Some(a), Some(oldest)) if oldest.seq > a.saturating_add(1) => oldest.seq - a - 1,
-            _ => 0,
+        // What the reader lost, counted from the evictions `events` actually made rather than from
+        // the distance between the cursor and the oldest retained event: the muted ring takes seqs
+        // out of the same counter without ever entering `events`, so that distance reports a gap
+        // for a session that only refused muted requests and evicted nothing.
+        //
+        // Evictions take the oldest first, so the events gone from `events` are its first
+        // `evicted` pushes in seq order, and the ones the reader will never see are the evictions
+        // beyond the main-ring events it was already given — hence the subtraction. That count of
+        // events comes from the seq space: seqs start at 1, so the seqs up to and including the
+        // cursor are exactly that many pushes, of which the ones muted refusals took are not the
+        // main ring's. Retained muted pushes are counted directly and evicted ones from the
+        // counter, which is exact as long as the cursor is at or past the newest muted eviction.
+        // Past that the muted ring has overflowed too and the count is left short rather than
+        // long: a gap reported where there is none is the one a reader acts on.
+        let dropped = match after {
+            Some(a) => {
+                let muted_seen = g.muted.iter().filter(|e| e.seq <= a).count() as u64
+                    + if g.muted_evicted_high <= a {
+                        g.muted_evicted
+                    } else {
+                        0
+                    };
+                let main_seen = a.saturating_sub(muted_seen);
+                g.evicted.saturating_sub(main_seen)
+            }
+            None => 0,
         };
         LogSnapshot {
             events,
@@ -3137,6 +3180,87 @@ mod tests {
         assert_eq!(snap.head, 2);
         assert_eq!(snap.events[1].verdict, LogVerdict::Deny);
         assert_eq!(snap.events[1].reason, "denied-default");
+    }
+
+    /// A muted refusal takes a seq from the counter both rings share while living in the muted ring
+    /// alone, so the distance between a follower's cursor and the oldest retained event is not the
+    /// number of events it lost. A session that refuses muted requests and evicts nothing has no gap
+    /// to report, and one that also overflows reports only what `events` actually lost.
+    #[test]
+    fn log_ring_follow_does_not_count_seqs_muted_refusals_took_as_a_gap() {
+        let ring = LogRing::new(8);
+        let mute = |host: &str| {
+            ring.push(
+                true,
+                host,
+                443,
+                None,
+                None,
+                LogVerdict::Deny,
+                "muted",
+                Proto::Https,
+                HttpVer::Unknown,
+                RpcKind::None,
+                Plane::Agent,
+            );
+        };
+        // Seqs 1-3 go to the muted ring; the main ring is still empty, so a tail read seeds the
+        // follower's cursor from the head alone.
+        for i in 0..3 {
+            mute(&format!("muted{i}.test"));
+        }
+        let tail = ring.snapshot(None, None, false);
+        assert!(tail.events.is_empty());
+        assert_eq!(tail.head, 3);
+        // Two more muted refusals, then one real decision: the main ring's oldest is seq 6, two
+        // seqs past the cursor, and both of those went to muted refusals this reader never had.
+        mute("muted3.test");
+        mute("muted4.test");
+        push_event(&ring, "real.test", LogVerdict::Allow, "allowed");
+        let snap = ring.snapshot(Some(tail.head), None, false);
+        assert_eq!(snap.events.len(), 1, "the one real decision");
+        assert_eq!(
+            snap.dropped, 0,
+            "nothing was evicted, so there is no gap to report"
+        );
+
+        // With the main ring over its cap the gap is what `events` lost, not what the seq space
+        // suggests: at cap 2, three real decisions (seqs 4-6) evict the first of them and no more,
+        // while the muted ring has overflowed on its own account.
+        let ring = LogRing::new(2);
+        let mute = |host: &str| {
+            ring.push(
+                true,
+                host,
+                443,
+                None,
+                None,
+                LogVerdict::Deny,
+                "muted",
+                Proto::Https,
+                HttpVer::Unknown,
+                RpcKind::None,
+                Plane::Agent,
+            );
+        };
+        for i in 0..3 {
+            mute(&format!("muted{i}.test"));
+        }
+        let cursor = ring.snapshot(None, None, false).head;
+        for i in 0..3 {
+            push_event(
+                &ring,
+                &format!("real{i}.test"),
+                LogVerdict::Allow,
+                "allowed",
+            );
+        }
+        let snap = ring.snapshot(Some(cursor), None, false);
+        assert_eq!(
+            snap.events.iter().map(|e| e.seq).collect::<Vec<u64>>(),
+            vec![5, 6]
+        );
+        assert_eq!(snap.dropped, 1, "the one real event the cap evicted");
     }
 
     #[test]

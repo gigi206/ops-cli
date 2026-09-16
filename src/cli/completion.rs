@@ -372,8 +372,16 @@ fn value_candidates(kind: &ValueKind, prefix: &str) -> Vec<(String, String)> {
         Literal(words) => words.iter().map(|w| (w.clone(), String::new())).collect(),
         // Read from the config files rather than a registry, so no data directory is needed.
         Rules { which, app } => rule_values(*which, app.as_deref()),
-        Bundles => named_globals("bundle", "bundle"),
-        Groups => named_globals("network.groups", "group"),
+        Bundles => named_files(
+            config::bundles_dir(),
+            config::is_valid_bundle_name,
+            "bundle",
+        ),
+        Groups => named_files(
+            config::net_groups_dir(),
+            config::is_valid_group_name,
+            "group",
+        ),
         // The oracle cannot decide a path; the shell owns file completion for it. The
         // prefix filtering is then the script's job, so the marker is unconditional.
         Files => return vec![(FILES.to_string(), String::new())],
@@ -544,49 +552,42 @@ fn config_tokens() -> Vec<(String, bool)> {
     tokens
 }
 
-/// The names one table of the **global** config declares, each with `what` as its
-/// description: the `[bundle.<name>]` blocks a `use` names, or the keys of the
-/// `[network.groups]` table an `@<name>` reference resolves against.
+/// The names one **global** vocabulary declares, each with `what` as its description: the
+/// bundles under `…/sbx/bundles/` a `use` names, or the egress groups under
+/// `…/sbx/net-groups/` an `@<name>` reference resolves against. One file per name, its stem
+/// being the name, which is why the directory listing is the whole answer — no file is read,
+/// since this runs on a keystroke and must never block on a config.
 ///
-/// Global-only, because both vocabularies are: a group or a bundle declared in a project
-/// file is dropped on load with a warning, so offering one would complete a name that
-/// grants nothing. Read the way [`config_tokens`] reads — line by line, no parse — since
-/// this runs on a keystroke and must never block on a config.
+/// Global-only, because both vocabularies are: a group or a bundle declared in a project file
+/// is dropped on load with a warning, so offering one would complete a name that grants
+/// nothing. An inline `[bundle.<name>]` or `[network.groups]` entry of `sbx.toml` is dropped
+/// on load the same way, so neither is read here either.
 ///
-/// A section header names the value (`[bundle.ci]`); a key inside the named table does too
-/// (`[network.groups]`, then `ci-hosts = […]`), so both shapes are read. Anything that is
-/// not a bare name is dropped: a continuation line of an array value can hold an `=` of its
-/// own, and a rule is not a name.
-fn named_globals(table: &str, what: &str) -> Vec<(String, String)> {
+/// `name_ok` is the loader's own rule for the vocabulary ([`config::is_valid_bundle_name`],
+/// [`config::is_valid_group_name`]): a stem the loader would refuse names nothing, so it is
+/// not offered.
+fn named_files(
+    dir: Option<PathBuf>,
+    name_ok: fn(&str) -> bool,
+    what: &str,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    let Some(path) = global_config_file() else {
+    let Some(dir) = dir else {
         return out;
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
     };
-    let prefix = format!("{table}.");
-    let mut inside = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            let header = header.trim();
-            inside = header == table;
-            if let Some(name) = header.strip_prefix(&prefix) {
-                out.push((name.to_string(), what.to_string()));
-            }
-            continue;
-        }
-        if inside && let Some((key, _)) = line.split_once('=') {
-            out.push((key.trim().trim_matches('"').to_string(), what.to_string()));
+    for entry in entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+    {
+        if let Some(name) = entry.strip_suffix(".toml")
+            && name_ok(name)
+        {
+            out.push((name.to_string(), what.to_string()));
         }
     }
-    out.retain(|(name, _)| {
-        !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    });
     out
 }
 
@@ -1941,17 +1942,36 @@ mod tests {
     fn the_global_config_names_its_bundles_and_egress_groups() {
         let _lock = env_lock();
         let tmp = TmpDir::new();
-        std::fs::create_dir_all(tmp.join("sbx")).unwrap();
+        std::fs::create_dir_all(tmp.join("sbx").join("bundles")).unwrap();
+        std::fs::create_dir_all(tmp.join("sbx").join("net-groups")).unwrap();
         std::fs::write(
             tmp.join("sbx").join("sbx.toml"),
-            "[network]\nmode = \"deny\"\n\n[network.groups]\nci-hosts = [\"github.com\"]\n\
-             anthropic = [\"api.anthropic.com\"]\n\n[bundle.claude]\npackages = [\"nix:jq\"]\n",
+            "[network]\nmode = \"deny\"\n\n[network.groups]\ninline-group = [\"github.com\"]\n\
+             \n[bundle.inline-bundle]\npackages = [\"nix:jq\"]\n",
+        )
+        .unwrap();
+        for (name, entries) in [
+            ("ci-hosts", "github.com"),
+            ("anthropic", "api.anthropic.com"),
+        ] {
+            std::fs::write(
+                tmp.join("sbx")
+                    .join("net-groups")
+                    .join(format!("{name}.toml")),
+                format!("entries = [\"{entries}\"]\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            tmp.join("sbx").join("bundles").join("claude.toml"),
+            "packages = [\"nix:jq\"]\n",
         )
         .unwrap();
         let _config_home = EnvVar::set("XDG_CONFIG_HOME", tmp.path());
 
-        // A group is a key of the `[network.groups]` table; a bundle is a section of its own.
-        // Both are global-only, so both are read from the file that is allowed to declare them.
+        // Both vocabularies live as one file per name, under the directory the loader reads:
+        // `bundles/<name>.toml` and `net-groups/<name>.toml`, the names `sbx bundle import` and
+        // `sbx net groups import` write.
         let names = |kind: &ValueKind| -> Vec<String> {
             value_candidates(kind, "")
                 .into_iter()
@@ -1960,6 +1980,10 @@ mod tests {
         };
         assert_eq!(names(&ValueKind::Groups), ["anthropic", "ci-hosts"]);
         assert_eq!(names(&ValueKind::Bundles), ["claude"]);
+        // An inline section of `sbx.toml` is dropped on load with a warning, so completing it
+        // would offer a name the verb behind it then refuses.
+        assert!(!names(&ValueKind::Bundles).contains(&"inline-bundle".to_string()));
+        assert!(!names(&ValueKind::Groups).contains(&"inline-group".to_string()));
         // The entries of a group are rules, not names: only what a `@<name>` can reference is
         // offered, and a rule is never a candidate here.
         assert!(!names(&ValueKind::Groups).contains(&"github.com".to_string()));

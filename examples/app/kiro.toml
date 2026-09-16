@@ -202,10 +202,11 @@ allow = [
 # set in the cage, emits an ABSOLUTE-form request INSIDE the CONNECT tunnel (`POST https://…/`
 # instead of `POST /`). sbx's proxy requires the tunneled request to be origin-form and refuses
 # that as `blocked (bad-request)` — a pre-verdict SECURITY GUARD, not a `deny`, and `mute` only
-# suppresses `deny`. So it cannot be muted; instead the `cmd` wrapper above disables telemetry at
-# the SOURCE on first launch (`kiro-cli settings telemetry.enabled false`, persisted in the isolated
-# ~/.kiro/settings/cli.json), which stops cognito-identity AND every telemetry host below from being
-# called at all. The mutes below stay as a belt-and-suspenders in case telemetry is re-enabled.
+# suppresses `deny`. So it cannot be muted; instead the `kiro` bundle's `provision` step disables
+# telemetry at the SOURCE at install time (`kiro-cli settings telemetry.enabled false`, persisted in
+# the isolated ~/.kiro/settings/cli.json), which stops cognito-identity AND every telemetry host
+# below from being called at all. The mutes below stay as a belt-and-suspenders in case telemetry is
+# re-enabled.
 mute = [
     # Nothing here: the telemetry hosts, the cookie-banner beacons, `@chromium-background` and the
     # translation service arrive with the bundle and are unioned into this list at resolution.

@@ -146,8 +146,8 @@ pub(super) fn open_mode(
 
 /// The `resolve` word of an `openat2`, which names path-walk restrictions the caller wants the
 /// kernel to enforce (`RESOLVE_NO_SYMLINKS`, `RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`,
-/// `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_XDEV`). `Some(0)` for the two older forms, which have no
-/// such word and therefore ask for no restriction.
+/// `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_XDEV`). `Some(0)` for the older forms, which have no such
+/// word and therefore ask for no restriction.
 ///
 /// The third word of `struct open_how`, and read for the same reason its siblings are: a caller
 /// that asked for a stricter walk than the supervisor performed must not be handed the result of
@@ -166,6 +166,10 @@ pub(super) fn open_resolve(
     // the walk the supervisor performed is the walk the caller asked for.
     #[cfg(target_arch = "x86_64")]
     if nr as libc::c_long == libc::SYS_open {
+        return Some(0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if nr as libc::c_long == libc::SYS_creat {
         return Some(0);
     }
     if nr as libc::c_long == libc::SYS_openat {

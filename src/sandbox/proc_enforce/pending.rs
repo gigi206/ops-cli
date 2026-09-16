@@ -86,7 +86,14 @@ impl PendingExec {
         // SAFETY: notif_fd is the supervisor's live notification descriptor; the copy belongs to the
         // entry below, which closes it. See [`Parked::notif_fd`] for why the entry does not simply
         // keep the supervisor's number.
-        let own_fd = unsafe { libc::dup(notif_fd) };
+        //
+        // `F_DUPFD_CLOEXEC` and not a bare `dup`, for the reason [`super::notify::recv_fd_raw`]
+        // gives about receiving the listener in the first place: a copy without `FD_CLOEXEC` is
+        // inherited by every process the supervisor forks and execs while the exec is parked, and
+        // what leaks is the seccomp notification listener itself, which its holder can answer the
+        // cage's notifications through. A park lasts until the operator answers, so that window is
+        // not the supervisor's to bound.
+        let own_fd = unsafe { libc::fcntl(notif_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if own_fd < 0 {
             // A park that cannot be answered later is not a park. Refused now, fail-closed, rather
             // than registered against a descriptor nobody can respond through.

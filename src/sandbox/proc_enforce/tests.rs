@@ -965,6 +965,18 @@ fn each_open_form_states_the_path_walk_it_asked_for() {
         Some(0),
         "`open` has no `resolve` word, so it restricts nothing"
     );
+    // `creat` is `open` with its flags fixed, and x86_64-only for the same reason.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        open_resolve(
+            std::process::id(),
+            libc::SYS_creat as libc::c_int,
+            &args,
+            None
+        ),
+        Some(0),
+        "nor does `creat`, which is `open` with its flags fixed"
+    );
     assert_eq!(
         open_resolve(
             std::process::id(),
@@ -2825,8 +2837,10 @@ fn a_shebang_run_from_a_descriptor_is_decided_too() {
     let by_fd = format!(
         "{common}argv=(ctypes.c_char_p*2)(b'payload',None)\n\
          envp=(ctypes.c_char_p*1)(None)\n\
-         libc.syscall(322,fd,b'',argv,envp,0x1000)\n\
-         os._exit(9)\n"
+         libc.syscall({},fd,b'',argv,envp,{})\n\
+         os._exit(9)\n",
+        libc::SYS_execveat,
+        libc::AT_EMPTY_PATH
     );
     let by_path = format!("{common}os.execv(f'/proc/self/fd/{{fd}}',['payload'])\nos._exit(9)\n");
 

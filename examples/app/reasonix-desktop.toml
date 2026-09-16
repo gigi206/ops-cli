@@ -107,11 +107,13 @@ mute = [
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage. To key
-# the provider, ADD this line to the `[env]` table above (do NOT open a second `[env]` header — a
-# duplicate table is invalid TOML and the whole profile would fail to parse), then uncomment the
-# `[secret]` block:
+# the provider, uncomment both blocks below. This profile declares no `[env]` table of its own — the
+# `[env]` that reaches the launch is the GDK/WebKit environment the bundle carries, and it stays
+# there — so the one uncommented here is the profile's only `[env]` header; keep it that way, since
+# a duplicate table is invalid TOML and the whole profile would fail to parse.
 #
-#   the key `DEEPSEEK_API_KEY` with the value "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#[env]
+#DEEPSEEK_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
 #
 #[secret."api.deepseek.com"]
 #from = "env://DEEPSEEK_API_KEY"

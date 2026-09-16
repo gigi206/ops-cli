@@ -1161,7 +1161,8 @@ pub(crate) fn mise_tool_specs(path: &Path) -> std::collections::BTreeMap<String,
 pub(crate) struct PrunedVersion {
     /// The tool's backend token (`aqua:anthropics/claude-code`), for the report.
     pub(crate) token: String,
-    /// The version directory that was (or would be) freed.
+    /// The version directory that was (or would be) freed, in the sanitised form a report prints;
+    /// the removal itself joins the name as it is written on disk.
     pub(crate) version: String,
     /// Its on-disk size.
     pub(crate) bytes: u64,
@@ -1211,11 +1212,27 @@ pub(crate) fn prune_stale_versions(
                 Err(_) => {}
             }
         }
-        for version in &tool.versions {
-            if live.contains(version) {
+        // The version directories are read from disk here rather than taken from the model, whose
+        // names are sanitised for display: sanitising is not reversible, so a name that is not
+        // sanitise-stable would be joined to a path that does not exist — never removed, yet named
+        // as prunable on every dry run — and would not match the raw name an alias link resolves
+        // to either. The same distinction `InstalledTool::dir_name` draws for the tool directory.
+        // The report carries the sanitised form; the filesystem sees the name as it is written.
+        let Ok(entries) = std::fs::read_dir(&tool_dir) else {
+            continue;
+        };
+        let mut versions: Vec<std::ffi::OsString> = entries
+            .flatten()
+            .filter(|v| v.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|v| v.file_name())
+            .collect();
+        versions.sort();
+        for version in versions {
+            let name = version.to_string_lossy();
+            if live.contains(name.as_ref()) {
                 continue;
             }
-            let dir = tool_dir.join(version);
+            let dir = tool_dir.join(&version);
             let bytes = tree_size(&dir);
             if apply {
                 if force_remove_dir_all(&dir).is_err() {
@@ -1225,7 +1242,7 @@ pub(crate) fn prune_stale_versions(
             }
             pruned.push(PrunedVersion {
                 token: tool.label().to_string(),
-                version: version.clone(),
+                version: crate::sandbox::sanitize(&name),
                 bytes,
             });
         }
@@ -1621,6 +1638,13 @@ pub(crate) fn tree_usage(path: &Path) -> TreeUsage {
     };
     usage.bytes += root.blocks() * 512;
     usage.inodes += 1;
+    // A root that is not a directory is what it is and nothing more. The check is on the link's own
+    // metadata, so a symlink handed in here reports the link rather than the tree it points at:
+    // `read_dir` resolves it, and a caller sizing what a removal will free would otherwise be told
+    // the target's figures for an entry whose removal only unlinks the name.
+    if !root.is_dir() {
+        return usage;
+    }
     let mut seen = std::collections::HashSet::new();
     accumulate_usage(path, &[], &mut seen, &mut usage);
     usage
@@ -1651,17 +1675,23 @@ pub(crate) fn tree_usage_parts(root: &Path, parts: &[PathBuf]) -> (TreeUsage, Ve
     // The named subtrees first, each into its own figures, so a part reports exactly what it would
     // have on its own; the walk of the rest then skips them rather than visiting them again.
     for (usage, part) in split.iter_mut().zip(parts) {
-        let Ok(meta) = part.symlink_metadata() else {
+        let Ok(part_meta) = part.symlink_metadata() else {
             continue;
         };
-        usage.bytes += meta.blocks() * 512;
+        usage.bytes += part_meta.blocks() * 512;
         usage.inodes += 1;
-        accumulate_usage(part, &[], &mut seen, usage);
+        // Descended into only when the part is a directory in its own right — a part that is a
+        // symlink is sized as the link, for the reason [`tree_usage`] gives for its root.
+        if part_meta.is_dir() {
+            accumulate_usage(part, &[], &mut seen, usage);
+        }
         total.bytes += usage.bytes;
         total.inodes += usage.inodes;
     }
     // ...and the rest of the tree, skipping the parts already accounted for above.
-    accumulate_usage(root, parts, &mut seen, &mut total);
+    if meta.is_dir() {
+        accumulate_usage(root, parts, &mut seen, &mut total);
+    }
     (total, split)
 }
 
@@ -2203,6 +2233,61 @@ mod tests {
         assert!(!installs.join("demo-tool/1.0.0").exists(), "the other goes");
     }
 
+    /// A version directory is named by the cage, so its name is not always sanitise-stable — and a
+    /// sanitised name joined to a path names nothing. Such a version has to be removed by the name
+    /// it actually has, and an alias pointing at one has to keep it alive, or a dry run promises a
+    /// removal every run and no run performs it.
+    #[test]
+    fn stale_prune_removes_a_version_whose_name_the_display_filter_changes() {
+        let tmp = TmpDir::new();
+        let installs = tmp.path().join("installs");
+        let raw = "1.0\rfake";
+        pool_with(&installs, "demo-tool", &[raw, "2.0.0"], &[]);
+        let wanted = std::collections::BTreeMap::from([(
+            "demo-tool".to_string(),
+            vec!["2.0.0".to_string()],
+        )]);
+
+        let pruned = prune_stale_versions(&installs, &wanted, true);
+
+        assert_eq!(
+            pruned.iter().map(|p| p.version.clone()).collect::<Vec<_>>(),
+            vec![crate::sandbox::sanitize(raw)],
+            "the report names it in the form a terminal may see"
+        );
+        assert!(
+            !installs.join("demo-tool").join(raw).exists(),
+            "the directory it was reported for is the one that went"
+        );
+        assert!(
+            installs.join("demo-tool/2.0.0").exists(),
+            "the version an activation names stays"
+        );
+    }
+
+    /// The same name through an alias: what keeps a version alive is the entry the link resolves
+    /// to, which is the raw directory name and never its display form.
+    #[test]
+    fn stale_prune_keeps_a_version_an_alias_names_whatever_its_name_carries() {
+        let tmp = TmpDir::new();
+        let installs = tmp.path().join("installs");
+        let raw = "1.0\rfake";
+        pool_with(&installs, "demo-tool", &[raw], &[("latest", raw)]);
+        let wanted = std::collections::BTreeMap::from([(
+            "demo-tool".to_string(),
+            vec!["latest".to_string()],
+        )]);
+
+        let pruned = prune_stale_versions(&installs, &wanted, true);
+
+        assert!(
+            pruned.is_empty(),
+            "the alias asks for it, got {:?}",
+            pruned.iter().map(|p| p.version.clone()).collect::<Vec<_>>()
+        );
+        assert!(installs.join("demo-tool").join(raw).is_dir());
+    }
+
     /// An activation may name an alias rather than a version, and mise writes aliases as links
     /// beside the version. Matching the spec as a string would call the version stale although
     /// `latest` is exactly what asks for it.
@@ -2552,6 +2637,37 @@ mod tests {
         let (again, missing) = tree_usage_parts(&root, &[root.join("absent")]);
         assert_eq!(missing[0], TreeUsage::default());
         assert_eq!(again, total);
+    }
+
+    /// A symlink is sized as the link, never as the tree it points at — the root of the walk as
+    /// much as an entry inside it. A cage writes these names itself (`.cache -> /nix/store`), and a
+    /// removal that reports the target's figures promises bytes that unlinking a name never frees,
+    /// while a link inside a tree would count the same files twice.
+    #[test]
+    fn tree_usage_does_not_walk_through_a_symlink_root_or_part() {
+        let tmp = TmpDir::new();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(target.join("sub")).unwrap();
+        std::fs::write(target.join("sub/payload"), vec![b'x'; 64 * 1024]).unwrap();
+        let big = tree_usage(&target);
+        assert!(big.inodes >= 3, "the target tree is the large one");
+
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&target, home.join("cache")).unwrap();
+
+        let link = tree_usage(&home.join("cache"));
+        assert_eq!(
+            link.inodes, 1,
+            "a symlink root is one entry, not the tree it names"
+        );
+        assert!(link.bytes < big.bytes, "nor the tree's bytes: {link:?}");
+
+        // The same through the breakdown: the part is the link, and the whole home is the link plus
+        // the directory holding it.
+        let (whole, parts) = tree_usage_parts(&home, &[home.join("cache")]);
+        assert_eq!(parts[0], link);
+        assert_eq!(whole.inodes, 2, "the home and the link it holds");
     }
 
     /// A hardlinked file occupies one inode and one set of blocks however many names point at it,

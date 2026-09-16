@@ -606,7 +606,13 @@ pub(crate) fn parse_binfmt_rule(text: &str) -> Option<BinfmtRule> {
             Some(("offset", v)) => rule.offset = v.trim().parse().ok()?,
             Some(("magic", v)) => rule.magic = unhex(v)?,
             Some(("mask", v)) => rule.mask = unhex(v)?,
-            Some(("extension", v)) => rule.extension = v.trim().to_string(),
+            // The kernel prints this one with a leading dot (`extension .jar`) while it matches
+            // on the component after the dot, so the dot is dropped here and the field holds the
+            // spelling [`binfmt_interpreters`] compares against.
+            Some(("extension", v)) => {
+                let v = v.trim();
+                rule.extension = v.strip_prefix('.').unwrap_or(v).to_string();
+            }
             _ => {}
         }
     }
@@ -1145,9 +1151,13 @@ mod tests {
 
         // An extension handler compares the trailing name component, case-sensitively.
         let ext = vec![
-            parse_binfmt_rule("enabled\ninterpreter /usr/bin/jre\nflags: \nextension jar\n")
+            parse_binfmt_rule("enabled\ninterpreter /usr/bin/jre\nflags: \nextension .jar\n")
                 .expect("an extension handler"),
         ];
+        assert_eq!(
+            ext[0].extension, "jar",
+            "the kernel prints the extension with a leading dot and matches without it"
+        );
         assert_eq!(
             binfmt_interpreters(&ext, b"PK\x03\x04", "/srv/app.jar"),
             vec!["/usr/bin/jre"]

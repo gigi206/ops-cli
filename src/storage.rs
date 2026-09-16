@@ -1208,38 +1208,42 @@ pub(crate) fn init(image: &Path, size_bytes: u64, label: &str, mkfs: &Mkfs) -> R
         .create(&seed)
         .map_err(|e| format!("cannot create {}: {e}", seed.display()))?;
 
-    let made = (|| -> Result<(), String> {
-        // Sparse: the file declares its size but occupies only what gets written.
-        //
-        // `create_new` + `mode(0o600)` rather than `File::create`, on two counts. The mode: this one
-        // file *is* the whole data directory once the volume is adopted — the shared nix store,
-        // every project's home and runtime tree, `apt-keys/`, session state — and `File::create`
-        // takes `0666 & ~umask`, so under the near-universal `umask 022` it landed `0644` and any
-        // other local account could read every byte of it by loop-mounting a copy. Every other
-        // creation site here refuses to trust the umask for far less: `lock_image` passes
-        // `mode(0o600)` for a file that holds nothing but an flock, and `store::ensure` builds
-        // `0700` "so a loose umask never leaves a world-readable window between creation and
-        // tightening". Tightening later would not help either — the image is read as raw bytes on
-        // the host, not through the mount.
-        //
-        // And `create_new` is what makes this function's own promise — "Refuses to touch an existing
-        // image, so it can never destroy a store" — hold as stated. The `exists()` check above is a
-        // separate stat, so an image appearing between the two would have been *truncated* by
-        // `File::create`. The check stays for the message it gives; the atomicity is here.
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(image)
-            .map_err(|e| format!("cannot create image: {e}"))?;
+    // Sparse: the file declares its size but occupies only what gets written.
+    //
+    // `create_new` + `mode(0o600)` rather than `File::create`, on two counts. The mode: this one
+    // file *is* the whole data directory once the volume is adopted — the shared nix store,
+    // every project's home and runtime tree, `apt-keys/`, session state — and `File::create`
+    // takes `0666 & ~umask`, so under the near-universal `umask 022` it landed `0644` and any
+    // other local account could read every byte of it by loop-mounting a copy. Every other
+    // creation site here refuses to trust the umask for far less: `lock_image` passes
+    // `mode(0o600)` for a file that holds nothing but an flock, and `store::ensure` builds
+    // `0700` "so a loose umask never leaves a world-readable window between creation and
+    // tightening". Tightening later would not help either — the image is read as raw bytes on
+    // the host, not through the mount.
+    //
+    // And `create_new` is what makes this function's own promise — "Refuses to touch an existing
+    // image, so it can never destroy a store" — hold as stated. The `exists()` check above is a
+    // separate stat, so an image appearing between the two would have been *truncated* by
+    // `File::create`. The check stays for the message it gives; the atomicity is here.
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(image)
+        .map_err(|e| format!("cannot create image: {e}"));
+    // Whether the image at that path is this call's to remove on the way out. A refused
+    // `create_new` means one appeared after the `exists()` check, and that image is the other
+    // party's store — the very thing the refusal exists to protect.
+    let ours = created.is_ok();
+    let made = created.and_then(|f| {
         f.set_len(size_bytes)
             .map_err(|e| format!("cannot size image: {e}"))?;
         drop(f);
         let (mut cmd, _seccomp) = mkfs_command(mkfs, image, &seed, label);
         run(&mut cmd).map(|_| ())
-    })();
+    });
     let _ = std::fs::remove_dir_all(&seed);
-    if made.is_err() {
+    if ours && made.is_err() {
         // Never leave a half-formatted image: it would look like a volume to `state`.
         let _ = std::fs::remove_file(image);
     }
@@ -1851,8 +1855,6 @@ this line has no separator at all
     /// `mountinfo` read one line below `loop_for`'s caller already is.
     #[test]
     fn an_unreadable_scan_is_an_error_rather_than_no_device() {
-        use std::os::unix::fs::PermissionsExt;
-
         let base = crate::testutil::TmpDir::new();
         let sys = base.path().join("block");
         let image = base.path().join("vol.btrfs");
@@ -1870,27 +1872,26 @@ this line has no separator at all
         // A sysfs that does not exist is a readable "no device", not a failure.
         assert_eq!(loop_for(&image, &base.path().join("absent")).unwrap(), None);
 
-        // An unreadable directory is not an empty one.
-        std::fs::set_permissions(&sys, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let scanned = loop_for(&image, &sys);
-        std::fs::set_permissions(&sys, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A sysfs path that cannot be listed is not an empty one. Staged as a regular file rather
+        // than a directory with its permissions stripped, because a mode of `0o000` is simply
+        // ignored for root and this assertion would then hold for the wrong reason wherever the
+        // suite runs as root. Both reach `read_dir` as an error that is not `NotFound`, which is
+        // the distinction under test.
+        let unlistable = base.path().join("not-a-directory");
+        std::fs::write(&unlistable, b"").unwrap();
+        let scanned = loop_for(&image, &unlistable);
         assert!(
             scanned.is_err(),
             "an unreadable /sys/block reported {scanned:?}, which `state` would call Detached"
         );
 
-        // An unreadable `backing_file` is not an unbound device either.
-        std::fs::set_permissions(
-            d.join("backing_file"),
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
+        // An unreadable `backing_file` is not an unbound device either. Staged as a directory in
+        // the file's place, for the same reason and with the same effect: the read fails with
+        // something other than `NotFound` whatever uid runs the suite.
+        let backing = d.join("backing_file");
+        std::fs::remove_file(&backing).unwrap();
+        std::fs::create_dir(&backing).unwrap();
         let read = loop_for(&image, &sys);
-        std::fs::set_permissions(
-            d.join("backing_file"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
         assert!(
             read.is_err(),
             "an unreadable backing_file reported {read:?}, hiding the device it names"
@@ -2121,23 +2122,27 @@ this line has no separator at all
     /// way [`loop_for`] and the config loader's global layer propagate theirs.
     #[test]
     fn a_pointer_that_cannot_be_read_is_not_an_absent_one() {
-        use std::os::unix::fs::PermissionsExt;
-
         let base = crate::testutil::TmpDir::new();
         let dir = base.path().join("sbx");
         let image = PathBuf::from("/vol/sbx-storage.btrfs");
         write_pointer(&dir, &image).expect("written");
         let path = dir.join(POINTER);
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Staged as a directory in the pointer's place rather than a file stripped of its
+        // permissions: a mode of `0o000` is simply ignored for root, so that staging would leave
+        // this assertion holding for the wrong reason wherever the suite runs as root. Both reach
+        // the read as an error that is not `NotFound`, which is the distinction under test.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         let read = read_pointer(&dir);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
             read.is_err(),
             "an unreadable pointer reported {read:?}, which reads as no volume at all"
         );
+        std::fs::remove_dir(&path).unwrap();
 
         // And the ordinary two answers are unchanged.
+        write_pointer(&dir, &image).expect("written");
         assert_eq!(
             read_pointer(&dir).unwrap().as_deref(),
             Some(image.as_path())
@@ -2631,6 +2636,29 @@ this line has no separator at all
         std::fs::write(&image, b"a store lives here").unwrap();
         assert!(init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &nowhere).is_err());
         assert_eq!(std::fs::read(&image).unwrap(), b"a store lives here");
+    }
+
+    /// The failure cleanup may only remove an image this call itself created. A `create_new` that
+    /// refuses because an image appeared after the `exists()` check leaves that image the other
+    /// party's, so unlinking it would destroy exactly what the refusal protects. A dangling symlink
+    /// reproduces the refusal without a race: `exists()` follows the link and reports nothing there,
+    /// while `O_EXCL` refuses the link itself.
+    #[test]
+    fn init_leaves_behind_a_path_it_did_not_create() {
+        let base = crate::testutil::TmpDir::new();
+        let image = base.path().join("vol.btrfs");
+        let nowhere = Mkfs::Host(PathBuf::from("/nonexistent-by-construction"));
+
+        std::os::unix::fs::symlink(base.path().join("elsewhere.btrfs"), &image).unwrap();
+        assert!(
+            !image.exists(),
+            "the existence check must not see the path, so the open is what refuses"
+        );
+        assert!(init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &nowhere).is_err());
+        assert!(
+            image.symlink_metadata().is_ok(),
+            "a path this call did not create must survive the refusal"
+        );
     }
 
     #[test]

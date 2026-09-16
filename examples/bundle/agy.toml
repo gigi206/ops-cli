@@ -8,11 +8,11 @@
 # egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
 # artifacts together, so they cannot drift apart.
 #
-# The Google ACCOUNT sign-in hosts are NOT here — they live in the consuming app's own
-# [network] allow (accounts.google.com, oauth2.googleapis.com, www.googleapis.com/oauth2/*,
-# lh3.googleusercontent.com). A shared `google-oauth` egress group still exists under
-# `examples/net-groups/` for the day several apps need the same lane again; nothing ships
-# referencing it right now.
+# The Google ACCOUNT sign-in hosts are NOT here — they are the account lane rather than this
+# agent's, so they come from the shared `google-oauth` egress group (accounts.google.com,
+# oauth2.googleapis.com, www.googleapis.com/oauth2/*, lh3.googleusercontent.com), which the
+# consuming app names in its own [network] allow as `"@google-oauth"` — `examples/app/agy.toml`
+# does exactly that, after `sbx net groups import examples/net-groups/google-oauth.toml`.
 #
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's

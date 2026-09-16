@@ -177,17 +177,26 @@ pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Opt
 /// 10.x, a `address=/github.com/127.0.0.1` blocklist entry, an NXDOMAIN-hijacking resolver.
 ///
 /// The exception exists for a target the operator deliberately named; a rule nobody wrote names
-/// nothing, so the built-in lane can only ever reach a public address. Compared by value rather than
-/// by an origin flag on [`Rule`]: `Rule`'s equality is its match (kind, methods, layer), the built-in
-/// entries all carry an explicit `{GET,HEAD}` prefix that no `apply_default_methods` pass rewrites,
-/// and the comparison is reached only for an address already classified private whose rule already
-/// names the host — so it costs nothing on any live path.
+/// nothing, so the built-in lane can only ever reach a public address.
+///
+/// [`Rule`] records no author, so the lane is identified by its **reach** rather than by an origin
+/// flag: `Rule`'s equality is its match (kind, methods, layer), and a rule whose match is a built-in
+/// entry's grants exactly what the always-on lane already grants — nothing the exception could be
+/// honouring. A written rule can be rewritten into that shape: under an app profile whose
+/// `default_methods` is `{GET,HEAD}`, a bare `allow github.com` becomes `{GET,HEAD} github.com:443`,
+/// which is the built-in entry itself, and the guard then refuses the private address rather than
+/// guessing who wrote it. That is the one ambiguity this comparison has, and it fails closed at it.
+/// An operator who means an internal target writes a rule that says more than the built-in lane
+/// already does — `allow {*} github.com`, `allow github.com:*`, or any verb set that is not
+/// `{GET,HEAD}` — and the exception applies again. The comparison is reached only for an address
+/// already classified private whose rule already names the host, so it costs nothing on any live
+/// path.
 pub(crate) fn opens_private_address(host: &str, deciding: Option<&Rule>) -> bool {
     names_exact_host(host, deciding) && !decided_by_builtin(deciding)
 }
 
-/// Whether the deciding rule is one of the always-on self-equip entries rather than one the user
-/// wrote.
+/// Whether the deciding rule matches exactly what one of the always-on self-equip entries matches.
+/// See [`opens_private_address`] for why reach, and not authorship, is what this can ask.
 fn decided_by_builtin(deciding: Option<&Rule>) -> bool {
     let Some(rule) = deciding else {
         return false;
@@ -551,6 +560,53 @@ mod tests {
                 Some(AddrRefusal::PrivateWithoutExactHost)
             ),
             "a `*.domain` match is still an SSRF wildcard"
+        );
+    }
+
+    /// The built-in lane is recognised by what a rule matches, so a written rule narrowed onto the
+    /// lane's own shape is read as the lane — and a rule that reaches further is not.
+    ///
+    /// An app profile's `default_methods` rewrite turns a bare `allow github.com` into
+    /// `{GET,HEAD} github.com:443`, which is the built-in entry itself. The guard has no authorship
+    /// to read, so it refuses the private address there rather than granting the exception to a
+    /// shape the always-on lane also has. The second half is what keeps that from being a blanket
+    /// refusal of the host: a rule that opens more than the built-in lane survives the same rewrite
+    /// as something else, and keeps the exception.
+    #[test]
+    fn a_written_rule_narrowed_onto_the_built_in_shape_is_read_as_the_built_in_lane() {
+        use crate::allowlist::{EgressPolicy, Methods};
+
+        let private: IpAddr = "10.0.0.5".parse().unwrap();
+        let read_only = Methods::Only(vec!["GET".into(), "HEAD".into()]);
+        let mut policy = EgressPolicy::new(
+            vec![
+                allowlist::classify("github.com").unwrap(),
+                allowlist::classify("{*} api.github.com").unwrap(),
+                allowlist::classify("codeload.github.com:*").unwrap(),
+            ],
+            Vec::new(),
+        );
+        policy.apply_default_methods(&read_only);
+        let allow = policy.allow_rules();
+
+        assert_eq!(
+            allow[0].methods, read_only,
+            "the rewrite is what puts the written rule on the built-in lane's shape"
+        );
+        assert!(
+            matches!(
+                ip_refusal(private, "github.com", Some(&allow[0])),
+                Some(AddrRefusal::PrivateWithoutExactHost)
+            ),
+            "a rule matching exactly what the built-in entry matches reaches no private address"
+        );
+        assert!(
+            ip_refusal(private, "api.github.com", Some(&allow[1])).is_none(),
+            "an explicit `{{*}}` opens more than the built-in lane, so it keeps the exception"
+        );
+        assert!(
+            ip_refusal(private, "codeload.github.com", Some(&allow[2])).is_none(),
+            "a wider port set opens more than the built-in lane, so it keeps the exception"
         );
     }
 

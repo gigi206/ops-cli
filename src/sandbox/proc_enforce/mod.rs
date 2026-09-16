@@ -526,19 +526,27 @@ fn exec_verdict(
     argv_addr: u64,
     notif: Option<(libc::c_int, u64)>,
 ) -> Decided {
-    let pathname = read_exec_path(pid, addr, notif).filter(|p| !p.is_empty());
+    let read = read_exec_path(pid, addr, notif);
     // Whether the target is named by the **descriptor** rather than by a path the syscall carried.
     // It changes how the file is reached below: an object with no name of its own -- a `memfd`, a
     // file already unlinked -- is reachable only through the caller's own `/proc` entry.
-    let by_descriptor = pathname.is_none() && dirfd != libc::AT_FDCWD;
-    let named = pathname
+    //
+    // An **empty** name is what says so, which is why it is distinguished from a read that did not
+    // work at all. A read failure on an `execveat` carrying a real path leaves the target unnamed,
+    // not named by the descriptor: deciding it on the directory the descriptor holds would judge a
+    // path the syscall never spoke about, and the head read below would then be a read of a
+    // directory, refused as an unreadable script. Such a call takes the mode's default, with the
+    // rest of the reads that did not work.
+    let by_descriptor = read.as_deref() == Some("") && dirfd != libc::AT_FDCWD;
+    let named = read
+        .filter(|p| !p.is_empty())
         // `execveat(fd, "", …, AT_EMPTY_PATH)` names its target by the descriptor and passes an
         // empty pathname — which is exactly what glibc's `fexecve` issues, so this is the ordinary
         // shape rather than an exotic one. The descriptor's own `/proc` link is the program, read in
         // the target's namespace like every other path here, so the policy gets a name to match
         // instead of the mode's unmatched default.
         .or_else(|| {
-            (dirfd != libc::AT_FDCWD)
+            by_descriptor
                 .then(|| std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}")).ok())
                 .flatten()
                 // `into_string` and not `to_string_lossy`, for the reason [`read_exec_path`] gives

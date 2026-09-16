@@ -81,16 +81,22 @@ fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal()
 
     // The script. `( : < /dev/tty )` succeeds only when the shell has a
     // controlling terminal — the whole point of the pty supervisor.
+    //
+    // Terminal-echo trap: the inner pty (cooked mode) echoes typed commands back, so a marker that
+    // appeared verbatim in a command would show up from the echo alone and pass on a launch with no
+    // controlling terminal. The marker is therefore assembled at *runtime* from a shell variable
+    // (`$Y`): the echoed command carries `CTTY=$Y`, while only the executed branch prints the
+    // expanded `CTTY=OK`.
     let script =
-        b"id -un\n( : < /dev/tty ) 2>/dev/null && echo CTTY=OK || echo CTTY=NO\nls\nexit\n";
+        b"Y=OK\nid -un\n( : < /dev/tty ) 2>/dev/null && echo CTTY=$Y || echo CTTY=no\nls\nexit\n";
 
     // Wait for the shell's first prompt before sending input: the supervisor
     // flushes pending input when it switches the terminal to raw mode (discarding
     // stale type-ahead), so a real user — and this test — types only once the
-    // shell is ready. Readiness is "a `$` appeared" — the hermetic shell has no
-    // PS1 so bash falls back to `bash-5.3$ `; a future `$`-less base prompt would
-    // make this wait to the deadline (then fail) rather than misfire. Read until
-    // the master closes (child exited -> EIO on Linux) or a deadline.
+    // shell is ready. Readiness is the shared prompt predicate, which accepts both
+    // characters bash renders `\$` as: the cage keeps the invoking uid, so a root
+    // invoker sees the rc's prompt end in `#` where anyone else sees `$`. Read
+    // until the master closes (child exited -> EIO on Linux) or a deadline.
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     let mut sent = false;
@@ -108,7 +114,7 @@ fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal()
             }
             out.extend_from_slice(&buf[..n as usize]);
         }
-        if !sent && out.contains(&b'$') {
+        if !sent && common::shell_prompt_seen(&out) {
             unsafe { libc::write(master, script.as_ptr().cast(), script.len()) };
             sent = true;
         }
@@ -192,7 +198,7 @@ fn an_interactive_observed_run_records_events_for_proc_logs() {
             }
             out.extend_from_slice(&buf[..n as usize]);
         }
-        if !sent && out.contains(&b'$') {
+        if !sent && common::shell_prompt_seen(&out) {
             unsafe { libc::write(master, b"sleep 20\n".as_ptr().cast(), 9) };
             sent = true;
             break;
@@ -353,7 +359,7 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
         let text = String::from_utf8_lossy(&out);
 
         // Once the shell prompt appears, send the setup block.
-        if !sent_setup && text.contains('$') {
+        if !sent_setup && common::shell_prompt_seen(&out) {
             unsafe { libc::write(master, setup.as_ptr().cast(), setup.len()) };
             sent_setup = true;
             continue;

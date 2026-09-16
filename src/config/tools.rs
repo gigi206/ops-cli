@@ -130,7 +130,11 @@ pub(super) fn apply_fresh_releases(
 ///
 /// Packages are applied first, then inline flakes, so a name declared in both — a config mistake —
 /// resolves to the `[flakes]` inline source, and the collision is warned rather than silently
-/// last-winning. `state`/`protect_trusted` gate both exactly like [`apply_packages`], so an
+/// last-winning. A `<name> = "<backend>:resolve"` entry is a `[packages]` declaration for both
+/// halves of that rule: it is read for the collision before the sentinels are taken out, and a
+/// colliding name is then skipped by the resolver pass, which runs after the flakes.
+///
+/// `state`/`protect_trusted` gate both exactly like [`apply_packages`], so an
 /// untrusted project's inline flake is stamped untrusted (withheld at launch) and cannot override
 /// a trusted app's tool. The collision check is per-layer, so a *legitimate* cross-layer override
 /// (a project flake replacing a global package of the same name) does not trip it — the two sit in
@@ -190,7 +194,7 @@ pub(super) fn apply_tools(
         ),
         (binary, BINARY_RESOLVE_SENTINEL, "binary", binary_resolve),
     ];
-    let resolve_names: Vec<BTreeSet<String>> = backends
+    let mut resolve_names: Vec<BTreeSet<String>> = backends
         .iter()
         .map(|(_, sentinel, _, _)| collect_sentinel(&packages, sentinel))
         .collect();
@@ -200,13 +204,22 @@ pub(super) fn apply_tools(
             .any(|(_, sentinel, _, _)| v.as_str() == *sentinel)
     });
 
-    for name in packages.keys() {
+    // The collision is read from every name the layer declared under `[packages]`, the sentinel
+    // entries the `retain` above just pulled out included: a `<name> = "<backend>:resolve"` is a
+    // `[packages]` declaration like any other, and one colliding with a `[flakes]` table went
+    // unreported because this loop ran over what was left.
+    for name in packages.keys().chain(resolve_names.iter().flatten()) {
         if flakes.contains_key(name) {
             warnings.push(format!(
                 "{source}: `{name}` is declared as both a [packages] entry and a [flakes] table; \
                  the [flakes] inline source is used"
             ));
         }
+    }
+    // And the name is withheld from the resolver pass, which runs after `apply_flakes` and would
+    // otherwise upsert over the inline flake the warning just said is used.
+    for names in &mut resolve_names {
+        names.retain(|name| !flakes.contains_key(name));
     }
     apply_packages(
         out,

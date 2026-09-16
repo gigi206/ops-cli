@@ -63,11 +63,13 @@ pub(crate) fn trust_cmd(args: Vec<OsString>) -> ExitCode {
 /// profile under the imported-app directory. Compared on the canonical parent, like the trust store
 /// keys, so a path reached through a symlinked home answers the same.
 fn trusted_by_location(path: &Path) -> bool {
+    // The parent goes through `trust::canonicalize_existing_prefix`, which names the current
+    // directory explicitly: the parent of a bare `claude.toml` is the empty path, which
+    // `canonicalize` refuses, so a name given from inside the config or `apps/` directory would
+    // otherwise stay relative and match neither location.
     let canon = |p: &Path| {
-        let parent = p
-            .parent()
-            .map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
-        parent.map(|d| d.join(p.file_name().unwrap_or_default()))
+        p.parent()
+            .map(|d| trust::canonicalize_existing_prefix(d).join(p.file_name().unwrap_or_default()))
     };
     let this = canon(path);
     if this.is_none() {
@@ -79,9 +81,9 @@ fn trusted_by_location(path: &Path) -> bool {
         return true;
     }
     match (crate::config::profiles_dir(), path.parent()) {
-        (Some(dir), Some(parent)) => {
-            dir.canonicalize().ok() == parent.canonicalize().ok() && dir.canonicalize().is_ok()
-        }
+        (Some(dir), Some(parent)) => dir
+            .canonicalize()
+            .is_ok_and(|dir| dir == trust::canonicalize_existing_prefix(parent)),
         _ => false,
     }
 }

@@ -1,9 +1,9 @@
 # Release — builds the self-contained (nix+bwrap bundled) static musl binaries and
 # attaches them to a GitHub Release created from the pushed tag.
 #
-# Trigger: any tag matching v*.*.* (e.g. v2.0.0, v2.0.1-alpha.0 is NOT matched by
-# that glob — use v2.0.1-alpha0 style, or widen the pattern below if you want
-# pre-release tags to publish too).
+# Trigger: any tag matching v*.*.*. GitHub ref globs let `*` match every character
+# but `/`, so pre-release tags publish too (v2.0.0, v2.0.1-alpha.0), and a tag
+# containing a hyphen is published as a pre-release — see `prerelease:` below.
 #
 # The bundled engines are pinned. Keep the nixpkgs REV and the expected_sha in
 # sync with build.rs / mise.toml when you bump them.

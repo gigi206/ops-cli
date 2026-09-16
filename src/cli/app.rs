@@ -1592,11 +1592,18 @@ struct AppTarget {
     homes: Vec<sandbox::inspect::AppHome>,
 }
 
-/// Resolve the app `name` for a read-only `sbx app` verb, or report why it cannot be. An app that is
+/// Resolve the app `name` for an `sbx app` verb, or report why it cannot be. An app that is
 /// neither declared for this directory nor installed on disk does not exist, and the refusal —
 /// tagged with `verb` — names the apps that *are* declared, or says that none is: that sentence is
 /// what separates a misspelled name from the wrong directory, so both verbs owe it.
 fn open_app(verb: &str, name: &str) -> Result<AppTarget, ExitCode> {
+    // The name is joined to the data directory to find the app's homes, and those homes are what a
+    // caller such as `app prune --reset` then deletes from, so only a validated name is ever joined
+    // to a path (anti-traversal), exactly as `app rm` requires.
+    if !config::is_valid_app_name(name) {
+        diag::error(&format!("sbx: {verb}: '{name}' is not a valid app name"));
+        return Err(ExitCode::from(2));
+    }
     let cwd = config_cwd()?;
     let layout = layout_or_fail()?;
     let resolved = config::load(&cwd);
@@ -2126,9 +2133,9 @@ struct PruneArgs {
     apply: bool,
 }
 
-/// Parse `<name> | --all` plus `[--caches] [-y|--yes]`. A dedicated parser rather than
-/// [`crate::cli::one_name`], which reads exactly one name and one switch: this verb has a bulk
-/// selector that stands *instead* of the name, and two switches that compose.
+/// Parse `<name> | --all` plus `[--stale] [--drop <entry>]... [--reset] [-y|--yes]`. A dedicated
+/// parser rather than [`crate::cli::one_name`], which reads exactly one name and one switch: this
+/// verb has a bulk selector that stands *instead* of the name, and switches that compose.
 fn parse_prune_args(args: &[OsString]) -> Result<PruneArgs, ExitCode> {
     let (mut name, mut all, mut apply) = (None, false, false);
     let (mut stale, mut reset) = (false, false);
@@ -2250,11 +2257,18 @@ mod prune_args_tests {
     #[test]
     fn reset_stands_alone() {
         // It already takes everything the others select, and it acts on one app.
-        assert!(parse(&["demo", "--reset", "--caches"]).is_err());
         assert!(parse(&["demo", "--reset", "--stale"]).is_err());
         assert!(parse(&["demo", "--reset", "--drop", ".npm"]).is_err());
+        assert!(parse(&["demo", "--stale", "--drop", ".npm", "--reset"]).is_err());
         assert!(parse(&["--all", "--reset"]).is_err());
         assert!(parse(&["demo", "--reset", "--yes"]).is_ok());
+    }
+
+    #[test]
+    fn a_flag_the_verb_does_not_take_is_refused() {
+        // A selector this parser never had reads as an unknown flag rather than as a name.
+        assert!(parse(&["demo", "--caches"]).is_err());
+        assert!(parse(&["demo", "--purge"]).is_err());
     }
 }
 
@@ -2268,12 +2282,14 @@ struct PruneTotals {
     bytes: u64,
 }
 
-/// `sbx app prune <name>|--all [--caches] [--yes]`: remove the mise tools an app's home(s) carry
-/// that the app's config does **not** declare — the `installed (undeclared)` leftovers `sbx app
-/// show` surfaces (a former profile's tool, or one added by hand). Each is deleted from the home's
-/// mise `installs/` and dropped from its `config.toml` `[tools]` so it does not re-equip. With
-/// `--caches`, each home's cache directory is emptied as well. Previews by default; `--yes` applies.
-/// Declared tools, login/session state, and any `nix:`/`deb:`/`flake:` build are untouched.
+/// `sbx app prune <name>|--all [--stale] [--drop <entry>]... [--reset] [--yes]`: remove the mise
+/// tools an app's home(s) carry that the app's config does **not** declare — the `installed
+/// (undeclared)` leftovers `sbx app show` surfaces (a former profile's tool, or one added by hand).
+/// Each is deleted from the home's mise `installs/` and dropped from its `config.toml` `[tools]` so
+/// it does not re-equip. With `--stale`, installed versions no activation asks for go as well;
+/// `--drop <entry>` takes one named entry of each home, and `--reset` takes everything the home(s)
+/// hold, keeping the app's declaration. Previews by default; `--yes` applies. Declared tools,
+/// login/session state, and any `nix:`/`deb:`/`flake:` build are untouched.
 fn app_prune(args: &[OsString]) -> ExitCode {
     let PruneArgs {
         name,

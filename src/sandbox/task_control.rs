@@ -491,6 +491,33 @@ impl TaskLog {
         }
     }
 
+    /// Record a refusal that a caller can provoke again and again — once.
+    ///
+    /// The exhausted call quota is the one refusal nothing ends: it consumes nothing, so a caller
+    /// that keeps asking gets it forever. Appended each time, identical rows would walk the whole
+    /// 512-entry ring and evict the invocation history the ring exists for, and spend the session
+    /// record's byte budget writing the same line to disk — the outcome [`MAX_CONCURRENT_CONNS`]
+    /// keeps a refused connection out of this log entirely to avoid. The first is kept, because it
+    /// is what tells a reader why nothing ran after it; a later one carries nothing the first does
+    /// not.
+    ///
+    /// Matched on the reason alone. The task a request names is whatever the caller wrote, so
+    /// matching on that too would let one flood the ring by varying it. Two callers refused at the
+    /// same instant may both record their line, which costs one duplicate row rather than a flood.
+    fn push_refusal_once(&self, entry: LogEntry) {
+        {
+            let inner = locked(&self.inner);
+            if inner
+                .entries
+                .iter()
+                .any(|e| e.refused.is_some() && e.refused == entry.refused)
+            {
+                return;
+            }
+        }
+        self.push(entry);
+    }
+
     /// The retained entries past `after`, how many fell out of the ring, and the head to come back
     /// with.
     ///
@@ -959,9 +986,11 @@ fn read_payloads(reader: &mut impl io::BufRead) -> io::Result<Result<Payloads, &
 
 /// Take a slot from the session's call quota and draw the invocation's id.
 ///
-/// The quota is decremented before anything runs, so a refusal is recorded once and a concurrent pair
-/// of callers cannot both slip past the last slot. `None` means the quota is exhausted and the caller
-/// has already been answered.
+/// The quota is decremented before anything runs, so a concurrent pair of callers cannot both slip
+/// past the last slot. `None` means the quota is exhausted and the caller has already been
+/// answered. The refusal costs no slot and so repeats for as long as a caller keeps asking, which
+/// is why it reaches the log through [`TaskLog::push_refusal_once`]: the answer on the wire is
+/// written every time, the line in the log is written once.
 fn admit_quota(
     writer: &mut UnixStream,
     name: &str,
@@ -978,7 +1007,7 @@ fn admit_quota(
         // Id `0`: nothing was admitted, so there is no invocation for an id to name. It is also what
         // keeps the id inside the width the socket paths were sized against — the quota is the bound
         // on how many are ever drawn.
-        log.push(refusal(0, name, &reason));
+        log.push_refusal_once(refusal(0, name, &reason));
         writeln!(writer, "err {reason}")?;
         return Ok(None);
     }
