@@ -2867,26 +2867,30 @@ mod tests {
             started.elapsed()
         );
 
-        // And the process the stub forked is gone with it. `kill(pid, 0)` answers about a pid the
-        // test can still name because nothing here reaps it: a survivor reads as alive.
-        let forked: i32 = std::fs::read_to_string(&marker)
+        // And the process the stub forked is gone with it. "Gone" is read as a state and not as
+        // `kill(pid, 0)`: the stub's fork is not this binary's child, so once its parent is killed
+        // it is inherited by whatever init the host runs, and an init that does not reap leaves a
+        // zombie whose pid answers `kill(pid, 0)` for as long as the test binary lives. The group
+        // kill would then look like it had done nothing, on a host where it had done exactly what
+        // it promises. [`crate::testutil::pid_is_running`] asks the question this actually means.
+        let forked: u32 = std::fs::read_to_string(&marker)
             .expect("the stub records what it forked")
             .trim()
             .parse()
             .expect("a pid");
-        let mut alive = true;
+        let mut running = true;
         for _ in 0..50 {
-            if unsafe { libc::kill(forked, 0) } != 0 {
-                alive = false;
+            if !crate::testutil::pid_is_running(forked) {
+                running = false;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        if alive {
-            unsafe { libc::kill(forked, libc::SIGKILL) };
+        if running {
+            unsafe { libc::kill(forked as libc::pid_t, libc::SIGKILL) };
         }
         assert!(
-            !alive,
+            !running,
             "the deadline ended the command and left {forked} behind holding what caused it"
         );
 

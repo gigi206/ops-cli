@@ -1892,17 +1892,7 @@ mod tests {
         // calls on its way in. The exited child is measured in the process table before and after:
         // a `Z` state is precisely the leak, one entry per announcement, in a supervisor that
         // outlives the session.
-        fn state_of(pid: u32) -> Option<char> {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            // The command name sits in parentheses and may hold spaces; the state is the field
-            // after the closing one.
-            stat.rsplit_once(')')?
-                .1
-                .split_whitespace()
-                .next()?
-                .chars()
-                .next()
-        }
+        use crate::testutil::process_state as state_of;
         let sh = crate::pathfind::find_on_path("sh").expect("a shell on PATH");
         let spawn = |script: &str| {
             std::process::Command::new(&sh)
