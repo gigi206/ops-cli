@@ -1905,7 +1905,9 @@ fn runtime_entry_pid(name: &str, prefixes: &[&str]) -> Option<u32> {
 /// else reaps them.
 ///
 /// Best-effort throughout: an unreadable directory is skipped and a failed removal is not an error,
-/// because this is housekeeping and never a reason to fail the caller.
+/// because this is housekeeping and never a reason to fail the caller. A removal that failed is
+/// left out of the returned vector instead, on the rule [`prune_rev_dirs`] states — these bytes are
+/// the freed total `sbx gc` prints, and a tree still on the disk must not be counted into it.
 pub(crate) fn sweep_distro_trees(
     data_dir: &Path,
     live_projects: &std::collections::BTreeSet<String>,
@@ -1927,7 +1929,9 @@ pub(crate) fn sweep_distro_trees(
                 let usage = crate::sandbox::tree_usage(&path);
                 if prune {
                     let _ = make_writable(&path);
-                    let _ = std::fs::remove_dir_all(&path);
+                    if std::fs::remove_dir_all(&path).is_err() {
+                        continue;
+                    }
                 }
                 freed.push((name, usage.bytes));
             }
@@ -1954,7 +1958,11 @@ pub(crate) fn sweep_distro_trees(
             // a plain removal rather than a recursive `chmod` first, but a tree from an older sbx
             // may not carry them, so the walk is done here rather than assumed away.
             let _ = make_writable(&path);
-            let _ = std::fs::remove_dir_all(&path);
+            // Only what actually went is reported: a tree the removal left on the disk would
+            // otherwise be announced as freed on this run and on every run after it.
+            if std::fs::remove_dir_all(&path).is_err() {
+                continue;
+            }
         }
         freed.push((name, usage.bytes));
     }
@@ -3993,6 +4001,43 @@ mod tests {
             !tree.exists(),
             "a read-only directory did not block the reclaim"
         );
+    }
+
+    #[test]
+    fn a_tree_whose_removal_failed_is_not_reported_as_freed() {
+        // The bytes this sweep returns are the freed total `sbx gc` prints, and it is the largest
+        // one it prints. A removal that fails — a full storage volume, a parent nothing may unlink
+        // from — leaves the tree where it was, so counting it announces space that is still taken
+        // and hides the entry that keeps failing behind a line naming it as gone.
+        use std::os::unix::fs::PermissionsExt;
+        let data = TmpDir::new();
+        let parent = data.path().join("distro");
+        std::fs::create_dir_all(&parent).unwrap();
+        // An entry the sweep matches by name that no removal can ever take: `remove_dir_all`
+        // answers `ENOTDIR` for it whatever the caller's privileges.
+        let stray = parent.join(format!("sha256-{}", "e".repeat(64)));
+        std::fs::write(&stray, b"not a tree").unwrap();
+
+        let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
+        assert!(freed.is_empty(), "{freed:?}");
+        assert!(stray.is_file(), "the entry is still on the disk");
+
+        // And the shape an operator meets: a tree whose removal is refused part-way — here by a
+        // parent that may not be unlinked from, as a full volume refuses the unlink itself.
+        // `make_writable` walks the tree and below, never its parent. Root ignores the permission
+        // bits, so this half only runs where they are enforced.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!("running as root, which unlinks from a directory with no write bit");
+            return;
+        }
+        let tree = distro_tree(data.path(), "a", &[]);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(freed.is_empty(), "{freed:?}");
+        assert!(tree.is_dir(), "the tree is still on the disk");
     }
 
     #[test]

@@ -43,6 +43,12 @@ pub(super) struct FrameTee {
     /// The leak tripwire, when the launch has any secret configured. It never fills, so a tunnel
     /// that scans keeps following the framing after the capture stops.
     scan: Option<LeakScan>,
+    /// Whether this direction is followed for a scan it does not have yet — the posture the caller
+    /// passed to [`Self::new`]. It outlives construction because the two questions asked of a
+    /// stopped decoder both turn on it: a direction kept alive for a needle the cage has not
+    /// acquired must not end when the capture fills ([`Self::spent`]), and if it does stop the
+    /// relay has to be told ([`Self::newly_blinded`]) even though no scan was ever attached.
+    follow_anyway: bool,
     /// The header of the frame being decoded. It can arrive split across reads, and is bounded: a
     /// WebSocket frame header is at most 14 bytes.
     header: Vec<u8>,
@@ -579,6 +585,7 @@ impl FrameTee {
             sink,
             sink_full: false,
             scan,
+            follow_anyway,
             header: Vec::with_capacity(14),
             payload_left: 0,
             keeps: false,
@@ -652,13 +659,17 @@ impl FrameTee {
     }
 
     /// Whether nothing further can be learned from this direction, so the decoder may stop: the
-    /// capture is full and there is no scan to keep going for.
+    /// capture is full, there is no scan to keep going for, and none is expected — a direction the
+    /// caller asked to follow anyway is being held open for a needle the launch does not have yet
+    /// ([`Self::new`]), and ending it at the capture's cap would put the framing out of reach
+    /// before [`Self::refresh_needles`] could ever attach that scan.
     fn spent(&self) -> bool {
-        self.sink_full && self.scan.is_none()
+        self.sink_full && self.scan.is_none() && !self.follow_anyway
     }
 
     /// Whether this direction's leak tripwire has *just* gone blind: the decoder gave up on the
-    /// framing while a scan was still configured, so nothing crossing from here on is watched.
+    /// framing while a scan was configured — or while one was still expected, on a direction the
+    /// caller asked to follow anyway — so nothing crossing from here on is watched.
     ///
     /// Reported once, like a sighting.
     ///
@@ -670,8 +681,14 @@ impl FrameTee {
     /// message, and `done` was invisible outside the tee — so `follow` reported no sighting, the
     /// relay kept forwarding, and `websocket_secret = block` could never fire again on that tunnel.
     /// Reporting it lets the relay treat a blinded direction as what it is.
+    ///
+    /// An empty needle set is not the same as no tripwire. Under [`crate::allowlist::WebsocketSecret::Block`]
+    /// the caller follows a direction that has nothing to look for yet precisely so it can look
+    /// later, so a decoder that stops there loses a tripwire just as surely as one that was already
+    /// scanning — and loses it for good, since [`Self::refresh_needles`] cannot attach a scan to a
+    /// stopped decoder. Only a capture-only tee, which has no tripwire to lose, stays silent.
     pub(super) fn newly_blinded(&mut self) -> bool {
-        if !self.done || self.scan.is_none() || self.blind_reported {
+        if !self.done || (self.scan.is_none() && !self.follow_anyway) || self.blind_reported {
             return false;
         }
         self.blind_reported = true;
@@ -1035,6 +1052,17 @@ mod tests {
     /// capture being on — that would make a security check follow a debugging setting.
     fn scanning_tee(needles: &[SecretNeedle], deflate: Option<bool>) -> FrameTee {
         FrameTee::new(None, needles, deflate, false).expect("needles are a consumer")
+    }
+
+    /// A tee for a direction followed with nothing to look for yet, which is the shape
+    /// `websocket_secret = block` gives a tunnel whose destination has no declared secret at the
+    /// `101`. `cap` mirrors whether the launch also captures bodies.
+    fn blocking_tee(cap: Option<usize>) -> (FrameTee, Option<Arc<CapBuf>>) {
+        let sink = cap.map(|c| Arc::new(CapBuf::new(c)));
+        (
+            FrameTee::new(sink.clone(), &[], None, true).expect("the posture follows anyway"),
+            sink,
+        )
     }
 
     /// One `permessage-deflate` message, compressed against `c`'s running window and framed with
@@ -1914,5 +1942,46 @@ mod tests {
             vec!["demo-token".to_string()],
             "the scan outlives the capture it shares a decoder with"
         );
+    }
+
+    /// A direction followed for a needle the launch does not have yet is a tripwire like any other:
+    /// it may not end at the capture's cap, and if the framing stops it says so.
+    ///
+    /// This is the shape `websocket_secret = block` gives a tunnel whose destination has no declared
+    /// secret at the `101` — the decoder is kept alive purely so `refresh_needles` can arm it when
+    /// the cage acquires a credential. Ending it quietly leaves the posture promising a scan that
+    /// can never be attached, on a tunnel that keeps relaying.
+    #[test]
+    fn a_direction_followed_for_a_later_needle_is_kept_and_reports_going_blind() {
+        // The capture fills first. The decoder must keep following the framing, because the scan it
+        // is being held open for has not arrived yet.
+        let (mut t, sink) = blocking_tee(Some(4));
+        t.push(&frame(0x1, b"aaaaaaaaaaaa", None));
+        assert!(
+            captured(&sink.expect("this arm captures")).truncated,
+            "the capture is full by now"
+        );
+        assert!(
+            !t.done,
+            "a full capture does not end a direction the posture follows anyway"
+        );
+        t.refresh_needles(&[needle()]);
+        t.push(&frame(0x1, b"late SECRET-VALUE-0123456789", None));
+        assert_eq!(
+            t.sightings(),
+            vec!["demo-token".to_string()],
+            "the credential the cage acquired after the `101` is watched for"
+        );
+
+        // And when the framing does stop before any needle arrives, the relay is told: the scan can
+        // never be attached afterwards, so this is the tripwire going off the air for good.
+        let (mut blind, _) = blocking_tee(None);
+        blind.push(&frame(0x5, b"reserved", None));
+        assert!(blind.done, "a reserved opcode stops the decoder");
+        assert!(
+            blind.newly_blinded(),
+            "a direction the posture was holding open for a scan cannot stop in silence"
+        );
+        assert!(!blind.newly_blinded(), "once, not on every later read");
     }
 }

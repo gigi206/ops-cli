@@ -60,6 +60,11 @@ pub(super) struct Response {
     pub(super) status: u16,
     pub(super) headers: Vec<(String, String)>,
     pub(super) body: Vec<u8>,
+    /// Whether a redirect was followed to reach the host that answered. The status and headers of
+    /// such an answer were written by a host the registry named, not by the one the configuration
+    /// did, so a caller that would act on them with a credential in hand has to know the
+    /// difference.
+    pub(super) redirected: bool,
 }
 
 impl Response {
@@ -76,6 +81,11 @@ impl Response {
 struct Url {
     host: String,
     port: u16,
+    /// The authority as it belongs in a `Host` header and in an absolute URL: the host alone when
+    /// the port is the scheme default, `host:port` otherwise. RFC 7230 §5.4 requires the port to
+    /// appear when it is not the default, and a registry reached on one (`localhost:5000`) routes
+    /// on this value and derives its absolute `Location` values from it.
+    authority: String,
     /// Path and query together, as they appear on the request line.
     target: String,
 }
@@ -107,6 +117,11 @@ fn parse_url(url: &str) -> io::Result<Url> {
     Ok(Url {
         host: host.to_string(),
         port,
+        authority: if port == 443 {
+            host.to_string()
+        } else {
+            format!("{host}:{port}")
+        },
         target: path.to_string(),
     })
 }
@@ -178,7 +193,7 @@ fn send<S: Read + Write>(
     // is no legitimate value to preserve.
     for (what, value) in [
         ("the request target", url.target.as_str()),
-        ("the host", url.host.as_str()),
+        ("the host", url.authority.as_str()),
     ]
     .into_iter()
     .chain(
@@ -196,7 +211,7 @@ fn send<S: Read + Write>(
     let mut request = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: sbx\r\nAccept-Encoding: identity\r\n\
          Connection: close\r\n",
-        url.target, url.host
+        url.target, url.authority
     );
     for (name, value) in headers {
         request.push_str(name);
@@ -257,6 +272,7 @@ pub(super) fn head(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> 
 fn request(url: &str, headers: &[(&str, &str)], method: &str) -> io::Result<Response> {
     let mut current = url.to_string();
     let mut carry = headers;
+    let mut redirected = false;
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
         let stream = connect(&parsed)?;
@@ -264,8 +280,10 @@ fn request(url: &str, headers: &[(&str, &str)], method: &str) -> io::Result<Resp
         if let Some(location) = redirect_target(status, &headers, &current)? {
             current = location;
             // Past the first hop the request is to somewhere the registry chose, so the caller's
-            // credential does not travel with it.
+            // credential does not travel with it, and the answer is marked as having come from
+            // there rather than from the registry.
             carry = &[];
+            redirected = true;
             continue;
         }
         // A `HEAD` response describes a body it does not carry, so its `Content-Length` is the
@@ -279,6 +297,7 @@ fn request(url: &str, headers: &[(&str, &str)], method: &str) -> io::Result<Resp
             status,
             headers,
             body,
+            redirected,
         });
     }
     Err(io::Error::other(format!(
@@ -347,11 +366,7 @@ fn redirect_target(
         )));
     }
     let origin = parse_url(current)?;
-    let base = if origin.port == 443 {
-        format!("https://{}", origin.host)
-    } else {
-        format!("https://{}:{}", origin.host, origin.port)
-    };
+    let base = format!("https://{}", origin.authority);
     if location.starts_with('/') {
         Ok(Some(format!("{base}{location}")))
     } else {

@@ -70,9 +70,16 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
 pub(crate) fn wrap(
     certutil: &Path,
     bash: &Path,
+    env_bin: &Path,
     ca_cage_path: &str,
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
+    // `mkdir` by absolute store path, for the same reason `certutil` is: this preamble runs before
+    // the `[proc]` shim installs its filter, and the cage's PATH leads through directories the cage
+    // itself can write (its own store, its mise shims), so a bare name here would let in-cage code
+    // choose the cage's first, unfiltered process. The store root it lives in is pinned read-only
+    // by `plumbing_pins`, which is what makes the absolute path worth more than the name.
+    let mkdir = env_bin.with_file_name("mkdir");
     // Every certutil call reads from `/dev/null`: `-N` on an *existing* db (the persistent home
     // is reused across launches) prompts for confirmation on stdin and would otherwise hang the
     // launch (no tty). The `-N` is also guarded on the db not already existing, so it runs once;
@@ -92,12 +99,13 @@ pub(crate) fn wrap(
     // starting a second cage).
     let script = format!(
         "DB=\"$HOME/.pki/nssdb\"\n\
-         mkdir -p \"$DB\"\n\
+         '{mkdir}' -p \"$DB\"\n\
          [ -f \"$DB/cert9.db\" ] || '{c}' -d \"sql:$DB\" -N --empty-password </dev/null 2>/dev/null || true\n\
-         for n in $('{c}' -d \"sql:$DB\" -L 2>/dev/null | grep -oE '{nick}[0-9a-f-]*'); do '{c}' -d \"sql:$DB\" -D -n \"$n\" </dev/null 2>/dev/null || true; done\n\
+         '{c}' -d \"sql:$DB\" -L 2>/dev/null | while read -r n _; do case \"$n\" in {nick}*) '{c}' -d \"sql:$DB\" -D -n \"$n\" </dev/null 2>/dev/null || true;; esac; done\n\
          '{c}' -d \"sql:$DB\" -A -n {nick} -t 'C,,' -i '{ca}' </dev/null 2>/dev/null || true\n\
          exec \"$@\"",
         c = certutil.to_string_lossy(),
+        mkdir = mkdir.to_string_lossy(),
         nick = CA_NICKNAME,
         ca = ca_cage_path,
     );
@@ -125,6 +133,7 @@ mod tests {
         let out = wrap(
             Path::new("/nix/store/abc-nss-tools/bin/certutil"),
             Path::new("/nix/store/def-bash/bin/bash"),
+            Path::new("/nix/store/ghi-coreutils/bin/env"),
             "/opt/sbx/egress-ca.pem",
             cmd,
         );
@@ -138,8 +147,17 @@ mod tests {
         assert!(script.contains("/nix/store/abc-nss-tools/bin/certutil"));
         // purges every prior `sbx-mitm*` entry first, so the persistent db never accumulates
         // several same-subject CAs (which collide on issuer lookup → ERR_CERT_AUTHORITY_INVALID)
-        assert!(script.contains("grep -oE 'sbx-mitm[0-9a-f-]*'"));
+        assert!(script.contains("case \"$n\" in sbx-mitm*)"));
         assert!(script.contains("-D -n \"$n\""));
+        // Every program the preamble runs is an absolute store path: it is the cage's first
+        // process, before the `[proc]` shim filters anything, and the cage writes its own PATH.
+        assert!(script.contains("'/nix/store/ghi-coreutils/bin/mkdir' -p \"$DB\""));
+        for bare in ["mkdir ", "grep ", "cat "] {
+            assert!(
+                !script.contains(bare),
+                "{bare} is run by name, which the cage's PATH decides: {script}"
+            );
+        }
         // `-N` only when the db is absent, and every certutil step reads /dev/null so an
         // existing-db confirmation prompt can never hang a tty-less launch (the bug this guards).
         assert!(script.contains("[ -f \"$DB/cert9.db\" ] ||"));

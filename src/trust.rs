@@ -325,19 +325,33 @@ pub(crate) fn verdict_for_hash(
 /// file that is present but unsafe is also reported `Untrusted`: the trusted
 /// content folds in that file, and an unverifiable one cannot yield `Trusted`.
 pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
+    state_with_inputs(store_dir, config_path).0
+}
+
+/// [`state`], handing back the sibling mise files the verdict was computed over.
+///
+/// A caller that gates a write on the verdict and then blesses what it wrote needs both: the
+/// verdict to admit the write, and those very bytes to hand to [`trust_written`], which attests to
+/// nothing else. Reading the mise files again at bless time would answer the same question twice,
+/// and the project tree is bound read-write into the cage — so the two answers can differ by an
+/// in-cage write, and the second one was admitted by nobody. An unreadable or unsafe file yields
+/// `(Untrusted, empty)`: the verdict the fail-closed arms of this function already give, paired
+/// with the expectation only a project with no mise file at all can meet.
+pub(crate) fn state_with_inputs(store_dir: &Path, config_path: &Path) -> (TrustState, MiseInputs) {
     let sbx_bytes = match crate::config::safety::read_safe_bytes(config_path) {
         Ok(b) => b,
-        Err(_) => return TrustState::Untrusted,
+        Err(_) => return (TrustState::Untrusted, Vec::new()),
     };
     let mise_inputs = match mise_inputs_for(config_path) {
         Ok(m) => m,
-        Err(_) => return TrustState::Untrusted,
+        Err(_) => return (TrustState::Untrusted, Vec::new()),
     };
-    verdict_for_hash(
+    let verdict = verdict_for_hash(
         store_dir,
         config_path,
         &content_hash(&sbx_bytes, &mise_inputs),
-    )
+    );
+    (verdict, mise_inputs)
 }
 
 /// Record trust for `config_path`: hash the file's current contents — and those of
@@ -360,18 +374,27 @@ pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
 /// already assumes it gets.
 ///
 /// The sibling mise files are still read here, because the caller did not write those — attesting
-/// to bytes it never composed would be inventing them.
+/// to bytes it never composed would be inventing them. `expected_mise` is what the caller's *gate*
+/// read of them ([`state_with_inputs`]), and the read here must still match it: the marker covers
+/// the mise files too, and a `nix:` tool in one is provisioned host-side the moment the project
+/// reads `Trusted`. A mise file that changed, appeared or vanished in between is content no gate
+/// admitted, so it is refused rather than blessed.
 pub(crate) fn trust_written(
     store_dir: &Path,
     config_path: &Path,
     sbx_bytes: &[u8],
+    expected_mise: &MiseInputs,
 ) -> io::Result<()> {
-    trust_inner(store_dir, config_path, Some(sbx_bytes))
+    trust_inner(store_dir, config_path, Some((sbx_bytes, expected_mise)))
 }
 
-/// The body of both: `written` is the config's bytes when the caller composed them, `None` to read
-/// them from `config_path`.
-fn trust_inner(store_dir: &Path, config_path: &Path, written: Option<&[u8]>) -> io::Result<()> {
+/// The body of both: `written` is the config's bytes as the caller composed them, paired with the
+/// sibling mise files its gate admitted; `None` to read both back from `config_path`.
+fn trust_inner(
+    store_dir: &Path,
+    config_path: &Path,
+    written: Option<(&[u8], &MiseInputs)>,
+) -> io::Result<()> {
     // Every error out of this function opens with the file it is about, so a caller can name the
     // action alone (`could not re-trust {e}`) instead of prefixing a path the message already
     // carries. The two reads get that from the safety gate, which is also the only layer that knows
@@ -392,8 +415,26 @@ fn trust_inner(store_dir: &Path, config_path: &Path, written: Option<&[u8]>) -> 
     // world-writable or foreign-owned file, and that question is about the file on disk, not about
     // what the caller holds. Only the *hashed* bytes come from the caller.
     let read_back = crate::config::safety::read_safe_bytes(config_path)?;
-    let sbx_bytes = written.map(|b| b.to_vec()).unwrap_or(read_back);
+    let sbx_bytes = written.map(|(b, _)| b.to_vec()).unwrap_or(read_back);
     let mise_inputs = mise_inputs_for(config_path)?;
+    // The mise half of the hash has no composed bytes to stand in for it, so it is read from disk
+    // here — a second read of files the caller's gate already judged. Anything that changed between
+    // the two reads was admitted by nobody, and pinning it would hand the marker to an in-cage
+    // writer: the marker is what releases a mise file's `nix:` provisioning on the host. Refusing
+    // instead leaves the project `Changed` and the verb reporting that it wrote but could not
+    // re-trust — the fail-safe the `.sbx.toml` half already gets from hashing the composed bytes.
+    if let Some((_, expected)) = written
+        && mise_inputs != *expected
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: a mise file beside it changed while sbx was writing, so the trust marker \
+                 would cover content that was never reviewed",
+                config_path.display()
+            ),
+        ));
+    }
     let hash = content_hash(&sbx_bytes, &mise_inputs);
 
     // Create the store owner-only from the start, so a loose umask never leaves a
@@ -542,6 +583,86 @@ mod tests {
         );
     }
 
+    /// A mise file rewritten between the gate and the bless is refused, never attested to.
+    ///
+    /// The marker covers the `.sbx.toml` *and* every mise file beside it, and a mise file that
+    /// reads `Trusted` has its `nix:` tools resolved and built on the host. `sbx net allow --local`
+    /// reads those files once to admit the write and would otherwise read them again to bless it —
+    /// two reads of a file the cage can write, with the command's own write in between. The racing
+    /// in-cage write is simulated by rewriting the mise file after the composed config: the marker
+    /// must not cover it, and the project must not come back trusted.
+    #[test]
+    fn a_mise_file_rewritten_after_the_gate_is_not_blessed() {
+        let dir = crate::testutil::TmpDir::new();
+        let store = dir.path().join("store");
+        let config = dir.path().join(crate::config::PROJECT_CONFIG);
+        let mise = dir.path().join(".mise.toml");
+        std::fs::write(&config, "[network]\nmode = \"deny\"\n").expect("the starting config");
+        std::fs::write(&mise, "[tools]\nnode = \"22\"\n").expect("the reviewed mise file");
+        trust(&store, &config).expect("trust the reviewed project");
+
+        // What the verb's gate read, and what it admitted the write on.
+        let (admitted_state, admitted_mise) = state_with_inputs(&store, &config);
+        assert_eq!(
+            admitted_state,
+            TrustState::Trusted,
+            "the gate must admit this"
+        );
+
+        // What sbx composed and wrote.
+        let composed = "[network]\nmode = \"deny\"\nallow = [\"example.com\"]\n";
+        std::fs::write(&config, composed).expect("write the composed config");
+
+        // The racing writer lands on the file the caller did not compose.
+        std::fs::write(&mise, "[tools]\nfoo = \"nix:hostile\"\n").expect("the racing write");
+
+        assert!(
+            trust_written(&store, &config, composed.as_bytes(), &admitted_mise).is_err(),
+            "the racing mise write was folded into the marker"
+        );
+        assert_ne!(
+            state(&store, &config),
+            TrustState::Trusted,
+            "the project reads trusted over a mise file no gate admitted"
+        );
+    }
+
+    /// The bootstrap arm keeps its promise: a mise file that appears during the write is not blessed.
+    ///
+    /// A `--local` save into a project with no config is admitted precisely because there is
+    /// nothing else to bless (`local_save_permitted`'s `(false, false)` arm). A mise file created
+    /// inside that window is exactly what the neighbouring `(false, true)` arm refuses, so it must
+    /// not ride along on the marker the save writes.
+    #[test]
+    fn a_mise_file_created_after_a_bootstrap_gate_is_not_blessed() {
+        let dir = crate::testutil::TmpDir::new();
+        let store = dir.path().join("store");
+        let config = dir.path().join(crate::config::PROJECT_CONFIG);
+
+        // The gate: no config, no mise file beside it.
+        let (admitted_state, admitted_mise) = state_with_inputs(&store, &config);
+        assert_eq!(admitted_state, TrustState::Untrusted);
+        assert!(admitted_mise.is_empty(), "nothing was there to admit");
+
+        let composed = "[network]\nmode = \"deny\"\n";
+        std::fs::write(&config, composed).expect("write the composed config");
+        std::fs::write(
+            dir.path().join(".mise.toml"),
+            "[tools]\nfoo = \"nix:hostile\"\n",
+        )
+        .expect("the racing write");
+
+        assert!(
+            trust_written(&store, &config, composed.as_bytes(), &admitted_mise).is_err(),
+            "a mise file that appeared during the write was blessed with the config"
+        );
+        assert_ne!(
+            state(&store, &config),
+            TrustState::Trusted,
+            "the bootstrap save blessed a file the user never reviewed"
+        );
+    }
+
     /// Trust attests to the bytes the caller wrote, not to whatever is on disk afterwards.
     ///
     /// `sbx net allow --local` writes a project config and then blesses it. The project tree is
@@ -563,7 +684,8 @@ mod tests {
         let hostile = "[network]\nmode = \"allow\"\n";
         std::fs::write(&config, hostile).expect("the racing write");
 
-        trust_written(&store, &config, composed.as_bytes()).expect("record trust");
+        trust_written(&store, &config, composed.as_bytes(), &MiseInputs::new())
+            .expect("record trust");
 
         // `Changed`, not `Trusted`: there *is* a marker (sbx wrote one), and the file no longer
         // matches it — which is precisely the signal a launch drops the security fields on. Had the

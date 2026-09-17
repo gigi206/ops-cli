@@ -172,6 +172,67 @@ fn establish_control_plane_pins_fails_closed_when_a_pin_cannot_be_created() {
     );
 }
 
+/// A pin that would land on an `[fs]` mask is dropped, so the mask is not silently undone.
+///
+/// The pins are appended after the masks and the later bind at a destination wins, so a chain
+/// running through a masked directory (`$HOME/.config` with the project root at `$HOME`) would
+/// otherwise put the real, read-write directory back over a `deny`'s decoy — and turn a declared
+/// `readonly` path read-write.
+#[test]
+fn a_control_plane_pin_that_lands_on_an_fs_mask_is_dropped() {
+    let home = PathBuf::from("/home/agent");
+    let pin = |path: PathBuf, writable: bool| binds::ExtraBind {
+        src: path.clone(),
+        dest: path,
+        writable,
+    };
+    // The chain `cd ~ && sbx run` produces for the global config root: a read-write intermediate
+    // and the read-only leaf under it.
+    let pins = vec![
+        pin(home.join(".config"), true),
+        pin(home.join(".config/sbx"), false),
+    ];
+    let masked = |path: PathBuf| crate::sandbox::fsmask::Masked {
+        path,
+        is_dir: true,
+        pattern: String::from(".config/"),
+    };
+
+    // `deny = [".config/"]`: the decoy is bound at the intermediate, so both it and everything
+    // below it must stay the mask's, not the pin's.
+    let mut masks = crate::sandbox::fsmask::Expanded {
+        denied: vec![masked(home.join(".config"))],
+        ..Default::default()
+    };
+    assert!(
+        pins_clear_of_masks(pins.clone(), &masks).is_empty(),
+        "a pin over a denied directory hands the cage back the real one, read-write"
+    );
+
+    // `readonly = [".config/"]`: same containment, and the pin would re-bind it read-write.
+    masks = crate::sandbox::fsmask::Expanded {
+        readonly: vec![masked(home.join(".config"))],
+        ..Default::default()
+    };
+    assert!(pins_clear_of_masks(pins.clone(), &masks).is_empty());
+
+    // A mask elsewhere in the project does not cost the control plane its pins.
+    masks = crate::sandbox::fsmask::Expanded {
+        denied: vec![masked(home.join("src"))],
+        ..Default::default()
+    };
+    assert_eq!(
+        pins_clear_of_masks(pins.clone(), &masks).len(),
+        2,
+        "only a mask the pin sits under may drop it"
+    );
+    // And neither does no mask at all, which is every launch without an `[fs]` section.
+    assert_eq!(
+        pins_clear_of_masks(pins, &crate::sandbox::fsmask::Expanded::default()).len(),
+        2
+    );
+}
+
 #[test]
 fn keep_passthrough_drops_bare_c_locale_but_keeps_real_ones() {
     let out = keep_passthrough([
@@ -273,6 +334,9 @@ fn the_programs_every_wrap_preamble_execs_are_pinned_read_only_from_the_shared_s
         &userland.mise_bin,
         &userland.nix_bin,
         &userland.base_loader,
+        // Coreutils, reached through `env`: the preambles run `mkdir`, `cat`, `ln`, `readlink`,
+        // `touch`, `rm` and `sleep` from beside it, by absolute path.
+        &userland.env_bin,
         &certutil,
         &dbus,
     ] {
@@ -297,11 +361,11 @@ fn the_programs_every_wrap_preamble_execs_are_pinned_read_only_from_the_shared_s
         );
     }
 
-    // Seven distinct store paths, so no pin is dropped by the de-duplication that keeps a
-    // shared root from being mounted twice — and a launch with no GUI hole pins only the five
+    // Eight distinct store paths, so no pin is dropped by the de-duplication that keeps a
+    // shared root from being mounted twice — and a launch with no GUI hole pins only the six
     // every posture runs.
-    assert_eq!(pins.len(), 7);
-    assert_eq!(plumbing_pins(&userland, &[], &layout).len(), 5);
+    assert_eq!(pins.len(), 8);
+    assert_eq!(plumbing_pins(&userland, &[], &layout).len(), 6);
 
     // A path that does not resolve through the store is not a store path and must not be
     // mounted over — the pin set is derived, never assumed.

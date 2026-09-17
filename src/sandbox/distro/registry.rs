@@ -208,10 +208,7 @@ fn get_authenticated(
 ) -> io::Result<http::Response> {
     let base: Vec<(&str, &str)> = accept.map(|a| vec![("Accept", a)]).unwrap_or_default();
     let first = http::get(url, &base)?;
-    if first.status != 401 {
-        return Ok(first);
-    }
-    let Some(challenge) = first.header("www-authenticate") else {
+    let Some(challenge) = answerable_challenge(&first)? else {
         return Ok(first);
     };
     // A registry that asks for `Basic` has no token service to go through, so the credential
@@ -227,6 +224,31 @@ fn get_authenticated(
     let mut headers = base;
     headers.push(("Authorization", &authorization));
     http::get(url, &headers)
+}
+
+/// The challenge on `response` worth answering, or `None` when it carries none.
+///
+/// A `401` is only a registry's challenge when the registry is what answered. [`http::get`] and
+/// [`http::head`] follow redirects, so the response may have been written by whatever host the
+/// registry pointed at — and answering *that* challenge means presenting the `distro` credential
+/// to a third party, either as the `Basic` header itself or at a token realm that host chose. The
+/// credential is scoped to the registry the configuration names, so a challenge from a redirect hop
+/// is refused rather than followed; a blob served from object storage that needs no challenge is
+/// unaffected, since it answers `200`.
+fn answerable_challenge(response: &http::Response) -> io::Result<Option<&str>> {
+    if response.status != 401 {
+        return Ok(None);
+    }
+    let Some(challenge) = response.header("www-authenticate") else {
+        return Ok(None);
+    };
+    if response.redirected {
+        return Err(io::Error::other(format!(
+            "a host reached by redirect asked for authentication ({challenge}): \
+             the `distro` credential is presented to the registry itself and to nowhere else"
+        )));
+    }
+    Ok(Some(challenge))
 }
 
 /// The credential to answer a `Basic` challenge with, or `None` when the challenge is not `Basic`
@@ -254,9 +276,7 @@ fn get_authenticated_to_writer<W: io::Write>(
     // answered `200` with the layer, which the document cap then refused for being too large:
     // no layer past four megabytes could be fetched from quay.io or registry.k8s.io at all.
     let probe = http::head(url, &[])?;
-    if probe.status == 401
-        && let Some(challenge) = probe.header("www-authenticate")
-    {
+    if let Some(challenge) = answerable_challenge(&probe)? {
         let authorization = match basic_answer(challenge, credential) {
             Some(header) => Some(header.to_string()),
             None => token(challenge, credential)?.map(|t| format!("Bearer {t}")),
@@ -358,6 +378,22 @@ pub(super) fn resolve(image: &ImageRef, credential: Option<&Credential>) -> io::
     Ok(Image { digest, layers })
 }
 
+/// What may be written while fetching a layer, before its digest can answer.
+///
+/// The digest is computed from the bytes as they land, so it is known only once the body is fully
+/// written: it bounds what is *kept*, not what is *written*, and a body that never ends fills the
+/// disk before it is ever declared wrong. A manifest that states a size holds the fetch to it, but
+/// that size is the registry's own number too, so it holds the fetch only as far as
+/// [`http::MAX_STREAMED_BODY`] and never past it; a manifest that states none falls back to that
+/// ceiling rather than to no ceiling at all.
+fn blob_cap(size: u64) -> u64 {
+    if size > 0 {
+        size.min(http::MAX_STREAMED_BODY)
+    } else {
+        http::MAX_STREAMED_BODY
+    }
+}
+
 /// Fetch one layer into `dir`, named by its digest, and return the path.
 ///
 /// The digest is verified over the bytes as they are written, so a blob that is not what was asked
@@ -380,16 +416,7 @@ pub(super) fn fetch_layer(
         inner: std::fs::File::create(&partial)?,
         hasher: Sha256::new(),
     };
-    // What may be written before the digest can answer. The digest is computed from the bytes as
-    // they land, so it is known only once the body is fully written: it bounds what is *kept*, not
-    // what is *written*, and a body that never ends fills the disk before it is ever declared
-    // wrong. A manifest that states a size holds the fetch to it; one that does not falls back to
-    // the absolute ceiling rather than to no ceiling at all.
-    let cap = if layer.size > 0 {
-        layer.size
-    } else {
-        http::MAX_STREAMED_BODY
-    };
+    let cap = blob_cap(layer.size);
     // Any failure removes the partial file, not only a digest mismatch: a fetch that stopped
     // halfway leaves bytes that are not a layer, and a later run must not find them and take them
     // for one.

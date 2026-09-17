@@ -24,7 +24,11 @@
 //!   after it ([`relayed_app_name`]). sbx raises its own refusal toasts on this same host daemon,
 //!   under `sbx` or `sbx · <session>` ([`super::notify_sink`]), and those carry the copy-and-paste
 //!   command that widens a launch's network policy — so a cage free to spell its own `app_name`
-//!   could ask the user, in sbx's own voice, to open a hole for it.
+//!   could ask the user, in sbx's own voice, to open a hole for it. The same line is reachable by a
+//!   second route, and it is closed with it: a daemon that is handed a `desktop-entry` hint resolves
+//!   it to an installed host application and renders the toast under *that* application's name and
+//!   icon, ahead of the arguments it was called with, so those hints are dropped
+//!   ([`HOST_IDENTITY_HINTS`]).
 //! - **Host files.** The icon a daemon renders is a path *the daemon* opens, host-side, in its own
 //!   process. A relayed `app_icon` is therefore reduced to a bare theme name and the hints that name
 //!   a file are dropped ([`relayed_app_icon`], [`HOST_PATH_HINTS`]); a caged app has no host path
@@ -43,9 +47,11 @@
 //!   ceiling. A size rule there would be wrong rather than merely absent — `image-data` carries a
 //!   notification's icon as raw pixel data, so "large" is what a legitimate hint looks like, and a
 //!   cap would refuse the real case while an attacker moved the same bytes into the next hint name.
-//!   What *is* ruled on is which hints cross at all ([`HOST_PATH_HINTS`]) and, for one of them,
-//!   which value ([`capped_urgency`]). The trigger to revisit: a hint the cage can make the host
-//!   daemon persist or execute, where the question stops being size.
+//!   What *is* ruled on is which hints cross at all — those that name a host file for the daemon to
+//!   open ([`HOST_PATH_HINTS`]) and those that name the application the daemon renders the toast as
+//!   ([`HOST_IDENTITY_HINTS`]) — and, for one of the rest, which value ([`capped_urgency`]). The
+//!   trigger to revisit: a hint the cage can make the host daemon persist or execute, or one that
+//!   decides something the arguments above were held to, where the question stops being size.
 //! - **Insistence.** Two fields ask the desktop to keep a toast on screen until a person clicks it
 //!   away: `urgency = critical` and `expire_timeout = 0`. Neither is something sbx sends for its
 //!   own announcements — [`super::notify_sink`] writes the reason, that a toast which must be
@@ -281,6 +287,22 @@ const RELAYED_BY: &str = "sandboxed";
 /// puts an avatar or a cover on its own notification.
 const HOST_PATH_HINTS: &[&str] = &["image-path", "image_path", "sound-file"];
 
+/// Hints that name an **installed host application** for the daemon to render the toast as, dropped
+/// from every relayed call.
+///
+/// A daemon resolves `desktop-entry` (and the vendor spellings of the same hint) to a `.desktop`
+/// file installed on the host, and then draws the notification under *that* application's name and
+/// icon — ahead of the `app_name` and `app_icon` arguments it was called with. Forwarded verbatim it
+/// hands the cage the one line [`relayed_app_name`] exists to own, and loads a host file of the
+/// cage's choosing by the same route [`HOST_PATH_HINTS`] closes. Nothing legitimate is lost: a caged
+/// app's own desktop entry lives inside the cage, where the host daemon has nothing to resolve.
+const HOST_IDENTITY_HINTS: &[&str] = &[
+    "desktop-entry",
+    "desktop_entry",
+    "x-gnome-desktop-entry",
+    "x-kde-desktop-entry",
+];
+
 /// `urgency = critical`, the level that pins a toast on screen until it is dismissed by hand.
 ///
 /// The same number [`crate::sandbox::notify_sink`] refuses to send for sbx's own announcements, and
@@ -443,7 +465,10 @@ impl Served {
         // The identity fields are the supervisor's to write, not the cage's: see the module header
         // for what a verbatim `app_name` and a verbatim icon path each buy an agent inside the cage.
         let mut relayed_hints = hints;
-        relayed_hints.retain(|hint, _| !HOST_PATH_HINTS.contains(&hint.as_str()));
+        relayed_hints.retain(|hint, _| {
+            let hint = hint.as_str();
+            !HOST_PATH_HINTS.contains(&hint) && !HOST_IDENTITY_HINTS.contains(&hint)
+        });
         relayed_hints = capped_urgency(relayed_hints);
         let id = self
             .host
@@ -1125,6 +1150,44 @@ mod tests {
         assert_eq!(
             calls[1].app_icon, "dialog-warning",
             "a bare theme name resolves against the user's own theme and is still forwarded"
+        );
+    }
+
+    /// A relayed toast names no host application for the daemon to render it as.
+    ///
+    /// A daemon handed a `desktop-entry` hint looks the entry up among the host's installed
+    /// applications and draws the notification under that application's name and icon, ahead of the
+    /// `app_name` and `app_icon` it was called with. Forwarded verbatim it would give the cage back
+    /// the line `relayed_app_name` exists to own — the head a forged refusal toast needs — and load a
+    /// host file the cage named, the same shape `HOST_PATH_HINTS` closes.
+    #[test]
+    fn notify_forwards_no_desktop_entry_for_the_daemon_to_resolve() {
+        let host = FakeHost::default();
+        let served = served(&host);
+
+        let mut hints = HashMap::new();
+        hints.insert("desktop-entry".to_string(), hint("org.gnome.Settings"));
+        hints.insert("desktop_entry".to_string(), hint("org.gnome.Settings"));
+        hints.insert(
+            "x-gnome-desktop-entry".to_string(),
+            hint("org.gnome.Settings"),
+        );
+        hints.insert("x-kde-desktop-entry".to_string(), hint("systemsettings"));
+        hints.insert("category".to_string(), hint("device.error"));
+        notify_as(&served, "", 0, "", hints);
+
+        let calls = locked(&host.calls);
+        let mut forwarded: Vec<&str> = calls[0].hints.keys().map(String::as_str).collect();
+        forwarded.sort_unstable();
+        assert_eq!(
+            forwarded,
+            vec!["category"],
+            "every hint naming the application the daemon renders the toast as must be dropped, and \
+             nothing else"
+        );
+        assert!(
+            calls[0].app_name.starts_with(RELAYED_BY),
+            "the application name the daemon shows stays the supervisor's to write"
         );
     }
 

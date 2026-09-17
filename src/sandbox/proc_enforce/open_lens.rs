@@ -584,11 +584,12 @@ impl OpenLens {
 /// Deliberately **without** `O_NOFOLLOW`: the kernel is about to follow the cage's symlinks, and a
 /// scan that stopped at the link would be walked around with one `ln -s`.
 ///
-/// The errno on failure is the one the cage's own open would have met. `O_PATH` is the most
-/// permissive open there is, succeeding even without read permission, so a probe that fails
-/// describes a path the cage was going to fail on too — which is what lets the answer be given
-/// without a second walk, and closes the last way a `CONTINUE` could be reached by naming something
-/// absent while the answer is formed and putting the secret behind it afterwards.
+/// `O_PATH` is the most permissive open there is, succeeding even without read permission, so an
+/// errno from here is usually the one the cage's own open would have met — which is what closes the
+/// last way a `CONTINUE` could be reached by naming something absent while the answer is formed and
+/// putting the secret behind it afterwards. Usually, not always: the walk from here leaves the cage
+/// at the first symlink with an absolute target, so a failure is checked against the cage's own root
+/// before it is answered with — see [`probe_from_the_cage_root`].
 pub(super) fn probe_and_vouch(
     mounts: &CageMounts,
     pid: u32,
@@ -612,6 +613,39 @@ pub(super) fn probe_and_vouch(
     // reached? Asked before the type test below, because a device and a FIFO are served from the
     // probe without ever being scanned — and `/dev/stdout` is exactly such a device.
     vouched_probe(mounts, pid, probe, own)
+}
+
+/// The walk again, this time taken from **inside the cage's root**, for a path this process could
+/// not reach.
+///
+/// `/proc/<pid>/root<path>` holds the walk on the cage's mounts only until it meets a symlink whose
+/// target begins with `/`: such a target restarts the resolution at the resolving process's root,
+/// which is this one's. Where the cage's copy of that target is not the host's — `/nix` bound from
+/// the project store, a link the cage planted in its own tmpfs — the host walk lands on a name that
+/// is not there, and the errno it met describes this filesystem rather than the cage's. Answered
+/// with, it refuses a file the cage opens perfectly well, which is a refusal the policy never asked
+/// for.
+///
+/// So a failure is not taken at its word before the resolution the cage's own kernel performs has
+/// been tried. [`probe_in_cage_root`] starts at the cage's root and walks with `RESOLVE_IN_ROOT`,
+/// which confines every absolute target to that root and refuses a magic link outright — the same
+/// resolution [`vouched_probe`] already trusts for a walk that left, so what it reaches is vouched
+/// for by the walk itself and no mount is asked about it.
+///
+/// Only for an absolute path. A relative one is walked from a descriptor rather than from a root,
+/// and the cage's absolute spelling of it is not this one's to reconstruct, so those keep the first
+/// answer.
+fn probe_from_the_cage_root(pid: u32, path: &str) -> Option<std::fs::File> {
+    use std::os::unix::io::FromRawFd;
+    if !path.starts_with('/') {
+        return None;
+    }
+    // `self` and `thread-self` are answered with whoever performs the lookup, so they are named
+    // outright here as they are everywhere else a cage's spelling is walked from outside it.
+    let named = caller_proc_path(pid, path);
+    let fd = probe_in_cage_root(pid, Path::new(named.as_deref().unwrap_or(path))).ok()?;
+    // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Decide one notified open: does the file it names carry a configured shape?
@@ -645,19 +679,22 @@ pub(super) fn open_is_refused(
         // spelled-out form cannot see them, while the kernel following them resolves `self` against
         // this process. Asked only here, so an open that resolved normally pays nothing for it.
         Err(e) => {
-            let Some(reached) = proc_self_behind_a_link(pid, dirfd, path) else {
-                return OpenOutcome::failed(e);
-            };
-            match probe_and_vouch(
-                &lens.mounts,
-                pid,
-                &open_target_path(pid, dirfd, &reached),
-                true,
-            ) {
-                Ok(probe) => probe,
-                // The first answer, not the second: the link was a guess at what the path meant, and
-                // a guess that led nowhere says nothing about the open.
-                Err(_) => return OpenOutcome::failed(e),
+            let behind_a_link = proc_self_behind_a_link(pid, dirfd, path).and_then(|reached| {
+                probe_and_vouch(
+                    &lens.mounts,
+                    pid,
+                    &open_target_path(pid, dirfd, &reached),
+                    true,
+                )
+                .ok()
+            });
+            // And, failing that, the walk the cage's own kernel takes: a name this process could
+            // not reach is not yet a name the cage cannot open.
+            match behind_a_link.or_else(|| probe_from_the_cage_root(pid, path)) {
+                Some(probe) => probe,
+                // The first answer, not a later one: each of those was a guess at what the path
+                // meant, and a guess that led nowhere says nothing about the open.
+                None => return OpenOutcome::failed(e),
             }
         }
     };

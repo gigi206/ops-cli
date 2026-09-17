@@ -218,6 +218,15 @@ same proxy, so the request meets the **same** policy as any other: host, path, m
 anti-fronting check, credential injection, the SSRF guard. Nothing is loosened; a name the allowlist
 does not permit is refused exactly as it would be through the proxy.
 
+Wiring the tap changes what the namespace looks like from inside: it gains a black-hole `dummy0`
+interface and a default route through it. The route is what makes the redirect reachable at all
+(the kernel resolves a route *before* the rules run), and it opens nothing: TCP and DNS are bent to
+the tap on loopback, and everything the tap does not carry, meaning UDP to any port but 53 and every
+other protocol, is rejected with `net-unreachable`, exactly the error a cage without the route
+already gave.
+[Architecture](../networking/architecture#why-empty-netns-fail-closed-by-construction) shows the two
+shapes side by side.
+
 Every name the cage asks for is recorded. A resolution appears in
 [`sbx net logs`](../cli/net) on its own line, once per name:
 

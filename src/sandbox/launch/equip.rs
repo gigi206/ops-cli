@@ -192,17 +192,26 @@ pub(super) fn wrap_mise_equip(
 /// collects the rolled-away one with no per-home enumeration. Written unconditionally (warm or
 /// fresh) so an older store missing the root self-heals. Best-effort: a failed build leaves no
 /// out-link, so the `readlink` yields nothing and no root is written (the missing tool surfaces
-/// when it is used), matching the in-cage self-equip posture. `mkdir`/`ln`/`readlink` are invoked
-/// by name (the base coreutils); a persisted tool shadowing one on PATH is a trusted layer harming
-/// its own cage — the self-equip self-harm class already accepted, never a cross-tenant concern.
+/// when it is used), matching the in-cage self-equip posture. `mkdir`/`ln`/`readlink`/`touch`/`rm`
+/// are invoked by absolute store path like `nix` itself, not by name: this preamble is the cage's
+/// first process and runs before the `[proc]` shim installs its filter, while the cage's PATH leads
+/// through directories the cage can write (its own store, its mise shims) — a bare name there would
+/// let in-cage code choose what runs unfiltered. `plumbing_pins` pins the coreutils store root
+/// read-only, which is what makes the absolute path worth more than the name.
 pub(super) fn wrap_flake_equip(
     nix: &Path,
     bash: &Path,
+    env_bin: &Path,
     flake_dir: &Path,
     quads: &[(String, PathBuf, PathBuf, String)],
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
     let n = quads.len();
+    let mkdir = env_bin.with_file_name("mkdir");
+    let touch = env_bin.with_file_name("touch");
+    let rm = env_bin.with_file_name("rm");
+    let readlink = env_bin.with_file_name("readlink");
+    let ln = env_bin.with_file_name("ln");
     // Per package (`$1` ref, `$2` build target, `$3` good out-link, `$4` key): build the target if
     // it is neither warm nor already known-failed (a `<target>.failed` marker, so a broken pin is
     // retried once per build target, not on every launch, and an edited flake — a new
@@ -213,33 +222,38 @@ pub(super) fn wrap_flake_equip(
     // target *is* its good — it has no second key to clear the marker, so it retries as before).
     // The hard-fail (exit 1) is reserved for the case where no prior good build exists at all.
     let script = format!(
-        "mkdir -p '{dir}'\n\
+        "'{mkdir}' -p '{dir}'\n\
          n={n}\n\
          while [ \"$n\" -gt 0 ]; do\n\
          ref=\"$1\"; target=\"$2\"; good=\"$3\"; key=\"$4\"\n\
          if [ ! -e \"$target/bin\" ] && [ ! -e \"$target.failed\" ]; then\n\
          '{nix}' build \"$ref\" --no-write-lock-file --out-link \"$target\" 1>&2\n\
-         [ -e \"$target/bin\" ] || [ \"$target\" = \"$good\" ] || touch \"$target.failed\"\n\
+         [ -e \"$target/bin\" ] || [ \"$target\" = \"$good\" ] || '{touch}' \"$target.failed\"\n\
          fi\n\
          if [ -e \"$target/bin\" ]; then\n\
-         rm -f \"$target.failed\"\n\
-         sp=$(readlink -f \"$target\")\n\
-         [ \"$target\" != \"$good\" ] && ln -sfn \"$sp\" \"$good\"\n\
+         '{rm}' -f \"$target.failed\"\n\
+         sp=$('{readlink}' -f \"$target\")\n\
+         [ \"$target\" != \"$good\" ] && '{ln}' -sfn \"$sp\" \"$good\"\n\
          elif [ -e \"$good/bin\" ]; then\n\
-         sp=$(readlink -f \"$good\")\n\
+         sp=$('{readlink}' -f \"$good\")\n\
          echo \"sbx: flake '$key': build failed — falling back to the last good build; a new revision (or, for an inline flake, an edit) triggers a fresh build\" 1>&2\n\
          else\n\
          echo \"sbx: flake '$key': the build failed and there is no prior build to fall back to\" 1>&2\n\
          exit 1\n\
          fi\n\
-         [ -n \"$sp\" ] && mkdir -p /nix/var/nix/gcroots \
-         && ln -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$key\"\n\
+         [ -n \"$sp\" ] && '{mkdir}' -p /nix/var/nix/gcroots \
+         && '{ln}' -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$key\"\n\
          shift 4\n\
          n=$((n - 1))\n\
          done\n\
          exec \"$@\"",
         dir = flake_dir.to_string_lossy(),
         nix = nix.to_string_lossy(),
+        mkdir = mkdir.to_string_lossy(),
+        touch = touch.to_string_lossy(),
+        rm = rm.to_string_lossy(),
+        readlink = readlink.to_string_lossy(),
+        ln = ln.to_string_lossy(),
     );
     let mut out = vec![
         bash.as_os_str().to_os_string(),

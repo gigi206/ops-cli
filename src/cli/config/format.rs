@@ -443,6 +443,22 @@ pub(super) fn channel_text(c: &config::view::ChannelView, pal: &style::Palette) 
     }
 }
 
+/// A comma-joined list whose entries pass through [`crate::sandbox::sanitize`], for a field a
+/// project supplies without a trust gate.
+///
+/// `[fs]` is honored from any source, so its lists reach this document from a repository nobody
+/// approved. Each entry is screened where it is read — a control character is refused at load —
+/// and this is the second wall on the surface itself: filtering per entry rather than over the
+/// joined line keeps [`crate::sandbox::sanitize`]'s length ceiling from truncating a long but
+/// well-formed list.
+pub(super) fn sanitized_list(entries: &[String]) -> String {
+    entries
+        .iter()
+        .map(|e| crate::sandbox::sanitize(e))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Map a channel's origin *label* to its provenance level for coloring. The channel view carries
 /// its origin as the richer display string `store::Origin::label` emits (`default`/`global`/`project
 /// pin`), a closed, stable set; this colors it on the same gray/cyan/green scale as the other

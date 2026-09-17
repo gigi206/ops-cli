@@ -626,6 +626,12 @@ pub(super) fn serve_tunneled_request(
         } else {
             &[]
         };
+        // Released here for the same reason it is released before the response relay below, and more
+        // sharply: `held` is `None` on this path, so the reservation covers no buffer at all, and
+        // the relay it would otherwise be carried into runs for the life of the WebSocket — a
+        // handshake that declared `Transfer-Encoding: chunked` would pin a whole request's worth of
+        // the shared ceiling, holding nothing, until the cage closed the tunnel.
+        drop(budget);
         // The capture follows the handshake into the upgrade relay, which files it at the `101` (it
         // cannot wait for a tunnel that may stay open for hours — see [`relay_upgrade`]).
         return Turn::closing(relay_upgrade(
@@ -635,6 +641,8 @@ pub(super) fn serve_tunneled_request(
             &injected,
             head_masking,
             ctx,
+            port,
+            &itarget,
             allow_seq,
             capture.as_ref(),
             flow.up.clone(),

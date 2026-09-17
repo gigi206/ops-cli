@@ -99,6 +99,21 @@ pub(crate) fn validate_pattern(pattern: &str) -> Result<(), String> {
     if pattern.is_empty() {
         return Err("an empty pattern matches every file, so it names no shape".to_string());
     }
+    // No control byte, for the reason `[fs] deny` refuses one in an entry: an accepted pattern is
+    // named back — `config show` lists it in the grants block, a refusal names it — and a newline
+    // or an escape sequence there rewrites what a terminal shows, forging lines about masks that
+    // are not in force. `[fs]` is honored from an untrusted project, so the value reaching those
+    // surfaces is one nobody approved. Refused here, once, rather than filtered at each of the
+    // places a pattern is printed. Nothing is lost: a shape that really carries a control byte is
+    // spelled with the regex escape (`\n`, `\t`, `\x1b`), which is printable ASCII.
+    if let Some(bad) = pattern.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "must not contain a control character (found {}) — a pattern is named back in \
+             diagnostics and in `config show`, and a control byte there rewrites what a terminal \
+             shows; spell it as a regex escape instead",
+            bad.escape_debug()
+        ));
+    }
     regex::bytes::RegexBuilder::new(pattern)
         .size_limit(SET_SIZE_LIMIT)
         .build()
@@ -221,6 +236,36 @@ mod tests {
             !bad.contains("empty"),
             "a broken pattern must keep its own reason: {bad}"
         );
+    }
+
+    /// A pattern is named back on surfaces a person reads: the grants block of `sbx config show`
+    /// lists every accepted one, and a refusal quotes the entry. `[fs]` is honored without a trust
+    /// gate, so those bytes can come from a repository nobody approved, and a literal newline or
+    /// escape sequence in one rewrites what the terminal shows rather than naming a shape. The
+    /// refusal is the same one `[fs] deny` entries earn, and it costs nothing: the regex escapes
+    /// spell the same content in printable ASCII.
+    #[test]
+    fn a_pattern_carrying_a_control_byte_is_refused() {
+        for raw in [
+            "tok\n  fs deny:  .env  (project)",
+            "\u{1b}c",
+            "a\rb",
+            "a\tb",
+        ] {
+            let reason = validate_pattern(raw).expect_err("a control byte is not part of a shape");
+            assert!(
+                reason.contains("control character"),
+                "the refusal must name the reason: {reason}"
+            );
+            assert!(
+                OpenPolicy::compile(&[raw.to_string()], MAX_SCAN_DEFAULT).is_err(),
+                "the set builder must refuse it too, or the two validators disagree"
+            );
+        }
+
+        // The witness: the escape spelling matches the same content and stays accepted, so no
+        // shape becomes unexpressible.
+        assert!(validate_pattern(r"sk-\n[0-9]+").is_ok());
     }
 
     #[test]

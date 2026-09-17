@@ -10,7 +10,7 @@ use crate::style;
 
 use super::format::{
     app_provenance_parts, app_provenance_tag, bind_mode_tag, channel_text, package_line,
-    service_line, write_net_posture_head, write_notify,
+    sanitized_list, service_line, write_net_posture_head, write_notify,
 };
 
 /// Whether a posture line belongs in the default per-app view, recording the ones it does not.
@@ -409,7 +409,7 @@ fn app_detail_fs(o: &mut String, view: &config::view::AppDetailView, pal: &style
         let _ = writeln!(
             o,
             "  {h}fs scan:{r} {} {dim}(content closed at every open; {ceiling}){r}{fs_tag}",
-            view.fs_scan.join(", ")
+            sanitized_list(&view.fs_scan)
         );
     }
     if !view.fs_readonly.is_empty() {
@@ -466,15 +466,25 @@ fn app_detail_collections(
             &view
                 .env
                 .iter()
-                .map(|e| format!("{n}{}{r}", e.key))
+                .map(|e| format!("{n}{}{r}", crate::sandbox::sanitize(&e.key)))
                 .collect::<Vec<_>>(),
             view.env_inherited,
             pal
         )
     );
     if details {
+        // `[env]` is the one table an untrusted project's `.sbx.toml` fills whose *values* nothing
+        // validates — only reserved keys are dropped — so an escape sequence or a newline in a
+        // value would otherwise repaint the lines above, which on this surface are the ones saying
+        // what the app's real posture is. Filtered like the baseline `env_section` and the app rows
+        // of `sbx config show --details`; `--json` and `sbx config get` keep the bytes.
         for e in &view.env {
-            let _ = writeln!(o, "    {n}{}{r}={}", e.key, e.value);
+            let _ = writeln!(
+                o,
+                "    {n}{}{r}={}",
+                crate::sandbox::sanitize(&e.key),
+                crate::sandbox::sanitize(&e.value)
+            );
         }
     }
     let _ = writeln!(
@@ -1166,6 +1176,29 @@ mod tests {
             out.contains("shared_credential claude.ai, api.anthropic.com"),
             "{out}"
         );
+    }
+
+    /// `[env]` values come verbatim from a project that may never have been trusted, so this view
+    /// filters them exactly as the baseline `env_section` does: an escape sequence expanded under
+    /// `--details` would repaint the posture lines printed above it.
+    #[test]
+    fn an_app_env_value_cannot_paint_the_terminal_of_whoever_audits_the_profile() {
+        let p = style::Palette::plain();
+        let mut view = sample_app_detail_view();
+        view.env = vec![
+            config::view::AppEnvVar {
+                key: "K".into(),
+                value: "v\u{1b}[2Kwiped\nnetwork: shared (host network)".into(),
+            },
+            config::view::AppEnvVar {
+                key: "PLAIN".into(),
+                value: "ordinary value".into(),
+            },
+        ];
+        let out = render_app_detail(&view, &p, true);
+        assert!(!out.contains('\u{1b}'), "{out}");
+        assert!(!out.contains("\nnetwork: shared"), "{out}");
+        assert!(out.contains("PLAIN=ordinary value"), "{out}");
     }
 
     #[test]

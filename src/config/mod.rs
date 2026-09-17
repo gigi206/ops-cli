@@ -743,8 +743,9 @@ pub(crate) struct Resolved {
     /// may open a filtering posture (`deny`/`allow`/`ask`) over a non-filtering baseline, in which
     /// case the proxy would inject these; [`Resolved::merge_app`] (and the `--app` view) re-derive
     /// the effective set from this, not from the posture-cleared `secrets`, so a baseline credential
-    /// the baseline posture would clear is still inheritable. The baseline launch/display use
-    /// `secrets`; only the per-app fold reads this.
+    /// the baseline posture would clear is still inheritable. A one-shot override that replaces the
+    /// posture re-derives from this for the same reason, so `sbx run --net deny` over a
+    /// non-filtering baseline injects what `sbx app run <name>` would.
     ///
     /// A one-shot override's `[secret]` section is applied to this set as well as to `secrets`
     /// ([`Resolved::apply_override`]): the `--app` view re-derives from here *after* an override
@@ -1240,6 +1241,7 @@ impl Resolved {
         }
 
         // The scalar postures validated above.
+        let network_overridden = new_network.is_some();
         if let Some((policy, stats)) = new_network {
             if let Some(b) = stats {
                 self.egress_stats = b;
@@ -1420,6 +1422,38 @@ impl Resolved {
                 &defaults,
                 &plugins,
             );
+            // Answer the just-declared credentials from the resolved `[plugin.*]` tables, the same
+            // way `resolve` answers the baseline's: a credential built here carries plugin
+            // instances straight from the registry, i.e. an empty `HostConfig`, so without this its
+            // resolver chain and its signer would run with none of the configured environment —
+            // one declaration resolving two different ways depending on whether it was written in
+            // the config or handed to a single launch. `matched` is local: the "no secret uses a
+            // plugin by that name" warning is emitted once, where the table is read.
+            let mut matched = BTreeSet::new();
+            apply_plugin_host_config_to_secrets(
+                &mut self.declared_secrets,
+                &self.plugin,
+                &mut matched,
+                &mut self.warnings,
+            );
+            apply_plugin_host_config_to_secrets(
+                &mut self.secrets,
+                &self.plugin,
+                &mut matched,
+                &mut self.warnings,
+            );
+        }
+        // An override that replaces the posture re-decides injection, exactly as an app overlay
+        // does: drop the baseline's secret-posture warning (it judged a posture no longer in
+        // effect) and re-derive the effective credentials from the *declared* set, so a launch that
+        // opens a filtering posture injects a credential the baseline posture had cleared. The
+        // re-check below re-emits the warning only if the overridden posture still drops them.
+        // Gated, because on a launch that left the posture alone the baseline verdict still stands
+        // and re-deriving would only clear the set a second time and say so twice.
+        if network_overridden {
+            self.warnings
+                .retain(|w| !w.contains("HTTP-header secret(s)"));
+            self.secrets = self.declared_secrets.clone();
         }
         enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
         Ok(())
@@ -4774,6 +4808,78 @@ mod a_layer_replaces_only_what_it_declares {
             headers(&r.declared_secrets),
             headers(&r.secrets),
             "and the half the app view reads says the same"
+        );
+    }
+
+    #[test]
+    fn a_one_shot_posture_that_filters_inherits_a_posture_cleared_credential() {
+        // The override half of the rule `merge_app` holds: a credential declared under a
+        // non-filtering baseline is absent from the baseline-effective set, and an override that
+        // hands the launch a filtering posture re-decides injection — the proxy it starts is what
+        // injects. Leaving the set empty sent every request to the host unauthenticated while the
+        // build printed a warning naming, as the cause, the very posture just supplied.
+        let mut r = global(
+            "network = \"none\"\n\
+             [secret.\"api.example.com\"]\n\
+             from = \"env://DEMO_API_KEY\"\n\
+             header = \"Authorization\"\n\
+             type = \"bearer\"\n",
+        );
+        assert!(
+            r.secrets.is_empty(),
+            "the baseline posture clears the credential"
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("HTTP-header secret(s)")),
+            "and says so: {:?}",
+            r.warnings
+        );
+        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")))
+            .expect("the override applies");
+        assert_eq!(
+            headers(&r.secrets),
+            vec!["Authorization"],
+            "the filtering posture the operator supplied injects it: {:?}",
+            r.warnings
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.contains("HTTP-header secret(s)")),
+            "and the warning that judged the replaced posture is gone: {:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn an_override_that_leaves_the_posture_alone_keeps_the_baseline_verdict() {
+        // The other side of the gate: the re-derivation above is conditional because a launch that
+        // says nothing about the network leaves the baseline's verdict standing — re-deriving
+        // unconditionally would reinstate the cleared set only to clear it again, and the warning
+        // resolve already pushed would be joined by a second copy of itself.
+        let mut r = global(
+            "network = \"none\"\n\
+             [secret.\"api.example.com\"]\n\
+             from = \"env://DEMO_API_KEY\"\n\
+             header = \"Authorization\"\n\
+             type = \"bearer\"\n",
+        );
+        r.apply_override(Override::for_test(cfg("[env]\nFOO = \"bar\"\n")))
+            .expect("the override applies");
+        assert!(
+            r.secrets.is_empty(),
+            "the posture that cleared them is still in force"
+        );
+        assert_eq!(
+            r.warnings
+                .iter()
+                .filter(|w| w.contains("HTTP-header secret(s)"))
+                .count(),
+            1,
+            "and it is said once: {:?}",
+            r.warnings
         );
     }
 }

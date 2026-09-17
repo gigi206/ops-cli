@@ -66,30 +66,39 @@ curl https://cache.nixos.org → Could not resolve host
 curl https://1.2.3.4/        → Could not connect
 ```
 
-The one **GUI-only nuance**: under `gui = "offscreen"` or `gui = "wayland"`, as
-[`gui`](../configuration/gui#offscreen) describes, a small
-host-side `__netns-holder` binary (`src/sandbox/netns.rs`) adds a `dummy0`
-interface (a kernel black hole, no peer, no route, drops everything) before exec'ing bwrap.
+The one **nuance**: some launches need a host-side `__netns-holder` binary
+(`src/sandbox/netns.rs`), namely `gui = "offscreen"` or `gui = "wayland"`, as
+[`gui`](../configuration/gui#offscreen) describes, and any launch that wires the
+[capture tap](../configuration/network#clients-that-ignore-the-proxy-variables). That holder adds a
+`dummy0` interface (a kernel black hole, no peer, drops everything) before exec'ing bwrap.
 Chromium/Electron decide `navigator.onLine` from the **presence of a non-loopback
 interface**, not from actual reachability, so a loopback-only cage reads as "no
 network" and a graphical app freezes on *"No internet"* even
 though egress works perfectly through the proxy. The dummy flips that to `true` without
-opening any egress: a direct `connect()` to any real host still finds no route and
+opening any egress: a direct `connect()` to any real host is still refused and
 fails closed, and all real traffic still goes through the proxy on loopback. So:
 
-- **CLI / headless cage (`gui = "none"`, the default)**: `lo` only. The above `ip -o addr`
-  output is true byte-for-byte.
-- **GUI cage (`gui = "offscreen"` / `gui = "wayland"`)**: `lo` + a `dummy0` with the
-  private non-routable /24 `10.11.12.0/24`. **No default route** is added, so the
+- **CLI / headless cage (`gui = "none"`, the default) with no capture tap**: `lo` only. The
+  above `ip -o addr` output is true byte-for-byte.
+- **GUI cage (`gui = "offscreen"` / `gui = "wayland"`) with no capture tap**: `lo` + a `dummy0`
+  with the private non-routable /24 `10.11.12.0/24`. **No default route** is added, so the
   dummy cannot become an egress path. No DNS resolver is added either; the empty-netns
   property holds.
+- **Any cage with the capture tap wired** (headless or GUI): `lo` + the same `dummy0`, and this
+  time a **default route** `via 10.11.12.1 dev dummy0`. The kernel looks a route up *before* the
+  redirect rules run, so without one those rules would never be consulted and the tap would listen
+  to silence. The route opens nothing: TCP and DNS are bent to the tap on loopback before a packet
+  can reach the dummy, and everything the tap does not carry (UDP to any port but 53, and every
+  other protocol) is refused by a filter rule with `net-unreachable`, the same error the routeless
+  cage raised. A DNS resolver *is* present here, and it is the tap itself (see
+  [`network`](../configuration/network#clients-that-ignore-the-proxy-variables)).
 
 Why the inverse fallback `lo` only → `lo + dummy0` does **not** re-introduce Model P's
 holes: under Model P a NAT uplink leaks the host's loopback and `169.254.169.254` by
-default; here the dummy has neither a peer nor a default route, so every cage-side
-`connect()` fails as before. The dummy flips Chromium's `navigator.onLine` API, which
-keys on interface presence, **not** a real reachability check that Model P would
-satisfy.
+default; here the dummy has no peer, and either no default route at all or one whose every
+uncaptured packet is rejected, so every cage-side `connect()` fails as before. The dummy flips
+Chromium's `navigator.onLine` API, which keys on interface presence, **not** a real reachability
+check that Model P would satisfy.
 
 Nothing leaves the cage unless it goes through the one bound socket. A
 misconfiguration, a missing socket, a crashed proxy, fails **closed**: no egress at

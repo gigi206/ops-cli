@@ -44,6 +44,7 @@ fn a_control_byte_in_a_request_part_is_refused_before_a_byte_is_written() {
     let url = |host: &str, target: &str| Url {
         host: host.to_string(),
         port: 443,
+        authority: host.to_string(),
         target: target.to_string(),
     };
 
@@ -82,6 +83,35 @@ fn a_control_byte_in_a_request_part_is_refused_before_a_byte_is_written() {
         "{text}"
     );
     assert!(text.contains("\r\nAuthorization: Bearer abc\r\n"), "{text}");
+}
+
+/// A registry reached on a port other than 443 is addressed by its whole authority: RFC 7230 §5.4
+/// requires the port in `Host` when it is not the scheme default, and a registry that routes on the
+/// authority, or derives its absolute `Location` values from it, answers the wrong origin without
+/// it. The port the TCP connection used is not visible on the wire.
+#[test]
+fn the_host_header_carries_the_port_when_it_is_not_the_default() {
+    let wire = || Wire {
+        written: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        response: std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()),
+    };
+    let sent = |u: &Url| {
+        let w = wire();
+        let seen = std::rc::Rc::clone(&w.written);
+        send(w, u, &[], "GET").expect("an ordinary request composes");
+        String::from_utf8(seen.borrow().clone()).unwrap()
+    };
+
+    let text = sent(&parse_url("https://localhost:5000/v2/x/manifests/1").unwrap());
+    assert!(
+        text.starts_with("GET /v2/x/manifests/1 HTTP/1.1\r\n"),
+        "{text}"
+    );
+    assert!(text.contains("\r\nHost: localhost:5000\r\n"), "{text}");
+
+    // …and the default port stays out of the authority, as the same rule requires.
+    let text = sent(&parse_url("https://r.test/v2/").unwrap());
+    assert!(text.contains("\r\nHost: r.test\r\n"), "{text}");
 }
 
 #[test]
@@ -206,6 +236,7 @@ fn a_header_is_read_case_insensitively() {
         status: 401,
         headers: headers(&[("WWW-Authenticate", "Bearer realm=\"https://auth\"")]),
         body: Vec::new(),
+        redirected: false,
     };
     assert_eq!(
         r.header("www-authenticate"),

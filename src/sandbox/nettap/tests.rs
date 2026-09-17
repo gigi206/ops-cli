@@ -611,6 +611,37 @@ fn the_ruleset_keeps_what_nftables_and_the_egress_forwarder_require() {
     );
 }
 
+/// The default route the holder installs alongside these rules gives every protocol somewhere to
+/// go, but only TCP and DNS are captured. Without the closing `reject` the rest would reach the
+/// dummy device and be dropped there, so a `sendto` would succeed into a black hole instead of
+/// failing at once. The order is what makes the refusal narrow: the accepts that precede it are the
+/// traffic the tap and the egress forwarder own.
+#[test]
+fn the_ruleset_refuses_what_it_does_not_capture() {
+    let rules = redirect_ruleset();
+    let offset = |needle: &str| {
+        rules
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?}: {rules}"))
+    };
+    assert!(
+        rules.contains("type filter hook output priority filter"),
+        "`reject` is not valid in a nat chain, so the refusal needs a filter chain of its own: \
+         {rules}"
+    );
+    let reject = offset("reject with icmp type net-unreachable");
+    for accept in [
+        "ip daddr 127.0.0.0/8 accept",
+        "udp dport 53 accept",
+        "meta l4proto tcp accept",
+    ] {
+        assert!(
+            offset(accept) < reject,
+            "{accept:?} must be reached before the catch-all refusal: {rules}"
+        );
+    }
+}
+
 #[test]
 fn the_cage_resolver_file_names_an_address_the_redirect_catches() {
     let body = resolv_conf();

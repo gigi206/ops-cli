@@ -1660,9 +1660,10 @@ impl TaskEngine {
     /// runs, and only the interpreter can be the caller of anything the script goes on to do.
     ///
     /// Read from the file rather than assumed, and followed through an interpreter that is itself a
-    /// script, which the kernel does not do (Linux runs one `#!` hop) but a reader might write. The
-    /// hop cap is what a loop meets; an unreadable file is left as itself, and the policy then simply
-    /// governs a program that never appears — fail-closed.
+    /// script, which the kernel does too: it re-enters its handler loop for each interpreter it
+    /// loads, up to a ceiling of its own. The hop cap is what a loop meets; an unreadable file is
+    /// left as itself, and the policy then simply governs a program that never appears —
+    /// fail-closed.
     ///
     /// A **relative** spelling is resolved against the cage's working directory first, because what
     /// this returns is a caller key: the supervisor addresses a caller by `/proc/<pid>/exe`, which

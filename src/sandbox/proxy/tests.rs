@@ -1159,6 +1159,10 @@ fn an_interim_head_before_the_101_does_not_decline_the_upgrade() {
 /// at `INTERIM_HEAD_MAX`. An upstream that closes without answering left the tunnel dying with the
 /// error propagated and nothing said, where the request planes write a `502` naming the cause. A
 /// client waiting on an upgrade cannot tell either from a hang.
+///
+/// The record is the other half of the answer. The allow was recorded before the relay was entered
+/// and its status never arrives, so the `error` line naming the upstream is the only thing that
+/// tells an operator reading `sbx net logs` why the WebSocket never opened.
 #[test]
 fn an_upgrade_the_upstream_never_answers_is_refused_rather_than_dropped() {
     for (label, prefix, reason) in [
@@ -1189,10 +1193,14 @@ fn an_upgrade_the_upstream_never_answers_is_refused_rather_than_dropped() {
         );
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
         let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(crate::sandbox::control::LogRing::new(
+            crate::sandbox::control::LOG_RING_CAP,
+        ));
         let ctx = Arc::new(
             ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
                 .unwrap()
                 .with_upstream(upstream_cfg)
+                .with_log(log.clone())
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         let transcript =
@@ -1202,6 +1210,23 @@ fn an_upgrade_the_upstream_never_answers_is_refused_rather_than_dropped() {
             transcript.contains("502") && transcript.contains(reason),
             "{label}: the client must be told why the upgrade never resolved: {transcript:?}"
         );
+        // The allow stands and is not amended; the `error` beside it is what names the cause.
+        let events = log.snapshot(None, None, false).events;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.reason == "allowed" && e.method.as_deref() == Some("WS")),
+            "{label}: the allow the policy granted must still be recorded: {events:?}"
+        );
+        let refusal = events
+            .iter()
+            .find(|e| e.verdict == crate::sandbox::control::LogVerdict::Error)
+            .unwrap_or_else(|| {
+                panic!("{label}: the refusal must leave a line naming the upstream: {events:?}")
+            });
+        assert_eq!(refusal.reason, reason, "{label}: {events:?}");
+        assert_eq!(refusal.method.as_deref(), Some("WS"), "{label}: {events:?}");
+        assert_eq!(refusal.host, "upstream.test", "{label}: {events:?}");
         if reason == "interim-head-cap" {
             let crossed = transcript.matches("100 Continue").count();
             assert!(
@@ -1289,6 +1314,72 @@ fn a_websocket_upgrade_the_upstream_declines_is_relayed_as_a_normal_response() {
     );
 }
 
+/// The handshake of an exchange whose answer will be scanned is forwarded asking for `identity`,
+/// the same bargain every other plane strikes.
+///
+/// A credential scoped to a *path* on a host (`host/v1/*`) does not refuse an upgrade to another
+/// path on it — the refusal is by injection match, the mask by host — so the WebSocket plane is
+/// reached with a non-empty reflection mask. A declining upstream's body then passes through a
+/// masker that strikes out verbatim occurrences only, and a `gzip` body holds none: the credential
+/// the host echoes would re-enter the cage in the clear. The negative arm is the scoping: a
+/// handshake nothing scans travels with no `identity` of sbx's own.
+#[test]
+fn a_websocket_handshake_whose_answer_will_be_scanned_is_asked_for_uncompressed() {
+    for target in ["upstream.test/v1/*", "other.test:*"] {
+        let scanned = target.starts_with("upstream.test");
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+                .with_injections(vec![injection(
+                    target,
+                    "Authorization",
+                    "Bearer sbx-secret-value",
+                )])
+                .with_redactions(vec![SecretNeedle::named(
+                    "test-secret",
+                    b"sbx-secret-value".to_vec(),
+                )]),
+        );
+        let transcript =
+            through_proxy_websocket(ctx, proxy_ca_der, "upstream.test", addr.port()).unwrap();
+        assert!(
+            transcript.contains("200"),
+            "the declined upgrade must still be relayed: {transcript:?}"
+        );
+        let head = rx
+            .recv_timeout(UPSTREAM_WAIT)
+            .expect("the upstream received the handshake")
+            .to_ascii_lowercase();
+        // Matched per line, because `grpc-accept-encoding: identity` contains the other header's
+        // spelling as a substring and a `contains` over the whole head would accept either alone.
+        let lines: Vec<&str> = head.lines().map(str::trim_end).collect();
+        assert!(
+            lines.contains(&"upgrade: websocket"),
+            "the handshake itself must still reach the upstream: {lines:?}"
+        );
+        assert_eq!(
+            scanned,
+            lines.contains(&"accept-encoding: identity")
+                && lines.contains(&"grpc-accept-encoding: identity"),
+            "only a handshake whose answer is scanned gives up compression: {lines:?}"
+        );
+    }
+}
+
 /// A WebSocket needs an explicit `{WS}` grant: a host allowed for all HTTP methods (`{*}`) does
 /// NOT open a WebSocket. The upgrade is method-denied (host allowed, WS not) and no tunnel opens —
 /// the opt-in that keeps a read/write HTTP allowance from silently becoming a bidirectional channel.
@@ -1348,6 +1439,85 @@ fn a_credential_injected_websocket_is_refused() {
         !transcript.contains("101 Switching"),
         "no injected WebSocket tunnel opens: {transcript:?}"
     );
+}
+
+/// An open WebSocket holds no share of the shared body-buffer ceiling. A handshake may legally
+/// declare `Transfer-Encoding: chunked`, which takes a whole request's reservation out of
+/// `held_bodies` — but an upgrade buffers no body at all, and the relay it turns into runs for as
+/// long as the peers keep the tunnel open. Teeth: without the release in the upgrade branch the
+/// reservation rides into the relay, so a handful of such handshakes pin the whole ceiling with
+/// nothing buffered and every later chunked or digested request is refused `body-buffer-cap`.
+#[test]
+fn an_open_websocket_holds_no_body_budget() {
+    let (addr, upstream_ca, up) = spawn_ws_upstream();
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let observer = Arc::clone(&ctx);
+
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+    });
+    let mut sock = UnixStream::connect(&path).unwrap();
+    write!(
+        sock,
+        "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
+        addr.port()
+    )
+    .unwrap();
+    sock.flush().unwrap();
+    let _ = read_until_blank(&mut sock).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(proxy_ca_der).unwrap();
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = ServerName::try_from("upstream.test".to_string()).unwrap();
+    let conn = ClientConnection::new(Arc::new(client_config), name).unwrap();
+    let mut tls = StreamOwned::new(conn, sock);
+    // The handshake the defect rides: a `GET` upgrade that also declares chunked framing, which the
+    // framing inspector accepts on any method on this plane.
+    tls.write_all(
+        b"GET /chat HTTP/1.1\r\nHost: upstream.test\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\nTransfer-Encoding: chunked\r\n\r\n",
+    )
+    .unwrap();
+    tls.flush().unwrap();
+    let head = read_head_until_blank(&mut tls).unwrap();
+    assert!(head.contains("101 Switching Protocols"), "{head:?}");
+    // Asked while the tunnel is open — the reservation is released before the relay is entered, so
+    // the `101` the client just read is proof the release has already happened.
+    assert_eq!(
+        observer
+            .held_bodies
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an open WebSocket buffers nothing and must reserve nothing"
+    );
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
+    drop(tls);
+    up.join().unwrap();
 }
 
 /// A deterministic large payload (no `\r\n` runs, so it cannot be mistaken for a head terminator).
@@ -8420,6 +8590,63 @@ fn the_cleartext_plane_observes_a_credential_the_cage_sent_itself() {
             .any(|n| n.as_bytes() == b"acquired-over-cleartext"),
         "a credential the cage sent in the clear must join the scan set: {:?}",
         set.needles.iter().map(|n| n.name()).collect::<Vec<_>>()
+    );
+}
+
+/// The inbound backstop, asked of the **inspected-cleartext (`http://`)** plane — the fourth one,
+/// and the one that answered the question by assuming it.
+///
+/// A cleartext host can be an injection target. `validate_secret_target` forces a `[secret] to` rule
+/// to `Layer::L7`, which is what keeps the bearer itself off this wire, but it says nothing about
+/// what else the policy may open: an operator who also allows `http://<same host>` (for an
+/// unencrypted status endpoint, say) has a host that holds the credential from its TLS requests and
+/// can reflect it into a cleartext response. [`CredentialSet::masks_reflection_for`] answers `true`
+/// for that host, so the two inspected-TLS planes mask it; this one has to ask the same question,
+/// or the value the injection design exists to keep out of the cage arrives in the clear, logged as
+/// a plain `allow`.
+#[test]
+fn a_reflected_injected_secret_is_masked_on_the_cleartext_plane() {
+    const SECRET: &str = "sbx-secret-value";
+    // The upstream echoes the injected value in a JSON body (43 bytes; the same-length mask keeps
+    // `Content-Length` valid).
+    let (addr, _up_head) = spawn_plain_upstream(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 43\r\nConnection: close\r\n\r\n\
+          {\"authorization\":\"Bearer sbx-secret-value\"}",
+    );
+    let port = addr.port();
+    let rule = format!("http://upstream.test:{port}");
+    let ctx = Arc::new(
+        ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            // The secret's own `to` rule names the same host the `http://` rule opens.
+            .with_injections(vec![injection(
+                "upstream.test:*",
+                "Authorization",
+                "Bearer sbx-secret-value",
+            )])
+            .with_redactions(vec![SecretNeedle::named(
+                "test-secret",
+                SECRET.as_bytes().to_vec(),
+            )]),
+    );
+    let request = format!(
+        "GET http://upstream.test:{port}/headers HTTP/1.1\r\nHost: upstream.test:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+    assert!(resp.contains("200"), "the response still flows: {resp:?}");
+    assert!(
+        !resp.contains(SECRET),
+        "the reflected secret must be masked out of the cleartext response: {resp:?}"
+    );
+    assert!(
+        resp.contains(&"*".repeat(SECRET.len())),
+        "the secret is replaced by an equal-length mask: {resp:?}"
+    );
+    assert!(
+        resp.contains("{\"authorization\":\"Bearer "),
+        "the legitimate response content around it survives: {resp:?}"
     );
 }
 

@@ -2347,7 +2347,28 @@ fn run_under_supervisor_binfmt(
     if let Some(p) = path {
         cmd.env("PATH", p);
     }
-    let mut child = spawn_shim(&mut cmd);
+    serve_under_supervisor(
+        &mut cmd, &listener, policy, overlay, notifs, notifier, binfmt,
+    )
+}
+
+/// The supervisor half of the harness: start `cmd`, take the shim's handoff from `listener`, and
+/// answer `notifs` notifications.
+///
+/// Apart from the command that produces them, because a payload needing a cage of its own builds a
+/// different command and the same supervisor — a second copy of this loop would drift from the one
+/// every other test measures.
+#[allow(clippy::too_many_arguments)]
+fn serve_under_supervisor(
+    cmd: &mut std::process::Command,
+    listener: &UnixListener,
+    policy: &ProcPolicy,
+    overlay: &ProcOverlay,
+    notifs: usize,
+    notifier: &crate::sandbox::notify_sink::Notifier,
+    binfmt: &[crate::proc_policy::BinfmtRule],
+) -> (Option<i32>, Arc<ExecRing>) {
+    let mut child = spawn_shim(cmd);
 
     let (sock, _) = listener.accept().expect("the shim never connected");
     let notif = recv_fd(&sock).expect("receive the listener fd");
@@ -2714,6 +2735,57 @@ fn the_interpreter_a_shebang_names_is_decided_too() {
             .iter()
             .any(|e| e.verdict == "deny" && e.command.contains("/bin/sh")),
         "the record names the interpreter the rule spoke about, not only the script: {events:?}"
+    );
+}
+
+/// A `#!` line naming a script is followed to the program the kernel really starts.
+///
+/// The kernel does not stop at one substitution: it re-enters its handler loop for the interpreter
+/// it has just loaded, so `a.sh` naming `b.sh` naming `/bin/sh` starts the shell from a single
+/// `execve` -- measured, argv built exactly as `binfmt_script` builds it. A supervisor that decided
+/// the first line alone would decide two names no rule speaks about and answer `CONTINUE` for the
+/// third, which is the one the `deny` rule names.
+///
+/// The witness arm is what keeps this from passing for the wrong reason: the same two-link chain
+/// under a policy denying something else must run to completion and return its own exit code.
+#[test]
+fn a_shebang_chain_is_followed_to_the_program_the_kernel_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TmpDir::new();
+    let inner = dir.join("b.sh");
+    std::fs::write(&inner, "#!/bin/sh\nexit 7\n").expect("write the inner script");
+    let outer = dir.join("a.sh");
+    std::fs::write(&outer, format!("#!{}\n", inner.display())).expect("write the outer script");
+    for script in [&inner, &outer] {
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let script = outer.to_str().expect("utf-8 script path").to_string();
+
+    // The witness: the chain really resolves here, so the refusal below is the rule and not the
+    // kernel refusing a script whose interpreter is a script.
+    let elsewhere = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+    let (code, _) = run_under_supervisor(&[&script], &elsewhere, &ProcOverlay::new());
+    assert_eq!(
+        code,
+        Some(7),
+        "the two-link chain must really reach the shell here, or this test measures nothing"
+    );
+
+    // The finding: the program at the end of the chain is decided too, though neither name the
+    // syscall or the first `#!` line carried is the one the rule speaks about.
+    let denied = ProcPolicy::new(ProcMode::Enforce, &[], &["sh".to_string()]);
+    let (code, ring) = run_under_supervisor(&[&script], &denied, &ProcOverlay::new());
+    assert_eq!(
+        code,
+        Some(126),
+        "a denied program must not run because two `#!` lines stood between it and the syscall"
+    );
+    let events = ring.snapshot(None).events;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.verdict == "deny" && e.command.contains("/bin/sh")),
+        "the record names the program the rule spoke about, at the end of the chain: {events:?}"
     );
 }
 
@@ -3398,6 +3470,164 @@ fn bwrap_on_path() -> Option<PathBuf> {
     })
 }
 
+/// Run the shim inside a cage of its own and answer the one `execve` it issues.
+///
+/// The cage is one `unshare`: a user namespace and a mount namespace, with a tmpfs over a directory
+/// that exists on the host as well. That is the whole fixture the two tests below need -- a name the
+/// cage resolves to one file and this process to another, or to nothing -- and it keeps the rest of
+/// the filesystem shared, so the shim and its handoff socket stay reachable from inside. `{cage}` in
+/// `setup` and in `target` is replaced with that directory; `plant` fills its **host** side first,
+/// before the tmpfs hides it from the cage.
+///
+/// `None` where the host cannot stand up a namespace at all, which is the caller's skip: with the
+/// target in this process's own namespace the two walks coincide and nothing is measured.
+fn run_in_cage(
+    setup: &str,
+    target: &str,
+    policy: &ProcPolicy,
+    plant: impl FnOnce(&std::path::Path),
+) -> Option<(Option<i32>, Arc<ExecRing>)> {
+    let unshare = crate::pathfind::find_on_path("unshare")?;
+    if !matches!(crate::probe_userns(), crate::Userns::Ok) {
+        return None;
+    }
+    let dir = TmpDir::new();
+    let cage = dir.join("cage");
+    std::fs::create_dir_all(&cage).expect("the directory the tmpfs goes over");
+    plant(&cage);
+    let cage = cage.to_str().expect("utf-8 fixture path").to_string();
+    let shim = materialized_shim(&dir);
+    // The shim was written a moment ago, and a test binary forking on another thread can still hold
+    // that write descriptor open -- which the kernel answers with `ETXTBSY`. The wait is taken here
+    // because the exec that matters happens inside the cage's shell, where it cannot be retried.
+    let _ =
+        spawn_shim(std::process::Command::new(&shim).stderr(std::process::Stdio::null())).wait();
+    let sock_path = dir.join("notif.sock");
+    let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
+
+    let script = format!(
+        "mount -t tmpfs tmpfs '{cage}' || exit 1\n{}\nexec '{}' '{}' -- '{}'\n",
+        setup.replace("{cage}", &cage),
+        shim.display(),
+        sock_path.display(),
+        target.replace("{cage}", &cage),
+    );
+    let mut cmd = std::process::Command::new(unshare);
+    cmd.args(["--user", "--map-root-user", "--mount"])
+        .arg("sh")
+        .arg("-c")
+        .arg(script);
+    Some(serve_under_supervisor(
+        &mut cmd,
+        &listener,
+        policy,
+        &ProcOverlay::new(),
+        1,
+        &crate::sandbox::notify_sink::Notifier::disabled(),
+        &[],
+    ))
+}
+
+/// A `#!` line behind an absolute symlink the cage planted is read, or the exec is refused.
+///
+/// The supervisor reaches an exec target by prefixing `/proc/<pid>/root`, which holds the walk on
+/// the cage's mounts only until it meets a symlink whose target begins with `/`: such a target
+/// restarts the resolution at the *resolving* process's root, which is this one's, and what it
+/// lands on there is usually nothing at all. The cage's own `execve` resolves the same link against
+/// the cage's root and runs what it finds, `#!` line and all -- so an absence this process measured
+/// is no reason to answer `CONTINUE` with the head unread. One `ln -s` would otherwise be the whole
+/// bypass: the script spelled directly is refused, and the link to it is not.
+///
+/// The witness arm is the script named directly, which must run to completion: the refusal below is
+/// then the link and not the cage failing to launch anything at all.
+#[test]
+fn a_head_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_given_up_on() {
+    let setup = "printf '#!/bin/sh\\nexit 7\\n' > '{cage}/payload'\n\
+                 chmod 755 '{cage}/payload'\n\
+                 ln -s '{cage}/payload' '{cage}/l'\n";
+    let elsewhere = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+    let Some((code, _)) = run_in_cage(setup, "{cage}/payload", &elsewhere, |_| {}) else {
+        skip_incapable!("skipping the cage walk: need `unshare` and a usable userns");
+        return;
+    };
+    assert_eq!(
+        code,
+        Some(7),
+        "the script must really run inside the cage here, or this test measures nothing"
+    );
+
+    // The finding: the same script reached through an absolute link the cage planted must not run
+    // with its interpreter undecided.
+    let denied = ProcPolicy::new(ProcMode::Enforce, &[], &["sh".to_string()]);
+    let (code, ring) =
+        run_in_cage(setup, "{cage}/l", &denied, |_| {}).expect("the cage stood up a moment ago");
+    assert_ne!(
+        code,
+        Some(7),
+        "a denied interpreter must not run because a link stood between the name and the script"
+    );
+    let events = ring.snapshot(None).events;
+    assert!(
+        events.iter().any(|e| e.verdict == "deny"),
+        "and the refusal is recorded: {events:?}"
+    );
+}
+
+/// A target spelled under `/proc/self` has its head read from the **cage's** file, or not at all.
+///
+/// `/proc/self/fd/<n>` names an object the caller already holds, so its head is read through the
+/// caller's own `/proc` entry with no mount asked to vouch for it. Everything else behind that
+/// prefix is ordinary path text the cage chose: `/proc/self/root/<anything>` names the cage's whole
+/// filesystem, and a component of it that is a symlink with an absolute target re-roots the walk at
+/// this process's root. Read unvouched, the supervisor then decides the `#!` line of a host file the
+/// cage never named -- and answers about it while the kernel runs the cage's.
+///
+/// The fixture is that differential: the same name holds one script on the host and another in the
+/// cage, and only one of them is the one the `execve` runs.
+#[test]
+fn a_head_spelled_under_proc_self_is_read_from_the_cage_and_not_from_the_host() {
+    use std::os::unix::fs::PermissionsExt;
+    // The host side, planted before the tmpfs covers it: the file this supervisor's own walk lands
+    // on when it leaves the cage, naming an interpreter no rule here speaks about.
+    let plant = |cage: &std::path::Path| {
+        let decoy = cage.join("payload");
+        std::fs::write(&decoy, "#!/bin/bash\nexit 3\n").expect("write the host's file");
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    let setup = "printf '#!/bin/sh\\nexit 7\\n' > '{cage}/payload'\n\
+                 chmod 755 '{cage}/payload'\n\
+                 ln -s '{cage}/payload' '{cage}/l'\n";
+    let target = "/proc/self/root{cage}/l";
+
+    // The witness: the spelling really runs the cage's script, so the refusal below is the rule.
+    let elsewhere = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+    let Some((code, _)) = run_in_cage(setup, target, &elsewhere, plant) else {
+        skip_incapable!("skipping the `/proc/self` walk: need `unshare` and a usable userns");
+        return;
+    };
+    assert_eq!(
+        code,
+        Some(7),
+        "the cage's own script must really run through this spelling, or nothing is measured"
+    );
+
+    // The finding: the interpreter decided is the cage's `/bin/sh`, not the `/bin/bash` the host's
+    // copy of the name would have named.
+    let denied = ProcPolicy::new(ProcMode::Enforce, &[], &["sh".to_string()]);
+    let (code, ring) =
+        run_in_cage(setup, target, &denied, plant).expect("the cage stood up a moment ago");
+    assert_ne!(
+        code,
+        Some(7),
+        "the interpreter the cage's own file names must be the one the rule is put to"
+    );
+    let events = ring.snapshot(None).events;
+    assert!(
+        events.iter().any(|e| e.verdict == "deny"),
+        "and the refusal is recorded: {events:?}"
+    );
+}
+
 /// A refusal's errno answers about the **cage's** filesystem, whatever the cage points a name at.
 ///
 /// The errno a denied `execve` carries is chosen by asking whether the target is there, because a
@@ -3537,6 +3767,140 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
         at("/proc/self/root/no-such-name-in-either"),
         "`self` names the caller, and the root behind it is the cage's own, so neither name is \
          answered off the host"
+    );
+}
+
+/// An open behind an absolute symlink the cage planted is asked of the cage before it is refused.
+///
+/// The lens reaches a notified path by prefixing `/proc/<pid>/root`, which holds the walk on the
+/// cage's mounts only until it meets a symlink whose target begins with `/`: the kernel restarts
+/// such a resolution at the *resolving* process's root, which is this one's. A cage's `/tmp` is its
+/// own and its `/nix` is bound from the project store, so the name the walk lands on out here is
+/// routinely absent -- and the `ENOENT` this process met was answered straight back, refusing an
+/// open the cage would have completed. One `ln -s` over a tmpfs is the whole fixture.
+///
+/// Two controls hold the finding down: the same file spelled without the link must be servable, or
+/// the cage holds nothing at all; and a name behind the link that nothing holds must still be
+/// absent, or the answer would be satisfied by a probe that stopped refusing anything.
+#[test]
+fn an_open_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_refused() {
+    let (Some(unshare), crate::Userns::Ok) = (
+        crate::pathfind::find_on_path("unshare"),
+        crate::probe_userns(),
+    ) else {
+        skip_incapable!("skipping the cage walk: need `unshare` and a usable userns");
+        return;
+    };
+    let dir = TmpDir::new();
+    // A directory that exists on the host too, with the cage's own tmpfs over it: the same absolute
+    // name then reaches the fixture from inside the cage and nothing at all from out here, which is
+    // the differential this measures. The pid file sits beside it rather than in it, so the mount
+    // does not hide it from this process.
+    let cage_dir = dir.join("cage");
+    std::fs::create_dir_all(&cage_dir).expect("the directory the tmpfs goes over");
+    let cage_dir = cage_dir.to_str().expect("utf-8 fixture path").to_string();
+    let pid_file = dir.join("pid");
+    // The link is the whole fixture: an absolute target is what restarts a walk at the resolver's
+    // root. The pid is the cage's own, written where this process can read it, because a pid
+    // guessed from the process tree is a race.
+    let script = format!(
+        "mount -t tmpfs tmpfs '{cage_dir}' || exit 1\n\
+         mkdir '{cage_dir}/behind'\n\
+         printf 'ordinary content\\n' > '{cage_dir}/behind/file.txt'\n\
+         ln -s '{cage_dir}/behind' '{cage_dir}/x'\n\
+         echo $$ > '{}'\n\
+         exec sleep 30\n",
+        pid_file.display()
+    );
+    let mut cage = match std::process::Command::new(unshare)
+        .args(["--user", "--map-root-user", "--mount"])
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .spawn()
+    {
+        Ok(child) => child,
+        // A host that cannot stand up a namespace cannot host a cage at all.
+        Err(_) => return,
+    };
+    let mut pid = None;
+    for _ in 0..200 {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(n) = text.trim().parse::<u32>()
+        {
+            pid = Some(n);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // A root nothing under test resolves into, so every answer below is about reaching the file and
+    // never about its content.
+    let lens = OpenLens::new(
+        crate::open_policy::OpenPolicy::compile(
+            &[r"sk-[A-Za-z0-9]{12,}".to_string()],
+            crate::open_policy::MAX_SCAN_DEFAULT,
+        )
+        .expect("the test pattern compiles")
+        .expect("a non-empty list yields a policy"),
+        std::fs::canonicalize(dir.path()).expect("canonical fixture root"),
+    );
+    // Every answer is taken before the cage is torn down, so a failing assertion cannot leave a
+    // `sleep` behind.
+    let answers = pid.map(|pid| {
+        [
+            format!("{cage_dir}/behind/file.txt"),
+            format!("{cage_dir}/x/file.txt"),
+            format!("{cage_dir}/x/no-such-name-in-either"),
+        ]
+        .map(|name| {
+            let outcome = open_is_refused(&lens, pid, libc::AT_FDCWD, &name);
+            (
+                name,
+                outcome.refused,
+                outcome.errno,
+                outcome.report.is_some(),
+            )
+        })
+    });
+    let _ = cage.kill();
+    let _ = cage.wait();
+
+    let answers = answers.expect("the cage never reported its pid");
+    let at = |name: &str| {
+        answers
+            .iter()
+            .find(|(n, ..)| n == name)
+            .expect("asked for")
+            .clone()
+    };
+    // Servable: allowed, with nothing left unexamined and no errno to answer with, which together
+    // are the one outcome that carries the supervisor's own descriptor out to the cage.
+    let servable = |name: &str| {
+        let (_, refused, errno, reported) = at(name);
+        !refused && errno.is_none() && !reported
+    };
+
+    // The witness: the fixture really is there and really is servable under its own name, or the
+    // finding below would be measured against a cage that holds nothing.
+    assert!(
+        servable(&format!("{cage_dir}/behind/file.txt")),
+        "the cage's own file must be servable under its own name: {answers:?}"
+    );
+
+    // The finding: the same file named through the absolute link must not be refused for a walk
+    // that left the cage and found nothing out here.
+    assert!(
+        servable(&format!("{cage_dir}/x/file.txt")),
+        "a file behind an absolute link is opened by the cage, so it is served rather than \
+         answered with the errno this process's own walk met: {answers:?}"
+    );
+
+    // And the probe still tells a name the cage has from one it does not, or the assertion above
+    // would be satisfied by one that stopped refusing anything.
+    let (_, refused, errno, _) = at(&format!("{cage_dir}/x/no-such-name-in-either"));
+    assert!(
+        !refused && errno == Some(libc::ENOENT),
+        "a name the cage does not hold behind the same link is still absent: {answers:?}"
     );
 }
 

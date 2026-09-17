@@ -1940,7 +1940,7 @@ pub(crate) enum NetworkField {
 /// `deny` auto-fails, everything else parks. `deny` always wins. `ask_timeout` (a duration like
 /// `"90s"`/`"5m"`, or absent for an indefinite wait) bounds a parked `ask` request, and
 /// `ask_notice = false` silences the inline stderr park alert (the request still parks).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct NetworkTable {
     /// The egress mode. Absent means "inherit the mode from the parent config layer" (an app takes
     /// the baseline's mode, a project takes the global's) while keeping this table's own
@@ -2401,9 +2401,11 @@ fn with_location<T: serde::de::DeserializeOwned>(text: &str, message: String) ->
 
 /// Parse a config **layer**, letting one mistyped value cost the value rather than the file.
 ///
-/// [`parse`] is all-or-nothing, which is what the write gate and the override blob want: a
-/// document that does not say what it appears to say must not commit. A file already on disk is a
-/// different question. The rule everywhere else in this loader is that a wrong field costs the
+/// [`parse`] is all-or-nothing, which is what the override blob wants: a document that does not
+/// say what it appears to say must not commit. A file already on disk is a different question, and
+/// so is an edit to one — [`crate::config::manage`]'s write gate reads a layer through this
+/// function too, so that it judges an edit by what the loader will make of it rather than refusing
+/// every write over a drop the file already carried. The rule everywhere else in this loader is that a wrong field costs the
 /// field and the rest still applies, and a *type* error was the one place it did not: `[network]
 /// allow = "github.com"` — a string where a list belongs — dropped the whole `.sbx.toml`, taking
 /// `[env]`, `[packages]`, every app and the `mode` the user was relying on with it. The warning
@@ -2599,7 +2601,7 @@ sshpass = \"nix:sshpass\"
     fn one_mistyped_value_costs_the_value_and_not_the_file() {
         let text =
             "[env]\nKEEPME = \"yes\"\n\n[network]\nmode = \"deny\"\nallow = \"github.com\"\n";
-        // Strict parsing is what the write gate and the override blob want, and it still refuses.
+        // Strict parsing is what the override blob wants, and it still refuses.
         assert!(parse(text.as_bytes()).is_err());
 
         let mut dropped = Vec::new();

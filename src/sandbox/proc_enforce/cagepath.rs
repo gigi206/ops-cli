@@ -114,19 +114,41 @@ pub(super) fn innermost_ids(status: &str) -> Option<(u32, u32)> {
 /// followed by the kernel against this process's root instead, and is refused rather than served —
 /// the same answer, reached by [`super::open_lens::vouched_probe`] rather than here.
 pub(super) fn caller_proc_path(pid: u32, path: &str) -> Option<String> {
-    let (rest, thread) = match path.strip_prefix("/proc/self") {
-        Some(rest) => (rest, false),
-        None => (path.strip_prefix("/proc/thread-self")?, true),
-    };
-    // `/proc/selfish` is not `/proc/self`.
-    if !rest.is_empty() && !rest.starts_with('/') {
-        return None;
-    }
+    let (rest, thread) = own_entry_rest(path)?;
     let (tgid, tid) = caller_ids_in_cage(pid)?;
     Some(if thread {
         format!("/proc/{tgid}/task/{tid}{rest}")
     } else {
         format!("/proc/{tgid}{rest}")
+    })
+}
+
+/// What follows the `/proc/self` or `/proc/thread-self` a path leads with, and which of the two it
+/// was — `None` where it leads with neither.
+///
+/// Split out because two questions are asked of the same prefix: which entry the path means, and
+/// whether what it names inside that entry is the caller's own descriptor table.
+fn own_entry_rest(path: &str) -> Option<(&str, bool)> {
+    let (rest, thread) = match path.strip_prefix("/proc/self") {
+        Some(rest) => (rest, false),
+        None => (path.strip_prefix("/proc/thread-self")?, true),
+    };
+    // `/proc/selfish` is not `/proc/self`.
+    (rest.is_empty() || rest.starts_with('/')).then_some((rest, thread))
+}
+
+/// Whether `path` names a descriptor in the caller's **own** table: `/proc/self/fd/<n>`, or the
+/// `thread-self` spelling of it.
+///
+/// The one shape whose object the caller holds already, which is what lets it be opened with no
+/// mount asked to vouch for it — see [`super::exec_head`]. Every *other* remainder behind that
+/// prefix (`/root/…`, `/cwd/…`, `/fd/<n>/…`) is ordinary path text the cage chose, walked like any
+/// other: a component of it that is a symlink with an absolute target re-roots the walk at the
+/// resolving process's root, and what it lands on there is not what the cage named.
+pub(super) fn names_caller_descriptor(path: &str) -> bool {
+    own_entry_rest(path).is_some_and(|(rest, _)| {
+        rest.strip_prefix("/fd/")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     })
 }
 

@@ -473,11 +473,14 @@ fn ifinfomsg(index: u32, flags: u32, change: u32) -> Vec<u8> {
 /// Only ever called when the capture tap is standing, and that gate is the whole point. For a
 /// locally generated packet the kernel looks the route up **before** the `nat` `OUTPUT` hook runs,
 /// so without a route a connect fails `ENETUNREACH` and the redirect rule is never consulted: the
-/// tap would listen to silence. With the tap, every such connect is bent to loopback before a packet
-/// reaches `dummy0` at all.
+/// tap would listen to silence. With the tap, a TCP connect and a DNS query are bent to loopback
+/// before a packet reaches `dummy0` at all.
 ///
-/// Adding it *without* the tap would be a regression rather than a gift: the packets would reach the
-/// dummy, which drops them, turning a fast, legible `ENETUNREACH` into a silent timeout.
+/// Everything else — UDP to any port but 53, and every other L4 protocol — is refused by the
+/// `filter` chain of [`super::nettap::redirect_ruleset`], which is installed with the redirect and
+/// is what keeps this route from becoming an egress path. Without that refusal the packets would
+/// reach the dummy, which drops them, turning a fast, legible `ENETUNREACH` into a silent timeout;
+/// adding the route without the whole ruleset would therefore be a regression rather than a gift.
 fn add_default_route(fd: libc::c_int, index: u32) -> io::Result<()> {
     nl_request(
         fd,

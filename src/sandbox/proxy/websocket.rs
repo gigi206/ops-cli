@@ -42,7 +42,17 @@ pub(super) fn is_websocket_upgrade(head: &Head) -> bool {
 /// PRESERVES the hop-by-hop `Connection`/`Upgrade` headers (and the `Sec-WebSocket-*` set) so the
 /// upstream actually performs the upgrade — the opposite of the normal path, which forces
 /// `Connection: close`. `Proxy-Connection` and `Expect` are still stripped (proxy-local hop headers).
-pub(super) fn reserialize_upgrade(head: &Head, injections: &[(String, String)]) -> Vec<u8> {
+///
+/// `force_identity_encoding` replaces the client's content codings with [`IDENTITY_ENCODINGS`], the
+/// same rewrite [`reserialize_request`] performs and for the same reason: the caller masks this
+/// exchange's response for a reflected credential, and that mask strikes out verbatim occurrences
+/// only. A declined upgrade whose body the upstream compressed would carry the credential past it.
+/// The two are one question, asked once by the caller.
+pub(super) fn reserialize_upgrade(
+    head: &Head,
+    injections: &[(String, String)],
+    force_identity_encoding: bool,
+) -> Vec<u8> {
     let mut out = String::with_capacity(head.request_line.len() + 64);
     out.push_str(&head.request_line);
     out.push_str("\r\n");
@@ -60,10 +70,28 @@ pub(super) fn reserialize_upgrade(head: &Head, injections: &[(String, String)]) 
         if injections.iter().any(|(name, _)| header_name_eq(k, name)) {
             continue;
         }
+        // The client's own content codings, dropped so sbx's `identity` below is the only offer the
+        // upstream sees — leaving the client's beside it would let the upstream honour `gzip` and
+        // hand the response mask bytes it cannot match.
+        if force_identity_encoding
+            && IDENTITY_ENCODINGS
+                .iter()
+                .any(|(name, _)| k.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
         out.push_str(k);
         out.push_str(": ");
         out.push_str(v);
         out.push_str("\r\n");
+    }
+    if force_identity_encoding {
+        for (name, value) in IDENTITY_ENCODINGS {
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(value);
+            out.push_str("\r\n");
+        }
     }
     for (name, value) in injections {
         out.push_str(name);
@@ -77,14 +105,35 @@ pub(super) fn reserialize_upgrade(head: &Head, injections: &[(String, String)]) 
 
 /// Answer an upgrade the upstream never resolved, and close.
 ///
-/// The same `502` and the same reason token the three request planes give, because they are the
-/// same fact about the server: it was reached and it did not answer. A refusal after interim heads
-/// have already crossed is a legal response, and it is the shape `relay_response_head` produces.
+/// The same `502`, the same reason token and the same `error` log line the three request planes
+/// give, because they are the same fact about the server: it was reached and it did not answer. A
+/// refusal after interim heads have already crossed is a legal response, and it is the shape
+/// `relay_response_head` produces.
+///
+/// The line is what makes the exchange readable. The `allow` was recorded before this plane was
+/// entered and it stands — policy did permit the upgrade — but its status never arrives, so without
+/// the line a stalled WebSocket shows in `sbx net logs` as an allow with no outcome and no cause.
 fn refuse_upgrade(
     br: &mut BufReader<StreamOwned<ServerConnection, UnixStream>>,
     why: NoFinalHead,
     host: &str,
+    ctx: &ProxyCtx,
+    port: u16,
+    target: &str,
 ) -> io::Result<()> {
+    ctx.push_log(
+        crate::sandbox::control::Proto::Https,
+        // The name, not `host:port`: the `Host` header carries the port when the client wrote one,
+        // and the port is its own field here — the same normalization the `101` path applies.
+        &strip_port(host),
+        port,
+        // The pseudo-verb the whole exchange was judged and logged under, so this line sits beside
+        // its own allow rather than under the handshake's literal `GET`.
+        Some("WS"),
+        Some(target),
+        crate::sandbox::control::LogVerdict::Error,
+        why.tag(),
+    );
     write_refusal(
         br.get_mut(),
         "502 Bad Gateway",
@@ -112,7 +161,12 @@ fn refuse_upgrade(
 /// targets — the same set [`relay_response_head`] applies to every other relayed head. Both
 /// handshake answers pass through it, because an upstream that echoes the injected credential in a
 /// header of its own does so as readily here as anywhere else. It reaches no further than the heads:
-/// the frames past a `101` are a byte-exact pipe by design, and this function's own contract.
+/// the frames past a `101` are a byte-exact pipe by design, and this function's own contract. When
+/// it is non-empty the handshake is forwarded asking for [`IDENTITY_ENCODINGS`], so a declined
+/// upgrade's body reaches the mask uncompressed — the invariant every other plane keeps.
+///
+/// `port` and `target` are the exchange's own, carried in for one purpose: naming the `error` line
+/// [`refuse_upgrade`] pushes when the upstream produces no head at all.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn relay_upgrade(
     mut br: BufReader<StreamOwned<ServerConnection, UnixStream>>,
@@ -121,13 +175,18 @@ pub(super) fn relay_upgrade(
     injected: &[(String, String)],
     redactions: &[SecretNeedle],
     ctx: &ProxyCtx,
+    port: u16,
+    target: &str,
     allow_seq: Option<u64>,
     capture: Option<&CaptureGuard>,
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
 ) -> io::Result<()> {
-    // Forward the handshake with its upgrade headers preserved (a handshake carries no body).
-    let handshake = reserialize_upgrade(inner, injected);
+    // Forward the handshake with its upgrade headers preserved (a handshake carries no body). A
+    // non-empty `redactions` is the one question the caller already asked — this exchange's response
+    // will be scanned — so the handshake goes up asking for `identity`, or the scan below would run
+    // over bytes it cannot read.
+    let handshake = reserialize_upgrade(inner, injected, !redactions.is_empty());
     upstream.write_all(&handshake)?;
     up.fetch_add(handshake.len() as u64, Ordering::Relaxed);
     upstream.flush().ok();
@@ -151,7 +210,16 @@ pub(super) fn relay_upgrade(
         // that never resolved and no line saying why. The same answer is given here.
         let head = match read_head_buffered(&mut up_br, HEAD_MAX, deadline) {
             Ok(head) => head,
-            Err(_) => return refuse_upgrade(&mut br, NoFinalHead::UpstreamClosed, &host),
+            Err(_) => {
+                return refuse_upgrade(
+                    &mut br,
+                    NoFinalHead::UpstreamClosed,
+                    &host,
+                    ctx,
+                    port,
+                    target,
+                );
+            }
         };
         match parse_status_code(&head) {
             Some(code) if (100..200).contains(&code) && code != 101 => {
@@ -161,7 +229,14 @@ pub(super) fn relay_upgrade(
                 // stopped at the same small number.
                 interim_seen += 1;
                 if interim_seen > INTERIM_HEAD_MAX {
-                    return refuse_upgrade(&mut br, NoFinalHead::InterimCap, &host);
+                    return refuse_upgrade(
+                        &mut br,
+                        NoFinalHead::InterimCap,
+                        &host,
+                        ctx,
+                        port,
+                        target,
+                    );
                 }
                 write_head_to_client(head, br.get_mut(), &down, redactions)?;
                 br.get_mut().flush()?;
@@ -822,7 +897,7 @@ mod tests {
                 ),
             ],
         };
-        let wire = String::from_utf8(reserialize_upgrade(&head, &[])).expect("ascii");
+        let wire = String::from_utf8(reserialize_upgrade(&head, &[], false)).expect("ascii");
         assert!(
             !wire.to_ascii_lowercase().contains("proxy-authorization"),
             "the proxy-hop credential was forwarded to the origin:\n{wire}"
@@ -835,6 +910,59 @@ mod tests {
             wire.contains("Connection: Upgrade"),
             "the upgrade's own Connection header must survive:\n{wire}"
         );
+    }
+
+    /// An upgrade whose response will be scanned for a reflected credential is forwarded asking for
+    /// `identity`, exactly as an ordinary request on that host is.
+    ///
+    /// The mask the declining answer's body passes through strikes out verbatim occurrences, and a
+    /// compressed body holds none. This plane copied the client's `Accept-Encoding` upstream, so a
+    /// host that declined the upgrade with a gzipped body echoing the injected credential handed it
+    /// back to the cage in the clear. The scoping is the other half: a handshake nothing scans keeps
+    /// the client's own offer, since no body is read looking for a value.
+    #[test]
+    fn an_upgrade_whose_response_will_be_scanned_is_asked_for_uncompressed() {
+        let head = Head {
+            request_line: "GET /socket HTTP/1.1".to_string(),
+            headers: vec![
+                ("Host".to_string(), "api.example.com".to_string()),
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Connection".to_string(), "Upgrade".to_string()),
+                ("Accept-Encoding".to_string(), "gzip, br".to_string()),
+                ("Grpc-Accept-Encoding".to_string(), "gzip".to_string()),
+            ],
+        };
+        for scanned in [true, false] {
+            let wire = String::from_utf8(reserialize_upgrade(&head, &[], scanned))
+                .expect("ascii")
+                .to_ascii_lowercase();
+            // Matched per line, because `grpc-accept-encoding: identity` contains the other
+            // header's spelling as a substring and a `contains` over the whole head would accept
+            // either one alone.
+            let lines: Vec<&str> = wire.lines().map(str::trim_end).collect();
+            if scanned {
+                assert!(
+                    lines.contains(&"accept-encoding: identity")
+                        && lines.contains(&"grpc-accept-encoding: identity"),
+                    "a handshake whose answer will be scanned must be asked for uncompressed on \
+                     both the HTTP coding and gRPC's own: {lines:?}"
+                );
+                assert!(
+                    !wire.contains("gzip"),
+                    "and the client's own offer must not travel beside it: {wire:?}"
+                );
+            } else {
+                assert!(
+                    lines.contains(&"accept-encoding: gzip, br")
+                        && lines.contains(&"grpc-accept-encoding: gzip"),
+                    "a handshake nothing scans keeps the client's own offer: {lines:?}"
+                );
+            }
+            assert!(
+                lines.contains(&"connection: upgrade"),
+                "the upgrade's own hop headers still survive: {lines:?}"
+            );
+        }
     }
 
     /// The frames a cage pipelines behind its handshake are gated BEFORE they are written upstream.

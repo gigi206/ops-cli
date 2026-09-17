@@ -170,8 +170,8 @@ pub(crate) fn resolv_conf() -> String {
 /// The nftables program that bends the cage's traffic to the tap, in its own table so it can be
 /// read and removed as a unit and never touches a chain something else shares.
 ///
-/// Three rules, in an order that is load-bearing (a nat statement is terminal, so the first match
-/// decides):
+/// The `nat` chain holds three rules, in an order that is load-bearing (a nat statement is
+/// terminal, so the first match decides):
 ///
 /// 1. `udp dport 53` and 2. `tcp dport 53` reach the resolver — **before** the general rule, or a
 ///    DNS query to a public resolver would be captured as ordinary traffic and never answered.
@@ -181,6 +181,21 @@ pub(crate) fn resolv_conf() -> String {
 ///
 /// `meta l4proto tcp` is not decoration — nftables refuses a `redirect to :port` that is not
 /// preceded by a transport-protocol match, because the port it rewrites has no meaning without one.
+///
+/// The `filter` chain refuses everything the `nat` chain does not capture, and exists because
+/// [`super::netns`] installs a default route through `dummy0` alongside these rules: without the
+/// refusal, a UDP datagram to any port but 53, or any other L4 protocol, would find a route, be
+/// handed to the dummy device and be dropped there — a silent black hole where the routeless cage
+/// answered `ENETUNREACH` on the first packet. Its order is load-bearing too, and it runs at
+/// `filter` priority, after the `nat` chain has already rewritten what it captures:
+///
+/// 1. loopback, which carries the egress forwarder and any intra-cage service — and, by the time
+///    this chain sees them, every packet the `nat` chain bent to the tap;
+/// 2. the DNS transports the tap answers;
+/// 3. TCP, whose non-loopback destinations the `nat` chain has already redirected;
+/// 4. everything else, rejected with the same `net-unreachable` the route lookup used to raise.
+///
+/// `reject` belongs here rather than in the `nat` chain, which nftables does not allow it in.
 pub(crate) fn redirect_ruleset() -> String {
     format!(
         "table ip {TABLE} {{\n  \
@@ -189,6 +204,13 @@ pub(crate) fn redirect_ruleset() -> String {
          udp dport 53 redirect to :{dns}\n    \
          tcp dport 53 redirect to :{dns}\n    \
          meta l4proto tcp ip daddr != 127.0.0.0/8 redirect to :{tap}\n  \
+         }}\n  \
+         chain refuse {{\n    \
+         type filter hook output priority filter; policy accept;\n    \
+         ip daddr 127.0.0.0/8 accept\n    \
+         udp dport 53 accept\n    \
+         meta l4proto tcp accept\n    \
+         reject with icmp type net-unreachable\n  \
          }}\n\
          }}\n",
         TABLE = NFT_TABLE,
@@ -204,10 +226,12 @@ const NFT_TABLE: &str = "sbx";
 /// owns and holds `CAP_NET_ADMIN` over; the cage that inherits that namespace is in a *nested* user
 /// namespace and cannot read or remove what this writes.
 ///
-/// The rules need `nf_nat` and the nat chain type. A kernel that has them as modules loads them on
-/// demand even for this unprivileged namespace, so the ordinary host needs nothing prepared; a
-/// kernel built without them, or one with `kernel.modules_disabled=1`, fails here and the caller
-/// degrades to the environment-variable path alone.
+/// The rules need `nf_nat`, the nat chain type and `reject`. A kernel that has them as modules loads
+/// them on demand even for this unprivileged namespace, so the ordinary host needs nothing prepared;
+/// a kernel built without them, or one with `kernel.modules_disabled=1`, fails here and the caller
+/// degrades to the environment-variable path alone. The program is installed as a unit, so a kernel
+/// that cannot refuse the uncaptured protocols does not capture either, and the cage keeps the
+/// routeless behaviour it had before the tap existed.
 pub(crate) fn install_redirect(nft: &Path) -> io::Result<()> {
     let mut child = std::process::Command::new(nft)
         .arg("-f")

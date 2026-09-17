@@ -300,10 +300,19 @@ fn gtk_theme_for(color_scheme: &str) -> &'static str {
 /// config. Pure over its inputs, so the shape is unit-tested without launching a cage.
 pub(crate) fn wrap_command(
     bash: &Path,
+    env_bin: &Path,
     provision: &Provision,
     color_scheme: Option<&str>,
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
+    // The coreutils this preamble does its housekeeping with, by absolute store path like the bus
+    // daemon and the keyring: the preamble is the cage's first process and runs before the `[proc]`
+    // shim installs its filter, while the cage's PATH leads through directories the cage itself can
+    // write (its own store, its mise shims) — so a bare name would let in-cage code pick what runs
+    // unfiltered. `plumbing_pins` pins the store root they live in read-only.
+    let mkdir = env_bin.with_file_name("mkdir");
+    let cat = env_bin.with_file_name("cat");
+    let sleep = env_bin.with_file_name("sleep");
     let Provision {
         dbus_daemon,
         xdp_root,
@@ -322,9 +331,11 @@ pub(crate) fn wrap_command(
             // no static `GTK_THEME` env, which GTK reads once at start and could not follow a switch.
             let kf_parent = KEYFILE_REL.rsplit_once('/').map_or(KEYFILE_REL, |(p, _)| p);
             format!(
-                "mkdir -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
-                 cat > \"$HOME/{KEYFILE_REL}\" <<'SBXPORTALKF' 2>/dev/null || true\n\
+                "'{mkdir}' -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
+                 '{cat}' > \"$HOME/{KEYFILE_REL}\" <<'SBXPORTALKF' 2>/dev/null || true\n\
                  {keyfile}SBXPORTALKF\n",
+                mkdir = mkdir.display(),
+                cat = cat.display(),
                 keyfile = keyfile_body(scheme),
             )
         }
@@ -341,8 +352,9 @@ pub(crate) fn wrap_command(
     // it lands. Best-effort, never blocks; the background job dies with the cage (its PID-1 reaper).
     let index = format!(
         "( for _ in 1 2 3; do \"{udd}\" \"$HOME/.local/share/applications\" >/dev/null 2>&1; \
-         sleep 1; done ) &\n",
+         '{sleep}' 1; done ) &\n",
         udd = update_desktop_db.display(),
+        sleep = sleep.display(),
     );
     // The Secret Service, started AFTER the bus it registers on. `--daemonize` makes this
     // synchronous the way `dbus-daemon --fork` is: the foreground process reads the passphrase,
@@ -360,14 +372,16 @@ pub(crate) fn wrap_command(
         kr = keyring_daemon.display(),
     );
     let preamble = format!(
-        "mkdir -p {dir}/xdg-desktop-portal 2>/dev/null\n\
-         cat > {dir}/session.conf <<'SBXPORTALCF'\n{session}SBXPORTALCF\n\
-         cat > {dir}/xdg-desktop-portal/portals.conf <<'SBXPORTALPF'\n{portals}SBXPORTALPF\n\
+        "'{mkdir}' -p {dir}/xdg-desktop-portal 2>/dev/null\n\
+         '{cat}' > {dir}/session.conf <<'SBXPORTALCF'\n{session}SBXPORTALCF\n\
+         '{cat}' > {dir}/xdg-desktop-portal/portals.conf <<'SBXPORTALPF'\n{portals}SBXPORTALPF\n\
          {seed}\
          {daemon} --config-file={dir}/session.conf --fork </dev/null >/dev/null 2>&1 || true\n\
          {keyring}\
          {index}",
         dir = CAGE_DIR,
+        mkdir = mkdir.display(),
+        cat = cat.display(),
         daemon = dbus_daemon.display(),
         portals = PORTALS_CONF,
     );
@@ -456,6 +470,7 @@ mod tests {
         let cmd = vec![OsString::from("demo-app"), OsString::from("--flag")];
         let argv = wrap_command(
             Path::new("/bin/bash"),
+            Path::new("/nix/store/hash-coreutils/bin/env"),
             &demo_provision(),
             Some("prefer-dark"),
             cmd,
@@ -470,6 +485,20 @@ mod tests {
         ));
         // portals.conf selects the gtk backend
         assert!(script.contains("default=gtk"));
+        // every helper the preamble runs is an absolute store path, never a bare name: the
+        // preamble is the cage's first process, before the `[proc]` shim filters anything, and
+        // the cage's own PATH leads through directories the cage can write
+        assert!(script.contains("'/nix/store/hash-coreutils/bin/mkdir' -p /run/sbx-portal"));
+        assert!(
+            script.contains("'/nix/store/hash-coreutils/bin/cat' > /run/sbx-portal/session.conf")
+        );
+        assert!(script.contains("'/nix/store/hash-coreutils/bin/sleep' 1"));
+        for bare in ["mkdir ", "cat ", "sleep "] {
+            assert!(
+                !script.contains(bare),
+                "{bare} is run by name, which the cage's PATH decides: {script}"
+            );
+        }
         // the theme is seeded into the keyfile: color-scheme (the app follows it) AND a named
         // gtk-theme (the file dialog follows it), both live-switchable via the keyfile backend
         assert!(script.contains("color-scheme='prefer-dark'"));
@@ -502,6 +531,7 @@ mod tests {
     fn the_preamble_starts_the_keyring_after_the_bus_and_waits_for_it() {
         let argv = wrap_command(
             Path::new("/bin/bash"),
+            Path::new("/nix/store/hash-coreutils/bin/env"),
             &demo_provision(),
             None,
             vec![OsString::from("x")],
@@ -537,6 +567,7 @@ mod tests {
     fn the_keyring_passphrase_never_rides_the_argv() {
         let argv = wrap_command(
             Path::new("/bin/bash"),
+            Path::new("/nix/store/hash-coreutils/bin/env"),
             &demo_provision(),
             None,
             vec![OsString::from("x")],
@@ -563,6 +594,7 @@ mod tests {
     fn wrap_command_without_a_theme_writes_no_keyfile() {
         let argv = wrap_command(
             Path::new("/bin/bash"),
+            Path::new("/nix/store/hash-coreutils/bin/env"),
             &demo_provision(),
             None,
             vec![OsString::from("x")],

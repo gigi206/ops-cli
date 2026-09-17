@@ -356,8 +356,9 @@ fn wrap_flake_equip_passes_quads_and_command_positionally() {
         ),
     ];
     let cmd = vec![OsString::from("flake-tool"), OsString::from("-z")];
+    let env_bin = PathBuf::from("/nix/store/coreutils/bin/env");
 
-    let argv = wrap_flake_equip(&nix, &bash, &dir, &quads, cmd);
+    let argv = wrap_flake_equip(&nix, &bash, &env_bin, &dir, &quads, cmd);
 
     assert_eq!(argv[0], OsString::from("/nix/store/bash/bin/bash"));
     assert_eq!(argv[1], OsString::from("-c"));
@@ -368,16 +369,29 @@ fn wrap_flake_equip_passes_quads_and_command_positionally() {
     assert!(script.contains(
         "'/nix/store/nix/bin/nix' build \"$ref\" --no-write-lock-file --out-link \"$target\""
     ));
-    assert!(script.contains("mkdir -p '/home/sandbox/.local/state/sbx/flake'"));
+    assert!(
+        script
+            .contains("'/nix/store/coreutils/bin/mkdir' -p '/home/sandbox/.local/state/sbx/flake'")
+    );
     // the fallback machinery: the per-revision failed-marker, the promotion of the good
     // out-link on success, and the loud notice when a pinned build fails.
-    assert!(script.contains("touch \"$target.failed\""));
-    assert!(script.contains("ln -sfn \"$sp\" \"$good\""));
+    assert!(script.contains("'/nix/store/coreutils/bin/touch' \"$target.failed\""));
+    assert!(script.contains("'/nix/store/coreutils/bin/ln' -sfn \"$sp\" \"$good\""));
     assert!(script.contains("falling back to the last good build"));
     assert!(script.contains("there is no prior build to fall back to"));
     // the gc root is keyed by the `$key` positional (the package name), targeting the used
     // build's store path resolved by `readlink -f` — host-resolvable, overwritten each launch
-    assert!(script.contains("ln -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$key\""));
+    assert!(script.contains(
+        "'/nix/store/coreutils/bin/ln' -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$key\""
+    ));
+    // Every helper is an absolute store path, never a bare name: this preamble is the cage's
+    // first process, before the `[proc]` shim filters anything, and the cage writes its own PATH.
+    for bare in ["mkdir ", "touch ", "rm ", "readlink ", "ln "] {
+        assert!(
+            !script.contains(bare),
+            "{bare} is run by name, which the cage's PATH decides: {script}"
+        );
+    }
     assert!(script.contains("shift 4"));
     assert!(script.trim_end().ends_with("exec \"$@\""));
     assert!(
@@ -408,6 +422,29 @@ fn wrap_flake_equip_passes_quads_and_command_positionally() {
     assert_eq!(argv[11], OsString::from("evil"));
     assert_eq!(argv[12], OsString::from("flake-tool"));
     assert_eq!(argv[13], OsString::from("-z"));
+}
+
+/// The host's coreutils `env`, whose siblings the wrap invokes by absolute path.
+///
+/// The tests below really run the emitted script, so the helper paths baked into it have to name
+/// programs this host has; on a launch they are the cage's store copies, pinned read-only.
+#[cfg(test)]
+fn host_env_bin() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    // The whole set has to come from one directory, the way the cage's does: a PATH entry may
+    // carry an `env` of its own (a shell snippet from a toolchain installer, say) without the
+    // helpers beside it.
+    let runnable = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|dir| dir.join("env"))
+        .find(|env_bin| {
+            ["env", "mkdir", "touch", "rm", "readlink", "ln"]
+                .iter()
+                .all(|name| runnable(&env_bin.with_file_name(name)))
+        })
+        .expect("a coreutils bin directory on PATH")
 }
 
 /// Write `body` to `path` as an executable file (a stub used to drive the flake-equip script).
@@ -453,7 +490,14 @@ fn wrap_flake_equip_falls_back_to_the_last_good_build_when_a_pinned_build_fails(
     )];
     // The command the wrap execs once equip is done — reaching it proves we did NOT exit 1.
     let cmd = vec![OsString::from("echo"), OsString::from("FELL-BACK")];
-    let argv = wrap_flake_equip(&fake_nix, &PathBuf::from("bash"), &flake, &quads, cmd);
+    let argv = wrap_flake_equip(
+        &fake_nix,
+        &PathBuf::from("bash"),
+        &host_env_bin(),
+        &flake,
+        &quads,
+        cmd,
+    );
 
     let run = || {
         std::process::Command::new(&argv[0])
@@ -513,7 +557,14 @@ fn wrap_flake_equip_hard_fails_when_a_build_fails_and_no_good_build_exists() {
         "tool".to_string(),
     )];
     let cmd = vec![OsString::from("echo"), OsString::from("SHOULD-NOT-RUN")];
-    let argv = wrap_flake_equip(&fake_nix, &PathBuf::from("bash"), &flake, &quads, cmd);
+    let argv = wrap_flake_equip(
+        &fake_nix,
+        &PathBuf::from("bash"),
+        &host_env_bin(),
+        &flake,
+        &quads,
+        cmd,
+    );
 
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])

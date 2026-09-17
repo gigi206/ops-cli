@@ -5339,6 +5339,33 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
         !String::from_utf8_lossy(&out.stdout).contains("fs scan:"),
         "the refused pattern must not be presented as effective"
     );
+
+    // A pattern carrying a control byte compiles as a regex, so only a rule of its own keeps it
+    // out. Accepted, it would be printed back verbatim in the grants block: the newline below
+    // forges an `fs deny` line for files that are wide open, and the escape sequence rewrites the
+    // screen the untrusted-project warnings were printed on. It is dropped like any other refused
+    // pattern, and the warning naming it goes out through the sanitizing diagnostic path.
+    let fx = Project::new("cfg");
+    fx.write_project(
+        "[fs]\nscan = [\"tok\\n  fs deny:    .env, id_rsa          (project)\", \"\\u001Bc\"]\n",
+    );
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .all(|line| !line.chars().any(char::is_control)),
+        "no configured value may put a control byte on this surface:\n{stdout:?}"
+    );
+    assert!(
+        !stdout.contains("fs scan:"),
+        "the refused patterns must not be presented as effective:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no file is closed") && stderr.contains("control character"),
+        "the drop has to be named, and for its own reason:\n{stderr}"
+    );
 }
 
 #[test]

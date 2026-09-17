@@ -101,6 +101,32 @@ fn pin_sources(binds: &[crate::config::Bind], project: &Path) -> Vec<crate::conf
     sources
 }
 
+/// Drop the control-plane pins an `[fs]` mask already covers.
+///
+/// Both emitters land on host paths, and `cage_mounts` appends `extra_binds` verbatim and in list
+/// order, so the *later* bind at a destination is the one the cage sees. The masks are staged
+/// first and the pins after them, so a pin at — or under — a mask destination would undo the mask:
+/// a `deny`'s decoy would be replaced by the real directory, and a `readonly`'s self re-bind by a
+/// read-write one. The shape is not exotic: launching from `$HOME` puts `$HOME/.config` and
+/// `$HOME/.local` on the pin chain, which is exactly what an `[fs]` entry there names.
+///
+/// The mask is the one that wins, because it costs the control plane nothing. A mask is itself a
+/// mount at that path — a decoy for `deny`, the path over itself for `readonly`, both read-only —
+/// so the component stays a mountpoint the kernel refuses to rename (`EBUSY`) and stays unwritable
+/// through, which is the whole of what the pin was there to provide. And `[fs]` only ever removes
+/// access, so deferring to it can never widen what the cage reaches.
+///
+/// Containment is asked of the expansion rather than restated here, so "this path is closed" keeps
+/// a single definition. Pure, so the precedence is asserted without a launch.
+fn pins_clear_of_masks(
+    pins: Vec<binds::ExtraBind>,
+    masks: &crate::sandbox::fsmask::Expanded,
+) -> Vec<binds::ExtraBind> {
+    pins.into_iter()
+        .filter(|pin| masks.covering(&pin.dest).is_none())
+        .collect()
+}
+
 /// Establish the mountpoint-chain pins that protect sbx's control plane: create each pin's host
 /// path (they are sbx's own directories — creating a not-yet-existent root here is what stops the
 /// agent pre-creating it unpinned) and turn it into the extra bind that freezes it. On the first
@@ -1210,6 +1236,7 @@ fn inline_flake_build<'a>(
                     wrap_flake_equip(
                         &prep.userland.nix_bin,
                         &prep.userland.shell_bin,
+                        &prep.userland.env_bin,
                         &binds::flake_roots_dir(),
                         flake_pairs,
                         cmd,
@@ -2525,6 +2552,7 @@ pub(super) fn build(
                     crate::sandbox::catrust::wrap(
                         &ct.certutil,
                         &prep.userland.shell_bin,
+                        &prep.userland.env_bin,
                         egress::CAGE_CA,
                         cmd,
                     )
@@ -2565,6 +2593,7 @@ pub(super) fn build(
             Box::new(|cmd| {
                 crate::sandbox::portal::wrap_command(
                     &prep.userland.shell_bin,
+                    &prep.userland.env_bin,
                     p,
                     portal_stack.scheme.as_deref(),
                     cmd,
@@ -2615,6 +2644,12 @@ pub(super) fn build(
     // are appended after this block (the task control plane below); the rule they have to respect
     // is stated on `control_plane_pins`, and it is about their destination, not their position.
     //
+    // The `[fs]` masks are the one set of binds already emitted *above* this point whose
+    // destinations are project paths rather than sbx's own constants, and the pin chain can run
+    // straight through one of them (`$HOME/.config` under a project root of `$HOME`). A pin landing
+    // on a mask would replace it, so `pins_clear_of_masks` drops those — the mask is a read-only
+    // mount at that path and already gives the pin everything it was there for.
+    //
     // Interdependency: the protection assumes in-cage code cannot `umount` a pin. That holds because
     // bwrap drops all capabilities (no `CAP_SYS_ADMIN` in the cage's user namespace) and the seccomp
     // filter denies `umount2`/`unshare`/`mount` — a change loosening either would silently break it.
@@ -2632,7 +2667,7 @@ pub(super) fn build(
     // containment test.
     let sources = pin_sources(&prep.cfg.binds, &prep.cwd);
     match establish_control_plane_pins(&crate::config::control_plane_pins(&sources)) {
-        Ok(pins) => extra_binds.extend(pins),
+        Ok(pins) => extra_binds.extend(pins_clear_of_masks(pins, &fs.masks)),
         Err(e) => {
             // Fail closed: if a pin cannot be established the containing read-write bind would be
             // unprotected, so abort the launch rather than run with a gap. An extreme case — a
@@ -3080,11 +3115,12 @@ fn resolve_wayland_hole(
 ///
 /// Every wrap but [`WrapLayer::ProcEnforce`] prepends a preamble that runs an sbx-chosen program by
 /// absolute store path — the shell each of them wraps its script in, `socat` for the egress and
-/// loopback forwarders, `mise` for an equip lane, `nix` for an inline flake build, and under the
-/// GUI holes the portal's bus daemon and the CA import's `certutil` (`gui_programs`) — and every one
-/// of those preambles runs *before* the enforcement shim installs its filter, which is what makes
-/// the shim's innermost position affordable. That reasoning only holds while those programs are
-/// sbx's own bytes. They are not: `/nix` is the project's own store, bound read-write so an agent
+/// loopback forwarders, `mise` for an equip lane, `nix` for an inline flake build, the coreutils
+/// the preambles do their own housekeeping with (`mkdir`, `cat`, `ln`, `readlink`, `touch`, `rm`,
+/// `sleep`, and the task client's `head`), and under the GUI holes the portal's bus daemon and the
+/// CA import's `certutil` (`gui_programs`) — and every one of those preambles runs *before* the
+/// enforcement shim installs its filter, which is what makes the shim's innermost position
+/// affordable. That reasoning only holds while those programs are sbx's own bytes. They are not: `/nix` is the project's own store, bound read-write so an agent
 /// can self-equip into it, and the seed places every path owner-writable — so in-cage code can
 /// replace `bin/bash` or `bin/socat` in it and have its replacement execute as the cage's first
 /// process, outside the `[proc]` exec policy and the `[fs] scan` content lens that the same launch
@@ -3113,6 +3149,10 @@ fn plumbing_pins(
         userland.mise_bin.as_path(),
         userland.nix_bin.as_path(),
         userland.base_loader.as_path(),
+        // The coreutils root, reached through the `env` that is carried on the userland: every
+        // helper a preamble runs (`mkdir`, `cat`, `ln`, `readlink`, `touch`, `rm`, `sleep`) lives
+        // beside it, and each is invoked from there by absolute path.
+        userland.env_bin.as_path(),
     ]
     .into_iter()
     .chain(gui_programs.iter().copied())

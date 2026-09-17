@@ -43,8 +43,10 @@ host; it provisions, inside the cage, the two things such an engine cannot work 
 
 It also gives the cage's network namespace a black-hole `dummy0` interface, so the engine
 reports itself online (Chromium decides `navigator.onLine` from a non-loopback interface
-being present, not from real reachability). No egress is opened: the dummy has no route,
-and all traffic still goes through the proxy on loopback.
+being present, not from real reachability). No egress is opened: the dummy has no route, or,
+when the [capture tap](network#clients-that-ignore-the-proxy-variables) is wired, a default route
+through it whose uncaptured packets are rejected with `net-unreachable`. All traffic still goes
+through the proxy on loopback.
 
 Use it for a terminal agent whose tools browse the web. It is strictly less exposure than
 `wayland` for the same capability, so prefer it whenever nothing needs a real window.

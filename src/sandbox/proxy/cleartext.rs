@@ -53,6 +53,16 @@ pub(super) fn handle_cleartext(
         return Ok(());
     };
 
+    // Asked once for the exchange, by the same function the other inspected planes ask
+    // ([`CredentialSet::masks_reflection_for`]). A cleartext host *can* be an injection target: the
+    // secret's own `to` rule is forced to `Layer::L7`, which keeps the bearer off this wire, but
+    // nothing stops the policy from also carrying an `http://` rule for that same hostname — and a
+    // host holding the credential from the TLS plane can reflect it into a cleartext response. It
+    // decides two things that must agree: whether the response is scanned for a reflected
+    // credential, and whether the request asks for a response the scan can read at all
+    // (`Accept-Encoding: identity`).
+    let masks_reflection = creds.masks_reflection_for(&host);
+
     // 5. The verdict — cleartext is strictly opt-in, so only an explicit `http://` allow rule permits
     //    it (`explain_clear` never consults the default action or parks; deny wins layer-agnostically).
     //    Evaluated against the effective policy, so an `http://` rule loaded live with `sbx net allow
@@ -233,10 +243,10 @@ pub(super) fn handle_cleartext(
         headers: head.headers.clone(),
     };
     // Never reused: reuse exists to amortize a TLS handshake, and a cleartext leg has none to save.
-    // Nothing scans this plane's responses — `masks_reflection` is asked of the same function on
-    // every plane and a cleartext host is never an injection target — so the client's own
-    // `Accept-Encoding` is forwarded as it was written.
-    let reserialized = reserialize_request(&origin, &[], None, false, false);
+    // When the response will be scanned for a reflected credential, `identity` is forced so the scan
+    // reads the bytes the cage would receive rather than a compressed body the mask cannot see into;
+    // otherwise the client's own `Accept-Encoding` is forwarded as it was written.
+    let reserialized = reserialize_request(&origin, &[], None, false, masks_reflection);
     upstream.write_all(&reserialized)?;
     flow.up
         .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
@@ -258,13 +268,17 @@ pub(super) fn handle_cleartext(
     begin_response_stream(&upstream);
 
     // 9. Relay the response head, then stream its framed body to the client and close. Inbound
-    //    masking is scoped to the responses of an injection-target host, and a cleartext host is
-    //    never one, so this response is relayed unredacted by the *same* rule the other planes apply
-    //    rather than a weaker one (`masks_reflection`, on the inspected-TLS path, asks exactly this
-    //    question). What that leaves open is narrow and deliberate: a value observed at step 6b can
-    //    name a cleartext host, so that host reflecting it back is not masked. Masking every host's
-    //    response instead would scan every body of every allowed request, which is the cost the
-    //    scoping decision exists to avoid.
+    //    masking is scoped to the responses of an injection-target host, by the *same* question the
+    //    other inspected planes ask and decided above, because it covers the head as much as the
+    //    body. What that leaves open is narrow and deliberate: a value observed at step 6b can name a
+    //    host no injection targets, so that host reflecting it back is not masked. Masking every
+    //    host's response instead would scan every body of every allowed request, which is the cost
+    //    the scoping decision exists to avoid.
+    let head_masking: &[SecretNeedle] = if masks_reflection {
+        &creds.needles
+    } else {
+        &[]
+    };
     let mut up_br = BufReader::new(upstream);
     let RelayedHead {
         head: resp_head,
@@ -276,7 +290,7 @@ pub(super) fn handle_cleartext(
         &mut client,
         &flow.down,
         capture.as_ref(),
-        &[],
+        head_masking,
         method,
         // One request per connection on this plane, so the client is told `close` in sbx's own
         // words rather than in whatever the upstream chose to answer.
@@ -311,7 +325,17 @@ pub(super) fn handle_cleartext(
         ctx.set_status(allow_seq, code);
     }
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
-    let counted = CountingReader::new(FramedBody::new(up_br, &framing), flow.down.clone());
-    let mut response = tee_response(counted, capture.as_ref());
-    pump_to_eof(&mut response, &mut client)
+    // Teed ahead of the reflection masking — the capture masks its own buffers at filing time. The
+    // relay's keep-alive answer has nothing to feed here: this plane serves one request per
+    // connection and both legs close after it.
+    relay_response_body(
+        &mut up_br,
+        &mut client,
+        &framing,
+        &flow.down,
+        capture.as_ref(),
+        masks_reflection,
+        &creds.needles,
+    )?;
+    Ok(())
 }

@@ -184,6 +184,13 @@ shapes beside it stopped deciding anything. A pattern that does not compile is r
 way, for its own reason. In both cases the remaining patterns still apply, so one bad line does
 not cost you the list.
 
+A pattern carrying a **control character** is refused for a reason about the terminal rather than
+about the scan. `[fs]` is honoured from an untrusted project, and an accepted pattern is printed
+back: `sbx config show` lists it under `fs scan`, and the launch warnings name it. A newline in one
+forges a line that reads like a mask which is not in force, and an escape sequence rewrites what the
+screen already shows. Nothing is lost by the refusal, since content that really holds such a byte is
+matched by spelling it as a regex escape (`\n`, `\t`, `\x1b`), which is plain text on the way back.
+
 This is the one key in the table that a trust gate holds. The rest of `[fs]` is honoured from an
 untrusted project because nothing in it can widen what another layer closed; a ceiling can, by
 being lowered, so an untrusted layer's `scan_max_kb` is refused rather than merely out-voted, and

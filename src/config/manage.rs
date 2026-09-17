@@ -458,16 +458,16 @@ pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<Written<SetOutcom
     // right and behaves wrong.
     if let Some(array) = parsed_array(val) {
         let created = put_value(&mut doc, key, array)?;
-        return match validate_layer(&doc) {
+        return match validate_layer(&before, &doc) {
             Ok(()) => commit(path, &doc, &before, created),
             Err(detail) => Err(ManageError::InvalidValue(key.to_string(), detail)),
         };
     }
     let created = put_value(&mut doc, key, scalar_value(val))?;
-    if validate_layer(&doc).is_err() {
+    if validate_layer(&before, &doc).is_err() {
         // The natural type broke the layer — write the value as a string instead.
         put_value(&mut doc, key, Value::from(val))?;
-        if let Err(detail) = validate_layer(&doc) {
+        if let Err(detail) = validate_layer(&before, &doc) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
@@ -514,6 +514,9 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
         return Err(ManageError::UseRuleVerb(key.to_string(), verb));
     }
     let mut doc = read_or_empty(path)?;
+    // Captured before `list_at` materializes the array, so the gate below compares against the
+    // file as it stands on disk.
+    let before = doc.to_string();
     let list = list_at(&mut doc, key)?;
     if list
         .iter()
@@ -529,14 +532,14 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
     // way in at all. The guess is validated below and retried as a string, so an over-eager one
     // (a host that looks like a number) is never committed.
     append_entry(list, scalar_value(entry));
-    if validate_layer(&doc).is_err() {
+    if validate_layer(&before, &doc).is_err() {
         // Replace the slot rather than take it out and append again: it already carries the decor
         // [`append_entry`] gave it, and a second append would move the trailing comment a second
         // time. `Array::replace` keeps the existing element's decor, which is exactly that slot's.
         let list = list_at(&mut doc, key)?;
         let last = list.len() - 1;
         list.replace(last, entry);
-        if let Err(detail) = validate_layer(&doc) {
+        if let Err(detail) = validate_layer(&before, &doc) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
@@ -554,6 +557,8 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
 /// being absent, which a parent layer may still fill.
 pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, ManageError> {
     let mut doc = read_or_empty(path)?;
+    // As in `add`: the pre-edit text, before `list_at` may materialize an empty array.
+    let before = doc.to_string();
     let list = list_at(&mut doc, key)?;
     let Some(idx) = list
         .iter()
@@ -565,7 +570,7 @@ pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool
         });
     };
     remove_entry(list, idx);
-    match validate_layer(&doc) {
+    match validate_layer(&before, &doc) {
         Ok(()) => {
             let text = write_doc(path, &doc)?;
             Ok(Written {
@@ -816,10 +821,27 @@ fn refuse_dropped_entry(dropped: Vec<String>) -> Result<(), String> {
     ))
 }
 
+/// The key path named inside a [`super::schema::parse_layer`] drop notice, which is what identifies
+/// a drop across an edit. The notice also carries the line the key sat on, and an insertion above
+/// moves it, so the line is deliberately not part of the comparison.
+fn dropped_path(notice: &str) -> &str {
+    notice.split('`').nth(1).unwrap_or(notice)
+}
+
 /// Whether the edited document still parses as a config layer **and** says what it appears to say.
 /// A `set`/`unset` that leaves the layer unparseable is worse than a no-op: the loader drops the
 /// WHOLE layer with only a warning, silently reverting every security field it carried, so a write
 /// is validated before it commits.
+///
+/// The question is asked the way the loader asks it, over `before` — the document as it read
+/// before the edit — and the edited one. Every loader path reads a layer through
+/// [`super::schema::parse_layer`], which recovers from a mistyped value by dropping that one key
+/// and applying the rest; judging an edit with the all-or-nothing [`super::schema::parse`] instead
+/// put the two planes at odds, and a file already carrying one recoverable type error — a file the
+/// loader loads and `sbx config show` prints — had every write verb refuse, naming the key just
+/// typed rather than the pre-existing one. So what is refused here is a document that no longer
+/// parses at all, or a key the edit itself newly costs; a drop the layer already carried is the
+/// loader's to warn about, not this gate's to block on.
 ///
 /// Parsing alone is not the whole gate. A field whose schema type is broad enough to hold a
 /// malformed value — `forward`, where a `"host:cage"` remap is a string and so any string parses —
@@ -858,8 +880,21 @@ fn refuse_dropped_entry(dropped: Vec<String>) -> Result<(), String> {
 /// to the URI scheme [`super::validate::validate_open`] reads it as; and a `[packages]` name is
 /// not held to the charset [`super::tools::apply_packages`] admits. Each of those writes reports
 /// success and changes nothing, which is what a check here would end.
-fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
-    let raw = super::schema::parse(doc.to_string().as_bytes())?;
+fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
+    // The drops the layer already had are not this edit's doing. A `before` that does not parse at
+    // all leaves the list empty, so an edit over an unrecoverable layer is judged on its result
+    // alone — repairing such a file stays possible, and leaving it broken stays refused.
+    let mut before_dropped = Vec::new();
+    let _ = super::schema::parse_layer(before.as_bytes(), &mut before_dropped);
+    let mut after_dropped = Vec::new();
+    let raw = super::schema::parse_layer(doc.to_string().as_bytes(), &mut after_dropped)?;
+    if let Some(notice) = after_dropped.iter().find(|notice| {
+        !before_dropped
+            .iter()
+            .any(|had| dropped_path(had) == dropped_path(notice))
+    }) {
+        return refuse_dropped_entry(vec![notice.clone()]);
+    }
     // The rule lists, baseline and per app. `sbx net allow` and `sbx proc allow` admit a rule
     // against the resolver's own grammar before writing it; `sbx config set network.allow '[…]'`
     // writes the same list in one go and went through neither, so `"*"`, an uncompilable `re:[`
@@ -1035,6 +1070,7 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
 /// schema's required set changes.
 pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError> {
     let mut doc = read_or_empty(path)?;
+    let before = doc.to_string();
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
@@ -1051,7 +1087,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError
             text: doc.to_string(),
         });
     }
-    if let Err(detail) = validate_layer(&doc) {
+    if let Err(detail) = validate_layer(&before, &doc) {
         return Err(ManageError::InvalidValue(key.to_string(), detail));
     }
     let text = write_doc(path, &doc)?;
@@ -1513,6 +1549,7 @@ pub(crate) fn add_fs_mask(
     entry: &str,
 ) -> Result<Written<AddOutcome>, ManageError> {
     let mut doc = read_or_empty(path)?;
+    let before = doc.to_string();
     let parent = layer_parent(&mut doc, app)?;
     let outcome = match parent.get("fs") {
         None => {
@@ -1553,7 +1590,7 @@ pub(crate) fn add_fs_mask(
         Some(_) => return Err(ManageError::MalformedFs("not a table".into())),
     };
 
-    if let Err(detail) = validate_layer(&doc) {
+    if let Err(detail) = validate_layer(&before, &doc) {
         return Err(ManageError::InvalidValue(
             format!("[fs] {}", list.key()),
             detail,
@@ -3083,6 +3120,54 @@ mod tests {
             "attr is optional"
         );
         assert_eq!(get(&p, "network").unwrap().as_deref(), Some("deny"));
+    }
+
+    /// The gate has to ask the question the loader asks. It used to parse the edited document with
+    /// the all-or-nothing `schema::parse` while every loader path reads a layer through the
+    /// recovering `schema::parse_layer`, so a file already carrying one mistyped value loaded fine —
+    /// that key dropped with a warning, the rest applied — and yet refused every write verb, naming
+    /// whichever key had just been typed instead of the one at fault.
+    #[test]
+    fn a_write_is_judged_the_way_the_loader_reads_the_layer() {
+        let tmp = crate::testutil::TmpDir::new();
+        // `[network] allow` takes a list, and a bare string there is exactly the single mistyped
+        // value `parse_layer` recovers from: `network.allow` goes, the posture and `[env]` stay.
+        let before =
+            "[env]\nKEEPME = \"yes\"\n\n[network]\nmode = \"deny\"\nallow = \"github.com\"\n";
+        let p = doc_at(tmp.path(), before);
+
+        set(&p, "env.FOO", "bar").expect("a drop the file already carried must not block a write");
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains("allow = \"github.com\""),
+            "the pre-existing line is the loader's to warn about, not this gate's to rewrite: \
+             {after}"
+        );
+        assert_eq!(get(&p, "env.FOO").unwrap().as_deref(), Some("bar"));
+        assert_eq!(get(&p, "env.KEEPME").unwrap().as_deref(), Some("yes"));
+
+        // An edit that takes the layer past what `parse_layer` recovers — a second type error in
+        // the same table, which elimination cannot pin on one key — is still refused, and the file
+        // is left as it was.
+        assert!(
+            set(&p, "network.deny", "evil.com").is_err(),
+            "a layer the loader would now drop whole must not commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            after,
+            "a refused set must leave the file exactly as it was"
+        );
+
+        // Witness: a drop the edit itself introduces is refused, and it is that key the message
+        // names rather than some pre-existing one.
+        let other = crate::testutil::TmpDir::new();
+        let clean = doc_at(other.path(), "[network]\nmode = \"deny\"\n");
+        let err = set(&clean, "network.allow", "github.com").expect_err("a new drop is refused");
+        let ManageError::InvalidValue(_, detail) = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(detail.contains("network.allow"), "{detail}");
     }
 
     #[test]

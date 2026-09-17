@@ -99,10 +99,13 @@
 //! `./script` and never of `/bin/sh`. That one is closed: the target's first bytes are read through
 //! a vouched probe (the shape the open lens walks, [`exec_head`]), the `#!` line is parsed
 //! ([`crate::proc_policy::shebang_interpreter`]), and the interpreter is decided as well, on the
-//! stricter of the two verdicts. The interpreter's own *argument* is not decided, for the reason
-//! [`crate::proc_policy::loader_targets`] gives about a loader's: `#!/usr/bin/env python3` is
-//! decided as `/usr/bin/env`, so a payload spelled there runs only under an interpreter a rule
-//! already allows.
+//! stricter of the verdicts. Nor does the kernel stop at one such line: it re-enters its handler
+//! loop for the interpreter it has just loaded, so an interpreter that is itself a script hands the
+//! exec on again inside the same syscall — measured. The chain is followed to the kernel's own
+//! ceiling ([`SHEBANG_HOPS`]) and every link is decided. The interpreter's own *argument* is not,
+//! for the reason [`crate::proc_policy::loader_targets`] gives about a loader's:
+//! `#!/usr/bin/env python3` is decided as `/usr/bin/env`, so a payload spelled there runs only
+//! under an interpreter a rule already allows.
 //!
 //! **`binfmt_misc` is the second substitution, and it is closed by reading the kernel rather than
 //! the file.** A registered handler for a `.jar`, a `.py` or a wine binary runs an interpreter that
@@ -167,7 +170,7 @@ mod target;
 pub(crate) use overlay::ProcOverlay;
 pub(crate) use pending::PendingExec;
 
-use cagepath::{caller_proc_path, open_target_path};
+use cagepath::{caller_proc_path, names_caller_descriptor, open_target_path};
 use notify::{
     notif_id_valid, notif_of, notif_recv_code, poll_events, poll_readable, recv_fd,
     respond_continue, respond_errno,
@@ -506,6 +509,19 @@ pub(crate) fn wrap_command(cmd: Vec<OsString>, open_lens: bool) -> Vec<OsString>
     out
 }
 
+/// How many `#!` rewrites one `execve` can carry, which is the kernel's own ceiling.
+///
+/// `exec_binprm` re-enters its handler loop for each interpreter it loads and answers `ELOOP` past
+/// the fifth, so a chain walked further than this would decide programs no `execve` ever reaches --
+/// and one walked less far would leave the program that does run undecided.
+const SHEBANG_HOPS: usize = 5;
+
+/// How a `#!` chain is named in the record: the path the syscall carried, then every interpreter the
+/// kernel loads behind it, in the order it loads them.
+fn shebang_chain(path: &str, chain: &[String]) -> String {
+    format!("{path} (#! {})", chain.join(" -> "))
+}
+
 /// Decide one notified `execve` by the name written at `addr` in the target's memory, and say what
 /// to record for it.
 ///
@@ -634,8 +650,67 @@ fn exec_verdict(
                         }
                     }
                     crate::proc_policy::ScriptHead::Interpreter(interp) => {
-                        let with = decide_target(cx, caller, pid, &interp);
-                        let stricter = verdict.stricter(with);
+                        // One `#!` line is not the end of the substitution. The kernel re-enters
+                        // its handler loop for the interpreter it has just loaded, so an
+                        // interpreter that is itself a script hands the exec on again -- inside
+                        // this same syscall, with no notification of its own. Measured: a script
+                        // naming a script naming `/bin/sh` starts the shell from one `execve`. The
+                        // chain is therefore walked rather than its first link alone, every link
+                        // decided, as far as the kernel itself goes.
+                        let mut chain = vec![interp];
+                        let mut stricter = verdict;
+                        while let Some(cur) = chain.last().cloned() {
+                            stricter = stricter.stricter(decide_target(cx, caller, pid, &cur));
+                            // Read the way the notified path's own head was read. An interpreter is
+                            // absolute by construction ([`crate::proc_policy::shebang_interpreter`]),
+                            // so it names a file rather than the caller's directory or a descriptor.
+                            let head =
+                                match exec_head(cx.mounts, pid, libc::AT_FDCWD, &cur, false, notif)
+                                {
+                                    Ok(head) => head,
+                                    // The same split the notified path's own read takes below:
+                                    // nothing there is nothing to refuse, while a link this
+                                    // supervisor reached and could not read hides what runs behind
+                                    // it.
+                                    Err(libc::ENOENT) | Err(libc::ENOTDIR) | Err(libc::ESRCH)
+                                    | Err(libc::ENOSYS) => break,
+                                    Err(_) => {
+                                        return Decided {
+                                            verdict: Verdict::Deny,
+                                            shown: shebang_chain(&path, &chain),
+                                            probed: path,
+                                            because: Because::UnreadableShebang,
+                                        };
+                                    }
+                                };
+                            match crate::proc_policy::shebang_interpreter(&head) {
+                                // The last link: what the kernel finally runs is a program no
+                                // further line names.
+                                crate::proc_policy::ScriptHead::NotScript => break,
+                                crate::proc_policy::ScriptHead::Unsettled => {
+                                    return Decided {
+                                        verdict: Verdict::Deny,
+                                        shown: shebang_chain(&path, &chain),
+                                        probed: path,
+                                        because: Because::UnreadableShebang,
+                                    };
+                                }
+                                crate::proc_policy::ScriptHead::Interpreter(next) => {
+                                    if chain.len() >= SHEBANG_HOPS {
+                                        // A chain still rewriting here is one the kernel answers
+                                        // `ELOOP` to, so nothing runs either way -- and what it
+                                        // would have reached was never named.
+                                        return Decided {
+                                            verdict: Verdict::Deny,
+                                            shown: shebang_chain(&path, &chain),
+                                            probed: path,
+                                            because: Because::UnreadableShebang,
+                                        };
+                                    }
+                                    chain.push(next);
+                                }
+                            }
+                        }
                         // Named in the record only where it changed the answer, which is the
                         // difference from a loader: there the notified path (`ld.so`) says nothing
                         // about what runs, while here it is the program the user launched and the
@@ -643,7 +718,7 @@ fn exec_verdict(
                         if stricter != verdict {
                             return Decided {
                                 verdict: stricter,
-                                shown: format!("{path} (#! {interp})"),
+                                shown: shebang_chain(&path, &chain),
                                 probed: path,
                                 because: Because::Policy,
                             };
@@ -658,19 +733,32 @@ fn exec_verdict(
                         };
                     }
                 },
-                // Nothing was there to read, so there is nothing to refuse: the target is gone,
-                // was never there, sits behind a path component that is not a directory (all three
-                // of which make the `execve` fail on its own), or this kernel has no scoped
-                // resolution to reach it with -- and `probe_in_cage_root` has already said that
-                // last one out loud. Keeping these off the refusing arm is also what keeps a name
-                // lookup walking, for the reason [`refusal_errno`] gives.
-                Err(libc::ENOENT) | Err(libc::ENOTDIR) | Err(libc::ESRCH) | Err(libc::ENOSYS) => {}
-                // Reached and not readable, which is the one arm that must refuse. Measured: a
-                // script in mode `0111` cannot be read by a same-uid supervisor, yet `execve` on it
+                // The target is already gone, or this kernel has no scoped resolution to reach it
+                // with -- and `probe_in_cage_root` has already said that last one out loud.
+                Err(libc::ESRCH) | Err(libc::ENOSYS) => {}
+                // A name this supervisor's own walk did not reach. Ordinarily there was nothing to
+                // read and so nothing to refuse: the target was never there, or it sits behind a
+                // path component that is not a directory, both of which make the `execve` fail on
+                // its own. Keeping that off the refusing arm is also what keeps a name lookup
+                // walking, for the reason [`refusal_errno`] gives.
+                //
+                // Ordinarily -- but the walk is this process's, and prefixing `/proc/<pid>/root`
+                // holds it on the cage's mounts only until it meets a symlink whose target begins
+                // with `/`: such a target restarts the resolution at the resolving process's root,
+                // which is this one's, and lands on a host path that is usually absent. The cage's
+                // own `execve` resolves that very link against the *cage's* root and runs what it
+                // finds there, `#!` line and all. So the cage is asked before an absence is
+                // believed, with the walk a refusal's errno is chosen by, and a target the cage
+                // holds falls through to the refusing arm below rather than running with its head
+                // unread.
+                Err(libc::ENOENT) | Err(libc::ENOTDIR) if !reached_in_cage(pid, &path) => {}
+                // Reached and not read, which is the one arm that must refuse. Measured: a script
+                // in mode `0111` cannot be read by a same-uid supervisor, yet `execve` on it
                 // succeeds and the interpreter runs -- with `#!/usr/bin/perl -esystem(...)` the
                 // payload rides in the interpreter's own argument and never needs the script at
                 // all. Taking the path's verdict alone there would let a denied interpreter run
-                // behind a file the cage made unreadable on purpose.
+                // behind a file the cage made unreadable on purpose, or behind one it named
+                // through a link this supervisor's walk could not follow.
                 Err(_) => {
                     return Decided {
                         verdict: Verdict::Deny,
@@ -729,6 +817,38 @@ fn decide_target(cx: &Deciding<'_>, caller: &[String], pid: u32, target: &str) -
         learn.record(target);
     }
     verdict
+}
+
+/// Whether the **cage** reaches `path`, asked with the walk the cage's own kernel would make.
+///
+/// The question a failed read of a target's first bytes leaves open. This supervisor resolves
+/// through `/proc/<pid>/root`, which holds the walk on the cage's mounts only until it meets a
+/// symlink whose target begins with `/` -- that restarts the resolution at this process's root,
+/// where the name usually leads nowhere, while the cage's own `execve` resolves it against the
+/// cage's root and runs what it finds. [`probe_in_cage_root`] is the second resolution that answers
+/// about the cage instead, and this is the second question put to it; [`refusal_errno`] chooses an
+/// errno with the same walk and spells out at length why it is the walk to use.
+///
+/// `false` for what this walk cannot start from: a relative path, resolved against a working
+/// directory this process does not have, and a name the kernel marked `(deleted)`, which is what a
+/// descriptor's own `/proc` link reads for an object no link is left to -- there is nothing there
+/// for any walk to reach, and the object is the caller's own already.
+fn reached_in_cage(pid: u32, path: &str) -> bool {
+    if !path.starts_with('/') || path.ends_with(" (deleted)") {
+        return false;
+    }
+    // `self` names whoever resolves it, and that is this process rather than the cage's task, so it
+    // is spelled out first -- the same rewrite the read of an exec target and a refusal both make.
+    let named = caller_proc_path(pid, path);
+    match probe_in_cage_root(pid, Path::new(named.as_deref().unwrap_or(path))) {
+        Ok(fd) => {
+            // SAFETY: fd is this call's own descriptor, returned by the probe and closed once.
+            // Nothing is read through it -- the question was whether it could be opened at all.
+            unsafe { libc::close(fd) };
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Whether a decided target is one a learning run should keep.
@@ -836,10 +956,11 @@ fn read_binfmt_rules() -> Vec<crate::proc_policy::BinfmtRule> {
 /// inside the cage's root or it is an error here, because reading the *wrong* file is how a script
 /// gets its interpreter decided as something the cage chose.
 ///
-/// The errno distinguishes two things for the caller. `ENOENT`/`ESRCH` mean there was nothing to
-/// read -- the exec will fail on its own, or the target is already gone -- and the path's own
-/// verdict stands. Anything else, `EACCES` first among them, means a file that is *there* and whose
-/// first bytes this supervisor cannot see, and the caller refuses on it.
+/// The errno distinguishes two things for the caller. `ENOENT`/`ESRCH` mean this walk reached
+/// nothing -- the target is already gone, or the exec will fail on its own -- and the path's own
+/// verdict stands, once the caller has asked the cage whether the absence is the cage's too
+/// ([`reached_in_cage`]). Anything else, `EACCES` first among them, means a file that is *there* and
+/// whose first bytes this supervisor cannot see, and the caller refuses on it.
 fn exec_head(
     mounts: &CageMounts,
     pid: u32,
@@ -859,19 +980,31 @@ fn exec_head(
     // such an object at all: a `memfd` links to `/memfd:<name> (deleted)` and a file unlinked since
     // to `<path> (deleted)`, neither of which any walk resolves, so vouching would answer `ENOENT`
     // about the very file the kernel is about to run.
+    //
+    // Those two spellings and nothing else. A path that merely *begins* with `/proc/self` carries
+    // an arbitrary remainder the cage chose -- `/proc/self/root/<anything>` names the cage's whole
+    // filesystem -- and a component of it that is a symlink with an absolute target re-roots the
+    // walk at this process's root. Such a path holds no object the caller already holds, so it is
+    // vouched for like any other ([`names_caller_descriptor`]).
     let held = by_descriptor
         .then(|| format!("/proc/{pid}/fd/{dirfd}"))
         .or_else(|| {
-            caller_proc_path(pid, path).map(|_| {
-                open_target_path(pid, dirfd, path)
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            caller_proc_path(pid, path)
+                .filter(|_| names_caller_descriptor(path))
+                .map(|_| {
+                    open_target_path(pid, dirfd, path)
+                        .to_string_lossy()
+                        .into_owned()
+                })
         });
     let mut file = if let Some(target) = held {
         std::fs::File::open(target).map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?
     } else {
-        let probe = probe_and_vouch(mounts, pid, &open_target_path(pid, dirfd, path), false)?;
+        // `own` is the open lens's own question, asked the same way: a path that names the caller's
+        // entry may land on an anonymous inode no mount can vouch for, and one the caller holds
+        // grants nothing. It waives the mount check for such an inode only, never for a path.
+        let own = caller_proc_path(pid, path).is_some();
+        let probe = probe_and_vouch(mounts, pid, &open_target_path(pid, dirfd, path), own)?;
         // The probe is an `O_PATH` descriptor, which no read answers; reopening through it reads
         // the object already resolved rather than whatever the path names a moment later -- and it
         // is also where a file the cage may execute and not read says `EACCES`.

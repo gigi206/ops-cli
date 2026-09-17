@@ -10336,6 +10336,66 @@ fn an_app_inherits_a_baseline_credentials_plugin_host_config() {
     );
 }
 
+/// A credential declared in a **one-shot override** must reach its plugin's `[plugin.<name>]`
+/// table too.
+///
+/// `apply_override` builds the override's credentials from a registry it loads itself, so every
+/// plugin instance they carry starts on `HostConfig::default()`, and nothing answers the table
+/// after it: `resolve` has already run both halves of the walk by then. So a `vault://` ref handed
+/// to one launch reached the resolver cage with none of the configured environment, while the
+/// byte-identical declaration written in the config reached it with all of it — one declaration
+/// resolving two different ways depending on which plane carried it.
+///
+/// The plugin is placed on disk because `apply_override` reads the registry from
+/// [`crate::store::Layout::from_env`] rather than from the registry the resolve was given.
+#[test]
+fn a_one_shot_credential_gets_its_plugins_table() {
+    let _lock = crate::testutil::env_lock();
+    let data = crate::testutil::TmpDir::new();
+    let dir = data.path().join("plugins/vault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"vault\"\ntype = \"resolver\"\nscheme = \"vault\"\nexec = \"resolve\"\n\
+         [sandbox]\nallow_env = [\"VAULT_ADDR\"]\n",
+    )
+    .unwrap();
+    let _data_dir = crate::testutil::EnvVar::set("SBX_DATA_DIR", data.path());
+
+    let mut global = raw_plugin_table("vault", &[("VAULT_ADDR", "https://vault.example.com")]);
+    global.network = Some(net_field("deny", &["api.example.com"], &[]));
+    let mut r = super::resolve(global, None, &PluginRegistry::default());
+    assert!(r.secrets.is_empty(), "the baseline declares no credential");
+
+    let mut over = raw(&[], &[]);
+    over.secret = Some(raw_secret_section(vec![(
+        "api.example.com".to_string(),
+        raw_secret_from(vec!["vault://secret/data/tok#v"]),
+    )]));
+    r.apply_override(Override::for_test(over))
+        .expect("the override applies");
+
+    let expected = vec![(
+        "VAULT_ADDR".to_string(),
+        "https://vault.example.com".to_string(),
+    )];
+    let host_of = |secrets: &[HeaderSecret]| match &secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => plugin.host.env.clone(),
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    assert_eq!(
+        host_of(&r.secrets),
+        expected,
+        "the launch's credential is answered: {:?}",
+        r.warnings
+    );
+    assert_eq!(
+        host_of(&r.declared_secrets),
+        expected,
+        "and so is the half the `--app` view re-derives from"
+    );
+}
+
 #[test]
 fn a_plugin_table_supplies_only_the_variables_the_manifest_reads() {
     let reg = PluginRegistry::with([plugin_reading("vault", &["VAULT_ADDR"], &["VAULT_CACERT"])]);

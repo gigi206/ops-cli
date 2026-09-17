@@ -491,7 +491,12 @@ pub(crate) enum ScriptHead {
 /// *different* program: the kernel reads the line, and executes the interpreter it names with the
 /// script's path appended. A supervisor deciding on the notified path alone therefore decides
 /// `./script` and never `/bin/sh`, which is the rule the cage was reaching around. So the line is
-/// read and the interpreter decided too, on the stricter of the two verdicts.
+/// read and the interpreter decided too, on the stricter of the verdicts.
+///
+/// One line is one link of a chain. The kernel re-enters its handler loop for the interpreter it has
+/// just loaded, so an interpreter that is itself a script hands the exec on again inside the same
+/// syscall; this parse answers about one head, and the caller reads the next one — see the `#!`
+/// paragraph of [`crate::sandbox::proc_enforce`].
 ///
 /// The grammar is the kernel's, measured rather than assumed:
 ///

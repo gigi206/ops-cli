@@ -164,6 +164,46 @@ fn only_a_basic_challenge_is_answered_with_the_credential_itself() {
     assert_eq!(basic_answer("Basic realm=\"private\"", None), None);
 }
 
+#[test]
+fn a_challenge_from_a_redirect_hop_is_not_answered() {
+    let challenge = "Bearer realm=\"https://elsewhere.example/token\",service=\"x\"";
+    let answered = |redirected| super::super::http::Response {
+        status: 401,
+        headers: vec![("WWW-Authenticate".to_string(), challenge.to_string())],
+        body: Vec::new(),
+        redirected,
+    };
+    // The registry itself challenged: this is the exchange the credential exists for.
+    assert_eq!(
+        answerable_challenge(&answered(false)).unwrap(),
+        Some(challenge)
+    );
+    // A host the registry redirected to challenged: it names a realm of its own choosing, and
+    // presenting the credential there would hand it to whoever the redirect pointed at.
+    let err = answerable_challenge(&answered(true)).expect_err("a redirect hop is refused");
+    assert!(err.to_string().contains("redirect"), "{err}");
+    // A redirect that simply serves the blob is not a challenge and is not refused.
+    let mut served = answered(true);
+    served.status = 200;
+    assert_eq!(answerable_challenge(&served).unwrap(), None);
+}
+
+/// A stated layer size bounds the fetch, but never past the absolute ceiling.
+///
+/// The size comes out of the manifest, so it is the registry's number: taken verbatim it let a
+/// registry name a terabyte and then stream until the disk filled, because the digest that would
+/// declare the blob wrong is known only once every byte has landed.
+#[test]
+fn a_stated_layer_size_cannot_raise_the_write_ceiling() {
+    assert_eq!(blob_cap(0), http::MAX_STREAMED_BODY);
+    assert_eq!(blob_cap(4096), 4096);
+    assert_eq!(blob_cap(u64::MAX), http::MAX_STREAMED_BODY);
+    assert_eq!(
+        blob_cap(http::MAX_STREAMED_BODY + 1),
+        http::MAX_STREAMED_BODY
+    );
+}
+
 /// A registry that does not challenge can still serve a layer larger than the document cap.
 ///
 /// The challenge probe used to be a `GET`: on a registry that answers `401` first, its body is the

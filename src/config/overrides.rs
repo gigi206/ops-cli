@@ -420,6 +420,13 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
     // `apply_override` carries only one-shot launch fields. Left in place they would be reported a
     // second time downstream, where every layer that may not define a group is reported.
     super::take_net_groups(&mut merged.network);
+    // A `[network]` table whose only content was those groups declares no posture, so it must not
+    // reach `apply_override`: the application layers a table by *replacing* the policy below it,
+    // and a table with no mode and no rules would rebuild it from nothing — silently trading an
+    // `none`/`shared` baseline for a filtering allowlist, or dropping a baseline's carve-outs.
+    if matches!(&merged.network, Some(NetworkField::Table(t)) if *t == NetworkTable::default()) {
+        merged.network = None;
+    }
     Ok(Override {
         raw: merged,
         notices,
@@ -2085,6 +2092,39 @@ mod tests {
         assert!(text.contains("[app.*]"), "{text}");
         // Noticed *and* dropped: the posture handed to the launch carries no group table, so the
         // layer that may not define one is not asked about it a second time downstream.
+        assert!(
+            !declares_net_groups(&ov.raw),
+            "the groups must not ride along"
+        );
+    }
+
+    #[test]
+    fn a_groups_only_override_carries_no_network_posture() {
+        // Once the groups are taken, nothing is left in the table: it declares no mode and no
+        // rules, so it must not reach the application at all. A table that did reach it replaces
+        // the policy below — a `none` baseline would come back as a filtering allowlist.
+        let ov = collect_cli(Cli {
+            config: &["[network.groups]\nx = [\"a.example.com\"]"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            ov.raw.network.is_none(),
+            "a groups-only blob must contribute no posture: {:?}",
+            ov.raw.network
+        );
+
+        // A table that also declares a posture still governs the launch; only the groups go.
+        let ov = collect_cli(Cli {
+            config: &["[network]\nmode = \"deny\"\n[network.groups]\nx = [\"a.example.com\"]"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            matches!(&ov.raw.network, Some(NetworkField::Table(t)) if t.mode.as_deref() == Some("deny")),
+            "the declared mode must survive: {:?}",
+            ov.raw.network
+        );
         assert!(
             !declares_net_groups(&ov.raw),
             "the groups must not ride along"

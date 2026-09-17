@@ -9,7 +9,7 @@ use crate::{net_mode_word, short_rev};
 
 use super::format::{
     bind_mode_tag, channel_text, opt_provenance_tag, package_line, provenance_parts,
-    provenance_tag, service_line, write_net_posture_head, write_notify,
+    provenance_tag, sanitized_list, service_line, write_net_posture_head, write_notify,
 };
 
 /// The layered environment, after the trust gate. Shown even when empty: a reader looking for a
@@ -464,7 +464,7 @@ fn grants_section(view: &config::view::ConfigView, pal: &style::Palette) -> Opti
         let _ = writeln!(
             o,
             "  {h}fs scan:{r} {} {dim}(content closed at every open; {ceiling}){r}{}",
-            view.fs_scan.join(", "),
+            sanitized_list(&view.fs_scan),
             provenance_tag(view.fs_origin, pal)
         );
     }
@@ -1197,7 +1197,7 @@ fn app_row_fs(o: &mut String, app: &config::view::AppView, pal: &style::Palette)
         let _ = writeln!(o, "      {dim}fs deny:{r} {}", app.fs_deny.join(", "));
     }
     if !app.fs_scan.is_empty() {
-        let _ = writeln!(o, "      {dim}fs scan:{r} {}", app.fs_scan.join(", "));
+        let _ = writeln!(o, "      {dim}fs scan:{r} {}", sanitized_list(&app.fs_scan));
     }
     if !app.fs_readonly.is_empty() {
         let _ = writeln!(

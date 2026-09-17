@@ -1028,15 +1028,19 @@ struct RuleWrite<'a> {
     app_key: Option<&'a str>,
     /// How to name the destination to the user; already carries the app, if any.
     target: String,
-    /// The trust store, and by its presence the gate itself: `Some` for a `--local` project write
-    /// (which must be re-trusted after the edit), `None` for a global config or an app profile,
-    /// both trusted by location.
+    /// The trust store and the sibling mise files the gate read, and by its presence the gate
+    /// itself: `Some` for a `--local` project write (which must be re-trusted after the edit),
+    /// `None` for a global config or an app profile, both trusted by location.
+    ///
+    /// The mise files travel with the store because the re-trust must attest to the ones the gate
+    /// judged: [`trust::trust_written`] refuses a marker over any other, so an in-cage payload
+    /// rewriting one between the gate and the re-trust cannot have it blessed.
     ///
     /// The re-trust stays with each caller rather than riding along here: the two add paths always
     /// owe one, the removal path owes one only when it actually changed the file (re-trusting a
     /// path that no removal created would fail and turn a no-op into an error), and all three word
     /// a failure differently.
-    store: Option<PathBuf>,
+    store: Option<(PathBuf, trust::MiseInputs)>,
 }
 
 /// Admit a rule write to the scoped config file, refusing everything that must be refused before
@@ -1095,14 +1099,13 @@ fn open_rule_write<'a>(
         let store = trust::default_store_dir().ok_or((1, no_store.to_string()))?;
         // One read for the gate and the refusal both, for the reason `precheck_local_save` states.
         let exists = path.exists();
-        if !local_save_permitted(
-            exists,
-            trust::state(&store, &path),
-            !trust::mise_files_for(&path).is_empty(),
-        ) {
+        // The mise files the verdict was computed over are kept for the re-trust: the two must
+        // attest to the same bytes, or the window between them is one an in-cage write can use.
+        let (state, mise) = trust::state_with_inputs(&store, &path);
+        if !local_save_permitted(exists, state, !trust::mise_files_for(&path).is_empty()) {
             return Err((2, local_save_refusal(&path, exists)));
         }
-        Some(store)
+        Some((store, mise))
     } else {
         None
     };
@@ -1264,10 +1267,10 @@ fn persist_egress_rule(
     // composed means a file changed underneath simply no longer matches its marker — the same
     // fail-safe outcome as the crash, and the one `local_save_permitted`'s gate reads as if it got.
     // Only when something was written: see `AddOutcome::wrote_anything`.
-    if let Some(store) = &store
+    if let Some((store, mise)) = &store
         && written.outcome.wrote_anything()
     {
-        trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
+        trust::trust_written(store, &path, written.text.as_bytes(), mise).map_err(|e| {
             (
                 1,
                 format!(
@@ -1330,10 +1333,10 @@ fn persist_proc_rule(
     // Re-trust after the write; the ordering is fail-safe (a crash between leaves a correct-but-
     // untrusted file the next launch drops — the rule does not take effect, never a security hole).
     // Only when something was written: see `AddOutcome::wrote_anything`.
-    if let Some(store) = &store
+    if let Some((store, mise)) = &store
         && written.outcome.wrote_anything()
     {
-        trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
+        trust::trust_written(store, &path, written.text.as_bytes(), mise).map_err(|e| {
             (
                 1,
                 format!(
@@ -1399,10 +1402,10 @@ fn persist_fs_mask(
         manage::add_fs_mask(&path, app_key, list, entry).map_err(|e| (2, e.to_string()))?;
 
     // Re-trust after the write, on the fail-safe ordering [`persist_proc_rule`] states.
-    if let Some(store) = &store
+    if let Some((store, mise)) = &store
         && written.outcome.wrote_anything()
     {
-        trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
+        trust::trust_written(store, &path, written.text.as_bytes(), mise).map_err(|e| {
             (
                 1,
                 format!(
@@ -1458,10 +1461,10 @@ fn persist_learned_proc_rules(
     // listed.
     let wrote_anything = written.outcome.wrote_anything();
 
-    if let Some(store) = &store
+    if let Some((store, mise)) = &store
         && wrote_anything
     {
-        trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
+        trust::trust_written(store, &path, written.text.as_bytes(), mise).map_err(|e| {
             (
                 1,
                 format!(
@@ -1560,8 +1563,8 @@ fn persist_removal<E: std::fmt::Display>(
             //
             // Attested from the text `remove` composed, never from a second read of the path — the
             // add path states the reasoning in full at its own `trust_written` call.
-            if let Some(store) = &store {
-                trust::trust_written(store, &path, text.as_bytes()).map_err(|e| {
+            if let Some((store, mise)) = &store {
+                trust::trust_written(store, &path, text.as_bytes(), mise).map_err(|e| {
                     (
                         1,
                         format!(

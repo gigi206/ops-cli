@@ -183,22 +183,6 @@ pub(crate) fn pointer_can_name(image: &Path) -> Result<(), String> {
     }
 }
 
-/// The scratch file [`write_pointer`] fills before the rename, named per process.
-///
-/// A shared name would void the atomicity the rename is there for. Two writers open it, and both
-/// hold a descriptor on the same inode: whichever renames first publishes it *while the other is
-/// still writing into it*, so the loser's bytes land in the live `storage.toml`, at offset zero, in
-/// a file it already truncated. Measured with that interleaving forced, the published file holds one
-/// writer's record followed by the tail of the other's — the partial the comment at the rename says
-/// cannot happen. `read_pointer` still finds a path there, since the surviving tail is the middle of
-/// one and can spell no header; what is lost is the file being the TOML it promises to be.
-///
-/// Per process rather than per call: one process writes this file once per command, and the same
-/// shape (`std::process::id`) already names the temp of the egress rollup.
-fn pointer_tmp_name() -> String {
-    format!(".{POINTER}.tmp.{}", std::process::id())
-}
-
 /// Record that sbx's data lives in the volume backed by `image`.
 ///
 /// Refuses a path [`pointer_can_name`] rules out. That guard is here, and not only at the command
@@ -206,28 +190,25 @@ fn pointer_tmp_name() -> String {
 /// reaches the format through it, and one that forgot to ask would otherwise write a file no reader
 /// can take back.
 pub(crate) fn write_pointer(default_data_dir: &Path, image: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
     pointer_can_name(image).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(default_data_dir)?;
-    let path = default_data_dir.join(POINTER);
-    let tmp = default_data_dir.join(pointer_tmp_name());
     // The value needs no escaping — `pointer_can_name` is what makes that true — and quoting it
     // keeps the file valid TOML for anyone who reads it as such.
-    std::fs::write(
-        &tmp,
-        format!(
-            "# sbx's data lives in this volume. Remove this file (or run `sbx storage unuse`)\n\
-             # to go back to using this directory directly.\n\
-             image = \"{}\"\n",
-            image.display()
-        ),
-    )?;
-    // Renamed into place so a reader sees the old file or the new one, never a partial. The
-    // temp's name is what makes that true for a *second* writer as well — see [`pointer_tmp_name`].
-    std::fs::rename(&tmp, &path)
+    let body = format!(
+        "# sbx's data lives in this volume. Remove this file (or run `sbx storage unuse`)\n\
+         # to go back to using this directory directly.\n\
+         image = \"{}\"\n",
+        image.display()
+    );
+    // Staged through the one helper every file sbx installs goes through, rather than a rename of
+    // its own, and for the property only that helper has: it flushes the temp to the device before
+    // the rename and fsyncs the directory after it. A rename alone orders itself against the data
+    // only once the data is durable, so a crash just after it can leave `storage.toml` present,
+    // the right size and full of zeros — which [`read_pointer`] cannot tell from a file that names
+    // no image, i.e. from no pointer at all, and sbx would then provision a fresh empty store in
+    // the default directory while the adopted volume still holds everything. It also owns the
+    // scratch file: named per process *and* per staging, so a second writer never lands in the
+    // inode this one is publishing, and removed on either failure rather than left behind.
+    crate::sandbox::atomicfile::write_atomic(&default_data_dir.join(POINTER), body.as_bytes())
 }
 
 /// Stop following a volume. The volume and its contents are untouched.
@@ -1054,6 +1035,23 @@ impl Mkfs {
     }
 }
 
+/// The channel the provisioned `btrfs-progs` is built from: whatever the shared lock already
+/// records, and only failing that the default.
+///
+/// The lock this targets is `<data>/nixpkgs.lock`, the one every launch resolves the base userland
+/// from — so the source handed to [`crate::store::LockTarget::global`] decides whether creating a
+/// volume *reads* that lock or *rewrites* it. Passing `None` names the default rolling channel, and
+/// a lock recording a global `nixpkgs` override then matches no longer: resolution falls through to
+/// the network and writes the default back over the user's pin, rolling the whole installation's
+/// channel for the sake of one helper binary. Reusing the recorded source keeps the resolution a
+/// lock hit — no network, no write — and builds the helper against the channel everything else on
+/// the host already uses. A fresh installation has no lock and is unchanged: it resolves the
+/// default, exactly as a first launch would.
+fn mkfs_lock_target(layout: &crate::store::Layout) -> crate::store::LockTarget {
+    let locked = crate::store::read_global_lock(layout).map(|(source, _)| source);
+    crate::store::LockTarget::global(layout, locked.as_deref())
+}
+
 /// Find `mkfs.btrfs`, provisioning it if the host has none.
 ///
 /// Only ever needed to *create* a volume. Using one needs no `btrfs` binary at all —
@@ -1072,7 +1070,7 @@ pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
     let bwrap = crate::store::resolve_bwrap(Some(&layout))
         .map(|c| c.path)
         .ok_or("no mkfs.btrfs on PATH, and no bubblewrap to run a provisioned one")?;
-    let nixpkgs = crate::store::LockTarget::global(&layout, None)
+    let nixpkgs = mkfs_lock_target(&layout)
         .resolve(&nix, &layout)
         .map_err(|e| format!("cannot resolve the nixpkgs channel: {e}"))?;
     let gcroot = layout
@@ -2232,27 +2230,35 @@ this line has no separator at all
         assert_eq!(read_pointer(&dir).unwrap().as_deref(), Some(ok.as_path()));
     }
 
-    /// Two writers must not share the scratch file, or the rename stops being atomic for the second
-    /// one: it goes on writing into the inode the first has already published. A second *process* is
-    /// what the name has to distinguish, so what a single-process test can hold is that the name
-    /// carries this process's identity — and therefore that no other process derives it.
+    /// A published pointer must never be present and empty: `read_pointer` takes a file that names
+    /// no image for "no pointer", so an empty one is silently the ordinary no-volume installation
+    /// while the adopted volume still holds everything. The durability half of that — the bytes
+    /// reaching the device before the rename, and the directory entry after it — is
+    /// [`crate::sandbox::atomicfile`]'s and is pinned there; what is held here is that
+    /// `write_pointer` publishes through it, so the file it installs is whole and its scratch file
+    /// is gone.
     #[test]
-    fn the_scratch_file_is_this_processs_own() {
-        let name = pointer_tmp_name();
-        assert!(
-            name.contains(&std::process::id().to_string()),
-            "a name two processes both derive is a shared scratch file: {name}"
-        );
-        assert!(name.starts_with(&format!(".{POINTER}.")), "{name}");
-
-        // And it is gone once the record is in place, whatever its name: a leftover would be read by
-        // nothing and cleaned by nobody.
+    fn a_published_pointer_is_never_empty_but_present() {
         let base = crate::testutil::TmpDir::new();
         let dir = base.path().join("sbx");
         write_pointer(&dir, Path::new("/vol/a.btrfs")).unwrap();
         assert!(
-            !dir.join(&name).exists(),
-            "the scratch file outlived the rename"
+            std::fs::metadata(dir.join(POINTER)).unwrap().len() > 0,
+            "a pointer that exists and is empty reads as no pointer at all"
+        );
+        assert_eq!(
+            read_pointer(&dir).unwrap().as_deref(),
+            Some(Path::new("/vol/a.btrfs"))
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the scratch file outlived the rename: {leftovers:?}"
         );
     }
 
@@ -2289,6 +2295,32 @@ this line has no separator at all
         // ...and it stays recorded, so a declined suggestion never becomes a nag.
         mark_offered(&dir);
         assert!(has_been_offered(&dir));
+    }
+
+    /// The `btrfs-progs` sbx provisions is built from the **shared** global lock, the one every
+    /// launch resolves the base userland from. Naming the default channel there when the lock
+    /// records an override makes resolution miss it and rewrite both its lines, rolling the
+    /// installation's channel off its pinned revision to create a volume. So the target adopts the
+    /// recorded source, which resolves straight out of the lock — no network, no write.
+    #[test]
+    fn provisioning_mkfs_tracks_the_locked_channel_rather_than_the_default() {
+        let base = crate::testutil::TmpDir::new();
+        let data = base.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let layout = crate::store::Layout::under(&data);
+        // A fresh installation has no lock and resolves the default, exactly as a first launch does.
+        assert_eq!(mkfs_lock_target(&layout).source(), "nixos-unstable");
+
+        let rev = "a".repeat(40);
+        let lock = data.join("nixpkgs.lock");
+        std::fs::write(&lock, format!("nixos-24.11\n{rev}\n")).unwrap();
+        let target = mkfs_lock_target(&layout);
+        assert_eq!(target.source(), "nixos-24.11");
+        assert_eq!(
+            target.locked_revision().as_deref(),
+            Some(rev.as_str()),
+            "a target whose source matches the lock resolves out of it instead of rewriting it"
+        );
     }
 
     #[test]
