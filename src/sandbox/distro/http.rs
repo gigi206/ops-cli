@@ -441,7 +441,7 @@ fn body_over_cap(cap: u64) -> io::Error {
 /// [`wire::read_chunked_body`] applies on the buffered path, applied here to the streamed one: a
 /// framing line is a few bytes, and a peer that sends one without end is not serving a body.
 const CHUNK_LINE_MAX: u64 = 8 * 1024;
-const TRAILER_LINES_MAX: usize = 32;
+const TRAILER_LINES_MAX: usize = 64;
 
 /// Copy a `Transfer-Encoding: chunked` body to `sink`, stripping its framing as it goes.
 ///

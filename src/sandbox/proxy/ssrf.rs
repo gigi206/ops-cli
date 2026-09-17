@@ -574,8 +574,9 @@ mod tests {
     /// does not already say. [`Rule::builtin`] records who wrote it instead, so the rewrite is
     /// irrelevant.
     ///
-    /// The rules that reach further are asserted beside it, so a regression that granted the
-    /// exception to everything would not pass as this property.
+    /// The built-in entry the rewrite reproduced is asserted beside it and refused the exception
+    /// the written rule keeps: two rules equal by value, opposite answers. A regression that
+    /// granted the exception to everything therefore cannot pass as this property.
     #[test]
     fn a_written_rule_keeps_the_exception_in_the_built_in_lanes_own_shape() {
         use crate::allowlist::{EgressPolicy, Methods};
@@ -618,6 +619,18 @@ mod tests {
         assert!(
             ip_refusal(private, "codeload.github.com", Some(&allow[2])).is_none(),
             "and so does a wider port set"
+        );
+        // The built-in entry the rewrite reproduced, byte for byte, is still refused it.
+        let builtin = super::super::builtin_allow_rules()
+            .into_iter()
+            .find(|rule| *rule == allow[0])
+            .expect("a built-in entry equal to the rewritten rule");
+        assert!(
+            matches!(
+                ip_refusal(private, "github.com", Some(&builtin)),
+                Some(AddrRefusal::PrivateWithoutExactHost)
+            ),
+            "the same rule from the built-in lane keeps no exception, so authorship decides"
         );
     }
 

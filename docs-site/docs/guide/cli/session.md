@@ -24,10 +24,25 @@ See also: [Sessions](../housekeeping/sessions) · [`sbx projects`](projects) · 
 `sbx session ls` is the machine inventory: every live session, whatever project started it, with its
 NAME, its PID and its project beside it. That is where an id comes from, and it is what lets the
 rest of the CLI narrow to one project without losing reach. Either column names a session for the
-verbs that address one: [`attach`](#attach), [`stop`](#stop), [`logs`](#logs) and the
-[`sbx proc`](proc) family take the NAME the listing leads with
-as readily as the PID it carries further along. A `--session <id>` elsewhere, such as
-[`sbx task`](task)'s, still wants the PID.
+verbs that resolve one through the registry: [`attach`](#attach), [`stop`](#stop),
+[`sbx logs`](logs) with its per-lens siblings, and the [`sbx proc`](proc) family take the NAME the
+listing leads with as readily as the PID it carries further along. Two ids stay the PID alone:
+[`session logs`](#logs), which resolves a log file rather than a live session, and a
+`--session <id>` elsewhere, such as [`sbx task`](task)'s.
+
+A PID is unique among live processes; a NAME is not. A name is derived from the app name, or from
+the project directory's own name, so two plain sessions of one project (a detached
+[`sbx run --detach`](run) beside an interactive [`sbx run`](run)), or sessions of two projects whose
+directories share a basename, answer to the same NAME. A verb handed a NAME that several live
+sessions answer to refuses rather than picking one: it lists the matches with their PIDs and exits
+2, and the PID is what tells them apart.
+
+```sh
+sbx session stop sbx-web
+# sbx: session stop: 2 live sessions answer to 'sbx-web' — name one by its PID:
+#        12345  [run]  /home/me/web
+#        12377  [shell]  /home/me/web
+```
 
 Three rules, and each verb follows the one that fits it:
 
@@ -61,14 +76,16 @@ liveness-validated by `(pid, start_time)` to defeat pid reuse. See
 
 ```sh
 sbx session ls
-# NAME       KIND          MODE        PID     AGE  PROJECT
-# sbx-web    app:claude    detached    12345   2m   /home/me/web
-# sbx-web    shell         foreground  12377   1m   /home/me/web
+# NAME        KIND          MODE        PID     AGE  PROJECT
+# sbx-claude  app:claude    detached    12345   2m   /home/me/web
+# sbx-web     shell         foreground  12377   1m   /home/me/web
 ```
 
-The `NAME` and `PID` columns are both the `<id>` used by `sbx session attach <id>`,
-`sbx session logs <id>` and `sbx session stop <id>`. A name is the friendlier of the two to type
-and the one the listing shows first; a PID is what a script already holds.
+The `NAME` and `PID` columns are both the `<id>` used by `sbx session attach <id>` and
+`sbx session stop <id>`. A name is the friendlier of the two to type and the one the listing shows
+first; a PID is what a script already holds, and it is the id that is never
+[ambiguous](#which-session-a-command-acts-on). `sbx session logs <id>` is the exception among the
+three: it takes the PID alone (see [`logs`](#logs)).
 
 `--json` emits the same listing as a document, which is what a script wants: it carries the
 registry's own values rather than this table's, so the age is a number of seconds instead of `2m`
@@ -105,7 +122,7 @@ hundred detached launches.
 
 | Operand / flag | Meaning |
 |---|---|
-| `<id>` | the session's NAME, or the PID reported when it was detached (required) |
+| `<id>` | the PID reported when the session was detached (required); a NAME is refused here, because the id names a log file and not a live session |
 | `-f`, `--follow` | keep streaming until the session exits |
 | `-n, --lines <N>` | show only the last N lines of the initial listing |
 | `--all` | show every session that wrote to this log, not just the most recent |
@@ -258,7 +275,9 @@ sbx session stop --all
 A session sbx could not get a handle on is a separate outcome from one that had already
 exited. Nothing was signalled, so the cage may still be running: the line names the reason,
 the session keeps its place in `sbx session ls` so a second attempt can still address it, and
-the command exits 1. An id that matched no live session still exits 2.
+the command exits 1. An id that matched no live session still exits 2, and so does a NAME
+[several live sessions answer to](#which-session-a-command-acts-on): nothing is stopped until one
+of the listed PIDs names which.
 
 ## Examples: the life of a background agent
 

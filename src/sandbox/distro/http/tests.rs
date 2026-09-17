@@ -243,13 +243,27 @@ fn a_streamed_body_is_refused_once_it_passes_the_cap() {
     assert_eq!(sink.len(), 64);
 
     // Chunked is de-framed rather than copied, and the cap applies to what the framing decodes
-    // to — not to the bytes on the wire, which carry the size lines as well.
+    // to — not to the bytes on the wire, which carry the size lines as well. The body is the same
+    // 64 bytes, wrapped in one well-formed chunk and its terminator, so the refusal can only come
+    // from the cap and not from the framing.
     let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let mut wire = b"40\r\n".to_vec();
+    wire.extend_from_slice(&body);
+    wire.extend_from_slice(b"\r\n0\r\n\r\n");
     let mut sink = Vec::new();
+    let err = stream_body(&mut &wire[..], chunked, &mut sink, 8)
+        .expect_err("a chunked body past the cap is refused, not written");
     assert!(
-        stream_body(&mut &body[..], chunked, &mut sink, 8).is_err(),
-        "a chunked body is bounded by the same cap"
+        err.to_string().contains("larger than the 8 bytes"),
+        "a chunked body is bounded by the same cap: {err}"
     );
+
+    // The very same framing under a cap that admits the decoded length arrives whole, which is
+    // what makes the refusal above attributable to the cap.
+    let mut sink = Vec::new();
+    let n = stream_body(&mut &wire[..], chunked, &mut sink, 1024).expect("within the cap");
+    assert_eq!(n, 64);
+    assert_eq!(sink, body, "the size lines are framing, not content");
 }
 
 /// A chunked body reaches the sink as the bytes it encodes, not as the framing that carried them.
@@ -298,5 +312,46 @@ fn an_announced_length_larger_than_the_cap_is_refused_before_the_body_is_read() 
     assert!(
         sink.is_empty(),
         "nothing is written for a body that was refused on its announced length"
+    );
+}
+
+/// A trailer section is admitted up to the count the buffered path admits, and no further.
+///
+/// The same wire format is read by [`wire::read_chunked_body`] on the buffered path, so a response
+/// one path accepts must not be a response the other refuses: a registry whose trailers are within
+/// the buffered bound would otherwise fetch its manifest and fail on its blobs. Past that bound the
+/// section is refused rather than read without end.
+#[test]
+fn a_trailer_section_is_bounded_at_the_count_the_buffered_path_applies() {
+    let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let framed = |trailers: usize| {
+        let mut wire = b"3\r\nabc\r\n0\r\n".to_vec();
+        for i in 0..trailers {
+            wire.extend_from_slice(format!("x-trailer-{i}: y\r\n").as_bytes());
+        }
+        wire.extend_from_slice(b"\r\n");
+        wire
+    };
+
+    // The count the buffered path admits, spelled out rather than read from `TRAILER_LINES_MAX`:
+    // the two paths agreeing on it is what this test is for.
+    let buffered_path_bound = 64;
+
+    // The largest section the buffered path accepts is accepted here too, body and all.
+    let wire = framed(buffered_path_bound);
+    let mut sink = Vec::new();
+    let n = stream_body(&mut &wire[..], chunked, &mut sink, 1024).expect("within the bound");
+    assert_eq!(n, 3);
+    assert_eq!(sink, b"abc", "the trailers are framing, not content");
+
+    // One line past it is refused, and the message names the section rather than the body.
+    let wire = framed(buffered_path_bound + 1);
+    let mut sink = Vec::new();
+    let err = stream_body(&mut &wire[..], chunked, &mut sink, 1024)
+        .expect_err("a trailer section past the bound is refused");
+    assert!(
+        err.to_string()
+            .contains("a trailer section that does not end"),
+        "the refusal names the section it bounded: {err}"
     );
 }

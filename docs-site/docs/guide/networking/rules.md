@@ -135,7 +135,23 @@ deny = ["re:^https://api\\.test/[^/]+/secrets$"]   # this is how to write it
 That rule looks like it closes the secrets page of every organisation, and as a
 literal segment it would have closed nothing at all, silently. A rule that cannot
 mean what it says is an error you are shown, the same way a wildcard host, an
-invalid port, an unsupported scheme and a query string are.
+invalid port, an unsupported scheme, a query string, a `#fragment` and a segment's
+`;parameters` are.
+
+Those last three share one reason. The matcher cuts a query, a fragment and
+`;parameters` off the request path before any rule sees it (see [path
+canonicalization](#path-canonicalization)) and off the rule's own path with them, so
+a rule carrying one matches the bare path while reading as something narrower:
+
+```toml
+allow = ["files.test/app;jsessionid"]   # refused: the parameters are not matched
+deny  = ["api.test/docs#intro"]         # refused: the fragment is not matched
+allow = ["re:^https://files\\.test/app;jsessionid=[0-9A-F]+$"]   # this is how to write it
+```
+
+A refused entry never becomes a rule. `sbx net allow|deny|mute` and `sbx config set
+network.allow` reject it before writing anything, and one written by hand straight
+into a config file is dropped at load with a warning naming the list it was in.
 
 ### Path canonicalization
 
@@ -154,6 +170,9 @@ So `deny github.com/secret` also catches `/secret?x=1`, `/secret/`, `/%73ecret`,
 That last one is why parameters are dropped, since a servlet container serves it as
 `/secret` while the raw spelling matched nothing. A *different* sub-resource
 (`/secret/sub`) is a deliberate carve-in: write `/secret/*` to include the subtree.
+Those spellings belong to the request side only: a *rule* that carries a fragment or
+`;parameters` of its own is [refused](#exact-url-and-subtrees), because this same cut
+would leave it matching the bare path.
 
 Both the fragment and the parameters are cut **after** decoding, so an encoded `%23` or
 `%3B` counts as the delimiter it decodes to. That is deliberate and it cuts one way: a

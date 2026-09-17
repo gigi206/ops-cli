@@ -1038,6 +1038,9 @@ pub(super) fn validate_open(
     raw: BTreeMap<String, schema::RawOpen>,
 ) -> BTreeMap<String, OpenHandler> {
     let mut out = BTreeMap::new();
+    // Which raw spelling took each folded scheme's slot, so a later spelling that displaces one
+    // can name the entry it replaced. `out` is keyed by the folded scheme and does not keep it.
+    let mut spelled: BTreeMap<String, String> = BTreeMap::new();
     for (key, entry) in raw {
         // Schemes are case-insensitive per RFC 3986, and the comparison the router makes is
         // literal, so the key is folded once here rather than at every match.
@@ -1084,13 +1087,16 @@ pub(super) fn validate_open(
         // Two keys differing only in case are one scheme once folded, and the router holds one
         // handler per scheme, so the later spelling takes the slot. It is reported like every
         // other value this table loses: overwritten in silence, the displaced entry left its
-        // author believing a click on such a link reaches their program.
-        if out.contains_key(&scheme) {
+        // author believing a click on such a link reaches their program. Both spellings are named,
+        // since the folded scheme is what the two have in common and tells their author nothing
+        // about which of the entries stopped working.
+        if let Some(earlier) = spelled.get(&scheme) {
             warnings.push(format!(
-                "{source}: `[open]` entry `{key}` replaces the handler an earlier spelling \
-                 of `{scheme}` — a URI scheme is case-insensitive, so the two keys are one"
+                "{source}: `[open]` entry `{key}` replaces the handler `{earlier}` set — a URI \
+                 scheme is case-insensitive, so the two keys are one"
             ));
         }
+        spelled.insert(scheme.clone(), key);
         out.insert(scheme, OpenHandler { argv, mode });
     }
     out
@@ -1367,6 +1373,36 @@ mod tests {
         // check above would pass by warning about every capture.
         let bodies = warnings_for(&format!("{base}capture = \"bodies\"\n"));
         assert!(bodies.is_empty(), "{bodies:?}");
+    }
+
+    /// A displaced `[open]` handler is named by the spelling that wrote it, not by the folded
+    /// scheme. The scheme is what the two entries have in common, so a message carrying it twice
+    /// leaves its author unable to tell which of their handlers stopped working — the harm the
+    /// warning exists to prevent.
+    #[test]
+    fn a_displaced_open_handler_is_named_by_the_spelling_that_wrote_it() {
+        let raw = BTreeMap::from([
+            (
+                "HTTP".to_string(),
+                schema::RawOpen::Argv(schema::RawCmd::Argv(vec!["firefox".to_string()])),
+            ),
+            (
+                "http".to_string(),
+                schema::RawOpen::Argv(schema::RawCmd::Argv(vec!["chromium".to_string()])),
+            ),
+        ]);
+        let mut warnings = Vec::new();
+        let out = validate_open(&mut warnings, "t", raw);
+        assert_eq!(out.len(), 1, "one scheme, one handler: {out:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("`HTTP`"),
+            "the displaced spelling is named: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("`http`"),
+            "and the spelling that took the slot: {warnings:?}"
+        );
     }
 
     /// A readiness gate names a port, and a port a service cannot listen on costs the gate alone.

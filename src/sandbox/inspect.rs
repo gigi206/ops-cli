@@ -699,7 +699,7 @@ mod tests {
         // Opening it would report a tree that is not under this home, named as if it were: the
         // composition answers where this home's space went, and a link holds none of it. So the
         // link is sized as the link it is, which leaves it with nothing to report, and the
-        // descent does not follow it either.
+        // descent refuses it as well.
         let tmp = crate::testutil::TmpDir::new();
         let home = tmp.join("home");
         let outside = tmp.join("outside");
@@ -711,6 +711,20 @@ mod tests {
             seen,
             [".real", ".real/f"],
             "the link is not reported at the size of the tree it points at"
+        );
+
+        // The descent is asserted on its own because sizing a link as the link it is keeps a link
+        // off the level entirely, so no composition can drive the guard: a link holds at most one
+        // block, the directory it sits in holds one too, and a leader is opened only above
+        // `PASSTHROUGH_PERCENT` of its level. A link pointing at a directory is the one case the
+        // guard answers differently from a metadata read that follows it.
+        assert!(
+            !descends_into(&home.join(".local")),
+            "a link to a directory is not a directory this descent may open"
+        );
+        assert!(
+            descends_into(&home.join(".real")),
+            "and a real child is still opened"
         );
     }
 
@@ -1301,6 +1315,14 @@ pub(crate) struct HomeEntry {
     pub(crate) depth: usize,
 }
 
+/// Whether [`home_composition`] may open `next` to list the level below it: a real directory, and
+/// never a link, even one pointing at a directory. Opening a link would report a tree that is not
+/// under this home at all, while the entry the caller acts on is named relative to the home. The
+/// distinction is why the metadata is read without following the link.
+fn descends_into(next: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(next), Ok(meta) if meta.is_dir())
+}
+
 /// What a home is made of: one entry per direct child, descending into a child that holds nearly
 /// all of its level.
 ///
@@ -1355,11 +1377,8 @@ pub(crate) fn home_composition(home: &Path) -> Vec<HomeEntry> {
             break;
         }
         let next = dir.join(&leader);
-        // A real directory, never a link: opening a link would report a tree that is not under this
-        // home at all, and the entry the caller acts on is named relative to the home.
-        match std::fs::symlink_metadata(&next) {
-            Ok(meta) if meta.is_dir() => {}
-            _ => break,
+        if !descends_into(&next) {
+            break;
         }
         prefix = format!("{prefix}{}/", leader.to_string_lossy());
         dir = next;

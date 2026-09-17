@@ -1874,9 +1874,10 @@ this line has no separator at all
 
         // A sysfs path that cannot be listed is not an empty one. Staged as a regular file rather
         // than a directory with its permissions stripped, because a mode of `0o000` is simply
-        // ignored for root and this assertion would then hold for the wrong reason wherever the
-        // suite runs as root. Both reach `read_dir` as an error that is not `NotFound`, which is
-        // the distinction under test.
+        // ignored for root: the listing would succeed, the scan would report the device it found,
+        // and this assertion would fail outright wherever the suite runs as root. A regular file
+        // reaches `read_dir` as an error that is not `NotFound` for any uid, which is the
+        // distinction under test.
         let unlistable = base.path().join("not-a-directory");
         std::fs::write(&unlistable, b"").unwrap();
         let scanned = loop_for(&image, &unlistable);
@@ -1887,7 +1888,8 @@ this line has no separator at all
 
         // An unreadable `backing_file` is not an unbound device either. Staged as a directory in
         // the file's place, for the same reason and with the same effect: the read fails with
-        // something other than `NotFound` whatever uid runs the suite.
+        // something other than `NotFound` whatever uid runs the suite, where stripped permissions
+        // would leave it succeeding under root.
         let backing = d.join("backing_file");
         std::fs::remove_file(&backing).unwrap();
         std::fs::create_dir(&backing).unwrap();
@@ -2129,9 +2131,10 @@ this line has no separator at all
         let path = dir.join(POINTER);
 
         // Staged as a directory in the pointer's place rather than a file stripped of its
-        // permissions: a mode of `0o000` is simply ignored for root, so that staging would leave
-        // this assertion holding for the wrong reason wherever the suite runs as root. Both reach
-        // the read as an error that is not `NotFound`, which is the distinction under test.
+        // permissions: a mode of `0o000` is simply ignored for root, so that staging would let the
+        // read succeed and this assertion would fail outright wherever the suite runs as root. A
+        // directory reaches the read as an error that is not `NotFound` for any uid, which is the
+        // distinction under test.
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         let read = read_pointer(&dir);

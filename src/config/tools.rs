@@ -217,10 +217,22 @@ pub(super) fn apply_tools(
         }
     }
     // And the name is withheld from the resolver pass, which runs after `apply_flakes` and would
-    // otherwise upsert over the inline flake the warning just said is used.
-    for names in &mut resolve_names {
-        names.retain(|name| !flakes.contains_key(name));
-    }
+    // otherwise upsert over the inline flake the warning just said is used. Which names were
+    // withheld is kept, because the `[<label>.<name>]` table has to go with its name: the pass
+    // reads the tables, and one whose name it no longer knows is reported as a `[packages]` entry
+    // the author never wrote — beside the collision warning that just quoted that same entry.
+    let withheld: Vec<BTreeSet<String>> = resolve_names
+        .iter_mut()
+        .map(|names| {
+            let colliding: BTreeSet<String> = names
+                .iter()
+                .filter(|name| flakes.contains_key(*name))
+                .cloned()
+                .collect();
+            names.retain(|name| !colliding.contains(name));
+            colliding
+        })
+        .collect();
     apply_packages(
         out,
         warnings,
@@ -233,12 +245,16 @@ pub(super) fn apply_tools(
     apply_flakes(out, warnings, source, flakes, state, protect_trusted);
     // Each table is cloned rather than moved: `apply_resolvers` consumes it, and the `libs` pass
     // below reads the same table after every package is in `out`.
-    for ((tables, sentinel, label, make_backend), names) in backends.iter().zip(&resolve_names) {
+    for (((tables, sentinel, label, make_backend), names), colliding) in
+        backends.iter().zip(&resolve_names).zip(&withheld)
+    {
+        let mut tables = tables.clone();
+        tables.retain(|name, _| !colliding.contains(name));
         apply_resolvers(
             out,
             warnings,
             source,
-            tables.clone(),
+            tables,
             names,
             state,
             protect_trusted,
@@ -1016,4 +1032,69 @@ fn is_valid_flake_ref(reference: &str, allow_insecure_http: bool) -> bool {
                 ':' | '/' | '#' | '?' | '=' | '&' | '~' | '@' | '.' | '_' | '-' | '+'
             )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `<name> = "<backend>:resolve"` colliding with a `[flakes.<name>]` table is withheld from
+    /// the resolver pass, and its `[<label>.<name>]` table is withheld with it. The pass reads the
+    /// tables against the names it was handed, so a table left behind is reported as a sentinel
+    /// the author never wrote — a second warning contradicting the collision warning above it and
+    /// pointing at a line already in the file.
+    #[test]
+    fn a_resolver_name_withheld_for_a_flake_collision_takes_its_table_with_it() {
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        apply_tools(
+            &mut out,
+            &mut warnings,
+            "t",
+            BTreeMap::from([("dup".to_string(), TARBALL_RESOLVE_SENTINEL.to_string())]),
+            BTreeMap::from([(
+                "dup".to_string(),
+                RawInlineFlake {
+                    flake: "{ outputs = _: { }; }".to_string(),
+                    attr: None,
+                },
+            )]),
+            BTreeMap::from([(
+                "dup".to_string(),
+                RawResolve {
+                    resolve: vec!["sh".into(), "-c".into(), "echo https://a.test/x.tgz".into()],
+                    ..RawResolve::default()
+                },
+            )]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            TrustState::Trusted,
+            false,
+            false,
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Package {
+                    backend: Backend::FlakeInline { .. },
+                    ..
+                }]
+            ),
+            "the inline flake holds the name: {out:?}"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the collision alone is reported: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("dup") && warnings[0].contains("both"),
+            "and it is the collision: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("no matching"),
+            "nothing claims the [packages] entry is missing: {warnings:?}"
+        );
+    }
 }

@@ -214,9 +214,9 @@ impl Session {
     /// pidfd pins one exact process: the pid is read once after opening to confirm it is the
     /// incarnation we recorded (the same `(pid, start_ticks)` guard the registry uses), and from
     /// then on the kernel cannot reuse that pid behind our back, so a stop can never signal an
-    /// unrelated process. And a pidfd becomes *readable* when its process terminates, so waiting
-    /// on it reports the exit cleanly — including the brief zombie window a plain liveness read
-    /// would still see as alive.
+    /// unrelated process. And a pidfd becomes *readable* when its process terminates, so the grace
+    /// window is a `poll` on that descriptor rather than a poll of `/proc`: the exit is reported as
+    /// it happens, for the pinned process alone.
     ///
     /// The cage is torn down by killing not only the recorded process but its whole descendant
     /// subtree. Killing the recorded pid alone is *not* reliable: on the allowlist path it is a
@@ -716,9 +716,10 @@ impl Registry {
     }
 
     /// Remove a specific session's record (best-effort), so a session just stopped disappears from
-    /// `sbx session ls` at once rather than lingering until liveness pruning catches it — which it would
-    /// not do immediately anyway while the killed process is still a zombie reading as alive. A
-    /// missing record is fine; liveness pruning remains the real cleanup.
+    /// `sbx session ls` at once rather than lingering until liveness pruning catches it — which only
+    /// the walks that reclaim do ([`housekeep`](Self::housekeep)), so an unremoved record stays
+    /// listed until the next `sbx session ls` or `sbx gc`. A missing record is fine; liveness
+    /// pruning remains the real cleanup.
     pub(crate) fn reap(&self, session: &Session) {
         let _ = std::fs::remove_file(self.dir.join(session.file_name()));
     }
@@ -1411,8 +1412,9 @@ mod tests {
         let (mut child, s) = spawn_session("sleep", &["30"]);
         assert!(is_alive(&s));
         assert_eq!(s.stop(Duration::from_secs(5)), StopOutcome::Terminated);
-        // Reap the zombie so the start-time check below sees the pid truly gone (a not-yet-reaped
-        // zombie still carries the recorded start time and would read as alive).
+        // Reap the child so the test leaves no corpse in the process table. The assertion below
+        // does not rest on it: `pid_is_live` reads the process state, so an unreaped zombie is
+        // already not a live session.
         let _ = child.wait();
         assert!(!is_alive(&s));
     }

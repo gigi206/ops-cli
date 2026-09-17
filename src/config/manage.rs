@@ -825,12 +825,15 @@ fn refuse_dropped_entry(dropped: Vec<String>) -> Result<(), String> {
 /// malformed value — `forward`, where a `"host:cage"` remap is a string and so any string parses —
 /// would let `add` commit an entry the resolver then drops with a warning nobody reads. The write
 /// would look like it worked and change nothing, which is the same silent revert one layer down.
-/// So every such field is checked here against the resolver's own parser, never a second copy of
-/// its rules.
+/// Such a field is therefore checked here against the resolver's own parser, never a second copy
+/// of its rules.
 ///
-/// `forward` was for a while the only one checked, while the sentence above said "every such
-/// field". `[fs]` is the other one, and the one where the gap costs the most: its lists are plain
-/// strings too, so `sbx config add fs.deny /etc/shadow` parsed, committed, and was dropped by
+/// The coverage is a list rather than a property of the gate, so the list is written out: what
+/// follows is the fields it holds, and, at the end, the ones it does not yet reach.
+///
+/// `forward` was for a while the only field on the list, though the rule above was already stated
+/// in the general. `[fs]` is the second, and the one where the gap cost the most: its lists are
+/// plain strings too, so `sbx config add fs.deny /etc/shadow` parsed, committed, and was dropped by
 /// [`super::apply_fs`] at the next load — a mask the user was told had been written, over a path
 /// the cage goes on reading.
 ///
@@ -842,11 +845,19 @@ fn refuse_dropped_entry(dropped: Vec<String>) -> Result<(), String> {
 /// says reopened a syscall and the kernel says did not.
 ///
 /// `[devices] allow`, `[ssh_agent] allow` and the `[network]` table's `http2` and
-/// `shared_credential` are the fifth, and they close the sentence above: each is a list the schema
-/// types broadly enough to hold what the resolver then drops with a warning — a path outside
-/// `/dev/`, a wildcard where a key must be named, a host that is not a host, a credential group
-/// naming one host and no wildcard. Each is checked through the resolver's own function, whose
-/// warning already names the entry and the reason, so no copy of those rules lives here either.
+/// `shared_credential` are the fifth: each is a list the schema types broadly enough to hold what
+/// the resolver then drops with a warning — a path outside `/dev/`, a wildcard where a key must be
+/// named, a host that is not a host, a credential group naming one host and no wildcard. Each is
+/// checked through the resolver's own function, whose warning already names the entry and the
+/// reason, so no copy of those rules lives here either.
+///
+/// What the list does not yet reach, so that the next field added is added knowingly rather than
+/// assumed covered: a `binds` entry is checked below for the command line's `:ro`/`:rw` spelling
+/// and not for the absoluteness [`super::apply_binds`] requires, so `sbx config add binds
+/// relative/dir` still commits and is still dropped at the next load; an `[open]` key is not held
+/// to the URI scheme [`super::validate::validate_open`] reads it as; and a `[packages]` name is
+/// not held to the charset [`super::tools::apply_packages`] admits. Each of those writes reports
+/// success and changes nothing, which is what a check here would end.
 fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
     let raw = super::schema::parse(doc.to_string().as_bytes())?;
     // The rule lists, baseline and per app. `sbx net allow` and `sbx proc allow` admit a rule
