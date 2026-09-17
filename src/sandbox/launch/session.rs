@@ -123,12 +123,29 @@ pub(crate) fn attach(id: &str, cmd: &[OsString]) -> ExitCode {
     // sandboxed children — the broker and signer plugin fences — since only the payload cage mounts
     // it. A `None` here means the cage has no in-namespace process left — it exited between
     // `sbx session ls` and now, or the host has no user namespaces (then it never had a cage).
-    let Some(cage_pid) = crate::sandbox::attach::find_cage_pid(target.pid, &target.project) else {
-        crate::diag::error(&format!(
-            "sbx session attach: session '{id}' has no live process to enter — it may have just exited \
-             (run `sbx session ls`)."
-        ));
-        return ExitCode::FAILURE;
+    let cage_pid = match crate::sandbox::attach::find_cage_target(target.pid, &target.project) {
+        Some(crate::sandbox::attach::CageTarget::Agent(pid)) => pid,
+        // The cage is up but holds only its own bubblewrap, which stands in for the payload in
+        // neither of the things this path reads off it: its `environ` is the launching one, and
+        // it sits in the parent's pid namespace rather than the one it made for its child. A
+        // shell entered through it would hold the host's `HOME` and survive the session's end.
+        // Saying the session has nothing to enter is both true and the answer a caller can act
+        // on: a launch still provisioning becomes enterable on its own.
+        Some(crate::sandbox::attach::CageTarget::MonitorOnly(_)) => {
+            crate::diag::error(&format!(
+                "sbx session attach: session '{id}' has no live process to enter — its cage is up \
+                 but holds no agent yet (a launch still starting), or the agent has exited (run \
+                 `sbx session ls`)."
+            ));
+            return ExitCode::FAILURE;
+        }
+        None => {
+            crate::diag::error(&format!(
+                "sbx session attach: session '{id}' has no live process to enter — it may have just exited \
+                 (run `sbx session ls`)."
+            ));
+            return ExitCode::FAILURE;
+        }
     };
     let cage = match crate::sandbox::attach::open_cage_handle(cage_pid, &target.project) {
         Ok(h) => h,

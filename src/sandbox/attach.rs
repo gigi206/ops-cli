@@ -48,7 +48,8 @@
 //!   above bounds what the entered process can do, and the operation is host-initiated by the
 //!   trusted user — the caged agent cannot trigger it.
 //! - **the environment the shell starts from is the agent's too.** It is read out of a live in-cage
-//!   process ([`read_environ`]), which that process owns: `PATH`, the proxy variables and the CA
+//!   process ([`read_environ`]), which that process owns — an agent, never the cage's own `bwrap`,
+//!   whose `environ` is the *launching* one ([`CageTarget`]): `PATH`, the proxy variables and the CA
 //!   path are whatever the agent left there, not whatever bubblewrap originally set. It is passed
 //!   through unfiltered on purpose — those variables are what let the entered shell resolve
 //!   anything inside the cage, and stripping them would buy no confinement, because the binary they
@@ -104,7 +105,7 @@ const NAMESPACES: [(&str, libc::c_int); 7] = [
 /// `pidfd_open` is permitted; the pidfd pins that exact process, so a pid reused **after** it is
 /// opened can never be entered by mistake.
 ///
-/// After it is opened, and that is the whole of what a pidfd promises. [`find_cage_pid`] chose this
+/// After it is opened, and that is the whole of what a pidfd promises. [`find_cage_target`] chose this
 /// pid a moment earlier, and the doc here used to say the pin covered that moment too — it does not:
 /// a pid recycled between the choice and the open is pinned as confidently as the right one. So the
 /// discriminating predicate is asked again on the pinned pid, and it is the one that separates this
@@ -214,14 +215,45 @@ struct Candidate {
     in_session_cage: bool,
 }
 
+/// What a session's descendants hold: an agent to enter, or only the cage's own monitor.
+///
+/// The two are kept apart because the monitor is not a stand-in for the payload in either of the
+/// things attaching reads off it.
+///
+/// Its `environ` is not the cage's. Bubblewrap is exec'd with the *launching* environment and
+/// passes the cage's own through the `--args` descriptor (see `argv`), which deliberately keeps
+/// those values out of the argument list and so never reaches `/proc/<pid>/environ` either.
+/// Reading it there yields the host's `HOME` and `PATH`, and a shell started from them stands in
+/// the cage's filesystem while pointing at the host's home — the one outcome this module's header
+/// promises does not happen.
+///
+/// Its namespaces are not all the cage's either. Bubblewrap unshares the user namespace for
+/// itself, which is what makes it look like a cage process here, but it creates the *pid*
+/// namespace for its child and stays in the parent's. Joining the monitor therefore joins the
+/// host's pid namespace, and a shell entered that way outlives the session it joined instead of
+/// being killed with it.
+///
+/// Neither has another source to read, so a cage holding only its monitor has nothing to attach
+/// to, and the caller says so rather than entering something that is only partly the cage.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CageTarget {
+    /// The cage's payload: the process whose `environ` is the cage's.
+    Agent(u32),
+    /// The cage's own `bwrap`, with no payload beside it — the launch is still provisioning, or
+    /// the agent has exited. Still distinguished from a plugin fence, so the caller reports *this*
+    /// session rather than mistaking a fence for it.
+    MonitorOnly(u32),
+}
+
 /// Locate a live process *inside* the cage of session `session_pid`, whose project root is
 /// `project`. The recorded pid is the cage's host-side anchor — bubblewrap on the exec path, the
 /// sbx supervisor on the egress path — and the cage processes are always its descendants (verified
 /// on both paths). Among the descendants, one in a *child* user namespace that carries the
-/// session's project is inside the cage; the payload (not bubblewrap itself) is preferred so its
-/// `environ` is the cage environment. Returns `None` if the cage has no live in-namespace process
-/// (it just exited, or the host lacks user namespaces).
-pub(super) fn find_cage_pid(session_pid: u32, project: &Path) -> Option<u32> {
+/// session's project is inside the cage; the payload (not bubblewrap itself) is what a caller may
+/// enter, because only its `environ` is the cage environment — see [`CageTarget`]. Returns `None`
+/// if the cage has no live in-namespace process (it just exited, or the host lacks user
+/// namespaces).
+pub(super) fn find_cage_target(session_pid: u32, project: &Path) -> Option<CageTarget> {
     let host = userns_link(std::process::id())?;
     let parents = parent_map();
     let candidates: Vec<Candidate> = descendants(session_pid, &parents)
@@ -273,11 +305,11 @@ fn in_session_cage(pid: u32, project: &Path) -> bool {
 }
 
 /// Pick the cage process from the candidates: skip any in the host user namespace (`host_userns`)
-/// and any that is not in this session's own cage ([`in_session_cage`]), prefer the first
-/// non-`bwrap` process left (the payload, whose `environ` is the cage's), and fall back to a
-/// child-namespace `bwrap` if that is all there is. Pure.
-fn choose_cage_pid(candidates: &[Candidate], host_userns: &str) -> Option<u32> {
-    let mut fallback = None;
+/// and any that is not in this session's own cage ([`in_session_cage`]), take the first non-`bwrap`
+/// process left as the payload, and report a child-namespace `bwrap` as a monitor — never as a
+/// payload — if that is all there is. Pure.
+fn choose_cage_pid(candidates: &[Candidate], host_userns: &str) -> Option<CageTarget> {
+    let mut monitor = None;
     for candidate in candidates {
         let Some(userns) = &candidate.userns else {
             continue;
@@ -286,11 +318,11 @@ fn choose_cage_pid(candidates: &[Candidate], host_userns: &str) -> Option<u32> {
             continue;
         }
         if candidate.comm.as_deref() != Some("bwrap") {
-            return Some(candidate.pid);
+            return Some(CageTarget::Agent(candidate.pid));
         }
-        fallback.get_or_insert(candidate.pid);
+        monitor.get_or_insert(candidate.pid);
     }
-    fallback
+    monitor.map(CageTarget::MonitorOnly)
 }
 
 /// The `user:[<inode>]` link string of `/proc/<pid>/ns/user`, used to tell a cage's
@@ -584,18 +616,36 @@ mod tests {
             candidate(102, Some(child), Some("sleep"), true),
             candidate(103, Some(child), Some("socat"), true),
         ];
-        assert_eq!(choose_cage_pid(&candidates, host), Some(102));
+        assert_eq!(
+            choose_cage_pid(&candidates, host),
+            Some(CageTarget::Agent(102))
+        );
     }
 
+    /// The cage's own `bwrap` is reported as a monitor, never as something to enter.
+    ///
+    /// Handing this pid back as a payload broke attaching in two ways, both of them reachable in
+    /// the window before a launch has exec'd its agent. Its `environ` is the launching one —
+    /// bubblewrap receives the cage's through the `--args` descriptor, which reaches neither its
+    /// argument list nor its `/proc/<pid>/environ` — so the attached shell held the *host's*
+    /// `HOME` while standing in the cage's filesystem, and wrote into the host's home. And it
+    /// sits in the parent's pid namespace, having made the cage's for its child alone, so the
+    /// shell outlived the session it had joined.
     #[test]
-    fn choose_falls_back_to_bwrap_when_it_is_the_only_in_cage_process() {
+    fn choose_reports_a_lone_bwrap_as_a_monitor_rather_than_a_payload() {
         let host = "user:[4026531837]";
         let child = "user:[4026533809]";
         let candidates = vec![
             candidate(100, Some(host), Some("bwrap"), true),
             candidate(101, Some(child), Some("bwrap"), true),
         ];
-        assert_eq!(choose_cage_pid(&candidates, host), Some(101));
+        let chosen = choose_cage_pid(&candidates, host);
+        assert_eq!(chosen, Some(CageTarget::MonitorOnly(101)));
+        assert_ne!(
+            chosen,
+            Some(CageTarget::Agent(101)),
+            "the monitor's environ is the host's; entering it is what this distinction prevents"
+        );
     }
 
     #[test]
@@ -634,18 +684,22 @@ mod tests {
         ];
         assert_eq!(
             choose_cage_pid(&candidates, host),
-            Some(102),
+            Some(CageTarget::Agent(102)),
             "the agent's payload must win over a fence's plugin process that comes first"
         );
 
-        // And with the payload already gone, the fallback is the cage's own bwrap — never the
-        // fence's, which would hand the operator a shell in the credential-brokering cage.
+        // And with the payload already gone, the monitor named is the cage's own bwrap — never the
+        // fence's, which would hand the operator a shell in the credential-brokering cage. It is a
+        // monitor either way, so nothing is entered through it.
         let candidates = vec![
             candidate(200, Some(fence), Some("bwrap"), false),
             candidate(201, Some(fence), Some("sbx-broker-ssh"), false),
             candidate(101, Some(cage), Some("bwrap"), true),
         ];
-        assert_eq!(choose_cage_pid(&candidates, host), Some(101));
+        assert_eq!(
+            choose_cage_pid(&candidates, host),
+            Some(CageTarget::MonitorOnly(101))
+        );
 
         // With nothing but the fence left there is no cage to enter, and saying so is the only
         // safe answer: attaching into a fence is worse than reporting that the session is gone.
