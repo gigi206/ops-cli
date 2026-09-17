@@ -640,10 +640,14 @@ fn parse_path_rule(
              would open `{before}` with any fragment at all. Use `re:` to constrain a fragment"
         ));
     }
-    if let Some((before, _)) = path.split_once(';') {
+    if path.contains(';') {
+        // The path this rule would really open is read from the canonicalization itself, because
+        // the cut is per segment: the text before the first `;` names it only when the parameters
+        // sit in the last segment, and `/a/b;x/c` opens `/a/b/c` rather than `/a/b`.
+        let opened = format!("/{}", canonical_segments(path).join("/"));
         return Err(format!(
             "entry `{s}` writes `;parameters` in a path rule — a rule matches the path segments \
-             only, so this would open `{before}` with any parameters at all. Use `re:` to \
+             only, so this would open `{opened}` with any parameters at all. Use `re:` to \
              constrain them"
         ));
     }

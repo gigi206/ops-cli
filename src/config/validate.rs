@@ -1395,13 +1395,18 @@ mod tests {
         let out = validate_open(&mut warnings, "t", raw);
         assert_eq!(out.len(), 1, "one scheme, one handler: {out:?}");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // Both spellings, and in the order that assigns them their roles: the entry doing the
+        // replacing is named first, the handler it displaced second. Naming the pair without the
+        // roles would leave the message as uninformative as the folded scheme it replaced.
+        let took = warnings[0]
+            .find("`http`")
+            .expect("the spelling that took the slot is named");
+        let displaced = warnings[0]
+            .find("`HTTP`")
+            .expect("and the spelling it displaced");
         assert!(
-            warnings[0].contains("`HTTP`"),
-            "the displaced spelling is named: {warnings:?}"
-        );
-        assert!(
-            warnings[0].contains("`http`"),
-            "and the spelling that took the slot: {warnings:?}"
+            took < displaced,
+            "the entry that took the slot is named as the one replacing: {warnings:?}"
         );
     }
 

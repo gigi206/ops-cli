@@ -265,9 +265,22 @@ pub(super) fn apply_tools(
     }
     // A second pass, after the packages exist, since the table's fields decorate a package rather
     // than declaring one: the table they come from may pair with either declaration form, so both
-    // must already be in `out`.
-    for (tables, _, label, _) in &backends {
-        apply_prebuilt_decor(out, warnings, source, tables, label, protect_trusted, state);
+    // must already be in `out`. A withheld name's table is withheld from this pass as well: the
+    // name went to the inline flake, so a table still carrying `libs` or `main` would decorate a
+    // package this layer no longer holds and be reported as a missing `[packages]` entry — the
+    // same contradiction the resolver pass withholds it to avoid.
+    for ((tables, _, label, _), colliding) in backends.iter().zip(&withheld) {
+        let mut tables = tables.clone();
+        tables.retain(|name, _| !colliding.contains(name));
+        apply_prebuilt_decor(
+            out,
+            warnings,
+            source,
+            &tables,
+            label,
+            protect_trusted,
+            state,
+        );
     }
 }
 
@@ -1063,6 +1076,10 @@ mod tests {
                 "dup".to_string(),
                 RawResolve {
                     resolve: vec!["sh".into(), "-c".into(), "echo https://a.test/x.tgz".into()],
+                    // Carried so the decoration pass reads the table too: a table holding neither
+                    // field is returned early there and would leave that half of the withholding
+                    // unexercised.
+                    libs: vec!["zlib".to_string()],
                     ..RawResolve::default()
                 },
             )]),

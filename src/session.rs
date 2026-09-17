@@ -715,11 +715,14 @@ impl Registry {
         Ok((live, pruned))
     }
 
-    /// Remove a specific session's record (best-effort), so a session just stopped disappears from
-    /// `sbx session ls` at once rather than lingering until liveness pruning catches it — which only
-    /// the walks that reclaim do ([`housekeep`](Self::housekeep)), so an unremoved record stays
-    /// listed until the next `sbx session ls` or `sbx gc`. A missing record is fine; liveness
-    /// pruning remains the real cleanup.
+    /// Remove a specific session's record (best-effort), so a session just stopped leaves nothing
+    /// behind on disk.
+    ///
+    /// What it buys is the file, not the listing: [`scan`](Self::scan) filters every record it
+    /// reads through liveness, so a stopped session is absent from `sbx session ls` whether or not
+    /// this ran, and an unremoved record only waits for the next walk that reclaims
+    /// ([`housekeep`](Self::housekeep)). A missing record is fine; liveness pruning remains the
+    /// real cleanup.
     pub(crate) fn reap(&self, session: &Session) {
         let _ = std::fs::remove_file(self.dir.join(session.file_name()));
     }

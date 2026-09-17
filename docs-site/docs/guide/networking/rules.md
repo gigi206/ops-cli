@@ -138,10 +138,12 @@ mean what it says is an error you are shown, the same way a wildcard host, an
 invalid port, an unsupported scheme, a query string, a `#fragment` and a segment's
 `;parameters` are.
 
-Those last three share one reason. The matcher cuts a query, a fragment and
-`;parameters` off the request path before any rule sees it (see [path
+Those last three share one reason. Before a path rule is matched, the matcher cuts a
+query, a fragment and `;parameters` off the request path (see [path
 canonicalization](#path-canonicalization)) and off the rule's own path with them, so
-a rule carrying one matches the bare path while reading as something narrower:
+a rule carrying one matches the bare path while reading as something narrower. A
+`re:` rule is matched against the request URL as it arrived, those parts still
+attached, which is why the regex below can name what a path rule cannot:
 
 ```toml
 allow = ["files.test/app;jsessionid"]   # refused: the parameters are not matched
@@ -156,8 +158,9 @@ into a config file is dropped at load with a warning naming the list it was in.
 ### Path canonicalization
 
 The in-cage agent controls the raw request, so a naive string match on the path
-would be trivial to evade. Every request path is **canonicalized once** before any
-rule sees it:
+would be trivial to evade. Every request path is **canonicalized once** before it is
+matched against a path rule (a `re:` pattern reads the URL as it arrived, see
+[Regex](#regex)):
 
 - the query string and the fragment dropped;
 - percent-decoded (a single level: `%2f` → `/`, but a double-encoded `%252f` stays

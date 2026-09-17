@@ -698,7 +698,7 @@ mod tests {
     fn a_link_is_never_opened() {
         // Opening it would report a tree that is not under this home, named as if it were: the
         // composition answers where this home's space went, and a link holds none of it. So the
-        // link is sized as the link it is, which leaves it with nothing to report, and the
+        // link is sized as the link it is — its own block at most, whatever it points at — and the
         // descent refuses it as well.
         let tmp = crate::testutil::TmpDir::new();
         let home = tmp.join("home");
@@ -730,11 +730,11 @@ mod tests {
             "while the real child is listed and opened"
         );
 
-        // The descent is asserted on its own because sizing a link as the link it is keeps a link
-        // off the level entirely, so no composition can drive the guard: a link holds at most one
-        // block, the directory it sits in holds one too, and a leader is opened only above
-        // `PASSTHROUGH_PERCENT` of its level. A link pointing at a directory is the one case the
-        // guard answers differently from a metadata read that follows it.
+        // The descent is asserted on its own because no composition can drive the guard: a link
+        // holds at most one block and the directory it sits in holds one too, so a link never
+        // reaches the `PASSTHROUGH_PERCENT` of its level that opens a leader, whether or not it is
+        // listed. A link pointing at a directory is the one case the guard answers differently
+        // from a metadata read that follows it.
         assert!(
             !descends_into(&home.join(".local")),
             "a link to a directory is not a directory this descent may open"
