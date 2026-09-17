@@ -1188,7 +1188,7 @@ impl LogRing {
                         0
                     };
                 let main_seen = a.saturating_sub(muted_seen);
-                g.evicted.saturating_sub(main_seen)
+                g.evicted.saturating_sub(main_seen).max(1)
             }
             _ => 0,
         };
