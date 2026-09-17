@@ -222,8 +222,8 @@ struct Candidate {
 ///
 /// Its `environ` is not the cage's. Bubblewrap is exec'd with the *launching* environment and
 /// passes the cage's own through the `--args` descriptor (see `argv`), which deliberately keeps
-/// those values out of the argument list and so never reaches `/proc/<pid>/environ` either.
-/// Reading it there yields the host's `HOME` and `PATH`, and a shell started from them stands in
+/// those values out of the argument list, so they never reach `/proc/<pid>/environ` either;
+/// reading it there yields the host's `HOME` and `PATH`, and a shell started from them stands in
 /// the cage's filesystem while pointing at the host's home — the one outcome this module's header
 /// promises does not happen.
 ///
