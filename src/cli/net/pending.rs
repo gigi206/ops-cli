@@ -406,18 +406,30 @@ pub(super) fn net_pending_answer(
     // it does not know. The id is the lone positional; the scope flags (--local/--global/--app) ride
     // `split_scope` and apply only with `--save`. `--session` remembers the decision for the live
     // session (no config write); the two combine.
-    let all = args.iter().any(|a| a.to_str() == Some("--all"));
-    let save = args.iter().any(|a| a.to_str() == Some("--save"));
-    let session = args.iter().any(|a| a.to_str() == Some("--session"));
+    //
+    // The lookup stops at a bare `--`, as it does in [`crate::split_session_flags`] and in
+    // `split_scope`, which this runs before: after the terminator a token is a positional whatever
+    // it looks like, so `sbx net pending allow -- --all` names an (invalid) id rather than draining
+    // every parked request. The `--` itself stays in `rest` for `split_scope` to read, so the
+    // terminator keeps working for the flags that ride that call.
+    let upto = args
+        .iter()
+        .position(|a| a.to_str() == Some("--"))
+        .unwrap_or(args.len());
+    let all = args[..upto].iter().any(|a| a.to_str() == Some("--all"));
+    let save = args[..upto].iter().any(|a| a.to_str() == Some("--save"));
+    let session = args[..upto].iter().any(|a| a.to_str() == Some("--session"));
     let rest: Vec<OsString> = args
         .iter()
-        .filter(|a| {
-            !matches!(
-                a.to_str(),
-                Some("--save") | Some("--session") | Some("--all")
-            )
+        .enumerate()
+        .filter(|(i, a)| {
+            *i >= upto
+                || !matches!(
+                    a.to_str(),
+                    Some("--save") | Some("--session") | Some("--all")
+                )
         })
-        .cloned()
+        .map(|(_, a)| a.clone())
         .collect();
 
     // `--all` drains every parked request across every reachable session (or, with `--app <name>`,

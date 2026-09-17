@@ -277,3 +277,53 @@ fn opening_a_detached_log_trims_the_directory_to_its_ceiling() {
         "a file that is not a session log is not the reaper's to remove"
     );
 }
+
+/// The ceiling reclaims finished sessions, never running ones. Nothing heartbeats a session log:
+/// a detached session that has been quiet for hours carries the oldest mtime in the directory and
+/// would sort straight into the tail — yet unlinking it strands its daemon writing to a nameless
+/// inode, while `sbx session logs <id>` resolves the same pid-keyed path and finds nothing for the
+/// rest of that session's life.
+#[test]
+fn a_live_sessions_log_survives_the_ceiling_however_old_it_is() {
+    let dir = crate::testutil::TmpDir::new();
+    let logs = dir.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+
+    // This process is a genuinely live session: its `(pid, start_ticks)` pair validates, so the
+    // registry reports it live rather than pruning it as a reused pid.
+    let registry = crate::session::Registry::at(dir.path());
+    let session = crate::session::Session::current(
+        std::path::PathBuf::from("/tmp"),
+        crate::session::Kind::Run,
+        crate::session::SessionRuntime::Project,
+    )
+    .expect("the test process itself is a live session")
+    .detached();
+    registry.register(&session).expect("a registered session");
+
+    // Written first, so it is the oldest thing in the directory — the far end of the tail.
+    let alive = logs.join(format!("{}.log", session.pid));
+    std::fs::write(&alive, b"quiet but running").unwrap();
+    for i in 0..(super::MAX_KEPT_LOGS + 45) {
+        std::fs::write(logs.join(format!("dead-{i}.log")), b"x").unwrap();
+    }
+
+    let opening = logs.join("99999.log");
+    std::fs::write(&opening, b"x").unwrap();
+    super::reap_old_logs(&logs, &opening);
+
+    assert!(
+        alive.exists(),
+        "the log of a session the registry still reports live is not the reaper's to remove"
+    );
+    let kept = std::fs::read_dir(&logs)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+        .count();
+    assert_eq!(
+        kept,
+        super::MAX_KEPT_LOGS + 1,
+        "the finished sessions are still trimmed to the ceiling; the live one sits beside it"
+    );
+}

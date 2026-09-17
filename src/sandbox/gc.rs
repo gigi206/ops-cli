@@ -1743,7 +1743,9 @@ pub(crate) fn tree_size(path: &Path) -> u64 {
 /// directories dropped. The shared store keeps one closure per channel revision and per project, so
 /// it is rooted under `<data>/gcroots/`: `base/<rev>/`, `gui/<rev>/`, `gpu/<rev>/`, and
 /// `audio/<rev>/` (all four keyed by the base channel revision — a hole's userspace is provisioned
-/// against the same channel as the base), `mise/<rev>/` (the engine revision), and `projects/<id>/` (a project's
+/// against the same channel as the base), `storage/<rev>` (the `btrfs-progs` sbx provisions for
+/// itself when the host has no `mkfs.btrfs`, resolved through the global lock and so keyed by the
+/// base revision too), `mise/<rev>/` (the engine revision), and `projects/<id>/` (a project's
 /// declared `[packages]` and `nix:` tools). A rev directory not in its live set, and a project
 /// directory whose runtime tree under `projects_dir` is gone, are stale: dropping the root lets the
 /// following `nix-store --gc` collect the closure it held. Destructive only when `prune`. The live
@@ -1764,6 +1766,12 @@ pub(crate) fn prune_shared_gcroots(
     for family in ["base", "gui", "gpu", "audio"] {
         prune_rev_dirs(&gcroots_dir.join(family), live_base, prune, &mut removed);
     }
+    // `storage/<rev>` is the same shape with a different leaf type: [`crate::storage::resolve_mkfs`]
+    // roots its provisioned `btrfs-progs` as a bare out-link named after the revision, not a
+    // directory holding one. It resolves that revision through the global lock, which
+    // `live_base_revisions` always covers, so the copy a volume creation is using is never in the
+    // stale set — and one left by a rolled channel pins its whole closure until dropped here.
+    prune_rev_dirs(&gcroots_dir.join("storage"), live_base, prune, &mut removed);
     prune_rev_dirs(&gcroots_dir.join("mise"), live_mise, prune, &mut removed);
 
     // Per-project roots: stale once the project's runtime tree is gone (the dead-tree reaper removes
@@ -1783,9 +1791,10 @@ pub(crate) fn prune_shared_gcroots(
     removed
 }
 
-/// Drop each revision-keyed root directory under `dir` whose revision is not in `live`. A root
-/// directory's name is the revision; one outside the live set roots a channel revision nothing
-/// references any more.
+/// Drop each revision-keyed root under `dir` whose revision is not in `live`. The entry's name is
+/// the revision; one outside the live set roots a channel revision nothing references any more.
+/// The entry is a directory of out-links in most families and a single out-link symlink in
+/// `storage/`; [`force_remove_dir_all`] removes either.
 fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1800,9 +1809,9 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
         // Reported only when it actually went. With `prune` off this is a plan and every candidate
         // belongs in it; with `prune` on it is a report, and a failed removal reported as one makes
         // `sbx gc` announce bytes that are still on the disk — and hides the entry that keeps
-        // failing, since it is named as gone every time. The removal fails on anything that is not
-        // a directory, which is how a stray regular file in a revision directory stays for good
-        // while being announced as removed on every run.
+        // failing, since it is named as gone every time. The removal handles a directory or a
+        // symlink and fails on a regular file, which is how a stray file where a revision belongs
+        // stays for good while being announced as removed on every run.
         if prune && force_remove_dir_all(&entry.path()).is_err() {
             continue;
         }
@@ -3590,6 +3599,44 @@ mod tests {
         }
         assert!(!gcroots.join("mise/oldeng").exists() && gcroots.join("mise/eng").is_dir());
         assert!(!gcroots.join("projects/p2").exists() && gcroots.join("projects/p1").is_dir());
+    }
+
+    /// The `storage/` family is reconciled like the rest, though its entries are bare out-links.
+    ///
+    /// `resolve_mkfs` roots the `btrfs-progs` it provisions at `gcroots/storage/<rev>` itself — a
+    /// symlink into the store, not a directory holding one. A root left by a rolled channel pins
+    /// that revision's whole closure, so it has to be dropped with the other base-keyed families,
+    /// and the removal has to cope with the symlink.
+    #[test]
+    fn prune_shared_gcroots_drops_a_stale_storage_out_link() {
+        let base = TmpDir::new();
+        let gcroots = base.path().join("gcroots");
+        let projects = base.path().join("projects");
+        std::fs::create_dir_all(gcroots.join("storage")).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::os::unix::fs::symlink("/nix/store/x", gcroots.join("storage/live")).unwrap();
+        std::os::unix::fs::symlink("/nix/store/y", gcroots.join("storage/stale")).unwrap();
+
+        let live_base = BTreeSet::from(["live".to_string()]);
+        let live_mise = BTreeSet::new();
+
+        let listed = prune_shared_gcroots(&gcroots, &projects, &live_base, &live_mise, false);
+        assert_eq!(
+            listed,
+            vec![gcroots.join("storage/stale")],
+            "the stale out-link belongs in the plan, the live one does not"
+        );
+
+        let removed = prune_shared_gcroots(&gcroots, &projects, &live_base, &live_mise, true);
+        assert_eq!(removed, vec![gcroots.join("storage/stale")]);
+        assert!(
+            gcroots.join("storage/stale").symlink_metadata().is_err(),
+            "the stale out-link still roots its closure"
+        );
+        assert!(
+            gcroots.join("storage/live").symlink_metadata().is_ok(),
+            "the out-link a volume creation is using was dropped"
+        );
     }
 
     /// What a prune reports is what it removed, not what it looked at.

@@ -132,20 +132,24 @@ const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 /// exists for, which is the very thing a caller unable to connect would want to read.
 const MAX_CONCURRENT_CONNS: usize = 32;
 
-/// How long the crossing socket waits for a connection to say what it wants.
+/// How long either of the plane's sockets waits for a connection to say what it wants.
 ///
-/// A connection is accepted, given a host thread and one of [`MAX_CONCURRENT_CONNS`] slots before
-/// the cage has said a word, and this socket set no read deadline at all: 32 connections that
-/// connect and then stay silent held every slot of the plane for the rest of the session, refusing
-/// every later caller with nothing recorded anywhere — [`MAX_CONCURRENT_CONNS`] itself says a
-/// refused connection is deliberately not logged. Both brokers whose sockets cross into the cage
-/// bound their first message for exactly this (`sshagent`'s `CAGE_FIRST_MESSAGE`, `broker`'s
-/// `CAGE_FIRST_FRAME`); this was the plane that did not.
+/// Both of them, matching [`MAX_CONCURRENT_CONNS`]'s own ceiling: a connection is accepted, given a
+/// host thread and one of those slots before the peer has said a word, and a socket with no read
+/// deadline lets 32 connections that connect and then stay silent hold every slot of that socket
+/// for the rest of the session, refusing every later caller with nothing recorded anywhere —
+/// [`MAX_CONCURRENT_CONNS`] itself says a refused connection is deliberately not logged. Both
+/// brokers whose sockets cross into the cage bound their first message for exactly this
+/// (`sshagent`'s `CAGE_FIRST_MESSAGE`, `broker`'s `CAGE_FIRST_FRAME`); this was the plane that did
+/// not. It applies to the host-only socket for the same reason and one of its own: that is where
+/// `sbx task status` and `sbx task stop` are answered, so a caller unable to reach it has lost the
+/// only lever for ending a running or detached invocation.
 ///
-/// It bounds the whole request rather than only its first line. `RUN` is followed by its payloads,
-/// so a budget lifted at the command line would move the wait one line down and no further. It ends
-/// at the `run` terminator because nothing is read after it: what follows is the invocation, which
-/// legitimately holds this connection for as long as the task's own timeout allows.
+/// It bounds the whole request rather than only its first line. `RUN` and `DETACH` are followed by
+/// their payloads, so a budget lifted at the command line would move the wait one line down and no
+/// further. It ends at the request's terminator because nothing is read after it: what follows is
+/// the invocation, which legitimately holds the connection for as long as the task's own timeout
+/// allows.
 ///
 /// Thirty seconds, the number both brokers chose and for their reason: a client connected because
 /// it had something to send, so a pause before it sends is slack rather than need.
@@ -792,7 +796,7 @@ pub(crate) fn start(
                 // behind that wait.
                 super::conncap::spawn_conn("task control (logs)", move || {
                     let _slot = slot;
-                    let _ = serve_host(stream, &engine, &log, &results, &quota);
+                    let _ = serve_host(stream, &engine, &log, &results, &quota, CAGE_FIRST_REQUEST);
                 });
             }
         });
@@ -1313,15 +1317,36 @@ fn write_outcome(writer: &mut UnixStream, id: u64, outcome: &TaskOutcome) -> io:
 /// `DETACH`/`RESULT`: a detached invocation is one nobody is waiting for, so putting its start
 /// within reach of a cage would let a caller create invocations it cannot then see or end, and hold
 /// several at once — which having to wait is what prevents.
+///
+/// The whole request is read under `first_request`, for the reason [`serve_cage`] gives and with
+/// the same two halves: this socket has its own [`MAX_CONCURRENT_CONNS`] ceiling and its own thread
+/// per connection, so a peer that connects and stays silent held a slot and a host thread for the
+/// life of the session — and this is the socket `sbx task status` and `sbx task stop` are answered
+/// on, so exhausting it takes away the only lever for ending a running invocation.
+///
+/// The budget is a parameter rather than [`CAGE_FIRST_REQUEST`] read directly, for the same reason
+/// [`serve_cage`] takes one: a test can prove a silent connection is given up on without waiting
+/// out the real thirty seconds.
 fn serve_host(
     stream: UnixStream,
     engine: &Arc<TaskEngine>,
     log: &Arc<TaskLog>,
     results: &Arc<TaskResults>,
     quota: &AtomicU64,
+    first_request: std::time::Duration,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
+    // Set on `writer`, which reaches the same socket: `try_clone` dups the descriptor, and a
+    // receive timeout belongs to the socket rather than to either descriptor naming it. The write
+    // timeout goes with it — `LOG` and `RESULT` stream bodies, so a caller that stops reading
+    // stalls this thread in `write` exactly as a silent one stalls it in `read`.
+    writer.set_read_timeout(Some(first_request))?;
+    writer.set_write_timeout(Some(first_request))?;
+    // Over the whole request rather than its first line: `DETACH` is followed by its payloads, and
+    // a budget lifted at the command line would move the wait one line down and no further.
+    let mut reader =
+        super::deadline::Deadlined::new(&mut reader, std::time::Instant::now() + first_request);
     let Some(command) = read_request_line(&mut reader)? else {
         return Ok(());
     };

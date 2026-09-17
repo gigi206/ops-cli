@@ -1515,6 +1515,31 @@ fn net_pending_answer_rejects_a_malformed_id() {
 }
 
 #[test]
+fn net_pending_answer_reads_no_flag_from_behind_the_terminator() {
+    let fx = Project::new("net");
+    // `--` says "what follows is a positional, whatever it looks like", so `--all` behind it names
+    // an id and is refused as one -- it must not select the drain path, which would answer every
+    // parked request on the machine in one shot.
+    for verb in ["allow", "deny"] {
+        let out = fx.run(&["net", "pending", verb, "--", "--all"]);
+        assert_eq!(out.status.code(), Some(2), "{verb}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("invalid pending id '--all'"),
+            "{verb}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Same for `--save`: behind the terminator it is a second positional, not a request to persist
+    // a rule, so the verb answers with its usage line rather than reaching a session.
+    let out = fx.run(&["net", "pending", "allow", "4294967295.1", "--", "--save"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("usage:"), "{err:?}");
+    assert!(!err.contains("no live session"), "{err:?}");
+}
+
+#[test]
 fn net_pending_answer_an_absent_session_is_refused() {
     let fx = Project::new("net");
     // A well-formed id whose session does not exist (no control socket) → a pointed refusal, exit 2.

@@ -401,6 +401,70 @@ fn a_request_trickled_a_byte_at_a_time_cannot_outlast_the_budget() {
     );
 }
 
+/// Stand the production [`serve_host`] up over a socketpair with a short first-request budget,
+/// and hand back the caller's end plus a channel carrying what the server returned.
+///
+/// The sibling of [`cage_conn`], and for the same reason: the budget is what is under test, and a
+/// real listener passes the production thirty seconds.
+fn host_conn(budget: Duration) -> (UnixStream, std::sync::mpsc::Receiver<io::Result<()>>) {
+    let (server, client) = UnixStream::pair().expect("socketpair");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let engine = Arc::new(super::super::task::TaskEngine::inventory_only(vec![
+            probe_task(),
+        ]));
+        let log = Arc::new(TaskLog::new());
+        let results = Arc::new(TaskResults::default());
+        let quota = AtomicU64::new(DEFAULT_CALL_QUOTA);
+        let _ = tx.send(serve_host(server, &engine, &log, &results, &quota, budget));
+    });
+    (client, rx)
+}
+
+/// The host-only socket gives up on a silent connection rather than holding its thread and slot.
+///
+/// It has its own [`MAX_CONCURRENT_CONNS`] ceiling and its own thread per connection, so the
+/// exhaustion [`CAGE_FIRST_REQUEST`] exists to prevent is reachable here too — and this is the
+/// socket `sbx task status` and `sbx task stop` are answered on, so 32 stalled callers take away
+/// the only lever for ending a running invocation, silently.
+///
+/// The caller's end stays **open** and simply says nothing, for the reason the crossing socket's
+/// twin gives: a peer that closed would be given up on at end-of-file whatever the deadline was.
+#[test]
+fn a_silent_caller_on_the_host_socket_is_given_up_on_rather_than_holding_its_slot() {
+    let budget = Duration::from_millis(200);
+    let (held, rx) = host_conn(budget);
+    let out = rx.recv_timeout(Duration::from_secs(5));
+    assert!(
+        out.is_ok(),
+        "a connection that said nothing kept its thread and its slot past the deadline"
+    );
+    assert!(
+        out.expect("the server returned").is_err(),
+        "a peer that ran out its deadline is a fault, not a clean hangup"
+    );
+    drop(held);
+
+    // The negative control, on the same budget: a caller that speaks is served in full. Without
+    // it this test would pass just as well against a plane that dropped every connection.
+    let (mut client, rx) = host_conn(budget);
+    client.write_all(b"STATUS\n").expect("write STATUS");
+    let mut reply = String::new();
+    BufReader::new(client.try_clone().expect("clone"))
+        .read_to_string(&mut reply)
+        .expect("read the reply");
+    assert_eq!(
+        reply, "ok\n",
+        "an idle plane answers STATUS with nothing running"
+    );
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the server returned")
+            .is_ok(),
+        "serving a caller that spoke is not a fault"
+    );
+}
+
 /// A value with the two properties a line-oriented client would get wrong: an embedded newline
 /// (which would forge a protocol line if it were not length-framed) and a multi-byte character
 /// (which a client counting characters instead of bytes would under-announce).

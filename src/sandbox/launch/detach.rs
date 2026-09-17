@@ -291,7 +291,10 @@ pub(crate) fn parse_session_header(line: &[u8]) -> Option<SessionHeader> {
 ///
 /// A session's log outlives its session on purpose, so `sbx session logs <id>` can still read it
 /// after the session is gone. Nothing else ever removes one, so without a ceiling the directory
-/// grows by a file per detached launch for as long as the host is used.
+/// grows by a file per detached launch for as long as the host is used. The ceiling only ever
+/// reclaims a finished session's log: a live session's is never counted out (see
+/// [`reap_old_logs`]), so the directory may exceed this bound while more sessions than that are
+/// running at once.
 const MAX_KEPT_LOGS: usize = 100;
 
 /// Remove the oldest logs beyond [`MAX_KEPT_LOGS`], keeping the newest by modification time.
@@ -300,17 +303,38 @@ const MAX_KEPT_LOGS: usize = 100;
 /// enforced by the same act that would breach it.
 ///
 /// `opening` is never removed: it is this launch's own log, and it is counted as one of the kept,
-/// which is why the others are trimmed to one fewer. Best-effort throughout — a directory that
+/// which is why the others are trimmed to one fewer. Neither is the log of any session the
+/// registry still reports live: nothing heartbeats these files, so a session that has simply been
+/// quiet for hours has an old mtime and would otherwise sort into the tail — and unlinking it
+/// leaves its daemon appending to a nameless inode while `sbx session logs <id>`, which resolves
+/// the very path [`detach_log_path`] keyed on that pid, finds nothing for the rest of the
+/// session's life. Best-effort throughout — a directory that cannot be read, a registry that
 /// cannot be read, a file whose age cannot be told or that cannot be removed, all cost a bounded
 /// directory and never a session that was otherwise ready to run.
 fn reap_old_logs(dir: &Path, opening: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    // `dir` is `<data>/logs`, so its parent is the data directory the registry is rooted under.
+    // `live` validates each record's `(pid, start_ticks)` pair, so a pid the kernel has reused
+    // cannot make a dead session look alive; an unreadable registry yields an empty set, which is
+    // simply the unguarded trim.
+    let live: std::collections::HashSet<u32> = dir
+        .parent()
+        .and_then(|data| crate::session::Registry::at(data).live().ok())
+        .map(|sessions| sessions.iter().map(|s| s.pid).collect())
+        .unwrap_or_default();
     let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p != opening && p.extension().is_some_and(|x| x == "log"))
+        .filter(|p| {
+            // The file name is the session id, as `detach_log_path` writes it.
+            !p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some_and(|pid| live.contains(&pid))
+        })
         .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
         .collect();
     // Newest first, so what falls past the ceiling is the tail. Ties break on the path, so two
