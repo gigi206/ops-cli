@@ -1276,21 +1276,11 @@ fn a_stop_tells_a_finished_invocation_from_an_unknown_one() {
 
 /// Execute the client the way a caller does — the file itself, through its shebang.
 ///
-/// The retry is a multithreaded-test artifact, not a property of the client: these tests write
-/// scripts and spawn processes concurrently in one process, so a spawn can inherit another
-/// thread's still-open write descriptor and make the exec fail with `ETXTBSY`. Nothing in a
-/// session does that — sbx writes the client, then bwrap binds it.
+/// Through the shared wait because the script was written by this test binary a moment ago, and
+/// nothing in a session has that shape: sbx writes the client, then bwrap binds it. See
+/// [`crate::testutil::output_past_etxtbsy`].
 fn run_client(script: &Path, args: &[&str]) -> std::process::Output {
-    for _ in 0..100 {
-        match Command::new(script).args(args).output() {
-            Ok(out) => return out,
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => panic!("run the client: {e}"),
-        }
-    }
-    panic!("the client stayed busy: another thread held a write descriptor throughout");
+    crate::testutil::output_past_etxtbsy(Command::new(script).args(args))
 }
 
 // The listing verbs, end to end: the generated client's request is parsed by the real plane and

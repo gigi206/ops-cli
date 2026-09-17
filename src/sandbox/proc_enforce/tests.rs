@@ -2226,24 +2226,10 @@ fn materialized_shim(dir: &TmpDir) -> PathBuf {
     path
 }
 
-/// Start a freshly written executable, waiting out `ETXTBSY`.
-///
-/// Writing a file and then executing it is racy in a multi-threaded process: while the write is
-/// in flight its descriptor is inherited by whatever any *other* thread forks in that instant,
-/// and the kernel refuses to exec a file some process holds open for writing. The descriptor is
-/// close-on-exec, so the window shuts on its own the moment that other child execs — waiting is
-/// the whole fix. A test binary runs many threads spawning many processes, which is what makes
-/// this worth handling here.
+/// Start a freshly written executable, waiting out the `ETXTBSY` that a test binary writing and
+/// spawning in parallel produces — see [`crate::testutil::spawn_past_etxtbsy`] for the race.
 fn spawn_shim(cmd: &mut std::process::Command) -> std::process::Child {
-    for _ in 0..100 {
-        match cmd.spawn() {
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
-                std::thread::sleep(std::time::Duration::from_millis(20))
-            }
-            other => return other.expect("spawn the shim"),
-        }
-    }
-    panic!("the shim stayed held open for writing");
+    crate::testutil::spawn_past_etxtbsy(cmd)
 }
 
 /// The wait above is what keeps the tests below deterministic, so it is proved rather than

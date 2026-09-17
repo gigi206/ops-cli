@@ -528,10 +528,9 @@ mod tests {
     }
 
     fn run_client(path: &Path, args: &[&str]) -> (i32, String, String) {
-        let out = std::process::Command::new(path)
-            .args(args)
-            .output()
-            .expect("run the client");
+        // Through the shared wait, because the client was written by this same test binary a moment
+        // ago: see `testutil::output_past_etxtbsy`.
+        let out = crate::testutil::output_past_etxtbsy(std::process::Command::new(path).args(args));
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),

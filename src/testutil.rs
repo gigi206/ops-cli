@@ -103,6 +103,36 @@ impl Drop for TmpDir {
     }
 }
 
+/// Run `attempt` until it stops failing with `ETXTBSY`, then hand back what it produced.
+///
+/// Writing an executable and then running it is racy in a multi-threaded process, and a test binary
+/// is one: while the write descriptor is open, whatever another thread forks in that instant
+/// inherits it, and the kernel refuses to exec a file some process holds open for writing. The
+/// descriptor is close-on-exec, so the window shuts by itself the moment that other child execs,
+/// which is why waiting is the whole fix. Nothing a session does has this shape, so the retry
+/// belongs to the tests rather than to what they exercise.
+fn past_etxtbsy<T>(what: &str, mut attempt: impl FnMut() -> std::io::Result<T>) -> T {
+    for _ in 0..100 {
+        match attempt() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other.unwrap_or_else(|e| panic!("{what}: {e}")),
+        }
+    }
+    panic!("{what}: the file stayed held open for writing by another thread");
+}
+
+/// Spawn `cmd`, waiting out the `ETXTBSY` [`past_etxtbsy`] describes.
+pub(crate) fn spawn_past_etxtbsy(cmd: &mut std::process::Command) -> std::process::Child {
+    past_etxtbsy("spawn", || cmd.spawn())
+}
+
+/// Run `cmd` to completion and collect its output, waiting out the same `ETXTBSY`.
+pub(crate) fn output_past_etxtbsy(cmd: &mut std::process::Command) -> std::process::Output {
+    past_etxtbsy("run", || cmd.output())
+}
+
 /// Every `.rs` source under `dir`, sorted, subdirectories included. The walk descends because a
 /// module that outgrew one file keeps its root in `<name>.rs` and everything else in a `<name>/`
 /// beside it: a flat listing would read the root, skip the children, and report the silence as a
