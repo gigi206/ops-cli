@@ -730,11 +730,14 @@ mod tests {
             "while the real child is listed and opened"
         );
 
-        // The descent is asserted on its own because no composition can drive the guard: a link
-        // holds at most one block and the directory it sits in holds one too, so a link never
-        // reaches the `PASSTHROUGH_PERCENT` of its level that opens a leader, whether or not it is
-        // listed. A link pointing at a directory is the one case the guard answers differently
-        // from a metadata read that follows it.
+        // The descent is asserted directly rather than through a composition because whether a
+        // composition reaches it at all is the filesystem's choice: where a directory occupies a
+        // block of its own the link is at most half of its level and never leads it, but on a
+        // filesystem that stores a directory in no blocks (tmpfs) a link with a long target is the
+        // whole of its level, clears `PASSTHROUGH_PERCENT` and is chosen as the leader. There the
+        // check asserted here is the only thing standing between the walk and a tree outside this
+        // home — a link pointing at a directory is the one case it answers differently from a
+        // metadata read that follows it.
         assert!(
             !descends_into(&home.join(".local")),
             "a link to a directory is not a directory this descent may open"

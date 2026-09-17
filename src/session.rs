@@ -715,8 +715,9 @@ impl Registry {
         Ok((live, pruned))
     }
 
-    /// Remove a specific session's record (best-effort), so a session just stopped leaves nothing
-    /// behind on disk.
+    /// Remove a specific session's record (best-effort), so a session just stopped leaves no record
+    /// behind. Only the record: a detached session's log survives the stop by design, which is what
+    /// `sbx session logs` reads afterwards.
     ///
     /// What it buys is the file, not the listing: [`scan`](Self::scan) filters every record it
     /// reads through liveness, so a stopped session is absent from `sbx session ls` whether or not

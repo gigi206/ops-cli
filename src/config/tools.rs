@@ -265,22 +265,17 @@ pub(super) fn apply_tools(
     }
     // A second pass, after the packages exist, since the table's fields decorate a package rather
     // than declaring one: the table they come from may pair with either declaration form, so both
-    // must already be in `out`. A withheld name's table is withheld from this pass as well: the
-    // name went to the inline flake, so a table still carrying `libs` or `main` would decorate a
-    // package this layer no longer holds and be reported as a missing `[packages]` entry — the
-    // same contradiction the resolver pass withholds it to avoid.
-    for ((tables, _, label, _), colliding) in backends.iter().zip(&withheld) {
-        let mut tables = tables.clone();
-        tables.retain(|name, _| !colliding.contains(name));
-        apply_prebuilt_decor(
-            out,
-            warnings,
-            source,
-            &tables,
-            label,
-            protect_trusted,
-            state,
-        );
+    // must already be in `out`.
+    //
+    // A name withheld from the resolver pass is **not** withheld here, and the two are not the same
+    // case. The resolver pass no longer knows the name, so it reports the sentinel as a `[packages]`
+    // entry the author never wrote — a claim the collision warning above it contradicts. This pass
+    // still finds the name: the inline flake holds it. What it says about a table left beside that
+    // flake is true, that `libs`/`main` decorate a prebuilt package and this one is a flake, and
+    // withholding it drops the only word the author gets that their field was ignored. It also
+    // reads alike for both declaration forms, where withholding covered the sentinel alone.
+    for (tables, _, label, _) in &backends {
+        apply_prebuilt_decor(out, warnings, source, tables, label, protect_trusted, state);
     }
 }
 
@@ -1056,6 +1051,11 @@ mod tests {
     /// tables against the names it was handed, so a table left behind is reported as a sentinel
     /// the author never wrote — a second warning contradicting the collision warning above it and
     /// pointing at a line already in the file.
+    ///
+    /// The decoration pass is the other half of the same question and answers it the other way, so
+    /// it is pinned here beside it: that pass finds the name, because the inline flake holds it,
+    /// and what it says about the leftover table is true. The author is told their `libs` was
+    /// ignored and why, which is a notice rather than a contradiction.
     #[test]
     fn a_resolver_name_withheld_for_a_flake_collision_takes_its_table_with_it() {
         let mut out = Vec::new();
@@ -1100,18 +1100,18 @@ mod tests {
             ),
             "the inline flake holds the name: {out:?}"
         );
-        assert_eq!(
-            warnings.len(),
-            1,
-            "the collision alone is reported: {warnings:?}"
-        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].contains("dup") && warnings[0].contains("both"),
-            "and it is the collision: {warnings:?}"
+            "the collision is reported first: {warnings:?}"
         );
         assert!(
-            !warnings[0].contains("no matching"),
-            "nothing claims the [packages] entry is missing: {warnings:?}"
+            warnings[1].contains("`libs` in [tarball.dup]") && warnings[1].contains("`flake`"),
+            "then the leftover table is answered for what it is: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("no matching")),
+            "and nothing claims the [packages] entry the author wrote is missing: {warnings:?}"
         );
     }
 }

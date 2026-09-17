@@ -459,8 +459,9 @@ fn render_stop_outcome(
 
 /// Stop one resolved session and, when it is accounted for, reap its record: SIGTERM, then
 /// SIGKILL after `grace`, report the outcome by pid and label, and drop the record so the stopped
-/// session leaves nothing behind on disk. The listing does not wait on that: it filters its records
-/// through liveness, and a process that has been killed stops reading as live whoever reaps it.
+/// session leaves no record behind (its log stays: that is what `sbx session logs` reads). The
+/// listing does not wait on the record either: it filters what it reads through liveness, and a
+/// process that has been killed stops reading as live whoever reaps it.
 ///
 /// Returns whether the session is accounted for — stopped, or already gone. The one case that is
 /// neither keeps its record: when the host refused a handle on the process, nothing was signalled

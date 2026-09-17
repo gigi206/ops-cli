@@ -424,13 +424,24 @@ fn a_path_rule_may_not_carry_a_fragment_or_segment_parameters() {
         params.contains("parameters") && params.contains("re:"),
         "the refusal names what was written and what to use instead: {params}"
     );
-    // And the path it names is the one the rule would really have opened. The cut is per segment,
-    // so parameters written anywhere but the last segment leave the segments after them in place:
-    // a refusal naming the text before the `;` would send its author to the wrong path.
+    // And each of the three names the path the rule would really have opened, which is not the
+    // text before the delimiter: parameters are cut per segment, so the segments after them stay,
+    // and a fragment or a query is cut before `.`/`..` are resolved. A refusal naming the raw text
+    // sends its author to a path the rule does not match.
     let inner = classify("api.test/a/b;x/c").unwrap_err();
     assert!(
         inner.contains("`/a/b/c`") && !inner.contains("`/a/b`"),
-        "the refusal names the path the rule would have opened: {inner}"
+        "the parameters refusal names the path the rule would have opened: {inner}"
+    );
+    let dots = classify("api.test/a/../b#f").unwrap_err();
+    assert!(
+        dots.contains("`/b`") && !dots.contains("`/a/../b`"),
+        "and so does the fragment refusal: {dots}"
+    );
+    let query = classify("api.test/a/../b?q=1").unwrap_err();
+    assert!(
+        query.contains("`/b`") && !query.contains("`/a/../b`"),
+        "and the query refusal: {query}"
     );
     // The plain rule those two were trying to narrow stays accepted, and still matches the
     // resource with any query, fragment or parameters attached.

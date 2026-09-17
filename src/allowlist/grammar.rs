@@ -593,6 +593,19 @@ pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
     Ok((canonical, port))
 }
 
+/// The path a refused rule would really have opened: its own path, canonicalized the way
+/// [`canonical_segments`] canonicalizes a request's.
+///
+/// Every refusal below names it rather than the text before the delimiter it refuses, because the
+/// two differ wherever the cut is not a tail cut: `;parameters` are dropped per segment, and
+/// `.`/`..` are resolved after the query and the fragment are gone, so `/a/../b#f` opens `/b` and
+/// `/a/b;x/c` opens `/a/b/c`. A refusal naming the raw text sends its author to a path the rule
+/// does not match. Reading it from the canonicalization itself is what keeps the message and the
+/// matcher from drifting apart.
+fn opened_path(path: &str) -> String {
+    format!("/{}", canonical_segments(path).join("/"))
+}
+
 /// Parse a `host[:ports]/path` entry into a `Url` rule. The part before the first `/` is the
 /// authority, parsed for its host and port set exactly like a host-level entry — so a path rule
 /// supports the same `:port`, comma-list, `lo-hi` range, and `:*` qualifiers (a bare host defaulting
@@ -624,27 +637,27 @@ fn parse_path_rule(
     // on `/exec` — and `sbx test net` printed the rule back with the query still on it. Refused
     // here, beside the wildcard-host refusal above and for the same reason: a rule that cannot mean
     // what it says is an error its author should see, not a silent widening.
-    if let Some((before, _)) = path.split_once('?') {
+    if path.contains('?') {
+        let opened = opened_path(path);
         return Err(format!(
             "entry `{s}` writes a query string in a path rule — a rule matches the path only, so \
-             this would open `{before}` with any query at all. Use `re:` to constrain a query"
+             this would open `{opened}` with any query at all. Use `re:` to constrain a query"
         ));
     }
     // A `#fragment` and a segment's `;parameters` are cut from the rule's own path by
     // `canonical_segments` exactly as they are from a request's, so a rule carrying either matches
     // the bare path while displaying a form that names something narrower. That is the same
-    // widening the query refusal above exists to prevent, so it is refused the same way.
-    if let Some((before, _)) = path.split_once('#') {
+    // widening the query refusal above exists to prevent, so both are refused the same way, and
+    // all three name the path [`opened_path`] reads back from the canonicalization.
+    if path.contains('#') {
+        let opened = opened_path(path);
         return Err(format!(
             "entry `{s}` writes a fragment in a path rule — a rule matches the path only, so this \
-             would open `{before}` with any fragment at all. Use `re:` to constrain a fragment"
+             would open `{opened}` with any fragment at all. Use `re:` to constrain a fragment"
         ));
     }
     if path.contains(';') {
-        // The path this rule would really open is read from the canonicalization itself, because
-        // the cut is per segment: the text before the first `;` names it only when the parameters
-        // sit in the last segment, and `/a/b;x/c` opens `/a/b/c` rather than `/a/b`.
-        let opened = format!("/{}", canonical_segments(path).join("/"));
+        let opened = opened_path(path);
         return Err(format!(
             "entry `{s}` writes `;parameters` in a path rule — a rule matches the path segments \
              only, so this would open `{opened}` with any parameters at all. Use `re:` to \

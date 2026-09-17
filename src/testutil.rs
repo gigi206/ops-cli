@@ -111,6 +111,10 @@ impl Drop for TmpDir {
 /// descriptor is close-on-exec, so the window shuts by itself the moment that other child execs,
 /// which is why waiting is the whole fix. Nothing a session does has this shape, so the retry
 /// belongs to the tests rather than to what they exercise.
+///
+/// The `sops` tests in [`crate::sandbox::egress`] wait the same race out on their own, because they
+/// retry a call that returns the spawn failure as a message rather than an `io::Error` of its own.
+/// That one is not routed through here.
 fn past_etxtbsy<T>(what: &str, mut attempt: impl FnMut() -> std::io::Result<T>) -> T {
     for _ in 0..100 {
         match attempt() {

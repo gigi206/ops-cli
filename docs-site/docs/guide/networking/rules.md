@@ -142,8 +142,9 @@ Those last three share one reason. Before a path rule is matched, the matcher cu
 query, a fragment and `;parameters` off the request path (see [path
 canonicalization](#path-canonicalization)) and off the rule's own path with them, so
 a rule carrying one matches the bare path while reading as something narrower. A
-`re:` rule is matched against the request URL as it arrived, those parts still
-attached, which is why the regex below can name what a path rule cannot:
+`re:` rule is matched against the request URL with those parts still attached (and
+against the canonical rebuild as well, see [Regex](#regex)), which is why the regex
+below can name what a path rule cannot:
 
 ```toml
 allow = ["files.test/app;jsessionid"]   # refused: the parameters are not matched
@@ -159,8 +160,8 @@ into a config file is dropped at load with a warning naming the list it was in.
 
 The in-cage agent controls the raw request, so a naive string match on the path
 would be trivial to evade. Every request path is **canonicalized once** before it is
-matched against a path rule (a `re:` pattern reads the URL as it arrived, see
-[Regex](#regex)):
+matched against a path rule (a `re:` pattern is tested against the URL as it arrived
+*and* against the canonical rebuild, see [Regex](#regex)):
 
 - the query string and the fragment dropped;
 - percent-decoded (a single level: `%2f` → `/`, but a double-encoded `%252f` stays
