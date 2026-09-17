@@ -706,11 +706,28 @@ mod tests {
         file_of(&outside, "share/f", 100 * 1024);
         file_of(&home, ".real/f", 100 * 1024);
         std::os::unix::fs::symlink(&outside, home.join(".local")).unwrap();
-        let seen: Vec<String> = home_composition(&home).into_iter().map(|e| e.rel).collect();
-        assert_eq!(
-            seen,
-            [".real", ".real/f"],
+        let seen: Vec<(String, u64)> = home_composition(&home)
+            .into_iter()
+            .map(|e| (e.rel, e.bytes))
+            .collect();
+        // Whether the link appears on the level at all is the filesystem's choice, not this
+        // module's: a target short enough to be stored inside the inode occupies no block and is
+        // dropped by the level's own zero filter, a longer one occupies one. What is asserted is
+        // what the sizing decides — the link is worth its own block at most, never the tree it
+        // points at, and that tree is never listed under this home's name.
+        let link = seen.iter().find(|(rel, _)| rel == ".local");
+        assert!(
+            link.is_none_or(|(_, bytes)| *bytes < 100 * 1024),
             "the link is not reported at the size of the tree it points at"
+        );
+        assert!(
+            !seen.iter().any(|(rel, _)| rel.starts_with(".local/")),
+            "and the tree it points at is never opened"
+        );
+        assert!(
+            seen.iter().any(|(rel, _)| rel == ".real")
+                && seen.iter().any(|(rel, _)| rel == ".real/f"),
+            "while the real child is listed and opened"
         );
 
         // The descent is asserted on its own because sizing a link as the link it is keeps a link
