@@ -135,6 +135,23 @@ fn a_layer_is_verified_against_its_digest_as_it_lands() {
     };
     let err =
         fetch_layer(&image, &wrong, dir.path(), None).expect_err("a mismatched digest is refused");
+    // Only a registry that answered can refuse, and a connection that dropped carries no verdict
+    // to read: the error is the socket's, not the registry's, and asserting the refusal's wording
+    // against it reports a broken client where there was a broken connection. That is what the two
+    // fetches above skip on, so it is what this skips on too — the refusal itself stays asserted
+    // for every answer that did arrive.
+    if matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+    ) {
+        skip_unreachable!("skipping the refusal check: the connection dropped before an answer");
+        return;
+    }
     assert!(
         err.to_string().contains("came back as") || err.to_string().contains("answered"),
         "{err}"
