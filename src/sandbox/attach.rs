@@ -760,6 +760,21 @@ mod tests {
         );
     }
 
+    /// An empty `environ` carries no environment, and a shell handed one does not start without a
+    /// home: it takes the one `/etc/passwd` names and keeps the directory it was launched from.
+    /// That is why [`read_environ`] returning nothing is not an environment to attach with, and
+    /// why the caller refuses instead of passing it on.
+    #[test]
+    fn an_empty_environ_leaves_a_shell_nothing_but_its_terminal() {
+        let env = build_env(b"", Some("xterm-256color"));
+        let strings: Vec<&str> = env.iter().map(|c| c.to_str().unwrap()).collect();
+        assert_eq!(strings, vec!["TERM=xterm-256color"]);
+        assert!(
+            !strings.iter().any(|e| e.starts_with("HOME=")),
+            "nothing names the cage's home, so the shell would invent one"
+        );
+    }
+
     #[test]
     fn build_env_defaults_term_when_the_attaching_terminal_has_none() {
         let env = build_env(b"HOME=/home/sandbox\x00", None);

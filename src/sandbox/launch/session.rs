@@ -157,6 +157,20 @@ pub(crate) fn attach(id: &str, cmd: &[OsString]) -> ExitCode {
         }
     };
     let environ = crate::sandbox::attach::read_environ(cage_pid);
+    // An in-cage payload is exec'd with the cage's own environment, so an empty read is never that
+    // environment: it is a process caught between its fork and its exec, or an `environ` this uid
+    // is not allowed to read. A shell started from nothing does not start from nothing — it falls
+    // back to the home `/etc/passwd` names and keeps the launching directory, so the operator gets
+    // the cage's filesystem under the host's `HOME` and cwd, which is the outcome choosing an agent
+    // over the monitor exists to prevent. It is the same "not yet", and it takes the same answer.
+    if environ.is_empty() {
+        crate::diag::error(&format!(
+            "sbx session attach: session '{id}' has no live process to enter — its agent's \
+             environment cannot be read yet (a launch still starting), or the agent has exited \
+             (run `sbx session ls`)."
+        ));
+        return ExitCode::FAILURE;
+    }
 
     // The in-cage argv: the interactive rc shell for a bare attach, or the command run through
     // `bash -c 'exec "$@"'` so bash resolves it on the cage PATH and execs it in place.
