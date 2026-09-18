@@ -45,20 +45,53 @@ fn a_digest_is_computed_over_the_bytes_that_came_back() {
     assert_ne!(digest_of(b"{}"), digest_of(b"{ }"));
 }
 
-/// The digest `skopeo inspect docker://docker.io/library/alpine:3.22` reports for the image this
-/// test resolves. A second implementation is the only oracle worth having here: it says the client
-/// followed the challenge, asked for the right media types, picked the `linux/amd64` entry out of
-/// the index, and hashed the manifest the way a registry does.
+/// One `alpine:3.22` index, named by digest. It is deliberately not what that tag resolves to
+/// today: a tag moves whenever Alpine republishes a patch release, while a digest names one
+/// document for as long as the registry keeps it, which is what a by-digest pin has to be tested
+/// against.
 const ALPINE_3_22: &str = "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce";
 
+/// A tag's oracle is the registry's own `Docker-Content-Digest`, never a digest written down here.
+///
+/// A constant held that role until `alpine:3.22` moved under it: the index digest changed between
+/// two runs hours apart, and a check that had passed went red on nothing the client had done. The
+/// registry states the digest of the bytes it has just served, so comparing that against the digest
+/// computed from those same bytes proves everything the constant proved — the challenge was
+/// followed, the right media types were asked for, and the document was hashed the way a registry
+/// hashes it — against a second implementation that cannot drift.
+///
+/// That a `linux/amd64` entry was picked out of the index is what the layers say: an index carries
+/// none of its own, so a resolve that returns any fetched the platform manifest behind one.
 #[test]
-fn a_tag_resolves_to_the_digest_a_second_implementation_reports() {
+fn a_tag_resolves_to_the_digest_the_registry_itself_reports() {
     let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
+    let url = v2_url(&image, "manifests", "3.22");
+    let Ok(served) = get_authenticated(&url, Some(MANIFEST_ACCEPT), None) else {
+        skip_unreachable!("skipping the registry resolve: the registry did not answer");
+        return;
+    };
+    if served.status != 200 {
+        skip_unreachable!("skipping the registry resolve: the registry did not serve the manifest");
+        return;
+    }
+    let Some(advertised) = served.header("docker-content-digest").map(str::to_string) else {
+        skip_unreachable!("skipping the registry resolve: the registry advertised no digest");
+        return;
+    };
+    assert_eq!(
+        digest_of(&served.body),
+        advertised,
+        "the manifest is hashed the way the registry that served it hashes it"
+    );
+
     let Ok(resolved) = resolve(&image, None) else {
         skip_unreachable!("skipping the registry resolve: the registry did not answer");
         return;
     };
-    assert_eq!(resolved.digest, ALPINE_3_22);
+    assert_eq!(
+        resolved.digest, advertised,
+        "a tag resolves to the digest of the index it names, not of the manifest behind it"
+    );
     assert!(!resolved.layers.is_empty(), "an image carries layers");
     for layer in &resolved.layers {
         assert!(reference::valid_digest(&layer.digest).is_some());
