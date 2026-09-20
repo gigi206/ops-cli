@@ -25,6 +25,8 @@ allow = [
 ]
 mute = [
     "*.rum.aliyuncs.com",
+    "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]

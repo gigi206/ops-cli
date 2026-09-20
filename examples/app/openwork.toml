@@ -15,6 +15,8 @@
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-runtime.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # OpenWork is a free, open-source Electron desktop app: a workspace where agents run against your
 # files, with skills, MCP connections and connected services you can share with teammates or keep to

@@ -47,6 +47,8 @@ mute = [
     "claude.ai",                      # referenced in help text only
     "mcp.notion.com",                 # referenced as an MCP example
     "commandcode.ai",                 # marketing / docs site
+    "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]

@@ -99,6 +99,8 @@ allow = [
 # Sentry configuration, so no crash-reporting host is listed here.
 mute = [
     "*.posthog.com",
+    "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]

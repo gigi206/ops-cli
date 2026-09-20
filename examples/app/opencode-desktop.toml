@@ -14,6 +14,8 @@
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-runtime.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # This is the GRAPHICAL sibling of the `opencode` profile (the terminal CLI/TUI) and of
 # `opencode-web` (the same server in your browser). opencode ships a native desktop app built with

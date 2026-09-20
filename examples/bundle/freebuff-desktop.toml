@@ -79,6 +79,8 @@ mute = [
     "@chromium-background",
     # Chrome's page-translation service — same class, but not every browser embed reaches it.
     "translate.googleapis.com",
+    "@npm-audit",
+    "@npm-jsr",
 ]
 
 # The header above says it plainly: the login page, the device-code flow and the model traffic all

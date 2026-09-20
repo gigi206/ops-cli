@@ -16,6 +16,8 @@
 #     sbx net groups import examples/net-groups/github.toml
 #     sbx net groups import examples/net-groups/github-api.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # Freebuff is CodebuffAI's free desktop coding agent: an Electron shell whose UI is served by a bundled
 # Bun "orchestrator" child process on the cage loopback, driving the `@codebuff/sdk`. On Linux upstream

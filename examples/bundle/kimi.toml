@@ -30,6 +30,8 @@ allow = [
 ]
 mute = [
     "telemetry-logs.kimi.com",
+    "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]

@@ -89,6 +89,10 @@ allow = [
     "@npm-registry",
     "@pypi",
 ]
+mute = [
+    "@npm-audit",  # npm's audit endpoint: POSTed by the install, irrelevant to whether it succeeded
+    "@npm-jsr",  # the JSR mirror the resolver probes: nothing here is installed from it
+]
 
 [packages]
 # The runtime the installer and the agent need, and the two tools the agent looks up on PATH

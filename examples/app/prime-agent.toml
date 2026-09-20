@@ -17,6 +17,8 @@
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/pypi.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # WHY A CAGE. Prime Agent hands the model ONE built-in tool: a long-lived IPython kernel. File
 # edits, project commands, tool use and context management all happen as model-written Python

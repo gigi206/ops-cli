@@ -25,6 +25,10 @@ allow = [
     "@npm-registry",
     "{*} https://opencode.ai",
 ]
+mute = [
+    "@npm-audit",  # npm's audit endpoint: POSTed by the install, irrelevant to whether it succeeded
+    "@npm-jsr",  # the JSR mirror the resolver probes: nothing here is installed from it
+]
 
 [packages]
 opencode = "mise:opencode"

@@ -43,6 +43,8 @@ allow = [
 mute = [
     # The desktop app POSTs crash/usage envelopes to Sentry, already refused by the allowlist.
     "*.sentry.io",
+    "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]
