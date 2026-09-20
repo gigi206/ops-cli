@@ -208,6 +208,33 @@ there `mise use -g` is a warm no-op, so the effect is concentrated on `sbx upgra
 > **Trade-off:** lifting the hold removes mise's supply-chain delay: a freshly published
 > release is installed without the window that lets a bad one be caught first.
 
+### Silencing mise's install statistics
+
+Installing a tool, mise `POST`s to `mise-versions.jdx.dev/api/tools/<tool>` what its own
+setting calls anonymous download statistics. The [built-in self-equip
+set](../networking/modes#the-built-in-self-equip-set) opens that host for `{GET,HEAD}`
+only, so the report is refused and, being a refusal no rule mutes, announced. Nothing
+needs it: the tool installs whether or not the report lands.
+
+The setting that produces it reaches the in-cage mise through the same channel as the one
+above:
+
+```toml
+[env]
+MISE_USE_VERSIONS_HOST_TRACK = "0"
+```
+
+Leave `MISE_USE_VERSIONS_HOST` alone. That is the other half of the same host and it is
+the one doing work: it serves the version lists and the public GitHub release metadata, so
+turning it off sends every lookup to GitHub's API and into the anonymous rate limit a cage
+has no token to escape. Only the statistics are being declined here.
+
+This is preferable to opening the host for `POST`. That lane is unioned into **every**
+policy, trusted project or not, and it is scoped to read verbs on purpose: a write verb
+there would give any cage an outbound body to a third party that no profile declared.
+Silencing the report at the source leaves the lane as it is and makes the refusal stop
+happening rather than stop being heard.
+
 ## Locks are written atomically
 
 A lock is rewritten atomically (temp + rename), so a concurrent reader sees old-or-new,
