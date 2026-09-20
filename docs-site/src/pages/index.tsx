@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, type ReactNode } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import CodeBlock from '@theme/CodeBlock';
@@ -29,22 +29,28 @@ const TRANSCRIPT: { kind: 'cmd' | 'ok' | 'detail' | 'plain' | 'blank'; text?: st
   { kind: 'cmd', text: 'sbx trust' },
   { kind: 'plain', text: 'sbx: trusted .sbx.toml' },
   { kind: 'blank' },
-  { kind: 'cmd', text: 'sbx app import examples/app/opencode.toml' },
+  { kind: 'cmd', text: 'sbx app import examples/app/opencode.toml --with-deps' },
   { kind: 'plain', text: "imported app profile 'opencode' -> ~/.config/sbx/apps/opencode.toml" },
   { kind: 'detail', text: 'launch it with: sbx app run opencode' },
   { kind: 'blank' },
   { kind: 'cmd', text: 'sbx app run opencode' },
 ];
 
-// What the hero's copy button hands over, and what it prints above it.
-const COMMAND = ['sbx app import opencode.toml', 'sbx app run opencode'];
+// What the hero's copy button hands over, and what it prints above it. `--with-deps`
+// is load-bearing rather than a convenience: a profile names the bundle and the egress
+// group it needs, and importing it alone launches an agent without the tool and the
+// egress it asked for. The flag follows those references from the files beside it.
+const COMMAND = [
+  'sbx app import examples/app/opencode.toml --with-deps',
+  'sbx app run opencode',
+];
 
 // The numbered blocks, in page order: one rail dot each, and the id its dot
 // links to. The rail is a plain list of in-page anchors, so it navigates with
 // no script at all; what the script adds is only which dot is lit.
 const RAIL: { id: string; label: string }[] = [
+  { id: 'trace', label: 'The session' },
   { id: 'preflight', label: 'Preflight' },
-  { id: 'trace', label: 'The trace' },
   { id: 'bind-layout', label: 'The bind layout' },
   { id: 'trust-gate', label: 'The trust gate' },
   { id: 'enforcement', label: 'Enforcement stack' },
@@ -58,223 +64,215 @@ const RAIL: { id: string; label: string }[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// The trace: one command, followed through the cage.
+// The session: one cage, from the launch to its death.
 //
-// Four outcomes over one path, because the system is legible through its
-// refusals rather than its happy path. Every string a pane quotes is the
-// binary's, on the rule the transcript above already follows:
+// Not one request — a session. The picture the landing needs is the one nothing
+// else can draw: a cage that equips itself, works, has a route cut, tells you,
+// takes your answer, and dies with what it held.
 //
-//   - a refusal is quoted as `write_refusal` puts it on the wire — the status
-//     line, the machine-readable `X-Sbx-Egress-Reason`, and `refusal_body`'s
-//     prefixed sentence — carrying `Refusal::body`'s own `DeniedDefault` text,
-//     down to the asymmetry between the backquoted `host:port` and the
-//     suggestion beside it, which elides the default port (`rule_destination`);
-//   - the trust warning is `config::gate::refuse_untrusted`, whose reason comes
-//     from `untrusted_reason`;
-//   - the feed lines carry `control::LogVerdict`'s own tokens (`allow`, `deny`)
-//     and the proxy's reason (`no-rule`), in the column order `sbx logs` prints.
+// The posture is an input rather than a constant, because it is the one setting
+// that changes the *shape* of the story: the same request to a host no rule
+// names is refused outright under `deny` and held under `ask`. Only the two
+// middle beats differ, which is exactly the difference between the two.
 //
-// The stages are sbx's real sequence, which spans a launch and the request that
-// follows it: the trust gate decides before anything runs, and the proxy decides
-// per request. A scenario names the stage that settled it, which is why the
-// untrusted one is settled at `trust` while the other three are settled on the
-// wire.
-const TRACE_STAGES: { id: string; label: string }[] = [
-  { id: 'trust', label: 'trust' },
-  { id: 'provision', label: 'provision' },
-  { id: 'bind', label: 'bind' },
-  { id: 'spawn', label: 'spawn' },
-  { id: 'request', label: 'request' },
-  { id: 'inspect', label: 'inspect' },
-  { id: 'verdict', label: 'verdict' },
-  { id: 'observe', label: 'observe' },
-];
+// Every string a pane quotes is the binary's:
+//
+//   - the refusal body is `write_refusal`'s, carrying `Refusal::body`'s own
+//     `DeniedDefault` text and the suggestion beside it (`rule_destination`);
+//   - the parked row is `render_pending`'s line — `<id>  host:port/path
+//     (×N, waiting Ns)` — and the inline alert is the park notice the proxy
+//     prints on the launch's stderr when `[network] ask_notice` is on;
+//   - the feed lines carry `control::LogVerdict`'s own tokens and the column
+//     order `sbx logs` prints. There is no `ask` token: a park is recorded when
+//     it is decided, never while it waits.
+type Leg = '' | 'flow' | 'wait' | 'cut';
 
-type TraceVerdict = 'allow' | 'deny' | 'idle';
+type Posture = 'deny' | 'ask';
 
-type TraceScenario = {
-  id: string;
-  tab: string;
-  /** The stage that settled this outcome; the rail marks it. */
-  decides: string;
-  /** What the scenario demonstrates, in one sentence, above the panes. */
-  lede: string;
-  /** The left pane: what was asked, and what came back. */
-  session: {
-    /** Whose pane it is — an agent's session, or the launch itself. */
-    label: string;
-    ask: string;
-    intent?: string;
-    lines: { kind: 'cmd' | 'out' | 'resp' | 'refusal' | 'warn' | 'note'; text: string }[];
-  };
-  /** The middle pane: what decided, in the order it decided. */
-  gates: { n: string; name: string; detail: string; verdict: TraceVerdict; to: string }[];
-  /** The right pane: the cage, the proxy that answers for it, and upstream. */
-  wire: { proxy: string; verdict: TraceVerdict; upstream: string; reached: boolean };
-  /** The bottom strip: what the host-side feeds recorded. */
-  feed: { at: string; feed: string; token: string; subject: string }[];
-  /** What the person running sbx is told, when that differs from what the cage sees. */
-  host?: string;
+type Beat = {
+  /** The rail's label for this beat. */
+  label: string;
+  /** Whether the hull is live, and what it holds. */
+  cage: 'live' | 'dead';
+  state: string;
+  /** How full the per-project Nix store is, as a percentage. */
+  store: number;
+  /** The four legs of the circuit, in the order the request crosses them. */
+  legs: { bind: Leg; egress: Leg; upstream: Leg; answer: Leg };
+  proxy: string;
+  upstream: string;
+  /** The proxy's own verdict, which also tints the upstream it reached or did not. */
+  verdict?: 'pass' | 'wait' | 'deny';
+  /** What the credential broker adds, at the step where it adds it. */
+  inject?: boolean;
+  /** Your terminal, host-side. */
+  you: { kind: 'cmd' | 'out' | 'note' | 'refusal'; text: string }[];
+  /** What reached you out of band: a host notification, or the inline park notice. */
+  alert?: { kind: 'deny' | 'wait'; text: string };
+  /** One sentence the feed strip carries, where what it does *not* say matters. */
+  note?: string;
+  feed: { feed: string; token: string; subject: string }[];
 };
 
-// The gates every scenario passes before the wire. Only their verdicts and the
-// egress rule differ, so the three constant ones are written once.
-const GATE_TRUST = { n: '01', name: 'trust', to: '/docs/concepts/trust' };
-const GATE_BIND = { n: '02', name: 'bind layout', to: '/docs/concepts/security-model' };
-const GATE_SECCOMP = { n: '03', name: 'seccomp', to: '/docs/configuration/seccomp' };
-const GATE_EGRESS = { n: '04', name: 'egress rule', to: '/docs/networking/rules' };
+// The three beats before the posture matters, and the one after it stops mattering.
+const OPENING: Beat[] = [
+  {
+    label: 'launch',
+    cage: 'live',
+    state: 'the project, bound',
+    store: 0,
+    legs: { bind: 'flow', egress: '', upstream: '', answer: '' },
+    proxy: 'nothing on the wire',
+    upstream: '—',
+    you: [{ kind: 'cmd', text: 'sbx app run claude-code --detach --observe' }],
+    feed: [],
+  },
+  {
+    label: 'self-equip',
+    cage: 'live',
+    state: 'equipping itself',
+    store: 78,
+    legs: { bind: '', egress: 'flow', upstream: 'flow', answer: '' },
+    verdict: 'pass',
+    proxy: 'CONNECT cache.nixos.org:443 · built-in set',
+    upstream: 'cache.nixos.org',
+    you: [{ kind: 'note', text: 'the agent installs the project’s dependencies' }],
+    feed: [{ feed: 'net', token: 'allow', subject: 'cache.nixos.org:443' }],
+  },
+  {
+    label: 'work',
+    cage: 'live',
+    state: '3 processes',
+    store: 100,
+    legs: { bind: '', egress: 'flow', upstream: 'flow', answer: '' },
+    verdict: 'pass',
+    proxy: 'CONNECT api.anthropic.com:443',
+    upstream: 'api.anthropic.com',
+    inject: true,
+    you: [{ kind: 'note', text: 'you are doing something else' }],
+    feed: [
+      { feed: 'proc', token: 'observe', subject: 'node' },
+      { feed: 'proc', token: 'observe', subject: 'rg --json TODO' },
+      { feed: 'net', token: 'allow', subject: 'api.anthropic.com:443' },
+    ],
+  },
+];
 
-const TRACES: TraceScenario[] = [
+const CLOSING: Beat[] = [
   {
-    id: 'allowed',
-    tab: 'allowed',
-    decides: 'verdict',
-    lede:
-      'A rule names the host, so the request leaves through the one socket the cage has, and the proxy validates the upstream certificate against the system trust store.',
-    session: {
-      label: 'agent session',
-      ask: 'List the models the API offers.',
-      intent: 'I will call the Anthropic API.',
-      lines: [
-        { kind: 'cmd', text: 'curl -sI https://api.anthropic.com/v1/models' },
-        { kind: 'resp', text: 'HTTP/2 200' },
-      ],
-    },
-    gates: [
-      { ...GATE_TRUST, detail: '.sbx.toml approved — its SHA-256 still matches', verdict: 'allow' },
-      { ...GATE_BIND, detail: 'the project tree, the store, the egress socket', verdict: 'allow' },
-      { ...GATE_SECCOMP, detail: 'two cBPF filters, default-allow', verdict: 'allow' },
-      { ...GATE_EGRESS, detail: 'allow api.anthropic.com', verdict: 'allow' },
-    ],
-    wire: {
-      proxy: 'CONNECT api.anthropic.com:443 · inspected',
-      verdict: 'allow',
-      upstream: 'api.anthropic.com',
-      reached: true,
-    },
-    feed: [{ at: '12:04:29', feed: 'net', token: 'allow', subject: 'api.anthropic.com:443' }],
+    label: 'end',
+    cage: 'dead',
+    state: 'died with its parent',
+    store: 0,
+    legs: { bind: '', egress: '', upstream: '', answer: '' },
+    proxy: 'socket closed',
+    upstream: '—',
+    you: [{ kind: 'cmd', text: 'sbx session stop · sbx gc' }],
+    // Nothing is added here: the feeds record what the cage reached for, and its
+    // death is not one of those. What it printed is `sbx session logs`, a view of
+    // its own that `sbx logs` does not merge.
+    feed: [],
   },
-  {
-    id: 'secret',
-    tab: 'secret brokered',
-    decides: 'inspect',
-    lede:
-      'The credential is resolved host-side at launch and injected inside the proxy. The cage is handed a capability toward one host, never the secret — so there is nothing in it to exfiltrate.',
-    session: {
-      label: 'agent session',
-      ask: 'Open an issue on the repository.',
-      intent: 'I will need a GitHub token.',
-      lines: [
-        { kind: 'cmd', text: 'env | grep -i token' },
-        { kind: 'note', text: 'nothing: the token was never bound in' },
-        { kind: 'cmd', text: "curl -s -o /dev/null -w '%{http_code}' https://api.github.com/user" },
-        { kind: 'out', text: '200' },
-        { kind: 'note', text: 'Authorization was added host-side, inside the proxy' },
-      ],
-    },
-    gates: [
-      { ...GATE_TRUST, detail: '.sbx.toml approved — [secret] applies', verdict: 'allow' },
-      { ...GATE_BIND, detail: 'declared secrets: absent from the cage in plaintext', verdict: 'allow' },
-      { ...GATE_SECCOMP, detail: 'two cBPF filters, default-allow', verdict: 'allow' },
-      { ...GATE_EGRESS, detail: 'allow api.github.com', verdict: 'allow' },
-    ],
-    wire: {
-      proxy: 'broker injects `Authorization` · bearer',
-      verdict: 'allow',
-      upstream: 'api.github.com',
-      reached: true,
-    },
-    feed: [{ at: '12:06:02', feed: 'net', token: 'allow', subject: 'api.github.com:443' }],
-    host: 'The plaintext lives in sbx’s own memory for the length of the request, and in no file the cage can name.',
-  },
-  {
-    id: 'denied',
-    tab: 'egress denied',
-    decides: 'verdict',
-    lede:
-      'No rule names the host. The proxy answers the cage with a 403 whose body carries the command that would allow it — and raises a host-side notification, because an agent is under no obligation to surface a refusal.',
-    session: {
-      label: 'agent session',
-      ask: 'Post the results to our metrics endpoint.',
-      intent: 'I will call api.example.com.',
-      lines: [
+];
+
+// The same request to `api.example.com`, which no rule names, under each posture.
+const MIDDLE: Record<Posture, Beat[]> = {
+  deny: [
+    {
+      label: 'refused outright',
+      cage: 'live',
+      state: '4 processes',
+      store: 100,
+      legs: { bind: '', egress: 'flow', upstream: 'cut', answer: '' },
+      verdict: 'deny',
+      proxy: 'api.example.com:443 · denied-default',
+      upstream: 'never contacted',
+      you: [
         { kind: 'cmd', text: 'curl -s https://api.example.com' },
-        { kind: 'resp', text: 'HTTP/1.1 403 Forbidden' },
-        { kind: 'resp', text: 'X-Sbx-Egress-Reason: denied-default' },
         {
           kind: 'refusal',
           text:
             'sbx egress refused this request: `api.example.com:443` is not allowed by the network policy. Allow it: sbx net allow api.example.com',
         },
       ],
+      alert: { kind: 'deny', text: 'host notification · egress refused — api.example.com:443' },
+      note: 'the request had already failed by the time you heard about it: nothing held it',
+      feed: [{ feed: 'net', token: 'deny', subject: 'api.example.com:443  (denied-default)' }],
     },
-    gates: [
-      { ...GATE_TRUST, detail: '.sbx.toml approved — its SHA-256 still matches', verdict: 'allow' },
-      { ...GATE_BIND, detail: 'the project tree, the store, the egress socket', verdict: 'allow' },
-      { ...GATE_SECCOMP, detail: 'two cBPF filters, default-allow', verdict: 'allow' },
-      { ...GATE_EGRESS, detail: 'no rule names api.example.com', verdict: 'deny' },
-    ],
-    wire: {
-      proxy: 'CONNECT api.example.com:443 · denied-default',
-      verdict: 'deny',
+    {
+      label: 'you open the route',
+      cage: 'live',
+      state: '4 processes',
+      store: 100,
+      legs: { bind: '', egress: 'flow', upstream: 'flow', answer: 'flow' },
+      verdict: 'pass',
+      proxy: 'open for the live session',
       upstream: 'api.example.com',
-      reached: false,
+      you: [{ kind: 'cmd', text: 'sbx net allow api.example.com --session' }],
+      note: 'the refused request is not replayed: it is the next one that passes',
+      feed: [{ feed: 'net', token: 'allow', subject: 'api.example.com:443' }],
     },
-    feed: [
-      { at: '12:04:31', feed: 'proc', token: 'observe', subject: 'curl -s https://api.example.com' },
-      { at: '12:04:31', feed: 'net', token: 'deny', subject: 'api.example.com:443  (no-rule)' },
-    ],
-    host: 'sbx notifies you separately: a boundary nobody hears about is one that looks like it never bit.',
-  },
-  {
-    id: 'untrusted',
-    tab: 'untrusted .sbx.toml',
-    decides: 'trust',
-    lede:
-      'The project declared a network posture. Approval is bound to the file’s content hash, so an unapproved file keeps its free fields and loses every security one: the launch goes ahead, without what the file asked for.',
-    session: {
-      label: 'your shell',
-      ask: 'The project ships a .sbx.toml declaring `network`.',
-      lines: [
-        { kind: 'cmd', text: 'sbx run -- curl -s https://api.example.com' },
-        {
-          kind: 'warn',
-          text: '.sbx.toml: ignoring `network` policy (untrusted — run `sbx trust`)',
-        },
-        { kind: 'resp', text: 'HTTP/1.1 403 Forbidden' },
-        {
-          kind: 'refusal',
-          text:
-            'sbx egress refused this request: `api.example.com:443` is not allowed by the network policy. Allow it: sbx net allow api.example.com',
-        },
-        { kind: 'note', text: 'the policy the project declared never applied' },
+  ],
+  ask: [
+    {
+      label: 'held',
+      cage: 'live',
+      state: '4 processes',
+      store: 100,
+      legs: { bind: '', egress: 'flow', upstream: 'wait', answer: '' },
+      verdict: 'wait',
+      proxy: '12345.7  api.example.com:443/v1/models  (×3, waiting 18s)',
+      upstream: 'waiting',
+      you: [
+        { kind: 'cmd', text: 'sbx net pending' },
+        { kind: 'out', text: '12345.7  api.example.com:443/v1/models  (×3, waiting 18s)' },
       ],
+      alert: {
+        kind: 'wait',
+        text: 'egress decision needed [12345.7] api.example.com:443/v1/models',
+      },
+      note:
+        'nothing is written while it waits: the park shows in sbx net pending, and the log records the decision',
+      feed: [],
     },
-    gates: [
-      {
-        ...GATE_TRUST,
-        detail: 'untrusted: every security field dropped, with a warning',
-        verdict: 'deny',
-      },
-      { ...GATE_BIND, detail: 'the default layout — no trusted [binds] applied', verdict: 'idle' },
-      { ...GATE_SECCOMP, detail: 'always on: trust changes nothing here', verdict: 'allow' },
-      {
-        ...GATE_EGRESS,
-        detail: 'the built-in self-equip set, not the declared policy',
-        verdict: 'deny',
-      },
-    ],
-    wire: {
-      proxy: 'CONNECT api.example.com:443 · denied-default',
-      verdict: 'deny',
+    {
+      label: 'you answer',
+      cage: 'live',
+      state: '4 processes',
+      store: 100,
+      legs: { bind: '', egress: 'flow', upstream: 'flow', answer: 'flow' },
+      verdict: 'pass',
+      proxy: 'api.example.com:443 · allowed — 12345.7 and its 3 retries',
       upstream: 'api.example.com',
-      reached: false,
+      you: [{ kind: 'cmd', text: 'sbx net pending allow 12345.7' }],
+      feed: [{ feed: 'net', token: 'allow', subject: 'api.example.com:443' }],
     },
-    feed: [
-      { at: '09:12:07', feed: 'net', token: 'deny', subject: 'api.example.com:443  (no-rule)' },
-    ],
-    host: 'sbx trust binds approval to the file’s SHA-256. Edit the file and trust is re-armed, on the direnv model.',
-  },
+  ],
+};
+
+// What each posture does with a host no rule names, said where the switch is.
+const POSTURE_NOTE: Record<Posture, string> = {
+  deny: 'no rule names the host → refused at once, 403 denied-default. The remedy comes after the fact.',
+  ask: 'no rule names the host → it waits for your decision. An explicit deny rule fails immediately instead.',
+};
+
+const DENY_BEATS: Beat[] = [...OPENING, ...MIDDLE.deny, ...CLOSING];
+const ASK_BEATS: Beat[] = [...OPENING, ...MIDDLE.ask, ...CLOSING];
+
+/** What the proxy's chip says, per verdict. */
+const VERDICT_WORD: Record<'pass' | 'wait' | 'deny' | 'idle', string> = {
+  pass: 'passing',
+  wait: 'waiting',
+  deny: 'refused',
+  idle: '—',
+};
+
+// The always-on layers, which hold whatever the config says. Stated inside the hull
+// because they are what the posture above rests on: the proxy is the only way out
+// only because the cage has no other route.
+const ALWAYS_ON = [
+  'all namespaces · no_new_privs · cap-drop ALL · seccomp, two cBPF filters',
+  'empty netns — no route, no resolver · one bound socket',
 ];
 
 // The bind zones of concepts/security-model, as the cage sees them. The egress
@@ -316,7 +314,8 @@ const FIELD_PANELS: {
       },
       {
         label: 'Closing, outside the gate',
-        note: 'Every entry subtracts; there is no syntax that grants.',
+        note:
+          'Every entry subtracts; there is no syntax that grants — except `scan_max_kb`, which the gate holds: a lower ceiling widens what a scan reads past.',
         fields: ['[fs]'],
       },
     ],
@@ -334,6 +333,9 @@ const FIELD_PANELS: {
           'secret',
           'packages',
           'nixpkgs',
+          'distro',
+          'allow_insecure_http',
+          'apps_share_install_pools',
           'forward',
           'gui',
           'gpu',
@@ -345,6 +347,10 @@ const FIELD_PANELS: {
           '[devices]',
           '[ssh_agent]',
           '[notify]',
+          '[observe]',
+          '[redact]',
+          '[open]',
+          '[service]',
           '[task.<name>]',
           '[app.<name>]',
           '[network.groups]',
@@ -845,7 +851,13 @@ function useCinematic(): void {
         copy.style.transform = `translate3d(0, ${(y * 0.14).toFixed(1)}px, 0)`;
         copy.style.opacity = String(1 - Math.min(y / 520, 1) * 0.92);
       }
-      if (cue) cue.style.opacity = String(Math.max(0, 1 - y / 260));
+      // The cue sits at the hero's bottom edge, which on a short window is itself
+      // below the fold: a fade measured over a fixed 260px would spend itself before
+      // the cue was ever on screen. It fades over what is left of the hero instead.
+      if (cue && hero) {
+        const travel = Math.max(260, hero.offsetHeight - window.innerHeight + 260);
+        cue.style.opacity = String(Math.max(0, 1 - y / travel));
+      }
     };
 
     const onScroll = (): void => {
@@ -1056,194 +1068,367 @@ function Transcript(): ReactNode {
   );
 }
 
-/**
- * The trace: four outcomes over one path.
- *
- * A tablist, on the WAI-ARIA pattern: arrows move between the scenarios and the
- * panel below is what changes. Only one panel is mounted at a time, so what the
- * reader has is what the page is showing — there is no hidden copy of the other
- * three for a find-in-page to land in.
- *
- * Every visual state is a class the markup carries, never a measurement, so the
- * block renders identically on the server and needs no effect to settle. The
- * transition between scenarios is a CSS animation on the panel, which
- * `prefers-reduced-motion` drops entirely in the stylesheet.
- */
-function Trace(): ReactNode {
-  const [active, setActive] = useState(0);
-  const tabs = useRef<(HTMLButtonElement | null)[]>([]);
-  const trace = TRACES[active];
+/* Four line glyphs, drawn rather than imported: the page carries no icon set, and
+   each takes the verdict's hue from `currentColor`. */
+function Globe(): ReactNode {
+  return (
+    <svg className="glyph glyph--globe" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.1" strokeLinecap="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.5" />
+      <ellipse cx="12" cy="12" rx="3.8" ry="8.5" />
+      <path d="M3.5 12h17M5.2 7.6h13.6M5.2 16.4h13.6" />
+    </svg>
+  );
+}
 
-  // Arrows, Home and End move the selection, as the tablist pattern requires;
-  // the browser's own Tab still leaves the list for the panel.
-  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
-    const last = TRACES.length - 1;
-    const next =
-      event.key === 'ArrowRight'
-        ? (active + 1) % TRACES.length
-        : event.key === 'ArrowLeft'
-          ? (active + last) % TRACES.length
-          : event.key === 'Home'
-            ? 0
-            : event.key === 'End'
-              ? last
-              : -1;
-    if (next < 0) return;
-    event.preventDefault();
-    setActive(next);
-    tabs.current[next]?.focus();
+function Wall(): ReactNode {
+  return (
+    <svg className="glyph glyph--wall" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.35" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3" y="4.5" width="18" height="15" rx="1.6" />
+      <path d="M3 9.5h18M3 14.5h18M9 4.5v5M15 9.5v5M9 14.5v5" />
+    </svg>
+  );
+}
+
+function Key(): ReactNode {
+  return (
+    <svg className="glyph glyph--key" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.35" strokeLinecap="round" aria-hidden="true">
+      <circle cx="8" cy="12" r="3.6" />
+      <path d="M11.6 12H21M18 12v3.2M15 12v2.4" />
+    </svg>
+  );
+}
+
+function Terminal(): ReactNode {
+  return (
+    <svg className="glyph glyph--term" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.15" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="2.5" y="4.5" width="19" height="15" rx="2" />
+      <path d="M6.6 10.2l2.6 2-2.6 2M12.6 15.6h5" />
+    </svg>
+  );
+}
+
+/** How long one beat holds before the session moves on, in milliseconds. */
+const BEAT_MS = 2600;
+
+/**
+ * The session block: one cage drawn as a circuit, playing its own beats.
+ *
+ * It advances on its own, because a reader should not have to operate a diagram to
+ * be told what the product does. It holds while the pointer is over it (a beat can
+ * be read) and while it is off screen (nothing plays to an empty room), and it does
+ * not start at all under `prefers-reduced-motion` — the arrows and the rail are then
+ * the only way through, which is the same picture at a reader's own pace.
+ */
+function Session(): ReactNode {
+  const [posture, setPosture] = useState<Posture>('deny');
+  const [at, setAt] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const held = useRef(false);
+  const onScreen = useRef(true);
+
+  const stage = useRef<HTMLDivElement>(null);
+  const proxy = useRef<HTMLDivElement>(null);
+  const socket = useRef<HTMLSpanElement>(null);
+  const egressLeg = useRef<HTMLDivElement>(null);
+  const bindLeg = useRef<HTMLDivElement>(null);
+  const project = useRef<HTMLLIElement>(null);
+  const grid = useRef<HTMLDivElement>(null);
+
+  const beats = posture === 'deny' ? DENY_BEATS : ASK_BEATS;
+  const beat = beats[Math.min(at, beats.length - 1)];
+
+  // Autoplay is enabled after mount rather than in the initial state: the server
+  // renders the first beat, and a reader who asked for less motion keeps it.
+  useEffect(() => {
+    if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) setPlaying(true);
+  }, []);
+
+  useEffect(() => {
+    if (!playing) return undefined;
+    const id = window.setInterval(() => {
+      if (held.current || !onScreen.current) return;
+      setProgress((p) => {
+        if (p + 100 < BEAT_MS) return p + 100;
+        setAt((i) => (i + 1) % beats.length);
+        return 0;
+      });
+    }, 100);
+    return () => window.clearInterval(id);
+  }, [playing, beats.length]);
+
+  useEffect(() => {
+    const node = stage.current;
+    if (!node || !('IntersectionObserver' in window)) return undefined;
+    const io = new IntersectionObserver(
+      (entries) => entries.forEach((e) => (onScreen.current = e.isIntersecting)),
+      { threshold: 0.25 },
+    );
+    io.observe(node);
+    return () => io.disconnect();
+  }, []);
+
+  /* A wire has to meet something. Both ends of the egress leg are placed on one
+     axis — the proxy's middle — and the hull's socket is moved onto it, because a
+     horizontal line cannot reach two different heights. Measured after layout, and
+     again once the cards have finished growing: a beat that opens the injection row
+     changes the very height the axis is taken from. */
+  const align = () => {
+    const box = grid.current;
+    if (!box || !proxy.current || !socket.current || !egressLeg.current) return;
+    const base = box.getBoundingClientRect();
+    const middle = (el: Element): number => {
+      const r = el.getBoundingClientRect();
+      return r.top + r.height / 2 - base.top;
+    };
+    const axis = middle(proxy.current);
+    const place = (cell: HTMLElement | null, y: number): void => {
+      if (!cell) return;
+      cell.style.alignSelf = 'start';
+      cell.style.paddingTop = `${Math.max(0, y - 1)}px`;
+    };
+    const hull = socket.current.parentElement;
+    if (hull) socket.current.style.top = `${axis - (hull.getBoundingClientRect().top - base.top)}px`;
+    place(egressLeg.current, axis);
+    if (project.current) place(bindLeg.current, middle(project.current));
+  };
+
+  useLayoutEffect(() => {
+    align();
+    const late = window.setTimeout(align, 420);
+    window.addEventListener('resize', align);
+    return () => {
+      window.clearTimeout(late);
+      window.removeEventListener('resize', align);
+    };
+  });
+
+  const go = (to: number): void => {
+    setAt((to + beats.length) % beats.length);
+    setProgress(0);
+  };
+
+  const swap = (next: Posture): void => {
+    setPosture(next);
+    // Land on the beat the posture changes, rather than restarting the story.
+    setAt(OPENING.length);
+    setProgress(0);
   };
 
   return (
-    <div className="trace">
-      <div className="trace__tabs" role="tablist" aria-label="What the cage did" onKeyDown={onKeyDown}>
-        {TRACES.map(({ id, tab }, i) => (
-          <button
-            type="button"
-            key={id}
-            role="tab"
-            id={`trace-tab-${id}`}
-            aria-selected={i === active}
-            /* Only the selected panel is mounted, so only the selected tab may
-               claim to control one: an `aria-controls` pointing at an absent id
-               is a dangling reference the other three would each carry. */
-            aria-controls={i === active ? `trace-panel-${id}` : undefined}
-            tabIndex={i === active ? 0 : -1}
-            ref={(node) => {
-              tabs.current[i] = node;
-            }}
-            className={
-              i === active ? 'trace__tab trace__tab--on' : 'trace__tab'
-            }
-            onClick={() => setActive(i)}
-          >
-            {tab}
+    <div className="live">
+      <div className="live__head">
+        <div className="live__posture" role="group" aria-label="Network posture">
+          <span className="live__trusted">.sbx.toml vouched for → [network] mode =</span>
+          {(['deny', 'ask'] as Posture[]).map((p) => (
+            <button
+              type="button"
+              key={p}
+              className={p === posture ? 'live__mode live__mode--on' : 'live__mode'}
+              aria-pressed={p === posture}
+              onClick={() => swap(p)}
+            >
+              {p}
+            </button>
+          ))}
+        </div>
+        <div className="live__transport">
+          <button type="button" className="live__step" onClick={() => go(at - 1)} aria-label="Previous beat">
+            ‹
           </button>
-        ))}
+          <button type="button" className="live__step" onClick={() => setPlaying((v) => !v)}>
+            {playing ? 'pause' : 'play'}
+          </button>
+          <button type="button" className="live__step" onClick={() => go(at + 1)} aria-label="Next beat">
+            ›
+          </button>
+        </div>
       </div>
 
-      {/* The stages, with the one that settled this scenario marked. It is a
-          list rather than a row of divs because that is what it is: eight
-          ordered steps, one of them called out. */}
-      <ol className="trace__rail" aria-label="Stages, and where this outcome was settled">
-        {TRACE_STAGES.map(({ id, label }) => {
-          const decides = id === trace.decides;
-          return (
-            <li
-              className={decides ? 'trace__stage trace__stage--decides' : 'trace__stage'}
-              key={id}
-            >
-              {label}
-              {decides && <span className="trace__stage-note"> (settled here)</span>}
-            </li>
-          );
-        })}
+      <p className="live__posture-note">{POSTURE_NOTE[posture]}</p>
+
+      <ol className="live__rail" aria-label="The beats of one session">
+        {beats.map((b, i) => (
+          <li key={b.label} className={i === at ? 'live__beat live__beat--now' : 'live__beat'}>
+            <button type="button" onClick={() => go(i)} aria-current={i === at ? 'step' : undefined}>
+              {b.label}
+            </button>
+          </li>
+        ))}
       </ol>
+      <div className="live__progress" aria-hidden="true">
+        <span style={{ width: `${playing ? (progress / BEAT_MS) * 100 : 0}%` }} />
+      </div>
+
+      <p className="sr-only">
+        {`Under ${posture}, one session: `}
+        {beats.map((b) => b.label).join(', ')}. {POSTURE_NOTE[posture]}
+      </p>
 
       <div
-        className="trace__panel"
-        role="tabpanel"
-        id={`trace-panel-${trace.id}`}
-        aria-labelledby={`trace-tab-${trace.id}`}
-        /* Keyed on the scenario so React remounts the panel: the entry
-           animation should replay on every change, which it would not if the
-           nodes were reused. */
-        key={trace.id}
-        tabIndex={0}
+        className="live__stage"
+        ref={stage}
+        onMouseEnter={() => {
+          held.current = true;
+        }}
+        onMouseLeave={() => {
+          held.current = false;
+        }}
       >
-        <p className="trace__lede">{trace.lede}</p>
+        <div className="live__grid" ref={grid}>
+          {/* The host: what was bound in, and what stayed out. */}
+          <div className="live__col">
+            <p className="live__col-bar">the host</p>
+            <ul className="live__host">
+              <li className="live__bound" ref={project}>
+                ~/projects/your-app <span>bind</span>
+              </li>
+              {ABSENT.slice(0, 3).map((item) => (
+                <li className="live__absent" key={item}>
+                  <b aria-hidden="true">✕</b> {item}
+                </li>
+              ))}
+            </ul>
+          </div>
 
-        <div className="trace__cols">
-          {/* Left: what was asked, and what came back. */}
-          <div className="trace__col trace__col--session">
-            <p className="trace__col-bar">{trace.session.label}</p>
-            <div className="trace__session">
-              <p className="trace__ask">{trace.session.ask}</p>
-              {trace.session.intent && (
-                <p className="trace__intent">{trace.session.intent}</p>
-              )}
-              <pre className="trace__lines">
-                {trace.session.lines.map(({ kind, text }, i) => (
-                  <span className={`trace__line trace__line--${kind}`} key={i}>
-                    {kind === 'cmd' && <span className="trace__sigil">$ </span>}
-                    {kind === 'resp' && <span className="trace__wire-sigil">← </span>}
-                    {text}
+          <div className="live__leg" ref={bindLeg}>
+            <span className={`w w--${beat.legs.bind || 'off'}`}>
+              <i />
+            </span>
+          </div>
+
+          {/* The cage, drawn as the enclosure it is. */}
+          <div className="live__col">
+            <p className="live__col-bar">the cage</p>
+            <div className={beat.cage === 'dead' ? 'hull hull--dead' : 'hull hull--live'}>
+              <span className="hull__edge" />
+              <span className="hull__face" />
+              <div className="hull__in">
+                <p className="hull__bar">
+                  <span>bubblewrap · uid = yours</span>
+                  <span>{beat.state}</span>
+                </p>
+                <p className="hull__base">
+                  <span>userland</span>
+                  sbx’s own store, hermetic — or a distro OCI image, resolved to a digest and
+                  mounted read-only
+                </p>
+                <ul className="hull__binds">
+                  {INSIDE.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+                <pre className="hull__procs">
+                  <span className="hull__root">claude-code</span>
+                  {'\n├─ node\n├─ rg'}
+                  {at >= OPENING.length ? '\n└─ curl' : ''}
+                </pre>
+                <div className="hull__store">
+                  <span className="hull__gauge">
+                    <span style={{ width: `${beat.store}%` }} />
+                  </span>
+                  <span className="hull__store-lbl">
+                    <span>nix store, per project</span>
+                    <span>{beat.store === 0 ? 'empty' : 'seeded'}</span>
+                  </span>
+                </div>
+                <p className="hull__foot">
+                  {ALWAYS_ON.map((line) => (
+                    <span key={line}>{line}</span>
+                  ))}
+                </p>
+              </div>
+              <span className="hull__socket" ref={socket} />
+            </div>
+          </div>
+
+          <div className="live__leg" ref={egressLeg}>
+            <span className={`w w--${beat.legs.egress || 'off'}`}>
+              <i />
+            </span>
+          </div>
+
+          {/* The one way out, stacked: what is reached, what decides, and you. */}
+          <div className="live__col">
+            <p className="live__col-bar">the one way out</p>
+            <div className={`eg eg--net eg--${beat.verdict ?? 'idle'}`}>
+              <Globe />
+              <span>
+                <b>internet</b>
+                <em>{beat.upstream}</em>
+              </span>
+            </div>
+            <div className="live__vleg">
+              <span className={`w w--v w--v-out w--${beat.legs.upstream || 'off'}`}>
+                <i />
+                <span className="w__x" aria-hidden="true">
+                  ✕
+                </span>
+              </span>
+            </div>
+            <div className={`eg eg--gate eg--${beat.verdict ?? 'idle'}`} ref={proxy}>
+              <p className="eg__head">
+                <Wall />
+                <b>sbx proxy</b>
+                <span className="eg__layer">L7 · inspected</span>
+                <span className="eg__chip">{VERDICT_WORD[beat.verdict ?? 'idle']}</span>
+              </p>
+              <p className="eg__detail">{beat.proxy}</p>
+              <p className={beat.inject ? 'eg__inject eg__inject--on' : 'eg__inject'}>
+                <Key />
+                <span>
+                  <b>secret header injected</b>
+                  Authorization: Bearer ••••••  ·  absent from the cage
+                </span>
+              </p>
+            </div>
+            <div className="live__vleg">
+              <span className={`w w--v w--v-you w--${beat.legs.answer || 'off'}`}>
+                <i />
+              </span>
+            </div>
+            <div className={beat.legs.answer ? 'eg eg--you eg--acting' : 'eg eg--you'}>
+              <p className="eg__head">
+                <Terminal />
+                <b>you · your terminal</b>
+              </p>
+              <pre className="eg__term">
+                {beat.you.map((line, i) => (
+                  <span className={`eg__line eg__line--${line.kind}`} key={i}>
+                    {line.text}
                     {'\n'}
                   </span>
                 ))}
               </pre>
-            </div>
-          </div>
-
-          {/* Middle: what decided, in the order it decided. */}
-          <div className="trace__col trace__col--gates">
-            <p className="trace__col-bar">sbx · what decides</p>
-            <ol className="trace__gates">
-              {trace.gates.map(({ n, name, detail, verdict, to }) => (
-                <li className={`trace__gate trace__gate--${verdict}`} key={n}>
-                  <Link className="trace__gate-head" to={to}>
-                    <span className="trace__gate-n">{n}</span>
-                    {name}
-                  </Link>
-                  <p className="trace__gate-detail">{detail}</p>
-                </li>
-              ))}
-            </ol>
-          </div>
-
-          {/* Right: the cage, the proxy that answers for it, and upstream. */}
-          <div className="trace__col trace__col--wire">
-            <p className="trace__col-bar">the cage, and the one way out</p>
-            <div className="trace__wire">
-              <div className="trace__cage">
-                <p className="trace__cage-head">bubblewrap · uid = yours</p>
-                <p className="trace__cage-detail">
-                  empty netns · no route, no resolver · one bound Unix socket
-                </p>
-              </div>
-              <p className="trace__hop" aria-hidden="true">
-                ↓
-              </p>
-              <div className={`trace__proxy trace__proxy--${trace.wire.verdict}`}>
-                <p className="trace__proxy-head">sbx CONNECT proxy · host-side</p>
-                <p className="trace__proxy-detail">{trace.wire.proxy}</p>
-              </div>
-              <p className="trace__hop" aria-hidden="true">
-                {trace.wire.reached ? '↓' : '✕'}
-              </p>
-              <div
-                className={
-                  trace.wire.reached
-                    ? 'trace__upstream'
-                    : 'trace__upstream trace__upstream--unreached'
-                }
-              >
-                <p className="trace__upstream-head">{trace.wire.upstream}</p>
-                <p className="trace__upstream-detail">
-                  {trace.wire.reached
-                    ? 'certificate validated against the system trust store'
-                    : 'never contacted: the refusal is local to the proxy'}
-                </p>
-              </div>
+              {beat.alert && (
+                <p className={`eg__alert eg__alert--${beat.alert.kind}`}>{beat.alert.text}</p>
+              )}
             </div>
           </div>
         </div>
 
-        {/* Bottom: what the host-side feeds recorded, and what you were told. */}
-        <div className="trace__record">
-          <pre className="trace__feed">
-            {trace.feed.map(({ at, feed, token, subject }) => (
-              <span key={`${at}${feed}${subject}`}>
-                <span className="home__feed-at">{at}</span>
-                {'  '}
-                <span className="home__feed-name">{feed.padEnd(5)}</span>
-                <span className="home__feed-token">{token.padEnd(8)}</span>
-                {subject}
-                {'\n'}
-              </span>
-            ))}
+        <div className="live__feed">
+          <p className="live__feed-bar">
+            what sbx logs records, live
+            {beat.note && <span className="live__feed-note">{beat.note}</span>}
+          </p>
+          <pre className="live__feed-rows">
+            {beats
+              .slice(0, at + 1)
+              .flatMap((b) => b.feed)
+              .slice(-4)
+              .map((row, i) => (
+                <span className={`live__row live__row--${row.token}`} key={`${row.subject}${i}`}>
+                  <b>{row.feed}</b>
+                  <em>{row.token}</em>
+                  <span>{row.subject}</span>
+                </span>
+              ))}
           </pre>
-          {trace.host && <p className="trace__host">{trace.host}</p>}
         </div>
       </div>
     </div>
@@ -1327,15 +1512,49 @@ export default function Home(): ReactNode {
               <li>no daemon</li>
               <li>no root</li>
             </ul>
+          </div>
 
-            <div className="home__scrollcue" id="home-hero-cue" aria-hidden="true">
-              <span>scroll: the ten subsystems</span>
-              <span className="home__scrollcue-line" />
-            </div>
+          {/* Anchored to the hero rather than carried by the copy column: a scroll cue
+              belongs at the edge the gesture starts from, not under the last paragraph. */}
+          <div className="home__scrollcue" id="home-hero-cue" aria-hidden="true">
+            <span>scroll: the ten subsystems</span>
+            <span className="home__scrollcue-line" />
           </div>
         </section>
 
-        <section className="home__section" id="preflight">
+        <section className="home__section" id="trace">
+          <div className="home__inner">
+            <div className="home__section-head" data-reveal>
+              <div>
+                <p className="home__kicker home__kicker--accent">the session</p>
+                <h2 className="home__section-title home__section-title--flush">
+                  One session, from its birth to its death.
+                </h2>
+              </div>
+              <p className="home__aside home__aside--side">
+                Not one request: a cage. It is born empty, equips itself, executes, has a
+                route cut, tells you, takes your answer, and dies with what it held. The one
+                setting that changes the shape of that story is the posture, so it is yours
+                to switch.
+              </p>
+            </div>
+
+            <div data-reveal>
+              <Session />
+            </div>
+
+            <Source
+              pages={[
+                { path: 'concepts/security-model', to: '/docs/concepts/security-model' },
+                { path: 'concepts/trust', to: '/docs/concepts/trust' },
+                { path: 'networking/rules', to: '/docs/networking/rules' },
+                { path: 'secrets/injection', to: '/docs/secrets/injection' },
+              ]}
+            />
+          </div>
+        </section>
+
+        <section className="home__section home__section--tint" id="preflight">
           <div className="home__inner">
             <div className="home__preflight" data-reveal>
               <div>
@@ -1361,37 +1580,6 @@ export default function Home(): ReactNode {
             numbered blocks below are the subsystems, and this is the map they
             are read against — each of its gates links into the block that owns
             it. */}
-        <section className="home__section home__section--tint" id="trace">
-          <div className="home__inner">
-            <div className="home__section-head" data-reveal>
-              <div>
-                <p className="home__kicker home__kicker--accent">the trace</p>
-                <h2 className="home__section-title home__section-title--flush">
-                  One command, four ways it can end.
-                </h2>
-              </div>
-              <p className="home__aside home__aside--side">
-                The same path every time: a trust gate that decides before anything runs, a
-                bind layout, an always-on filter, and a proxy that answers per request. What
-                changes is where it is settled — and what the agent is handed back.
-              </p>
-            </div>
-
-            <div data-reveal>
-              <Trace />
-            </div>
-
-            <Source
-              pages={[
-                { path: 'concepts/security-model', to: '/docs/concepts/security-model' },
-                { path: 'concepts/trust', to: '/docs/concepts/trust' },
-                { path: 'networking/rules', to: '/docs/networking/rules' },
-                { path: 'secrets/injection', to: '/docs/secrets/injection' },
-              ]}
-            />
-          </div>
-        </section>
-
         <section className="home__section" id="bind-layout">
           <div className="home__inner">
             <div className="home__split">
@@ -1455,9 +1643,10 @@ export default function Home(): ReactNode {
               <p className="home__aside home__aside--side">
                 Approval is bound to the file's content hash and re-armed whenever the file
                 changes, so a security field applies only while you have vouched for the exact
-                bytes that declare it. <a href="#trace">The trace</a> follows what an
-                unapproved file costs at launch; what this block carries is the field list the
-                gate decides over.
+                bytes that declare it — and <code>sbx untrust</code> takes the approval
+                back. <a href="#trace">The session</a> runs on a file that was vouched for,
+                which is why the posture it shows applies at all; what this block carries is
+                the field list the gate decides over.
               </p>
             </div>
 
@@ -1510,8 +1699,8 @@ export default function Home(): ReactNode {
                 None of them is a toggle, and none replaces the bind layout: they bound what a
                 mistake in it can become. The fourth vetoes what the agent spawns, and is
                 trusted-only because an untrusted project may not forge the enforcement of its
-                own agent. <a href="#trace">The trace</a> shows the always-on three holding
-                on every one of its four outcomes, the unapproved project included.
+                own agent. <a href="#trace">The session</a> shows the always-on three
+                holding under either posture, through the refusal and the wait alike.
               </p>
             </div>
             <div className="home__layers" data-reveal data-stagger="120">
@@ -1561,6 +1750,9 @@ export default function Home(): ReactNode {
                   exact revision is pinned as data, into a store that belongs to the project,
                   leaving the host OS untouched. Seven backends, one field, and no bare form:
                   a value with no recognized prefix is dropped with a warning naming the fix.
+                  The userland underneath is sbx’s own; a trusted project may name a
+                  distribution image instead, which sbx consumes from a registry — resolved
+                  once to a digest and mounted read-only — and never produces.
                 </p>
                 <div className="home__chips" data-reveal data-stagger="45">
                   {BACKENDS.map((backend) => (
@@ -1572,6 +1764,7 @@ export default function Home(): ReactNode {
                 <Source
                   pages={[
                     { path: 'concepts/provisioning', to: '/docs/concepts/provisioning' },
+                { path: 'configuration/distro', to: '/docs/configuration/distro' },
                     { path: 'configuration/packages', to: '/docs/configuration/packages' },
                   ]}
                 />
@@ -1597,7 +1790,7 @@ export default function Home(): ReactNode {
               <p className="home__aside home__aside--side">
                 No interface but loopback, no route, no DNS resolver. Nothing leaves by
                 construction, so a misconfiguration fails closed rather than open.{' '}
-                <a href="#trace">The trace</a> walks one request down that path; what
+                <a href="#trace">The session</a> walks a request down that path; what
                 follows is the policy surface it is decided against.
               </p>
             </div>
@@ -1765,10 +1958,12 @@ export default function Home(): ReactNode {
               </div>
               <div data-reveal data-delay="120">
                 <p className="home__aside home__aside--lead">
-                  Resolvers are the open-ended half, installed as plugins from{' '}
-                  <Link to="/docs/plugins/stores">signed stores</Link>, as are the signers
+                  Resolvers are the open-ended half, installed with <code>sbx plugins</code>{' '}
+                  from <Link to="/docs/plugins/stores">signed stores</Link>, as are the signers
                   that form a credential per request and the brokers that stand in front of a
-                  host socket. The one that puts a header on the wire stays first-party.
+                  host socket. The one that puts a header on the wire stays first-party.{' '}
+                  <code>sbx secret list</code> names what a launch declares, and where each
+                  value is read from — never the values.
                 </p>
                 <div className="home__notes home__notes--stack">
                   <div className="home__note">
@@ -1854,7 +2049,11 @@ export default function Home(): ReactNode {
                 <p className="home__aside home__aside--lead">
                   An <code>[app.&lt;name&gt;]</code> table, or a standalone profile file,
                   defines a reusable launcher: <code>sbx app run agent</code> and it comes up
-                  the same way every time, on any machine that has the file.
+                  the same way every time, on any machine that has the file. A profile is not
+                  self-contained: it names the tool bundle and the egress group it needs, which
+                  travel as their own files — <code>sbx bundle</code> lists them, and an import
+                  with <code>--with-deps</code> follows the references rather than leaving an
+                  agent short of what it asked for.
                 </p>
                 <dl className="home__facts" data-reveal data-stagger="70">
                   {APP_PROPS.map(({ term, detail }) => (
@@ -1961,7 +2160,7 @@ export default function Home(): ReactNode {
             <div data-reveal>
               <Ordinal n="10" label="the desktop hole, and the registry" />
               <h2 className="home__section-title">
-                A GUI app can run in the cage. Wayland, never X11.
+                A GUI app can run in the cage, without being handed your desktop.
               </h2>
               <p className="home__aside home__aside--lead">
                 A hermetic cage has no display, no GPU, no audio and no session bus, which is

@@ -34,6 +34,12 @@
   --keep-code-bg: #221e19;
   --keep-code-fg: #e6ddd1;
 
+  /* A refusal is red, never terracotta: the accent is the brand's, and a boundary
+     that bit must not be read as a decorative flourish. The accent is kept for the
+     one state that wants a person — a request held for a live decision. */
+  --keep-deny: #c1271d;
+  --keep-deny-soft: #fbe3e0;
+
   /* Inline code chip, and the table row under the pointer. */
   --keep-chip-bg: rgba(180, 85, 47, 0.09);
   --keep-chip-border: rgba(180, 85, 47, 0.16);
@@ -137,6 +143,9 @@ html[data-theme='dark']:root {
   --keep-muted: #a89d8e;
   --keep-faint: #7f7565;
   --keep-code-header: #241f19;
+
+  --keep-deny: #ff7a6b;
+  --keep-deny-soft: #2e1714;
 
   --keep-chip-bg: rgba(232, 137, 95, 0.13);
   --keep-chip-border: rgba(232, 137, 95, 0.2);
@@ -923,6 +932,9 @@ html[data-theme='dark']:root .home {
 .home__hero {
   position: relative;
   display: flex;
+  /* The strip the scroll cue sits in, reserved rather than shared: the copy is
+     centred in what is left, so the two cannot collide however short the window. */
+  padding-bottom: 5.5rem;
   /* Centred, as the design sets it: the copy is the hero's subject, not a
      caption sitting on its floor. The copy's own top padding clears the bar the
      hero runs under, so the block reads centred in the space actually visible. */
@@ -999,11 +1011,17 @@ html[data-theme='dark']:root .home {
 
 /* At the foot of the copy, on its left edge, where the design puts it: it reads
    as the last line of the column rather than a marker in the corner. */
+/* The cue invites a downward gesture, so it points down: a stroke that descends
+   under the label, drifting the way the reader is asked to move. */
 .home__scrollcue {
-  display: flex;
+  position: absolute;
+  right: clamp(1.25rem, 4vw, 3.5rem);
+  bottom: 2.25rem;
+  /* Above the footage and the copy column, which carries a stacking order of its own. */
+  z-index: 3;
+  display: inline-flex;
   align-items: center;
   gap: 0.75rem;
-  margin-top: 2rem;
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.6875rem;
   letter-spacing: 0.16em;
@@ -1012,18 +1030,28 @@ html[data-theme='dark']:root .home {
 }
 
 .home__scrollcue-line {
-  width: 3.75rem;
-  height: 1px;
-  background: linear-gradient(to right, var(--keep-accent), transparent);
+  width: 1px;
+  height: 2.75rem;
+  /* Faint where it starts, solid where it points: the weight pulls the eye the way
+     the gesture goes. */
+  background: linear-gradient(to bottom, transparent, var(--keep-accent));
   animation: home-drift 1.6s ease-in-out infinite alternate;
 }
 
 @keyframes home-drift {
   from {
-    transform: translateX(0);
+    transform: translateY(0);
   }
   to {
-    transform: translateX(8px);
+    transform: translateY(8px);
+  }
+}
+
+/* Only where the corner itself is gone: on a phone the copy spans the full width and
+   there is no margin to stand in. Everywhere else the reserved strip above keeps it. */
+@media (max-width: 48rem) {
+  .home__scrollcue {
+    display: none;
   }
 }
 
@@ -2587,35 +2615,56 @@ html[data-theme='dark']:root .home__ordinal {
 }
 
 
-/* The trace
+/* The session
    --------------------------------------------------------------------------
-   One path, four outcomes. Two hues carry every verdict: the olive the page
-   already uses for a permitted thing, and the accent for a refused one. They
-   are never the only signal — each verdict is also spelled in words, and the
-   deciding stage is named in the rail — so the block survives being read
-   without colour.
+   One cage, drawn as the circuit it is, playing its own beats. Three hues carry
+   every verdict — the olive the page already uses for a permitted thing, the
+   accent for the one state that waits for a person, and red for a refusal — and
+   none of them is ever the only signal: each verdict is also spelled in words,
+   the deciding beat is named in the rail, and the legs differ in shape (solid,
+   held, cut) as well as in colour.
    ------------------------------------------------------------------------ */
 
-.trace {
+.live {
+  --pass: var(--home-olive);
+  --wait: var(--keep-accent);
+  --deny: var(--keep-deny);
   margin-top: 2.5rem;
-  --trace-allow: var(--home-olive);
-  --trace-deny: var(--keep-accent);
-  --trace-idle: var(--keep-faint);
 }
 
-.trace__tabs {
+.live__head {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
 }
 
-.trace__tab {
-  padding: 0.5rem 0.9375rem;
+.live__posture {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* The posture applies because the file was vouched for: saying so here keeps the
+   switch from reading as an unconditional setting. */
+.live__trusted {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.625rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+.live__mode,
+.live__step {
+  padding: 0.25rem 0.6rem;
   border: 1px solid var(--keep-border);
   border-radius: 999px;
-  background: var(--keep-bg);
+  background: transparent;
   font-family: var(--ifm-font-family-monospace);
-  font-size: 0.75rem;
+  font-size: 0.6875rem;
   color: var(--keep-muted);
   cursor: pointer;
   transition:
@@ -2624,344 +2673,999 @@ html[data-theme='dark']:root .home__ordinal {
     background 160ms ease;
 }
 
-.trace__tab:hover {
+.live__mode:hover,
+.live__step:hover {
   border-color: var(--home-edge);
   color: var(--keep-ink);
 }
 
-.trace__tab--on {
+.live__mode--on {
   border-color: var(--keep-accent);
   background: var(--keep-accent-soft);
   color: var(--keep-accent);
 }
 
-/* The eight stages. A wrapping row rather than a grid: the labels differ in
-   width, and an even track would either clip `provision` or strand `trust`. */
-.trace__rail {
+.live__transport {
+  display: inline-flex;
+  gap: 0.35rem;
+}
+
+.live__posture-note {
+  margin: 0.5rem 0 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  line-height: 1.6;
+  color: var(--keep-muted);
+}
+
+/* The beats. Buttons rather than clickable list items: moving through the story
+   is an action, and it belongs to the keyboard as much as to the pointer. */
+.live__rail {
   display: flex;
   flex-wrap: wrap;
   gap: 0.25rem 0.5rem;
-  margin: 1.25rem 0 0;
+  margin: 1.1rem 0 0;
   padding: 0;
   list-style: none;
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.6875rem;
-  color: var(--trace-idle);
 }
 
-.trace__stage + .trace__stage::before {
+.live__beat + .live__beat::before {
   content: '·';
   margin-right: 0.5rem;
   color: var(--keep-border-strong);
 }
 
-/* The stage that settled the selected outcome. The dot before it is the
-   marker; `--decides` also names itself in words beside it. */
-.trace__stage--decides {
+.live__beat button {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--keep-faint);
+  cursor: pointer;
+  transition: color 200ms ease;
+}
+
+.live__beat button:hover {
+  color: var(--keep-ink);
+}
+
+.live__beat--now button {
   color: var(--keep-accent);
 }
 
-.trace__stage-note {
-  color: var(--keep-muted);
+/* How far into the current beat the session is, so the next one is visibly coming. */
+.live__progress {
+  height: 2px;
+  margin: 0.35rem 0 1.1rem;
+  border-radius: 1px;
+  background: var(--keep-border);
+  overflow: hidden;
 }
 
-.trace__panel {
-  margin-top: 1.25rem;
-  animation: trace-enter 320ms ease both;
+.live__progress span {
+  display: block;
+  height: 100%;
+  background: var(--keep-accent);
+  transition: width 120ms linear;
 }
 
-.trace__panel:focus-visible {
-  outline: 2px solid var(--keep-accent);
-  outline-offset: 6px;
-  border-radius: 16px;
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
-@keyframes trace-enter {
-  from {
+.live__stage {
+  border: 1px solid var(--home-edge);
+  border-radius: 14px;
+  /* No ruled texture here, unlike the page's other panels: this one carries wires
+     and cards, and a rule every 30px crosses both. */
+  background: var(--home-deep);
+  box-shadow: inset 0 1px 12px -6px var(--home-shadow);
+  padding: 1.1rem 1.2rem 1rem;
+  overflow-x: auto;
+}
+
+/* Five tracks: host, leg, cage, leg, the way out. The columns are sized by their
+   content — a stretched column leaves dead space under the host list and inside
+   the hull, which reads as an unfinished drawing. */
+.live__grid {
+  display: grid;
+  grid-template-columns: 13.5rem 3.4rem 1fr 3.4rem 13rem;
+  align-items: start;
+  min-width: 58rem;
+}
+
+.live__col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.live__col-bar {
+  margin: 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.5625rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+/* The legs are placed by script, on the centre of what they join. */
+.live__leg,
+.live__vleg {
+  display: flex;
+  align-items: center;
+}
+
+.live__leg .w {
+  flex: 1;
+}
+
+.live__vleg {
+  height: 2.4rem;
+  justify-content: center;
+}
+
+/* ── the one primitive every leg is made of ─────────────────────────────── */
+
+.w {
+  position: relative;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--keep-border);
+}
+
+.w > i {
+  position: absolute;
+  top: -2px;
+  width: 26px;
+  height: 6px;
+  border-radius: 3px;
+  opacity: 0;
+}
+
+.w--flow {
+  background: color-mix(in srgb, var(--pass) 35%, var(--keep-border));
+}
+
+.w--flow > i {
+  background: linear-gradient(90deg, transparent, var(--pass));
+  animation: leg-flow 1.1s linear infinite;
+}
+
+/* Held, not failed: the pulse stops in the middle and breathes. */
+.w--wait {
+  background: color-mix(in srgb, var(--wait) 40%, var(--keep-border));
+}
+
+.w--wait > i {
+  left: 46%;
+  opacity: 1;
+  background: linear-gradient(90deg, transparent, var(--wait));
+  animation: leg-hold 1.1s ease-in-out infinite;
+}
+
+.w--cut {
+  background: repeating-linear-gradient(90deg, var(--deny) 0 4px, transparent 4px 8px);
+}
+
+.w--cut > i {
+  display: none;
+}
+
+/* The cross is a mark, not a character lost on a hairline. */
+.w__x {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 1.5px solid var(--deny);
+  border-radius: 50%;
+  background: var(--keep-deny-soft);
+  color: var(--deny);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  line-height: 1;
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.4);
+}
+
+.w--cut .w__x {
+  animation: leg-cut 420ms cubic-bezier(0.2, 1.4, 0.4, 1) forwards;
+}
+
+.w--v {
+  width: 2px;
+  height: 100%;
+}
+
+.w--v > i {
+  top: auto;
+  left: -2px;
+  width: 6px;
+  height: 26px;
+}
+
+.w--v.w--flow > i {
+  animation: leg-flow-up 1s linear infinite;
+}
+
+.w--v-out.w--flow {
+  background: color-mix(in srgb, var(--pass) 40%, var(--keep-border));
+}
+
+.w--v-out.w--flow > i {
+  background: linear-gradient(0deg, transparent, var(--pass));
+}
+
+/* The reader's own answer travels the other way: up, into the boundary. */
+.w--v-you.w--flow {
+  background: color-mix(in srgb, var(--wait) 45%, var(--keep-border));
+}
+
+.w--v-you.w--flow > i {
+  background: linear-gradient(0deg, transparent, var(--wait));
+}
+
+.w--v.w--cut {
+  background: repeating-linear-gradient(0deg, var(--deny) 0 4px, transparent 4px 8px);
+}
+
+.w--v.w--wait > i {
+  top: 44%;
+  left: -2px;
+  opacity: 1;
+  background: linear-gradient(0deg, transparent, var(--wait));
+  animation: leg-hold 1.1s ease-in-out infinite;
+}
+
+@keyframes leg-flow {
+  0% {
+    left: -26px;
     opacity: 0;
-    transform: translateY(6px);
+  }
+  12%,
+  88% {
+    opacity: 1;
+  }
+  100% {
+    left: 100%;
+    opacity: 0;
   }
 }
 
-.trace__lede {
-  max-width: 54rem;
-  margin: 0 0 1.5rem;
-  font-size: 1rem;
-  line-height: 1.6;
+@keyframes leg-flow-up {
+  0% {
+    bottom: -26px;
+    opacity: 0;
+  }
+  12%,
+  88% {
+    opacity: 1;
+  }
+  100% {
+    bottom: 100%;
+    opacity: 0;
+  }
+}
+
+@keyframes leg-hold {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes leg-cut {
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+/* ── the host: what was bound in, and what stayed out ───────────────────── */
+
+.live__host {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.live__bound,
+.live__absent {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--home-edge);
+  border-radius: 8px;
+  background: var(--keep-surface);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.625rem;
   color: var(--keep-body);
 }
 
-/* Three columns on a wide viewport, one below it. The session column is the
-   widest because it carries wrapped prose; the other two carry short lines. */
-.trace__cols {
-  display: grid;
-  grid-template-columns: 1.15fr 1fr 1fr;
-  gap: 1rem;
-  /* Equal heights: the three are one picture, and a ragged bottom edge would
-     read as three cards that happen to sit beside each other. */
-  align-items: stretch;
+.live__bound span {
+  margin-left: auto;
+  color: var(--pass);
 }
 
-.trace__col {
-  overflow: hidden;
-  border: 1px solid var(--keep-border);
-  border-radius: 12px;
-  background: var(--ifm-background-surface-color);
+.live__absent {
+  border-style: dashed;
+  color: var(--keep-faint);
 }
 
-.home__section--tint .trace__col {
+.live__absent b {
+  color: var(--deny);
+}
+
+/* ── the cage, drawn as the enclosure it is ─────────────────────────────── */
+
+.hull {
+  position: relative;
+  transition: opacity 500ms ease;
+}
+
+.hull--dead {
+  opacity: 0.35;
+}
+
+.hull__edge,
+.hull__face {
+  position: absolute;
+  inset: 0;
+  clip-path: polygon(
+    14px 0,
+    calc(100% - 14px) 0,
+    100% 14px,
+    100% calc(100% - 14px),
+    calc(100% - 14px) 100%,
+    14px 100%,
+    0 calc(100% - 14px),
+    0 14px
+  );
+}
+
+.hull__edge {
+  background: var(--keep-border-strong);
+  transition: background 400ms ease;
+}
+
+.hull--live .hull__edge {
+  background: color-mix(in srgb, var(--keep-accent) 45%, var(--keep-border-strong));
+}
+
+.hull__face {
+  inset: 1px;
   background: var(--keep-bg);
 }
 
-.trace__col-bar {
+.hull__in {
+  position: relative;
+  padding: 0.75rem 0.85rem;
+}
+
+.hull__bar {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
   margin: 0;
-  padding: 0.625rem 0.875rem;
-  border-bottom: 1px solid var(--keep-border);
-  background: var(--keep-code-header);
   font-family: var(--ifm-font-family-monospace);
-  font-size: 0.6875rem;
+  font-size: 0.5625rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+/* What the cage runs on, before what it holds: the substrate is the broadest
+   supply-chain choice a config can express, and the picture never named it. */
+.hull__base {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 0.45rem;
+  margin: 0.5rem 0 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.5625rem;
+  line-height: 1.6;
   color: var(--keep-muted);
 }
 
-/* The session is a console in both modes, like every other sample pane on the
-   page: what it quotes is what a terminal printed. */
-.trace__col--session {
-  border-color: transparent;
-  background: var(--home-code-deep);
+.hull__base span {
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
 }
 
-.home__section--tint .trace__col--session {
-  background: var(--home-code-deep);
+.hull__binds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
 }
 
-.trace__col--session .trace__col-bar {
-  border-bottom-color: rgba(230, 221, 209, 0.1);
-  background: rgba(230, 221, 209, 0.04);
-  color: var(--keep-accent);
-}
-
-.trace__session {
-  padding: 1rem 1.125rem 1.125rem;
-}
-
-.trace__ask {
-  margin: 0;
-  font-size: 0.875rem;
-  line-height: 1.5;
-  color: var(--keep-code-fg);
-}
-
-.trace__intent {
-  margin: 0.375rem 0 0;
-  font-size: 0.875rem;
-  line-height: 1.5;
-  color: rgba(230, 221, 209, 0.55);
-}
-
-.trace__intent::before {
-  content: '⟩ ';
-  color: var(--keep-accent);
-}
-
-.trace__lines {
-  margin: 0.875rem 0 0;
-  padding: 0.875rem 0 0;
-  border-top: 1px solid rgba(230, 221, 209, 0.1);
-  overflow-x: auto;
-  background: transparent;
+.hull__binds li {
+  padding: 0.15rem 0.45rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 999px;
+  background: var(--keep-surface);
   font-family: var(--ifm-font-family-monospace);
-  font-size: 0.75rem;
-  line-height: 1.85;
+  font-size: 0.5625rem;
+  color: var(--keep-muted);
+}
+
+.hull__procs {
+  margin: 0.5rem 0 0;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--keep-border);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  line-height: 1.7;
+  color: var(--keep-body);
+  background: none;
+}
+
+.hull__root {
+  color: var(--keep-ink);
+}
+
+.hull__store {
+  margin-top: 0.6rem;
+}
+
+.hull__gauge {
+  display: block;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--keep-border);
+  overflow: hidden;
+}
+
+.hull__gauge span {
+  display: block;
+  height: 100%;
+  background: var(--pass);
+  transition: width 1.1s ease;
+}
+
+.hull__store-lbl {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 0.3rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.5625rem;
+  color: var(--keep-faint);
+}
+
+/* The layers that hold whatever the config says. The proxy is the only way out
+   only because these leave the cage no other route. */
+.hull__foot {
+  display: grid;
+  gap: 0.1rem;
+  margin: 0.5rem 0 0;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--keep-border);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.5rem;
+  line-height: 1.6;
+  color: var(--keep-faint);
+}
+
+.hull__socket {
+  position: absolute;
+  right: -6px;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid var(--keep-border-strong);
+  background: var(--keep-bg);
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.hull--live .hull__socket {
+  border-color: var(--keep-accent);
+}
+
+/* ── the way out: what is reached, what decides, and you ────────────────── */
+
+/* A card carried the stage's own surface, so only a hairline separated the two, and
+   the tone next to it is barely a step. These sit on the page's recessed surface —
+   the one the code panes use — behind the warm edge the landing draws its other
+   boundaries with, so the pieces around the cage read as objects on a table. */
+.eg {
+  border: 1px solid var(--home-edge);
+  border-radius: 9px;
+  padding: 0.55rem 0.65rem;
+  background: var(--keep-surface);
+}
+
+.eg__head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  color: var(--keep-ink);
+}
+
+.eg__head b {
+  font-weight: 400;
+}
+
+.eg__layer {
+  margin-left: auto;
+  font-size: 0.5rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+.eg__chip {
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 999px;
+  font-size: 0.5rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+.eg__detail {
+  margin: 0.25rem 0 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.5625rem;
+  line-height: 1.5;
+  color: var(--keep-muted);
+  word-break: break-all;
+}
+
+/* Internet is not ours, so it keeps its rounded corners; the proxy wears sbx's
+   own cut ones, because the shape says whose piece it is before the label does. */
+.eg--net {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.eg--net b,
+.eg--net em {
+  display: block;
+  font-family: var(--ifm-font-family-monospace);
+  font-style: normal;
+  font-weight: 400;
+}
+
+.eg--net b {
+  font-size: 0.6875rem;
+  color: var(--keep-ink);
+}
+
+.eg--net em {
+  margin-top: 0.15rem;
+  font-size: 0.5625rem;
+  color: var(--keep-muted);
+  word-break: break-all;
+}
+
+.eg--gate {
+  position: relative;
+  border: 0;
+  background: none;
+}
+
+.eg--gate::before,
+.eg--gate::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  clip-path: polygon(
+    11px 0,
+    calc(100% - 11px) 0,
+    100% 11px,
+    100% calc(100% - 11px),
+    calc(100% - 11px) 100%,
+    11px 100%,
+    0 calc(100% - 11px),
+    0 11px
+  );
+}
+
+.eg--gate::before {
+  background: var(--keep-border-strong);
+  transition: background 350ms ease;
+}
+
+.eg--gate::after {
+  inset: 1px;
+  background: var(--keep-surface);
+}
+
+/* Above the face layer, which is painted after the content it would hide. */
+.eg--gate > * {
+  position: relative;
+  z-index: 1;
+}
+
+.eg--pass.eg--gate::before {
+  background: color-mix(in srgb, var(--pass) 60%, var(--keep-border-strong));
+}
+
+.eg--wait.eg--gate::before {
+  background: var(--wait);
+}
+
+.eg--deny.eg--gate::before {
+  background: var(--deny);
+}
+
+.eg--deny.eg--gate::after {
+  background: var(--keep-deny-soft);
+}
+
+.eg--pass .eg__chip {
+  color: var(--pass);
+  border-color: color-mix(in srgb, var(--pass) 45%, transparent);
+}
+
+.eg--wait .eg__chip {
+  color: var(--wait);
+  border-color: color-mix(in srgb, var(--wait) 45%, transparent);
+}
+
+.eg--deny .eg__chip {
+  color: var(--deny);
+  border-color: color-mix(in srgb, var(--deny) 45%, transparent);
+}
+
+.eg--net.eg--deny b {
+  color: var(--keep-faint);
+  text-decoration: line-through;
+}
+
+/* The one thing the boundary adds rather than removes, shown at the beat where it
+   happens: it is an act, not a property the proxy carries between requests. */
+.eg__inject {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  margin: 0.4rem 0 0;
+  padding-top: 0;
+  max-height: 0;
+  overflow: hidden;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.5625rem;
+  line-height: 1.5;
+  color: var(--keep-muted);
+  opacity: 0;
+  transition:
+    opacity 350ms ease,
+    max-height 350ms ease;
+}
+
+.eg__inject--on {
+  padding-top: 0.4rem;
+  border-top: 1px dashed var(--keep-border);
+  max-height: 4rem;
+  opacity: 1;
+}
+
+.eg__inject b {
+  display: block;
+  font-weight: 400;
+  color: var(--pass);
+}
+
+.eg__term {
+  margin: 0.4rem 0 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.625rem;
+  line-height: 1.7;
   white-space: pre-wrap;
-  /* The refusal bodies are long sentences, so they wrap rather than scroll;
-     breaking inside a word would corrupt a host name or a command. */
-  overflow-wrap: break-word;
+  word-break: break-word;
+  background: none;
 }
 
-.trace__sigil {
-  color: var(--keep-accent);
+.eg__line--cmd {
+  color: var(--keep-ink);
 }
 
-.trace__line--cmd {
-  color: var(--keep-code-fg);
+.eg__line--cmd::before {
+  content: '$ ';
+  color: var(--keep-faint);
 }
 
-.trace__line--out {
-  color: rgba(230, 221, 209, 0.7);
+.eg__line--out {
+  color: var(--keep-body);
 }
 
-/* What the proxy put on the wire, as against what a command printed: the
-   arrow is the difference, and the tone keeps the two apart without asking
-   the reader to tell one grey from another. */
-.trace__line--resp {
-  color: rgba(230, 221, 209, 0.82);
-}
-
-.trace__wire-sigil {
-  color: var(--keep-accent);
-}
-
-.trace__line--refusal {
-  color: var(--trace-deny);
-}
-
-.trace__line--warn {
-  color: #d9a441;
-}
-
-.trace__line--note {
-  color: rgba(230, 221, 209, 0.6);
+.eg__line--note {
+  color: var(--keep-faint);
   font-style: italic;
 }
 
-/* The gates, in the order they decide. The left border is the verdict, so the
-   column reads top to bottom as a run of outcomes. */
-.trace__gates {
-  margin: 0;
-  padding: 0.875rem;
-  list-style: none;
-  display: grid;
-  gap: 0.5rem;
-}
-
-.trace__gate {
-  padding: 0.625rem 0.75rem;
-  border: 1px solid var(--keep-border);
-  border-left: 3px solid var(--trace-idle);
-  border-radius: 4px 10px 10px 4px;
-}
-
-.trace__gate--allow {
-  border-left-color: var(--trace-allow);
-}
-
-.trace__gate--deny {
-  border-left-color: var(--trace-deny);
-}
-
-.trace__gate-head {
+.eg__line--refusal {
   display: block;
+  margin-top: 0.3rem;
+  padding: 0.4rem 0.45rem;
+  border-left: 2px solid var(--deny);
+  background: var(--keep-deny-soft);
+  color: var(--deny);
+}
+
+.eg--acting {
+  border-color: var(--wait);
+}
+
+.eg--acting .glyph--term,
+.eg--acting .eg__head b {
+  color: var(--wait);
+}
+
+/* What reached you out of band. A refusal is announced; a park is already in front
+   of you on the launch's stderr, so the two do not wear the same colour. */
+.eg__alert {
+  margin: 0.45rem 0 0;
+  padding: 0.4rem 0.5rem;
+  border-left: 2px solid var(--deny);
+  border-radius: 0 8px 8px 0;
+  background: var(--keep-deny-soft);
   font-family: var(--ifm-font-family-monospace);
-  font-size: 0.8125rem;
-  color: var(--keep-ink);
-}
-
-.trace__gate-head:hover {
-  color: var(--keep-accent);
-  text-decoration: none;
-}
-
-.trace__gate-n {
-  margin-right: 0.5rem;
-  color: var(--trace-idle);
-}
-
-.trace__gate-detail {
-  margin: 0.25rem 0 0;
-  font-size: 0.8125rem;
-  line-height: 1.45;
-  color: var(--keep-muted);
-}
-
-/* The wire: the cage, the proxy that answers for it, and upstream. */
-.trace__wire {
-  padding: 0.875rem;
-  display: grid;
-  gap: 0.25rem;
-}
-
-.trace__cage,
-.trace__proxy,
-.trace__upstream {
-  padding: 0.625rem 0.75rem;
-  border: 1px solid var(--keep-border);
-  border-radius: 10px;
-}
-
-.trace__proxy--allow {
-  border-color: var(--trace-allow);
-}
-
-.trace__proxy--deny {
-  border-color: var(--trace-deny);
-}
-
-/* Upstream was never contacted, so it is drawn as an outline rather than a
-   box: the dashed edge is the refusal, restated. */
-.trace__upstream--unreached {
-  border-style: dashed;
-  opacity: 0.55;
-}
-
-.trace__cage-head,
-.trace__proxy-head,
-.trace__upstream-head {
-  margin: 0;
-  font-family: var(--ifm-font-family-monospace);
-  font-size: 0.8125rem;
-  color: var(--keep-ink);
-}
-
-.trace__cage-detail,
-.trace__proxy-detail,
-.trace__upstream-detail {
-  margin: 0.25rem 0 0;
-  font-size: 0.75rem;
-  line-height: 1.45;
-  color: var(--keep-muted);
-}
-
-.trace__hop {
-  margin: 0;
-  text-align: center;
-  font-family: var(--ifm-font-family-monospace);
-  font-size: 0.8125rem;
-  line-height: 1.2;
-  color: var(--keep-accent);
-}
-
-/* What the host-side feeds recorded, and what you were told. Its console is
-   the same surface as the session pane, because it is the same kind of
-   evidence — except the cage can neither read nor amend this one. */
-.trace__record {
-  margin-top: 1rem;
-  overflow: hidden;
-  border-radius: 12px;
-  background: var(--home-code-deep);
-}
-
-.trace__feed {
-  margin: 0;
-  padding: 1rem 1.125rem;
-  overflow-x: auto;
-  background: transparent;
-  font-family: var(--ifm-font-family-monospace);
-  font-size: 0.75rem;
-  line-height: 1.9;
-  color: var(--keep-code-fg);
-  white-space: pre;
-}
-
-.trace__host {
-  margin: 0;
-  padding: 0.75rem 1.125rem 0.9375rem;
-  border-top: 1px solid rgba(230, 221, 209, 0.1);
-  font-size: 0.8125rem;
+  font-size: 0.5625rem;
   line-height: 1.5;
-  color: rgba(230, 221, 209, 0.6);
+  color: var(--deny);
+}
+
+.eg__alert--wait {
+  border-left-color: var(--wait);
+  background: var(--keep-accent-soft);
+  color: var(--wait);
+}
+
+.glyph {
+  flex: none;
+  color: var(--keep-faint);
+  transition: color 350ms ease;
+}
+
+.glyph--globe {
+  width: 26px;
+  height: 26px;
+  color: var(--keep-border-strong);
+}
+
+.eg--pass .glyph--globe {
+  color: color-mix(in srgb, var(--pass) 75%, var(--keep-border-strong));
+}
+
+.eg--wait .glyph--globe {
+  color: var(--wait);
+  opacity: 0.75;
+}
+
+.eg--deny .glyph--globe {
+  color: var(--deny);
+  opacity: 0.5;
+}
+
+.glyph--wall {
+  width: 19px;
+  height: 19px;
+}
+
+.eg--pass .glyph--wall {
+  color: var(--pass);
+}
+
+.eg--wait .glyph--wall {
+  color: var(--wait);
+  animation: gate-breathe 2.2s ease-in-out infinite;
+}
+
+.eg--deny .glyph--wall {
+  color: var(--deny);
+}
+
+.glyph--key {
+  width: 13px;
+  height: 13px;
+  margin-top: 0.1rem;
+  color: var(--pass);
+}
+
+.glyph--term {
+  width: 17px;
+  height: 17px;
+}
+
+@keyframes gate-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ── what the feeds recorded ────────────────────────────────────────────── */
+
+.live__feed {
+  margin-top: 1rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--keep-border);
+  min-height: 6rem;
+}
+
+.live__feed-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.5625rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+/* Said where a beat's silence would otherwise read as a gap in the record. */
+.live__feed-note {
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--wait);
+}
+
+.live__feed-rows {
+  margin: 0.4rem 0 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  line-height: 1.8;
+  background: none;
+  white-space: normal;
+}
+
+/* Columns as a grid rather than padded to width with spaces: a monospace column
+   built out of padding cannot reflow, and on a narrow screen it pushed a
+   horizontal scrollbar under the whole picture. */
+.live__row {
+  display: grid;
+  grid-template-columns: 3.25rem 4.5rem 1fr;
+  gap: 0 0.5rem;
+}
+
+.live__row b,
+.live__row em {
+  font-style: normal;
+  font-weight: 400;
+}
+
+.live__row > span {
+  word-break: break-word;
+}
+
+.live__row b {
+  color: var(--keep-faint);
+}
+
+.live__row--allow em {
+  color: var(--pass);
+}
+
+.live__row--deny em {
+  color: var(--deny);
+}
+
+.live__row--observe em,
+.live__row--exit em {
+  color: var(--keep-muted);
 }
 
 @media (max-width: 62rem) {
-  .trace__cols {
+  /* Below the width the five tracks need, the picture stacks: the host and the way
+     out sit under the cage rather than beside it. Every leg then joins two blocks
+     one *above* the other, so every leg turns vertical — including the two that run
+     across the columns on a wide screen. The placement script is a no-op here: the
+     axis it measures belongs to elements the stack no longer puts side by side. */
+  .live__grid {
     grid-template-columns: 1fr;
+    min-width: 0;
+  }
+
+  .live__leg,
+  .live__vleg {
+    height: 2.2rem;
+    justify-content: center;
+    padding-top: 0 !important;
+  }
+
+  .live__leg .w {
+    flex: none;
+    width: 2px;
+    height: 100%;
+  }
+
+  .live__leg .w > i {
+    top: auto;
+    left: -2px;
+    width: 6px;
+    height: 26px;
+  }
+
+  .live__leg .w--flow > i {
+    background: linear-gradient(0deg, transparent, var(--pass));
+    animation: leg-flow-up 1s linear infinite;
+  }
+
+  .live__leg .w--wait > i {
+    top: 44%;
+    left: -2px;
+    background: linear-gradient(0deg, transparent, var(--wait));
+  }
+
+  .live__leg .w--cut {
+    background: repeating-linear-gradient(0deg, var(--deny) 0 4px, transparent 4px 8px);
+  }
+
+  .live__col {
+    margin-bottom: 0.4rem;
+  }
+}
+
+@media (max-width: 32rem) {
+  /* On a phone the subject column is narrower than a host name, so the break lands
+     inside the name. The feed and its verdict keep the first line; what was decided
+     takes the next one whole. */
+  .live__row {
+    grid-template-columns: 3.25rem 1fr;
+  }
+
+  .live__row > span {
+    grid-column: 1 / -1;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  /* The scenarios still switch; what stops is the panel sliding in, which is
-     decoration over a change the tabs already announce. */
-  .trace__panel {
+  /* The beats still change, and the progress bar still reports where the reader is:
+     both are states. What stops is the travelling pulse and the gate's breathing,
+     which are motion and nothing else. */
+  .w > i,
+  .eg--wait .glyph--wall {
     animation: none;
+  }
+
+  .w--wait > i {
+    opacity: 1;
+  }
+
+  .w--cut .w__x {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+    animation: none;
+  }
+
+  .hull__gauge span,
+  .eg__inject {
+    transition: none;
   }
 }
 

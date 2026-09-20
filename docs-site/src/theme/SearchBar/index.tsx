@@ -59,6 +59,18 @@ export default function SearchBar(): ReactNode {
     // A second run (React strict mode) must not stack a second widget.
     if (!mount || mount.childElementCount > 0) return undefined;
 
+    // The index is a postbuild artifact (`pagefind --site build`), so it does not
+    // exist under `docusaurus start` — and the dev server answers the request for
+    // it with the site's own HTML at 200 rather than a 404, which a classic
+    // <script> tag loads "successfully" and then fails to parse, as an uncaught
+    // page error no try/catch below can reach. Declare it unavailable before
+    // anything is injected: the disabled field this renders already says the
+    // search is build-only.
+    if (process.env.NODE_ENV !== 'production') {
+      setUnavailable(true);
+      return undefined;
+    }
+
     let cancelled = false;
     void (async () => {
       try {
