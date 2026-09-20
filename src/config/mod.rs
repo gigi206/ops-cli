@@ -1647,13 +1647,14 @@ fn override_fatal_error(fatal: &[String], notes: Vec<String>) -> Vec<String> {
 /// Answer the baseline credentials, split from [`apply_plugin_host_config`] so it can run **before**
 /// the posture clear.
 ///
-/// `resolve` snapshots `secrets` into `declared_secrets` at that point, and `merge_app` restores
-/// that snapshot wholesale (`self.secrets = self.declared_secrets.clone()`) so an app opening a
-/// filtering posture inherits a baseline credential the baseline posture had cleared. Answering the
-/// whole table afterwards therefore answered a set the app path throws away: every inherited
-/// baseline credential resolved through a plugin reached the launch with an empty `HostConfig`, so
-/// the plugin ran with neither the configured environment nor its `nix:`-provisioned program —
-/// under `sbx app run <name>` but not under `sbx run`, from one declaration.
+/// `resolve` snapshots `secrets` into `declared_secrets` at that point, and `merge_app` re-derives
+/// `secrets` from that snapshot — with the app's own credentials upserted into it first — so an
+/// app opening a filtering posture inherits a baseline credential the baseline posture had
+/// cleared. Answering the whole table afterwards therefore answered a set the app path throws
+/// away: every inherited baseline credential resolved through a plugin reached the launch with an
+/// empty `HostConfig`, so the plugin ran with neither the configured environment nor its
+/// `nix:`-provisioned program — under `sbx app run <name>` but not under `sbx run`, from one
+/// declaration.
 ///
 /// The rest of the table (tasks, apps, brokers) is answered later because those are resolved after
 /// the clear; `matched` is threaded through both halves so the "no secret uses a plugin by that
