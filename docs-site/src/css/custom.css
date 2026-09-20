@@ -39,6 +39,9 @@
      one state that wants a person — a request held for a live decision. */
   --keep-deny: #c1271d;
   --keep-deny-soft: #fbe3e0;
+  /* Attention, which is neither a refusal nor a wait: the mark on an alert addressed
+     to a person. The page's only yellow, and it carries nothing else. */
+  --keep-warn: #9a7a0a;
 
   /* Inline code chip, and the table row under the pointer. */
   --keep-chip-bg: rgba(180, 85, 47, 0.09);
@@ -146,6 +149,7 @@ html[data-theme='dark']:root {
 
   --keep-deny: #ff7a6b;
   --keep-deny-soft: #2e1714;
+  --keep-warn: #f2cc63;
 
   --keep-chip-bg: rgba(232, 137, 95, 0.13);
   --keep-chip-border: rgba(232, 137, 95, 0.2);
@@ -2831,6 +2835,14 @@ a.home__chip:focus-visible {
   justify-content: center;
 }
 
+/* The column spaces its children by 0.5rem, which the leg's own cell does not cover:
+   the wire has to reach across that gap at both ends, or it floats short of the two
+   cards it joins. */
+.live__vleg .w {
+  height: calc(100% + 1rem);
+  margin-block: -0.5rem;
+}
+
 /* ── the one primitive every leg is made of ─────────────────────────────── */
 
 .w {
@@ -2974,6 +2986,21 @@ a.home__chip:focus-visible {
   }
   100% {
     bottom: 100%;
+    opacity: 0;
+  }
+}
+
+@keyframes leg-flow-down {
+  0% {
+    top: -26px;
+    opacity: 0;
+  }
+  12%,
+  88% {
+    opacity: 1;
+  }
+  100% {
+    top: 100%;
     opacity: 0;
   }
 }
@@ -3144,6 +3171,11 @@ a.home__chip:focus-visible {
   color: var(--keep-ink);
 }
 
+.hull__gone {
+  color: var(--keep-faint);
+  font-style: italic;
+}
+
 .hull__store {
   margin-top: 0.6rem;
 }
@@ -3189,6 +3221,9 @@ a.home__chip:focus-visible {
 .hull__socket {
   position: absolute;
   right: -6px;
+  /* Its resting place. The wide layout's script moves it onto the axis the egress leg
+     runs along; stacked, there is no such axis and it stays on the hull's own middle. */
+  top: 50%;
   width: 11px;
   height: 11px;
   border: 1.5px solid var(--keep-border-strong);
@@ -3391,6 +3426,14 @@ a.home__chip:focus-visible {
   color: var(--pass);
 }
 
+.eg__aside {
+  margin: 0.3rem 0 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.5rem;
+  letter-spacing: 0.06em;
+  color: var(--keep-faint);
+}
+
 .eg__term {
   margin: 0.4rem 0 0;
   font-family: var(--ifm-font-family-monospace);
@@ -3428,6 +3471,12 @@ a.home__chip:focus-visible {
   color: var(--deny);
 }
 
+/* Under the picture, full width: the console is not a stop on the path out, and the
+   record of what the session did sits right below it. */
+.eg--you {
+  margin-top: 1rem;
+}
+
 .eg--acting {
   border-color: var(--wait);
 }
@@ -3437,10 +3486,20 @@ a.home__chip:focus-visible {
   color: var(--wait);
 }
 
-/* What reached you out of band. A refusal is announced; a park is already in front
-   of you on the launch's stderr, so the two do not wear the same colour. */
+/* What reached you out of band. The bell stands outside the frame — it is what makes
+   you look up — and the frame carries the message, in the hue of what happened: a
+   refusal announced, or a request held for your decision. */
 .eg__alert {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
   margin: 0.45rem 0 0;
+}
+
+/* Sized to its message, not to the strip: a full-width red bar under a short line
+   reads as a banner rather than as a notice. */
+.eg__alert-box {
+  flex: 0 1 auto;
   padding: 0.4rem 0.5rem;
   border-left: 2px solid var(--deny);
   border-radius: 0 8px 8px 0;
@@ -3451,7 +3510,7 @@ a.home__chip:focus-visible {
   color: var(--deny);
 }
 
-.eg__alert--wait {
+.eg__alert-box--wait {
   border-left-color: var(--wait);
   background: var(--keep-accent-soft);
   color: var(--wait);
@@ -3506,6 +3565,13 @@ a.home__chip:focus-visible {
   height: 13px;
   margin-top: 0.1rem;
   color: var(--pass);
+}
+
+.glyph--alert {
+  width: 14px;
+  height: 14px;
+  margin-top: 0.05rem;
+  color: var(--keep-warn);
 }
 
 .glyph--term {
@@ -3614,10 +3680,19 @@ a.home__chip:focus-visible {
     padding-top: 0 !important;
   }
 
+  /* Stacked, the next column opens with its own heading, so a leg that stops at the
+     cell boundary lands on the label rather than on the box it joins. It runs past
+     the heading — the height that heading occupies, taken from the same tokens it is
+     set in, plus the column's gap. */
+  .live__grid {
+    --bar: calc(0.5625rem * 1.6 + 0.5rem);
+  }
+
   .live__leg .w {
     flex: none;
     width: 2px;
-    height: 100%;
+    height: calc(100% + var(--bar));
+    margin-bottom: calc(-1 * var(--bar));
   }
 
   .live__leg .w > i {
@@ -3627,9 +3702,14 @@ a.home__chip:focus-visible {
     height: 26px;
   }
 
-  .live__leg .w--flow > i {
-    background: linear-gradient(0deg, transparent, var(--pass));
-    animation: leg-flow-up 1s linear infinite;
+  /* Stacked, the picture is read top to bottom and every leg flows that way — the
+     egress one included, which the reorder above turned around: the proxy now sits
+     over the upstream it reaches, not under it. */
+  .live__leg .w--flow > i,
+  .live__vleg--out .w--flow > i {
+    bottom: auto;
+    background: linear-gradient(180deg, transparent, var(--pass));
+    animation: leg-flow-down 1s linear infinite;
   }
 
   .live__leg .w--wait > i {
@@ -3642,9 +3722,35 @@ a.home__chip:focus-visible {
     background: repeating-linear-gradient(0deg, var(--deny) 0 4px, transparent 4px 8px);
   }
 
-  .live__col {
-    margin-bottom: 0.4rem;
+  /* The way-out column is read bottom-up on a wide screen — you feed the proxy, the
+     proxy reaches upstream. Unrolled into one column it would read the other way and
+     say the request meets the internet before the wall that decides it, so the order
+     is reversed here: what decides comes first, what is reached follows. The answer's
+     leg goes with it: `you` is a person acting on the proxy, not a hop after the
+     upstream, and a leg drawn from the internet to your terminal would claim it is. */
+  .live__col .eg--gate {
+    order: 1;
   }
+
+  .live__vleg--out {
+    order: 2;
+  }
+
+  .live__col .eg--net {
+    order: 3;
+  }
+
+  /* The socket marks the one opening on the hull's right flank, which is where the
+     egress leg meets it on a wide screen. Stacked, that leg leaves from the bottom,
+     so the diamond would mark a way out nothing takes. */
+  .hull__socket {
+    display: none;
+  }
+
+
+
+  /* No margin under a column: the leg between two of them is what spans the gap,
+     and a margin the leg cannot reach leaves it floating short of both boxes. */
 }
 
 @media (max-width: 32rem) {

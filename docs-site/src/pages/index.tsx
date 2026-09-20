@@ -187,12 +187,14 @@ const MIDDLE: Record<Posture, Beat[]> = {
       verdict: 'deny',
       proxy: 'api.example.com:443 · denied-default',
       upstream: 'never contacted',
+      // What reaches *you*, which is not what the cage sees: the request was the
+      // agent's and the 403 body went to it. Yours is the notification below, and one
+      // line saying what that body carries — the same fact twice, once framed in red
+      // and once in a second frame beneath it, was one frame too many.
       you: [
-        { kind: 'cmd', text: 'curl -s https://api.example.com' },
         {
-          kind: 'refusal',
-          text:
-            'sbx egress refused this request: `api.example.com:443` is not allowed by the network policy. Allow it: sbx net allow api.example.com',
+          kind: 'note',
+          text: 'you typed nothing — and the refusal the agent got names its own fix',
         },
       ],
       alert: { kind: 'deny', text: 'host notification · egress refused — api.example.com:443' },
@@ -1153,6 +1155,21 @@ function Terminal(): ReactNode {
   );
 }
 
+/* The mark stands before the alert, not inside it: what is framed is the message,
+   and the bell is what makes you look up. The one yellow the page carries. */
+function Bell(): ReactNode {
+  return (
+    <svg className="glyph glyph--alert" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M18 9a6 6 0 0 0-12 0c0 5-2 6.5-2 6.5h16S18 14 18 9Z" />
+      <path d="M10.3 19a2 2 0 0 0 3.4 0" />
+    </svg>
+  );
+}
+
+/** What the agent spawns, in the order its own feed records them. */
+const PROCS = ['node', 'rg', 'curl'];
+
 /** How long one beat holds before the session moves on, in milliseconds. */
 const BEAT_MS = 2600;
 
@@ -1222,6 +1239,21 @@ function Session(): ReactNode {
   const align = () => {
     const box = grid.current;
     if (!box || !proxy.current || !socket.current || !egressLeg.current) return;
+
+    // Stacked, the pieces this places are no longer side by side: the axis would put
+    // the hull's socket at the proxy's height, which is now several cards below it —
+    // the diamond ends up on another box. The layout does the work there, so what was
+    // written for the wide one is taken back rather than left behind.
+    if (getComputedStyle(box).gridTemplateColumns.split(' ').length === 1) {
+      socket.current.style.top = '';
+      [egressLeg.current, bindLeg.current].forEach((cell) => {
+        if (!cell) return;
+        cell.style.alignSelf = '';
+        cell.style.paddingTop = '';
+      });
+      return;
+    }
+
     const base = box.getBoundingClientRect();
     const middle = (el: Element): number => {
       const r = el.getBoundingClientRect();
@@ -1364,10 +1396,23 @@ function Session(): ReactNode {
                     <li key={item}>{item}</li>
                   ))}
                 </ul>
+                {/* `--die-with-parent`: the tree goes with the cage, so the last beat has
+                    nothing left to list rather than a frozen copy of the one before. */}
                 <pre className="hull__procs">
-                  <span className="hull__root">claude-code</span>
-                  {'\n├─ node\n├─ rg'}
-                  {at >= OPENING.length ? '\n└─ curl' : ''}
+                  {beat.cage === 'dead' ? (
+                    <span className="hull__gone">no process left</span>
+                  ) : (
+                    <>
+                      <span className="hull__root">claude-code</span>
+                      {PROCS.slice(0, at >= OPENING.length ? 3 : at >= 2 ? 2 : 0).map(
+                        (proc, i, kept) => (
+                          <span key={proc}>
+                            {`\n${i === kept.length - 1 ? '└─' : '├─'} ${proc}`}
+                          </span>
+                        ),
+                      )}
+                    </>
+                  )}
                 </pre>
                 <div className="hull__store">
                   <span className="hull__gauge">
@@ -1404,7 +1449,7 @@ function Session(): ReactNode {
                 <em>{beat.upstream}</em>
               </span>
             </div>
-            <div className="live__vleg">
+            <div className="live__vleg live__vleg--out">
               <span className={`w w--v w--v-out w--${beat.legs.upstream || 'off'}`}>
                 <i />
                 <span className="w__x" aria-hidden="true">
@@ -1428,29 +1473,38 @@ function Session(): ReactNode {
                 </span>
               </p>
             </div>
-            <div className="live__vleg">
-              <span className={`w w--v w--v-you w--${beat.legs.answer || 'off'}`}>
-                <i />
-              </span>
-            </div>
-            <div className={beat.legs.answer ? 'eg eg--you eg--acting' : 'eg eg--you'}>
-              <p className="eg__head">
-                <Terminal />
-                <b>you · your terminal</b>
-              </p>
-              <pre className="eg__term">
-                {beat.you.map((line, i) => (
-                  <span className={`eg__line eg__line--${line.kind}`} key={i}>
-                    {line.text}
-                    {'\n'}
-                  </span>
-                ))}
-              </pre>
-              {beat.alert && (
-                <p className={`eg__alert eg__alert--${beat.alert.kind}`}>{beat.alert.text}</p>
-              )}
-            </div>
           </div>
+        </div>
+
+        {/* The operator's console sits under the picture rather than in the way-out
+            column: it commands the session as a whole — it starts it, answers for it
+            and ends it — and only one beat of the seven is addressed to the proxy. */}
+        <div className={beat.legs.answer ? 'eg eg--you eg--acting' : 'eg eg--you'}>
+          <p className="eg__head">
+            <Terminal />
+            <b>you · your terminal</b>
+            <span className="eg__layer">host-side</span>
+          </p>
+          {/* Where the answer goes, and where it cannot come from: the launch binds
+              the control socket this talks to, and never binds it into the cage —
+              so a caged agent cannot answer the request it just had parked. */}
+          <p className="eg__aside">the control socket, never bound into the cage</p>
+          <pre className="eg__term">
+            {beat.you.map((line, i) => (
+              <span className={`eg__line eg__line--${line.kind}`} key={i}>
+                {line.text}
+                {'\n'}
+              </span>
+            ))}
+          </pre>
+          {beat.alert && (
+            <p className="eg__alert">
+              <Bell />
+              <span className={`eg__alert-box eg__alert-box--${beat.alert.kind}`}>
+                {beat.alert.text}
+              </span>
+            </p>
+          )}
         </div>
 
         <div className="live__feed">
