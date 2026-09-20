@@ -747,6 +747,12 @@ pub(crate) struct Resolved {
     /// posture re-derives from this for the same reason, so `sbx run --net deny` over a
     /// non-filtering baseline injects what `sbx app run <name>` would.
     ///
+    /// [`Resolved::merge_app`] upserts an app's own credentials **here** before cloning the
+    /// effective set from it, so after an overlay this holds every credential any layer declared —
+    /// which is what makes that later re-derivation whole. Holding the baseline's alone meant an
+    /// override applied after the overlay dropped the app's, and reinstated the baseline twin an
+    /// app credential had shadowed.
+    ///
     /// A one-shot override's `[secret]` section is applied to this set as well as to `secrets`
     /// ([`Resolved::apply_override`]): the `--app` view re-derives from here *after* an override
     /// has been folded in, so a set that stopped at the last config layer would describe an app as
@@ -915,15 +921,28 @@ impl Resolved {
         self.warnings
             .retain(|w| !w.contains("HTTP-header secret(s)"));
         self.warnings.extend(app.warnings);
-        // Re-derive the effective credentials from the *declared* baseline (not the posture-cleared
+        // Re-derive the effective credentials from the *declared* set (not the posture-cleared
         // `secrets`), so an app that opens a filtering posture inherits a baseline credential the
         // baseline posture would have cleared. App credentials fold through the same `(to, header)`
         // upsert a single layer uses, so an app credential shadows its baseline twin (like
         // env/packages) instead of injecting a second identical header line upstream.
-        self.secrets = self.declared_secrets.clone();
+        //
+        // The upsert lands in `declared_secrets` and the effective set is cloned from it, rather
+        // than the reverse. That set is the pre-clear one every *later* re-derivation reads, and a
+        // one-shot `[network]` override is one of them ([`Resolved::apply_override`]): folding an
+        // app's credentials into `secrets` alone left them outside it, so `sbx app run <name>
+        // --net deny` — an override that need only restate the posture already in force — injected
+        // none of them, and where one shadowed a baseline twin it put the broader baseline value
+        // back on the wire. Both silently, since that step also drops the posture warning.
         for secret in app.secrets {
-            upsert_secret(&mut self.secrets, &mut self.warnings, "app overlay", secret);
+            upsert_secret(
+                &mut self.declared_secrets,
+                &mut self.warnings,
+                "app overlay",
+                secret,
+            );
         }
+        self.secrets = self.declared_secrets.clone();
         enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
         // The app's tasks fold onto the baseline's by name — an app task shadows a baseline one of
         // the same name (like env/packages/secrets) rather than offering two operations a caller
@@ -1446,8 +1465,11 @@ impl Resolved {
         // An override that replaces the posture re-decides injection, exactly as an app overlay
         // does: drop the baseline's secret-posture warning (it judged a posture no longer in
         // effect) and re-derive the effective credentials from the *declared* set, so a launch that
-        // opens a filtering posture injects a credential the baseline posture had cleared. The
-        // re-check below re-emits the warning only if the overridden posture still drops them.
+        // opens a filtering posture injects a credential the baseline posture had cleared. On an
+        // app launch that set holds the app's own credentials as well, because `merge_app` upserts
+        // them there and runs before this — without which re-deriving here would reset the launch
+        // to the baseline's alone. The re-check below re-emits the warning only if the overridden
+        // posture still drops them.
         // Gated, because on a launch that left the posture alone the baseline verdict still stands
         // and re-deriving would only clear the set a second time and say so twice.
         if network_overridden {
@@ -4880,6 +4902,92 @@ mod a_layer_replaces_only_what_it_declares {
             1,
             "and it is said once: {:?}",
             r.warnings
+        );
+    }
+
+    /// An app's own credential survives a one-shot posture — the override half of the rule
+    /// [`Resolved::merge_app`] holds for the overlay.
+    ///
+    /// `apply_override` re-derives the effective set from `declared_secrets` whenever the launch
+    /// replaces the posture, and it runs *after* the app overlay, so the overlay has to leave the
+    /// app's credentials in that set. Folding them into `secrets` alone meant a launch that merely
+    /// restated the posture already in force injected none of them, and the same step drops the
+    /// secret-posture warning, so nothing on the terminal said so.
+    #[test]
+    fn an_app_credential_survives_a_one_shot_posture_the_launch_restates() {
+        let mut r = global(
+            "network = \"deny\"\n\
+             [app.demo]\n\
+             cmd = [\"demo\"]\n\
+             [app.demo.secret.\"api.example.com\"]\n\
+             from = \"env://DEMO_API_KEY\"\n\
+             header = \"Authorization\"\n\
+             type = \"bearer\"\n",
+        );
+        let demo = r.apps["demo"].clone();
+        r.merge_app(demo);
+        assert_eq!(
+            headers(&r.secrets),
+            vec!["Authorization"],
+            "the precondition: the overlay injects the app's own credential"
+        );
+
+        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")))
+            .expect("the override applies");
+        assert_eq!(
+            headers(&r.secrets),
+            vec!["Authorization"],
+            "an override that replaces the posture must not drop it: {:?}",
+            r.warnings
+        );
+    }
+
+    /// And the credential it keeps is the app's own, not the baseline twin that app shadowed.
+    ///
+    /// An app credential folds through the same `(to, header)` upsert a single layer uses, so a
+    /// profile narrowing a broad baseline token to a scoped one displaces it rather than adding a
+    /// second header line. Re-deriving from a declared set the overlay had never written to undid
+    /// exactly that, and the launch then reached the host holding the broad value the profile was
+    /// written to avoid — the sharper half of the same defect, since it sends a credential rather
+    /// than withholding one.
+    #[test]
+    fn a_one_shot_posture_keeps_the_app_credential_that_shadowed_its_baseline_twin() {
+        let named = |set: &[HeaderSecret]| -> Vec<String> {
+            set.iter()
+                .flat_map(|s| s.sources.iter())
+                .map(|source| match source {
+                    SecretSource::Env(name) => name.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        let mut r = global(
+            "network = \"deny\"\n\
+             [secret.\"api.example.com\"]\n\
+             from = \"env://BROAD_TOKEN\"\n\
+             header = \"Authorization\"\n\
+             type = \"bearer\"\n\
+             [app.demo]\n\
+             cmd = [\"demo\"]\n\
+             [app.demo.secret.\"api.example.com\"]\n\
+             from = \"env://NARROW_TOKEN\"\n\
+             header = \"Authorization\"\n\
+             type = \"bearer\"\n",
+        );
+        let demo = r.apps["demo"].clone();
+        r.merge_app(demo);
+        assert_eq!(
+            named(&r.secrets),
+            vec!["NARROW_TOKEN"],
+            "the precondition: the app's credential shadows its baseline twin"
+        );
+
+        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")))
+            .expect("the override applies");
+        assert_eq!(
+            named(&r.secrets),
+            vec!["NARROW_TOKEN"],
+            "the override must not put the baseline value the profile displaced back on the wire"
         );
     }
 }
