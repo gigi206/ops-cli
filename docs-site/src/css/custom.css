@@ -1554,23 +1554,6 @@ html[data-theme='dark']:root .home__ordinal {
   color: var(--keep-muted);
 }
 
-/* The path's four steps live in one box, because they are one path. */
-.home__pathbox {
-  margin-top: 2.5rem;
-  padding: 1.125rem;
-  border: 1px solid var(--keep-border);
-  border-radius: 16px;
-  background: var(--ifm-background-surface-color);
-}
-
-.home__section--tint .home__pathbox {
-  background: var(--keep-bg);
-}
-
-.home__steps--flush {
-  margin-top: 0;
-}
-
 /* Two panels of equal weight, for a block whose subject has two halves. */
 .home__panels {
   display: grid;
@@ -2599,6 +2582,385 @@ html[data-theme='dark']:root .home__ordinal {
   /* The script skips the reveal and the parallax under this preference; the cue
      is the one piece of motion declared in CSS, so it is stopped here. */
   .home__scrollcue-line {
+    animation: none;
+  }
+}
+
+
+/* The trace
+   --------------------------------------------------------------------------
+   One path, four outcomes. Two hues carry every verdict: the olive the page
+   already uses for a permitted thing, and the accent for a refused one. They
+   are never the only signal — each verdict is also spelled in words, and the
+   deciding stage is named in the rail — so the block survives being read
+   without colour.
+   ------------------------------------------------------------------------ */
+
+.trace {
+  margin-top: 2.5rem;
+  --trace-allow: var(--home-olive);
+  --trace-deny: var(--keep-accent);
+  --trace-idle: var(--keep-faint);
+}
+
+.trace__tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.trace__tab {
+  padding: 0.5rem 0.9375rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 999px;
+  background: var(--keep-bg);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  color: var(--keep-muted);
+  cursor: pointer;
+  transition:
+    border-color 160ms ease,
+    color 160ms ease,
+    background 160ms ease;
+}
+
+.trace__tab:hover {
+  border-color: var(--home-edge);
+  color: var(--keep-ink);
+}
+
+.trace__tab--on {
+  border-color: var(--keep-accent);
+  background: var(--keep-accent-soft);
+  color: var(--keep-accent);
+}
+
+/* The eight stages. A wrapping row rather than a grid: the labels differ in
+   width, and an even track would either clip `provision` or strand `trust`. */
+.trace__rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.5rem;
+  margin: 1.25rem 0 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  color: var(--trace-idle);
+}
+
+.trace__stage + .trace__stage::before {
+  content: '·';
+  margin-right: 0.5rem;
+  color: var(--keep-border-strong);
+}
+
+/* The stage that settled the selected outcome. The dot before it is the
+   marker; `--decides` also names itself in words beside it. */
+.trace__stage--decides {
+  color: var(--keep-accent);
+}
+
+.trace__stage-note {
+  color: var(--keep-muted);
+}
+
+.trace__panel {
+  margin-top: 1.25rem;
+  animation: trace-enter 320ms ease both;
+}
+
+.trace__panel:focus-visible {
+  outline: 2px solid var(--keep-accent);
+  outline-offset: 6px;
+  border-radius: 16px;
+}
+
+@keyframes trace-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.trace__lede {
+  max-width: 54rem;
+  margin: 0 0 1.5rem;
+  font-size: 1rem;
+  line-height: 1.6;
+  color: var(--keep-body);
+}
+
+/* Three columns on a wide viewport, one below it. The session column is the
+   widest because it carries wrapped prose; the other two carry short lines. */
+.trace__cols {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr 1fr;
+  gap: 1rem;
+  /* Equal heights: the three are one picture, and a ragged bottom edge would
+     read as three cards that happen to sit beside each other. */
+  align-items: stretch;
+}
+
+.trace__col {
+  overflow: hidden;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--ifm-background-surface-color);
+}
+
+.home__section--tint .trace__col {
+  background: var(--keep-bg);
+}
+
+.trace__col-bar {
+  margin: 0;
+  padding: 0.625rem 0.875rem;
+  border-bottom: 1px solid var(--keep-border);
+  background: var(--keep-code-header);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  color: var(--keep-muted);
+}
+
+/* The session is a console in both modes, like every other sample pane on the
+   page: what it quotes is what a terminal printed. */
+.trace__col--session {
+  border-color: transparent;
+  background: var(--home-code-deep);
+}
+
+.home__section--tint .trace__col--session {
+  background: var(--home-code-deep);
+}
+
+.trace__col--session .trace__col-bar {
+  border-bottom-color: rgba(230, 221, 209, 0.1);
+  background: rgba(230, 221, 209, 0.04);
+  color: var(--keep-accent);
+}
+
+.trace__session {
+  padding: 1rem 1.125rem 1.125rem;
+}
+
+.trace__ask {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--keep-code-fg);
+}
+
+.trace__intent {
+  margin: 0.375rem 0 0;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: rgba(230, 221, 209, 0.55);
+}
+
+.trace__intent::before {
+  content: '⟩ ';
+  color: var(--keep-accent);
+}
+
+.trace__lines {
+  margin: 0.875rem 0 0;
+  padding: 0.875rem 0 0;
+  border-top: 1px solid rgba(230, 221, 209, 0.1);
+  overflow-x: auto;
+  background: transparent;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  line-height: 1.85;
+  white-space: pre-wrap;
+  /* The refusal bodies are long sentences, so they wrap rather than scroll;
+     breaking inside a word would corrupt a host name or a command. */
+  overflow-wrap: break-word;
+}
+
+.trace__sigil {
+  color: var(--keep-accent);
+}
+
+.trace__line--cmd {
+  color: var(--keep-code-fg);
+}
+
+.trace__line--out {
+  color: rgba(230, 221, 209, 0.7);
+}
+
+/* What the proxy put on the wire, as against what a command printed: the
+   arrow is the difference, and the tone keeps the two apart without asking
+   the reader to tell one grey from another. */
+.trace__line--resp {
+  color: rgba(230, 221, 209, 0.82);
+}
+
+.trace__wire-sigil {
+  color: var(--keep-accent);
+}
+
+.trace__line--refusal {
+  color: var(--trace-deny);
+}
+
+.trace__line--warn {
+  color: #d9a441;
+}
+
+.trace__line--note {
+  color: rgba(230, 221, 209, 0.6);
+  font-style: italic;
+}
+
+/* The gates, in the order they decide. The left border is the verdict, so the
+   column reads top to bottom as a run of outcomes. */
+.trace__gates {
+  margin: 0;
+  padding: 0.875rem;
+  list-style: none;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.trace__gate {
+  padding: 0.625rem 0.75rem;
+  border: 1px solid var(--keep-border);
+  border-left: 3px solid var(--trace-idle);
+  border-radius: 4px 10px 10px 4px;
+}
+
+.trace__gate--allow {
+  border-left-color: var(--trace-allow);
+}
+
+.trace__gate--deny {
+  border-left-color: var(--trace-deny);
+}
+
+.trace__gate-head {
+  display: block;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-ink);
+}
+
+.trace__gate-head:hover {
+  color: var(--keep-accent);
+  text-decoration: none;
+}
+
+.trace__gate-n {
+  margin-right: 0.5rem;
+  color: var(--trace-idle);
+}
+
+.trace__gate-detail {
+  margin: 0.25rem 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: var(--keep-muted);
+}
+
+/* The wire: the cage, the proxy that answers for it, and upstream. */
+.trace__wire {
+  padding: 0.875rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.trace__cage,
+.trace__proxy,
+.trace__upstream {
+  padding: 0.625rem 0.75rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 10px;
+}
+
+.trace__proxy--allow {
+  border-color: var(--trace-allow);
+}
+
+.trace__proxy--deny {
+  border-color: var(--trace-deny);
+}
+
+/* Upstream was never contacted, so it is drawn as an outline rather than a
+   box: the dashed edge is the refusal, restated. */
+.trace__upstream--unreached {
+  border-style: dashed;
+  opacity: 0.55;
+}
+
+.trace__cage-head,
+.trace__proxy-head,
+.trace__upstream-head {
+  margin: 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-ink);
+}
+
+.trace__cage-detail,
+.trace__proxy-detail,
+.trace__upstream-detail {
+  margin: 0.25rem 0 0;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--keep-muted);
+}
+
+.trace__hop {
+  margin: 0;
+  text-align: center;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  line-height: 1.2;
+  color: var(--keep-accent);
+}
+
+/* What the host-side feeds recorded, and what you were told. Its console is
+   the same surface as the session pane, because it is the same kind of
+   evidence — except the cage can neither read nor amend this one. */
+.trace__record {
+  margin-top: 1rem;
+  overflow: hidden;
+  border-radius: 12px;
+  background: var(--home-code-deep);
+}
+
+.trace__feed {
+  margin: 0;
+  padding: 1rem 1.125rem;
+  overflow-x: auto;
+  background: transparent;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  line-height: 1.9;
+  color: var(--keep-code-fg);
+  white-space: pre;
+}
+
+.trace__host {
+  margin: 0;
+  padding: 0.75rem 1.125rem 0.9375rem;
+  border-top: 1px solid rgba(230, 221, 209, 0.1);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: rgba(230, 221, 209, 0.6);
+}
+
+@media (max-width: 62rem) {
+  .trace__cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The scenarios still switch; what stops is the panel sliding in, which is
+     decoration over a change the tabs already announce. */
+  .trace__panel {
     animation: none;
   }
 }

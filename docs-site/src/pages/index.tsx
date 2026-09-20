@@ -44,6 +44,7 @@ const COMMAND = ['sbx app import opencode.toml', 'sbx app run opencode'];
 // no script at all; what the script adds is only which dot is lit.
 const RAIL: { id: string; label: string }[] = [
   { id: 'preflight', label: 'Preflight' },
+  { id: 'trace', label: 'The trace' },
   { id: 'bind-layout', label: 'The bind layout' },
   { id: 'trust-gate', label: 'The trust gate' },
   { id: 'enforcement', label: 'Enforcement stack' },
@@ -54,6 +55,226 @@ const RAIL: { id: string; label: string }[] = [
   { id: 'apps', label: 'Apps and profiles' },
   { id: 'observability', label: 'Observability' },
   { id: 'desktop', label: 'The desktop hole' },
+];
+
+// ---------------------------------------------------------------------------
+// The trace: one command, followed through the cage.
+//
+// Four outcomes over one path, because the system is legible through its
+// refusals rather than its happy path. Every string a pane quotes is the
+// binary's, on the rule the transcript above already follows:
+//
+//   - a refusal is quoted as `write_refusal` puts it on the wire — the status
+//     line, the machine-readable `X-Sbx-Egress-Reason`, and `refusal_body`'s
+//     prefixed sentence — carrying `Refusal::body`'s own `DeniedDefault` text,
+//     down to the asymmetry between the backquoted `host:port` and the
+//     suggestion beside it, which elides the default port (`rule_destination`);
+//   - the trust warning is `config::gate::refuse_untrusted`, whose reason comes
+//     from `untrusted_reason`;
+//   - the feed lines carry `control::LogVerdict`'s own tokens (`allow`, `deny`)
+//     and the proxy's reason (`no-rule`), in the column order `sbx logs` prints.
+//
+// The stages are sbx's real sequence, which spans a launch and the request that
+// follows it: the trust gate decides before anything runs, and the proxy decides
+// per request. A scenario names the stage that settled it, which is why the
+// untrusted one is settled at `trust` while the other three are settled on the
+// wire.
+const TRACE_STAGES: { id: string; label: string }[] = [
+  { id: 'trust', label: 'trust' },
+  { id: 'provision', label: 'provision' },
+  { id: 'bind', label: 'bind' },
+  { id: 'spawn', label: 'spawn' },
+  { id: 'request', label: 'request' },
+  { id: 'inspect', label: 'inspect' },
+  { id: 'verdict', label: 'verdict' },
+  { id: 'observe', label: 'observe' },
+];
+
+type TraceVerdict = 'allow' | 'deny' | 'idle';
+
+type TraceScenario = {
+  id: string;
+  tab: string;
+  /** The stage that settled this outcome; the rail marks it. */
+  decides: string;
+  /** What the scenario demonstrates, in one sentence, above the panes. */
+  lede: string;
+  /** The left pane: what was asked, and what came back. */
+  session: {
+    /** Whose pane it is — an agent's session, or the launch itself. */
+    label: string;
+    ask: string;
+    intent?: string;
+    lines: { kind: 'cmd' | 'out' | 'resp' | 'refusal' | 'warn' | 'note'; text: string }[];
+  };
+  /** The middle pane: what decided, in the order it decided. */
+  gates: { n: string; name: string; detail: string; verdict: TraceVerdict; to: string }[];
+  /** The right pane: the cage, the proxy that answers for it, and upstream. */
+  wire: { proxy: string; verdict: TraceVerdict; upstream: string; reached: boolean };
+  /** The bottom strip: what the host-side feeds recorded. */
+  feed: { at: string; feed: string; token: string; subject: string }[];
+  /** What the person running sbx is told, when that differs from what the cage sees. */
+  host?: string;
+};
+
+// The gates every scenario passes before the wire. Only their verdicts and the
+// egress rule differ, so the three constant ones are written once.
+const GATE_TRUST = { n: '01', name: 'trust', to: '/docs/concepts/trust' };
+const GATE_BIND = { n: '02', name: 'bind layout', to: '/docs/concepts/security-model' };
+const GATE_SECCOMP = { n: '03', name: 'seccomp', to: '/docs/configuration/seccomp' };
+const GATE_EGRESS = { n: '04', name: 'egress rule', to: '/docs/networking/rules' };
+
+const TRACES: TraceScenario[] = [
+  {
+    id: 'allowed',
+    tab: 'allowed',
+    decides: 'verdict',
+    lede:
+      'A rule names the host, so the request leaves through the one socket the cage has, and the proxy validates the upstream certificate against the system trust store.',
+    session: {
+      label: 'agent session',
+      ask: 'List the models the API offers.',
+      intent: 'I will call the Anthropic API.',
+      lines: [
+        { kind: 'cmd', text: 'curl -sI https://api.anthropic.com/v1/models' },
+        { kind: 'resp', text: 'HTTP/2 200' },
+      ],
+    },
+    gates: [
+      { ...GATE_TRUST, detail: '.sbx.toml approved — its SHA-256 still matches', verdict: 'allow' },
+      { ...GATE_BIND, detail: 'the project tree, the store, the egress socket', verdict: 'allow' },
+      { ...GATE_SECCOMP, detail: 'two cBPF filters, default-allow', verdict: 'allow' },
+      { ...GATE_EGRESS, detail: 'allow api.anthropic.com', verdict: 'allow' },
+    ],
+    wire: {
+      proxy: 'CONNECT api.anthropic.com:443 · inspected',
+      verdict: 'allow',
+      upstream: 'api.anthropic.com',
+      reached: true,
+    },
+    feed: [{ at: '12:04:29', feed: 'net', token: 'allow', subject: 'api.anthropic.com:443' }],
+  },
+  {
+    id: 'secret',
+    tab: 'secret brokered',
+    decides: 'inspect',
+    lede:
+      'The credential is resolved host-side at launch and injected inside the proxy. The cage is handed a capability toward one host, never the secret — so there is nothing in it to exfiltrate.',
+    session: {
+      label: 'agent session',
+      ask: 'Open an issue on the repository.',
+      intent: 'I will need a GitHub token.',
+      lines: [
+        { kind: 'cmd', text: 'env | grep -i token' },
+        { kind: 'note', text: 'nothing: the token was never bound in' },
+        { kind: 'cmd', text: "curl -s -o /dev/null -w '%{http_code}' https://api.github.com/user" },
+        { kind: 'out', text: '200' },
+        { kind: 'note', text: 'Authorization was added host-side, inside the proxy' },
+      ],
+    },
+    gates: [
+      { ...GATE_TRUST, detail: '.sbx.toml approved — [secret] applies', verdict: 'allow' },
+      { ...GATE_BIND, detail: 'declared secrets: absent from the cage in plaintext', verdict: 'allow' },
+      { ...GATE_SECCOMP, detail: 'two cBPF filters, default-allow', verdict: 'allow' },
+      { ...GATE_EGRESS, detail: 'allow api.github.com', verdict: 'allow' },
+    ],
+    wire: {
+      proxy: 'broker injects `Authorization` · bearer',
+      verdict: 'allow',
+      upstream: 'api.github.com',
+      reached: true,
+    },
+    feed: [{ at: '12:06:02', feed: 'net', token: 'allow', subject: 'api.github.com:443' }],
+    host: 'The plaintext lives in sbx’s own memory for the length of the request, and in no file the cage can name.',
+  },
+  {
+    id: 'denied',
+    tab: 'egress denied',
+    decides: 'verdict',
+    lede:
+      'No rule names the host. The proxy answers the cage with a 403 whose body carries the command that would allow it — and raises a host-side notification, because an agent is under no obligation to surface a refusal.',
+    session: {
+      label: 'agent session',
+      ask: 'Post the results to our metrics endpoint.',
+      intent: 'I will call api.example.com.',
+      lines: [
+        { kind: 'cmd', text: 'curl -s https://api.example.com' },
+        { kind: 'resp', text: 'HTTP/1.1 403 Forbidden' },
+        { kind: 'resp', text: 'X-Sbx-Egress-Reason: denied-default' },
+        {
+          kind: 'refusal',
+          text:
+            'sbx egress refused this request: `api.example.com:443` is not allowed by the network policy. Allow it: sbx net allow api.example.com',
+        },
+      ],
+    },
+    gates: [
+      { ...GATE_TRUST, detail: '.sbx.toml approved — its SHA-256 still matches', verdict: 'allow' },
+      { ...GATE_BIND, detail: 'the project tree, the store, the egress socket', verdict: 'allow' },
+      { ...GATE_SECCOMP, detail: 'two cBPF filters, default-allow', verdict: 'allow' },
+      { ...GATE_EGRESS, detail: 'no rule names api.example.com', verdict: 'deny' },
+    ],
+    wire: {
+      proxy: 'CONNECT api.example.com:443 · denied-default',
+      verdict: 'deny',
+      upstream: 'api.example.com',
+      reached: false,
+    },
+    feed: [
+      { at: '12:04:31', feed: 'proc', token: 'observe', subject: 'curl -s https://api.example.com' },
+      { at: '12:04:31', feed: 'net', token: 'deny', subject: 'api.example.com:443  (no-rule)' },
+    ],
+    host: 'sbx notifies you separately: a boundary nobody hears about is one that looks like it never bit.',
+  },
+  {
+    id: 'untrusted',
+    tab: 'untrusted .sbx.toml',
+    decides: 'trust',
+    lede:
+      'The project declared a network posture. Approval is bound to the file’s content hash, so an unapproved file keeps its free fields and loses every security one: the launch goes ahead, without what the file asked for.',
+    session: {
+      label: 'your shell',
+      ask: 'The project ships a .sbx.toml declaring `network`.',
+      lines: [
+        { kind: 'cmd', text: 'sbx run -- curl -s https://api.example.com' },
+        {
+          kind: 'warn',
+          text: '.sbx.toml: ignoring `network` policy (untrusted — run `sbx trust`)',
+        },
+        { kind: 'resp', text: 'HTTP/1.1 403 Forbidden' },
+        {
+          kind: 'refusal',
+          text:
+            'sbx egress refused this request: `api.example.com:443` is not allowed by the network policy. Allow it: sbx net allow api.example.com',
+        },
+        { kind: 'note', text: 'the policy the project declared never applied' },
+      ],
+    },
+    gates: [
+      {
+        ...GATE_TRUST,
+        detail: 'untrusted: every security field dropped, with a warning',
+        verdict: 'deny',
+      },
+      { ...GATE_BIND, detail: 'the default layout — no trusted [binds] applied', verdict: 'idle' },
+      { ...GATE_SECCOMP, detail: 'always on: trust changes nothing here', verdict: 'allow' },
+      {
+        ...GATE_EGRESS,
+        detail: 'the built-in self-equip set, not the declared policy',
+        verdict: 'deny',
+      },
+    ],
+    wire: {
+      proxy: 'CONNECT api.example.com:443 · denied-default',
+      verdict: 'deny',
+      upstream: 'api.example.com',
+      reached: false,
+    },
+    feed: [
+      { at: '09:12:07', feed: 'net', token: 'deny', subject: 'api.example.com:443  (no-rule)' },
+    ],
+    host: 'sbx trust binds approval to the file’s SHA-256. Edit the file and trust is re-armed, on the direnv model.',
+  },
 ];
 
 // The bind zones of concepts/security-model, as the cage sees them. The egress
@@ -75,26 +296,6 @@ const ABSENT = [
   'every capability (cap-drop ALL)',
   'host device nodes',
   'declared secrets, in plaintext',
-];
-
-// The trust gate's three states, in the order a project meets them.
-const TRUST_STEPS: { n: string; head: string; detail: string; now?: boolean }[] = [
-  {
-    n: '01',
-    head: '.sbx.toml, as found',
-    detail: 'Free fields apply. Every security field is dropped, with a warning.',
-  },
-  {
-    n: '02',
-    head: 'sbx trust .sbx.toml',
-    detail: "The approval is a SHA-256 of the whole file, never a parsed subset.",
-    now: true,
-  },
-  {
-    n: '03',
-    head: 'the file changes',
-    detail: 'Trust is re-armed, and the security fields go back to being dropped.',
-  },
 ];
 
 // The split of concepts/trust, in the two panels the gate actually has. `[fs]`
@@ -354,29 +555,6 @@ const PACKAGES_SAMPLE = `[packages]
 jq       = "nix:jq"
 ripgrep  = "mise:aqua:BurntSushi/ripgrep"
 myagent  = "flake:github:owner/repo#default"`;
-
-// The one path out of an empty netns, in the order a request travels it. Both
-// ends are lit: the cage it leaves and the proxy that decides for it.
-const EGRESS_PATH: { n: string; head: string; detail: string; now?: boolean }[] = [
-  {
-    n: '01',
-    head: 'the cage',
-    detail: 'empty netns · in-cage socat relays 127.0.0.1:18043',
-    now: true,
-  },
-  { n: '02', head: 'unix socket', detail: 'the only thing bound in' },
-  {
-    n: '03',
-    head: 'sbx CONNECT proxy',
-    detail: 'host-side MITM · per-session cage-only CA · host, port, path, method, regex',
-    now: true,
-  },
-  {
-    n: '04',
-    head: 'upstream',
-    detail: 'certificate validated against the system trust store',
-  },
-];
 
 const MODES: { mode: string; tag?: string; reach: string; proxy: string; use: string }[] = [
   {
@@ -878,6 +1056,200 @@ function Transcript(): ReactNode {
   );
 }
 
+/**
+ * The trace: four outcomes over one path.
+ *
+ * A tablist, on the WAI-ARIA pattern: arrows move between the scenarios and the
+ * panel below is what changes. Only one panel is mounted at a time, so what the
+ * reader has is what the page is showing — there is no hidden copy of the other
+ * three for a find-in-page to land in.
+ *
+ * Every visual state is a class the markup carries, never a measurement, so the
+ * block renders identically on the server and needs no effect to settle. The
+ * transition between scenarios is a CSS animation on the panel, which
+ * `prefers-reduced-motion` drops entirely in the stylesheet.
+ */
+function Trace(): ReactNode {
+  const [active, setActive] = useState(0);
+  const tabs = useRef<(HTMLButtonElement | null)[]>([]);
+  const trace = TRACES[active];
+
+  // Arrows, Home and End move the selection, as the tablist pattern requires;
+  // the browser's own Tab still leaves the list for the panel.
+  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    const last = TRACES.length - 1;
+    const next =
+      event.key === 'ArrowRight'
+        ? (active + 1) % TRACES.length
+        : event.key === 'ArrowLeft'
+          ? (active + last) % TRACES.length
+          : event.key === 'Home'
+            ? 0
+            : event.key === 'End'
+              ? last
+              : -1;
+    if (next < 0) return;
+    event.preventDefault();
+    setActive(next);
+    tabs.current[next]?.focus();
+  };
+
+  return (
+    <div className="trace">
+      <div className="trace__tabs" role="tablist" aria-label="What the cage did" onKeyDown={onKeyDown}>
+        {TRACES.map(({ id, tab }, i) => (
+          <button
+            type="button"
+            key={id}
+            role="tab"
+            id={`trace-tab-${id}`}
+            aria-selected={i === active}
+            /* Only the selected panel is mounted, so only the selected tab may
+               claim to control one: an `aria-controls` pointing at an absent id
+               is a dangling reference the other three would each carry. */
+            aria-controls={i === active ? `trace-panel-${id}` : undefined}
+            tabIndex={i === active ? 0 : -1}
+            ref={(node) => {
+              tabs.current[i] = node;
+            }}
+            className={
+              i === active ? 'trace__tab trace__tab--on' : 'trace__tab'
+            }
+            onClick={() => setActive(i)}
+          >
+            {tab}
+          </button>
+        ))}
+      </div>
+
+      {/* The stages, with the one that settled this scenario marked. It is a
+          list rather than a row of divs because that is what it is: eight
+          ordered steps, one of them called out. */}
+      <ol className="trace__rail" aria-label="Stages, and where this outcome was settled">
+        {TRACE_STAGES.map(({ id, label }) => {
+          const decides = id === trace.decides;
+          return (
+            <li
+              className={decides ? 'trace__stage trace__stage--decides' : 'trace__stage'}
+              key={id}
+            >
+              {label}
+              {decides && <span className="trace__stage-note"> (settled here)</span>}
+            </li>
+          );
+        })}
+      </ol>
+
+      <div
+        className="trace__panel"
+        role="tabpanel"
+        id={`trace-panel-${trace.id}`}
+        aria-labelledby={`trace-tab-${trace.id}`}
+        /* Keyed on the scenario so React remounts the panel: the entry
+           animation should replay on every change, which it would not if the
+           nodes were reused. */
+        key={trace.id}
+        tabIndex={0}
+      >
+        <p className="trace__lede">{trace.lede}</p>
+
+        <div className="trace__cols">
+          {/* Left: what was asked, and what came back. */}
+          <div className="trace__col trace__col--session">
+            <p className="trace__col-bar">{trace.session.label}</p>
+            <div className="trace__session">
+              <p className="trace__ask">{trace.session.ask}</p>
+              {trace.session.intent && (
+                <p className="trace__intent">{trace.session.intent}</p>
+              )}
+              <pre className="trace__lines">
+                {trace.session.lines.map(({ kind, text }, i) => (
+                  <span className={`trace__line trace__line--${kind}`} key={i}>
+                    {kind === 'cmd' && <span className="trace__sigil">$ </span>}
+                    {kind === 'resp' && <span className="trace__wire-sigil">← </span>}
+                    {text}
+                    {'\n'}
+                  </span>
+                ))}
+              </pre>
+            </div>
+          </div>
+
+          {/* Middle: what decided, in the order it decided. */}
+          <div className="trace__col trace__col--gates">
+            <p className="trace__col-bar">sbx · what decides</p>
+            <ol className="trace__gates">
+              {trace.gates.map(({ n, name, detail, verdict, to }) => (
+                <li className={`trace__gate trace__gate--${verdict}`} key={n}>
+                  <Link className="trace__gate-head" to={to}>
+                    <span className="trace__gate-n">{n}</span>
+                    {name}
+                  </Link>
+                  <p className="trace__gate-detail">{detail}</p>
+                </li>
+              ))}
+            </ol>
+          </div>
+
+          {/* Right: the cage, the proxy that answers for it, and upstream. */}
+          <div className="trace__col trace__col--wire">
+            <p className="trace__col-bar">the cage, and the one way out</p>
+            <div className="trace__wire">
+              <div className="trace__cage">
+                <p className="trace__cage-head">bubblewrap · uid = yours</p>
+                <p className="trace__cage-detail">
+                  empty netns · no route, no resolver · one bound Unix socket
+                </p>
+              </div>
+              <p className="trace__hop" aria-hidden="true">
+                ↓
+              </p>
+              <div className={`trace__proxy trace__proxy--${trace.wire.verdict}`}>
+                <p className="trace__proxy-head">sbx CONNECT proxy · host-side</p>
+                <p className="trace__proxy-detail">{trace.wire.proxy}</p>
+              </div>
+              <p className="trace__hop" aria-hidden="true">
+                {trace.wire.reached ? '↓' : '✕'}
+              </p>
+              <div
+                className={
+                  trace.wire.reached
+                    ? 'trace__upstream'
+                    : 'trace__upstream trace__upstream--unreached'
+                }
+              >
+                <p className="trace__upstream-head">{trace.wire.upstream}</p>
+                <p className="trace__upstream-detail">
+                  {trace.wire.reached
+                    ? 'certificate validated against the system trust store'
+                    : 'never contacted: the refusal is local to the proxy'}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Bottom: what the host-side feeds recorded, and what you were told. */}
+        <div className="trace__record">
+          <pre className="trace__feed">
+            {trace.feed.map(({ at, feed, token, subject }) => (
+              <span key={`${at}${feed}${subject}`}>
+                <span className="home__feed-at">{at}</span>
+                {'  '}
+                <span className="home__feed-name">{feed.padEnd(5)}</span>
+                <span className="home__feed-token">{token.padEnd(8)}</span>
+                {subject}
+                {'\n'}
+              </span>
+            ))}
+          </pre>
+          {trace.host && <p className="trace__host">{trace.host}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Home(): ReactNode {
   const { siteConfig } = useDocusaurusContext();
   const heroVideo = useHeroVideo(useBaseUrl(HERO_VIDEO));
@@ -985,7 +1357,42 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section home__section--tint" id="bind-layout">
+        {/* The canonical pass over the whole path. It carries no ordinal: the
+            numbered blocks below are the subsystems, and this is the map they
+            are read against — each of its gates links into the block that owns
+            it. */}
+        <section className="home__section home__section--tint" id="trace">
+          <div className="home__inner">
+            <div className="home__section-head" data-reveal>
+              <div>
+                <p className="home__kicker home__kicker--accent">the trace</p>
+                <h2 className="home__section-title home__section-title--flush">
+                  One command, four ways it can end.
+                </h2>
+              </div>
+              <p className="home__aside home__aside--side">
+                The same path every time: a trust gate that decides before anything runs, a
+                bind layout, an always-on filter, and a proxy that answers per request. What
+                changes is where it is settled — and what the agent is handed back.
+              </p>
+            </div>
+
+            <div data-reveal>
+              <Trace />
+            </div>
+
+            <Source
+              pages={[
+                { path: 'concepts/security-model', to: '/docs/concepts/security-model' },
+                { path: 'concepts/trust', to: '/docs/concepts/trust' },
+                { path: 'networking/rules', to: '/docs/networking/rules' },
+                { path: 'secrets/injection', to: '/docs/secrets/injection' },
+              ]}
+            />
+          </div>
+        </section>
+
+        <section className="home__section" id="bind-layout">
           <div className="home__inner">
             <div className="home__split">
               <div className="home__split-aside" data-reveal>
@@ -1036,7 +1443,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section" id="trust-gate">
+        <section className="home__section home__section--tint" id="trust-gate">
           <div className="home__inner">
             <div className="home__section-head" data-reveal>
               <div>
@@ -1048,23 +1455,10 @@ export default function Home(): ReactNode {
               <p className="home__aside home__aside--side">
                 Approval is bound to the file's content hash and re-armed whenever the file
                 changes, so a security field applies only while you have vouched for the exact
-                bytes that declare it.
+                bytes that declare it. <a href="#trace">The trace</a> follows what an
+                unapproved file costs at launch; what this block carries is the field list the
+                gate decides over.
               </p>
-            </div>
-
-            <div className="home__steps" data-reveal data-stagger="90">
-              {TRUST_STEPS.map(({ n, head, detail, now }) => (
-                <div
-                  className={now ? 'home__step home__step--now' : 'home__step'}
-                  key={n}
-                >
-                  <p className="home__step-head">
-                    <span className="home__step-n">{n} · </span>
-                    {head}
-                  </p>
-                  <p className="home__step-detail">{detail}</p>
-                </div>
-              ))}
             </div>
 
             <div className="home__groups">
@@ -1105,7 +1499,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section home__section--tint" id="enforcement">
+        <section className="home__section" id="enforcement">
           <div className="home__inner">
             <div data-reveal>
               <Ordinal n="03" label="defense in depth" />
@@ -1116,7 +1510,8 @@ export default function Home(): ReactNode {
                 None of them is a toggle, and none replaces the bind layout: they bound what a
                 mistake in it can become. The fourth vetoes what the agent spawns, and is
                 trusted-only because an untrusted project may not forge the enforcement of its
-                own agent.
+                own agent. <a href="#trace">The trace</a> shows the always-on three holding
+                on every one of its four outcomes, the unapproved project included.
               </p>
             </div>
             <div className="home__layers" data-reveal data-stagger="120">
@@ -1153,7 +1548,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section" id="provisioning">
+        <section className="home__section home__section--tint" id="provisioning">
           <div className="home__inner">
             <div className="home__profile">
               <div data-reveal>
@@ -1190,7 +1585,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section home__section--tint" id="egress">
+        <section className="home__section" id="egress">
           <div className="home__inner">
             <div className="home__section-head" data-reveal>
               <div>
@@ -1201,24 +1596,10 @@ export default function Home(): ReactNode {
               </div>
               <p className="home__aside home__aside--side">
                 No interface but loopback, no route, no DNS resolver. Nothing leaves by
-                construction, so a misconfiguration fails closed rather than open.
+                construction, so a misconfiguration fails closed rather than open.{' '}
+                <a href="#trace">The trace</a> walks one request down that path; what
+                follows is the policy surface it is decided against.
               </p>
-            </div>
-
-            {/* Boxed, because these four are one path rather than four
-                independent facts: the container is what says so. */}
-            <div className="home__pathbox" data-reveal>
-              <div className="home__steps home__steps--flush" data-reveal data-stagger="90">
-                {EGRESS_PATH.map(({ n, head, detail, now }) => (
-                  <div className={now ? 'home__step home__step--now' : 'home__step'} key={n}>
-                    <p className="home__step-head">
-                      <span className="home__step-n">{n} · </span>
-                      {head}
-                    </p>
-                    <p className="home__step-detail">{detail}</p>
-                  </div>
-                ))}
-              </div>
             </div>
 
             <p className="home__subhead" data-reveal>
@@ -1349,7 +1730,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section" id="secrets">
+        <section className="home__section home__section--tint" id="secrets">
           <div className="home__inner">
             <div className="home__section-head" data-reveal>
               <div>
@@ -1423,7 +1804,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section home__section--tint" id="tasks">
+        <section className="home__section" id="tasks">
           <div className="home__inner">
             <div className="home__profile home__profile--code-left">
               <div className="home__profile-code" data-reveal>
@@ -1462,7 +1843,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section" id="apps">
+        <section className="home__section home__section--tint" id="apps">
           <div className="home__inner">
             <div className="home__profile">
               <div data-reveal>
@@ -1506,7 +1887,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section home__section--tint" id="observability">
+        <section className="home__section" id="observability">
           <div className="home__inner">
             <div className="home__section-head" data-reveal>
               <div>
@@ -1575,7 +1956,7 @@ export default function Home(): ReactNode {
           </div>
         </section>
 
-        <section className="home__section" id="desktop">
+        <section className="home__section home__section--tint" id="desktop">
           <div className="home__inner">
             <div data-reveal>
               <Ordinal n="10" label="the desktop hole, and the registry" />
