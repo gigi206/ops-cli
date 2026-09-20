@@ -63,6 +63,25 @@ impl Origin {
     }
 }
 
+/// Which lock file a target pins its source in — the axis [`Origin`] does not answer.
+///
+/// `Origin` says where the *source* was chosen; this says who resolves it at launch. The two are
+/// independent: an app's target carries the global source (`nixpkgs` under an app is a refused key)
+/// in a lock of its own. A roll replaces a revision in exactly one lock, so this is also what says
+/// whose store paths that roll moved — the global lock is what a cage naming no app resolves, and
+/// is otherwise only the seed a first app or engine lock is written from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// The shared data-dir lock.
+    Global,
+    /// A trusted project's pin, in its per-project lock — inherited by every app launched there.
+    Project,
+    /// One app's own lock, resolved by that app and by no other.
+    App,
+    /// The mise engine's dedicated lock, so rolling the engine never bumps the base.
+    Engine,
+}
+
 /// The single channel a launch resolves against: a concrete `source` and the lock
 /// file that pins it, plus where the source came from (for display). One launch uses
 /// exactly one of these for the **whole** sandbox — base userland and tools alike.
@@ -89,6 +108,9 @@ pub(crate) struct LockTarget {
     /// So the seed is not a cache: it is what makes the carve-out invisible until something is
     /// rolled on purpose. `None` for the two targets that were always their own source of truth.
     seed_from: Option<PathBuf>,
+    /// Which lock `lock_path` is, named rather than inferred from the path, so a caller asking
+    /// whose revision a roll replaced reads the answer off the target it rolled.
+    scope: Scope,
 }
 
 impl LockTarget {
@@ -101,6 +123,7 @@ impl LockTarget {
             lock_path: global_lock_path(layout),
             origin,
             seed_from: None,
+            scope: Scope::Global,
         }
     }
 
@@ -126,6 +149,7 @@ impl LockTarget {
             lock_path: engine_lock_path(layout),
             origin,
             seed_from: Some(global_lock_path(layout)),
+            scope: Scope::Engine,
         }
     }
 
@@ -137,6 +161,7 @@ impl LockTarget {
             lock_path: project_lock_path(layout, project_id),
             origin: Origin::ProjectPin,
             seed_from: None,
+            scope: Scope::Project,
         }
     }
 
@@ -164,6 +189,7 @@ impl LockTarget {
             lock_path: app_lock_path(layout, name)?,
             origin,
             seed_from: Some(global_lock_path(layout)),
+            scope: Scope::App,
         })
     }
 
@@ -175,6 +201,11 @@ impl LockTarget {
     /// Where this source was chosen.
     pub(crate) fn origin(&self) -> Origin {
         self.origin
+    }
+
+    /// Which lock pins this source, and therefore who resolves the revision it records.
+    pub(crate) fn scope(&self) -> Scope {
+        self.scope
     }
 
     /// The revision currently locked for **this** source — `None` when no lock exists

@@ -1890,6 +1890,14 @@ pub(super) const PAGES: &[Page] = &[
             nixpkgs revision, the mise engine with the project's tools and task pool, and the\n\
             distribution image — plus `provision`, which is not a backend at all.\n\
             \n\
+            THE BASE CHANNEL IS THE ONE PLACE `all` IS NOT THE UNION OF THE PER-APP ROLLS. An\n\
+            app is pinned in a base lock of its own the first time it launches, seeded from the\n\
+            shared one. An unscoped roll refreshes the shared lock — what a cage naming no app\n\
+            resolves — and leaves every app's own pin exactly where it is. That is the point of\n\
+            the per-app lock: an app advances when it is named, not when something else rolls.\n\
+            So a roll says how many apps its revision left behind, and `nix -a <name>` is what\n\
+            advances one. An app seeded at the revision the roll confirmed is not among them.\n\
+            \n\
             `nix --app <name>` is refused in a project that pins `nixpkgs`. A pin outranks an\n\
             app's own lock, because an app launch builds the project's declared packages too and\n\
             those must come from the pinned revision — so there is no app-only revision to roll\n\

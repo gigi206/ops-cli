@@ -172,11 +172,11 @@ pub(crate) use nixhub::{ToolUpgrade, current_system, parse_nix_tools, upgrade_to
 /// because the host-side process view (`sbx proc ls`) renders the same argv the exec feed does, from
 /// outside this module, and a second definition of the rule is how the two would come to disagree.
 pub(crate) use observe_feed::sanitize;
-/// The sibling selector, exported for one guard rather than for a caller: an inline
-/// `[flakes.<name>]` is advanced by no roll at all *because* this is what the `flake:` roll
-/// selects, and the test that pins that asserts it against this function rather than against a
-/// restatement of the rule.
-#[cfg(test)]
+/// The `flake:` references a set of packages rides, withheld ones dropped. Re-exported for the
+/// same reason as its `mise:` sibling below: `sbx upgrade`'s closing note asks which apps a
+/// replaced flake pin repointed, and it must ask the selection the roll actually makes rather than
+/// a lookalike — an inline `[flakes.<name>]` is advanced by no roll at all *because* this is what
+/// the `flake:` roll selects. The guard that pins that asserts it against this function too.
 pub(crate) use packages::flake_packages;
 /// The `mise:` tokens a set of packages equips, untrusted ones withheld. Re-exported so `sbx
 /// upgrade --app` can ask the same question the roll asks rather than a lookalike of its own.

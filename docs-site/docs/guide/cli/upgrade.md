@@ -61,15 +61,18 @@ the channel, `flake` builds through `nix build`, and `mise` re-resolves the proj
 one that is gone: a virtualenv is the clear case, since its `bin/python` is a symlink
 into the store. When such a roll replaces a revision that was locked before, the run
 closes by naming the apps whose [install
-steps](../configuration/bundles#the-install-step) build against those paths:
+steps](../configuration/bundles#the-install-step) build against those paths, and only
+those: the three do not repoint the same paths. A replaced `flake:` pin reaches the apps
+riding one; the project's `nix:` tools are equipped in every cage, so they reach all of
+them; a base revision reaches an app only through [the lock that app
+resolves](#an-apps-base-channel), which is not the one an unscoped roll refreshes.
 
 ```
-sbx upgrade — nix channel
-  channel: nixos-unstable  (default)
-  rolled forward 1111111 → 0e251e2 — the new base and tools download on the next launch.
-  the store paths moved: the install steps of odysseus build against them, so an app home
-  may now hold a reference to a path that is gone. Each repairs itself at its next launch
-  — or now, with `sbx upgrade provision`.
+sbx upgrade — flake packages
+  flake:github:owner/agent#desktop: 1111111 → 0e251e2 — rolled forward.
+  the store paths moved: the install steps of agent-desktop build against them, so an app
+  home may now hold a reference to a path that is gone. Each repairs itself at its next
+  launch — or now, with `sbx upgrade provision`.
 ```
 
 It is a pointer, not a failure: each home repairs itself the next time the app launches,
@@ -148,6 +151,20 @@ packages resolve against a lock of the app's own, so:
 The first time an app runs, its lock is seeded from the global channel's, so an app that
 existed before this and an app created today both start where the base already is.
 Nothing moves it afterwards but a roll naming it.
+
+An unscoped roll says how many apps its revision left behind, so a run that deliberately
+leaves them alone never reads as one that covered them:
+
+```
+sbx upgrade — nix channel
+  channel: nixos-unstable  (default)
+  rolled forward 1111111 → 0e251e2 — the new base and tools download on the next launch.
+  4 app(s) are pinned on another revision and not rolled here — `sbx upgrade nix -a <name>`
+  advances one.
+```
+
+An app seeded at the revision the roll confirmed is not counted: it is already where
+naming it would put it, so the line is absent on an installation with nothing behind.
 
 `sbx upgrade nix --app <name>` is refused in a project that **pins** `nixpkgs`. A pin
 outranks an app's own lock, because an app launch also builds the project's declared

@@ -276,14 +276,17 @@ fn run_upgrade(
     // early-returning.
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut ok = true;
-    // Whether this run replaced a locked revision, and so repointed store paths. Tracked across
-    // the three channels that build through nix — `nix`, `mise` (its project `nix:` tools) and
-    // `flake` — and read once at the close (below).
-    let mut moved_store_paths = false;
+    // What this run replaced, and so repointed store paths for. Tracked across the three channels
+    // that build through nix — `nix`, `mise` (its project `nix:` tools) and `flake` — and kept
+    // apart by what each one reaches, because they do not reach the same homes. Read once at the
+    // close (below).
+    let mut moved = Moved::default();
     if matches!(what, "nix" | "all") {
-        let roll = upgrade_nix_channel(&nix, &layout, &cwd, &cfg, only, &pal);
+        let (roll, scope) = upgrade_nix_channel(&nix, &layout, &cwd, &cfg, only, &pal);
         ok &= roll.ok;
-        moved_store_paths |= roll.moved;
+        if roll.moved {
+            moved.base = scope;
+        }
     }
     if matches!(what, "mise" | "all") {
         // Under `--app`, the engine and the project's `nix:` tools are deliberately left alone:
@@ -297,7 +300,7 @@ fn run_upgrade(
             ok &= upgrade_mise_engine(&nix, &layout, &cfg, &pal);
             let roll = upgrade_mise_tools(&nix, &layout, &cwd, &cfg, &pal);
             ok &= roll.ok;
-            moved_store_paths |= roll.moved;
+            moved.project_tools |= roll.moved;
         }
         // The project's and apps' `mise:` `[packages]` are equipped in-cage, not host-side, so
         // their roll runs `mise upgrade` inside a cage (per home) rather than rewriting a lock.
@@ -312,7 +315,7 @@ fn run_upgrade(
         // in-cage at the next launch), like the `nix:` tools.
         let roll = upgrade_flake_packages(&nix, &layout, &cwd, &cfg, only, &pal);
         ok &= roll.ok;
-        moved_store_paths |= roll.moved;
+        moved.flake |= roll.moved;
     }
     if matches!(what, "all") {
         // The project's and apps' `deb:` `[packages]` re-resolve their `.deb` URL to a new content
@@ -376,8 +379,8 @@ fn run_upgrade(
         }
         ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, only, force);
     }
-    match closing_note(what, moved_store_paths) {
-        ClosingNote::StoreMoved => store_moved_hint(&cfg, only, &pal),
+    match closing_note(what, moved) {
+        ClosingNote::StoreMoved => store_moved_hint(&cfg, only, moved, &pal),
         ClosingNote::None => {}
     }
     // A roll is what eventually supersedes a build. Point the user at `sbx gc --prune` when the
@@ -410,7 +413,7 @@ enum ClosingNote {
 /// The scope is bounded by which channels can report a move at all: [`upgrade_nix_channel`],
 /// [`upgrade_mise_tools`] and [`upgrade_flake_packages`] are the three that return a [`Roll`], and
 /// they are exactly the three the `StoreMoved` arm below names — plus `all`, which runs them.
-fn closing_note(what: &str, moved_store_paths: bool) -> ClosingNote {
+fn closing_note(what: &str, moved: Moved) -> ClosingNote {
     match what {
         // The channel that runs the install steps has nothing to point at: it just ran them.
         "provision" => ClosingNote::None,
@@ -426,7 +429,7 @@ fn closing_note(what: &str, moved_store_paths: bool) -> ClosingNote {
         // worth printing for: `all` has just run the install steps with their own guards in charge,
         // and a guard that compares an upstream version cannot see that a store path moved under
         // the home it built. That is precisely what `sbx upgrade provision` is for.
-        "nix" | "flake" | "mise" | "all" if moved_store_paths => ClosingNote::StoreMoved,
+        "nix" | "flake" | "mise" | "all" if moved.any() => ClosingNote::StoreMoved,
         _ => ClosingNote::None,
     }
 }
@@ -598,6 +601,18 @@ pub(crate) fn app_upgrade_cmd(args: &[OsString]) -> ExitCode {
     run_upgrade("app upgrade", "all", None, Some(name))
 }
 
+/// Whether this app rides a `flake:` package the flake roll advances — whose paths a replaced pin
+/// repoints, and no others.
+///
+/// Asked through [`sandbox::flake_packages`], which is the selection that roll itself makes, so an
+/// inline flake (which it does not resolve) and a withheld one can never be named here. A second
+/// reading of the same rule would be a second answer waiting to diverge from it.
+fn declares_a_flake_package(cfg: &config::Resolved, name: &str) -> bool {
+    cfg.apps
+        .get(name)
+        .is_some_and(|app| !sandbox::flake_packages(&app.packages).is_empty())
+}
+
 /// The launchable apps whose bundles carry an install step, named once and in a stable order.
 ///
 /// One selector, so nothing that reasons about this set can disagree with anything else about which
@@ -634,6 +649,12 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// would be right about the event and wrong about the subject — the same defect as the reserve
 /// below, by inclusion instead of omission.
 ///
+/// `moved` narrows it on the **second** axis, which a selector cannot reach: *what* was replaced.
+/// An unscoped run rolls the global base lock, which no app resolves, so a base move alone names
+/// nobody; a `flake:` pin repoints only the apps declaring one; the project's `nix:` tools are
+/// equipped in every cage. Selecting on the event alone is what made an unscoped run name every
+/// app carrying a step, including those whose every path stayed exactly where it was.
+///
 /// **Reserve, structural**: an app that installs from its own `cmd` rather than from a bundle's
 /// install step cannot be named here, because it declares no step to select on. The shipped
 /// catalogue has **two**: `open-design`, which clones and installs on every launch, and `aionui`,
@@ -661,10 +682,12 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// to declare that its home holds store content, or a bundle of its own to host the step — which in
 /// this catalogue means the namesake shape (a bundle's profile is thin and names only it, pinned in
 /// `src/config/tests.rs`) that a consumer profile is precisely not.
-fn store_moved_note(cfg: &config::Resolved, only: Option<&str>) -> Option<String> {
+fn store_moved_note(cfg: &config::Resolved, only: Option<&str>, moved: Moved) -> Option<String> {
+    let reaches_them_all = moved.base_reaches_the_apps() || moved.project_tools;
     let apps: Vec<&str> = apps_with_install_steps(cfg)
         .into_iter()
         .filter(|name| only.is_none_or(|want| want == *name))
+        .filter(|name| reaches_them_all || (moved.flake && declares_a_flake_package(cfg, name)))
         .collect();
     if apps.is_empty() {
         return None;
@@ -678,8 +701,13 @@ fn store_moved_note(cfg: &config::Resolved, only: Option<&str>) -> Option<String
 }
 
 /// Print [`store_moved_note`], when this roll has an app it applies to.
-fn store_moved_hint(cfg: &config::Resolved, only: Option<&str>, pal: &style::Palette) {
-    let Some(note) = store_moved_note(cfg, only) else {
+fn store_moved_hint(
+    cfg: &config::Resolved,
+    only: Option<&str>,
+    moved: Moved,
+    pal: &style::Palette,
+) {
+    let Some(note) = store_moved_note(cfg, only, moved) else {
         return;
     };
     let (dim, r) = (pal.dim, pal.reset);
@@ -713,6 +741,45 @@ impl Roll {
     };
 }
 
+/// What a run replaced, kept apart by which homes each replacement reaches.
+///
+/// The three channels that resolve through `nix build` all repoint store paths, but not the same
+/// ones, and folding them into a single flag is what leaves the closing note right about the event
+/// and wrong about the subject. A base revision replaced in the **global** lock repoints nothing an
+/// app home holds: an app that has its own lock never resolves that one, and an app that has none
+/// is seeded from it at its next launch, which creates paths rather than moving them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Moved {
+    /// Which lock carried the base-channel revision this run replaced, `None` when none was — read
+    /// off the target that was rolled, so it can never disagree with what was chosen.
+    base: Option<store::Scope>,
+    /// A project `nix:` tool was repointed. Every cage equips the project's tools, app or not.
+    project_tools: bool,
+    /// A `flake:` pin in the project's lock was replaced, which repoints the paths of the apps
+    /// declaring one, and of no others.
+    flake: bool,
+}
+
+impl Moved {
+    /// Whether this run replaced anything at all.
+    fn any(self) -> bool {
+        self.base.is_some() || self.project_tools || self.flake
+    }
+
+    /// Whether the base-channel revision this run replaced is one the project's apps resolve.
+    ///
+    /// A trusted project's pin is inherited by every app launched there. An app's own lock is
+    /// reachable only under `--app`, which has already narrowed the note to that app. The global
+    /// lock is what a cage naming no app resolves, and no app does. The engine's lock is never a
+    /// base target, and its own revision reaches no app home — it runs out of a private home.
+    fn base_reaches_the_apps(self) -> bool {
+        match self.base {
+            Some(store::Scope::Project | store::Scope::App) => true,
+            Some(store::Scope::Global | store::Scope::Engine) | None => false,
+        }
+    }
+}
+
 /// Roll the nixpkgs channel the current directory tracks — a trusted project pin, else
 /// the global channel — forcing a fresh resolution and rewriting that lock. Returns
 /// whether it succeeded and whether it replaced a locked revision; the base and `[packages]`
@@ -724,12 +791,12 @@ fn upgrade_nix_channel(
     cfg: &config::Resolved,
     only: Option<&str>,
     pal: &style::Palette,
-) -> Roll {
+) -> (Roll, Option<store::Scope>) {
     let target = match sandbox::effective_lock_target(cwd, layout, cfg, only) {
         Ok(t) => t,
         Err(e) => {
             diag::error(&format!("sbx: cannot resolve the channel target: {e}"));
-            return Roll::FAILED;
+            return (Roll::FAILED, None);
         }
     };
     // `--app` asked for one app, and a trusted project pin outranks an app's own lock (the app
@@ -744,7 +811,7 @@ fn upgrade_nix_channel(
              for the whole project, or launch the app from a directory that does not pin.",
             target.source()
         ));
-        return Roll::FAILED;
+        return (Roll::FAILED, None);
     }
     // Read what was locked BEFORE the roll, and read it across sources. `Upgrade::previous` cannot
     // answer this: it is scoped to the current source, so it reports `None` both for a first-ever
@@ -756,7 +823,7 @@ fn upgrade_nix_channel(
         Ok(u) => u,
         Err(e) => {
             diag::error(&format!("sbx: cannot upgrade the nixpkgs channel: {e}"));
-            return Roll::FAILED;
+            return (Roll::FAILED, None);
         }
     };
     let moved = before.is_some_and(|prev| prev != upgrade.revision);
@@ -770,7 +837,48 @@ fn upgrade_nix_channel(
     ) {
         println!("{line}");
     }
-    Roll { ok: true, moved }
+    // The summary above reads as "the whole installation moved", and for an app pinned elsewhere
+    // nothing did: the global lock is that app's seed, not its channel, and this roll left its
+    // lock untouched by design. Name the count and the verb that advances one, so a roll that
+    // deliberately skips them never looks like a roll that covered them.
+    if target.scope() == store::Scope::Global
+        && let Some(note) = own_pin_note(layout, cfg, &upgrade.revision)
+    {
+        let (dim, r) = (pal.dim, pal.reset);
+        println!("{}", style::prose(&format!("  {dim}{note}{r}"), pal));
+    }
+    (Roll { ok: true, moved }, Some(target.scope()))
+}
+
+/// The note a global roll owes about the apps it deliberately left behind, `None` when there are
+/// none to name.
+///
+/// Returned rather than printed, so the wording is pinned by a test without nix — the shape the
+/// channel summary and the store note already follow.
+///
+/// Counted from the locks on disk, because holding a pin is a fact about this installation and not
+/// something a profile declares: an app is pinned the first time it launches, seeded from the
+/// global lock, and stays on that revision until a roll names it. And counted only where the pin
+/// is on ANOTHER revision: an app seeded at the one this roll just confirmed is already where
+/// naming it would put it, so counting it would leave a healthy installation reading a standing
+/// warning after every run.
+fn own_pin_note(layout: &store::Layout, cfg: &config::Resolved, rolled: &str) -> Option<String> {
+    let behind = cfg
+        .apps
+        .keys()
+        .filter(|name| {
+            store::LockTarget::app(layout, name, cfg.nixpkgs_global.as_deref())
+                .ok()
+                .and_then(|target| target.previously_locked())
+                .is_some_and(|pinned| pinned != rolled)
+        })
+        .count();
+    (behind > 0).then(|| {
+        format!(
+            "{behind} app(s) are pinned on another revision and not rolled here — \
+             `sbx upgrade nix -a <name>` advances one."
+        )
+    })
 }
 
 /// Roll the declared distribution image: re-resolve its locator against the registry and rewrite
@@ -1544,9 +1652,16 @@ mod tests {
     /// guard inside a step can see that the store moved under the home it built.
     #[test]
     fn a_roll_that_moved_store_paths_names_the_homes_built_against_them() {
+        // A project pin was replaced: every app launched here inherits it, so this is the move
+        // that reaches them all. The narrowing this test is about is the selector's, not the
+        // move's — that axis has its own test below.
+        let inherited = Moved {
+            base: Some(store::Scope::Project),
+            ..Moved::default()
+        };
         let mut cfg = crate::testutil::resolved(vec![], vec![]);
         assert!(
-            store_moved_note(&cfg, None).is_none(),
+            store_moved_note(&cfg, None, inherited).is_none(),
             "a project with no app says nothing"
         );
 
@@ -1559,7 +1674,8 @@ mod tests {
         cfg.apps
             .insert("plain".into(), crate::testutil::app_with(vec![]));
 
-        let note = store_moved_note(&cfg, None).expect("an app with a step must be named");
+        let note =
+            store_moved_note(&cfg, None, inherited).expect("an app with a step must be named");
         assert!(note.contains("odysseus"), "{note}");
         assert!(
             !note.contains("plain"),
@@ -1588,14 +1704,157 @@ mod tests {
         }];
         cfg.apps.insert("untouched".into(), other);
         let narrowed =
-            store_moved_note(&cfg, Some("odysseus")).expect("the rolled app is still named");
+            store_moved_note(&cfg, Some("odysseus"), inherited).expect("the rolled app is named");
         assert!(narrowed.contains("odysseus"), "{narrowed}");
         assert!(
             !narrowed.contains("untouched"),
             "an app this roll did not touch must not be named: {narrowed}"
         );
         // And an app that rides no install step selects nothing, so the roll closes silently.
-        assert!(store_moved_note(&cfg, Some("plain")).is_none());
+        assert!(store_moved_note(&cfg, Some("plain"), inherited).is_none());
+    }
+
+    /// The line a global roll owes about the apps it left behind, and the silence it owes when it
+    /// left none.
+    ///
+    /// The second half is the whole point of counting rather than listing every lock: an app
+    /// seeded at the revision this roll just confirmed is already where naming it would put it,
+    /// so counting it would leave a healthy installation reading a standing warning after every
+    /// run. Asserted on the note rather than on stdout, so the wording is pinned without nix.
+    #[test]
+    fn a_global_roll_names_only_the_apps_pinned_on_another_revision() {
+        let rolled = "a".repeat(40);
+        let elsewhere = "b".repeat(40);
+        let data = TmpDir::new();
+        let layout = store::Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+
+        let mut cfg = crate::testutil::resolved_channels(Some(&rolled), None);
+        for name in ["at-the-rolled-revision", "left-behind", "never-launched"] {
+            cfg.apps
+                .insert(name.into(), crate::testutil::app_with(vec![]));
+        }
+        // Two locks on disk, one at each revision. The third app has never launched, so it holds
+        // no lock at all and is behind nothing — the case that separates "has a pin" from "has a
+        // pin elsewhere".
+        let write_lock = |name: &str, rev: &str| {
+            let dir = layout.data_dir().join("apps").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("nixpkgs.lock"), format!("{rolled}\n{rev}\n")).unwrap();
+        };
+        write_lock("at-the-rolled-revision", &rolled);
+        write_lock("left-behind", &elsewhere);
+
+        let note = own_pin_note(&layout, &cfg, &rolled).expect("one app is pinned elsewhere");
+        assert!(
+            note.starts_with("1 app(s)"),
+            "only the app on another revision is counted: {note}"
+        );
+        assert!(
+            note.contains("sbx upgrade nix -a <name>"),
+            "the note must name the verb that advances one: {note}"
+        );
+
+        // And the silence, which is what keeps the line off an installation with nothing behind.
+        write_lock("left-behind", &rolled);
+        assert_eq!(own_pin_note(&layout, &cfg, &rolled), None);
+    }
+
+    /// The note's **second** axis: not which app the selector picked, but what the roll replaced.
+    ///
+    /// The three channels that build through nix do not repoint the same paths, and reading them
+    /// through one flag is what made an unscoped run name every app carrying an install step. An
+    /// unscoped run rolls the global base lock, which no app resolves — an app holding a lock of
+    /// its own never reads it, and one holding none is *seeded* from it, which creates paths
+    /// rather than moving them. So a base move alone names nobody, however many apps carry a step.
+    #[test]
+    fn the_note_names_only_the_apps_the_replacement_reached() {
+        let with_step = |bundle: &str, packages: Vec<config::Package>| {
+            let mut app = crate::testutil::app_with(packages);
+            app.provisions = vec![config::BundleProvision {
+                bundle: bundle.into(),
+                argv: vec!["true".into()],
+            }];
+            app
+        };
+        let mut cfg = crate::testutil::resolved(vec![], vec![]);
+        cfg.apps
+            .insert("plain-step".into(), with_step("plain", vec![]));
+        cfg.apps.insert(
+            "flake-step".into(),
+            with_step(
+                "flaked",
+                vec![pkg(
+                    "agent",
+                    config::Backend::Flake("github:owner/repo#default".into()),
+                )],
+            ),
+        );
+
+        let global_base = Moved {
+            base: Some(store::Scope::Global),
+            ..Moved::default()
+        };
+        assert!(
+            store_moved_note(&cfg, None, global_base).is_none(),
+            "the global lock is an app's seed, not the channel it resolves: naming one is wrong"
+        );
+
+        // The counter-case on the same axis, so the silence above is not silence about everything:
+        // a project pin IS inherited by every app launched here.
+        let pinned = Moved {
+            base: Some(store::Scope::Project),
+            ..Moved::default()
+        };
+        let note = store_moved_note(&cfg, None, pinned).expect("every app inherits a project pin");
+        assert!(
+            note.contains("plain-step") && note.contains("flake-step"),
+            "{note}"
+        );
+
+        // A `flake:` pin repoints the apps riding one, and them alone.
+        let flake = Moved {
+            flake: true,
+            ..Moved::default()
+        };
+        let note = store_moved_note(&cfg, None, flake).expect("the app riding a flake is named");
+        assert!(note.contains("flake-step"), "{note}");
+        assert!(
+            !note.contains("plain-step"),
+            "an app riding no flake holds no path into the pin that moved: {note}"
+        );
+
+        // The project's `nix:` tools are equipped in every cage, app or not.
+        let tools = Moved {
+            project_tools: true,
+            ..Moved::default()
+        };
+        let note = store_moved_note(&cfg, None, tools).expect("a project tool reaches every app");
+        assert!(
+            note.contains("plain-step") && note.contains("flake-step"),
+            "{note}"
+        );
+
+        // And an inline flake is advanced by no roll, so riding one is not riding a moved pin —
+        // asserted through the roll's own selector, not through a second reading of it.
+        let mut inline = crate::testutil::resolved(vec![], vec![]);
+        inline.apps.insert(
+            "inline-step".into(),
+            with_step(
+                "inlined",
+                vec![pkg(
+                    "agent",
+                    config::Backend::FlakeInline {
+                        content: "{ outputs = _: {}; }".into(),
+                        attr: "default".into(),
+                    },
+                )],
+            ),
+        );
+        assert!(
+            store_moved_note(&inline, None, flake).is_none(),
+            "no roll advances an inline flake, so none of its paths moved"
+        );
     }
 
     /// The scope of the store note, asserted where it is decided. Removing the guard that keeps it
@@ -1605,14 +1864,19 @@ mod tests {
         // `mise` is in this list on account of the project's `nix:` tools, which resolve to store
         // paths like the channel does — not its engine (host-side, in its own home) and not its
         // `mise:` packages (per-home downloads).
+        let moved = Moved {
+            base: Some(store::Scope::Project),
+            ..Moved::default()
+        };
+        let nothing = Moved::default();
         for what in ["nix", "flake", "mise"] {
             assert_eq!(
-                closing_note(what, true),
+                closing_note(what, moved),
                 ClosingNote::StoreMoved,
                 "{what} resolves to store paths, so a replaced revision moved them"
             );
             assert_eq!(
-                closing_note(what, false),
+                closing_note(what, nothing),
                 ClosingNote::None,
                 "{what} re-resolved to the revision already pinned: nothing moved, so say nothing"
             );
@@ -1622,7 +1886,7 @@ mod tests {
         // from the flag never being set.
         for what in ["deb", "appimage", "tarball", "binary"] {
             assert_eq!(
-                closing_note(what, true),
+                closing_note(what, moved),
                 ClosingNote::None,
                 "{what} does not move the paths a home holds"
             );
@@ -1631,17 +1895,17 @@ mod tests {
         // It used to be excluded because it printed a note of its own about the steps it skipped;
         // it no longer skips them, so the exclusion went with the reason for it.
         assert_eq!(
-            closing_note("all", true),
+            closing_note("all", moved),
             ClosingNote::StoreMoved,
             "`all` runs nix/flake/mise, so a moved store path is its note too"
         );
         assert_eq!(
-            closing_note("all", false),
+            closing_note("all", nothing),
             ClosingNote::None,
             "and it says nothing when no revision was replaced"
         );
         assert_eq!(
-            closing_note("provision", true),
+            closing_note("provision", moved),
             ClosingNote::None,
             "the channel that just ran the steps has nothing left to point at"
         );
@@ -2127,7 +2391,7 @@ mod tests {
         let mut cfg = crate::testutil::resolved(vec![], vec![]);
         cfg.nixpkgs_project = Some("f".repeat(40));
 
-        let roll = upgrade_nix_channel(
+        let (roll, scope) = upgrade_nix_channel(
             Path::new("/nonexistent-nix"),
             &layout,
             proj.path(),
@@ -2137,6 +2401,7 @@ mod tests {
         );
         assert!(!roll.ok, "the roll must refuse rather than run");
         assert!(!roll.moved);
+        assert_eq!(scope, None, "a refused roll refreshed no lock at all");
         assert!(
             !layout.data_dir().join("projects").exists(),
             "a refused roll writes no project lock"
@@ -2147,7 +2412,7 @@ mod tests {
         // resolves with no nix, and the revision lands in that app's lock.
         let mut unpinned = crate::testutil::resolved(vec![], vec![]);
         unpinned.nixpkgs_global = Some("e".repeat(40));
-        let roll = upgrade_nix_channel(
+        let (roll, scope) = upgrade_nix_channel(
             Path::new("/nonexistent-nix"),
             &layout,
             proj.path(),
@@ -2156,6 +2421,11 @@ mod tests {
             &style::Palette::plain(),
         );
         assert!(roll.ok);
+        assert_eq!(
+            scope,
+            Some(store::Scope::App),
+            "`--app` on an unpinned project refreshes that app's own lock"
+        );
         assert!(
             layout
                 .data_dir()
@@ -2198,8 +2468,14 @@ mod tests {
             &cfg(&rev_a),
             &plain
         ));
-        let seed = upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_a), None, &plain);
+        let (seed, seed_scope) =
+            upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_a), None, &plain);
         assert!(seed.ok);
+        assert_eq!(
+            seed_scope,
+            Some(store::Scope::Global),
+            "an unscoped roll refreshes the global lock, the one no app resolves"
+        );
         assert!(
             !seed.moved,
             "a first resolution pins a revision, it replaces none — nothing a home holds moved"
@@ -2234,9 +2510,10 @@ mod tests {
             &plain
         ));
         let engine_reseed = std::fs::read(&engine_lock).unwrap();
-        let rolled =
+        let (rolled, rolled_scope) =
             upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_b), None, &plain);
         assert!(rolled.ok);
+        assert_eq!(rolled_scope, Some(store::Scope::Global));
         assert!(
             rolled.moved,
             "REV_A was locked and REV_B replaced it: the store paths moved"

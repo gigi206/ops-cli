@@ -1038,9 +1038,10 @@ impl Mkfs {
 /// The channel the provisioned `btrfs-progs` is built from: whatever the shared lock already
 /// records, and only failing that the default.
 ///
-/// The lock this targets is `<data>/nixpkgs.lock`, the one every launch resolves the base userland
-/// from — so the source handed to [`crate::store::LockTarget::global`] decides whether creating a
-/// volume *reads* that lock or *rewrites* it. Passing `None` names the default rolling channel, and
+/// The lock this targets is `<data>/nixpkgs.lock`: what a launch naming no app resolves the base
+/// userland from, and the seed an app's own lock takes its first revision from — so the source
+/// handed to [`crate::store::LockTarget::global`] decides whether creating a volume *reads* that
+/// lock or *rewrites* it. Passing `None` names the default rolling channel, and
 /// a lock recording a global `nixpkgs` override then matches no longer: resolution falls through to
 /// the network and writes the default back over the user's pin, rolling the whole installation's
 /// channel for the sake of one helper binary. Reusing the recorded source keeps the resolution a
