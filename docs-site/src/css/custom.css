@@ -1727,6 +1727,22 @@ html[data-theme='dark']:root .home__ordinal {
   color: var(--keep-chip-ink);
 }
 
+/* Each chip leads to the page that defines the field, so it needs to say it can be
+   followed — without the underline a prose link wears, which would turn a dense
+   index into a thicket. */
+a.home__chip {
+  text-decoration: none;
+  transition:
+    border-color 160ms ease,
+    color 160ms ease;
+}
+
+a.home__chip:hover,
+a.home__chip:focus-visible {
+  border-color: var(--keep-accent);
+  color: var(--keep-accent);
+}
+
 /* A run of chips that closes a note, rather than opening a column of its own. */
 .home__chips--tight {
   margin-top: 0.875rem;

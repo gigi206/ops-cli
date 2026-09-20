@@ -296,6 +296,42 @@ const ABSENT = [
   'declared secrets, in plaintext',
 ];
 
+// Where each field is defined. The panel is this page's index of the security
+// surface, so every entry leads to the page that specifies it — the two booleans
+// among them, which live in the tables they govern rather than on a page of their own.
+const FIELD_DOC: Record<string, string> = {
+  binds: '/docs/configuration/binds',
+  network: '/docs/configuration/network',
+  secret: '/docs/configuration/secret',
+  packages: '/docs/configuration/packages',
+  nixpkgs: '/docs/configuration/nixpkgs',
+  distro: '/docs/configuration/distro',
+  allow_insecure_http: '/docs/configuration/packages',
+  apps_share_install_pools: '/docs/configuration/apps',
+  forward: '/docs/networking/forward',
+  gui: '/docs/configuration/gui',
+  gpu: '/docs/configuration/gpu',
+  audio: '/docs/configuration/audio',
+  dbus: '/docs/configuration/dbus',
+  env: '/docs/configuration/env',
+  timezone: '/docs/configuration/timezone',
+  '[fs]': '/docs/configuration/fs',
+  '[proc]': '/docs/configuration/proc',
+  '[limits]': '/docs/configuration/limits',
+  '[seccomp]': '/docs/configuration/seccomp',
+  '[devices]': '/docs/configuration/devices',
+  '[ssh_agent]': '/docs/configuration/ssh-agent',
+  '[notify]': '/docs/configuration/notify',
+  '[observe]': '/docs/configuration/observe',
+  '[redact]': '/docs/secrets/redaction',
+  '[open]': '/docs/configuration/open',
+  '[service]': '/docs/configuration/service',
+  '[task.<name>]': '/docs/configuration/task',
+  '[app.<name>]': '/docs/configuration/apps',
+  '[network.groups]': '/docs/networking/groups',
+  '[bundle.<name>]': '/docs/configuration/bundles',
+};
+
 // The split of concepts/trust, in the two panels the gate actually has. `[fs]`
 // is neither free nor gated: it is the one *closing* table, so it keeps its own
 // group inside the ungated panel rather than being filed as a free field.
@@ -636,6 +672,12 @@ const GRAMMAR = [
 
 // Guards that sit under the rule set: no allow widens them, and a regex never
 // satisfies the one that asks to be named.
+const PLANE_DOC: Record<string, string> = {
+  'host · https://': '/docs/networking/rules#layers-inspected-over-tls-default-cleartext-http-raw-tcp',
+  'http://': '/docs/networking/rules#cleartext-http-http',
+  'tcp://': '/docs/networking/rules#raw-l4-splice-tcp',
+};
+
 const GUARDS: { term: string; detail: string }[] = [
   {
     term: 'SSRF',
@@ -1664,12 +1706,13 @@ export default function Home(): ReactNode {
                       <p className="home__group-label">{label}</p>
                       <div className="home__chips" data-reveal data-stagger="45">
                         {fields.map((field) => (
-                          <span
+                          <Link
                             className={gated ? 'home__chip home__chip--gated' : 'home__chip'}
                             key={field}
+                            to={FIELD_DOC[field]}
                           >
                             {field}
-                          </span>
+                          </Link>
                         ))}
                       </div>
                       <p className="home__group-note">{note}</p>
@@ -1812,7 +1855,9 @@ export default function Home(): ReactNode {
                   {MODES.map(({ mode, tag, reach, proxy, use }) => (
                     <tr key={mode} className={tag ? 'home__table-row--now' : undefined}>
                       <td>
-                        <code>{mode}</code>
+                        <Link to={`/docs/networking/modes#${mode}`}>
+                          <code>{mode}</code>
+                        </Link>
                         {tag && <span className="home__layer-tag">{tag}</span>}
                       </td>
                       <td>{reach}</td>
@@ -1829,14 +1874,14 @@ export default function Home(): ReactNode {
             </p>
             <div className="home__grid" data-reveal data-stagger="110">
               {PLANES.map(({ tag, spell, name, detail }) => (
-                <div className="home__card" key={spell}>
+                <Link className="home__card" key={spell} to={PLANE_DOC[spell]}>
                   <p className="home__layer-n">
                     {tag}
                     <span className="home__plane-spell">{spell}</span>
                   </p>
                   <p className="home__card-name">{name}</p>
                   <p className="home__card-detail">{detail}</p>
-                </div>
+                </Link>
               ))}
             </div>
 
@@ -2175,7 +2220,9 @@ export default function Home(): ReactNode {
                 <dl className="home__facts home__facts--inline" data-reveal data-stagger="60">
                   {DESKTOP.map(({ term, detail }) => (
                     <div className="home__fact" key={term}>
-                      <dt>{term}</dt>
+                      <dt>
+                        <Link to={FIELD_DOC[term]}>{term}</Link>
+                      </dt>
                       <dd>{detail}</dd>
                     </div>
                   ))}
