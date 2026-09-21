@@ -677,11 +677,13 @@ Two shapes are dropped with a warning, and the tripwire then keeps the per-host 
 it had without them: a group naming fewer than two distinct hosts and no wildcard, which
 says nothing a credential's own host does not already say, and a group whose entry an
 earlier group already covers, which leaves "the same service" undecided rather than merely
-wide. A lone `*.domain` entry is kept, because a wildcard does say something by itself: it
-widens the exemption from the one host a credential was acquired on to that whole domain,
-which is how the shipped `freebuff-desktop` bundle writes `[["*.codebuff.com"]]`. The
-second shape is asked with the matcher the tripwire itself uses, so a wildcard that swallows
-another group's host counts as the collision it is.
+wide. A lone `*.domain` entry is kept, because a wildcard does say something by itself: a
+group written `[["*.example.com"]]` widens the exemption from the one host a credential was
+acquired on to that whole domain, which naming that host alone does not. The second shape
+is asked with the matcher the tripwire itself uses, so a wildcard that swallows another
+group's host counts as the collision it is. That is why a service answering on two domains
+is written as one group naming both, the way the shipped `freebuff-desktop` bundle pairs
+`*.codebuff.com` with `*.freebuff.com`, rather than as a second group beside the first.
 
 The refusal itself names no fix, deliberately: an `outbound-secret` block is a security
 guard, and a message offering to lift it would be advice to allow a leak. What tells the

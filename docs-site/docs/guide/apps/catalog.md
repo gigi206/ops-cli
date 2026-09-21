@@ -116,7 +116,7 @@ every other entry here.
 | `claude-desktop` | `deb:apt:downloads.claude.ai/…` (+ `nix:chromium`) | `api.anthropic.com` / `claude.ai` (Anthropic account) |
 | `codex-desktop` | `deb:apt:persistent.oaistatic.com/…` (+ `nix:chromium`) | `chatgpt.com` / `api.openai.com` (ChatGPT account, or `OPENAI_API_KEY` BYOK) |
 | `cursor` | `deb:resolve` (+ `nix:chromium`) | `*.cursor.com` (Cursor account) |
-| `freebuff-desktop` | `appimage:resolve` (+ `nix:chromium`) | `www.codebuff.com` (account) |
+| `freebuff-desktop` | `appimage:resolve` (+ `nix:chromium`) | `www.codebuff.com` / `freebuff.com` (account) |
 | `goose-desktop` | `deb:github:aaif-goose/goose` | provider-dependent (BYOK) |
 | `hermes-desktop` | `flake:github:NousResearch/hermes-agent#desktop` (+ `nix:chromium`, `nix:nodejs`, …) | `openrouter.ai` (BYOK) |
 | `kiro` | `nix:kiro-cli.unwrapped` (+ `nix:chromium`) | `*.kiro.dev` (AWS/Kiro account) |

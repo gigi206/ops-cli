@@ -83,11 +83,18 @@ mute = [
     "@npm-jsr",
 ]
 
-# The header above says it plainly: the login page, the device-code flow and the model traffic all
-# target codebuff.com. They are not the same HOST, though, and the tripwire's exemption is per host,
-# so the credential the sign-in obtains would be refused on its way to `api.codebuff.com`. One
-# wildcard says what the sentence already said.
-shared_credential = [["*.codebuff.com"]]
+# The account credential this app signs in for travels to BOTH of the vendor's domains, and the
+# tripwire's exemption is per host, so one group has to name them together. On codebuff.com: the
+# login page, the device-code flow and the model traffic, which are not the same host either — the
+# credential the sign-in obtains would otherwise be refused on its way to `api.codebuff.com`. On
+# freebuff.com: the desktop's sponsored-task client (`/api/v1/ads/*`), which sends the same account
+# bearer to the vendor site. Their registrable domains differ, which is exactly why nothing infers
+# the group — the shipped `claude-desktop` bundle pairs `claude.ai` with `api.anthropic.com` for the
+# same reason. Two wildcards say what the two sentences say.
+#
+# ONE group, never two: a group whose entry an earlier group already covers is dropped with a
+# warning, so a second `[["*.freebuff.com"]]` beside this one would grant nothing.
+shared_credential = [["*.codebuff.com", "*.freebuff.com"]]
 
 [packages]
 # The Freebuff desktop app, auto-upgraded through the resolver below. The package name is
