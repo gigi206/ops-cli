@@ -664,6 +664,7 @@ fn clear_tree(root: &Path) -> std::io::Result<()> {
 /// Move the migrated subtrees out of the data directory into a dated sibling, leaving the
 /// pointer behind. Renames within one filesystem, so it is instant whatever the size.
 fn set_aside(dir: &Path, skip: &[&str]) -> std::io::Result<Option<PathBuf>> {
+    use std::os::unix::fs::DirBuilderExt as _;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -672,7 +673,15 @@ fn set_aside(dir: &Path, skip: &[&str]) -> std::io::Result<Option<PathBuf>> {
         "{}.old-{stamp}",
         dir.file_name().unwrap_or_default().to_string_lossy()
     ));
-    std::fs::create_dir_all(&old)?;
+    // Owner-only: what lands here is the *whole* previous store — every profile, every bundle,
+    // every runtime tree the migration left behind — under a name derived from a timestamp, and it
+    // is created in the data directory's parent rather than inside a tree sbx already keeps
+    // owner-only. At the umask it would be the one readable copy of everything the migration was
+    // asked to move.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&old)?;
     let mut moved = false;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -883,7 +892,7 @@ fn status(args: Vec<OsString>) -> ExitCode {
 
     if opts.json {
         match serde_json::to_string_pretty(&view) {
-            Ok(s) => println!("{s}"),
+            Ok(s) => crate::cli::print_document(&format!("{s}\n")),
             Err(e) => return fail(e),
         }
         return ExitCode::SUCCESS;

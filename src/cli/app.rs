@@ -1009,13 +1009,11 @@ fn app_export(args: &[OsString]) -> ExitCode {
         }
     };
     match out {
-        None => {
-            use std::io::Write as _;
-            if let Err(e) = std::io::stdout().write_all(&bytes) {
-                diag::error(&format!("sbx: cannot write the profile: {e}"));
-                return ExitCode::FAILURE;
-            }
-        }
+        // Through the same writer `sbx bundle export` and `sbx net groups export` end with: a
+        // reader that takes the head of a document and walks away (`sbx app export demo | head -1`)
+        // has not made the export fail, and reporting one turns a normal pipeline into a red exit
+        // beside a partial file the reader asked for.
+        None => crate::cli::print_bytes(&bytes),
         Some(path) => {
             let path = Path::new(path);
             // Through the writer the other two exporters use: a profile is written to be imported

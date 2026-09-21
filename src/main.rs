@@ -395,9 +395,15 @@ fn split_one_rule(
     Ok((parsed, rule))
 }
 
-/// The `--interval` value the watching verbs share: whole seconds, at least one. Shared for the
-/// three refusals it carries rather than for its length — a message the user reads, written out
-/// once per call site, is a message that drifts between them.
+/// The `--interval` value the watching verbs share: whole seconds, at least one, and at most
+/// [`config::DURATION_MAX_SECS`]. Shared for the four refusals it carries rather than for its
+/// length — a message the user reads, written out once per call site, is a message that drifts
+/// between them.
+///
+/// The ceiling is the one every other duration in the CLI is already held to, and it is here for
+/// the reason `sbx session stop --delay` states at its own door: a number the type accepts but
+/// nothing can wait out is not a value, it is a hang. `sbx proc live` handed `u64::MAX` redrew
+/// once and then slept for longer than the machine will run.
 fn interval_seconds(value: Option<&OsString>) -> Result<u64, String> {
     let v = value.ok_or_else(|| "`--interval` needs a value in seconds".to_string())?;
     let secs: u64 = v.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
@@ -408,6 +414,12 @@ fn interval_seconds(value: Option<&OsString>) -> Result<u64, String> {
     })?;
     if secs == 0 {
         return Err("interval must be at least 1 second".to_string());
+    }
+    if secs > config::DURATION_MAX_SECS {
+        return Err(format!(
+            "interval may name at most {} seconds, not `{secs}`",
+            config::DURATION_MAX_SECS
+        ));
     }
     Ok(secs)
 }
@@ -460,10 +472,17 @@ fn live_sessions(data_dir: &Path) -> Result<Vec<session::Session>, ExitCode> {
 /// the tail every `--json` verb ends with. `verb` tags the refusal (`sbx: app show: cannot
 /// serialize: …`), so one condition keeps one wording across the whole CLI. The success exit code
 /// stays with the caller: a verb that renders a *refusal* as a document still exits non-zero on it.
+///
+/// Written through [`cli::print_document`] for the reason that function states: Rust ignores
+/// `SIGPIPE`, so a bare `println!` into a downstream that has gone away panics rather than ending.
+/// `sbx config show --json | head -1` reached `failed printing to stdout` and exit 101 on a
+/// pipeline the shell reports as having worked. This is the one printer every `--json` verb ends
+/// with, so the discipline the human documents already carried belongs here rather than at each of
+/// them.
 fn print_json<T: serde::Serialize>(verb: &str, view: &T) -> Result<(), ExitCode> {
     match serde_json::to_string_pretty(view) {
         Ok(doc) => {
-            println!("{doc}");
+            cli::print_document(&format!("{doc}\n"));
             Ok(())
         }
         Err(e) => {

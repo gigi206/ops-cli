@@ -50,6 +50,36 @@ pub(crate) fn print_document(text: &str) {
     let _ = out.flush();
 }
 
+/// [`print_document`] for a document that is not text: the exported profile `sbx app export`
+/// writes to stdout, carried as the bytes `export_profile` produced.
+///
+/// A separate entry point rather than a lossy conversion at the call site. What is exported is
+/// read back by `sbx app import`, so a byte that is not valid UTF-8 must reach the reader as
+/// itself or not at all — replacing it with `U+FFFD` would hand on a profile that no longer
+/// round-trips, and it would do so silently.
+pub(crate) fn print_bytes(bytes: &[u8]) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
+/// The epoch-millisecond stamp a `--json` row carries, saturated into the width JSON numbers are
+/// read at.
+///
+/// The feeds hold their stamps as `u128` — that is the width `SystemTime` arithmetic produces —
+/// while every consumer of a `--json` row reads a JSON number, and `serde_json` has no number for
+/// a value past `u64`. A record whose stamp is beyond that width is not a time anything happened
+/// at: the stamps are also read back from a session's own record files under the data directory,
+/// which the operator may edit, so the shape has to have an answer.
+///
+/// Saturating rather than wrapping is the whole point. A cast folds `u64::MAX + 1` onto `0` and
+/// renders 1970, which reads as a real instant and is the one wrong answer that cannot be
+/// recognised as wrong; the ceiling cannot be mistaken for anything a clock produced.
+pub(crate) fn json_epoch_ms(at: u128) -> u64 {
+    u64::try_from(at).unwrap_or(u64::MAX)
+}
+
 /// Refuse an argument a verb does not take, rather than ignoring it. Silently dropping one is worse
 /// than not supporting it: `sbx plugins store ls --installed` would print the whole listing, which
 /// reads as a filtered result and quietly answers a different question than the one asked — and a
@@ -70,6 +100,65 @@ pub(crate) fn reject_extra(path: &[&str], extra: &[OsString]) -> Result<(), Exit
     ));
     eprintln!("sbx: usage: {}", crate::help::synopsis_of(path));
     Err(ExitCode::from(2))
+}
+
+/// Refuse an **option** standing where a verb's single positional belongs, in the wording
+/// [`reject_extra`] already uses for one standing after it.
+///
+/// `sbx plugins install --json` took `--json` as the directory to install from and answered
+/// `cannot install plugin: --json is not a plugin`, at exit 1, while `sbx plugins install foo
+/// --json` — the same mistake one token later — was a usage error at exit 2. A verb whose page
+/// documents no option at all should answer both the same way, and a caller that scripts on exit
+/// codes reads 1 as "the command ran and the thing was wrong" rather than "I mistyped".
+///
+/// A token that is not valid UTF-8 is left alone: it cannot be an option spelling, and the verbs
+/// that care refuse it with a message about the name it failed to be.
+pub(crate) fn reject_option_as_name(
+    path: &[&str],
+    first: Option<&OsString>,
+) -> Result<(), ExitCode> {
+    let Some(tok) = first else {
+        return Ok(());
+    };
+    match tok.to_str() {
+        Some(t) if t.starts_with('-') => reject_extra(path, std::slice::from_ref(tok)),
+        _ => Ok(()),
+    }
+}
+
+/// The value an option takes, or the message refusing what stood in its place.
+///
+/// One rule for the whole surface, because the surface disagreed with itself: `sbx config show
+/// --app --json` bound the app name to `--json` and then failed downstream as "no app named
+/// `--json`" at exit **1**, `sbx net pending --app --json` reported "none for app `--json`" and
+/// exited **0**, and the neighbouring parsers (`sbx test net`, `sbx logs -n`) refused the same
+/// shape outright. An option consumed as a value is never what the caller meant: the flag it
+/// swallowed does not take effect either, so the command quietly answers a different question
+/// than the one asked.
+///
+/// The value's own validity stays with the caller — this says only that what followed the flag is
+/// not another flag, and that it is text. Non-UTF-8 is refused here rather than carried through
+/// `to_string_lossy`, which turns a name nothing can match into a name that merely looks wrong.
+///
+/// `what` completes "needs …", so it reads as the sentence the caller sees: `needs an app name`.
+pub(crate) fn option_value<'a>(
+    next: Option<&'a OsString>,
+    verb: &str,
+    flag: &str,
+    what: &str,
+) -> Result<&'a str, String> {
+    let Some(tok) = next else {
+        return Err(format!("sbx: {verb}: `{flag}` needs {what}"));
+    };
+    let Some(text) = tok.to_str() else {
+        return Err(format!("sbx: {verb}: `{flag}`'s value is not valid UTF-8"));
+    };
+    if text.starts_with('-') {
+        return Err(format!(
+            "sbx: {verb}: `{flag}` needs {what}, and `{text}` is an option"
+        ));
+    }
+    Ok(text)
 }
 
 /// What parsing a `<verb> <name> [switch]` command line yielded: show the verb's page, run with the

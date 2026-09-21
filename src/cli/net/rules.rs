@@ -36,11 +36,13 @@ pub(super) fn net_rules(args: &[OsString]) -> ExitCode {
             Some("--json") => json = true,
             Some("--expand") | Some("-e") => expand = true,
             Some("--app") | Some("-a") => {
-                let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    diag::error("sbx: net rules: `--app` needs an app name");
-                    return ExitCode::from(2);
-                };
-                app = Some(v.to_string());
+                match crate::cli::option_value(it.next(), "net rules", "--app", "an app name") {
+                    Ok(v) => app = Some(v.to_string()),
+                    Err(message) => {
+                        diag::error(&message);
+                        return ExitCode::from(2);
+                    }
+                }
             }
             Some("--source") | Some("-s") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
@@ -142,7 +144,7 @@ pub(super) fn net_rules(args: &[OsString]) -> ExitCode {
             "mode": mode,
             "rules": shown.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
         });
-        println!("{value}");
+        crate::cli::print_document(&format!("{value}\n"));
         return ExitCode::SUCCESS;
     }
 
@@ -237,15 +239,12 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
             "mode": "session",
             "rules": shown.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
         });
-        println!("{value}");
+        crate::cli::print_document(&format!("{value}\n"));
         return ExitCode::SUCCESS;
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!(
-        "{}",
-        render_net_rules("session", &scope, &shown, total, &pal)
-    );
+    crate::cli::print_document(&render_net_rules("session", &scope, &shown, total, &pal));
     ExitCode::SUCCESS
 }
 

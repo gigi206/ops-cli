@@ -77,7 +77,7 @@ pub(crate) fn completion_cmd(args: &[OsString]) -> ExitCode {
         ));
         return ExitCode::from(2);
     };
-    print!("{script}");
+    crate::cli::print_document(script);
     ExitCode::SUCCESS
 }
 
@@ -110,7 +110,7 @@ pub(crate) fn complete_cmd(args: &[OsString]) -> ExitCode {
         out.push_str(&describe(&desc));
         out.push('\n');
     }
-    print!("{out}");
+    crate::cli::print_document(&out);
     ExitCode::SUCCESS
 }
 
