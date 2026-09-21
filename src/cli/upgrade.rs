@@ -417,19 +417,23 @@ fn closing_note(what: &str, moved: Moved) -> ClosingNote {
     match what {
         // The channel that runs the install steps has nothing to point at: it just ran them.
         "provision" => ClosingNote::None,
-        // Named, not defaulted. These three resolve to nix store paths, so rolling one repoints a
-        // path and a home that holds it is left dangling: `nix` rolls the channel, `flake` builds
-        // through `nix build`, and `mise` rolls the project's `nix:` tools (its engine moves
-        // nothing a home holds, and its `mise:` packages are per-home downloads — the tools are
-        // what qualifies it). The rest are excluded on their mechanism: `deb`, `appimage`,
-        // `tarball` and `binary` place their own content-hashed artifacts, so none of them moves a
-        // path a home points into, and claiming otherwise would be an unmeasured warning.
+        // Named, not defaulted. These two resolve to nix store paths, so rolling one repoints a
+        // path and a home that holds it is left dangling: `nix` rolls the channel, and `mise` rolls
+        // the project's `nix:` tools (its engine moves nothing a home holds, and its `mise:`
+        // packages are per-home downloads — the tools are what qualifies it). The rest are excluded
+        // on their mechanism: `deb`, `appimage`, `tarball` and `binary` place their own
+        // content-hashed artifacts, so none of them moves a path a home points into, and claiming
+        // otherwise would be an unmeasured warning.
         //
-        // `all` is here because it runs all three, and because it is the case the note is now most
+        // The arm names only what [`TARGETS`] can carry. `flake` builds through `nix build` and
+        // would belong here on its mechanism, but it stopped being a target, so naming it matched
+        // nothing a caller could type and read as a coverage this function did not have.
+        //
+        // `all` is here because it runs both, and because it is the case the note is now most
         // worth printing for: `all` has just run the install steps with their own guards in charge,
         // and a guard that compares an upstream version cannot see that a store path moved under
         // the home it built. That is precisely what `sbx upgrade provision` is for.
-        "nix" | "flake" | "mise" | "all" if moved.any() => ClosingNote::StoreMoved,
+        "nix" | "mise" | "all" if moved.any() => ClosingNote::StoreMoved,
         _ => ClosingNote::None,
     }
 }
@@ -1863,13 +1867,19 @@ mod tests {
     fn only_the_channels_that_build_through_nix_close_on_the_store_note() {
         // `mise` is in this list on account of the project's `nix:` tools, which resolve to store
         // paths like the channel does — not its engine (host-side, in its own home) and not its
-        // `mise:` packages (per-home downloads).
+        // `mise:` packages (per-home downloads). Every name here is one `TARGETS` carries, so a
+        // name that stops being a target fails this test rather than living on as an arm nothing
+        // reaches.
         let moved = Moved {
             base: Some(store::Scope::Project),
             ..Moved::default()
         };
         let nothing = Moved::default();
-        for what in ["nix", "flake", "mise"] {
+        for what in ["nix", "mise"] {
+            assert!(
+                super::TARGETS.contains(&what),
+                "`{what}` is asserted about here, so it has to be a target a caller can type"
+            );
             assert_eq!(
                 closing_note(what, moved),
                 ClosingNote::StoreMoved,

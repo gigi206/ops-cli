@@ -291,8 +291,14 @@ fn emit_mise_plugin(manifest: &Path, out_dir: &Path) {
 /// Collect every file under `dir` as `(path relative to `root`, absolute path)`, recursing into
 /// subdirectories. The relative path is forward-slashed, which is what an in-sandbox path needs.
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    for entry in fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
+    // Named rather than unwrapped, in the form the rest of this script uses: a build that stops
+    // has to say which directory it could not walk, because the failure is read from a build log
+    // by whoever is looking at a compile that never started.
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {} ({e})", dir.display()));
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("reading an entry of {} ({e})", dir.display()))
+            .path();
         if path.is_dir() {
             collect(root, &path, out);
         } else {
