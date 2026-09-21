@@ -582,3 +582,54 @@ fn every_command_path_completes_in_a_real_zsh() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The oracle never reads a file outside the profiles directory, whatever `--app` spells.
+///
+/// A removal verb offers the rules it would take out, read from the files it would edit — the
+/// project config and the named app's profile. The profile is `apps/<name>.toml`, so the name is a
+/// path component, and nothing in the completion path could refuse one: every verb that *writes*
+/// through the same derivation validates the name and says so, while the oracle prints candidates
+/// and nothing else. `--app ../../evil` therefore read the file beside the profiles directory and
+/// offered its rules as if they were the app's.
+///
+/// Both halves are asserted, because a guard that also broke the ordinary case would pass a test
+/// that only checked the traversal.
+#[test]
+fn the_oracle_offers_no_rule_from_outside_the_profiles_directory() {
+    let dir = scratch("traversal");
+    let apps = dir.join("sbx/apps");
+    std::fs::create_dir_all(&apps).unwrap();
+    std::fs::write(
+        apps.join("demo.toml"),
+        b"[network]\nmode = \"deny\"\nallow = [\"declared.example\"]\n",
+    )
+    .unwrap();
+    // A sibling of the profiles directory, which `../../evil` addresses from inside it.
+    std::fs::write(
+        dir.join("evil.toml"),
+        b"[network]\nmode = \"deny\"\nallow = [\"outside.example\"]\n",
+    )
+    .unwrap();
+
+    let ask = |app: &str| -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(["__complete", "--", "net", "unallow", "--app", app, ""])
+            .env("XDG_CONFIG_HOME", &dir)
+            .env("LC_ALL", "C.UTF-8")
+            .output()
+            .expect("spawn sbx");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert!(
+        ask("demo").contains("declared.example"),
+        "the ordinary case must still offer the app's own rules"
+    );
+    let escaped = ask("../../evil");
+    assert!(
+        !escaped.contains("outside.example"),
+        "a name spelling its way out of the profiles directory was read: {escaped}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -798,9 +798,23 @@ pub(crate) fn profiles_dir() -> Option<PathBuf> {
 }
 
 /// The profile file for app `name` (`…/sbx/apps/<name>.toml`), or `None` when no config base
-/// resolves. The counterpart of [`profiles_dir`] for a single app — the target an app-scoped
-/// global write (`sbx net allow -a <name> --save -g`, `sbx config … --app <name> -g`) reaches.
+/// resolves **or** `name` is not one an app may carry. The counterpart of [`profiles_dir`] for a
+/// single app — the target an app-scoped global write (`sbx net allow -a <name> --save -g`,
+/// `sbx config … --app <name> -g`) reaches.
+///
+/// The name is a path component here, so it is held to [`is_valid_app_name`] at the join rather
+/// than only where a diagnostic is produced. Every verb that writes through this validates first
+/// and says so in the caller's own words; the completion oracle does not, and cannot — it prints
+/// nothing but candidates, and `sbx net unallow --app ../../evil <TAB>` read the rules out of a
+/// file beside the profiles directory and offered them. The two checks sit far apart and only one
+/// of them can name the file it reached, which is why both are here.
+///
+/// Folding a refused name onto `None` keeps the signature honest: `None` has always meant "there
+/// is no profile file to speak of", and a name that cannot address one is that same answer.
 pub(crate) fn profile_path(name: &str) -> Option<PathBuf> {
+    if !super::is_valid_app_name(name) {
+        return None;
+    }
     profiles_dir().map(|d| d.join(format!("{name}.toml")))
 }
 
