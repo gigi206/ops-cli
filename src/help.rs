@@ -27,6 +27,11 @@
 //! alias table, the queries the rest of the crate asks over the table, and the entry points that
 //! decide *which* page a request names and which stream's palette it is rendered for.
 
+#![allow(
+    clippy::unwrap_used,
+    reason = "a `Page`'s path is its position in the command tree and is never empty (the root page is the bare `sbx`), so `last()` is `Some` for every page in the table this module owns"
+)]
+
 mod pages;
 mod render;
 

@@ -940,6 +940,11 @@ fn scan_frame_header(buf: &[u8]) -> HeaderScan {
     let payload_len = match extended {
         2 => u64::from(u16::from_be_bytes([buf[2], buf[3]])),
         8 => {
+            #[expect(
+                clippy::expect_used,
+                reason = "the length check above returned `Need` unless the buffer holds `total` \
+                          bytes, which for this arm is at least ten"
+            )]
             let n = u64::from_be_bytes(buf[2..10].try_into().expect("8 bytes checked above"));
             // The most significant bit of a 64-bit length must be 0 (RFC 6455 §5.2); a stream that
             // sets it is not framing this decoder should keep following.

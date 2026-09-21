@@ -684,6 +684,10 @@ fn reported_count(header: &[u8; 16]) -> io::Result<usize> {
     /// Block groups a volume may report before the answer is treated as nonsense.
     const MAX_SPACES: u64 = 1 << 20;
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the header is a `[u8; 16]`, so the second half is eight bytes by type"
+    )]
     let count = u64::from_ne_bytes(header[8..16].try_into().unwrap());
     if count > MAX_SPACES {
         return Err(io::Error::new(

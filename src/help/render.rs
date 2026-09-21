@@ -6,6 +6,11 @@
 //! malformed input: an unterminated `<` or backtick is emitted verbatim rather than left as a
 //! dangling style span, so a bad table entry can only under-style, never corrupt the output.
 
+#![allow(
+    clippy::unwrap_used,
+    reason = "a `Page`'s path is never empty (the root is the bare `sbx`), so `last()` is `Some` for every page this renderer is handed"
+)]
+
 use super::pages::PAGES;
 use super::{Page, children};
 use crate::style::Palette;

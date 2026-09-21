@@ -66,6 +66,11 @@ pub(crate) fn builtin_allow_rules() -> Vec<Rule> {
     builtin_allow_hosts()
         .iter()
         .map(|e| {
+            #[expect(
+                clippy::expect_used,
+                reason = "the entries are literals in `builtin_allow_hosts`, and a literal this \
+                          crate writes that the grammar refuses is a build the tests fail"
+            )]
             let mut rule =
                 allowlist::classify(e).expect("a built-in self-equip entry must be a valid rule");
             rule.builtin = true;

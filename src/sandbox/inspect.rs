@@ -4,6 +4,11 @@
 //! the per-tree package locks), so a user can see declared-vs-installed. Pure host-side filesystem
 //! reads — no sandbox, no nix, no network.
 
+#![allow(
+    clippy::expect_used,
+    reason = "both `expect`s stand inside a loop the depth counter guards: it is entered only while more than one level is held, so the pop and the peek below it both have one"
+)]
+
 use std::path::{Path, PathBuf};
 
 /// A mise tool present under a home's `installs/` dir, by its on-disk (munged) directory name and

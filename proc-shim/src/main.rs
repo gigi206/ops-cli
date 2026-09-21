@@ -30,6 +30,20 @@
 //! a file's content and refuse the open before any byte reaches the cage. It is opt-in: the traffic
 //! is orders of magnitude heavier than `execve`'s.
 
+// The same panic gate the launcher carries, and here it costs nothing to hold: this binary has no
+// `unwrap`, `expect`, `panic!` or `unreachable!` of its own, so the lints are a floor rather than a
+// cleanup. They are worth stating on the half that runs *inside* the cage, where a panic is the
+// payload's supervisor dying with the filter still installed. Scoped to `not(test)` for the reason
+// the launcher scopes it: a test asserts by panicking.
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 // Every `unsafe` block here states the invariant it rests on: this binary is what sbx binds
 // inside a cage, so its raw syscalls are the ones an in-cage adversary faces directly.
 #![warn(clippy::undocumented_unsafe_blocks)]

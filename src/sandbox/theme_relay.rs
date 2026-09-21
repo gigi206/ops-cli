@@ -570,6 +570,11 @@ fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    #[expect(
+        clippy::expect_used,
+        reason = "`KEYFILE_REL` is a constant this crate writes, and it is a path with at least \
+                  one separator; a spelling without one is caught by the tests that read it"
+    )]
     let (dirs, leaf) = super::portal::KEYFILE_REL
         .rsplit_once('/')
         .expect("KEYFILE_REL names a file inside a directory");

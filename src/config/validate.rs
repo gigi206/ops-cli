@@ -1261,6 +1261,11 @@ fn service_enable(
                             (Some(values), _) => (true, values.into_vec()),
                             (_, Some(values)) => (false, values.into_vec()),
                             // Refused above.
+                            #[expect(
+                                clippy::unreachable,
+                                reason = "a condition carrying neither `is` nor `not` is \
+                                          refused before this map runs"
+                            )]
                             (None, None) => unreachable!(),
                         };
                         EnvCondition {

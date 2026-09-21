@@ -16,6 +16,26 @@
 // names `#[allow(rustdoc::broken_intra_doc_links)]` in its own error text, so the escape it offers is
 // refused here rather than left to prose. Carry a reference with the symbol it names instead.
 #![forbid(rustdoc::broken_intra_doc_links)]
+// A site that ends the process on an unexpected value has to say why that value cannot arrive, and
+// the ones that ship were neither forbidden nor blessed: these lints are `allow` by default and sit
+// outside the pinned set, so `mise run lint` walked past every `unwrap`, `expect`, `panic!` and
+// `unreachable!` in the binary. Counted rather than assumed, they are 51, none of them reached from
+// a hostile input and each of them resting on something a reader has to reconstruct. Warned here,
+// which `-D warnings` turns into the gate, so a NEW one is a red build; the existing ones carry an
+// `expect`/`allow` naming the reason the value is impossible, per module where the reason is one and
+// per site where it is not.
+//
+// Scoped to `not(test)` for the same reason the `unsafe` gate above is: a test asserts by panicking,
+// and a fixture that cannot be built is a test that must stop rather than one that must handle it.
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 
 // Declared before every other module, and only for that reason: `macro_rules!` are textually
 // scoped, so `#[macro_use]` lifts the skip macros into scope for the modules that follow. A module

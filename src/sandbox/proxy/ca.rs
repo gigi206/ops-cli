@@ -23,6 +23,12 @@ use rustls::{ClientConfig, RootCertStore};
 pub(super) fn ensure_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        #[expect(
+            clippy::expect_used,
+            reason = "the only way this fails is a provider already installed, and the `Once` \
+                      around it is what makes this the single installer in the process; a \
+                      process with no provider builds no TLS config at all"
+        )]
         rustls::crypto::ring::default_provider()
             .install_default()
             .expect("install the ring crypto provider");

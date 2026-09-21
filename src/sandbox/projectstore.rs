@@ -545,6 +545,11 @@ fn load_db_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
+    #[expect(
+        clippy::expect_used,
+        reason = "the child was spawned with `stdout(Stdio::piped())` three lines above and \
+                  nothing takes the handle first"
+    )]
     let dump_out = dump.stdout.take().expect("stdout was requested as a pipe");
     // The reader child consumes the pipe directly, so a large dump never blocks on
     // a full pipe buffer; reap the writer only once the reader has finished.

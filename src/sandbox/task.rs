@@ -27,6 +27,11 @@
 //! validated under) and the variable names in `env_allow`. Not the program, not the rest of the
 //! environment, not the mounts.
 
+#![allow(
+    clippy::expect_used,
+    reason = "`stdout`/`stderr` are taken from a child this function spawned with `Stdio::piped()` for both, and nothing takes them first"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{self, Read};

@@ -222,6 +222,11 @@ pub(super) fn validate_host_secret(
             RuleKind::Host(h, _) | RuleKind::Url { host: h, .. } => h.clone(),
             RuleKind::Ip(ip, _) => ip.to_string(),
             // `validate_secret_target` admits those three kinds and no other.
+            #[expect(
+                clippy::unreachable,
+                reason = "`validate_secret_target` ran above and admits exactly the three kinds \
+                          matched here, so a fourth is this file disagreeing with itself"
+            )]
             other => unreachable!("a secret target classified as {other:?}"),
         },
     };

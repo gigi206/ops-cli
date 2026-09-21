@@ -32,6 +32,11 @@
 //! reach; it is not a budget for sbx's own setup, and routing an install through it would demand
 //! that the author allowlist registries they never asked to talk to.
 
+#![allow(
+    clippy::expect_used,
+    reason = "`stdout`/`stderr` are taken from a child this function spawned with `Stdio::piped()` for both, and nothing takes them first"
+)]
+
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};

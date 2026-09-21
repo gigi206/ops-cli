@@ -596,6 +596,11 @@ fn read_bounded(path: &Path) -> io::Result<(String, bool)> {
         Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
     };
     Ok((
+        #[expect(
+            clippy::expect_used,
+            reason = "the match above either validated the bytes or truncated them at \
+                      `valid_up_to()`, and every other error returned"
+        )]
         String::from_utf8(text).expect("validated, or cut at the last valid boundary"),
         over,
     ))

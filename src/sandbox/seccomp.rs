@@ -57,6 +57,11 @@
 //! `umount2`→a mount teardown that can defeat a control-plane pin) is surfaced with a
 //! [`Caution`] the resolver turns into a warning.
 
+#![allow(
+    clippy::expect_used,
+    reason = "every `expect` here builds a filter from constants this file declares: a rule with one condition, a condition over a literal argument index and mask, and a program compiled from the static rule set. None takes a value from outside, so a failure would be this file disagreeing with itself at startup -- which is the moment to stop, since the alternative is a cage running with no syscall filter"
+)]
+
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch,

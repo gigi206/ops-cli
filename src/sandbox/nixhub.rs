@@ -17,6 +17,11 @@
 //! pin for a tool from nixhub metadata (pure) — with the one impure step, the metadata
 //! GET, isolated in [`resolve`].
 
+#![allow(
+    clippy::expect_used,
+    reason = "`stdout`/`stderr` are taken from a child this function spawned with `Stdio::piped()` for both, and nothing takes them first"
+)]
+
 use super::packages::Provisioned;
 use crate::store::{self, Layout};
 use std::collections::{BTreeMap, HashSet};

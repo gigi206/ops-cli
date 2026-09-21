@@ -12,6 +12,11 @@
 //! `packages.jq`). Array and table-of-table fields (`binds`, an allowlist, `[secret]`, `[app]`)
 //! are reported as non-scalar — they are edited through `$EDITOR`, not a single typed value.
 
+#![allow(
+    clippy::expect_used,
+    reason = "each `expect` re-reads an item this function classified a few lines above (`Item::Table`, `Item::Value` + inline table) and nothing between the classification and the read mutates the document: the branch it stands in is the one that classification selected"
+)]
+
 use std::path::{Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, Item, RawString, Table, TableLike, Value, value};

@@ -53,6 +53,11 @@
 //! a candidate the classifier rejects) and a verb-widening (a method-scoped host opened to `{*}`) are
 //! surfaced as [`Synthesis::notes`] for the caller to print.
 
+#![allow(
+    clippy::expect_used,
+    reason = "`host_token` is called on entries the same iterator chain has already filtered to the ones it answers for, so the `None` arm is a filter disagreeing with the function it filters for"
+)]
+
 use std::collections::BTreeSet;
 
 use super::control::{LogEvent, Plane, Proto};

@@ -19,6 +19,11 @@
 //! (strip-and-replace) onto the upstream request, and a reflected secret is masked out of the
 //! response DATA/headers/trailers for an injection-target host ([`relay_body_redacting`]).
 
+#![allow(
+    clippy::expect_used,
+    reason = "both `expect`s build a response from a status this module chose and an ASCII reason token from its own table, which is the whole of what `Response::builder` validates"
+)]
+
 use super::capture::CapBuf;
 use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
 use super::{

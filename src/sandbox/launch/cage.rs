@@ -14,6 +14,11 @@
 //! This is the part of a launch that the rest of the sandbox reaches into — the task engine, the
 //! task pool and the resolver each build a spec of their own and run it through the same argv.
 
+#![allow(
+    clippy::expect_used,
+    reason = "`stdout`/`stderr` are taken from a child this function spawned with `Stdio::piped()` for both, and nothing takes them first -- the handle is `None` only if the pipe was never requested"
+)]
+
 use super::*;
 
 /// Record this sandbox in the on-disk registry so `sbx session ls` can list it. Best

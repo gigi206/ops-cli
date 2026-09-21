@@ -1216,6 +1216,11 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
         }
         PluginKind::Resolver => Ok(Some(Plugin::Resolver(Box::new(ResolverPlugin {
             name,
+            #[expect(
+                clippy::expect_used,
+                reason = "a resolver with no `scheme` is refused earlier in this function, so the \
+                          arm building one has a scheme by the time it is reached"
+            )]
             scheme: scheme.expect("a resolver's scheme is required above"),
             dir: dir.to_path_buf(),
             exec,
@@ -1235,6 +1240,11 @@ pub(crate) fn validate_scheme(scheme: &str) -> Result<(), String> {
         return Err("`scheme` is empty".to_string());
     }
     let mut chars = scheme.chars();
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the empty scheme is refused on the line above, so the iterator has a first \
+                  character"
+    )]
     let first = chars.next().unwrap();
     if !first.is_ascii_lowercase() {
         return Err(format!(

@@ -200,6 +200,10 @@ pub(crate) fn read_log(
                 Some(c) => c,
                 None => {
                     captures.push(Capture::new(seq));
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "the push on the line above is what makes the vector non-empty"
+                    )]
                     captures.last_mut().expect("just pushed")
                 }
             };
