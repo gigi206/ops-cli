@@ -861,7 +861,7 @@ pub(crate) fn census(root: &Path, skip: &[&str]) -> io::Result<Census> {
 ///   read-only (`0555`); creating them with their final mode would make writing their contents
 ///   impossible, so they are created writable and tightened on the way back out.
 pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Census> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     let mut c = Census::default();
     // Every hardlinked file's first destination, so later names link to it instead of copying.
@@ -870,7 +870,15 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
     // (destination, mode) for each directory, applied after everything is written.
     let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
 
-    std::fs::create_dir_all(dst)?;
+    // The root of the copy is created owner-only. Every directory below it is created here too
+    // and then tightened to the mode its source carried (`dir_modes`, applied on the way out), so
+    // the root was the one entry whose mode came from the umask instead of from the tree being
+    // copied — and it is the entry that names the volume's whole contents to a reader of its
+    // parent.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dst)?;
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf(), true)];
     while let Some((from, to, top)) = stack.pop() {
         for entry in std::fs::read_dir(&from)? {

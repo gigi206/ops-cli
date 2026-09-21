@@ -680,6 +680,7 @@ fn runs_without_a_shell(editor: &std::ffi::OsStr) -> bool {
 /// non-zero exit stops before anything is trusted, and the trust verdict is read from the file as
 /// the editor left it.
 pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
+    use std::os::unix::fs::DirBuilderExt as _;
     let ScopeArgs {
         positionals,
         scope,
@@ -712,8 +713,17 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
     };
     // Make sure the parent directory exists so the editor can save a new file (the global config
     // directory may not exist yet).
+    //
+    // Owner-only, like every other directory sbx creates for itself (`Layout::ensure`, the config
+    // writer's own `write_doc`): this is the first thing that brings `~/.config/sbx` into being on
+    // a machine that had no global config, and a directory left at the umask publishes the names
+    // of an operator's apps and bundles to every other uid on the host. The files inside are
+    // already written `0600`; the directory holding them has to say the same thing.
     if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(e) = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
     {
         diag::error(&format!(
             "sbx: config: cannot create {}: {e}",
