@@ -71,6 +71,7 @@ fn nix_mount() -> NixMount {
 fn base_paths() -> SandboxPaths<'static> {
     SandboxPaths {
         project: Path::new("/home/u/proj"),
+        project_writable: true,
         distro_writable: &[],
         home_src: Path::new("/data/sbx/projects/abc/home"),
         mise_project_src: None,
@@ -119,6 +120,40 @@ fn assembled_from(paths: &SandboxPaths) -> SandboxSpec {
         vec![OsString::from("/bin/sh")],
     )
     .expect("valid spec")
+}
+
+/// The project mount carries the mode it was handed, and nothing else decides it.
+///
+/// The read-only case is what a project root sitting on sbx's own control plane gets: the decision
+/// is `build_spec`'s, because only it can read where those roots are, but the mount is emitted here
+/// and this is where the two spellings can be told apart. Without it, a project was mounted
+/// read-write whatever it was — the launcher's pins protect a project that *contains* a root, and a
+/// project that *is* one has no path between the two for a pin to freeze.
+#[test]
+fn the_project_mount_is_read_only_when_the_launcher_says_the_project_is_control_plane() {
+    let project = Path::new("/home/u/proj");
+    let mode_of = |writable: bool| {
+        assembled_from(&SandboxPaths {
+            project_writable: writable,
+            ..base_paths()
+        })
+        .mounts()
+        .iter()
+        .find_map(|m| match m {
+            Mount::Bind { src, dest } if src == project && dest == project => Some(true),
+            Mount::RoBind { src, dest } if src == project && dest == project => Some(false),
+            _ => None,
+        })
+        .expect("the project is mounted at its own path")
+    };
+    assert!(
+        mode_of(true),
+        "an ordinary project is the writable work surface"
+    );
+    assert!(
+        !mode_of(false),
+        "a project on the control plane is mounted read-only, like a bind declared over it"
+    );
 }
 
 fn assembled_with_ssh_config(ssh_config_src: Option<&Path>) -> SandboxSpec {
@@ -491,6 +526,37 @@ fn a_nesting_note_writes_the_host_home_as_a_tilde_and_leaves_the_rest() {
     // A `HOME` of `/` is a prefix of every absolute path, so eliding it would replace the whole
     // tree with `~` and say nothing. Left alone.
     assert_eq!(elided(Path::new("/etc"), Some(Path::new("/"))), "/etc");
+}
+
+/// A bind aimed at one of the launcher's own destinations is named, not silently replaced.
+///
+/// The launcher appends its binds after the config's, so a `[[binds]]` at one of them is shadowed
+/// the same way a bind under `/nix` is. Most of what it binds sits under `/tmp` or `/opt/sbx`, both
+/// structural, so those were already caught; the five under `/run` were not, and a bind aimed there
+/// did nothing and said nothing. Two lists rather than one because `STRUCTURAL_DESTS` also carries
+/// the distribution-mountpoint contract, which these do not take part in: their writability is
+/// arranged at launch by `distro_writable`.
+#[test]
+fn a_bind_at_one_of_the_launchers_own_destinations_is_named() {
+    for dest in [
+        "/run/sbx-pulse",
+        "/run/sbx-portal",
+        "/run/sbx-nvidia",
+        "/run/sbx-programs",
+        "/run/sbx-state",
+    ] {
+        let w = structural_nesting_warning(Path::new(dest), false, None);
+        assert!(
+            w.is_some(),
+            "`{dest}` is bound by the launch and would replace this bind without a word"
+        );
+    }
+    // The ones already covered keep being covered, by the structural root that contains them.
+    for covered in ["/tmp/sbx-egress.sock", "/opt/sbx/egress-ca.pem"] {
+        assert!(structural_nesting_warning(Path::new(covered), false, None).is_some());
+    }
+    // And an unrelated path is still not a conflict.
+    assert!(structural_nesting_warning(Path::new("/run/user/1000"), false, None).is_none());
 }
 
 #[test]
@@ -1942,6 +2008,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
     let paths = SandboxPaths {
         mise_shared_installs: &[],
         project: Path::new("/home/u/proj"),
+        project_writable: true,
         distro_writable: &[],
         home_src: Path::new("/data/sbx/apps/demo-app/home"),
         mise_project_src: Some(pool),

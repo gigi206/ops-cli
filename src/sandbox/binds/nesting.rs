@@ -9,7 +9,7 @@
 //! Prose only: nothing here is reached from a launch, and nothing here produces a mount. The list
 //! it reads, [`super::STRUCTURAL_DESTS`], stays with the mount plan that declares it.
 
-use super::STRUCTURAL_DESTS;
+use super::{LAUNCHER_DESTS, STRUCTURAL_DESTS};
 use std::path::Path;
 
 /// How a config bind's destination overlaps a structural mount destination.
@@ -30,16 +30,32 @@ enum Nesting {
 /// the later mount and vanishes; an ancestor over-exposes the host directory around the
 /// structural files — so it is the footgun worth surfacing.
 fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
-    STRUCTURAL_DESTS.iter().find_map(|s| {
+    let nesting = |s: &'static str| {
         let structural = Path::new(s);
         if dest == structural {
             None
         } else if dest.starts_with(structural) {
-            Some((*s, Nesting::Shadowed))
+            Some((s, Nesting::Shadowed))
         } else if structural.starts_with(dest) {
-            Some((*s, Nesting::Contains))
+            Some((s, Nesting::Contains))
         } else {
             None
+        }
+    };
+    if let Some(hit) = STRUCTURAL_DESTS.iter().copied().find_map(nesting) {
+        return Some(hit);
+    }
+    // The launcher's own destinations, mounted after the config binds like the structural ones and
+    // shadowing a bind the same way — but with the exact match reported rather than passed over.
+    // For a structural mount that collision is the control working (a config bind must not displace
+    // `/nix`), and the user who wrote it learns nothing from being told. For one of these it is the
+    // opposite: nobody writes `[[binds]] path = "/run/sbx-pulse"` meaning "let sbx replace this",
+    // and what they get is a bind that does nothing, silently. See [`super::LAUNCHER_DESTS`].
+    LAUNCHER_DESTS.iter().copied().find_map(|s| {
+        if dest == Path::new(s) {
+            Some((s, Nesting::Shadowed))
+        } else {
+            nesting(s)
         }
     })
 }

@@ -337,7 +337,7 @@ fn control_plane_mode(
         return false;
     }
     // At or under a root: the bind is entirely control plane → read-only.
-    if let Some(root) = roots.iter().find(|r| canon.starts_with(r)) {
+    if let Some(root) = root_at_or_above(canon, roots) {
         warnings.push(format!(
             "bind `{}` is read-write over sbx's own control plane `{}` — binding it read-only \
              instead (a writable bind there could alter what sbx runs or trusts on the host)",
@@ -363,6 +363,26 @@ fn control_plane_mode(
         ));
     }
     true
+}
+
+/// The control-plane root `canon` sits at or under, when there is one.
+///
+/// One definition of "this path *is* the control plane", because two callers have to answer it the
+/// same way: [`control_plane_mode`], which forces a declared bind read-only, and the launcher, which
+/// mounts the project root the caller's working directory chose. Written twice, it would be a rule
+/// two callers could come to apply differently — and the mount that escaped it would be the one
+/// nobody declared.
+pub(crate) fn control_plane_root_of(canon: &Path) -> Option<PathBuf> {
+    root_at_or_above(canon, &sbx_control_plane_roots()).cloned()
+}
+
+/// The pure core of [`control_plane_root_of`], taking the roots explicitly so the containment rule
+/// is testable without the environment that places them.
+///
+/// `starts_with` is a component-wise prefix, so it holds for a path *equal* to a root as well as one
+/// under it — the two cases the rule treats alike.
+fn root_at_or_above<'a>(canon: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    roots.iter().find(|r| canon.starts_with(r))
 }
 
 /// The mountpoint-chain pins that protect sbx's control plane from path substitution when a
@@ -2309,6 +2329,43 @@ mod tests {
             "the layer keeps its own posture: {:?}",
             global.network
         );
+    }
+
+    #[test]
+    fn the_containment_rule_answers_the_project_mount_and_the_declared_bind_alike() {
+        // The launcher asks this rule about the project root the caller's working directory chose,
+        // and `control_plane_mode` asks it about a declared bind. They must agree, so they share one
+        // definition: a path AT a root and a path UNDER it are both control plane, an ancestor is
+        // not, and a sibling whose name merely starts with the same characters is not either.
+        let roots = vec![PathBuf::from("/home/u/.config/sbx")];
+
+        assert_eq!(
+            root_at_or_above(Path::new("/home/u/.config/sbx"), &roots),
+            Some(&roots[0]),
+            "a project root equal to a control-plane root is control plane — the case no pin covers"
+        );
+        assert_eq!(
+            root_at_or_above(Path::new("/home/u/.config/sbx/apps"), &roots),
+            Some(&roots[0]),
+        );
+        assert_eq!(
+            root_at_or_above(Path::new("/home/u/.config"), &roots),
+            None,
+            "an ancestor merely contains the root; the launcher pins it rather than closing it"
+        );
+        assert_eq!(
+            root_at_or_above(Path::new("/home/u/.config/sbx-notes"), &roots),
+            None,
+            "containment is component-wise, so a longer sibling name is not under the root"
+        );
+        // And the same rule, read through the caller that downgrades a declared bind.
+        let mut warnings = Vec::new();
+        assert!(!control_plane_mode(
+            Path::new("/home/u/.config/sbx"),
+            true,
+            &roots,
+            &mut warnings
+        ));
     }
 
     #[test]

@@ -124,6 +124,11 @@ handled fail-closed and warned about; see [`binds`](../configuration/binds).)
   whole home) stays read-write, but each of `sbx`'s roots is **pinned read-only in
   place**, so the rest of the tree is writable while the agent still cannot alter
   what `sbx` runs or trusts.
+- The **project itself** follows the same rule. The working directory you launch
+  from is bound read-write without being declared anywhere, so running from one of
+  `sbx`'s own directories is the same request as a read-write bind over it. It is
+  mounted **read-only**, with a warning naming the directory. Launch from somewhere
+  else if you need to write there.
 
 This closes an escalation where a writable parent directory would let the agent
 substitute a forged control-plane directory. See [`binds`](../configuration/binds)
@@ -177,6 +182,14 @@ the same treatment.
 What remains in the argument list is the mount layout and the command itself. A
 command's own text is unavoidably an argument: it is what the cage is asked to run, so **do not put a secret in a command line**; declare it as a credential and read it
 from the environment.
+
+**Other users, not other processes of yours.** `400` means the owner, and the owner is
+you: any process running as your account can read a cage's environment, its control
+sockets (`0700`, and you own them) and its trust markers. That is the same-uid model
+seen from the host side, and it is the boundary this page draws. `sbx` protects you
+from what runs **inside** the cage. It does not protect you from what already runs as
+you outside it: an editor plugin, a shell hook, another tool you installed. If that is
+your threat, the control is not an `sbx` setting; it is not running that code.
 
 ## Defense in depth
 

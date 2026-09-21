@@ -1418,6 +1418,25 @@ mod tests {
     use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
 
+    /// The two destinations this module owns are the two `binds` spells out by hand.
+    ///
+    /// `LAUNCHER_DESTS` names every path the launcher binds, so a `[[binds]]` aimed at one is told it
+    /// will be replaced instead of vanishing. These two constants are private to this module, so that
+    /// list carries them as literals — and a literal is what a rename leaves behind, still compiling
+    /// and no longer true. This is the same shape `STRUCTURAL_DESTS` is held in lockstep by, from the
+    /// side that can see the constants.
+    #[test]
+    fn the_launcher_destination_list_names_this_modules_two_paths() {
+        let listed = crate::sandbox::binds::LAUNCHER_DESTS;
+        for owned in [CAGE_PROGRAMS, CAGE_STATE] {
+            assert!(
+                listed.contains(&owned),
+                "`{owned}` is bound into a cage by this module and is missing from \
+                 `LAUNCHER_DESTS`, so a config bind aimed at it would be replaced in silence"
+            );
+        }
+    }
+
     /// A plugin's cage carries the same mandatory syscall denylist an agent's cage does.
     ///
     /// It did not, and the asymmetry ran the wrong way. This is the cage that runs code sbx did not

@@ -104,6 +104,11 @@ still lands correctly inside it.
   whole `$HOME`) **stays read-write**, but each `sbx` root is **pinned read-only in
   place**, so the rest of the tree is writable while the agent still cannot alter
   what `sbx` runs or trusts.
+- The **project itself** follows the same rule. The working directory you launch
+  from is bound read-write without being declared anywhere, so running from one of
+  `sbx`'s own directories is the same request as a read-write bind over it. It is
+  mounted **read-only**, with a warning naming the directory. Launch from somewhere
+  else if you need to write there.
 
 This closes an escalation where a writable parent directory would let the agent
 rename a control-plane directory out of the way and substitute a forged one. See

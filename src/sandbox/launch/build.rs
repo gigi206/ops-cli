@@ -2662,6 +2662,12 @@ pub(super) fn build(
     // actor must first confine the project root" — and no caller implements it, so pinning is what
     // this one can do without changing which directories a person may launch from.
     //
+    // Pins cover the project that *contains* a root, and only that. A project root **equal** to one
+    // gets no pin from here and can get none: a pin is a mountpoint on the path between the bind and
+    // the root, and between a directory and itself there is no such path. That case is closed at the
+    // mount instead — `build_spec` binds such a project read-only — which is why this computation is
+    // whole even though the containment test below is strict.
+    //
     // Canonicalized to match: `sbx_control_plane_roots` resolves symlinks, and a bind is compared
     // against them canonicalized, so a symlinked `$HOME` component would otherwise walk past the
     // containment test.

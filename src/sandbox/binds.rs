@@ -558,8 +558,15 @@ pub(crate) struct Overlay<'a> {
 
 /// Host-side locations of one sandbox's mount sources, passed to [`assemble`].
 struct SandboxPaths<'a> {
-    /// Canonical project root; bound read-write at the same absolute path.
+    /// Canonical project root; bound at the same absolute path, read-write unless it is sbx's own
+    /// control plane (see `project_writable`).
     project: &'a Path,
+    /// Whether the project mount is read-write. False when the project root is at or under one of
+    /// sbx's control-plane roots, where a writable mount would be host-side code execution or a
+    /// forged trust/config rather than the single-project self-harm the project mount accepts.
+    ///
+    /// Decided by [`build_spec`], which is where the roots can be read.
+    project_writable: bool,
     /// Cage directories to cover with a tmpfs before anything else, under a declared distribution
     /// only: a mount whose destination the image lacks needs a writable ancestor to be created in.
     /// Computed by [`distro_writable`] from this launch's own paths, which is why it lives here and
@@ -921,15 +928,22 @@ fn cage_mounts(
         Mount::Tmpfs {
             dest: PathBuf::from("/tmp"),
         },
-        // Zone 2 — the writable work surface: a private home, and the project at
-        // its own absolute path (tool compatibility; code is not a secret).
+        // Zone 2 — the work surface: a private home, and the project at its own absolute path
+        // (tool compatibility; code is not a secret). The project is writable for every project but
+        // sbx's own control plane, which is read-only for the reason a declared bind there is.
         Mount::Bind {
             src: paths.home_src.to_path_buf(),
             dest: PathBuf::from(SANDBOX_HOME),
         },
-        Mount::Bind {
-            src: paths.project.to_path_buf(),
-            dest: paths.project.to_path_buf(),
+        match paths.project_writable {
+            true => Mount::Bind {
+                src: paths.project.to_path_buf(),
+                dest: paths.project.to_path_buf(),
+            },
+            false => Mount::RoBind {
+                src: paths.project.to_path_buf(),
+                dest: paths.project.to_path_buf(),
+            },
         },
     ]);
 
@@ -1067,7 +1081,7 @@ fn cage_mounts(
 /// Make every directory between the writable home and each of `rels` a mountpoint of its own, so a
 /// read-only bind at one of those paths cannot be moved out of the way by renaming a parent.
 ///
-/// Read-write binds of the host home's own subdirectories: same source, same content, same mode —
+/// Read-write binds of the **cage** home's own subdirectories: same source, same content, same mode —
 /// all they change is that the kernel now refuses to rename or remove those components.
 ///
 /// Returned shallow-to-deep, so a parent is mounted before its child: a child mounted first would be
@@ -1281,6 +1295,28 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     MISE_PROJECT_INCAGE,
     MISE_SHARED_INCAGE,
     super::contract::EGRESS_CONTRACT_INCAGE,
+];
+
+/// The destinations the **launcher** binds into a cage, as opposed to the structural mounts
+/// [`assemble`] emits. Kept apart from [`STRUCTURAL_DESTS`] because that list carries a second
+/// contract — every entry has to be a mountpoint a provisioned distribution tree already has
+/// (`distro_mountpoints_cover_every_structural_destination`) — and these are not: a launcher bind's
+/// destination is made writable at launch by `distro_writable`, which walks the extra binds and
+/// puts a tmpfs above whatever the image lacks.
+///
+/// What they share is the *shadowing*: the launcher's binds are appended after the config's, so a
+/// `[[binds]]` aimed at one of them is replaced without a word. Most of what the launcher binds sits
+/// under `/tmp` or `/opt/sbx`, both structural and therefore already covered; these five are the
+/// ones no covered root contains, and they were silent. The direction is safe either way — the
+/// launcher's mount is the later one and wins — but a bind that quietly does nothing is exactly what
+/// [`nesting::structural_nesting_warning`] exists to name.
+pub(super) const LAUNCHER_DESTS: &[&str] = &[
+    super::audio::CAGE_SOCK,
+    super::portal::CAGE_DIR,
+    super::gpu::CAGE_NVIDIA,
+    // `resolver`'s two, whose constants are private to it.
+    "/run/sbx-programs",
+    "/run/sbx-state",
 ];
 
 /// mise's data directory inside the cage, relative to the sandbox `$HOME`. The
@@ -1562,11 +1598,18 @@ fn join_paths(dirs: &[PathBuf]) -> String {
 /// are created owner-only; they outlive the process by design (later housekeeping
 /// reclaims them).
 ///
-/// `cwd` is bound **read-write at its own path** as the work surface — correct
+/// `cwd` is bound **at its own path** as the work surface, read-write — correct
 /// when the user chose the directory. This is the shared chokepoint where that
 /// surface is granted, so a caller launching an *untrusted* actor must first
 /// confine the project root (e.g. refuse `$HOME` or `/`); otherwise `cd ~` would
 /// expose the whole home read-write.
+///
+/// The one confinement this chokepoint applies itself is sbx's own control plane: a project root at
+/// or under one of those directories is mounted **read-only**, with a warning, because what a write
+/// there reaches is the host rather than the project. It is applied here rather than left to the
+/// caller for the reason the rest of this contract is not: there is exactly one project mount, and
+/// the launcher's control-plane pins cannot cover it — a pin freezes the path *between* a bind and a
+/// root, and here there is none.
 ///
 /// It carries one argument more than clippy's threshold, deliberately: the grouping discipline
 /// (`SandboxPaths`) keeps the *audited* core — the pure [`assemble`] — at the limit, so the I/O
@@ -1597,6 +1640,27 @@ pub(crate) fn build_spec(
     use std::os::unix::fs::DirBuilderExt;
 
     let project = canonicalize_project(cwd)?;
+    // The project mount is the one read-write mount nobody declares: it is chosen by where the
+    // caller stands. It therefore takes the same control-plane rule a declared bind takes — at or
+    // under one of sbx's own roots it is mounted read-only — because the reason is the mount's, not
+    // the declaration's: writing there alters what sbx runs or trusts on the *host*, which is
+    // outside the single-project self-harm the project mount accepts. The launcher's pins close the
+    // neighbouring case (a project that merely *contains* a root, `$HOME` being the everyday one);
+    // this closes the case where the two are the same directory, which no pin can cover because
+    // there is no path between them to make a mountpoint of.
+    let project_writable = match crate::config::control_plane_root_of(&project) {
+        Some(root) => {
+            crate::diag::warn(&format!(
+                "the project root `{}` is sbx's own control plane `{}` — mounting it read-only \
+                 (a writable mount there could alter what sbx runs or trusts on the host); run \
+                 from somewhere else to write in it",
+                project.display(),
+                root.display()
+            ));
+            false
+        }
+        None => true,
+    };
     let rt = project_runtime(data_dir, &project, runtime);
 
     DirBuilder::new()
@@ -1820,6 +1884,7 @@ pub(crate) fn build_spec(
 
     let paths = SandboxPaths {
         project: &project,
+        project_writable,
         distro_writable: &distro_writable,
         home_src: &rt.home_src,
         mise_project_src: rt.mise_project_src.as_deref(),
