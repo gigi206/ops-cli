@@ -52,6 +52,26 @@ fn ioctl_codes_match_the_kernel_abi() {
     assert_eq!(notif_id_valid_code(), 0x4008_2102);
 }
 
+/// The skip a test takes when the host does not carry a program its payload runs.
+///
+/// These tests are about the lens, not about coreutils: the payload is only a process that opens or
+/// execs something, and it is spelled with absolute host paths so the decision has a name to hold.
+/// A userland without them — a cage over a distro root, an image built from nothing — cannot stage
+/// the payload at all, and that is a precondition the harness has no outcome for unless it is said
+/// here. Enforced, so a host that is supposed to carry them proves it under `SBX_REQUIRE_CAPABLE`.
+macro_rules! need_host_programs {
+    ($($program:literal),+ $(,)?) => {
+        $(
+            if !std::path::Path::new($program).exists() {
+                skip_incapable!(concat!(
+                    "skipping: no `", $program, "` on this host to build the payload from"
+                ));
+                return;
+            }
+        )+
+    };
+}
+
 /// Run `payload` under a supervisor whose content lens carries `patterns`, draining every
 /// notification until the payload exits.
 ///
@@ -142,6 +162,7 @@ fn run_with_open_lens(
 
 #[test]
 fn an_allowed_open_hands_the_cage_the_inode_that_was_scanned() {
+    need_host_programs!("/bin/cat", "/bin/sh");
     // The property this defends is what makes an *allow* mean anything. The supervisor forms its
     // verdict against an inode, and the cage must receive a descriptor for that inode — not for
     // whatever the path it wrote names once the answer is given.
@@ -281,6 +302,7 @@ fn a_creat_is_notified_like_the_open_it_is() {
 
 #[test]
 fn a_non_regular_first_target_no_longer_lets_the_swap_through() {
+    need_host_programs!("/bin/cat", "/bin/sh");
     // The door increment one left open, and the cheapest one to walk: the supervisor decides on
     // the path it read, so the cage picks what that path names *first*. Naming something the
     // supervisor could not serve from a descriptor sent the answer back to `CONTINUE`, and the
@@ -345,6 +367,7 @@ fn a_non_regular_first_target_no_longer_lets_the_swap_through() {
 
 #[test]
 fn an_absent_first_target_is_answered_rather_than_walked_again() {
+    need_host_programs!("/bin/cat", "/bin/sh");
     // The cheapest door of the three, because it needs no special file at all: point the name at
     // nothing while the answer is being formed, and a `CONTINUE` would send the kernel back down
     // the path once the secret is behind it.
@@ -411,6 +434,7 @@ fn an_absent_first_target_is_answered_rather_than_walked_again() {
 
 #[test]
 fn a_device_and_a_fifo_are_served_without_changing_what_the_cage_gets() {
+    need_host_programs!("/bin/cat", "/bin/dd", "/bin/sh", "/bin/wc");
     // The arms that carry the most machinery are also the ones that would break quietly: a cage
     // opens `/dev/null` constantly, and a FIFO read is served from a thread of its own. What is
     // asserted here is that neither behaves differently for being served.
@@ -630,6 +654,7 @@ fn the_umask_line_is_read_as_the_octal_it_is_written_in() {
 
 #[test]
 fn a_made_file_lands_with_the_masks_the_cage_asked_for() {
+    need_host_programs!("/bin/sh");
     // The file is made by the supervisor, so the kernel subtracts the *supervisor's* umask — and
     // the two part company the moment the cage sets its own, which is what a script writing a key
     // does. Both directions are pinned: a mask stricter than this process's has to be honoured,
@@ -1236,6 +1261,7 @@ fn an_open_that_asked_not_to_follow_a_link_is_refused_when_the_final_component_i
 
 #[test]
 fn a_name_that_is_not_there_yet_is_made_rather_than_reported_absent() {
+    need_host_programs!("/bin/sh");
     // The probe that examines a path creates nothing, so a creating open finds its name absent
     // and would be told so. Both halves are asserted: the file has to appear with the bytes the
     // cage wrote, and a file that already carries a secret must still be refused — a lens that
@@ -1373,6 +1399,7 @@ fn the_second_resolution_reaches_the_same_inode_and_refuses_a_marked_path() {
 
 #[test]
 fn a_secret_named_from_a_subdirectory_is_still_scanned() {
+    need_host_programs!("/bin/cat", "/bin/sh");
     // The fast path exists so that an ordinary relative open keeps resolving exactly as it did,
     // `..` included. Pinning it here because the alternative once considered — resolving every
     // open inside the cage's root — would rebase `..` onto the starting directory and let this
@@ -1639,6 +1666,7 @@ fn a_creation_that_could_not_be_handed_over_is_taken_away_again() {
 /// target's.
 #[test]
 fn a_target_named_in_bytes_no_name_can_carry_is_not_read_as_a_name_with_them_replaced() {
+    need_host_programs!("/bin/env");
     let me = std::process::id();
     let good = b"/usr/bin/env\0";
     assert_eq!(
@@ -1672,6 +1700,7 @@ fn a_target_named_in_bytes_no_name_can_carry_is_not_read_as_a_name_with_them_rep
 /// supervisor's reach.
 #[test]
 fn an_open_named_in_bytes_no_name_can_carry_is_refused_rather_than_resolved_under_another() {
+    need_host_programs!("/bin/cat", "/bin/sh");
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1779,6 +1808,7 @@ fn a_target_named_by_its_descriptor_is_undecidable_rather_than_substituted() {
 
 #[test]
 fn a_file_whose_content_matches_is_refused_at_the_open() {
+    need_host_programs!("/bin/cat");
     let dir = TmpDir::new();
     let secret = dir.join("carries.txt");
     std::fs::write(&secret, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
@@ -1841,6 +1871,7 @@ fn measure_lens_end_to_end() {
 
 #[test]
 fn a_symlink_to_matching_content_is_refused_like_its_target() {
+    need_host_programs!("/bin/cat");
     let dir = TmpDir::new();
     let secret = dir.join("carries.txt");
     std::fs::write(&secret, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
@@ -1992,6 +2023,7 @@ fn a_refusal_never_carries_an_errno_about_the_supervisor() {
 
 #[test]
 fn a_fifo_does_not_wedge_the_supervisor() {
+    need_host_programs!("/bin/sh");
     let dir = TmpDir::new();
     let fifo = dir.join("pipe");
     let cfifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
@@ -2029,6 +2061,7 @@ fn a_fifo_does_not_wedge_the_supervisor() {
 
 #[test]
 fn a_file_whose_content_does_not_match_is_read_normally() {
+    need_host_programs!("/bin/cat");
     let dir = TmpDir::new();
     let clean = dir.join("ordinary.txt");
     std::fs::write(&clean, b"just ordinary prose, no credential here\n")
@@ -2169,6 +2202,7 @@ fn send_fd(stream: &UnixStream, fd: libc::c_int) {
 /// itself ends the wait, which is the same outcome by a shorter route.
 #[test]
 fn a_handoff_that_is_not_the_shims_is_refused_without_ending_the_wait() {
+    need_host_programs!("/bin/true");
     let dir = TmpDir::new();
     let shim = materialized_shim(&dir);
     let sock_path = dir.join("notif.sock");
@@ -2420,6 +2454,7 @@ fn serve_under_supervisor(
 /// is under test is *when the sweep is reached*, not what it decides once it is.
 #[test]
 fn a_parked_decision_times_out_while_the_cage_keeps_the_receive_loop_busy() {
+    need_host_programs!("/bin/nope", "/bin/sh", "/bin/true");
     let dir = TmpDir::new();
     let shim = materialized_shim(&dir);
     let sock_path = dir.join("notif.sock");
@@ -2517,6 +2552,7 @@ fn a_parked_decision_times_out_while_the_cage_keeps_the_receive_loop_busy() {
 /// receives its `CONTINUE` or waits forever.
 #[test]
 fn a_parked_exec_is_answered_after_the_supervisors_own_descriptor_is_gone() {
+    need_host_programs!("/bin/true");
     let dir = TmpDir::new();
     let shim = materialized_shim(&dir);
     let sock_path = dir.join("notif.sock");
@@ -2594,6 +2630,7 @@ fn a_parked_exec_is_answered_after_the_supervisors_own_descriptor_is_gone() {
 /// window on a refusal. The shim reports that refusal as its own exit 126.
 #[test]
 fn a_denied_execve_announces_what_the_user_reads() {
+    need_host_programs!("/bin/true");
     // The refusal's own words, which nothing else asserted: they are built here and rendered by
     // the notification path, so a wrong edit to either ships as user-visible text that every
     // other test still passes over.
@@ -2657,6 +2694,7 @@ fn a_denied_execve_announces_what_the_user_reads() {
 
 #[test]
 fn a_denied_execve_returns_eperm_and_the_payload_never_runs() {
+    need_host_programs!("/bin/true");
     let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
     let (code, ring) = run_under_supervisor(&["/bin/true"], &policy, &ProcOverlay::new());
 
@@ -2704,6 +2742,7 @@ fn own_dynamic_loader() -> Option<PathBuf> {
 /// policy denying something else must run to completion and return its own exit code.
 #[test]
 fn the_interpreter_a_shebang_names_is_decided_too() {
+    need_host_programs!("/bin/nonexistent", "/bin/sh");
     use std::os::unix::fs::PermissionsExt;
     let dir = TmpDir::new();
     let path = dir.join("s.sh");
@@ -2750,6 +2789,7 @@ fn the_interpreter_a_shebang_names_is_decided_too() {
 /// under a policy denying something else must run to completion and return its own exit code.
 #[test]
 fn a_shebang_chain_is_followed_to_the_program_the_kernel_runs() {
+    need_host_programs!("/bin/nonexistent", "/bin/sh");
     use std::os::unix::fs::PermissionsExt;
     let dir = TmpDir::new();
     let inner = dir.join("b.sh");
@@ -2803,6 +2843,7 @@ fn a_shebang_chain_is_followed_to_the_program_the_kernel_runs() {
 /// with no handler in force must run.
 #[test]
 fn an_interpreter_binfmt_misc_would_run_is_decided() {
+    need_host_programs!("/bin/nonexistent", "/bin/true");
     let handler = crate::proc_policy::parse_binfmt_rule(
         "enabled\ninterpreter /opt/vm/run\nflags: \noffset 0\nmagic 7f454c46\n",
     )
@@ -2879,6 +2920,7 @@ fn an_interpreter_binfmt_misc_would_run_is_decided() {
 /// so, where the interpreter is not on this host.
 #[test]
 fn a_shebang_run_from_a_descriptor_is_decided_too() {
+    need_host_programs!("/bin/nonexistent", "/bin/python3", "/bin/sh");
     let Some(python) = ["/usr/bin/python3", "/bin/python3"]
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
@@ -2944,6 +2986,7 @@ fn a_shebang_run_from_a_descriptor_is_decided_too() {
 /// interpreter run behind a file the cage made unreadable on purpose.
 #[test]
 fn a_target_that_can_be_reached_and_not_read_is_refused() {
+    need_host_programs!("/bin/nonexistent", "/bin/sh");
     use std::os::unix::fs::PermissionsExt;
     let dir = TmpDir::new();
     let path = dir.join("x.sh");
@@ -3022,6 +3065,7 @@ fn a_target_that_can_be_reached_and_not_read_is_refused() {
 /// the loader alone under the denying policy must still be allowed.
 #[test]
 fn a_program_a_loader_is_asked_to_run_is_decided_by_its_own_name() {
+    need_host_programs!("/bin/nonexistent", "/bin/sh", "/bin/true");
     let Some(loader) = own_dynamic_loader() else {
         return;
     };
@@ -3110,6 +3154,7 @@ fn a_program_a_loader_is_asked_to_run_is_decided_by_its_own_name() {
 /// the payload and the payload's own exit code is what comes back.
 #[test]
 fn an_allowed_execve_runs_the_payload() {
+    need_host_programs!("/bin/nonexistent", "/bin/true");
     // A denylist that denies something else entirely: `/bin/true` is unmatched, which under
     // `enforce` means allowed.
     let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
@@ -3133,6 +3178,7 @@ fn an_allowed_execve_runs_the_payload() {
 /// sitting in the first `PATH` entry is unlaunchable.
 #[test]
 fn a_confined_allowlist_still_lets_a_name_lookup_find_its_program() {
+    need_host_programs!("/bin/env", "/bin/true");
     let empty = TmpDir::new();
     std::fs::create_dir_all(empty.join("a")).expect("an empty PATH entry");
     std::fs::create_dir_all(empty.join("b")).expect("another empty PATH entry");
@@ -3184,6 +3230,7 @@ fn a_confined_allowlist_still_lets_a_name_lookup_find_its_program() {
 /// tree. Measured here rather than taken from the kernel's documentation.
 #[test]
 fn a_grandchild_execve_traps_the_same_supervisor() {
+    need_host_programs!("/bin/timeout", "/bin/true");
     // `timeout` forks and execs its argument, so the denied target is reached across both — a
     // chain the payload's own exec could not demonstrate on its own.
     let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
@@ -3216,6 +3263,7 @@ fn a_grandchild_execve_traps_the_same_supervisor() {
 /// otherwise be the only cover for.
 #[test]
 fn a_session_overlay_deny_returns_eperm_at_the_syscall() {
+    need_host_programs!("/bin/true");
     let policy = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
     let overlay = ProcOverlay::new();
     assert!(overlay.remember(Verdict::Deny, "/bin/true"));
@@ -3241,6 +3289,7 @@ fn a_session_overlay_deny_returns_eperm_at_the_syscall() {
 /// must run nothing, not run everything.
 #[test]
 fn the_shim_refuses_to_run_a_payload_with_no_supervisor() {
+    need_host_programs!("/bin/touch");
     let dir = TmpDir::new();
     let shim = materialized_shim(&dir);
     let marker = dir.join("the-payload-ran");
@@ -3342,6 +3391,7 @@ const UNREADABLE: (u32, u64) = (1, 0);
 /// and a rule loaded afterwards still reaches it.
 #[test]
 fn a_poisoned_overlay_still_decides_and_still_takes_a_rule() {
+    need_host_programs!("/bin/curl", "/bin/wget");
     let overlay = std::sync::Arc::new(ProcOverlay::new());
     overlay.remember(Verdict::Deny, "curl");
     let base = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
@@ -3542,6 +3592,7 @@ fn run_in_cage(
 /// then the link and not the cage failing to launch anything at all.
 #[test]
 fn a_head_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_given_up_on() {
+    need_host_programs!("/bin/nonexistent", "/bin/sh");
     let setup = "printf '#!/bin/sh\\nexit 7\\n' > '{cage}/payload'\n\
                  chmod 755 '{cage}/payload'\n\
                  ln -s '{cage}/payload' '{cage}/l'\n";
@@ -3586,6 +3637,7 @@ fn a_head_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_given_up_on(
 /// cage, and only one of them is the one the `execve` runs.
 #[test]
 fn a_head_spelled_under_proc_self_is_read_from_the_cage_and_not_from_the_host() {
+    need_host_programs!("/bin/bash", "/bin/nonexistent", "/bin/sh");
     use std::os::unix::fs::PermissionsExt;
     // The host side, planted before the tmpfs covers it: the file this supervisor's own walk lands
     // on when it leaves the cage, naming an interpreter no rule here speaks about.
@@ -3643,6 +3695,7 @@ fn a_head_spelled_under_proc_self_is_read_from_the_cage_and_not_from_the_host() 
 /// while the errno still tells a name the cage really has from one it does not.
 #[test]
 fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link() {
+    need_host_programs!("/bin/sh");
     let Some(bwrap) = bwrap_on_path() else {
         return;
     };
@@ -3784,11 +3837,15 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
 /// absent, or the answer would be satisfied by a probe that stopped refusing anything.
 #[test]
 fn an_open_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_refused() {
-    let (Some(unshare), crate::Userns::Ok) = (
+    // The fixture is a shell script the cage runs, so a shell is as much a prerequisite here as the
+    // namespace is — named rather than assumed, because a userland that has `unshare` and no `sh`
+    // would otherwise fail on the payload rather than skip on the host.
+    let (Some(unshare), Some(_sh), crate::Userns::Ok) = (
         crate::pathfind::find_on_path("unshare"),
+        crate::pathfind::find_on_path("sh"),
         crate::probe_userns(),
     ) else {
-        skip_incapable!("skipping the cage walk: need `unshare` and a usable userns");
+        skip_incapable!("skipping the cage walk: need `unshare`, `sh` and a usable userns");
         return;
     };
     let dir = TmpDir::new();
@@ -4037,6 +4094,7 @@ fn an_open_the_lens_cannot_name_is_counted_because_it_leaves_nothing_else_behind
 
 #[test]
 fn a_caller_whose_program_is_not_a_name_a_policy_can_hold_is_counted_rather_than_flattened() {
+    need_host_programs!("/bin/sleep");
     // `/proc/<pid>/exe` is bytes and a policy's caller nodes are text. A lossy conversion bridges
     // the two by mapping every byte it cannot carry onto one replacement character, so callers
     // that are different programs would arrive under a single name and a rule written for one

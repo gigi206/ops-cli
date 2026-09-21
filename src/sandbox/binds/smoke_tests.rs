@@ -143,6 +143,16 @@ fn the_nix_ld_shim_serves_foreign_binaries_and_unskews_cross_channel_tools() {
         skip_unreachable!("skipping: base userland provisioning failed (cache or channel drift)");
         return;
     };
+    // The userland resolving says the cache answered *then*, not that it will answer for what this
+    // test provisions next — `hello` and `patchelf` are exactly the packages a local cache is
+    // likeliest to lack while the base closure is warm. Asked with the helper the mise smokes
+    // already use, so an unreachable cache is counted the way the line above counts it rather than
+    // failing on a `provision` that was never this test's subject.
+    if !network_reachable() {
+        skip_unreachable!("skipping: the binary cache is unreachable, and this test provisions");
+        return;
+    }
+
     // both halves consume the shared store read-only (the userland is what is under
     // test); the writable per-project store is the launcher's concern.
     let nix_mount = NixMount {
@@ -342,6 +352,16 @@ fn the_cage_runs_from_a_writable_per_project_store_seeded_with_the_base_closure(
         skip_unreachable!("skipping: base userland provisioning failed (cache or channel drift)");
         return;
     };
+    // The userland resolving says the cache answered *then*, not that it will answer for what this
+    // test provisions next — `hello` and `patchelf` are exactly the packages a local cache is
+    // likeliest to lack while the base closure is warm. Asked with the helper the mise smokes
+    // already use, so an unreachable cache is counted the way the line above counts it rather than
+    // failing on a `provision` that was never this test's subject.
+    if !network_reachable() {
+        skip_unreachable!("skipping: the binary cache is unreachable, and this test provisions");
+        return;
+    }
+
     let unseeded = crate::store::provision(
         &nix,
         &layout,
@@ -514,6 +534,16 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
         skip_unreachable!("skipping: base userland provisioning failed (cache or channel drift)");
         return;
     };
+    // The userland resolving says the cache answered *then*, not that it will answer for what this
+    // test provisions next — `hello` and `patchelf` are exactly the packages a local cache is
+    // likeliest to lack while the base closure is warm. Asked with the helper the mise smokes
+    // already use, so an unreachable cache is counted the way the line above counts it rather than
+    // failing on a `provision` that was never this test's subject.
+    if !network_reachable() {
+        skip_unreachable!("skipping: the binary cache is unreachable, and this test provisions");
+        return;
+    }
+
     // hello: realised into the shared store but NOT a seeded root — the discriminant's
     // non-seeded dependency. (jq was the original probe but is now in the curated base
     // toolset, so it IS seeded and could no longer serve as the non-seeded discriminant.)

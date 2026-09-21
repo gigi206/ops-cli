@@ -129,6 +129,21 @@ mise run audit   # cargo audit against the RustSec advisory database, for both l
 mise run ci      # all of the above
 ```
 
+The host has to carry a few things the build and the suite reach for, and each one
+fails late rather than at the door:
+
+| What | Needed by | Absent |
+|---|---|---|
+| a C compiler (`cc`) | the build scripts of `libc`, `serde_core`, `proc-macro2` | `cargo build` fails to link |
+| `gzip`, coreutils (`/bin/sh`, `/bin/cat`, `/bin/wc`, `/bin/dd`, `/bin/true`, `mkdir`) | the unit tests that stage a payload or check an inflater against its oracle | those tests skip and say so |
+| user namespaces, `bwrap`, `nix` | every cage the sandbox suites open | those tests skip and say so |
+| a reachable binary cache | the suites that provision a package | those tests skip and say so |
+
+Only the compiler stops the build. The rest are skips, which is why `mise run test`
+ends by counting them: a green run that did nothing is the failure mode this guards
+against. `SBX_REQUIRE_CAPABLE=1` turns a host-capability skip into a failure, for a
+machine that is supposed to manage.
+
 `proc-shim/` is named separately in `fmt` and `lint` because it is its own workspace
 root: the in-cage shim must inherit none of sbx's dependency graph, and the cost of
 that isolation is that no cargo invocation rooted at the repository reaches it

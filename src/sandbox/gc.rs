@@ -3537,15 +3537,21 @@ mod tests {
         let store = tree.join("store/nix/store/xxxx");
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join("file"), b"x").unwrap();
-        // a symlink to a real file outside the tree must be unlinked, never followed
-        std::os::unix::fs::symlink("/etc/hostname", tree.join("link")).unwrap();
+        // A symlink to a real file outside the tree must be unlinked, never followed. The target is
+        // the test's own, in the fixture beside the tree rather than somewhere on the host: a host
+        // path is one the test cannot promise exists, and one a test process could not delete even
+        // if the walk did follow the link — so the assertion below would hold whatever happened,
+        // which is no assertion at all.
+        let outside = base.path().join("outside");
+        std::fs::write(&outside, b"target").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
         // nix-style read-only directory
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         force_remove_dir_all(&tree).unwrap();
         assert!(!tree.exists(), "the read-only tree was not removed");
         assert!(
-            Path::new("/etc/hostname").exists(),
+            outside.exists(),
             "a symlink target was followed and deleted"
         );
     }

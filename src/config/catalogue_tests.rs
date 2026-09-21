@@ -338,6 +338,17 @@ fn a_launch_that_installs_from_its_own_command_survives_an_absent_override_and_a
     // `git`, `corepack` and `pnpm` are stood in for, because the launch otherwise clones from the
     // network and walks a workspace. The Corepack stand-in REPORTS what it was handed rather than
     // reproducing the upstream failure, so the assertion is on the state the script produces.
+    // The subject is the shipped script, and the script is bash plus the coreutils it calls. A
+    // userland carrying neither runs nothing to observe, so the prerequisite is named here rather
+    // than surfacing as `mkdir: command not found` inside an assertion about a launch — the same
+    // rule the rest of the suite follows for bwrap and nix.
+    for program in ["bash", "mkdir"] {
+        if crate::pathfind::find_on_path(program).is_none() {
+            skip_incapable!("skipping: no `{program}` on PATH to run the shipped script with");
+            return;
+        }
+    }
+
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let profile = root.join("examples/app/open-design.toml");
     let raw = schema::parse_app(&std::fs::read(&profile).expect("read the profile")).unwrap();

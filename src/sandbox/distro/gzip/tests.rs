@@ -1,5 +1,30 @@
 use super::*;
 
+/// Whether the host has the `gzip` these tests compress and decompress *with*.
+///
+/// The inflater under test is sbx's own; `gzip` is the oracle it is held against, and an oracle is a
+/// host prerequisite like bwrap or nix. Absent, the tests that need it are counted as skipped rather
+/// than failing on a program that was never the subject — the repo's rule for a precondition that is
+/// decided at runtime.
+fn gzip_on_path() -> bool {
+    std::process::Command::new("gzip")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The skip every test in this file takes when its oracle is missing, so the reason is written once.
+macro_rules! need_gzip {
+    () => {
+        if !gzip_on_path() {
+            skip_incapable!("skipping: no `gzip` on PATH to compress the fixtures with");
+            return;
+        }
+    };
+}
+
 /// Compress `data` the way a registry's layer is compressed, so the reader is exercised against a
 /// real gzip member rather than one this test also invented.
 fn gzip(data: &[u8]) -> Vec<u8> {
@@ -30,6 +55,7 @@ fn inflate_all(bytes: &[u8]) -> io::Result<Vec<u8>> {
 
 #[test]
 fn a_gzip_member_round_trips() {
+    need_gzip!();
     for payload in [
         Vec::new(),
         b"hello".to_vec(),
@@ -43,6 +69,7 @@ fn a_gzip_member_round_trips() {
 
 #[test]
 fn the_optional_header_fields_are_skipped_not_inflated() {
+    need_gzip!();
     // `gzip -N` writes the original name into the header (FNAME), which the reader must consume
     // before the deflate stream starts. A reader that did not would inflate the name as data.
     let dir = crate::testutil::TmpDir::new();
@@ -74,6 +101,7 @@ fn something_that_is_not_gzip_is_refused_at_the_header() {
 
 #[test]
 fn a_truncated_member_is_an_error_not_a_short_read() {
+    need_gzip!();
     // The failure that matters: a layer cut in half must not look like a layer that ended.
     let compressed = gzip(&b"payload that will be cut".repeat(500));
     let truncated = &compressed[..compressed.len() / 2];
@@ -92,6 +120,7 @@ fn a_truncated_member_is_an_error_not_a_short_read() {
 /// other readers do.
 #[test]
 fn a_file_of_several_gzip_members_inflates_to_all_of_them() {
+    need_gzip!();
     let first = b"the first member\n".repeat(3000);
     let second = b"the second member\n".repeat(3000);
     let mut concatenated = gzip(&first);

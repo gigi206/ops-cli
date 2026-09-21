@@ -615,6 +615,11 @@ fn tally(entries: &[u8]) -> Space {
     const GLOBAL_RSV: u64 = 1 << 49;
 
     let mut space = Space::default();
+    #[expect(
+        clippy::unwrap_used,
+        reason = "`chunks_exact(ENTRY)` yields chunks of exactly `ENTRY` bytes, and `ENTRY` is \
+                  three `u64`s, so each eight-byte slice converts"
+    )]
     for e in entries.chunks_exact(ENTRY) {
         let flags = u64::from_ne_bytes(e[0..8].try_into().unwrap());
         if flags & GLOBAL_RSV != 0 {
@@ -721,6 +726,11 @@ pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
     if unsafe { libc::ioctl(fd, BTRFS_IOC_SPACE_INFO as libc::Ioctl, buf.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the buffer was sized to hold the header plus the reported entries, so its \
+                  first sixteen bytes are present"
+    )]
     let got = u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as usize;
 
     Ok(tally(&buf[HEADER..HEADER + got.min(count) * ENTRY]))
@@ -1126,6 +1136,11 @@ pub(crate) fn mkfs_command(
             // it is a pair of descriptors compiled per call, not a flag, and the caller is what
             // holds them open across the exec. This argv is assembled by hand rather than through
             // the `SandboxSpec` keystone, and had the namespaces and the capabilities without it.
+            #[expect(
+                clippy::expect_used,
+                reason = "the filters are built from constants `seccomp` declares, so a failure \
+                          here is that module disagreeing with itself rather than an input"
+            )]
             let seccomp = crate::sandbox::seccomp::memfds(&Default::default())
                 .expect("the statically-defined filters compile");
             c.args(crate::sandbox::seccomp::argv_prefix(&seccomp));
@@ -1901,12 +1916,26 @@ this line has no separator at all
 
     #[test]
     fn compression_reports_none_where_the_attribute_cannot_exist() {
-        // A directory on an ordinary filesystem carries no such attribute. Reporting `None`
-        // rather than failing matters: `status` runs against whatever the volume turns out to
-        // be, and must render a plain answer instead of an error.
-        let base = crate::testutil::TmpDir::new();
-        assert_eq!(compression(base.path()), None);
+        // A path that names nothing carries no attribute on any filesystem, and reporting `None`
+        // rather than failing is what lets `status` render a plain answer against whatever the
+        // volume turns out to be.
         assert_eq!(compression(Path::new("/nonexistent-by-construction")), None);
+
+        // The ordinary-directory half asks the same question of a real directory, and that one is
+        // only a question where the fixture root is not itself a compressing volume. It can be: the
+        // root follows `SBX_TEST_TMPDIR`, then `XDG_CACHE_HOME`, and pointing either at an sbx
+        // storage volume — a btrfs the feature under test creates with `btrfs.compression` set,
+        // which children inherit — makes the attribute present and the premise false. Measured
+        // rather than assumed from the filesystem type, because inheritance is what decides it.
+        let base = crate::testutil::TmpDir::new();
+        if compression(base.path()).is_some() {
+            skip_incapable!(
+                "skipping: the fixture root is on a compressing volume, so an ordinary directory \
+                 there does carry the attribute"
+            );
+            return;
+        }
+        assert_eq!(compression(base.path()), None);
     }
 
     /// Build a stand-in for one filesystem's sysfs directory: the device it is backed by, and
@@ -2638,7 +2667,15 @@ this line has no separator at all
         let image = base.path().join("vol.btrfs");
         // A `mkfs` that succeeds without doing anything, so `init` runs to the end and leaves the
         // image it created in place to be inspected. What is under test is the open, not the format.
-        let noop = Mkfs::Host(PathBuf::from("/bin/true"));
+        // The stand-in is a host binary, which is a host prerequisite: a userland without `/bin/true`
+        // (a cage over a distro root, a container built from nothing) cannot stage this, and that is
+        // a skip rather than a failure about a file this test never meant to be about.
+        let noop_path = PathBuf::from("/bin/true");
+        if !noop_path.exists() {
+            skip_incapable!("skipping: no `/bin/true` to stand in for a mkfs that does nothing");
+            return;
+        }
+        let noop = Mkfs::Host(noop_path);
 
         // SAFETY: `umask` is a per-process scalar syscall; the previous value is restored below.
         let previous = unsafe { libc::umask(0o022) };
