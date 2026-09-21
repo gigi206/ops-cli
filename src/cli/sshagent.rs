@@ -69,7 +69,7 @@ fn write_agent_event(
         let obj = serde_json::json!({
             "session_pid": session_pid,
             "seq": e.seq,
-            "at_epoch_ms": e.at_epoch_ms as u64,
+            "at_epoch_ms": crate::cli::json_epoch_ms(e.at_epoch_ms),
             "kind": e.kind.token(),
             "detail": e.detail,
         });

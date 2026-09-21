@@ -885,7 +885,7 @@ fn write_row(
     if json {
         let obj = serde_json::json!({
             "session_pid": session_pid,
-            "at_epoch_ms": row.at_epoch_ms as u64,
+            "at_epoch_ms": crate::cli::json_epoch_ms(row.at_epoch_ms),
             "feed": row.feed,
             "token": row.token,
             "subject": row.subject,
