@@ -431,14 +431,64 @@ impl FakeIps {
 /// is "which names did this cage ask for" rather than "how often". A name that fell out of the
 /// table and is asked for again is reported again — the record says what was asked, not what is
 /// currently held.
+///
+/// **The report is handed to a thread of its own, never delivered on the caller's.** Delivering it
+/// in line put a `connect` and a `write` — bounded by [`REPORT_TIMEOUT`], not by anything faster —
+/// on the single-threaded UDP resolver, between a query arriving and its answer going out. Every
+/// *fresh* name paid it, one at a time, so a cage asking for names nobody has asked for before
+/// slowed its own resolution by however long the control plane took to accept, and the queries
+/// behind it waited their turn. The tap's job is to answer; the record is what it says about
+/// having answered, and the two must not be the same wait.
+///
+/// The queue is bounded and a full one **drops** rather than blocks, which is the only choice that
+/// keeps the property above: blocking on a full queue would put the coupling straight back, and
+/// growing it without end would hand a cage a way to spend the supervisor's memory by asking for
+/// names. Dropping is already the contract every other failure here has — a report is never a
+/// prerequisite — and the thing that is bounded is the one the cage controls.
 #[derive(Debug, Default)]
 pub(crate) struct Reporter {
-    control: Option<PathBuf>,
+    /// The queue the sender thread drains; `None` when there is no control plane to report to,
+    /// which is every test and any launch without one.
+    outbox: Option<std::sync::mpsc::SyncSender<String>>,
 }
+
+/// How many reports may be waiting for the sender thread before one is dropped.
+///
+/// The same number the durable egress register keeps destination rows for, and by the same
+/// derivation rather than by coincidence: past that many hosts it folds everything into one
+/// overflow row, so a queue deeper than the number of rows the far end can still tell apart buys
+/// nothing. Both numbers are bounded because the cage is what chooses their contents.
+///
+/// What a drop costs is worth naming, because a `RESOLVED` is not only a log line: the control
+/// plane **counts** it, and that count is the part which survives the live ring evicting its own
+/// entries. A dropped report therefore loses a resolution from that count. It is still the right
+/// direction — the alternative is holding the resolver the cage is waiting on, which loses the
+/// resolution itself — and reaching it takes a control plane that has stopped accepting for long
+/// enough to fill this, while each write the sender thread makes is already bounded by
+/// [`REPORT_TIMEOUT`].
+const REPORT_BACKLOG: usize = 256;
 
 impl Reporter {
     pub(crate) fn new(control: Option<PathBuf>) -> Self {
-        Self { control }
+        let Some(control) = control else {
+            return Self { outbox: None };
+        };
+        let (outbox, queue) = std::sync::mpsc::sync_channel::<String>(REPORT_BACKLOG);
+        // One thread, so the reports keep the order they were made in — a `RESOLVED` and the
+        // `BYPASSED` that follows it read as a sequence in the record. It ends when the queue's
+        // last sender goes, which is this `Reporter` being dropped.
+        std::thread::spawn(move || {
+            for line in queue {
+                if let Ok(mut sock) = UnixStream::connect(&control) {
+                    let _ = sock.set_write_timeout(Some(REPORT_TIMEOUT));
+                    let _ = sock.write_all(line.as_bytes());
+                    let _ = sock.flush();
+                }
+            }
+        });
+        Self {
+            outbox: Some(outbox),
+        }
     }
 
     /// Report one newly resolved name.
@@ -453,23 +503,18 @@ impl Reporter {
         self.send(format!("BYPASSED {} {}\n", addr.ip(), addr.port()));
     }
 
-    /// One line to the control plane. Best-effort and non-blocking beyond a short write: the
-    /// control plane answers `ok`, which is not read back, because nothing here would do anything
-    /// differently on a refusal.
+    /// Hand one line to the sender thread. Never blocks and never fails: a queue with no room
+    /// drops the line, for the reason the type's own documentation gives.
     fn send(&self, line: String) {
-        let Some(control) = &self.control else {
-            return;
-        };
-        if let Ok(mut sock) = UnixStream::connect(control) {
-            let _ = sock.set_write_timeout(Some(REPORT_TIMEOUT));
-            let _ = sock.write_all(line.as_bytes());
-            let _ = sock.flush();
+        if let Some(outbox) = &self.outbox {
+            let _ = outbox.try_send(line);
         }
     }
 }
 
-/// How long a resolution report may take before it is abandoned. Short: the cage is waiting on the
-/// DNS answer behind it, and a report is worth none of that latency.
+/// How long one report's write may take before it is abandoned. Short because a control plane that
+/// is not accepting must not hold the sender thread while the queue behind it fills: the cage is no
+/// longer waiting on this — the answer went out without it — but the reports behind it are.
 const REPORT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A parsed DNS question: the name asked for, its type, and how many bytes the question section

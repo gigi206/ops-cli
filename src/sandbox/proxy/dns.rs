@@ -22,6 +22,52 @@ fn default_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
         .collect())
 }
 
+/// How long a caller waits for a name before the resolution is given up on.
+///
+/// Above any healthy lookup and below what a host resolver left to its own devices can take: glibc
+/// tries each nameserver in turn with its own timeout and its own retry count, so a
+/// `/etc/resolv.conf` naming several unreachable servers reaches tens of seconds before it answers
+/// at all. The proxy is what the cage waits on, so that number becomes the cage's.
+const RESOLVE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// [`default_resolve`] under [`RESOLVE_DEADLINE`], so a slow host resolver cannot hold a connection
+/// thread for as long as it likes.
+///
+/// `getaddrinfo` is a blocking call with no cancellation and no timeout of its own, and it runs on
+/// the connection's thread. A resolver that accepts queries and never answers therefore pinned one
+/// thread per name for its whole libc timeout, and on the HTTP/2 plane that thread is the tunnel's
+/// runtime — so every stream multiplexed onto that connection waited for a name only one of them
+/// had asked for.
+///
+/// **Two things this does not do, both of them consequences of that missing cancellation.** The
+/// lookup is not stopped: the thread carrying it stays until libc returns, and what the deadline
+/// frees is the *caller*, not the work. And those threads accumulate while that lasts: a name is
+/// looked up on the connection that asked for it, so their number is the connection cap **per libc
+/// timeout window** rather than the connection cap outright — a failed lookup is deliberately not
+/// cached, so a client that retries asks again and starts another one. What this replaces is worse
+/// in kind rather than in degree: the same threads were held with no bound at all, and on the
+/// HTTP/2 plane one of them is the tunnel's whole runtime.
+///
+/// The channel is bounded at one rather than rendezvous-synchronised, so the lookup that finishes
+/// after its caller walked away deposits its answer and ends instead of blocking forever on a
+/// receiver nobody holds.
+fn deadlined_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
+    let (answer, wait) = std::sync::mpsc::sync_channel(1);
+    let name = host.to_string();
+    std::thread::spawn(move || {
+        let _ = answer.send(default_resolve(&name));
+    });
+    wait.recv_timeout(RESOLVE_DEADLINE).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "resolving `{host}` took longer than {}s",
+                RESOLVE_DEADLINE.as_secs()
+            ),
+        ))
+    })
+}
+
 /// A [`Resolver`] wrapping [`default_resolve`] with a short-TTL cache — the resolution resilience a
 /// proxy fronting a long `nix`/flake build needs. A build fetches from one host (`cache.nixos.org`)
 /// thousands of times; re-resolving per request wastes lookups and turns any single resolver hiccup
@@ -32,7 +78,7 @@ fn default_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
 /// this resolution, so a proxy-level retry would be redundant. It holds at most
 /// [`DNS_CACHE_CAP`] hosts.
 pub(super) fn caching_resolver(ttl: Duration) -> Resolver {
-    cached_resolver(ttl, default_resolve)
+    cached_resolver(ttl, deadlined_resolve)
 }
 
 /// The most hosts cached at once. Past it a host is resolved per request but not stored, so a name

@@ -165,7 +165,14 @@ impl Tally {
     fn bump(&mut self, host: &str, kind: StatKind) {
         let host = super::observe_feed::sanitize(host);
         let has_room = self.hosts.contains_key(&host) || self.hosts.len() < MAX_HOSTS;
-        if has_room && !RESERVED_PREFIXES.iter().any(|p| host.starts_with(*p)) {
+        // An **empty** name folds like a reserved prefix, and for the same reason: it is not a
+        // destination, so it cannot have a row of its own. The refusal a connection meets before it
+        // has said where it was going — the connection cap, decided on the accept loop — reports no
+        // host at all, and a row keyed on nothing reaches `sbx net stats` as a destination the
+        // session apparently talked to. Folded, the refusal is still counted and nothing claims it
+        // had a name.
+        let named = !host.is_empty() && !RESERVED_PREFIXES.iter().any(|p| host.starts_with(*p));
+        if has_room && named {
             self.hosts.entry(host).or_default().bump(kind);
         } else {
             self.overflow.bump(kind);
