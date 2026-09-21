@@ -2146,14 +2146,16 @@ fn the_connection_settings_flow_from_the_table_and_fail_closed_on_a_value_that_w
     );
 }
 
-/// The WebSocket-secret posture flows from the table to the policy, and an unknown value keeps the
-/// default rather than picking one.
+/// The WebSocket-secret posture flows from the table to the policy, and an unknown value is refused
+/// on the strict side rather than the neutral side.
 ///
-/// The default is the one that does not tear a live tunnel down, so "fails closed" is the wrong
-/// frame here and the reason is written where the value is parsed: closing on a value nobody chose
-/// ends a conversation, and the setting exists because that is a cost only its author can weigh.
+/// The value a policy carries unasked is `warn`, the permissive one, and that is what sets this key
+/// apart from `capture`, whose unasked-for `off` is already its closed posture. Keeping it on a typo
+/// left the weaker setting in force on a value its author most likely wrote to mean `block` — a
+/// fail-open with no signal inside the cage. The fallback is therefore `block`, and the warning
+/// names both the value and the posture taken.
 #[test]
-fn the_websocket_secret_posture_flows_from_the_table_and_keeps_the_default_on_a_typo() {
+fn the_websocket_secret_posture_flows_from_the_table_and_fails_closed_on_a_typo() {
     use crate::allowlist::WebsocketSecret;
     let table = |raw: Option<&str>| {
         NetworkField::Table(NetworkTable {
@@ -2194,14 +2196,20 @@ fn the_websocket_secret_posture_flows_from_the_table_and_keeps_the_default_on_a_
             if p.websocket_secret() == WebsocketSecret::Warn));
     assert!(w.is_empty(), "valid values warn nothing: {w:?}");
 
+    // A typo — the spelling this key's author is likeliest to reach for — must not leave the weaker
+    // posture in force. Teeth: reverting the fallback to `Warn` reports `Warn` here.
     let typo = validate_network(&mut w, GLOBAL_CONFIG, table(Some("blocked"))).unwrap();
     assert!(
         matches!(&typo, NetworkPolicy::Allowlist(p)
-            if p.websocket_secret() == WebsocketSecret::Warn),
-        "an unknown value keeps the default rather than choosing one"
+            if p.websocket_secret() == WebsocketSecret::Block),
+        "an unknown value is refused on the strict side"
     );
     assert_eq!(w.len(), 1);
     assert!(w[0].contains("websocket_secret"), "{w:?}");
+    assert!(
+        w[0].contains("blocked") && w[0].contains("strict"),
+        "the warning names the value it refused and the posture it runs instead: {w:?}"
+    );
 }
 
 #[test]
@@ -2263,6 +2271,46 @@ fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_ty
     );
     assert_eq!(w.len(), 1);
     assert!(w[0].contains("unknown capture level"), "{w:?}");
+}
+
+/// An unreadable `capture` level closes the capture in an **amending** overlay too, not only in a
+/// table that replaces the layer below.
+///
+/// The overlay starts from the layer below, so a level merely dropped left that layer's in force:
+/// an `[app.<name>.network]` writing `capture = "of"` to turn the profile's body capture off kept
+/// every body, while the warning beside it said the capture was off. The level the validator
+/// cannot read is therefore applied rather than skipped, which is what its warning states and the
+/// rule `websocket_secret` follows with its own posture.
+#[test]
+fn an_unknown_capture_level_closes_the_capture_an_overlay_amends() {
+    use crate::allowlist::{DefaultAction, EgressPolicy};
+    use crate::sandbox::control::CaptureLevel;
+    let parent = NetworkPolicy::Allowlist(Box::new(
+        EgressPolicy::new(vec![], vec![])
+            .with_default(DefaultAction::Deny)
+            .with_capture(CaptureLevel::Bodies, Some(64)),
+    ));
+    let field = NetworkField::Table(NetworkTable {
+        capture: Some("of".into()),
+        ..net_table_defaults()
+    });
+    let mut w = Vec::new();
+    let policy =
+        super::validate_network_amending(&mut w, "app `demo`", field, &NetGroups::new(), &parent)
+            .expect("the overlay validates");
+    let NetworkPolicy::Allowlist(p) = &policy else {
+        panic!("an amending overlay stays a filtering policy");
+    };
+    // Teeth: dropping the unreadable level instead of applying it reports `Bodies` here.
+    assert_eq!(
+        p.capture_level(),
+        CaptureLevel::Off,
+        "an unknown level closes the capture the overlay amends: {w:?}"
+    );
+    assert!(
+        w.iter().any(|m| m.contains("unknown capture level")),
+        "the miss is named: {w:?}"
+    );
 }
 
 /// The capture rides the `[network]` table, so it inherits that table's trust gate: an untrusted
@@ -8204,6 +8252,56 @@ fn a_malformed_entry_in_either_list_is_dropped_keeping_the_valid_ones() {
             .any(|w| w.contains("ignoring allow entry"))
     );
     assert!(r.warnings.iter().any(|w| w.contains("ignoring deny entry")));
+}
+
+/// A malformed `deny` entry under the **denylist** posture leaves the host it named reachable, and
+/// the warning says so.
+///
+/// The sibling entries survive a drop, which is why the table is not thrown away over one of them:
+/// that would lose the `deny` rules that did parse. What a drop cannot be is silent about its
+/// direction — under `mode = "allow"` the deny list is the whole restriction, so the entry sbx
+/// could not read is the one host its author believed blocked. sbx cannot guess that host, so the
+/// one thing it owes the author is the consequence, named where the entry is dropped.
+#[test]
+fn a_malformed_deny_entry_under_the_denylist_posture_names_the_host_it_leaves_reachable() {
+    let table = RawConfig {
+        network: Some(NetworkField::Table(NetworkTable {
+            mode: Some("allow".to_string()),
+            deny: vec!["blocked-ok.example.com".into(), "blocked typo".into()],
+            ..net_table_defaults()
+        })),
+        ..RawConfig::default()
+    };
+    let r = resolve_no_plugins(table, None);
+    match &r.network {
+        NetworkPolicy::Allowlist(a) => {
+            assert_eq!(
+                a.deny_rules().len(),
+                1,
+                "the parsed sibling survives the drop"
+            );
+            assert!(
+                !a.permits("blocked-ok.example.com", 443, "/"),
+                "the kept deny wins"
+            );
+            // Teeth: the posture under test is the one where a dropped `deny` opens a hole, so
+            // the message that announces it cannot be read as redundant and removed.
+            assert!(
+                a.permits("other.example.com", 443, "/"),
+                "allow-by-default is the posture under test"
+            );
+        }
+        other => panic!("expected an allowlist, got {other:?}"),
+    }
+    let dropped = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("ignoring deny entry"))
+        .unwrap_or_else(|| panic!("the drop is named: {:?}", r.warnings));
+    assert!(
+        dropped.contains("nothing is denied for it"),
+        "the drop names what it costs, not only that it happened: {dropped}"
+    );
 }
 
 #[test]

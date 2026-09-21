@@ -886,9 +886,11 @@ pub(crate) enum WebsocketSecret {
 }
 
 impl WebsocketSecret {
-    /// Parse the config spelling, or `None` for anything else (the caller warns and keeps the
-    /// default, which is the fail-open direction only because the alternative is a tunnel torn down
-    /// on a value nobody chose).
+    /// Parse the config spelling, or `None` for anything else. The caller refuses the value rather
+    /// than keeping the one the policy already carries, because that one *is* the open posture
+    /// here: see the strict fallback in `config::validate`, which warns with the value and with the
+    /// posture it runs instead. (`CaptureLevel::parse`'s caller refuses the same way, applying its
+    /// own `off`.)
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "warn" => Some(Self::Warn),

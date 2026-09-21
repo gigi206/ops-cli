@@ -68,6 +68,13 @@ splice carries no HTTP request, so a `deny` is matched on `host:port` alone ther
 [what a `deny` reaches on a spliced host](../networking/modes#what-a-deny-reaches-on-a-spliced-host)
 for that detail.
 
+An entry sbx cannot parse is dropped with a warning naming what the drop costs, because
+that cost is not the same in both lists. A dropped `allow` entry leaves its host
+unreachable. A dropped `deny` entry under `mode = "allow"` leaves its host **reachable**,
+since the deny list is the whole restriction there: the entries beside it still apply, but
+the host its author believed blocked is not. sbx cannot guess that host from an entry it
+could not read, so read those warnings before trusting a denylist.
+
 `none` and `shared` stand up no egress proxy, so every other field of the table is
 addressed to something that is not there. A table that pairs one of them with `allow`,
 `capture`, `ask_timeout` or any other field is named in the launch warnings, field by
@@ -93,9 +100,9 @@ host, unfiltered".
 | `body_max_mb` | the most of one request body the proxy holds in memory, in MiB (default `64`): see below |
 | `ca_roots` | `false` hands the cage the session CA alone instead of pairing it with the public roots (default `true`): see below |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
-| `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
+| `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"`; an unrecognized value is refused and `"off"` applies, with a warning naming the value |
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"`; above the ceiling it is clamped, not refused |
-| `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel): see below |
+| `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel); an unrecognized value is refused and the strict `"block"` posture applies, with a warning naming the value: see below |
 | `shared_credential` | groups of hosts that are one service, so a credential the cage obtained by its own sign-in may travel among them: see below |
 | `groups` | **ignored, with a warning**: an egress group lives in its own file under `net-groups/`, and a list references it as `@<name>`: see [Egress groups](../networking/groups) |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
@@ -138,6 +145,11 @@ Every inspected path is captured: HTTPS, inspected cleartext,
 the messages each direction carried, unmasked). A raw [`tcp://`](../networking/rules)
 splice has no head to read and is the one exception.
 
+A value sbx cannot read is refused at load and `"off"` applies in its place, with a
+warning naming it. The level is set rather than left alone, because an app overlay that
+adds to a profile starts from the profile's level: a mistyped `capture` there would
+otherwise have gone on keeping the bodies it was written to stop keeping.
+
 Three properties, covered in full on the [observability page](../networking/observability#seeing-the-traffic-network-capture):
 every configured secret is masked out of a capture before it is stored (and an
 sbx-injected credential never enters one at all); a capture lives only in the running
@@ -169,6 +181,11 @@ The way back is recorded and never closed, whichever setting you choose: a secre
 *into* the cage is not an exfiltration, and the answer the request paths give that is
 redaction, which a byte-for-byte relay cannot do without rewriting a stream two peers agreed
 on.
+
+A value sbx cannot read is refused at load, and the strict `"block"` posture applies in its
+place with a warning naming both the value and the posture taken. The default is only for the
+spelling `"warn"`: a typo like `"blocked"` must not leave the weaker setting in force, where
+nothing inside the cage could ever show you it had.
 
 The two settings also differ in what a tunnel watches for. sbx remembers a credential an app
 obtained by its own sign-in, so the set of values it scans for grows while a session runs, and

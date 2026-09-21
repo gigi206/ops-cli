@@ -734,9 +734,11 @@ fn warn_inert_under_posture(
 }
 
 /// Validate the table form of `network`: `none`/`shared` behave as the string form; `deny`/`allow`/
-/// `ask` classify each declared entry (a malformed one is dropped with a warning, fail-closed —
-/// that host simply stays unreachable, never silently allowed); and an **omitted** `mode` inherits
-/// the filtering mode from `parent` while keeping this table's own rules.
+/// `ask` classify each declared entry (a malformed one is dropped with a warning that names what
+/// the drop costs: an `allow` entry leaves its host unreachable, while a `deny` entry under an
+/// allow-by-default posture leaves the host it named **reachable** — which is why the drop is
+/// announced rather than called fail-closed); and an **omitted** `mode` inherits the filtering mode
+/// from `parent` while keeping this table's own rules.
 pub(super) fn validate_network_table(
     warnings: &mut Vec<String>,
     source_label: &str,
@@ -904,14 +906,15 @@ pub(super) fn validate_network_table(
                  `pool = false`, which turns connection reuse off on both legs"
             )),
             Err(reason) => warnings.push(format!(
-                "{source_label}: ignoring invalid `idle_timeout` — {reason}; the built-in bound \
-                 stays"
+                "{source_label}: ignoring invalid `idle_timeout` — {reason}; the bound already in \
+                 force stays"
             )),
         }
     }
     // How many client connections the proxy serves at once. Zero would refuse every connection and
-    // is far likelier a typo than an intent, so it is warned and dropped (fail-closed: the built-in
-    // cap stays).
+    // is far likelier a typo than an intent, so it is warned and dropped, leaving the cap already
+    // in force — the built-in one under a table that replaces, the layer below's under one that
+    // amends. Not called fail-closed: a wider cap inherited from below is not a narrowing.
     match table.max_connections {
         Some(0) => warnings.push(format!(
             "{source_label}: ignoring `max_connections = 0` — it would refuse every connection; \
@@ -948,11 +951,15 @@ pub(super) fn validate_network_table(
         }
     }
     // The traffic capture: how much of each permitted exchange the proxy keeps for
-    // `sbx net logs --with-headers/--with-body`. Never a verdict. An unknown level is dropped with a
-    // warning and the capture stays off — fail-closed, since the value names how much plaintext the
-    // launch retains.
-    // An amending table starts from the layer below, so the level it inherits is that layer's: a
-    // ceiling written alone in an overlay bounds the capture the profile turned on, and reading it
+    // `sbx net logs --with-headers/--with-body`. Never a verdict. An unknown level is refused and
+    // `off` applies — fail-closed, since the value names how much plaintext the launch retains.
+    // The closed posture is *applied* rather than left to the policy's own default, because the two
+    // layerings do not start from the same place: a replacing table is already at `off` here, while
+    // an amending overlay starts from the layer below, so dropping the level left that layer's in
+    // force — an overlay writing `capture = "of"` to turn the profile's bodies off kept every one
+    // of them, under a warning that said the capture was off.
+    // The same overlay is why the ceiling is read against the *inherited* level below: a
+    // `capture_max_kb` written alone bounds the capture the profile turned on, and reading it
     // against "no level" declared it inert while the bodies it bounds were being kept.
     let mut capture = amends_below.then(|| policy.capture_level());
     if let Some(raw) = &table.capture {
@@ -961,10 +968,15 @@ pub(super) fn validate_network_table(
                 policy = policy.with_capture(level, table.capture_max_kb);
                 capture = Some(level);
             }
-            None => warnings.push(format!(
-                "{source_label}: ignoring unknown capture level `{raw}` (expected \"off\", \
-                 \"headers\", or \"bodies\") — the traffic capture stays off"
-            )),
+            None => {
+                let off = crate::sandbox::control::CaptureLevel::Off;
+                policy = policy.with_capture(off, None);
+                capture = Some(off);
+                warnings.push(format!(
+                    "{source_label}: unknown capture level `{raw}` (expected \"off\", \
+                     \"headers\", or \"bodies\") — the traffic capture is off"
+                ));
+            }
         }
     } else if let Some(level) = capture.filter(|l| l.captures_bodies())
         && table.capture_max_kb.is_some()
@@ -982,16 +994,30 @@ pub(super) fn validate_network_table(
             "{source_label}: `capture_max_kb` is only meaningful with `capture = \"bodies\"` — ignored"
         ));
     }
-    // What a secret seen leaving through a WebSocket does. An unknown value keeps the default, and
-    // the default is the one that does not tear a live tunnel down: the alternative would end a
-    // conversation on a value nobody chose, which is not a safer failure, only a louder one.
+    // What a secret seen leaving through a WebSocket does. An unreadable value is refused and the
+    // closed posture — `block` — applies, the rule the capture level above follows with its own
+    // `off`. What the two do not share is which spelling that is: `off` is also the level a policy
+    // carries when nothing asked for a capture, while here the unasked-for value is `warn`, the
+    // *open* one, so leaving the policy as it stood would have kept the weaker setting in force on
+    // a value the operator had every reason to believe was the strict one.
+    //
+    // The cost of the strict fallback is real and is not hidden: a mistyped `"blocked"` ends a live
+    // tunnel on the sighting its author may have meant only to record. What makes that the right
+    // side to fall on is that it is *announced* — the launch warns with the value and with the
+    // posture it is running instead — while the permissive fallback is the one failure an operator
+    // cannot notice from inside a cage, which is the whole point of setting this key.
     if let Some(raw) = &table.websocket_secret {
         match crate::allowlist::WebsocketSecret::parse(raw) {
             Some(action) => policy = policy.with_websocket_secret(action),
-            None => warnings.push(format!(
-                "{source_label}: ignoring unknown `websocket_secret` value `{raw}` (expected \
-                 \"warn\" or \"block\") — a secret seen leaving a WebSocket is recorded and relayed"
-            )),
+            None => {
+                policy = policy.with_websocket_secret(crate::allowlist::WebsocketSecret::Block);
+                warnings.push(format!(
+                    "{source_label}: unknown `websocket_secret` value `{raw}` (expected \"warn\" \
+                     or \"block\") — the strict posture applies instead: a secret seen leaving a \
+                     WebSocket is recorded and the tunnel is closed. Write `\"warn\"` to \
+                     record-and-relay instead"
+                ));
+            }
         }
     }
     // What declaring a table costs, said where it happens. The policy above was *rebuilt* from this

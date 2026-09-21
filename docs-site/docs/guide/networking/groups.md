@@ -84,9 +84,10 @@ warning**. The direction of the failure depends on the list:
 - In an **`allow`** list, dropping the reference means those hosts are **not
   allowed**: the safe (fail-closed) direction.
 - In a **`deny`** list, dropping the reference means a carve-out is **lost**: the
-  host is no longer blocked. This is the one case where a typo fails open *in
-  intent*, which is exactly why the warning is loud and un-ignorable: an undefined
-  reference must never pass unnoticed.
+  host is no longer blocked. A typo fails open *in intent* here, which is exactly
+  why the warning is loud and un-ignorable: an undefined reference must never pass
+  unnoticed. A plain entry sbx cannot parse is dropped on the same terms and costs
+  the same thing, so its warning names that cost too.
 
 Always check `sbx config` (or [`sbx net rules`](observability)) after editing
 groups so an undefined reference is caught before a launch.

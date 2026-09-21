@@ -4195,18 +4195,23 @@ fn classify_entries(
                      (`sbx net groups import <file>`) or define it under `[network.groups]` in the \
                      global config, or remove the reference (the entry is ignored, so nothing is \
                      {} for it)",
-                    match slot {
-                        Slot::Deny => "denied",
-                        Slot::Mute => "muted",
-                        _ => "allowed",
-                    }
+                    slot.consequence()
                 )),
             }
             continue;
         }
         match crate::allowlist::classify_in(&entry, slot) {
             Ok(rule) => rules.push(rule),
-            Err(e) => warnings.push(format!("{source_label}: ignoring {list} entry — {e}")),
+            // The consequence is spelled out for the same reason the undefined-group arm above
+            // spells it out: a dropped entry is not uniformly a narrowing. A malformed `allow`
+            // leaves its host unreachable, but a malformed `deny` under an allow-by-default
+            // posture leaves the host its author meant to block reachable, and the drop is the
+            // only place that can say so.
+            Err(e) => warnings.push(format!(
+                "{source_label}: ignoring {list} entry — {e} (the entry is ignored, so nothing is \
+                 {} for it)",
+                slot.consequence()
+            )),
         }
     }
     rules

@@ -31,6 +31,18 @@ impl Slot {
             Slot::Target => "target",
         }
     }
+
+    /// What dropping an entry from this slot costs, for a diagnostic that says so instead of
+    /// leaving the reader to work it out: nothing is *denied* for a dropped `deny`, nothing
+    /// *allowed* for a dropped `allow`. [`Slot::Target`] is a request rather than a declaration and
+    /// is never dropped, so it takes the `allow` wording it would have been classified under.
+    pub(crate) fn consequence(self) -> &'static str {
+        match self {
+            Slot::Deny => "denied",
+            Slot::Mute => "muted",
+            Slot::Allow | Slot::Target => "allowed",
+        }
+    }
 }
 
 /// Classify one declared entry by its syntax, or report why it is malformed, as a [`Slot::Allow`]

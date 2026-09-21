@@ -2051,8 +2051,9 @@ pub(crate) struct NetworkTable {
     /// captured request was already allowed, and capturing changes nothing about what is. What it
     /// changes is how much plaintext the launch holds in memory, which is why it is
     /// trusted/global-only like the rest of the table: an untrusted project cannot start capturing
-    /// its own traffic. An unknown level is dropped with a warning and the capture stays off
-    /// (fail-closed).
+    /// its own traffic. An unknown level is refused with a warning and `off` applies (fail-closed)
+    /// — applied rather than assumed, because an overlay that amends a layer below starts from that
+    /// layer's level and a level merely dropped would have left it capturing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture: Option<String>,
     /// What happens when a configured secret is seen leaving through a **WebSocket** tunnel:
@@ -2066,8 +2067,11 @@ pub(crate) struct NetworkTable {
     /// `"block"` buys is bounded by how the bytes arrive: the scan runs on each chunk read from the
     /// cage before that chunk is written on, so a secret whole inside one chunk never crosses, while
     /// one split across chunks has had its first part relayed before the match completes. An unknown
-    /// value is dropped with a warning and the default stays. Trusted/global-only like the rest of
-    /// the table.
+    /// value is refused with a warning and the **strict** posture applies instead, as `capture`
+    /// above applies its own `off`. The difference is which spelling that is: here the permissive
+    /// value is the one a policy carries unasked, so leaving it in place would keep the weaker
+    /// setting on a value its author most likely wrote to mean `"block"`. Trusted/global-only like
+    /// the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) websocket_secret: Option<String>,
     /// The per-body capture cap in KiB, meaningful only with `capture = "bodies"`. It is ignored
