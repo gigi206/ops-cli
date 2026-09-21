@@ -110,13 +110,15 @@ fn config_show(args: &[OsString]) -> ExitCode {
         match arg.to_str() {
             Some("--json") => json = true,
             Some("--details") => details = true,
-            Some("--app") | Some("-a") => match it.next() {
-                Some(name) => app = Some(name.to_string_lossy().into_owned()),
-                None => {
-                    diag::error("sbx: config show: `--app` needs an app name");
-                    return config_usage("show");
+            Some("--app") | Some("-a") => {
+                match crate::cli::option_value(it.next(), "config show", "--app", "an app name") {
+                    Ok(name) => app = Some(name.to_string()),
+                    Err(message) => {
+                        diag::error(&message);
+                        return config_usage("show");
+                    }
                 }
-            },
+            }
             Some("--global") | Some("-g") => {
                 if let Err(code) = set_show_source(&mut source, "--global", config::Source::Global)
                 {

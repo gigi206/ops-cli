@@ -86,13 +86,15 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
     while let Some(a) = it.next() {
         match a.to_str() {
             Some("--json") => json = true,
-            Some("--app") | Some("-a") => match it.next() {
-                Some(name) => app = Some(name.to_string_lossy().into_owned()),
-                None => {
-                    diag::error("sbx: `--app` needs an app name");
-                    return ExitCode::from(2);
+            Some("--app") | Some("-a") => {
+                match crate::cli::option_value(it.next(), "net pending", "--app", "an app name") {
+                    Ok(name) => app = Some(name.to_string()),
+                    Err(message) => {
+                        diag::error(&message);
+                        return ExitCode::from(2);
+                    }
                 }
-            },
+            }
             _ => {
                 diag::error(&format!(
                     "sbx: usage: {}",
@@ -168,8 +170,13 @@ fn parse_watch_args(args: &[OsString]) -> Result<WatchArgs, String> {
         match a.to_str() {
             Some("-i") | Some("--interval") => interval_secs = interval_seconds(it.next())?,
             Some("-a") | Some("--app") => {
-                let name = it.next().ok_or("`--app` needs an app name")?;
-                app = Some(name.to_string_lossy().into_owned());
+                let name = crate::cli::option_value(
+                    it.next(),
+                    "net pending watch",
+                    "--app",
+                    "an app name",
+                )?;
+                app = Some(name.to_string());
             }
             _ => {
                 return Err(format!(

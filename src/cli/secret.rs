@@ -57,16 +57,23 @@ fn secret_list(args: &[OsString]) -> ExitCode {
                 sources = true;
                 i += 1;
             }
-            Some("-a") | Some("--app") => match args.get(i + 1).and_then(|a| a.to_str()) {
-                Some(v) => {
-                    app = Some(v.to_string());
-                    i += 2;
+            Some("-a") | Some("--app") => {
+                match crate::cli::option_value(
+                    args.get(i + 1),
+                    "secret list",
+                    "--app",
+                    "an app name",
+                ) {
+                    Ok(v) => {
+                        app = Some(v.to_string());
+                        i += 2;
+                    }
+                    Err(message) => {
+                        diag::error(&message);
+                        return ExitCode::from(2);
+                    }
                 }
-                None => {
-                    diag::error("sbx: secret list: `--app` needs a name");
-                    return ExitCode::from(2);
-                }
-            },
+            }
             other => {
                 diag::error(&format!(
                     "sbx: secret list: unexpected argument {:?}",

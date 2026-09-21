@@ -1230,8 +1230,18 @@ fn task_show(args: &[OsString]) -> ExitCode {
                     "finished".into(),
                     crate::format_log_time(sandbox::task_control::epoch_ms(v)),
                 ),
-                ("elapsed_ms", Ok(ms)) => ("elapsed".into(), format_elapsed(ms as u64)),
-                ("timeout_s", Ok(s)) => ("timeout".into(), format_elapsed(s as u64 * 1000)),
+                // Saturated, never folded: both values are parsed off the control plane's wire,
+                // so the width they arrive in is the caller's to choose, and a cast would render a
+                // duration past `u64` as a small plausible one. `format_elapsed` at the ceiling
+                // reads as the absurdity it is.
+                ("elapsed_ms", Ok(ms)) => (
+                    "elapsed".into(),
+                    format_elapsed(u64::try_from(ms).unwrap_or(u64::MAX)),
+                ),
+                ("timeout_s", Ok(s)) => (
+                    "timeout".into(),
+                    format_elapsed(u64::try_from(s).unwrap_or(u64::MAX).saturating_mul(1000)),
+                ),
                 _ => (key.clone(), value.clone()),
             };
             // Looked up under the key the *plane* sent, not the label: the rename above is this
@@ -1511,16 +1521,23 @@ fn listing_args(args: &[OsString], verb: &str) -> Result<Listing, ExitCode> {
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str() {
-            Some("--session") => match args.get(i + 1).and_then(|a| a.to_str()) {
-                Some(v) => {
-                    listing.session = Some(v.to_string());
-                    i += 2;
+            Some("--session") => {
+                match crate::cli::option_value(
+                    args.get(i + 1),
+                    &format!("task {verb}"),
+                    "--session",
+                    "a session id",
+                ) {
+                    Ok(v) => {
+                        listing.session = Some(v.to_string());
+                        i += 2;
+                    }
+                    Err(message) => {
+                        diag::error(&message);
+                        return Err(ExitCode::from(2));
+                    }
                 }
-                None => {
-                    diag::error(&format!("sbx: task {verb}: `--session` needs a session id"));
-                    return Err(ExitCode::from(2));
-                }
-            },
+            }
             Some(s) if !s.starts_with('-') && listing.operation.is_none() => {
                 listing.operation = Some(s.to_string());
                 i += 1;

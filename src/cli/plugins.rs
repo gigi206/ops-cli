@@ -40,7 +40,11 @@ pub(crate) fn plugins_cmd(args: &[OsString]) -> ExitCode {
             }
         }
         Some("install") => {
-            match crate::cli::reject_extra(&["plugins", "install"], args.get(2..).unwrap_or(&[])) {
+            match crate::cli::reject_option_as_name(&["plugins", "install"], args.get(1)).and_then(
+                |()| {
+                    crate::cli::reject_extra(&["plugins", "install"], args.get(2..).unwrap_or(&[]))
+                },
+            ) {
                 Err(code) => code,
                 Ok(()) => plugins_install(args.get(1)),
             }
@@ -48,7 +52,9 @@ pub(crate) fn plugins_cmd(args: &[OsString]) -> ExitCode {
         Some("rm") => plugins_remove(&args[1..]),
         Some("upgrade") => plugins_upgrade(&args[1..]),
         Some("verify") => {
-            match crate::cli::reject_extra(&["plugins", "verify"], args.get(2..).unwrap_or(&[])) {
+            match crate::cli::reject_option_as_name(&["plugins", "verify"], args.get(1)).and_then(
+                |()| crate::cli::reject_extra(&["plugins", "verify"], args.get(2..).unwrap_or(&[])),
+            ) {
                 Err(code) => code,
                 // A name that is not text is refused by name: folded into `None` it would read as
                 // "no name given", which this verb answers by verifying every installed plugin —
@@ -826,20 +832,30 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
         Some("install") => plugins_store_install(&args[1..]),
         Some("verify") => plugins_store_verify(&args[1..]),
         Some("rekey") => plugins_store_rekey(&args[1..]),
-        Some("info") => match crate::cli::reject_extra(
-            &["plugins", "store", "info"],
-            args.get(2..).unwrap_or(&[]),
-        ) {
-            Err(code) => code,
-            Ok(()) => plugins_store_info(args.get(1).and_then(|a| a.to_str())),
-        },
-        Some("rm") => match crate::cli::reject_extra(
-            &["plugins", "store", "rm"],
-            args.get(2..).unwrap_or(&[]),
-        ) {
-            Err(code) => code,
-            Ok(()) => plugins_store_remove(args.get(1).and_then(|a| a.to_str())),
-        },
+        Some("info") => {
+            match crate::cli::reject_option_as_name(&["plugins", "store", "info"], args.get(1))
+                .and_then(|()| {
+                    crate::cli::reject_extra(
+                        &["plugins", "store", "info"],
+                        args.get(2..).unwrap_or(&[]),
+                    )
+                }) {
+                Err(code) => code,
+                Ok(()) => plugins_store_info(args.get(1).and_then(|a| a.to_str())),
+            }
+        }
+        Some("rm") => {
+            match crate::cli::reject_option_as_name(&["plugins", "store", "rm"], args.get(1))
+                .and_then(|()| {
+                    crate::cli::reject_extra(
+                        &["plugins", "store", "rm"],
+                        args.get(2..).unwrap_or(&[]),
+                    )
+                }) {
+                Err(code) => code,
+                Ok(()) => plugins_store_remove(args.get(1).and_then(|a| a.to_str())),
+            }
+        }
         // Unknown or no subcommand: name the mistake (if any), then print the full page so its
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {

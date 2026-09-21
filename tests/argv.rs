@@ -158,3 +158,65 @@ fn a_refusal_names_the_offending_token_and_prints_the_usage() {
     assert!(out.contains("'zzz'"), "{out}");
     assert!(out.contains("sbx: usage: sbx session ls"), "{out}");
 }
+
+/// An option standing where an option's **value** belongs is refused, at the usage exit.
+///
+/// The value slot is the one place a stray flag is not surplus but *consumed*: `--app --json` bound
+/// the app name to `--json`, and what the caller met afterwards depended on which verb they had
+/// typed — `config show` failed downstream as "no app named" at exit 1, `net pending` printed
+/// "none for app `--json`" and exited 0, and `secret list` reported a name it had invented. In
+/// every one of them the flag that was swallowed also did not take effect, so the command answered
+/// a different question than the one asked and said nothing about it.
+///
+/// Swept rather than asserted one by one, because the parsers are written apart and this is the
+/// property they have to share.
+#[test]
+fn an_option_is_never_taken_as_another_options_value() {
+    let home = TmpDir::new("argv");
+    let cases: &[&[&str]] = &[
+        &["config", "show", "--app", "--json"],
+        &["secret", "list", "--app", "--sources"],
+        &["net", "rules", "--app", "--json"],
+        &["net", "pending", "--app", "--json"],
+        &["net", "pending", "watch", "--app", "--json"],
+        &["task", "list", "--session", "--json"],
+    ];
+    for args in cases {
+        let (code, out) = run(args, home.path());
+        assert_eq!(
+            code,
+            2,
+            "`sbx {}` took an option as a value:\n{out}",
+            args.join(" ")
+        );
+        assert!(
+            out.contains("is an option"),
+            "`sbx {}` refused without saying what it found:\n{out}",
+            args.join(" ")
+        );
+    }
+}
+
+/// A verb whose page documents no option refuses one in its name slot the same way it refuses one
+/// after it — `sbx plugins install --json` and `sbx plugins install foo --json` are the same
+/// mistake, and used to exit 1 and 2 respectively.
+#[test]
+fn a_name_only_verb_refuses_an_option_in_the_name_slot() {
+    let home = TmpDir::new("argv");
+    let cases: &[&[&str]] = &[
+        &["plugins", "install", "--json"],
+        &["plugins", "verify", "--json"],
+        &["plugins", "store", "info", "--json"],
+        &["plugins", "store", "rm", "--json"],
+    ];
+    for args in cases {
+        let (code, out) = run(args, home.path());
+        assert_eq!(
+            code,
+            2,
+            "`sbx {}` took an option as its name:\n{out}",
+            args.join(" ")
+        );
+        assert!(out.contains("--json"), "{out}");
+    }
+}
