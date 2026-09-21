@@ -16,8 +16,9 @@
 //! cannot exchange (from inside, it *is* the mount), so it is the anchor every walk starts from and
 //! the caller's job to name correctly.
 
-use std::fs::{self, DirBuilder};
+use std::fs::DirBuilder;
 use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
@@ -25,48 +26,129 @@ use std::path::{Path, PathBuf};
 /// already exists and is **not a real directory**. Returns the path of the leaf.
 ///
 /// `root` is the trusted anchor — a bind's mount point, or a directory the cage never sees — and is
-/// created with `create_dir_all` like any ordinary path. Every component below it is
-/// `symlink_metadata`'d before it is used, and a non-directory is a hard error rather than
-/// something repaired in place: a tree that is not what sbx left is a finding the user should see,
-/// and silently re-creating it would destroy the evidence along with whatever the cage had staged.
+/// created with `create_dir_all` like any ordinary path. Every component below it is opened
+/// `O_NOFOLLOW | O_DIRECTORY` **from the descriptor of the one above it**, and a non-directory is a
+/// hard error rather than something repaired in place: a tree that is not what sbx left is a finding
+/// the user should see, and silently re-creating it would destroy the evidence along with whatever
+/// the cage had staged.
 ///
-/// This closes the shape, not its last instant. A cage that is live *while* a launch walks here
-/// could still swap a component between the check and the use; closing that needs descriptor-based
-/// I/O carried through every caller, several of which hand paths to `nix`. What it removes is the
-/// case that needs no race at all: a symlink left behind for the next launch to find.
+/// The walk descends by descriptor rather than by re-resolving the path at each step, and that is
+/// what makes the check and the use the same act: a component validated here is the one the next
+/// component is opened from, so exchanging it afterwards reaches nothing this walk went on to use.
+/// Re-resolving from the path — which is what this did — left a window between a component's check
+/// and the resolution that walked through it, and the cage owns every directory below the anchor.
+///
+/// What remains open is the **path this returns**. A caller holds a name, not a descriptor, and the
+/// cage may exchange a component before the caller uses it; closing that needs descriptor-based I/O
+/// carried through every caller, several of which hand paths to `nix`. So the window this removes is
+/// the one inside the walk, and the case that needs no race at all — a symlink left behind for the
+/// next launch to find — is removed with it.
 pub(crate) fn ensure_under(root: &Path, rel: &str, mode: u32) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+
     DirBuilder::new().recursive(true).mode(mode).create(root)?;
     let mut at = root.to_path_buf();
+    let mut dir = open_dir(libc::AT_FDCWD, &cstr(root.as_os_str().as_encoded_bytes())?)?;
+
     for component in rel.split('/').filter(|c| !c.is_empty()) {
         at.push(component);
-        match fs::symlink_metadata(&at) {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(meta) => return Err(not_a_directory(&at, &meta)),
+        let name = cstr(component.as_bytes())?;
+        let opened = match open_dir(dir.as_raw_fd(), &name) {
+            Ok(fd) => Some(fd),
             // Absent a moment ago. Creating it can still lose a race — two launches of the same
             // project register their mise plugin at once, which is the "second terminal" case
             // `miseplugin` is tested for — so `AlreadyExists` is re-read rather than propagated,
             // exactly as `create_dir_all` tolerates it. What the winner left still has to be a real
-            // directory: the check is not skipped for having lost.
-            Err(_) => match DirBuilder::new().mode(mode).create(&at) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    match fs::symlink_metadata(&at) {
-                        Ok(meta) if meta.is_dir() => {}
-                        Ok(meta) => return Err(not_a_directory(&at, &meta)),
-                        Err(e) => return Err(e),
+            // directory, and the re-open below is the check: it is not skipped for having lost.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // SAFETY: `name` is a live NUL-terminated component for the duration of the call,
+                // and `dir` is an open directory descriptor this function owns. `split('/')` on a
+                // `&str` cannot yield an interior NUL, which `cstr` refuses in any case.
+                let made = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode) };
+                if made < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(e);
                     }
                 }
-                Err(e) => return Err(e),
-            },
-        }
+                None
+            }
+            Err(e) => return Err(describe(&at, dir.as_raw_fd(), &name, e)),
+        };
+        dir = match opened {
+            Some(fd) => fd,
+            None => {
+                let parent = dir.as_raw_fd();
+                open_dir(parent, &name).map_err(|e| describe(&at, parent, &name, e))?
+            }
+        };
     }
     Ok(at)
 }
 
+/// Open `name` under `at` as a directory that is itself no symlink: `O_PATH` because nothing is read
+/// through it, `O_NOFOLLOW` so a component the cage replaced with a link is refused rather than
+/// walked, and `O_DIRECTORY` so anything else that is not a directory is refused too.
+fn open_dir(at: libc::c_int, name: &std::ffi::CString) -> io::Result<OwnedFd> {
+    // SAFETY: `name` is a live NUL-terminated path for the duration of the call, and `at` is either
+    // `AT_FDCWD` or a directory descriptor owned by the caller and still open.
+    let fd = unsafe {
+        libc::openat(
+            at,
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh owned descriptor; `OwnedFd` takes sole ownership and closes it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A component's path as a NUL-terminated string, refusing the interior NUL a path cannot carry.
+fn cstr(bytes: &[u8]) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a path component holds a NUL byte",
+        )
+    })
+}
+
+/// Turn the open's errno into the refusal a reader can act on.
+///
+/// `O_NOFOLLOW | O_DIRECTORY` answers a symlink and a plain file with the same `ENOTDIR`, and the
+/// difference is the whole of what the user needs to know — so the kind is read back with an
+/// `lstat`, which is a second look at a name this walk is refusing either way. Any other errno is
+/// what it is.
+fn describe(at: &Path, dir: libc::c_int, name: &std::ffi::CString, e: io::Error) -> io::Error {
+    if e.raw_os_error() != Some(libc::ENOTDIR) && e.raw_os_error() != Some(libc::ELOOP) {
+        return e;
+    }
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is a live NUL-terminated component, `dir` is an open directory descriptor the
+    // caller still owns, and `st` is written only on success, which the return value reports.
+    let asked = unsafe {
+        libc::fstatat(
+            dir,
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if asked < 0 {
+        return e;
+    }
+    // SAFETY: `fstatat` returned success, so `st` is initialised.
+    let mode = unsafe { st.assume_init() }.st_mode;
+    not_a_directory(at, mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
 /// The refusal [`ensure_under`] returns for a component that exists and is not a directory, naming
 /// what was found and what to do about it.
-fn not_a_directory(at: &Path, meta: &fs::Metadata) -> io::Error {
-    let kind = if meta.file_type().is_symlink() {
+fn not_a_directory(at: &Path, is_symlink: bool) -> io::Error {
+    let kind = if is_symlink {
         "a symlink"
     } else {
         "not a directory"
@@ -86,6 +168,48 @@ fn not_a_directory(at: &Path, meta: &fs::Metadata) -> io::Error {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A component exchanged between two walks is refused on the second, and nothing is written
+    /// through it.
+    ///
+    /// The case the module exists for, and the one that needs no race at all: in-cage code replaces
+    /// a directory in the middle of a tree it holds read-write with a link to somewhere it owns, and
+    /// the next launch walks the same chain. What the descriptor walk adds on top of this is the
+    /// window *inside* one walk, between a component's check and the resolution that walks through
+    /// it. That window is closed by construction rather than by this test: racing it against the
+    /// previous implementation does not reach it, so there is no red to calibrate against and the
+    /// property is asserted where it can be — the elsewhere stays untouched.
+    #[test]
+    fn a_component_exchanged_between_two_walks_is_refused_on_the_second() {
+        let base = crate::testutil::TmpDir::new();
+        let root = base.path().join("root");
+        let elsewhere = base.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("witness"), b"untouched").unwrap();
+
+        let leaf = ensure_under(&root, "a/b/c", 0o700).expect("the first walk builds the chain");
+        assert!(leaf.is_dir(), "the first walk leaves a real tree");
+
+        std::fs::remove_dir_all(root.join("a")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("a")).unwrap();
+
+        let e = ensure_under(&root, "a/b/c", 0o700)
+            .expect_err("a component that is now a link must be refused");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        assert!(
+            e.to_string().contains("symlink"),
+            "the refusal names what it found: {e}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&elsewhere).unwrap().count(),
+            1,
+            "nothing was created through the link"
+        );
+        assert_eq!(
+            std::fs::read(elsewhere.join("witness")).unwrap(),
+            b"untouched"
+        );
+    }
 
     /// The case that needs no race: a link left behind for the next launch to walk into. Every
     /// component below the anchor is checked, because one missing check is the whole hole.

@@ -37,6 +37,18 @@ param:
   # (`--param release=v1.2.3`) when that matters more than being current.
   release: "latest"
 
+  # The digest the installed binary must have, when you want the guest to stop trusting the
+  # release's own `.sha256`. Empty means what it always meant: fetch the digest published beside
+  # the asset, which catches a truncated or corrupted transfer and nothing else, because both come
+  # from one origin. Set it and the origin is no longer asked at all:
+  #
+  #   limactl create --name sbx --param release=v1.2.3 --param sha256=<digest> dist/macos/sbx.yaml
+  #
+  # Only a fixed tag can carry one: `latest` is rewritten on every push, so a digest pinned against
+  # it would refuse the next boot. That is the pairing to reach for when a guest must install the
+  # bytes you checked rather than the bytes the release currently holds.
+  sha256: ""
+
 vmType: "vz"
 
 mounts:
@@ -119,7 +131,10 @@ provision:
       #    step, and it also means a long-running guest can fall behind it.
       #  - Fetching the binary and its digest from the same HTTPS origin catches a truncated or
       #    corrupted transfer. It does not catch a compromised release, and it is therefore
-      #    weaker than build.rs's pinned constant. Saying so is the point.
+      #    weaker than build.rs's pinned constant. Saying so is the point — and `--param sha256=`
+      #    is how to stop relying on it: a digest carried in from outside the release is checked
+      #    against bytes the release serves, which is the comparison that means something. It
+      #    takes a fixed `release` tag, since a rolling one is rewritten underneath it.
       base="https://github.com/gigi206/ops-cli/releases/download/{{.Param.release}}"
       case "$(uname -m)" in
         aarch64) asset="sbx-linux-aarch64" ;;
@@ -131,10 +146,20 @@ provision:
       trap 'rm -rf "$tmp"' EXIT
       marker="/usr/local/lib/sbx/installed.sha256"
 
-      # The digest is 65 bytes and the binary is fifty megabytes, so the digest decides whether
-      # the binary is worth fetching at all. Without this, every restart would re-download it.
-      curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 -o "$tmp/want" "$base/$asset.sha256"
-      want="$(tr -d '[:space:]' < "$tmp/want")"
+      # Where the expected digest comes from decides what the check is worth. A pinned one is the
+      # caller's own, carried in from outside the release, so it catches a rewritten or compromised
+      # asset as well as a corrupted transfer. An unpinned one is the release's `.sha256`, fetched
+      # from the origin that serves the binary: it catches the transfer and nothing more, which is
+      # why build.rs's pinned constant is the stronger rule and this says so.
+      pinned="{{.Param.sha256}}"
+      if [ -n "$pinned" ]; then
+        want="$pinned"
+      else
+        # The digest is 65 bytes and the binary is fifty megabytes, so the digest decides whether
+        # the binary is worth fetching at all. Without this, every restart would re-download it.
+        curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 -o "$tmp/want" "$base/$asset.sha256"
+        want="$(tr -d '[:space:]' < "$tmp/want")"
+      fi
       if [ -x /usr/local/bin/sbx ] && [ "$(cat "$marker" 2>/dev/null)" = "$want" ]; then
         exit 0
       fi
@@ -155,11 +180,15 @@ provision:
       # a window in which it 404s and a wider one in which the digest and the binary come from
       # different builds. Re-reading the digest after the download closes the second: a release
       # that moved underneath this fetch is refused rather than installed half from each build.
-      curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 -o "$tmp/want2" "$base/$asset.sha256"
-      if [ "$want" != "$(tr -d '[:space:]' < "$tmp/want2")" ]; then
-        echo "$asset moved while it was being fetched, so the bytes and the digest may come" >&2
-        echo "from different builds; re-run rather than installing them" >&2
-        exit 1
+      # A pinned digest has no such window — it never came from the release — so the re-read is the
+      # unpinned path's alone.
+      if [ -z "$pinned" ]; then
+        curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 -o "$tmp/want2" "$base/$asset.sha256"
+        if [ "$want" != "$(tr -d '[:space:]' < "$tmp/want2")" ]; then
+          echo "$asset moved while it was being fetched, so the bytes and the digest may come" >&2
+          echo "from different builds; re-run rather than installing them" >&2
+          exit 1
+        fi
       fi
 
       install -D -m 0755 "$tmp/sbx" /usr/local/bin/sbx

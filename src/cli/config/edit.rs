@@ -622,6 +622,26 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
     o
 }
 
+/// Whether `editor` is a bare program name, so it can be spawned without a shell to read it.
+///
+/// The character set is what a program name and a path are made of, and nothing else: a space means
+/// arguments, and every shell metacharacter means the value is a command line that has always been
+/// read as one. Answered on the **bytes**, because `$EDITOR` is an `OsString` and a lossy conversion
+/// would let an undecodable byte arrive as `U+FFFD` and pass a check the real value fails.
+///
+/// Empty is false: there is nothing to run, and the shell branch produces the clearer error.
+///
+/// Admitting ASCII alone is also what lets the caller hand the lossy conversion of `$EDITOR` to the
+/// `PATH` search: no byte this predicate accepts changes under it. Widening the set to anything
+/// outside ASCII would break that silently, at the call site rather than here.
+fn runs_without_a_shell(editor: &std::ffi::OsStr) -> bool {
+    let bytes = editor.as_encoded_bytes();
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'))
+}
+
 /// `sbx config edit`: open the target layer file in `$VISUAL`/`$EDITOR` (falling back to `vi`).
 /// The escape hatch for what `set` does not handle — arrays, secrets, and app tables. Runs through
 /// a shell so an editor carrying arguments (e.g. `code --wait`) works, with the path passed as a
@@ -645,6 +665,11 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
 /// configuration, plugins and credentials work at all, and it is the same trust the shell that
 /// invoked `sbx` already extends to it. It also means this verb is not a confinement boundary: an
 /// editor is a program, and running one is running it.
+///
+/// A bare program name is spawned as itself; a value carrying a space or a shell metacharacter
+/// keeps the `sh -c` that has always read it, because that is what makes `code -w` an ordinary
+/// `$EDITOR`. The split removes a second reading of an environment value from the common case; it
+/// is not a boundary, for the reason just given.
 ///
 /// **The file is edited in place.** sbx stages no temporary copy and performs no atomic replace,
 /// because the write is the editor's and the editor owns how it makes it — most replace through a
@@ -716,26 +741,58 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
         .or_else(|| std::env::var_os("EDITOR"))
         .unwrap_or_else(|| OsString::from("vi"));
     let editor = editor_os.to_string_lossy();
-    // The shell is located through the one `PATH` search, which reads absolute entries only: an
-    // empty element means the current directory to `execvp`, and this verb runs from whatever tree
-    // the user is standing in, a project's included.
-    //
-    // Deliberately not the owner/mode-checking lookup the host tools elsewhere take. This `sh` is
-    // the interpreter every `$EDITOR` invocation already runs through, so an untrusted one is a
-    // condition of the machine rather than of this verb: refusing here would close nothing that is
-    // not already open, and would block editing a configuration file — a repair path — on it.
-    let Some(shell) = crate::pathfind::find_on_path("sh") else {
-        diag::error(&format!(
-            "sbx: config: could not launch the editor `{editor}`: no `sh` on PATH"
-        ));
-        return ExitCode::FAILURE;
+    // `$EDITOR` is a command line, not always a program name: `code -w`, `emacsclient -nw` and
+    // `vim -u NONE` are all ordinary values, and they need the shell that has always run them. A
+    // bare program name needs nothing of the sort, and running it through `sh -c` means a second
+    // reading of a string the environment supplies — so the two cases are separated, and the common
+    // one is spawned directly. It closes nothing a same-uid attacker could not already do (an
+    // editor is a program, and running one is running it, as this function's own contract says);
+    // what it removes is the shell's grammar from a value that never needed it.
+    let status = match runs_without_a_shell(&editor_os) {
+        // A name with no `/` is resolved through the one `PATH` search, which reads absolute
+        // entries only. `Command::new` would `execvp` it instead, and an empty `PATH` element means
+        // the working directory to `execvp` — which for this verb is whatever tree the user is
+        // standing in, a project's included. That is the same reason the shell below is located
+        // this way rather than spawned by name, and it is why the direct branch cannot simply hand
+        // the value to `Command`. A name *with* a `/` is a path the user wrote: `execvp` consults
+        // no `PATH` for it, and it is passed as it stands.
+        //
+        // `to_string_lossy` is exact here and nowhere else: the predicate admits ASCII alphanumerics
+        // and `_./-` only, so a value reaching this line has no byte a conversion could alter.
+        true if !editor.contains('/') => match crate::pathfind::find_on_path(&editor) {
+            Some(program) => std::process::Command::new(program).arg(&path).status(),
+            None => {
+                diag::error(&format!(
+                    "sbx: config: could not launch the editor `{editor}`: not found on PATH"
+                ));
+                return ExitCode::FAILURE;
+            }
+        },
+        true => std::process::Command::new(&editor_os).arg(&path).status(),
+        false => {
+            // The shell is located through the one `PATH` search, which reads absolute entries
+            // only: an empty element means the current directory to `execvp`, and this verb runs
+            // from whatever tree the user is standing in, a project's included.
+            //
+            // Deliberately not the owner/mode-checking lookup the host tools elsewhere take. This
+            // `sh` is the interpreter every `$EDITOR` invocation already runs through, so an
+            // untrusted one is a condition of the machine rather than of this verb: refusing here
+            // would close nothing that is not already open, and would block editing a configuration
+            // file — a repair path — on it.
+            let Some(shell) = crate::pathfind::find_on_path("sh") else {
+                diag::error(&format!(
+                    "sbx: config: could not launch the editor `{editor}`: no `sh` on PATH"
+                ));
+                return ExitCode::FAILURE;
+            };
+            std::process::Command::new(shell)
+                .arg("-c")
+                .arg(format!("{editor} \"$@\""))
+                .arg("sh")
+                .arg(&path)
+                .status()
+        }
     };
-    let status = std::process::Command::new(shell)
-        .arg("-c")
-        .arg(format!("{editor} \"$@\""))
-        .arg("sh")
-        .arg(&path)
-        .status();
     let code = match status {
         Ok(code) => code,
         Err(e) => {
@@ -956,6 +1013,49 @@ fn strip_app_prefix(key: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare program name runs as itself; anything carrying a shell's grammar keeps the shell.
+    ///
+    /// The split exists so the common value does not have its string read twice, and the predicate
+    /// is where it is decided, so this is where it is pinned. The false cases are the ones that must
+    /// keep working: an editor with arguments is an ordinary `$EDITOR`, and losing it would be a
+    /// regression far worse than the reading it avoids.
+    #[test]
+    fn only_a_bare_program_name_is_spawned_without_a_shell() {
+        for bare in [
+            "vi",
+            "nvim",
+            "/usr/bin/vim",
+            "emacs-nox",
+            "my_editor",
+            "../bin/ed",
+        ] {
+            assert!(
+                runs_without_a_shell(std::ffi::OsStr::new(bare)),
+                "`{bare}` is a program name and needs no shell to read it"
+            );
+        }
+        for needs_shell in [
+            "code -w",
+            "emacsclient -nw",
+            "vim -u NONE",
+            "ed;rm -rf /",
+            "$EDITOR",
+            "vi&",
+            "sh -c 'x'",
+            "",
+        ] {
+            assert!(
+                !runs_without_a_shell(std::ffi::OsStr::new(needs_shell)),
+                "`{needs_shell}` is a command line, and the shell is what has always read it"
+            );
+        }
+        // Read as bytes: a value no encoding can render is not a program name, and must not become
+        // one by way of a replacement character.
+        let undecodable =
+            std::os::unix::ffi::OsStrExt::from_bytes(&b"vi\xff"[..]) as &std::ffi::OsStr;
+        assert!(!runs_without_a_shell(undecodable));
+    }
 
     /// `sbx config set|add|rm|unset --trust` blesses the text it composed, never a second read of
     /// the path.

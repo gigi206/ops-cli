@@ -74,14 +74,21 @@ pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) ->
         // not redundant: `open` masks its mode with the umask, so a `0755` router under a strict
         // umask still has to be made what it must be, and doing it before the rename keeps the
         // published path finished from its first instant.
+        //
+        // The open is `create_new` and `O_NOFOLLOW`. The temp name is this process's to make, so
+        // whatever else may be sitting there is not this write's business to open: a symlink left at
+        // the name would otherwise be followed, and the bytes would land wherever it points, with
+        // `mode` set on that file instead. Planting one takes a process of the same uid, which is
+        // inside sbx's trust domain and outside this function's assumptions — and the two flags cost
+        // nothing to hold, because a temp name is disposable: the write reports the collision, and
+        // the next attempt takes the next sequence number.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW);
         let file = match mode {
-            Some(mode) => std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(mode)
-                .open(&tmp)?,
-            None => std::fs::File::create(&tmp)?,
+            Some(mode) => opts.mode(mode).open(&tmp)?,
+            None => opts.open(&tmp)?,
         };
         {
             use io::Write as _;
@@ -142,6 +149,60 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A symlink sitting at the temp's name is not followed, and the write says so instead.
+    ///
+    /// The staging opened its temp with `create`, which follows a link and truncates whatever is on
+    /// the other end — so a file outside the directory would be written with the bytes, and given
+    /// `mode` on top. Planting the link takes a process of the same uid, which sbx already treats as
+    /// inside its trust domain; the point is that this function no longer *assumes* it, at the cost
+    /// of two open flags.
+    ///
+    /// The names are planted over a span because the sequence number is the process's, shared with
+    /// whatever else stages a file while this runs. A span that the run walks past would fail the
+    /// test loudly rather than pass it on a name nobody used, which is the reason for the second
+    /// assertion.
+    #[test]
+    fn a_symlink_left_at_the_temps_name_is_refused_rather_than_written_through() {
+        let dir = TmpDir::new();
+        let target = dir.join("elsewhere");
+        std::fs::write(&target, b"untouched").unwrap();
+
+        let staged = dir.join("pointer.toml");
+        let next = unique() + 1;
+        let planted: Vec<std::path::PathBuf> = (next..next + 64)
+            .map(|n| {
+                let tmp = dir
+                    .path()
+                    .join(format!(".pointer.toml.tmp.{}.{n}", std::process::id()));
+                std::os::unix::fs::symlink(&target, &tmp).unwrap();
+                tmp
+            })
+            .collect();
+
+        let e = write_atomic_mode(&staged, b"volume = \"/dev/sdb1\"\n", Some(0o600))
+            .expect_err("a name this write did not create is not a name it may open");
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::AlreadyExists,
+            "the refusal must be the collision itself: {e}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"untouched",
+            "the link's target must not have been written through"
+        );
+        assert!(
+            !staged.exists(),
+            "and nothing was published at the destination either"
+        );
+        // Calibration: the name the write reached is one of the planted ones, so the assertions
+        // above were answered by the guard rather than by a name nobody tried.
+        assert!(
+            planted.iter().any(|p| !p.exists()),
+            "the write never reached a planted name — the span no longer covers the sequence"
+        );
+    }
 
     /// The published file carries its mode, and a caller that needs one no longer has to set it
     /// after the rename.

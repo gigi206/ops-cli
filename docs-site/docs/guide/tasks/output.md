@@ -90,6 +90,14 @@ sbx: the operation wrote 41231872 byte(s) to /opt/sbx/task-out/dump
 agent that could write there would plant the input a credential-bearing command later reads back
 (`psql -f {out}/script.sql`), taking back control of what the privileged operation does.
 
+**The agent reads every task's directory, not only the one it invoked.** What is bound into the
+session's cage is the *parent*, `/opt/sbx/task-out/`, because a cage's mounts are fixed when it is
+built and no invocation can add one afterwards. So an operation that writes a secret into its own
+output directory has put it where the agent can read it, alongside the artifacts of every other task
+in this project. That is the same direction as the line above (the artifact is meant to come back to
+the agent), but it is worth stating on its own: `output` is a channel to the agent, and what a task
+leaves there is chosen with that in mind. A file the agent must not read does not belong in `{out}`.
+
 **It is emptied when the invocation claims it.** A predictable path is only honest if what sits there
 is *this* invocation's work; otherwise a caller reads the previous artifact and cannot tell. If you
 want to keep an artifact, copy it out. For the same reason, a second invocation of the same task is

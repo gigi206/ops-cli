@@ -1276,9 +1276,12 @@ fn write_outcome(writer: &mut UnixStream, id: u64, outcome: &TaskOutcome) -> io:
     // What `spawn` refused. One line per `execve`, because which program was refused is the whole
     // content of the report — a count would say "something you declared is missing" and leave the
     // caller to guess which. Two paths, caller first: what may run depends on who is running it, so
-    // the target alone can send a reader to add an entry that is already there. Neither carries a
-    // space (both are exec paths the cage resolved), so the line-based framing holds; the caller is
-    // `-` when the policy decided by target alone, keeping the field count fixed.
+    // the target alone can send a reader to add an entry that is already there. The caller is
+    // `-` when the policy decided by target alone, keeping the field count fixed, and the reader
+    // splits on the first space: a caller whose own path carries one hands the rest of it to the
+    // target. A path may hold a space, so that is this report's limit rather than a property of the
+    // values, and what it costs is a misattributed line in a diagnostic — nothing reads these back
+    // to decide anything.
     for refusal in &outcome.refused {
         let caller = match refusal.caller.is_empty() {
             true => "-",
