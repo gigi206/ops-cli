@@ -10,6 +10,7 @@
 //! string: a package token comes from a project file, so it is data, and a shell that re-read it
 //! would find syntax.
 
+use super::startup::shell_quote;
 use super::*;
 
 /// The mise invocation that equips an app's `[packages] mise:` tools, and the one that rolls them.
@@ -42,9 +43,12 @@ pub(super) fn equip_announcement(tokens: &[String]) -> String {
 /// pool, which does not hold them, so a plain `mise upgrade` there would find nothing and silently
 /// roll nothing — a regression of a shipped command. So for a global app the roll is pinned to the
 /// app-global pool via a bash `MISE_DATA_DIR=<app-global>` prefix; the tokens ride `"$@"`
-/// positionally (no shell injection — only the sbx-owned mise path and fixed cage data dir are
-/// interpolated), and `exec` keeps the roll the cage's main process. Other runtimes have a single
-/// pool (the home), already the ambient primary, so the plain command runs unwrapped.
+/// positionally, the two interpolated values go through [`shell_quote`], and `exec` keeps the roll
+/// the cage's main process. Both values are sbx's own — the mise path it resolved and a fixed cage
+/// path — so nothing untrusted reaches the script either way; quoting them makes that a property of
+/// how the line is built rather than of what the values happen to contain, which is the form that
+/// survives a path acquiring a space. Other runtimes have a single pool (the home), already the
+/// ambient primary, so the plain command runs unwrapped.
 ///
 /// `--bump` is the other half of the launch's `use -g --pin`. A plain `mise upgrade` keeps whatever
 /// range the config states, and after a pin that range is one exact version: the roll would report
@@ -63,8 +67,9 @@ pub(super) fn mise_upgrade_cmd(
     if matches!(runtime, binds::Runtime::GlobalApp(_)) {
         let data_dir = binds::mise_app_global_data_dir();
         let script = format!(
-            "MISE_DATA_DIR='{data_dir}' exec {mise} upgrade {MISE_ROLL_FLAG} \"$@\"",
-            mise = mise.to_string_lossy(),
+            "MISE_DATA_DIR={data_dir} exec {mise} upgrade {MISE_ROLL_FLAG} \"$@\"",
+            data_dir = shell_quote(&data_dir),
+            mise = shell_quote(&mise.to_string_lossy()),
         );
         let mut cmd = vec![
             bash.as_os_str().to_os_string(),
@@ -131,17 +136,18 @@ pub(super) fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
 /// clean) and then `exec`s the real command — which therefore stays the cage's main process,
 /// leaving an interactive `sbx run`'s pty job control unchanged. The `verb` is an sbx-chosen literal
 /// (`install` for the project's local `.mise.toml` tools, `use -g` for the app's `[packages]
-/// mise:` ones); the tokens and the command ride `"$@"` positionally, so only the absolute mise
-/// path, the sbx-chosen verb, and the integer token count are interpolated into the script — a
-/// token from an untrusted config can never inject shell. Best-effort: a failed equip does not
-/// abort the command (the missing tool surfaces when it is used), matching the self-equip
-/// posture rather than the host `nix:` hard-fail guarantee.
+/// mise:` ones) and is interpolated **unquoted**, because `use -g` has to reach mise as two words;
+/// the tokens and the command ride `"$@"` positionally, and the mise path goes through
+/// [`shell_quote`], so a token from an untrusted config can never inject shell. Best-effort: a
+/// failed equip does not abort the command (the missing tool surfaces when it is used), matching
+/// the self-equip posture rather than the host `nix:` hard-fail guarantee.
 ///
 /// `mise_data_dir`, when `Some`, pins **only the equip step's** `MISE_DATA_DIR` (the exec'd command
 /// keeps the cage's ambient value). This is how a global app's Lane-1 `mise use -g` installs an app
-/// package into the app-global home pool while the ambient primary is the per-project pool: the
-/// value is an sbx-owned fixed cage path ([`binds::mise_app_global_data_dir`]), so single-quoting it
-/// in the assignment is injection-safe.
+/// package into the app-global home pool while the ambient primary is the per-project pool. The
+/// value is an sbx-owned fixed cage path ([`binds::mise_app_global_data_dir`]) and it is quoted
+/// through [`shell_quote`] rather than wrapped in a pair of literal quotes, so the assignment holds
+/// whatever the path turns out to contain instead of holding because of what it contains today.
 pub(super) fn wrap_mise_equip(
     mise: &Path,
     bash: &Path,
@@ -152,12 +158,12 @@ pub(super) fn wrap_mise_equip(
 ) -> Vec<OsString> {
     let n = tokens.len();
     let data_dir_prefix = match mise_data_dir {
-        Some(dir) => format!("MISE_DATA_DIR='{dir}' "),
+        Some(dir) => format!("MISE_DATA_DIR={} ", shell_quote(dir)),
         None => String::new(),
     };
     let script = format!(
         "{data_dir_prefix}{mise} {verb} \"${{@:1:{n}}}\" 1>&2; shift {n}; exec \"$@\"",
-        mise = mise.to_string_lossy(),
+        mise = shell_quote(&mise.to_string_lossy()),
     );
     let mut out = vec![
         bash.as_os_str().to_os_string(),

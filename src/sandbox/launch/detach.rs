@@ -138,9 +138,18 @@ fn detached_child(
         guard.as_ref().and_then(|g| g.notify_sink.as_deref()),
     );
 
-    // Ready: tell the parent, then hand stdout/stderr to the log and drop the pipe.
+    // The streams go to the log **before** the parent is told, so a failure to move them is still
+    // a failure this daemon can report: afterwards the parent has printed the session id and
+    // returned, and a daemon whose stdout is still the launching terminal writes an agent's output
+    // over whatever the operator does next, with nothing left to say so. Both calls sit after
+    // `build`/`register` either way, so provisioning progress and any error were seen live, which
+    // is what the ordering is really for.
+    if !redirect_to_log(&log) {
+        crate::diag::error("sbx: cannot hand the detached session's output to its log file.");
+        fail_detached(write_fd);
+    }
+    // Ready: tell the parent, and drop the pipe.
     signal_detach_ready(write_fd);
-    redirect_to_log(&log);
     // SAFETY: the readiness byte has been written and this daemon has been the write end's only
     // owner since the fork, so this is its single close.
     unsafe { libc::close(write_fd) };
@@ -489,14 +498,19 @@ fn redirect_stdin_to_null() {
     }
 }
 
-/// Point stdout and stderr at the open log file: the daemon's runtime output goes there.
-fn redirect_to_log(log: &File) {
+/// Point stdout and stderr at the open log file: the daemon's runtime output goes there. Answers
+/// whether both descriptors were moved.
+///
+/// Checked rather than best-effort, unlike its `/dev/null` sibling. A failure to redirect **stdin**
+/// leaves the daemon with a terminal it never reads; a failure to redirect stdout or stderr leaves
+/// the agent's output on a terminal the caller has been told it no longer holds, and leaves
+/// `sbx session logs` with an empty file for a session that is running and talking. The two are not
+/// the same kind of best-effort, and the caller ends the launch on this one.
+fn redirect_to_log(log: &File) -> bool {
     let fd = log.as_raw_fd();
-    // SAFETY: dup the log fd onto stdout and stderr.
-    unsafe {
-        libc::dup2(fd, 1);
-        libc::dup2(fd, 2);
-    }
+    // SAFETY: dup the log fd onto stdout and stderr; both return -1 on failure without touching
+    // anything else.
+    unsafe { libc::dup2(fd, 1) >= 0 && libc::dup2(fd, 2) >= 0 }
 }
 
 #[cfg(test)]

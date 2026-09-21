@@ -281,6 +281,16 @@ pub(in crate::sandbox) fn cage_command(
     Ok((prog, args, keep_open))
 }
 
+/// What the pty child exits with when the cage could not be entered at all — the descriptors could
+/// not be made inheritable, the terminal could not be taken, or the `execv` failed.
+///
+/// Deliberately **not** `126` or `127`. Those two are the shell convention for answers the cage
+/// itself gives about the program it was asked to run ("found but not executable", "not found"),
+/// and the in-cage shim already uses them that way; a launcher that never reached the cage has to
+/// say something the cage cannot. `125` is the spelling the surrounding tooling uses for "the
+/// wrapper failed before the command ran", and it leaves both of the cage's own answers intact.
+const CAGE_NEVER_STARTED: i32 = 125;
+
 /// A process's exit code in the shell convention: its own code, or 128 + the signal that
 /// killed it (matching the pty supervisor's `pump`).
 pub(in crate::sandbox) fn status_code(status: std::process::ExitStatus) -> i32 {
@@ -351,13 +361,19 @@ pub(super) fn supervise(
 
     // The child of the fork below: it calls only async-signal-safe functions (`login_tty`, `execv`,
     // `_exit`) on the prebuilt argv, and never returns.
+    //
+    // What it exits with when it cannot get there is [`CAGE_NEVER_STARTED`] rather than the `127`
+    // this used: `supervise` carries the child's status out as the launch's own, so `127` reached
+    // the caller indistinguishable from the cage's own "command not found" — the same number for
+    // "the cage said your program does not exist" and "the cage was never entered". The two call
+    // for opposite next steps, and the second is the one nothing else reports.
     let in_child = move |slave: libc::c_int| -> std::convert::Infallible {
         // First, and through the same helper the `Command` paths use: bwrap reads these descriptors
         // by number off its own argument list, so an exec that dropped them would have it open
         // nothing. `clear_cloexec` calls only `fcntl`, which this child may.
         if !crate::sandbox::memfd::clear_cloexec(&inherit) {
             // SAFETY: `_exit` in a fork child, the only safe way out of here.
-            unsafe { libc::_exit(127) };
+            unsafe { libc::_exit(CAGE_NEVER_STARTED) };
         }
         // SAFETY: this runs between `fork` and `exec` in `fork_with_pty`'s child, so it may call
         // only async-signal-safe code: `login_tty`, `execv` and `_exit` are raw syscalls, and
@@ -371,7 +387,7 @@ pub(super) fn supervise(
                 libc::execv(program_c.as_ptr(), argv.as_ptr());
             }
             // only reached if login_tty or execv failed
-            libc::_exit(127)
+            libc::_exit(CAGE_NEVER_STARTED)
         }
     };
     // SAFETY: the closure honours the async-signal-safe contract above, and `_keep_open` holds the

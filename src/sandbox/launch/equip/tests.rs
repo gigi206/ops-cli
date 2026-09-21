@@ -63,6 +63,27 @@ fn a_hostile_mise_token_cannot_rewrite_the_launching_terminal() {
     );
 }
 
+/// A mise path that would need quoting reaches the script as **one** word.
+///
+/// The interpolated values are sbx's own, so today none of them carries a space or a quote — which
+/// is exactly why the property has to be asserted against a value that does. Unquoted, the path
+/// below reaches bash as three words and the equip runs something else entirely.
+#[test]
+fn an_interpolated_mise_path_is_one_word_whatever_it_contains() {
+    let mise = PathBuf::from("/nix/store/a b/it's/mise");
+    let bash = PathBuf::from("/nix/store/bash/bin/bash");
+    let tokens = vec!["aqua:example/demo-tool".to_string()];
+    let cmd = vec![OsString::from("demo-app")];
+
+    let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, None, cmd);
+    let script = argv[2].to_string_lossy();
+
+    assert!(
+        script.contains(r"'/nix/store/a b/it'\''s/mise' install"),
+        "the path must reach bash as one word, quotes and all: {script}"
+    );
+}
+
 #[test]
 fn wrap_autoequip_passes_tokens_and_command_positionally() {
     // The install tokens and the real command both ride `"$@"`, so a token from an
@@ -84,7 +105,7 @@ fn wrap_autoequip_passes_tokens_and_command_positionally() {
     let script = argv[2].to_string_lossy();
     // mise by absolute path; the slice/shift use the count, not the tokens; the command
     // is exec'd (so it stays the cage's main process) after the tokens are shifted off.
-    assert!(script.contains("/nix/store/mise/bin/mise install \"${@:1:2}\""));
+    assert!(script.contains("'/nix/store/mise/bin/mise' install \"${@:1:2}\""));
     assert!(script.contains("shift 2;"));
     assert!(script.trim_end().ends_with("exec \"$@\""));
     assert!(
@@ -112,7 +133,7 @@ fn wrap_mise_equip_uses_the_global_verb_for_app_packages() {
     let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, None, cmd);
 
     let script = argv[2].to_string_lossy();
-    assert!(script.contains("/nix/store/mise/bin/mise use -g \"${@:1:1}\""));
+    assert!(script.contains("'/nix/store/mise/bin/mise' use -g \"${@:1:1}\""));
     assert!(script.contains("shift 1;"));
     // no data-dir override: the equip runs under the ambient primary
     assert!(!script.contains("MISE_DATA_DIR="));
@@ -205,10 +226,10 @@ fn wrap_mise_equip_pins_the_app_global_data_dir_for_the_global_lane() {
     let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, Some(&data_dir), cmd);
 
     let script = argv[2].to_string_lossy();
-    // the equip's MISE_DATA_DIR is pinned to the app-global home, single-quoted, before mise
+    // the equip's MISE_DATA_DIR is pinned to the app-global home, quoted, before mise
     assert!(
         script.contains(&format!(
-            "MISE_DATA_DIR='{data_dir}' /nix/store/mise/bin/mise use -g"
+            "MISE_DATA_DIR='{data_dir}' '/nix/store/mise/bin/mise' use -g"
         )),
         "the global lane must pin the app-global data dir: {script}"
     );
@@ -308,7 +329,7 @@ fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
     let script = g[2].to_string_lossy();
     assert!(
         script.contains(&format!(
-            "MISE_DATA_DIR='{data_dir}' exec /nix/store/mise/bin/mise upgrade"
+            "MISE_DATA_DIR='{data_dir}' exec '/nix/store/mise/bin/mise' upgrade"
         )),
         "the global-app roll must pin the app-global data dir: {script}"
     );

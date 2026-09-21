@@ -162,7 +162,7 @@ pub(super) fn provision_only_cmd(provisions: &[crate::config::BundleProvision]) 
 
 /// Quote one argv element for the shell that chains the install steps: single quotes, with an
 /// embedded single quote closed and re-opened around an escaped one.
-fn shell_quote(arg: &str) -> String {
+pub(super) fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
