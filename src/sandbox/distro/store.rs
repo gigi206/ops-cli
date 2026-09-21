@@ -270,8 +270,12 @@ fn locked_base(layout: &Layout, lock_path: &Path, locator: &str) -> Option<Strin
 /// The tree is assembled under a sibling name and renamed at the end, so the directory a launch
 /// binds at `/` exists only once every layer has landed: an interrupted unpack leaves a partial
 /// directory that no launch will ever name, rather than a root filesystem missing half its files.
-/// The name carries this process's pid so two launches provisioning the same image at once each
-/// assemble their own, and the loser of the rename finds the winner's tree already there.
+/// The name carries this process's pid **and a sequence number** so two launches provisioning the
+/// same image at once each assemble their own, and the loser of the rename finds the winner's tree
+/// already there. The pid alone did not say that: a single process provisions more than one image
+/// — a roll walks every declared one — and two of those sharing a name meant the second emptied
+/// the tree the first was still writing into, since the staging directory is cleared on the way
+/// in. The sequence number is what makes the name this *call's* rather than this process's.
 fn unpack_into(
     image: &ImageRef,
     digest: &str,
@@ -284,9 +288,10 @@ fn unpack_into(
         .ok_or_else(|| io::Error::other(format!("`{}` has no parent directory", dir.display())))?;
     std::fs::create_dir_all(parent)?;
     let partial = parent.join(format!(
-        "{}.partial.{}",
+        "{}.partial.{}.{}",
         dir.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        crate::sandbox::atomicfile::unique()
     ));
     let _ = std::fs::remove_dir_all(&partial);
 

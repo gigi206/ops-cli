@@ -584,26 +584,23 @@ pub(crate) fn read_lock_lines(lock_path: &Path) -> Option<(String, Option<String
 /// Write a source-aware lock as `<source>\n<rev>`, creating the parent directory
 /// owner-only first (a per-project lock lives under a project's runtime tree).
 ///
-/// The write is atomic: a per-pid temp beside the target is written then renamed
-/// over it (`rename` is atomic on a POSIX filesystem). So a concurrent reader —
-/// another launch resolving, or a second `sbx upgrade` — sees either the old lock
-/// or the new one, never a half-written file. Two upgrades racing settle on a
+/// The write is atomic: a temp beside the target is written then renamed over it
+/// (`rename` is atomic on a POSIX filesystem). So a concurrent reader — another
+/// launch resolving, or a second `sbx upgrade` — sees either the old lock or the
+/// new one, never a half-written file. Two upgrades racing settle on a
 /// last-writer-wins of two valid revisions, which the next upgrade reconciles.
+///
+/// Through [`crate::sandbox::atomicfile::write_atomic`] rather than a temp-and-rename written out
+/// here, which is what this was: that one names its temp with a sequence number as
+/// well as the pid (two writers in one process cannot collide on it), opens it
+/// `create_new` and `O_NOFOLLOW` (nothing is truncated and no symlink at the name
+/// is followed), and syncs the bytes and the directory entry before returning. A
+/// lock is exactly the file those three matter for — it is what a later launch
+/// resolves against without asking the network, so a machine that loses power just
+/// after the rename must not come back holding a present, right-sized file of
+/// zeros.
 pub(crate) fn write_lock(lock_path: &Path, source: &str, rev: &str) -> io::Result<()> {
-    if let Some(parent) = lock_path.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
-    let tmp = lock_path.with_extension(format!("tmp.{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, format!("{source}\n{rev}\n")) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, lock_path)
+    crate::sandbox::atomicfile::write_atomic(lock_path, format!("{source}\n{rev}\n").as_bytes())
 }
 
 /// Resolve a channel reference to its current locked revision via
