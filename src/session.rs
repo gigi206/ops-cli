@@ -304,13 +304,20 @@ pub(crate) fn report_ambiguous_id(verb: &str, id: &str, many: &[&Session]) {
 }
 
 /// Merge the two cage-member sources — the launcher's ppid subtree and the scope cgroup — into one
-/// list, dropping a pid that appears in both. The scope members are the load-bearing half: when the
-/// resource-limit scope has reparented the cage off the launcher, the ppid subtree is empty or
+/// list, dropping a member that appears in both. The scope members are the load-bearing half: when
+/// the resource-limit scope has reparented the cage off the launcher, the ppid subtree is empty or
 /// partial and only the scope cgroup still names the cage, so a teardown that dropped them would
 /// leave the agent running.
+///
+/// A member is the **pair**, not the pid. The two sources are read a moment apart, so the same
+/// number can name two different processes across them — the kernel recycled it between the walk
+/// and the cgroup read — and deduplicating on the number alone kept whichever was seen first and
+/// dropped the other. What the sweep does with the pair is ask `signal_if_match` whether the
+/// process still is that incarnation, so carrying both costs one refused signal and carrying one
+/// can cost a live cage member its `SIGKILL`.
 fn union_cage_members(mut subtree: Vec<(u32, u64)>, scope: Vec<(u32, u64)>) -> Vec<(u32, u64)> {
     for member in scope {
-        if !subtree.iter().any(|&(p, _)| p == member.0) {
+        if !subtree.contains(&member) {
             subtree.push(member);
         }
     }
@@ -951,6 +958,13 @@ mod tests {
         );
         // No scope (degraded launch, no systemd): the ppid subtree is used unchanged.
         assert_eq!(union_cage_members(vec![(10, 1)], vec![]), vec![(10, 1)]);
+        // One number, two incarnations: the kernel recycled the pid between the two reads. Both are
+        // carried, because the sweep asks each pair whether the process still is that incarnation —
+        // keeping only the first drops a live member instead of a dead one.
+        assert_eq!(
+            union_cage_members(vec![(10, 1)], vec![(10, 2)]),
+            vec![(10, 1), (10, 2)]
+        );
     }
 
     #[test]

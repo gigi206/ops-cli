@@ -1215,17 +1215,24 @@ impl TaskEngine {
                 None if Instant::now() >= deadline => {
                     // Killing bwrap tears the whole cage down: it is the pid-namespace init for
                     // everything inside, so no descendant outlives the timeout.
-                    timed_out = true;
+                    //
+                    // The flag is read off the status rather than set before the kill, for the
+                    // reason [`super::cagewait::ended_on_our_kill`] gives: the command may have
+                    // finished between the poll and the signal, and then what it carried out is its
+                    // own answer and this one would overwrite it.
                     let _ = child.kill();
-                    break child.wait()?;
+                    let status = child.wait()?;
+                    timed_out = super::cagewait::ended_on_our_kill(status);
+                    break status;
                 }
                 // A stop uses the same lever as the timeout and stays a *distinct* answer: both end
                 // the command, but one is the declaration's ceiling firing and the other is someone
                 // deciding, and a caller that cannot tell them apart cannot know which to act on.
                 None if self.stop_requested(invocation) => {
-                    stopped = true;
                     let _ = child.kill();
-                    break child.wait()?;
+                    let status = child.wait()?;
+                    stopped = super::cagewait::ended_on_our_kill(status);
+                    break status;
                 }
                 None => std::thread::sleep(POLL_INTERVAL),
             }
@@ -1359,16 +1366,21 @@ impl TaskEngine {
     ///
     /// The name is joined onto the output tree and the result is **emptied**, so a name that is not a
     /// path component of its own would empty a tree it does not own: `..` reaches the project tree,
-    /// store included, and `.` reaches every other task's artifacts. `validate_task_name` refuses
-    /// both where a declaration is read, and this refuses them again here, because the two sit far
-    /// apart and only one of them destroys anything. A `TaskSpec` reaching this function is not
-    /// always one that came through the validator — the tests build them directly, and so would a
-    /// caller added later.
+    /// store included, `.` reaches every other task's artifacts, and a name carrying a separator
+    /// addresses something else again — `a/b` descends out of the task's own directory, and an
+    /// absolute one throws the output tree away entirely, since `Path::join` on an absolute
+    /// argument answers that argument. `validate_task_name` refuses all of them where a declaration
+    /// is read, and this refuses them again here, because the two sit far apart and only one of
+    /// them destroys anything. A `TaskSpec` reaching this function is not always one that came
+    /// through the validator — the tests build them directly, and so would a caller added later.
+    ///
+    /// The test asks the separator question rather than the `..` one, because a guard that named
+    /// only the two spellings it was written for is how this arrived here in the first place.
     fn claim_output(&self, task: &TaskSpec) -> Result<OutputClaim, String> {
-        if task.name == "." || task.name == ".." {
+        if task.name == "." || task.name == ".." || task.name.contains('/') {
             return Err(format!(
-                "`{}` cannot name an output directory — it addresses the tree that holds them \
-                 rather than a place inside it",
+                "`{}` cannot name an output directory — it addresses a place outside the tree that \
+                 holds them rather than one inside it",
                 task.name
             ));
         }
