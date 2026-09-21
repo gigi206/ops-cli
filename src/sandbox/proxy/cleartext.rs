@@ -322,7 +322,12 @@ pub(super) fn handle_cleartext(
     if let Some(code) = parse_status_code(&resp_head)
         && code >= 200
     {
-        ctx.set_status(allow_seq, code);
+        // Through the shared route the other planes take, with an empty injected list because a
+        // cleartext request never carries a credential — stated here as the argument rather than
+        // held as a reason to reach past it. The two spellings did the same thing only as long as
+        // that stayed true, and an invariant kept in one file about another is the shape the proxy
+        // has already drifted along once.
+        note_final_status(ctx, allow_seq, &creds, &[], code);
     }
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
     // Teed ahead of the reflection masking — the capture masks its own buffers at filing time. The

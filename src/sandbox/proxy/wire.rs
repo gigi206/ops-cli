@@ -742,8 +742,15 @@ pub(super) fn offer_reuse_in_head(head: &[u8], idle: Duration) -> Vec<u8> {
     rewrite_client_connection(head, replacement.as_bytes())
 }
 
-/// Drop every `Connection` and `Keep-Alive` header from a response head and put `replacement` back
-/// in their place, just before the terminator — the shared body of the two rewrites above.
+/// Drop every `Connection`, `Keep-Alive` and `Proxy-Connection` header from a response head and put
+/// `replacement` back in their place, just before the terminator — the shared body of the two
+/// rewrites above.
+///
+/// `Proxy-Connection` is the non-standard hop header a proxy-aware client sends and some servers
+/// echo. It describes a hop that ended at sbx, so relaying it tells the cage about a connection it
+/// does not have — the same reason the other two are replaced rather than passed through. The h2
+/// rebuild already dropped it (`forbidden_response_header`), and this was the one header where the
+/// two versions of "strip what is hop-by-hop" disagreed.
 fn rewrite_client_connection(head: &[u8], replacement: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(head.len() + replacement.len());
     let mut lines = head.split_inclusive(|&b| b == b'\n');
@@ -775,7 +782,8 @@ fn rewrite_client_connection(head: &[u8], replacement: &[u8]) -> Vec<u8> {
                 .unwrap_or(&[])
                 .trim_ascii();
             dropping = name.eq_ignore_ascii_case(b"connection")
-                || name.eq_ignore_ascii_case(b"keep-alive");
+                || name.eq_ignore_ascii_case(b"keep-alive")
+                || name.eq_ignore_ascii_case(b"proxy-connection");
             if dropping {
                 continue;
             }
@@ -991,6 +999,43 @@ pub(super) fn strip_eol(line: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hop headers dropped from a relayed response head are the same set on both versions.
+    ///
+    /// `Proxy-Connection` is the non-standard hop header a proxy-aware client sends and some servers
+    /// echo back. It described a hop that ended at sbx, and relaying it told the cage about a
+    /// connection it does not hold — which is exactly why `Connection` and `Keep-Alive` are replaced
+    /// rather than passed on. The h2 rebuild dropped all three; this one dropped two, and that was
+    /// the only header where the two spellings of "strip what is hop-by-hop" disagreed.
+    #[test]
+    fn a_relayed_response_head_drops_the_same_hop_headers_the_h2_rebuild_does() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nProxy-Connection: keep-alive\r\n\
+                     Keep-Alive: timeout=60\r\nConnection: keep-alive\r\nX-Kept: yes\r\n\r\n";
+        let out = String::from_utf8(force_close_in_head(head)).expect("ascii");
+
+        for gone in [
+            "Proxy-Connection",
+            "Keep-Alive: timeout",
+            "Connection: keep-alive",
+        ] {
+            assert!(
+                !out.contains(gone),
+                "`{gone}` must not reach the cage: {out}"
+            );
+        }
+        assert!(
+            out.contains("Connection: close"),
+            "sbx's own answer is put back: {out}"
+        );
+        assert!(
+            out.contains("X-Kept: yes"),
+            "an ordinary header is untouched: {out}"
+        );
+        assert!(
+            out.contains("Content-Length: 0"),
+            "and so is the framing: {out}"
+        );
+    }
 
     /// Read a whole framed body, returning the bytes the relay would forward.
     fn framed(head: &[u8], method: &str, wire: &[u8]) -> Vec<u8> {

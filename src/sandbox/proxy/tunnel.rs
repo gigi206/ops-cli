@@ -503,7 +503,14 @@ pub(super) fn serve_tunneled_request(
     //     secret is only ever offered to a request that receives the same secret.
     let keep_alive =
         ctx.pool.is_some() && !ws_upgrade && request_line_is_http11(&inner.request_line);
-    let pool_key = keep_alive.then(|| PoolKey::new(connect_host, port, &injected_ids));
+    let pool_key = keep_alive.then(|| {
+        PoolKey::new(
+            connect_host,
+            port,
+            &injected_ids,
+            ctx.credentials.generation(),
+        )
+    });
     // Taking a parked connection is limited to a request the proxy can send a second time, because a
     // connection the upstream closed while it was parked only shows up after the write. That means a
     // request with no body, a chunked one whose body the de-chunker buffers before forwarding, or one

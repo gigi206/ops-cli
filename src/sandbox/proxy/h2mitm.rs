@@ -432,10 +432,38 @@ fn authority_bound_to(
     })
 }
 
+/// The URI the upstream request is rebuilt from, with `:scheme` pinned to what the transport is.
+///
+/// HTTP/2 carries the scheme as a pseudo-header the client chooses, and this plane is reached only
+/// through a `CONNECT` whose TLS sbx terminated — so `https` is a fact about the exchange rather
+/// than a claim inside it. It was read (for the tripwire blob) and never checked, and the upstream
+/// request is rebuilt from this URI, so `:scheme: http` on an inspected TLS tunnel travelled to the
+/// server as written. Nothing opens: policy, certificate and routing are all bound to the `CONNECT`
+/// host and port, and the upstream leg is TLS whatever the pseudo-header says. What the server gets
+/// is a contradiction, and one that routes on the scheme or builds an absolute URL from it acts on
+/// it.
+///
+/// Re-pinned rather than refused, because a stream that was otherwise permitted should not fail over
+/// a value sbx can state correctly. `Err` is for a URI that cannot be rebuilt at all, which is the
+/// fail-closed direction for a shape this plane does not produce.
+fn upstream_uri(uri: http::Uri) -> Result<http::Uri, http::Error> {
+    if uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
+        return Ok(uri);
+    }
+    let mut rebuilt = http::Uri::builder().scheme(http::uri::Scheme::HTTPS);
+    if let Some(authority) = uri.authority() {
+        rebuilt = rebuilt.authority(authority.clone());
+    }
+    if let Some(path) = uri.path_and_query() {
+        rebuilt = rebuilt.path_and_query(path.clone());
+    }
+    rebuilt.build()
+}
+
+#[allow(clippy::too_many_arguments)]
 /// Connect the checked upstream over HTTP/2 (validate cert, require ALPN `h2`) and relay the RPC —
 /// request headers + body, then the response headers + body + trailers (`grpc-status`). A
 /// pre-forward failure answers the client with a `502`; a mid-stream error just ends the stream.
-#[allow(clippy::too_many_arguments)]
 async fn relay(
     req: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
@@ -609,9 +637,23 @@ async fn relay(
     // pseudo-headers), copying regular headers minus the connection-specific ones h2 forbids and
     // minus any header sbx is injecting (stripped so its value is the only one upstream).
     let (parts, client_body) = req.into_parts();
+    // `:scheme` is the client's to write and the transport's to be; see [`upstream_uri`].
+    let Ok(upstream_uri) = upstream_uri(parts.uri) else {
+        ctx.outcome(
+            Proto::Https,
+            host,
+            port,
+            Some(parts.method.as_str()),
+            Some(path),
+            StatKind::Blocked,
+            "bad-request",
+        );
+        let _ = refuse(respond, StatusCode::BAD_REQUEST, "bad-request");
+        return;
+    };
     let mut builder = Request::builder()
         .method(parts.method)
-        .uri(parts.uri)
+        .uri(upstream_uri)
         .version(http::Version::HTTP_2);
     for (name, value) in parts.headers.iter() {
         let n = name.as_str();
@@ -1031,11 +1073,10 @@ async fn relay_body(
             // planes never had the hole: they de-chunk and re-frame, so no trailer is forwarded at
             // all.
             //
-            // The response direction passes `None`: nothing is injected that way, and a reflected
-            // secret in a response trailer is `relay_body_redacting`'s to mask.
-            if let Some(strip) = &strip {
-                trailers = strip_request_trailers(trailers, strip);
-            }
+            // The response direction passes `None`: nothing is injected that way, so what it has
+            // to drop is the connection-specific set alone. A reflected secret in a response
+            // trailer is `relay_body_redacting`'s to mask, which is a different question.
+            trailers = strip_trailers(trailers, strip.as_deref());
             dst.send_trailers(trailers)?;
         }
         None => dst.send_data(Bytes::new(), true)?,
@@ -1043,8 +1084,17 @@ async fn relay_body(
     Ok(())
 }
 
-/// Hold a request's trailers to the same strip the request head passed: no connection-specific
-/// header, and none of the names sbx injected.
+/// Hold a direction's trailers to the same strip its head passed: no connection-specific header,
+/// and — on the request side — none of the names sbx injected.
+///
+/// Both directions, because the head of each is filtered and only one of the two sets of trailers
+/// was. A request's trailers going through untouched let a cage put its own `authorization` after
+/// the body instead of before it, beside sbx's; a response's going through untouched let an upstream
+/// put a connection-specific field where RFC 9113 §8.2.2 forbids one, on the plane that carries
+/// gRPC and where trailers are ordinary traffic. Nothing was demonstrated to open by the second —
+/// the only reader is the cage's own client, and a peer that can send trailers can already reset the
+/// stream — but a head and its trailers filtered by different rules is a difference with no reason
+/// behind it, and it is the shape a later change reads as deliberate.
 ///
 /// Split out of [`relay_body`] because it is the decision rather than the plumbing, and because the
 /// pump around it needs a live h2 stream pair while this needs nothing.
@@ -1052,7 +1102,7 @@ async fn relay_body(
 /// `HeaderMap` has no `retain`, so the kept set is rebuilt. Its `into_iter` reports the name only
 /// once per run of repeats, yielding `None` for the rest — `last` carries it, so a repeated header
 /// is judged by the name it belongs to instead of being dropped for having none.
-fn strip_request_trailers(trailers: http::HeaderMap, injected: &[String]) -> http::HeaderMap {
+fn strip_trailers(trailers: http::HeaderMap, injected: Option<&[String]>) -> http::HeaderMap {
     let mut kept = http::HeaderMap::with_capacity(trailers.len());
     let mut last: Option<http::header::HeaderName> = None;
     for (name, value) in trailers {
@@ -1060,7 +1110,13 @@ fn strip_request_trailers(trailers: http::HeaderMap, injected: &[String]) -> htt
             continue;
         };
         let n = name.as_str();
-        if !forbidden_request_header(n) && !injected.iter().any(|h| header_name_eq(h, n)) {
+        let forbidden = match injected {
+            Some(names) => {
+                forbidden_request_header(n) || names.iter().any(|h| header_name_eq(h, n))
+            }
+            None => forbidden_response_header(n),
+        };
+        if !forbidden {
             kept.append(name.clone(), value);
         }
         last = Some(name);
@@ -1537,6 +1593,51 @@ mod tests {
     // signature; the tests below still spell their own policy imports where they build one.
     use crate::allowlist::EgressPolicy;
     use crate::sandbox::egress_stats::Counts;
+
+    /// The scheme the upstream is told is the one the transport is, not the one the cage wrote.
+    ///
+    /// This plane is reached only through a `CONNECT` whose TLS sbx terminated, so `https` is a fact
+    /// about the exchange. The pseudo-header was read for the tripwire blob and never checked, and
+    /// the upstream request is rebuilt from this URI: `:scheme: http` travelled to the server as
+    /// written, on a connection that was not. Nothing opened — host, port, certificate and policy
+    /// are all bound to the `CONNECT` — but a server routing on the scheme was handed a
+    /// contradiction. The authority and the path are untouched: they are matched and bound
+    /// elsewhere, and rewriting them here would move a decision into a rebuild.
+    #[test]
+    fn the_upstream_is_told_the_scheme_the_transport_is() {
+        let pinned = |raw: &str| {
+            super::upstream_uri(raw.parse::<http::Uri>().expect("a well-formed URI"))
+                .expect("a URI this plane can rebuild")
+        };
+
+        let rewritten = pinned("http://grpc.example.com/v1/Echo?x=1");
+        assert_eq!(rewritten.scheme_str(), Some("https"));
+        assert_eq!(
+            rewritten.authority().map(http::uri::Authority::as_str),
+            Some("grpc.example.com"),
+            "the authority is bound elsewhere and is not this rebuild's to change"
+        );
+        assert_eq!(
+            rewritten.path_and_query().map(|p| p.as_str()),
+            Some("/v1/Echo?x=1")
+        );
+
+        // Already right: returned as it stands, so the ordinary stream is not rebuilt at all.
+        let untouched = pinned("https://grpc.example.com/v1/Echo");
+        assert_eq!(untouched.to_string(), "https://grpc.example.com/v1/Echo");
+
+        // And a scheme nobody sends over an inspected tunnel is still pinned rather than passed on.
+        assert_eq!(
+            pinned("ws://grpc.example.com/socket").scheme_str(),
+            Some("https")
+        );
+
+        // A URI with no authority cannot be rebuilt into one, and is refused rather than forwarded
+        // under a scheme it does not carry. Unreachable on this plane — `:authority` is mandatory in
+        // HTTP/2 and is bound to the CONNECT target above — so this pins the fail-closed branch
+        // rather than a case the plane produces.
+        assert!(super::upstream_uri("http:".parse::<http::Uri>().expect("a URI")).is_err());
+    }
 
     /// The h2 plane drops the proxy-hop credential too, and keeps what gRPC needs.
     ///
@@ -2129,6 +2230,43 @@ mod tests {
         assert_eq!((counts, events), one_denial("http2-ask-unsupported"));
     }
 
+    /// A response's trailers are stripped like its head, which is what the request side already did.
+    ///
+    /// The head of each direction is filtered and only one of the two sets of trailers was: the
+    /// response's went through untouched, so an upstream could put a connection-specific field where
+    /// RFC 9113 §8.2.2 forbids one, on the plane that carries gRPC. Nothing was shown to open by it —
+    /// the only reader is the cage's own client, and a peer that can send trailers can already reset
+    /// the stream — but a head and its trailers filtered by different rules is a difference with
+    /// nothing behind it. Nothing is injected toward the client, so the response side drops the
+    /// connection-specific set and nothing else: `grpc-status` and the message are ordinary traffic.
+    #[test]
+    fn a_responses_trailers_are_stripped_like_its_head() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.append("grpc-status", "0".parse().unwrap());
+        trailers.append("grpc-message", "ok".parse().unwrap());
+        for forbidden in ["transfer-encoding", "connection", "keep-alive", "upgrade"] {
+            trailers.append(forbidden, "x".parse().unwrap());
+        }
+        trailers.append("proxy-connection", "keep-alive".parse().unwrap());
+
+        let kept = strip_trailers(trailers, None);
+
+        assert_eq!(kept.get("grpc-status").unwrap(), "0");
+        assert_eq!(kept.get("grpc-message").unwrap(), "ok");
+        for gone in [
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "upgrade",
+            "proxy-connection",
+        ] {
+            assert!(
+                kept.get(gone).is_none(),
+                "`{gone}` is connection-specific and must not reach the cage in a trailer"
+            );
+        }
+    }
+
     /// A request's trailers are held to the same strip its head passed.
     ///
     /// The head rebuild drops a connection-specific header and every name sbx injects, "so the
@@ -2153,7 +2291,7 @@ mod tests {
         trailers.append("grpc-message", "a".parse().unwrap());
         trailers.append("grpc-message", "b".parse().unwrap());
 
-        let kept = strip_request_trailers(trailers, &injected);
+        let kept = strip_trailers(trailers, Some(&injected));
 
         assert_eq!(kept.get("grpc-status").unwrap(), "0");
         assert!(

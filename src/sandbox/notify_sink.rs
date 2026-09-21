@@ -118,6 +118,36 @@ const URGENCY_NORMAL: u8 = 1;
 /// otherwise depend on. Read only on the delivery thread.
 pub(crate) type Needles = Arc<RwLock<Vec<SecretNeedle>>>;
 
+/// Add `needles` to the set the notifier redacts its announcements against, skipping any it already
+/// holds.
+///
+/// **Added to, never replacing.** One session's notifier also serves the per-invocation proxies its
+/// declared tasks stand up, and each of those resolves its own credentials; replacing would let a
+/// task's set erase the session's, and the erased value would then reach a notification body
+/// unredacted. The union is bounded by the number of *distinct* credentials declared rather than by
+/// the number of invocations, because an identical needle is recognised and skipped.
+///
+/// One definition, because two callers publish: the launch, once the credentials first resolve, and
+/// a refresh, when an upstream refusal produces a new value. A set seeded once and never added to is
+/// a notifier redacting against a superseded value.
+///
+/// A poisoned lock publishes nothing rather than failing the caller. The alternative would be to end
+/// a launch, or a refresh, over an announcement's redaction: the notifier still holds every needle
+/// published before the poisoning, and what is lost is a value no announcement may yet carry.
+pub(crate) fn publish_needles(shared: &Needles, needles: &[SecretNeedle]) {
+    let Ok(mut held) = shared.write() else {
+        return;
+    };
+    for needle in needles {
+        let known = held
+            .iter()
+            .any(|n| n.name() == needle.name() && n.as_bytes() == needle.as_bytes());
+        if !known {
+            held.push(needle.clone());
+        }
+    }
+}
+
 /// The launch's notification wiring, passed as one value so the notifier and the credential set it
 /// redacts against cannot be handed over separately — a notifier attached without its needles would
 /// announce unredacted text, which is the failure this whole path is built to avoid.

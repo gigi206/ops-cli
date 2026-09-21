@@ -64,6 +64,17 @@ pub(super) fn reserialize_upgrade(
             // missing only here and on the h2 rebuild. `Connection` is deliberately *not* stripped
             // alongside it: an upgrade needs its `Connection: Upgrade` to survive.
             || k.eq_ignore_ascii_case("proxy-authorization")
+            // The framing headers, which describe a body this exchange does not send. An upgrade
+            // may legally declare one — `inspect_framing` accepts it, and a handshake carrying
+            // `Transfer-Encoding: chunked` is a shape this plane serves — but the upgrade path
+            // hands the socket to `relay_upgrade` at the `101` and never reads a body. Left on,
+            // they promised the upstream bytes that arrive only after the switch, where they are
+            // frames: a strict server waits for them until its deadline and the exchange ends
+            // `502`, a lax one answers `101` and reads the client's first frames as the body it
+            // was told to expect. Neither is what the client wrote, and neither is what the
+            // handshake means, so what is forwarded stops claiming it.
+            || k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -252,6 +263,12 @@ pub(super) fn relay_upgrade(
         if let Some(code) = parse_status_code(&resp_head)
             && code >= 200
         {
+            // The bare `set_status`, not `note_final_status`, and the difference is one case: a
+            // `401` that would ask a refreshable credential to refresh. No credential is injected
+            // into an exchange that reaches here — `refuse_ws_into_injected_host` ends an upgrade
+            // toward an injected host before any egress — so there is nothing to refresh and the
+            // two would do the same thing. Written here because that is a fact about another
+            // function, and a reader of this line cannot see it from where they stand.
             ctx.set_status(allow_seq, code);
         }
         // A declined upgrade is an ordinary response and is relayed as one: sbx's own
@@ -292,6 +309,8 @@ pub(super) fn relay_upgrade(
 
     // What the peers agreed for payload compression, decided by this response alone.
     let deflate = negotiated_deflate(&resp_head);
+    // A `101` is never the status that asks a credential to refresh, so the bare setter is the whole
+    // of what this records; see the declined branch above for the injected-host half of it.
     ctx.set_status(allow_seq, 101);
     // Relay the `101` to the client so it completes the WebSocket handshake. Its own hop headers
     // stand — rewriting the `Connection: Upgrade` out of it would undo the switch the two peers just
@@ -802,7 +821,7 @@ mod tests {
     #[test]
     fn only_a_get_carrying_the_upgrade_headers_is_a_websocket_handshake() {
         let head = |method: &str| {
-            crate::sandbox::proxy::wire::parse_head(
+            wire::parse_head(
                 format!(
                     "{method} /socket HTTP/1.1\r\nHost: chat.example\r\nUpgrade: websocket\r\n\
                      Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n"
@@ -874,6 +893,43 @@ mod tests {
             ),
             "the exemption must be the host it was learned on and no other"
         );
+    }
+
+    /// The handshake forwarded upstream does not promise a body the upgrade never sends.
+    ///
+    /// A handshake may legally declare framing — `inspect_framing` accepts it and
+    /// `an_open_websocket_holds_no_body_budget` pins the shape — but the upgrade path hands the
+    /// socket to [`relay_upgrade`] at the `101` and reads no body at all. The reserializer keeps
+    /// `Connection`/`Upgrade` on purpose, and it used to keep what sat beside them: the upstream was
+    /// told to expect bytes that arrive only after the switch, where they are frames. A strict
+    /// server waits for them until its deadline and the exchange ends `502`; a lax one answers
+    /// `101` and reads the client's first frames as the body. The rest of the head is untouched:
+    /// what the handshake means is carried, what it does not mean is not.
+    #[test]
+    fn the_forwarded_handshake_promises_no_body() {
+        let head = wire::parse_head(
+            b"GET /chat HTTP/1.1\r\nHost: chat.example\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+        )
+        .expect("a well-formed head");
+        let wire = String::from_utf8(reserialize_upgrade(&head, &[], false)).expect("ascii");
+
+        let lower = wire.to_ascii_lowercase();
+        assert!(
+            !lower.contains("transfer-encoding") && !lower.contains("content-length"),
+            "the framing headers must not reach the upstream: {wire}"
+        );
+        // What the upgrade is made of still travels, or the upstream performs no upgrade at all.
+        for kept in [
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Key",
+            "Host: chat.example",
+        ] {
+            assert!(wire.contains(kept), "`{kept}` must survive: {wire}");
+        }
     }
 
     /// The credential the client addressed to the **proxy hop** must not reach the origin server.

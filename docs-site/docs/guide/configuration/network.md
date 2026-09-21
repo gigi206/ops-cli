@@ -563,6 +563,24 @@ A refused request is *not* a rule, so it does **not** appear in
 `-a <app>`. Once you run the suggested `sbx net allow`, the host becomes an allow rule and
 *then* shows in `sbx net rules`.
 
+## What the posture does not cover
+
+`[network]` governs the cage. Two things sbx does **for** a launch run outside it, on the
+host's own network, and no rule here applies to them:
+
+- **Package resolution.** A `<backend>:resolve` command (see
+  [`[packages]`](packages)) is arbitrary code you declare, and it runs in its own
+  hermetic sandbox **sharing the host's network**, because its job is to reach a
+  vendor's download API. It is honored only from a trusted layer, and only on a cold
+  pin: a warm launch reuses the pin offline and runs nothing.
+- **Fetching what a package names.** The download of a `.deb`, `.AppImage`, tarball
+  or nixpkgs closure is host-side too, and is bounded by the URL validation and the
+  content hash recorded in the lock file rather than by an allowlist rule.
+
+The boundary `[network]` draws is around what runs **inside** the cage. What sbx
+itself fetches on your behalf is bounded by trust: whether you trusted the layer that
+declared it.
+
 ## Mode inheritance
 
 A table may **omit** `mode` to inherit it from the parent config layer (an app takes

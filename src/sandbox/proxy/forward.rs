@@ -322,7 +322,8 @@ pub(super) fn handle_https_forward(
     //     tunneled path: the launch has to have asked for reuse, and the request has to be HTTP/1.1.
     //     Only a request the proxy can send again takes a parked connection.
     let keep_alive = ctx.pool.is_some() && request_line_is_http11(&head.request_line);
-    let pool_key = keep_alive.then(|| PoolKey::new(&host, port, &injected_ids));
+    let pool_key =
+        keep_alive.then(|| PoolKey::new(&host, port, &injected_ids, ctx.credentials.generation()));
     let replayable = chunked || body_len == 0 || held.is_some();
 
     // 7b. Take the upstream connection: a parked one, or a new validated TLS connection to the

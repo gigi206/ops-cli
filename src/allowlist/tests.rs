@@ -407,6 +407,28 @@ fn a_scheme_selects_the_enforcement_layer() {
 
 /// A path rule may not carry a delimiter the matcher cuts away on both sides.
 ///
+/// An encoded separator is refused for the same reason a query, a fragment and `;parameters` are.
+///
+/// `canonical_segments` decodes before it splits, on the rule's path as on the request's, so
+/// `host/a%2fb` matched `/a/b` and printed back as `a%2fb`: one segment to read, two to match. The
+/// four other spellings of "this rule matches wider than it reads" were already errors their author
+/// is shown; this one was accepted. Decoding itself stays legal — it is the contract, and `%73` is
+/// just a letter.
+#[test]
+fn a_path_rule_may_not_carry_an_encoded_separator() {
+    for entry in ["api.test/a%2fb", "api.test/a%2Fb"] {
+        let e = classify(entry).unwrap_err();
+        assert!(
+            e.contains("encoded `/`") && e.contains("`/a/b`"),
+            "the refusal names the encoding and the path really opened: {e}"
+        );
+    }
+    // An encoded character that is not a separator changes no shape and stays admitted, as does a
+    // double-encoded slash, which decodes to a literal `%2f` inside one segment.
+    assert!(classify("api.test/%73ecret").is_ok());
+    assert!(classify("api.test/a%252fb").is_ok());
+}
+
 /// `canonical_segments` strips a `#fragment` and a segment's `;parameters` from a request's path,
 /// and from the rule's path with it, so a rule written with either matches the bare path while
 /// displaying a form that names something narrower — the operator reads a rule for one resource
@@ -2581,6 +2603,51 @@ fn a_secret_to_rule_is_l7_by_construction() {
     // both feed paths that must never be raw-spliced credential targets. (The secret `to`
     // validator rejecting a tcp:// `to` is covered in the config tests; here just pin the layer.)
     assert_eq!(host_port_rule("h", 443).layer, Layer::L7);
+}
+
+/// Port 0 is not a port, and the three surfaces that read one say so alike.
+///
+/// A rule's port went through `parse_port` and was refused; a `tcp://` target was refused with its
+/// own message; a request target parsed straight to `u16` and accepted it. Nothing opened — nothing
+/// listens on 0 and the connection would fail — but one value with three answers is how a grammar
+/// starts meaning different things in different places.
+#[test]
+fn port_zero_is_refused_wherever_a_port_is_read() {
+    assert!(classify("api.test:0").is_err(), "a rule's port");
+    assert!(
+        classify("tcp://db.test:0").is_err(),
+        "a `tcp://` target's port"
+    );
+    assert!(
+        parse_url_target("https://api.test:0/x").is_err(),
+        "a request target's port"
+    );
+    // And the ports that are ports still parse, in all three.
+    assert!(classify("api.test:443").is_ok());
+    assert!(classify("tcp://db.test:5432").is_ok());
+    assert!(parse_url_target("https://api.test:8443/x").is_ok());
+}
+
+/// An entry whose host still carries a colon is malformed, and is dropped as one.
+///
+/// The `:port` split takes the rightmost colon and only before a numeric suffix. That is right for a
+/// hostname and wrong for anything else carrying one: `2001:db8::1` came out as the host `2001:db8:`
+/// on port 1 and then displayed itself back as `2001:db8::1`, so the table showed an address while
+/// the matcher held a name no CONNECT target can equal; `host:` kept its colon the same way. The
+/// module's contract for a malformed entry is a warning and a drop, which is what both get now —
+/// the host simply stays HTTP/1.1, which is where it already was.
+#[test]
+fn an_http2_entry_whose_host_keeps_a_colon_is_malformed() {
+    for entry in ["2001:db8::1", "host:", "grpc.example.com:http"] {
+        assert!(
+            Http2Host::parse(entry).is_none(),
+            "`{entry}` is not a `host[:port]` and must be dropped, not silently kept"
+        );
+    }
+    // What the split is for still works, and so does the wildcard it coexists with.
+    assert!(Http2Host::parse("grpc.example.com").is_some());
+    assert!(Http2Host::parse("grpc.example.com:9001").is_some());
+    assert!(Http2Host::parse("*.example.com:443").is_some());
 }
 
 #[test]

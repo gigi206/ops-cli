@@ -63,14 +63,21 @@ pub(super) struct PoolKey {
     host: String,
     port: u16,
     injections: Vec<usize>,
+    /// Which generation of the launch's credentials the request carried. The positions above are
+    /// exact in *rules* and were therefore equal across a re-resolution: a connection parked while
+    /// the old value was in flight stayed on offer to a request carrying the new one. No value goes
+    /// in a key — that is the rule this field keeps rather than breaks — so what distinguishes the
+    /// two is a count of replacements.
+    generation: u64,
 }
 
 impl PoolKey {
-    pub(super) fn new(host: &str, port: u16, injections: &[usize]) -> Self {
+    pub(super) fn new(host: &str, port: u16, injections: &[usize], generation: u64) -> Self {
         Self {
             host: host.to_string(),
             port,
             injections: injections.to_vec(),
+            generation,
         }
     }
 }

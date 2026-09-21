@@ -237,6 +237,17 @@ Everything below applies unchanged (host identity, SSRF guard, upstream validati
 credential injection and redaction), and the connection sbx opens to the real upstream
 is still a **validated TLS** one.
 
+The equivalence is one of **verdict**, not of transport. The same rules decide the
+request, the same refusals come back, and the same records are written. What the two
+shapes do differently is what happens after a `101`: a permitted WebSocket upgrade
+that arrived as a `CONNECT` is relayed as a tunnel sbx keeps reading, while one that
+arrived in absolute form ends at the client, which takes the connection over. The
+handshake is inspected and masked either way and the boundary is unchanged (the empty
+netns, the allowlist, the inspected handshake), but the frames that follow an
+absolute-form upgrade are not seen by sbx at all: the traffic capture and the frame
+tripwire have nothing to file. Prefer the tunnelled shape where you want the frames
+recorded.
+
 What differs on the wire is the *client* leg: that request, and the response, travel in
 cleartext between the tool and the proxy. That leg is a loopback socket **inside the
 cage**, which no process in the cage can read (there is no `CAP_NET_RAW` for a packet

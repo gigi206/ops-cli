@@ -397,6 +397,10 @@ the command; `sbx upgrade` re-runs it and re-fetches the `.deb` only when the UR
 changed. Because the command is arbitrary code it is honored **only from a trusted source** and
 **never runs for an untrusted layer**.
 
+The network it uses is the **host's**, which is what lets it reach the vendor API, and that puts it
+outside the cage's egress boundary: no `[network]` posture, allowlist rule or proxy applies to a
+resolve command. See [What the posture does not cover](network#what-the-posture-does-not-cover).
+
 ### `appimage:`: a prebuilt AppImage
 
 ```toml

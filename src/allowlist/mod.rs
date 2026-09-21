@@ -928,6 +928,8 @@ impl Http2Host {
     /// drops it with a warning, fail-closed (that host simply keeps HTTP/1.1). A hostname is expected:
     /// an h2 target needs an SNI, and the proxy refuses IP-literal CONNECT targets, so the `:port`
     /// split (rightmost colon, numeric suffix) does not attempt to parse a bracketed IPv6 literal.
+    /// A colon surviving that split means the entry was never a `host[:port]`, and it is refused
+    /// here rather than kept as a host no CONNECT target can equal.
     pub(crate) fn parse(entry: &str) -> Option<Self> {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -941,6 +943,16 @@ impl Http2Host {
             }
             _ => (entry, None),
         };
+        // A colon left in the host is not a host. The split above takes the rightmost one and only
+        // when a numeric suffix follows it, which is right for `host:443` and wrong for everything
+        // that carries a colon for another reason: `host:` keeps its trailing colon, and an IPv6
+        // literal keeps all but its last group (`2001:db8::1` parsing as `2001:db8:` on port 1,
+        // then displaying itself back as the address it is not). Neither can ever match a CONNECT
+        // target, so the contract this module states — malformed, dropped with a warning — is what
+        // they get, rather than an entry that reads as an address and matches nothing forever.
+        if hostpart.contains(':') {
+            return None;
+        }
         let (domain, subdomain) = match hostpart.strip_prefix("*.") {
             Some("") => return None, // a bare `*.` with no domain is malformed
             Some(d) => (d, true),

@@ -555,6 +555,35 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
                 (addr, true)
             }
         };
+        // Two rules can name one address and port by two spellings: `tcp://localhost:5432` resolves
+        // to the cage's own loopback, and `tcp://127.0.0.1:5432` writes that address out. Both would
+        // emit `TCP-LISTEN:5432,bind=127.0.0.1`; `reuseaddr` does not let two live listeners share
+        // an address, so the second `bind` fails — and socat's diagnostic goes to `/dev/null` with
+        // the rest of the detached preamble, so the destination it served is simply unreachable with
+        // nothing said. `await_listeners` does not catch it either: its patterns come from these
+        // destinations, so the duplicate pattern is matched twice by the one listener that did bind,
+        // and the wait is satisfied. Named here instead, the way `forward::plan` names the same
+        // clash on the host side — the loser is the later spelling, so the plan stays the order the
+        // rules were written in.
+        let mut ports = ports;
+        ports.retain(|port| {
+            let Some(other) = plan
+                .destinations
+                .iter()
+                .find(|d| d.cage_addr == addr && d.host != host && d.ports.contains(port))
+            else {
+                return true;
+            };
+            plan.skipped.push(format!(
+                "tcp://{host}:{port} is `tcp://{}:{port}` seen twice — both are {addr} inside the \
+                 cage, and one address holds one listener",
+                other.host
+            ));
+            false
+        });
+        if ports.is_empty() {
+            continue;
+        }
         match plan.destinations.iter_mut().find(|d| d.host == host) {
             Some(existing) => {
                 for port in ports {
@@ -811,12 +840,19 @@ pub(crate) fn start(
             // the resolver reach the raw resource — is the one that must not exist.
             brokers.to_vec(),
         );
-        std::sync::Arc::new(super::proxy::CredentialRefresh::new(
+        let refresh = super::proxy::CredentialRefresh::new(
             credentials.clone(),
             Box::new(move |standing| {
                 resolve_injections(&secrets, &root, &bwrap, redact_min_len, &brokers, standing)
             }),
-        ))
+        );
+        // A refresh resolves a value this launch has not seen, and an announcement is redacted
+        // against the notifier's set alone. Wired here, where both exist, so the set follows the
+        // credential instead of holding the one it replaced.
+        std::sync::Arc::new(match notify {
+            Some(wiring) => refresh.announcing_to(wiring.needles.clone()),
+            None => refresh,
+        })
     });
 
     // Through the lens helper rather than a second spelling of the same three calls: what lives
@@ -887,27 +923,11 @@ pub(crate) fn start(
     // announcement can ever be composed against an empty set. The notifier is stood up earlier than
     // this (the exec supervisor needs it first) and nothing is refused in between.
     //
-    // Added to rather than replacing what is there: one session's notifier also serves the
-    // per-invocation proxies its declared tasks stand up, and each of those resolves its own
-    // credentials. Replacing would let a task's set erase the session's — a credential that then
-    // reaches a notification body unredacted. The union is bounded by the number of *distinct*
-    // credentials declared, not by the number of invocations, because an identical needle is
-    // recognised and skipped.
-    if let Some(wiring) = notify
-        && let Ok(mut shared) = wiring.needles.write()
-    {
-        // Seeded from the state as first resolved. A later refresh is NOT propagated here: the
-        // notifier would then redact against a superseded value. Bounded in practice — a refusal
-        // notice quotes the request, and the value it would have to match is one the upstream has
-        // already rejected — but it is a residual, not a guarantee.
-        for needle in &credentials.snapshot().needles {
-            let known = shared
-                .iter()
-                .any(|n| n.name() == needle.name() && n.as_bytes() == needle.as_bytes());
-            if !known {
-                shared.push(needle.clone());
-            }
-        }
+    // The union rule, and why a set seeded here is not the whole story, are both in
+    // [`super::notify_sink::publish_needles`] — which a refresh calls too, so a value that replaces
+    // this one is announced against rather than past.
+    if let Some(wiring) = notify {
+        super::notify_sink::publish_needles(&wiring.needles, &credentials.snapshot().needles);
     }
 
     // The traffic capture (`[network] capture`), off unless a trusted layer asked for it. It holds
@@ -2472,6 +2492,59 @@ mod tests {
             plan.skipped[0].contains("sbx-myproject"),
             "{:?}",
             plan.skipped
+        );
+    }
+
+    /// Two spellings of one cage address and port produce one listener, and the plan says which
+    /// rule it dropped.
+    ///
+    /// `localhost` is already the cage's loopback and `127.0.0.1` is that address written out, so
+    /// both land on `127.0.0.1:5432`. Emitting both wrote two identical `TCP-LISTEN` clauses: the
+    /// second `bind` fails, socat's diagnostic goes to `/dev/null` with the detached preamble, and
+    /// the wait that should have caught it counts the surviving listener once per pattern. Nothing
+    /// opened that should not — the destination just stopped working, quietly.
+    #[test]
+    fn one_cage_address_and_port_gets_one_listener_however_it_was_spelled() {
+        let plan = tcp_destinations(&tcp_policy(&[
+            "tcp://localhost:5432",
+            "tcp://127.0.0.1:5432",
+            "tcp://127.0.0.1:5433",
+        ]));
+        let script = wrap_command(
+            Path::new("/nix/store/abc-socat/bin/socat"),
+            Path::new("/nix/store/def-bash/bin/bash"),
+            vec![OsString::from("psql")],
+            &plan.destinations,
+        )[2]
+        .to_string_lossy()
+        .into_owned();
+
+        assert_eq!(
+            script.matches("TCP-LISTEN:5432,bind=127.0.0.1").count(),
+            1,
+            "the clash must leave one listener, not two that fight over the address: {script}"
+        );
+        assert!(
+            plan.skipped.iter().any(|s| s.contains("5432")),
+            "and the rule that lost must be named, not dropped in silence: {:?}",
+            plan.skipped
+        );
+        // The port that clashes is the only thing dropped: a second port on the same address is a
+        // second listener, and keeps its own.
+        assert!(
+            script.contains("TCP-LISTEN:5433,bind=127.0.0.1"),
+            "an unclashing port on the same address still gets its listener: {script}"
+        );
+        // The wait is derived from the same destinations, so it must not ask for the same address
+        // twice either — a duplicated pattern is a wait one listener can satisfy alone.
+        let patterns = listener_patterns(&plan.destinations);
+        let mut unique = patterns.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            patterns.len(),
+            unique.len(),
+            "each awaited listener must be a distinct address: {patterns:?}"
         );
     }
 

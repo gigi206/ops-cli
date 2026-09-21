@@ -508,8 +508,10 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
                 let p = t
                     .strip_prefix(':')
                     .ok_or_else(|| format!("URL `{url}` has unexpected text after `]`"))?;
-                p.parse::<u16>()
-                    .map_err(|_| format!("URL `{url}` has an invalid port `{p}`"))?
+                // Through `parse_port`, which is what a *rule*'s port and a `tcp://` target both
+                // go through: port 0 is not a port, and answering that differently depending on
+                // whether the value names a rule or a request is three answers to one question.
+                parse_port(p).map_err(|_| format!("URL `{url}` has an invalid port `{p}`"))?
             }
         };
         (addr, port)
@@ -520,9 +522,9 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
         };
         reject_catch_all(h, Slot::Target)?;
         let port = match port_spec {
-            Some(p) => p
-                .parse::<u16>()
-                .map_err(|_| format!("URL `{url}` has an invalid port `{p}`"))?,
+            Some(p) => {
+                parse_port(p).map_err(|_| format!("URL `{url}` has an invalid port `{p}`"))?
+            }
             None => default_port,
         };
         (h, port)
@@ -674,6 +676,20 @@ fn parse_path_rule(
             "entry `{s}` writes `;parameters` in a path rule — a rule matches the path segments \
              only, so this would open `{opened}` with any parameters at all. Use `re:` to \
              constrain them"
+        ));
+    }
+    // An encoded separator is the fourth spelling of the same mistake. `canonical_segments` decodes
+    // a path before it splits it, on the rule's side exactly as on the request's, so `host/a%2fb`
+    // matches `/a/b` while `sbx test net` prints it back as `a%2fb` — a rule that reads as one
+    // segment and matches two. Percent-encoding itself stays legal, because decoding is the
+    // contract: `/%73ecret` is `/secret` and an author may reasonably write either. It is the
+    // separator alone that changes the shape of what the rule matches.
+    if path.to_ascii_lowercase().contains("%2f") {
+        let opened = opened_path(path);
+        return Err(format!(
+            "entry `{s}` writes an encoded `/` in a path rule — the path is decoded before it is \
+             split, so this matches `{opened}` while reading as one segment. Write the separator \
+             literally"
         ));
     }
     let subtree = path.ends_with("/*");

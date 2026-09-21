@@ -597,6 +597,13 @@ impl CredentialSet {
 /// and a reader keeps a coherent set for the whole exchange even if a refresh lands mid-flight.
 pub(crate) struct Credentials {
     current: std::sync::RwLock<std::sync::Arc<CredentialSet>>,
+    /// How many times this launch's declared set has been replaced. Not a version of the values and
+    /// never derived from them: it is a counter, so nothing about a credential can be read back out
+    /// of it. It exists for the upstream pool, whose key is exact in *rules* — which injections a
+    /// request carries — and was therefore equal across a refresh: a connection parked while the old
+    /// value was in flight stayed on offer to a request carrying the new one. Counting the
+    /// replacements makes the key exact in generations too, without putting a secret in it.
+    generation: std::sync::atomic::AtomicU64,
     /// The launch's `[redact] min_len`. Held because [`Credentials::observe`] builds needles of its
     /// own after the launch resolved its declared ones, and a needle it adds must clear the same
     /// floor as those — see [`OBSERVE_MIN_LEN`].
@@ -626,6 +633,7 @@ impl Credentials {
             })),
             min_len,
             shared_credential,
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -648,6 +656,19 @@ impl Credentials {
     #[cfg(test)]
     pub(crate) fn min_len(&self) -> usize {
         self.min_len
+    }
+
+    /// Which generation of the declared set is in force. Read where a pool key is built, so two
+    /// requests separated by a refresh cannot be offered one another's parked connection.
+    ///
+    /// Read *after* the snapshot the rest of the key comes from, not with it. A refresh landing
+    /// between the two builds a key whose injection positions are the older set's and whose
+    /// generation is the newer one — a key nothing else will ever match, so the connection it parks
+    /// is simply never reused. That is the conservative direction, and it is the whole of what the
+    /// gap costs; carrying the generation inside [`CredentialSet`] would remove it, at the price of
+    /// a field every construction site would have to fill.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The set to use for one exchange. Take it once and keep it: re-reading mid-exchange could
@@ -673,6 +694,11 @@ impl Credentials {
         let Ok(mut current) = self.current.write() else {
             return;
         };
+        // Counted under the same lock that installs the set, so a pool key read after this cannot
+        // see the new values under the old generation. It only ever moves forward, and a reader that
+        // saw the previous number simply keeps its own parked connections to itself.
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // What the re-resolution produced is the whole of the *declared* state, and replaces it.
         // What it cannot speak for is what was **learned**: an app's own credential belongs to no
         // declaration, so a re-resolution has nothing to offer in its place and taking the answer
@@ -929,6 +955,10 @@ pub(crate) struct CredentialRefresh {
     refresher: Refresher,
     credentials: std::sync::Arc<Credentials>,
     state: std::sync::Mutex<RefreshState>,
+    /// The notifier's needle set, when this launch has one. A refresh produces a value the launch
+    /// never saw, and an announcement redacts against this set alone: without it the notifier would
+    /// mask the credential that has just been superseded and quote the one now in use.
+    needles: Option<crate::sandbox::notify_sink::Needles>,
 }
 
 #[derive(Default)]
@@ -943,7 +973,18 @@ impl CredentialRefresh {
             refresher,
             credentials,
             state: std::sync::Mutex::new(RefreshState::default()),
+            needles: None,
         }
+    }
+
+    /// Announce this launch's refreshes to `needles`, the set the notifier redacts against.
+    ///
+    /// Separate from [`Self::new`] because a refresh exists wherever credentials do, while a needle
+    /// set exists only where a launch stood a notifier up: the tests build the first without the
+    /// second, and so does any caller that resolves credentials for something other than a launch.
+    pub(crate) fn announcing_to(mut self, needles: crate::sandbox::notify_sink::Needles) -> Self {
+        self.needles = Some(needles);
+        self
     }
 
     /// Re-resolve after an upstream refusal, and report whether the credential state actually
@@ -990,6 +1031,13 @@ impl CredentialRefresh {
                 state.stopped = true;
             }
             return false;
+        }
+        // Published before the set is replaced, so there is no instant in which the value in use is
+        // one the notifier cannot mask. The old needle stays in the set: it can no longer appear in
+        // a request, and masking a value nothing sends costs nothing, where dropping it would leave
+        // an in-flight announcement holding the one it was composed against.
+        if let Some(shared) = &self.needles {
+            crate::sandbox::notify_sink::publish_needles(shared, &needles);
         }
         self.credentials.replace(CredentialSet {
             injections,
@@ -1186,6 +1234,100 @@ mod tests {
             "authorization".to_string(),
             value.to_string(),
         )
+    }
+
+    /// A re-resolution moves the pool key, so a connection parked under the old credential is never
+    /// offered to a request carrying the new one.
+    ///
+    /// The key is exact in *rules* — which injections a request carries, by position — and no value
+    /// ever enters it, deliberately. Across a refresh the positions are identical, so the two sides
+    /// of a re-resolution shared parked connections: what the upstream may associate with the
+    /// earlier exchange was handed to the later one. Counting the replacements distinguishes them
+    /// without putting a secret in a key.
+    #[test]
+    fn a_re_resolution_moves_what_a_parked_connection_may_be_offered_to() {
+        let creds = Arc::new(default_creds(
+            vec![injection("Bearer old")],
+            vec![SecretNeedle::named("tok", b"old".to_vec())],
+        ));
+        assert_eq!(creds.generation(), 0, "a launch starts at its first set");
+
+        let before = creds.generation();
+        creds.replace(CredentialSet {
+            injections: vec![injection("Bearer new")],
+            needles: vec![SecretNeedle::named("tok", b"new".to_vec())],
+        });
+        let after = creds.generation();
+        assert_ne!(
+            before, after,
+            "the key must move, or the two sides of a refresh share parked connections"
+        );
+
+        // It counts replacements, not reads: asking twice is the same generation.
+        assert_eq!(creds.generation(), after);
+    }
+
+    /// The value a refresh resolves reaches the notifier's needle set, and the one it replaced stays.
+    ///
+    /// An announcement is redacted against that set alone. Seeded once at launch and never added to,
+    /// it held the value the upstream had just rejected while the launch ran on a newer one, so a
+    /// refusal notice composed after a refresh masked the dead credential and could quote the live
+    /// one. The old needle is kept rather than swapped: it can no longer ride a request, and masking
+    /// a value nothing sends costs nothing, where dropping it would leave an announcement already in
+    /// flight holding the value it was composed against.
+    #[test]
+    fn a_refresh_publishes_its_new_value_to_the_notifier_that_redacts_with_it() {
+        let creds = Arc::new(default_creds(
+            vec![injection("Bearer old")],
+            vec![SecretNeedle::named("tok", b"old".to_vec())],
+        ));
+        let shared: crate::sandbox::notify_sink::Needles =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        crate::sandbox::notify_sink::publish_needles(&shared, &creds.snapshot().needles);
+
+        let refresh = CredentialRefresh::new(
+            creds.clone(),
+            Box::new(|_| {
+                Ok((
+                    vec![injection("Bearer new")],
+                    vec![SecretNeedle::named("tok", b"new".to_vec())],
+                ))
+            }),
+        )
+        .announcing_to(shared.clone());
+
+        assert!(refresh.on_refusal(), "a first refusal re-resolves");
+        let held = shared.read().expect("the needle set");
+        let values: Vec<&[u8]> = held.iter().map(SecretNeedle::as_bytes).collect();
+        assert!(
+            values.contains(&&b"new"[..]),
+            "the notifier must be able to mask the value now in use: {values:?}"
+        );
+        assert!(
+            values.contains(&&b"old"[..]),
+            "and must not have lost the one an in-flight announcement was composed against"
+        );
+    }
+
+    /// A refresh with no notifier wired is a refresh, not a failure: credentials resolve for callers
+    /// that stand no notifier up, and the tests above are two of them.
+    #[test]
+    fn a_refresh_without_a_notifier_still_replaces_the_credential() {
+        let creds = Arc::new(default_creds(
+            vec![injection("Bearer old")],
+            vec![SecretNeedle::named("tok", b"old".to_vec())],
+        ));
+        let refresh = CredentialRefresh::new(
+            creds.clone(),
+            Box::new(|_| {
+                Ok((
+                    vec![injection("Bearer new")],
+                    vec![SecretNeedle::named("tok", b"new".to_vec())],
+                ))
+            }),
+        );
+        assert!(refresh.on_refusal());
+        assert_eq!(creds.snapshot().injections[0].value(), "Bearer new");
     }
 
     /// A refresh replaces both halves at once, and the value the proxy will inject next is the new
