@@ -988,6 +988,50 @@ fn read_payloads(reader: &mut impl io::BufRead) -> io::Result<Result<Payloads, &
     Ok(Ok((params, env)))
 }
 
+/// Answer a request that names a task this session does not declare, **before** any slot is taken.
+///
+/// Returns whether the request was refused here, in which case the caller is done with it.
+///
+/// The declaration check has to precede [`admit_quota`] rather than fall out of the engine's own
+/// refusal further down, because of what a slot is: the quota bounds the invocations a session will
+/// ever admit, and the cage is the party asking. A name nothing declares cost a slot all the same,
+/// so `RUN <anything>` in a loop spent the session's five hundred without ever running a command,
+/// and every later invocation — including one the operator made from the host — was answered "this
+/// session's task quota is exhausted" for the rest of the session.
+///
+/// Refusing here also keeps what the quota is the bound *on*. An admitted request draws an
+/// invocation id, and the ids are bounded by the quota rather than by anything of their own; paying
+/// the refusal back into the counter afterwards would have left the ids unbounded instead, which is
+/// a different thing to have to size against. Nothing is drawn here, so there is nothing to give
+/// back.
+///
+/// The answer on the wire names the task, because the caller asked about that one, and it is the
+/// engine's own [`super::task::TaskError::Unknown`] rather than a second spelling of the same
+/// sentence — what moved to this side of the admission is the refusal, not the wording. The line in
+/// the log does not repeat the name: the reason is fixed and reaches the ring through
+/// [`TaskLog::push_refusal_once`], so a caller inventing a fresh name each time leaves one entry
+/// rather than filling the ring and evicting the invocations a reader is looking for. That is the
+/// same split the quota's own refusal makes, for the same reason.
+fn refuse_undeclared(
+    writer: &mut UnixStream,
+    name: &str,
+    engine: &TaskEngine,
+    log: &TaskLog,
+) -> io::Result<bool> {
+    if engine.task(name).is_some() {
+        return Ok(false);
+    }
+    log.push_refusal_once(refusal(
+        0,
+        name,
+        "named a task this session does not declare (recorded once; the answer on the wire names \
+         each request)",
+    ));
+    let reason = super::task::TaskError::Unknown(name.into()).to_string();
+    writeln!(writer, "err {}", sanitize(&reason))?;
+    Ok(true)
+}
+
 /// Take a slot from the session's call quota and draw the invocation's id.
 ///
 /// The quota is decremented before anything runs, so a concurrent pair of callers cannot both slip
@@ -1055,6 +1099,9 @@ fn serve_run(
         Ok(payloads) => payloads,
         Err(reason) => return writeln!(writer, "err {reason}"),
     };
+    if refuse_undeclared(writer, name, engine, log)? {
+        return Ok(());
+    }
     let Some(id) = admit_quota(writer, name, log, quota)? else {
         return Ok(());
     };
@@ -1097,6 +1144,9 @@ fn serve_detach(
         Ok(payloads) => payloads,
         Err(reason) => return writeln!(writer, "err {reason}"),
     };
+    if refuse_undeclared(writer, name, engine, log)? {
+        return Ok(());
+    }
     let Some(id) = admit_quota(writer, name, log, quota)? else {
         return Ok(());
     };

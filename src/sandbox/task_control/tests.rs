@@ -2228,3 +2228,56 @@ fn a_task_record_reads_back_as_the_invocations_that_were_logged() {
     assert_eq!(back.events[1].cursor, 2);
     assert_eq!(back.events[1].refused.as_deref(), Some("not declared"));
 }
+
+/// A request naming a task nothing declares costs the session no invocation.
+///
+/// The cage is the party that types these names, and the quota is what the whole plane rests on:
+/// spend it and every later invocation is refused, the operator's own included. Charging a slot for
+/// a name the session does not declare turned `RUN <anything>` into a way to close the plane in
+/// five hundred keystrokes without ever running a command.
+///
+/// The log is asserted too, because the obvious repair trades one unbounded thing for another: a
+/// refusal recorded per request would let the same loop evict every real invocation from the ring a
+/// reader is looking at. Distinct names, one line.
+#[test]
+fn a_request_naming_no_declared_task_costs_neither_a_slot_nor_a_log_line_each() {
+    let engine = super::super::task::TaskEngine::inventory_only(vec![probe_task()]);
+    let log = TaskLog::new();
+    let quota = AtomicU64::new(DEFAULT_CALL_QUOTA);
+    let (mut server, _client) = UnixStream::pair().expect("socketpair");
+
+    for n in 0..8 {
+        // `run` alone: no parameters, which is what a probe would send.
+        let mut request = std::io::Cursor::new(b"run\n".to_vec());
+        serve_run(
+            &mut request,
+            &mut server,
+            &format!("no-such-task-{n}"),
+            &engine,
+            &log,
+            &quota,
+        )
+        .expect("the plane answers every request");
+    }
+
+    assert_eq!(
+        quota.load(Ordering::SeqCst),
+        DEFAULT_CALL_QUOTA,
+        "a name the session does not declare spent one of its invocations"
+    );
+    let (entries, _, _) = log.since(0);
+    assert_eq!(
+        entries.len(),
+        1,
+        "eight invented names left {} lines in a ring that holds what a reader came for",
+        entries.len()
+    );
+    assert!(
+        entries[0]
+            .refused
+            .as_deref()
+            .is_some_and(|r| r.contains("does not declare")),
+        "the one line must say what the class of refusal was: {:?}",
+        entries[0].refused
+    );
+}
