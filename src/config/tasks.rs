@@ -456,6 +456,11 @@ fn validate_task_exec(
                  may run and then names none of it, which is what having no section already means."
             ));
         };
+        #[expect(
+            clippy::expect_used,
+            reason = "`spawn_entries` answers `None` only for the `None` argument, and the \
+                      `let ... else` above returned for that case"
+        )]
         let entries = spawn_entries(Some(spawn))?.expect("a declared spawn is never absent");
         let whose = format!("`[exec.{program}]`'s `spawn`");
         let entries = validate_spawn_entries(name, &whose, entries)?;
@@ -572,9 +577,23 @@ fn validate_task_packages(raw: &[String]) -> Result<Vec<String>, String> {
 
 /// A task name is addressed on a command line and over the control socket, and it names a log line,
 /// so it takes the same narrow character set as a secret's logical name.
+///
+/// It carries one constraint a secret's name does not, and that difference is why the two are
+/// checked separately rather than merged: an output-declaring task's directory is this name joined
+/// onto the project's output tree, so the name is a **path component**. The shared character set
+/// admits `.` — a secret may reasonably be called `stripe.live` — and the two names made of dots
+/// alone would therefore address that tree itself and its parent, which an invocation empties
+/// before it writes. They are refused here, where the declaration is read, rather than at the join,
+/// because a name that cannot address a directory of its own is not one this table can carry.
 fn validate_task_name(name: &str) -> Result<(), String> {
     if name == "defaults" {
         return Err("`defaults` is the reserved settings table, not a task name".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!(
+            "`{name}` is not a task name — the name is also the directory an invocation writes its \
+             output into, and this one addresses that tree's parent rather than a place inside it"
+        ));
     }
     validate_secret_name(name).map(|_| ())
 }
@@ -1958,6 +1977,43 @@ mod tests {
         // With no `[secret.defaults] order`, a bare key has no resolver to expand through — the
         // failure names that rather than silently treating the key as a literal value.
         assert!(validate(terse).is_err());
+    }
+
+    /// The name is joined onto the project's output tree to make the directory an invocation empties
+    /// and writes into, so a name that is not a path component of its own would address a tree it
+    /// does not own. The dot forms are the two that do, and they are the ones the shared character
+    /// set lets through: `.` names the output tree itself — every other task's artifacts — and `..`
+    /// names the project tree that holds it, store included.
+    #[test]
+    fn a_task_cannot_be_named_after_a_directory_it_does_not_own() {
+        for name in [".", ".."] {
+            let e = validate_task(
+                name,
+                raw_task(),
+                &TaskOrigin::Project,
+                &TaskDefaults::default(),
+                &SecretDefaults::default(),
+                &PluginRegistry::default(),
+            )
+            .unwrap_err();
+            assert!(
+                e.contains("output into"),
+                "the refusal must name what the directory is: {e}"
+            );
+        }
+        // And a dot inside a name is still a name: the character set admits it, and nothing about
+        // `a.b` addresses anywhere but a directory of its own.
+        assert!(
+            validate_task(
+                "db.migrate",
+                raw_task(),
+                &TaskOrigin::Project,
+                &TaskDefaults::default(),
+                &SecretDefaults::default(),
+                &PluginRegistry::default(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

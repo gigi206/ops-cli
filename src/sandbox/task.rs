@@ -1351,7 +1351,22 @@ impl TaskEngine {
     /// Emptying is what keeps a predictable path honest. The directory is one per task, so a caller
     /// knows where to look without being told — and would otherwise find the previous invocation's
     /// artifact sitting there, indistinguishable from the one it just asked for.
+    ///
+    /// The name is joined onto the output tree and the result is **emptied**, so a name that is not a
+    /// path component of its own would empty a tree it does not own: `..` reaches the project tree,
+    /// store included, and `.` reaches every other task's artifacts. `validate_task_name` refuses
+    /// both where a declaration is read, and this refuses them again here, because the two sit far
+    /// apart and only one of them destroys anything. A `TaskSpec` reaching this function is not
+    /// always one that came through the validator — the tests build them directly, and so would a
+    /// caller added later.
     fn claim_output(&self, task: &TaskSpec) -> Result<OutputClaim, String> {
+        if task.name == "." || task.name == ".." {
+            return Err(format!(
+                "`{}` cannot name an output directory — it addresses the tree that holds them \
+                 rather than a place inside it",
+                task.name
+            ));
+        }
         {
             let mut held = locked(&self.output_held);
             if !held.insert(task.name.clone()) {

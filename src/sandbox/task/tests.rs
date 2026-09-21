@@ -1326,6 +1326,52 @@ fn engine_with_project(root: &Path, tasks: Vec<TaskSpec>) -> TaskEngine {
     engine
 }
 
+/// The claim refuses a name that would empty a tree the task does not own.
+///
+/// `claim_output` joins the name onto the output tree and **empties** the result, so `..` reaches
+/// the project tree the store lives in and `.` reaches every other task's artifacts. The declaration
+/// side refuses both, and this is the second gate: a `TaskSpec` arriving here has not necessarily
+/// come through the validator, as this very test shows by building one directly.
+///
+/// The witness is what is still there afterwards. A refusal that came too late would leave the
+/// fixture emptied and the error returned all the same.
+#[test]
+fn an_output_claim_refuses_a_name_that_addresses_the_tree_holding_it() {
+    let root = crate::testutil::TmpDir::new();
+    let engine = engine_with_project(root.path(), vec![task()]);
+
+    let tree = engine.output_root().expect("the project tree");
+    std::fs::create_dir_all(tree.join("another-task")).expect("a neighbour's directory");
+    std::fs::write(tree.join("another-task/artifact"), b"kept").expect("its artifact");
+    let parent = tree
+        .parent()
+        .expect("the project tree's parent")
+        .to_path_buf();
+    std::fs::write(parent.join("witness"), b"kept").expect("something beside the output tree");
+
+    for name in [".", ".."] {
+        let mut task = task();
+        task.name = name.into();
+        task.output = true;
+        let e = engine
+            .claim_output(&task)
+            .expect_err("a name addressing the tree that holds the outputs");
+        assert!(
+            e.contains("cannot name an output directory"),
+            "the refusal says what the name addresses: {e}"
+        );
+    }
+
+    assert!(
+        tree.join("another-task/artifact").exists(),
+        "`.` must not have emptied the tree the other tasks write into"
+    );
+    assert!(
+        parent.join("witness").exists(),
+        "`..` must not have emptied the project tree"
+    );
+}
+
 /// A task declaring `output` gets exactly one writable mount, and it is the directory the claim
 /// created — the single path in an otherwise ephemeral cage whose contents outlive the run.
 #[test]
