@@ -1671,6 +1671,19 @@ impl TaskEngine {
     /// warning about the commonest command there is, on every invocation, would teach a reader to
     /// stop reading. What bounds it either way is that only an **allowed** program can be running,
     /// so the over-grant never reaches past the programs the declaration already admits.
+    ///
+    /// **The same class has a form this cannot warn about.** A multi-call binary is one file under
+    /// several names and it is that way before the declaration is read, so the check above sees it.
+    /// Two *scripts* become one program the moment their `#!` lines name the same interpreter — and
+    /// a script that lives in the project is writable by the session's own agent, which is also the
+    /// party that asks for the invocation. Declared with different interpreters and aligned
+    /// afterwards, they pass [`node`](Self::spawn_policy)'s refusal at read time and arrive as one
+    /// caller at run time: `proc_enforce`'s `caller_chain` addresses a process by
+    /// `/proc/<pid>/exe`, which is the interpreter the kernel loaded inside the `execve` that named
+    /// the script, and the script's own name is not in it. The bound is the one stated above and
+    /// nothing more — what is reachable stays inside the programs the declaration admits — and
+    /// closing it would mean addressing a caller by the `execve` it came from rather than by what
+    /// it is, which is a different contract between the shim and the supervisor than this one.
     fn warn_if_multicall(&self, program: &str, incage: &str, task: &TaskSpec) {
         let canonical = self.canonical_incage(incage, task);
         let real = Path::new(&canonical).file_name().unwrap_or_default();
@@ -1809,6 +1822,9 @@ impl TaskEngine {
         // every coreutils name mean all of them, so the two sides are deliberately not symmetrical.
         let mut node = |program: &str, incage: &str, entries: Vec<String>| -> Result<(), String> {
             let key = self.canonical_incage(incage, task);
+            // Read time, which is the only time this can be asked: two declared scripts whose
+            // `#!` lines are made to agree *after* this point arrive as one caller anyway, and
+            // [`Self::warn_if_multicall`] names why nothing downstream can tell them apart.
             if callers.contains_key(&key) {
                 return Err(format!(
                     "`{program}` cannot have a node of its own: it is the same executable as \
