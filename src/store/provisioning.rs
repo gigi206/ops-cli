@@ -528,23 +528,25 @@ fn reuse_built_expr(
     Some(logical)
 }
 
-/// Write the expression stamp atomically (temp + rename): the digest, then the logical out-link
-/// target it describes, one per line. Best-effort: a write failure just makes the next launch
-/// rebuild instead of short-circuiting — slower, never incorrect. A target that is not UTF-8 writes
-/// no stamp at all, for the same reason and with the same consequence; a store path is ASCII, so
-/// this is a shape that does not arise rather than a case being handled.
+/// Write the expression stamp: the digest, then the logical out-link target it describes, one per
+/// line. Best-effort: a write failure just makes the next launch rebuild instead of
+/// short-circuiting — slower, never incorrect. A target that is not UTF-8 writes no stamp at all,
+/// for the same reason and with the same consequence; a store path is ASCII, so this is a shape
+/// that does not arise rather than a case being handled.
+///
+/// Through [`crate::sandbox::atomicfile::write_atomic`] rather than a temp-and-rename written out
+/// here, which is what this was, and for the reasons that one states: its temp name carries a
+/// sequence number as well as the pid, so two stamps written in one process cannot collide on it —
+/// a roll walks every declared package — it opens `create_new` with `O_NOFOLLOW`, and it syncs the
+/// bytes and the directory entry before returning. What that last one buys is narrow but real: a
+/// stamp is read back to *skip* a build, so a present, right-sized file of zeros after a power cut
+/// is the one content it must never come back holding.
 fn write_expr_stamp(stamp: &Path, digest: &str, target: &Path) {
     let Some(target) = target.to_str() else {
         return;
     };
-    let mut tmp = stamp.as_os_str().to_owned();
-    tmp.push(format!(".tmp.{}", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    if std::fs::write(&tmp, format!("{digest}\n{target}\n")).is_ok() {
-        let _ = std::fs::rename(&tmp, stamp);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ =
+        crate::sandbox::atomicfile::write_atomic(stamp, format!("{digest}\n{target}\n").as_bytes());
 }
 
 /// Pick, among the logical store paths a build printed (`--print-out-paths` may list several —

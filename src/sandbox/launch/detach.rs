@@ -233,8 +233,19 @@ fn detach_parent(
     } else {
         // The daemon closed the pipe without signalling success: it failed before launch (the
         // error is already on this terminal). Reap it.
-        // SAFETY: `waitpid` on our own child.
-        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        //
+        // Retried on `EINTR`, in the form `pty::supervise` uses: a signal arriving while this waits
+        // — a `SIGWINCH` from a resized terminal is enough — returns without reaping, and the
+        // daemon then stays a zombie for as long as this shell lives. The child has already exited,
+        // so the loop turns at most once more.
+        loop {
+            // SAFETY: `waitpid` on our own child, which nothing else in this process reaps.
+            let r = unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+            if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
         crate::diag::error("sbx: the detached session failed to start (see the error above).");
         ExitCode::FAILURE
     }
