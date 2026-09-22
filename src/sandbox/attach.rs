@@ -482,12 +482,21 @@ unsafe fn confine_and_exec(
     // the NUL-terminated arrays the caller keeps alive across the call, and `filters` holds the
     // filter programs installed below.
     unsafe {
+        // Preparing the terminal is the first of this fork's setup steps, and it ends the attach
+        // the way the ones below it do: `125`, never `126` or `127`. Those two are the shell
+        // convention for what the *cage* answers about the program it was asked to run ("found but
+        // not executable", "not found"), and the `execve` at the end of this function gives the
+        // second of them its real meaning. A terminal that could not be taken is not an answer
+        // about the program — nothing ran — and reporting it as `127` said the cage had looked for
+        // the command and not found it, which is the one reading that sends a caller after the
+        // wrong thing. `125` is what the launch path spells `CAGE_NEVER_STARTED` and what `sbx task
+        // run` already documents for a refusal that ran nothing.
         match tty {
             // setsid + make the pty slave our controlling terminal + dup it onto stdio — the
             // same `login_tty` the an interactive `sbx run` supervisor uses, so job control works inside.
             TtyMode::Pty(slave) => {
                 if libc::login_tty(slave) != 0 {
-                    libc::_exit(127);
+                    libc::_exit(125);
                 }
             }
             // A non-interactive command: keep sbx's own stdin/stdout/stderr so bytes pass through
@@ -504,10 +513,12 @@ unsafe fn confine_and_exec(
             // Every other launch path leaves the session for this reason (`argv.rs` emits
             // `--new-session`), and its one documented exception is the private pty above, where
             // `login_tty` does the `setsid` itself. Fatal on failure, like the confinement steps
-            // below: entering without leaving the session is entering unconfined in this respect.
+            // below — and with their exit code, which is what "like" had always claimed and not
+            // what this reported: entering without leaving the session is entering unconfined in
+            // this respect.
             TtyMode::Inherit => {
                 if libc::setsid() < 0 {
-                    libc::_exit(126);
+                    libc::_exit(125);
                 }
             }
         }
