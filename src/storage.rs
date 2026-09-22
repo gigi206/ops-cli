@@ -814,6 +814,19 @@ pub(crate) struct Census {
     pub(crate) special: u64,
 }
 
+/// Whether a directory entry is one of the names a walk is told to leave alone.
+///
+/// Compared as bytes, not through `to_string_lossy`. A name that is not valid UTF-8 comes back from
+/// that conversion with every undecodable byte replaced by the same character, so two names that
+/// are different files arrive under one string — the comparison then answers about a name neither
+/// entry has. Nothing in today's `skip` lists can be reached that way (they are ASCII, and no
+/// replacement sequence spells an ASCII name), which is exactly why the form is worth fixing while
+/// it costs nothing: the next list added here would not come with that guarantee, and the failure
+/// would be a tree quietly copied or counted with an entry missing.
+fn skips(skip: &[&str], name: &std::ffi::OsStr) -> bool {
+    skip.iter().any(|s| std::ffi::OsStr::new(s) == name)
+}
+
 /// Walk a tree and tally it. Entries named in `skip` are ignored at the top level only.
 pub(crate) fn census(root: &Path, skip: &[&str]) -> io::Result<Census> {
     use std::os::unix::fs::MetadataExt;
@@ -824,7 +837,7 @@ pub(crate) fn census(root: &Path, skip: &[&str]) -> io::Result<Census> {
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
-            if first && skip.contains(&entry.file_name().to_string_lossy().as_ref()) {
+            if first && skips(skip, &entry.file_name()) {
                 continue;
             }
             let path = entry.path();
@@ -868,7 +881,7 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
     let mut linked: std::collections::HashMap<(u64, u64), PathBuf> =
         std::collections::HashMap::new();
     // (destination, mode) for each directory, applied after everything is written.
-    let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+    let mut dir_modes: Vec<(PathBuf, u32, Times)> = Vec::new();
 
     // The root of the copy is created owner-only. Every directory below it is created here too
     // and then tightened to the mode its source carried (`dir_modes`, applied on the way out), so
@@ -884,7 +897,7 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
         for entry in std::fs::read_dir(&from)? {
             let entry = entry?;
             let name = entry.file_name();
-            if top && skip.contains(&name.to_string_lossy().as_ref()) {
+            if top && skips(skip, &name) {
                 continue;
             }
             let s = entry.path();
@@ -894,12 +907,15 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
             if meta.is_symlink() {
                 let target = std::fs::read_link(&s)?;
                 std::os::unix::fs::symlink(target, &d)?;
+                // On the link itself: `set_mtime` passes `AT_SYMLINK_NOFOLLOW`, so this dates the
+                // link rather than whatever it points at — which may be outside the tree entirely.
+                set_mtime(&d, Times::of(&meta))?;
                 c.symlinks += 1;
             } else if meta.is_dir() {
                 // Writable for now: its contents still have to be written into it.
                 std::fs::create_dir_all(&d)?;
                 std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
-                dir_modes.push((d.clone(), meta.mode() & 0o7777));
+                dir_modes.push((d.clone(), meta.mode() & 0o7777, Times::of(&meta)));
                 c.dirs += 1;
                 stack.push((s, d, false));
             } else if !meta.is_file() {
@@ -917,7 +933,7 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
                     linked.insert(key, d.clone());
                 }
                 std::fs::copy(&s, &d)?;
-                set_mtime(&d, &meta)?;
+                set_mtime(&d, Times::of(&meta))?;
                 c.files += 1;
                 c.inodes += 1;
                 c.bytes += meta.len();
@@ -925,29 +941,62 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Cen
         }
     }
 
-    // Deepest first, so tightening a parent never blocks writing into a child.
-    dir_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-    for (path, mode) in dir_modes {
+    // Deepest first, so tightening a parent never blocks writing into a child — and so a
+    // directory's date is posed after everything written into it, each write having rewritten it.
+    // The mode goes on before the date for the same ordering reason it always did; `chmod` moves a
+    // directory's ctime, never its mtime, so it cannot undo what was just posed.
+    dir_modes.sort_by_key(|(path, ..)| std::cmp::Reverse(path.components().count()));
+    for (path, mode, times) in dir_modes {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        set_mtime(&path, times)?;
     }
     Ok(c)
 }
 
-/// Carry a file's modification time across, so a copied tree is indistinguishable from the
+/// The two timestamps [`set_mtime`] carries across, held for an entry whose own date can only be
+/// applied after something else has been written into it.
+///
+/// Four integers rather than the `Metadata` they come from: a store's tree has a directory for
+/// every few files, the list below holds one entry per directory for the whole walk, and a `stat`
+/// buffer each would be paid for a tree measured in hundreds of thousands of entries.
+#[derive(Clone, Copy)]
+struct Times {
+    atime: i64,
+    atime_nsec: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl Times {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            atime: meta.atime(),
+            atime_nsec: meta.atime_nsec(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+}
+
+/// Carry an entry's modification time across, so a copied tree is indistinguishable from the
 /// original to anything that looks at timestamps.
-fn set_mtime(path: &Path, meta: &std::fs::Metadata) -> io::Result<()> {
+///
+/// Applied to files as they are copied, and to directories and symlinks on the way back out — a
+/// directory's own mtime is rewritten by every entry created inside it, so posing it before its
+/// contents are written would pose the wrong time and then lose it.
+fn set_mtime(path: &Path, times: Times) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("path contains an interior NUL"))?;
     let times = [
         libc::timespec {
-            tv_sec: meta.atime(),
-            tv_nsec: meta.atime_nsec(),
+            tv_sec: times.atime,
+            tv_nsec: times.atime_nsec,
         },
         libc::timespec {
-            tv_sec: meta.mtime(),
-            tv_nsec: meta.mtime_nsec(),
+            tv_sec: times.mtime,
+            tv_nsec: times.mtime_nsec,
         },
     ];
     // SAFETY: a valid NUL-terminated path and a two-element timespec array, exactly what
@@ -2398,6 +2447,47 @@ this line has no separator at all
             std::fs::Permissions::from_mode(0o555),
         )
         .unwrap();
+    }
+
+    /// Every entry keeps its own modification time, directories and symlinks included.
+    ///
+    /// What the doc above promises is that a copied tree is indistinguishable from the original to
+    /// anything that looks at timestamps, and only files were carrying theirs: a directory's date
+    /// is rewritten by every entry created inside it, so a copy left each one at the moment it was
+    /// written rather than at the moment the original was. A store normalises its dates, which is
+    /// what makes the difference visible there rather than merely present.
+    #[test]
+    fn a_copied_tree_keeps_the_dates_of_its_directories_and_links() {
+        use std::os::unix::fs::MetadataExt;
+        let base = crate::testutil::TmpDir::new();
+        let src = base.path().join("src");
+        let dst = base.path().join("dst");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("dir/file"), b"x").unwrap();
+        std::os::unix::fs::symlink("file", src.join("dir/link")).unwrap();
+
+        // A date no copy could produce by accident: the store's own normalised mtime, one second
+        // after the epoch, posed deepest-first so writing a child does not rewrite what was posed.
+        let epoch_plus_one = Times {
+            atime: 1,
+            atime_nsec: 0,
+            mtime: 1,
+            mtime_nsec: 0,
+        };
+        for entry in ["dir/link", "dir/file", "dir"] {
+            set_mtime(&src.join(entry), epoch_plus_one).unwrap();
+        }
+
+        copy_tree(&src, &dst, &[]).unwrap();
+
+        for entry in ["dir", "dir/file", "dir/link"] {
+            let meta = std::fs::symlink_metadata(dst.join(entry)).unwrap();
+            assert_eq!(
+                meta.mtime(),
+                1,
+                "`{entry}` was copied with the date of the copy, not its own"
+            );
+        }
     }
 
     #[test]
