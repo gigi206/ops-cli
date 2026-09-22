@@ -798,6 +798,13 @@ impl TaskEngine {
         let _proxy = if task.network.is_empty() {
             None
         } else {
+            // Built from the task's own list and left at `EgressPolicy::new`'s default, which is
+            // `Deny`: a task's egress is what its declaration allows and nothing else. That this
+            // plane never *asks* is what makes its control socket's name harmless. The name carries
+            // the invocation (`control-<pid>.t<n>.sock`) while every reader globs for a bare pid, so
+            // `sbx net pending` neither lists this plane nor could answer it — and a parked request
+            // here would wait on an operator who cannot see it, under the indefinite default. A
+            // later change that let a task ask has to give these requests a route out first.
             let policy = crate::allowlist::EgressPolicy::new(task.network.clone(), Vec::new());
             let policy_for_cage = policy.clone();
             let (guard, wiring) = super::egress::start(
