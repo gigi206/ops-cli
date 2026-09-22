@@ -1519,8 +1519,9 @@ fn dispatch(
                 // parked with no id to answer it by. `path` is last, so its value is everything past
                 // the first `=` and a query string's own `=` round-trips.
                 out.push_str(&format!(
-                    "pending seq={} port={} waiting={} host={} path={}\n",
+                    "pending seq={} inc={} port={} waiting={} host={} path={}\n",
                     row.seq,
+                    incarnation_field(),
                     row.port,
                     row.waiting_secs,
                     head_field(&row.host),
@@ -1541,7 +1542,29 @@ fn dispatch(
             let Some(target) = parts.next() else {
                 return "err bad-request\n".to_string();
             };
-            let remember = parts.next() == Some("session");
+            // What follows the target is a set of tokens rather than a position: `session` has been
+            // one from the start, `inc=` was added beside it, and an unknown one is ignored so a
+            // client newer than this server is answered rather than refused.
+            let mut remember = false;
+            let mut claimed: Option<&str> = None;
+            for token in parts {
+                match token {
+                    "session" => remember = true,
+                    _ => {
+                        if let Some(ticks) = token.strip_prefix("inc=") {
+                            claimed = Some(ticks);
+                        }
+                    }
+                }
+            }
+            if let Some(claimed) = claimed
+                && !is_our_incarnation(claimed)
+            {
+                // The id was minted by another incarnation of this pid — this session inherited the
+                // number from a predecessor, and the request the operator means is gone with it.
+                // Answered as a request this session does not have, which is exactly what it is.
+                return "err not-found\n".to_string();
+            }
             if target == "*" {
                 // Drain framing mirrors `LIST`: one `answered host=…` line per request, then `ok`.
                 // An empty queue is a clean `ok` (nothing to answer is not an error).
@@ -1830,6 +1853,39 @@ fn format_sighting_line(seq: u64, seen: &SecretSighting) -> String {
 /// capture is not carried: it lives in its own store and stays there.
 fn format_amend_line(seq: u64, status: u16) -> String {
     format!("{}seq={seq} status={status}\n", super::lens::RECORD_AMEND)
+}
+
+/// This process's incarnation — its start-time ticks — read once.
+///
+/// The same number [`crate::session::current_start_ticks`] gives the persisted stats file, and for
+/// the same reason: a pid is not an identity. A process cannot change its own start time, so this
+/// is read once and kept; a host whose `/proc` does not answer leaves it `None`, and the two
+/// functions below then behave as this plane did before the field existed.
+pub(in crate::sandbox) fn incarnation() -> Option<u64> {
+    static TICKS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TICKS.get_or_init(crate::session::current_start_ticks)
+}
+
+/// The incarnation as it goes on the wire: the ticks, or `-` when this host does not offer them.
+///
+/// A dash rather than an omitted token, so every `pending` line has the same shape; the reader
+/// parses it as a number and simply finds none, which is the same answer it gets from a session
+/// too old to send the field at all.
+fn incarnation_field() -> String {
+    incarnation().map_or_else(|| "-".to_string(), |ticks| ticks.to_string())
+}
+
+/// Whether `claimed` names this incarnation.
+///
+/// A host that cannot read its own start time answers `true` to anything: refusing every tagged id
+/// there would make the plane unanswerable on a host where nothing is wrong except that `/proc`
+/// is not readable. That leaves such a host exactly where it was before the tag existed, which is
+/// the fallback this whole field is a strict improvement on.
+fn is_our_incarnation(claimed: &str) -> bool {
+    match incarnation() {
+        Some(ticks) => claimed.parse::<u64>() == Ok(ticks),
+        None => true,
+    }
 }
 
 /// Make `value` safe to occupy one whitespace-split `key=value` token of a control-wire line.
@@ -2670,7 +2726,7 @@ mod tests {
         let seq = wait_for_one(&pending);
 
         // Answer it ALLOW with `--session` (remember) over the real socket.
-        match answer_request(data.path(), pid, seq, Verdict::Allow, true).unwrap() {
+        match answer_request(data.path(), pid, seq, incarnation(), Verdict::Allow, true).unwrap() {
             AnswerOutcome::Answered { host, count } => {
                 assert_eq!(host, "api.test");
                 assert_eq!(count, 1);
@@ -2686,10 +2742,93 @@ mod tests {
         assert_eq!(rules[0].rule, "https://api.test:8080");
 
         // The consumed seq is now gone — a second answer is NotFound (not a phantom success).
-        match answer_request(data.path(), pid, seq, Verdict::Allow, false).unwrap() {
+        match answer_request(data.path(), pid, seq, incarnation(), Verdict::Allow, false).unwrap() {
             AnswerOutcome::NotFound => {}
             AnswerOutcome::Answered { .. } => panic!("an already-answered seq must be NotFound"),
         }
+    }
+
+    /// An id from another incarnation of this pid is refused over the real socket, and what it
+    /// named stays parked.
+    ///
+    /// The whole chain rather than the dispatch alone: the tag is put on by [`format_id`], read
+    /// back by [`parse_id`], carried by [`answer_request`] and decided by the server. A link that
+    /// dropped it — an `Option` flattened on the way through — would leave every other test here
+    /// green, because each of them passes the tag this session actually has.
+    #[test]
+    fn an_id_from_another_incarnation_does_not_answer_this_session() {
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        // A stand-in session pid, as in the round-trip test above: the socket path is keyed by it,
+        // and what this test is about is the tag the id carries beside it.
+        let pid = 12345u32;
+        let socket = control_socket(data.path(), pid);
+
+        let pending = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let flows = Arc::new(FlowRegistry::new());
+        let listener = UnixListener::bind(&socket).unwrap();
+        {
+            let pending = pending.clone();
+            let manual = manual.clone();
+            let log = log.clone();
+            let flows = flows.clone();
+            thread::spawn(move || {
+                let _ = serve(
+                    listener,
+                    Planes {
+                        state: pending,
+                        manual,
+                        log,
+                        flows,
+                        capture: None,
+                        stats: None,
+                    },
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
+            });
+        }
+
+        let p = pending.clone();
+        let parked = thread::spawn(move || p.park("api.test", 443, "/x", None, 256, |_| {}));
+        let seq = wait_for_one(&pending);
+
+        // The id as an operator would hold it, from a session that no longer exists.
+        let ours = incarnation().expect("this host reports its own start time");
+        let stale = format_id(pid, seq, Some(ours.wrapping_add(1)));
+        let (parsed_pid, parsed_seq, parsed_inc) = parse_id(&stale).expect("a tagged id parses");
+        assert_eq!((parsed_pid, parsed_seq), (pid, seq));
+
+        match answer_request(
+            data.path(),
+            parsed_pid,
+            parsed_seq,
+            parsed_inc,
+            Verdict::Allow,
+            false,
+        )
+        .unwrap()
+        {
+            AnswerOutcome::NotFound => {}
+            AnswerOutcome::Answered { .. } => {
+                panic!("an id minted by another incarnation must not answer this queue")
+            }
+        }
+        assert_eq!(
+            pending.list().len(),
+            1,
+            "the request it named is still parked"
+        );
+
+        // And this session's own id still answers it, so the guard refuses the stale tag rather
+        // than the socket.
+        match answer_request(data.path(), pid, seq, incarnation(), Verdict::Allow, false).unwrap() {
+            AnswerOutcome::Answered { host, .. } => assert_eq!(host, "api.test"),
+            AnswerOutcome::NotFound => panic!("the live id must still be answered"),
+        }
+        assert_eq!(parked.join().unwrap(), Verdict::Allow);
     }
 
     #[test]
@@ -2717,11 +2856,69 @@ mod tests {
 
     #[test]
     fn parse_id_and_format_id_round_trip() {
-        assert_eq!(format_id(12345, 7), "12345.7");
-        assert_eq!(parse_id("12345.7"), Some((12345, 7)));
+        assert_eq!(format_id(12345, 7, None), "12345.7");
+        assert_eq!(parse_id("12345.7"), Some((12345, 7, None)));
         assert_eq!(parse_id("nope"), None);
         assert_eq!(parse_id("12345"), None);
         assert_eq!(parse_id("12345.x"), None);
+
+        // Tagged with the incarnation its session minted it in, and back.
+        assert_eq!(format_id(12345, 7, Some(9_657_137)), "12345.7@9657137");
+        assert_eq!(
+            parse_id("12345.7@9657137"),
+            Some((12345, 7, Some(9_657_137)))
+        );
+        // A tag that is not a number is not a tag, and the id is refused rather than read as the
+        // untagged form — accepting it would hand the answer to whatever the pid is now.
+        assert_eq!(parse_id("12345.7@"), None);
+        assert_eq!(parse_id("12345.7@x"), None);
+    }
+
+    /// A verdict carrying another incarnation's tag is refused, and the request stays parked.
+    ///
+    /// The window this closes: the id routes on the pid alone (`control-<pid>.sock`) and the
+    /// sequence restarts at zero in every session, so a session given a dead one's pid was handed
+    /// its predecessor's ids and answered them against its own queue. What the operator meant is
+    /// gone with the session that parked it; `not-found` is what actually happened.
+    #[test]
+    fn a_verdict_tagged_for_another_incarnation_is_refused() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = Arc::new(LogRing::new(8));
+        let flows = Arc::new(FlowRegistry::new());
+        let s = state.clone();
+        let parked = thread::spawn(move || s.park("api.test", 443, "/x", None, 256, |_| {}));
+        let seq = wait_for_one(&state);
+
+        let ours = incarnation().expect("this host reports its own start time");
+        let theirs = ours.wrapping_add(1);
+        assert_eq!(
+            dispatch(
+                &format!("ALLOW {seq} inc={theirs}"),
+                &state,
+                &manual,
+                &log,
+                &flows,
+                None,
+                None
+            ),
+            "err not-found\n",
+            "a tag that is not this session's must not answer its queue"
+        );
+
+        // Untagged, as an older `sbx` sends it: answered, which is the behaviour this field is a
+        // strict addition to rather than a replacement of.
+        let reply = dispatch(
+            &format!("ALLOW {seq}"),
+            &state,
+            &manual,
+            &log,
+            &flows,
+            None,
+            None,
+        );
+        assert!(reply.starts_with("ok host=api.test"), "{reply}");
+        assert_eq!(parked.join().unwrap(), Verdict::Allow);
     }
 
     /// Block briefly until exactly one request is parked, returning its seq — so a test can answer a

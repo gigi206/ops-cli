@@ -779,7 +779,11 @@ fn decide_https(
                 ASK_PENDING_CAP,
                 |seq| {
                     if ctx.notices {
-                        let id = super::control::format_id(std::process::id(), seq);
+                        let id = super::control::format_id(
+                            std::process::id(),
+                            seq,
+                            super::control::incarnation(),
+                        );
                         print_egress_notice(
                             &format!("egress decision needed [{id}] {host}:{port}{path}"),
                             &[

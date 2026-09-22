@@ -50,7 +50,7 @@ for into rules:
 ```sh
 sbx app run claude --net-learn
 sbx net pending watch
-sbx net pending allow 12345.7 --save   # writes the rule into the project config
+sbx net pending allow 12345.7@9657137 --save   # writes the rule into the project config
 ```
 
 The learn workflow end to end: [Ask mode](../networking/ask).

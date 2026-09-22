@@ -18,18 +18,42 @@ pub(crate) fn control_socket(data_dir: &Path, pid: u32) -> PathBuf {
 /// One reachable session's pending requests, for `sbx net pending`.
 pub(crate) struct SessionPending {
     pub(crate) pid: u32,
+    /// Which incarnation of `pid` these ids belong to — its start-time ticks, as the session itself
+    /// reported them. `None` when the session's server predates the field, which is the only case
+    /// an id without a tag is minted for.
+    pub(crate) incarnation: Option<u64>,
     pub(crate) rows: Vec<PendingRow>,
 }
 
-/// Format a pending id the user types and the notice prints: `<pid>.<seq>`.
-pub(crate) fn format_id(pid: u32, seq: u64) -> String {
-    format!("{pid}.{seq}")
+/// Format a pending id the user types and the notice prints: `<pid>.<seq>`, with the session's
+/// incarnation appended as `@<ticks>` when it is known.
+///
+/// The tag is what keeps an answer from reaching a session it was not meant for. What routes an
+/// answer is the pid — the socket is `control-<pid>.sock` — and the sequence restarts from zero in
+/// every session, so a session that dies and a later one given the same pid mint the same early
+/// ids. Without the tag, an operator answering an id read before the first session ended would
+/// have that verdict applied by the second, to whichever request happened to carry that number.
+///
+/// Decimal rather than a shorter encoding: the tag is copied from the listing, never typed, so the
+/// three characters a base-36 or base-64 form would save buy nothing, while base 64's alphabet puts
+/// `/` in about one id in nine — in a tool whose every other argument is a path.
+pub(crate) fn format_id(pid: u32, seq: u64, incarnation: Option<u64>) -> String {
+    match incarnation {
+        Some(ticks) => format!("{pid}.{seq}@{ticks}"),
+        None => format!("{pid}.{seq}"),
+    }
 }
 
-/// Parse a `<pid>.<seq>` id back into its parts, or `None` if it is not that shape.
-pub(crate) fn parse_id(id: &str) -> Option<(u32, u64)> {
-    let (pid, seq) = id.split_once('.')?;
-    Some((pid.parse().ok()?, seq.parse().ok()?))
+/// Parse a `<pid>.<seq>` or `<pid>.<seq>@<ticks>` id back into its parts, or `None` if it is
+/// neither shape. The untagged form stays accepted: it is what an older session mints, and what an
+/// operator may still have in their scrollback.
+pub(crate) fn parse_id(id: &str) -> Option<(u32, u64, Option<u64>)> {
+    let (pid, rest) = id.split_once('.')?;
+    let (seq, incarnation) = match rest.split_once('@') {
+        Some((seq, ticks)) => (seq, Some(ticks.parse().ok()?)),
+        None => (rest, None),
+    };
+    Some((pid.parse().ok()?, seq.parse().ok()?, incarnation))
 }
 
 /// Discover every reachable ask-mode session's pending requests: glob the control sockets, parse
@@ -39,8 +63,12 @@ pub(crate) fn parse_id(id: &str) -> Option<(u32, u64)> {
 pub(crate) fn list_all(data_dir: &Path) -> Vec<SessionPending> {
     let mut sessions = Vec::new();
     for pid in session_pids(data_dir) {
-        if let Ok(rows) = query(&control_socket(data_dir, pid)) {
-            sessions.push(SessionPending { pid, rows });
+        if let Ok((rows, incarnation)) = query(&control_socket(data_dir, pid)) {
+            sessions.push(SessionPending {
+                pid,
+                incarnation,
+                rows,
+            });
         }
     }
     sessions
@@ -71,30 +99,42 @@ fn pid_from_socket(name: &str) -> Option<u32> {
         .ok()
 }
 
-/// Query one session's control socket for its pending rows (`LIST`).
-fn query(socket: &Path) -> io::Result<Vec<PendingRow>> {
+/// Query one session's control socket for its pending rows (`LIST`), and the incarnation it
+/// reports with them.
+///
+/// The incarnation rides the `pending` lines rather than the closing `ok`, so a client older than
+/// the field meets a key it does not know on a line it already parses key-by-key — and ignores it —
+/// instead of a terminator it no longer recognises. Every line of one answer carries the same
+/// value; the first one seen is the session's.
+fn query(socket: &Path) -> io::Result<(Vec<PendingRow>, Option<u64>)> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     (&stream).write_all(b"LIST\n")?;
     (&stream).flush()?;
     let mut rows = Vec::new();
+    let mut incarnation = None;
     for line in BufReader::new(&stream).lines() {
         let line = line?;
         if line == "ok" {
             break;
         }
-        if let Some(row) = parse_pending_line(&line) {
+        if let Some((row, ticks)) = parse_pending_line(&line) {
+            incarnation = incarnation.or(ticks);
             rows.push(row);
         }
     }
-    Ok(rows)
+    Ok((rows, incarnation))
 }
 
-/// Parse one `pending seq=… port=… waiting=… host=… path=…` line into a row, or `None` if it is
-/// not a well-formed pending line. Each token is split on its first `=`, so a `path` carrying a
-/// query string's `=` round-trips (it is the last field).
-fn parse_pending_line(line: &str) -> Option<PendingRow> {
+/// Parse one `pending seq=… inc=… port=… waiting=… host=… path=…` line into a row and the
+/// incarnation it names, or `None` if it is not a well-formed pending line. Each token is split on
+/// its first `=`, so a `path` carrying a query string's `=` round-trips (it is the last field).
+///
+/// `inc` is optional: a session whose server predates it sends none, and its ids are then minted
+/// untagged — the shape this function answered before the field existed.
+fn parse_pending_line(line: &str) -> Option<(PendingRow, Option<u64>)> {
+    let mut incarnation = None;
     let mut seq = None;
     let mut port = None;
     let mut waiting = None;
@@ -108,6 +148,7 @@ fn parse_pending_line(line: &str) -> Option<PendingRow> {
         let (key, value) = token.split_once('=')?;
         match key {
             "seq" => seq = value.parse().ok(),
+            "inc" => incarnation = value.parse().ok(),
             "port" => port = value.parse().ok(),
             "waiting" => waiting = value.parse().ok(),
             "host" => host = Some(value.to_string()),
@@ -115,13 +156,16 @@ fn parse_pending_line(line: &str) -> Option<PendingRow> {
             _ => {}
         }
     }
-    Some(PendingRow {
-        seq: seq?,
-        host: host?,
-        port: port?,
-        path: path?,
-        waiting_secs: waiting?,
-    })
+    Some((
+        PendingRow {
+            seq: seq?,
+            host: host?,
+            port: port?,
+            path: path?,
+            waiting_secs: waiting?,
+        },
+        incarnation,
+    ))
 }
 
 // The client half of the event log — the reader the `sbx net logs` command connects through.
@@ -546,10 +590,16 @@ fn parse_answer_reply(line: &str) -> AnswerOutcome {
 /// verdict. With `remember`, a trailing `session` token also records the decision as a live manual
 /// rule (so the same request is not re-asked this session). A missing socket / dead session surfaces
 /// as a connect error; a live session that has no such request returns [`AnswerOutcome::NotFound`].
+///
+/// `incarnation` is the tag the id carried, sent on as `inc=<ticks>`. The server answers nothing
+/// but [`AnswerOutcome::NotFound`] when it is not its own, which is what stops a verdict aimed at a
+/// dead session from being applied by a later one holding its pid — see [`format_id`]. An id
+/// without a tag sends none, and the session answers it as it always did.
 pub(crate) fn answer_request(
     data_dir: &Path,
     pid: u32,
     seq: u64,
+    incarnation: Option<u64>,
     verdict: Verdict,
     remember: bool,
 ) -> io::Result<AnswerOutcome> {
@@ -560,10 +610,14 @@ pub(crate) fn answer_request(
         Verdict::Allow => "ALLOW",
         Verdict::Deny => "DENY",
     };
+    // `inc` before `session`, because the server reads the verdict's target and then scans what
+    // follows for tokens it knows: a value that is not a token it knows is ignored, and both orders
+    // would work — this one keeps the line readable in a log.
+    let tag = incarnation.map_or_else(String::new, |ticks| format!(" inc={ticks}"));
     let cmd = if remember {
-        format!("{verb} {seq} session\n")
+        format!("{verb} {seq}{tag} session\n")
     } else {
-        format!("{verb} {seq}\n")
+        format!("{verb} {seq}{tag}\n")
     };
     (&stream).write_all(cmd.as_bytes())?;
     (&stream).flush()?;
@@ -820,10 +874,11 @@ mod tests {
 
     #[test]
     fn parse_pending_line_round_trips_a_query_path() {
-        let row = parse_pending_line(
-            "pending seq=3 port=443 waiting=12 host=api.example.com path=/v1?a=b&c=d",
+        let (row, incarnation) = parse_pending_line(
+            "pending seq=3 inc=9657137 port=443 waiting=12 host=api.example.com path=/v1?a=b&c=d",
         )
         .unwrap();
+        assert_eq!(incarnation, Some(9_657_137));
         assert_eq!(row.seq, 3);
         assert_eq!(row.port, 443);
         assert_eq!(row.waiting_secs, 12);

@@ -126,7 +126,7 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
                     .into_iter()
                     .map(move |g| {
                         serde_json::json!({
-                            "id": sandbox::control::format_id(s.pid, g.seq),
+                            "id": sandbox::control::format_id(s.pid, g.seq, s.incarnation),
                             "pid": s.pid,
                             "project": project,
                             "label": label,
@@ -337,7 +337,7 @@ fn render_pending(
         // Collapse identical destinations: a tool that retries one URL re-parks it many times, and
         // they are a single decision. `×N` is itself a signal — an agent hammering one endpoint.
         for group in group_pending(&session.rows) {
-            let id = sandbox::control::format_id(session.pid, group.seq);
+            let id = sandbox::control::format_id(session.pid, group.seq, session.incarnation);
             let times = if group.count > 1 {
                 format!("×{}, ", group.count)
             } else {
@@ -494,9 +494,10 @@ pub(super) fn net_pending_answer(
             return ExitCode::from(2);
         }
     };
-    let Some((pid, seq)) = sandbox::control::parse_id(id) else {
+    let Some((pid, seq, incarnation)) = sandbox::control::parse_id(id) else {
         diag::error(&format!(
-            "sbx: invalid pending id '{id}' (expected <pid>.<seq>, e.g. 12345.1)"
+            "sbx: invalid pending id '{id}' (expected <pid>.<seq> or <pid>.<seq>@<ticks>, \
+             e.g. 12345.1)"
         ));
         return ExitCode::from(2);
     };
@@ -534,8 +535,15 @@ pub(super) fn net_pending_answer(
     // gone from the queue the moment the answer lands, while the reply names only the host. A rule
     // saved without it means port 443 alone — see [`egress_rule_for`].
     let port = save.then(|| pending_port(&data_dir, pid, seq)).flatten();
+    // The id's own incarnation tag travels with the verdict: it is what keeps this answer from
+    // being applied by a later session that was given the same pid — see `control::format_id`.
     let (host, count) = match sandbox::control::answer_request(
-        &data_dir, pid, seq, verdict, session,
+        &data_dir,
+        pid,
+        seq,
+        incarnation,
+        verdict,
+        session,
     ) {
         Ok(sandbox::control::AnswerOutcome::Answered { host, count }) => (host, count),
         Ok(sandbox::control::AnswerOutcome::NotFound) => {
@@ -974,6 +982,7 @@ mod tests {
         let sessions = [
             SessionPending {
                 pid: 12345,
+                incarnation: Some(9_657_137),
                 rows: vec![
                     row(1, "api.example.com", "/v1/x", 12),
                     // A retry of the SAME destination: it must collapse onto the lowest-seq line as
@@ -983,6 +992,7 @@ mod tests {
             },
             SessionPending {
                 pid: 67890,
+                incarnation: None,
                 rows: vec![row(1, "files.example.org", "/dl", 3)],
             },
         ];
@@ -995,11 +1005,19 @@ mod tests {
 
         let out = render_pending(&sessions, &context, None, &p);
         // The collapsed destination: the lowest-seq id, the target, `×2`, and the largest wait.
+        // The id carries its session's incarnation, because that is the form an operator copies
+        // and the form the answer path refuses to apply to a later session holding that pid.
         assert!(
-            out.contains("12345.1")
+            out.contains("12345.1@9657137")
                 && out.contains("api.example.com:443/v1/x")
                 && out.contains("×2, waiting 12s"),
             "{out}"
+        );
+        // The other session reports no incarnation (an `sbx` predating the field), and its id is
+        // rendered untagged rather than with an empty tag — both shapes live in one listing.
+        assert!(
+            out.contains("67890.1 ") || out.contains("67890.1\n"),
+            "an untagged id keeps its old shape: {out}"
         );
         // The retry collapsed — its higher seq is not a line of its own.
         assert!(!out.contains("12345.4"), "{out}");
@@ -1036,10 +1054,12 @@ mod tests {
             // Reachable, registered, and empty: it answered the query with no rows.
             SessionPending {
                 pid: 4242,
+                incarnation: None,
                 rows: Vec::new(),
             },
             SessionPending {
                 pid: 4243,
+                incarnation: None,
                 rows: vec![PendingRow {
                     seq: 1,
                     host: "api.example.com".into(),

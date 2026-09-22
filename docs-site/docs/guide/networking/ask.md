@@ -38,16 +38,19 @@ blocks inside the cage while it waits for your live decision.
    ```
 
    This lists every request parked across every live `ask`-mode session, each with a
-   `<pid>.<seq>` id (the PID is the one [`sbx session ls`](../housekeeping/sessions)
-   shows). Identical retries of one URL collapse to a single `×N` line, so a tool
-   that retries does not flood the list. Add `--json` for scripts, `-a <app>` to
-   scope to one app's session(s).
+   `<pid>.<seq>@<ticks>` id (the PID is the one
+   [`sbx session ls`](../housekeeping/sessions) shows). The trailing tag names which
+   incarnation of that PID parked the request, so a verdict cannot be applied by a
+   later session the kernel happened to give the same number: copy the id as the
+   listing prints it. Identical retries of one URL collapse to a single `×N` line, so
+   a tool that retries does not flood the list. Add `--json` for scripts, `-a <app>`
+   to scope to one app's session(s).
 
 3. **Answer it:**
 
    ```bash
-   sbx net pending allow 12345.7     # let this destination proceed
-   sbx net pending deny  12345.7     # refuse it (the cage gets a 403)
+   sbx net pending allow 12345.7@9657137   # let this destination proceed
+   sbx net pending deny  12345.7@9657137   # refuse it (the cage gets a 403)
    ```
 
    The id addresses one live session's destination. Answering unblocks the parked
@@ -69,9 +72,9 @@ To watch parked requests appear as an agent triggers them, without re-running
 `sbx net pending`:
 
 ```bash
-sbx net pending watch              # redraw every 2 seconds
-sbx net pending watch -i 5         # every 5 seconds
-sbx net pending watch -a claude    # one app's sessions
+sbx net pending watch                            # redraw every 2 seconds
+sbx net pending watch -i 5                       # every 5 seconds
+sbx net pending watch -a claude                  # one app's sessions
 ```
 
 `watch` polls the same live control sockets and redraws the listing in place
@@ -94,10 +97,10 @@ retries). Two flags make an answer stick further:
 | `--save` | also **persists a rule** (an allow or deny) to config, so the host is pre-decided next launch | permanent |
 
 ```bash
-sbx net pending allow 12345.7 --session          # don't ask again this session
-sbx net pending allow 12345.7 --save             # write an allow rule (project config)
-sbx net pending allow 12345.7 --save -g          # write it to the global config
-sbx net pending deny  12345.7 --session          # remember as denied for the session
+sbx net pending allow 12345.7@9657137 --session  # don't ask again this session
+sbx net pending allow 12345.7@9657137 --save     # write an allow rule (project config)
+sbx net pending allow 12345.7@9657137 --save -g  # write it to the global config
+sbx net pending deny  12345.7@9657137 --session  # remember as denied for the session
 ```
 
 `--session` and `--save` combine. The unblock **sticks even if a save fails** (the
@@ -142,10 +145,10 @@ relaunching. It writes no file and dies with the session. See
 `--all` answers every parked request at once instead of one id:
 
 ```bash
-sbx net pending allow --all              # allow everything parked, every session
-sbx net pending deny  --all              # deny everything parked
-sbx net pending allow --all -a claude    # only one app's sessions
-sbx net pending allow --all --session    # …and remember each for its session
+sbx net pending allow --all                      # allow everything parked, every session
+sbx net pending deny  --all                      # deny everything parked
+sbx net pending allow --all -a claude            # only one app's sessions
+sbx net pending allow --all --session            # …and remember each for its session
 ```
 
 `--all` is a **point-in-time** bulk answer: a request that parks *after* the drain

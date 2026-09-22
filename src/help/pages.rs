@@ -2946,8 +2946,10 @@ pub(super) const PAGES: &[Page] = &[
             ("--json", "list the pending requests as JSON"),
         ],
         details: "Under `[network] mode = \"ask\"` a request no rule decides parks until answered. With no\n\
-            verb, lists what is parked across every live ask-mode session, each with a `<pid>.<seq>`\n\
-            id; identical retries of one URL collapse to a single `×N` line. `allow <id>`/`deny <id>`\n\
+            verb, lists what is parked across every live ask-mode session, each with a\n\
+            `<pid>.<seq>@<ticks>` id — the trailing tag names the session incarnation the id belongs\n\
+            to, so a verdict cannot be applied by a later session that was given the same pid;\n\
+            identical retries of one URL collapse to a single `×N` line. `allow <id>`/`deny <id>`\n\
             answer that whole destination (every identical retry at once); `allow|deny --all` drain\n\
             every parked request; `watch` redraws the listing live. `--app <name>` scopes the\n\
             listing or the `--all` drain to one app's session(s). No launch, no nix, no network.",
@@ -2978,10 +2980,7 @@ pub(super) const PAGES: &[Page] = &[
         synopsis: "sbx net pending allow <id> [-a <app>] [--session] [--save [-l|-g]] | sbx net pending allow --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "allow a parked egress request (optionally remembering or saving a rule)",
         options: &[
-            (
-                "<id>",
-                "the `<pid>.<seq>` id from `sbx net pending` or the launch notice",
-            ),
+            ("<id>", "the id from `sbx net pending` or the launch notice"),
             (
                 "--all",
                 "allow every parked request at once (every session, or with `-a <app>` only that app's)",
@@ -3025,10 +3024,7 @@ pub(super) const PAGES: &[Page] = &[
         synopsis: "sbx net pending deny <id> [-a <app>] [--session] [--save [-l|-g]] | sbx net pending deny --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "deny a parked egress request (optionally remembering or saving a rule)",
         options: &[
-            (
-                "<id>",
-                "the `<pid>.<seq>` id from `sbx net pending` or the launch notice",
-            ),
+            ("<id>", "the id from `sbx net pending` or the launch notice"),
             (
                 "--all",
                 "deny every parked request at once (every session, or with `-a <app>` only that app's)",
