@@ -514,6 +514,39 @@ pub(crate) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
         .collect()
 }
 
+/// The ownership calls, which [`ownership_noop_memfd`] answers with success and does not perform.
+/// `chown` and `lchown` exist only on x86; every architecture routes through `fchownat`.
+fn ownership_rules() -> Rules {
+    let mut m = Rules::new();
+    for nr in [libc::SYS_fchown, libc::SYS_fchownat] {
+        m.insert(nr, vec![]);
+    }
+    #[cfg(target_arch = "x86_64")]
+    for nr in [libc::SYS_chown, libc::SYS_lchown] {
+        m.insert(nr, vec![]);
+    }
+    m
+}
+
+/// A filter that makes every change of ownership succeed without taking place, for a cage mapped
+/// to uid 0 in a namespace of its own ([`super::spec::SandboxSpec::rooted_in_its_namespace`]).
+///
+/// Such a cage holds one id and nothing else, so a `chown` to any other owner or group is
+/// `EINVAL`: the id has no mapping. A distribution's package scripts make that call as a matter
+/// of course (Debian's `fontconfig-config` gives `/usr/local/share/fonts` to group `staff`), and
+/// the install then fails on a step whose outcome nothing keeps: the tree is unpacked and consumed
+/// by one host uid, and no owner an image records survives into it. Answering success is what
+/// containers-storage calls `ignore_chown_errors`, for the same single mapping. A `chown` to the
+/// one mapped id changes nothing either, so skipping every one loses nothing a successful call
+/// would have kept.
+///
+/// `ERRNO(0)` is the kernel's own form of that answer: the call returns 0 and is never executed.
+/// It is loaded beside the mandatory filters, never instead of them, and only there: a launch runs
+/// as the user's own uid, where a `chown` means what it says.
+pub(crate) fn ownership_noop_memfd() -> io::Result<File> {
+    write_to_memfd(&compile(ownership_rules(), SeccompAction::Errno(0)))
+}
+
 fn write_to_memfd(bytes: &[u8]) -> io::Result<File> {
     super::memfd::write(c"sbx-seccomp", bytes)
 }
@@ -903,6 +936,34 @@ mod tests {
         lifted.allow(Allow::Whole(libc::SYS_clone));
         lifted.allow(Allow::Whole(libc::SYS_ioctl));
         assert!(refused_families(&lifted).is_empty());
+    }
+
+    /// Every call that changes an owner is answered by the ownership filter, and nothing else is:
+    /// the filter says success without acting, so a call outside this family would be one a build
+    /// is told happened when it did not.
+    #[test]
+    fn the_ownership_filter_covers_the_chown_family_and_only_it() {
+        let rules = ownership_rules();
+        assert!(rules.contains_key(&libc::SYS_fchown));
+        assert!(rules.contains_key(&libc::SYS_fchownat));
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(rules.contains_key(&libc::SYS_chown));
+            assert!(rules.contains_key(&libc::SYS_lchown));
+        }
+        for nr in [
+            libc::SYS_setuid,
+            libc::SYS_setgid,
+            libc::SYS_setresuid,
+            libc::SYS_setresgid,
+            libc::SYS_setgroups,
+        ] {
+            assert!(
+                !rules.contains_key(&nr),
+                "a change of identity is not faked: a program that drops privileges checks it did"
+            );
+        }
+        assert!(ownership_noop_memfd().is_ok(), "the filter compiles");
     }
 
     #[test]

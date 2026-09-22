@@ -81,6 +81,15 @@ mapped, and the fetch fails with `seteuid 42 failed`. Telling apt not to drop is
 it is a line you write because you know your distribution: `sbx` neither knows it nor
 supplies it.
 
+A change of **owner** is the other thing that single id cannot express: a package script
+giving a directory to a group such as `staff` (Debian's `fontconfig-config` does) would get
+`Invalid argument`, since that group has no mapping. Inside a build, `sbx` answers every
+`chown` with success and performs none. Nothing is lost by it: the tree is unpacked and used
+by your one host uid, so no owner an image records survives into it anyway. A change of
+**identity** is not treated that way, and that is why the `apt` line above is still yours to
+write: a program that drops its privileges checks that it did, and telling it so falsely would
+be a lie about the one thing it is checking.
+
 The allowlist entries name the **scheme** for the reason [the recipe
 below](#adding-a-package-anyway) explains: Debian fetches over plain `http`, which the egress
 proxy refuses unless the entry says so.

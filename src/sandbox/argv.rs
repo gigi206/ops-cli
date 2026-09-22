@@ -62,7 +62,12 @@ pub(crate) const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
 /// vector.
 pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
     let mut argv = to_argv(spec);
-    let filters = crate::sandbox::seccomp::memfds(&spec.seccomp)?;
+    let mut filters = crate::sandbox::seccomp::memfds(&spec.seccomp)?;
+    // A cage rooted in its own namespace holds one id, so a change of ownership can only fail
+    // there; it is answered with success instead (`seccomp::ownership_noop_memfd`).
+    if spec.as_root {
+        filters.push(crate::sandbox::seccomp::ownership_noop_memfd()?);
+    }
     // The prefix names the filter descriptors and only those, so it is built before the
     // environment's descriptor joins them: the two kinds share a lifetime, not a meaning.
     let mut full = crate::sandbox::seccomp::argv_prefix(&filters);
@@ -1033,6 +1038,24 @@ mod tests {
                 "the argv names a filter descriptor nothing keeps alive: {argv:?}"
             );
         }
+    }
+
+    /// A cage rooted in its own namespace carries one filter more, the one that answers a change
+    /// of ownership with success; every other cage carries exactly the mandatory ones, since a
+    /// launch runs as the user's own uid, where a `chown` means what it says.
+    #[test]
+    fn only_a_cage_rooted_in_its_namespace_ignores_ownership() {
+        let count = |spec: &SandboxSpec| {
+            let (argv, _held) = compose(spec).expect("compose");
+            argv.iter().filter(|a| *a == "--add-seccomp-fd").count()
+        };
+        let launch = spec(vec![], vec![], NetPolicy::Shared);
+        let build = spec(vec![], vec![], NetPolicy::Shared).rooted_in_its_namespace();
+        assert_eq!(
+            count(&build),
+            count(&launch) + 1,
+            "the build carries the ownership filter on top of the mandatory ones"
+        );
     }
 
     /// Every bubblewrap argument list this crate assembles either comes from [`compose`], which
