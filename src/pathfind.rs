@@ -74,12 +74,21 @@ fn is_executable(p: &Path) -> bool {
 
 /// Whether the current process may execute `p` (`access(2)` with `X_OK`).
 fn access_x_ok(p: &Path) -> bool {
+    access_ok(p, libc::X_OK)
+}
+
+/// Whether the current process may use `p` as `mode` says (`access(2)`: `R_OK`, `W_OK`, `X_OK`).
+///
+/// The kernel's answer rather than a reading of the mode bits: it weighs this uid and its groups
+/// against owner, group and other together, applies ACLs, and refuses a write on a read-only mount,
+/// none of which a `mode & 0o222` test sees.
+pub(crate) fn access_ok(p: &Path, mode: libc::c_int) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
         return false;
     };
     // SAFETY: `c` is a valid NUL-terminated path; `access` only reads and returns a status.
-    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+    unsafe { libc::access(c.as_ptr(), mode) == 0 }
 }
 
 #[cfg(test)]

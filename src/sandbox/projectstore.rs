@@ -264,12 +264,14 @@ pub(crate) fn prepare(
     // shared base, and atomically so a crash or a concurrent seed never leaves a
     // partial at a real store-path name.
     let shared_paths = shared_store.join("nix").join("store");
+    let mut all_cloned = reflink_ok;
     for path in &closure {
         let Some(name) = path.file_name() else {
             continue;
         };
-        seed_path(&shared_paths, &project_paths, name, reflink_ok)?;
+        all_cloned &= seed_path(&shared_paths, &project_paths, name, reflink_ok)?;
     }
+    record_seed_mode(&store_dir, all_cloned)?;
 
     // Register exactly that closure in the project store's own database.
     load_db(nix_store, &shared_store, &store_dir, &closure)?;
@@ -322,15 +324,18 @@ fn closure_of(
 /// and moved into place by [`place_atomically`], so a half-written tree only ever
 /// exists under the temporary name and a crash or a racing seed cannot leave a
 /// partial at the real store-path name.
+///
+/// Returns whether every file placed was cloned rather than copied ([`place_file`]); a path
+/// already present places nothing, and answers `true`.
 fn seed_path(
     shared_paths: &Path,
     project_paths: &Path,
     name: &OsStr,
     reflink_ok: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let dest = project_paths.join(name);
     if dest.symlink_metadata().is_ok() {
-        return Ok(());
+        return Ok(true);
     }
     let mut tmp_name = std::ffi::OsString::from(format!(".tmp-{}-", unique()));
     tmp_name.push(name);
@@ -343,10 +348,11 @@ fn seed_path(
 /// names, and a leftover store-path temp is a *directory tree* — use the recursive `discard` (a
 /// no-op when absent), not `remove_file`, or `copy_recursive`'s non-recursive `DirBuilder::create`
 /// would fail EEXIST.
-fn copy_into_place(src: &Path, dest: &Path, tmp: &Path, reflink_ok: bool) -> io::Result<()> {
+fn copy_into_place(src: &Path, dest: &Path, tmp: &Path, reflink_ok: bool) -> io::Result<bool> {
     discard(tmp);
-    copy_recursive(src, tmp, reflink_ok)?;
-    place_atomically(tmp, dest)
+    let cloned = copy_recursive(src, tmp, reflink_ok)?;
+    place_atomically(tmp, dest)?;
+    Ok(cloned)
 }
 
 /// Move the fully-copied `tmp` tree into place at its real store-path name `dest` by
@@ -382,21 +388,26 @@ fn place_atomically(tmp: &Path, dest: &Path) -> io::Result<()> {
 /// boundary against the cage: the cage runs as the uid that owns these paths, and an
 /// owner may `chmod` what it owns. What protects the shared store is that the cage never
 /// holds it — the copy is physically independent ([`place_file`]) — never a mode.
-fn copy_recursive(from: &Path, to: &Path, reflink_ok: bool) -> io::Result<()> {
+///
+/// Returns whether every regular file under `from` was cloned rather than copied.
+fn copy_recursive(from: &Path, to: &Path, reflink_ok: bool) -> io::Result<bool> {
     // `symlink_metadata` does not follow symlinks, so a store symlink is recreated
     // rather than dereferenced.
     let meta = from.symlink_metadata()?;
     let file_type = meta.file_type();
     if file_type.is_dir() {
         DirBuilder::new().mode(DIR_MODE).create(to)?;
+        let mut cloned = true;
         for entry in fs::read_dir(from)? {
             let entry = entry?;
-            copy_recursive(&entry.path(), &to.join(entry.file_name()), reflink_ok)?;
+            cloned &= copy_recursive(&entry.path(), &to.join(entry.file_name()), reflink_ok)?;
         }
         // After the entries, never before: a directory sealed read-only takes none.
-        fs::set_permissions(to, meta.permissions())
+        fs::set_permissions(to, meta.permissions())?;
+        Ok(cloned)
     } else if file_type.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(from)?, to)
+        std::os::unix::fs::symlink(fs::read_link(from)?, to)?;
+        Ok(true)
     } else {
         place_file(from, to, reflink_ok)
     }
@@ -409,12 +420,56 @@ fn copy_recursive(from: &Path, to: &Path, reflink_ok: bool) -> io::Result<()> {
 /// untouched — costing no extra disk until a write. Otherwise (a filesystem without
 /// reflink, e.g. ext4) it is a full content copy. Either way `to` is a distinct
 /// inode with `from`'s mode.
-fn place_file(from: &Path, to: &Path, reflink_ok: bool) -> io::Result<()> {
+///
+/// Returns `true` when the file was cloned, `false` when it was copied: a clone that fails on a
+/// filesystem that supports them falls back to the copy, and the seed records that it did.
+fn place_file(from: &Path, to: &Path, reflink_ok: bool) -> io::Result<bool> {
     if reflink_ok && reflink(from, to).is_ok() {
-        return Ok(());
+        return Ok(true);
     }
     // a plain copy is independent on every filesystem and preserves the mode
-    fs::copy(from, to).map(|_| ())
+    fs::copy(from, to).map(|_| false)
+}
+
+/// The file under a project's store directory that records how its store paths were seeded,
+/// kept outside `store/nix`, the one part of the store bound into the cage, so nothing in the cage
+/// writes it.
+const SEED_MODE: &str = "seeded-by";
+
+/// How the store paths of the project tree at `tree_dir` were seeded: `Some(true)` when every file
+/// was cloned from the shared store, `Some(false)` when any was copied, `None` for a tree with no
+/// record (seeded before one was kept, or never seeded).
+///
+/// Read by the figure for what removing the tree gives back (`gc::Reclaim`), which turns on
+/// exactly this: a cloned store shares its data with the shared one and returns none of it, a
+/// copied one returns all of it. Recorded where the answer is known, so a reading command need not
+/// probe the filesystem to guess it.
+pub(crate) fn seed_mode(tree_dir: &Path) -> Option<bool> {
+    match fs::read_to_string(tree_dir.join("store").join(SEED_MODE))
+        .ok()?
+        .trim()
+    {
+        "reflink" => Some(true),
+        "copy" => Some(false),
+        _ => None,
+    }
+}
+
+/// Record how this seed placed its paths, once any copy has made the store a mix: a store that ever
+/// took a copied file stays recorded as copied, since those bytes are its own whatever later seeds
+/// clone. Written only when the record changes, so a launch that seeds nothing new writes nothing.
+fn record_seed_mode(store_dir: &Path, all_cloned: bool) -> io::Result<()> {
+    let path = store_dir.join(SEED_MODE);
+    let before = fs::read_to_string(&path).ok();
+    let now = match before.as_deref().map(str::trim) {
+        Some("copy") => "copy",
+        _ if all_cloned => "reflink",
+        _ => "copy",
+    };
+    if before.as_deref().map(str::trim) == Some(now) {
+        return Ok(());
+    }
+    super::atomicfile::write_atomic(&path, format!("{now}\n").as_bytes())
 }
 
 /// Clone `from` into a fresh `to` copy-on-write via the `FICLONE` ioctl, preserving
@@ -696,6 +751,38 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    /// The seed's record of how it placed its paths, which `gc::Reclaim` reads: cloned while every
+    /// file was, and copied for good once one was, since those bytes stay the tree's own whatever a
+    /// later seed clones. A seed that changes nothing writes nothing.
+    #[test]
+    fn the_seed_mode_record_turns_to_copy_and_stays_there() {
+        let tmp = TmpDir::new();
+        let tree = tmp.path().join("tree");
+        let store = tree.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        assert_eq!(
+            seed_mode(&tree),
+            None,
+            "a tree seeded before the record has none"
+        );
+
+        record_seed_mode(&store, true).unwrap();
+        assert_eq!(seed_mode(&tree), Some(true));
+        let before = ino(&store.join(SEED_MODE));
+        record_seed_mode(&store, true).unwrap();
+        let after = ino(&store.join(SEED_MODE));
+        assert_eq!(before, after, "an unchanged record is not rewritten");
+
+        record_seed_mode(&store, false).unwrap();
+        assert_eq!(seed_mode(&tree), Some(false));
+        record_seed_mode(&store, true).unwrap();
+        assert_eq!(
+            seed_mode(&tree),
+            Some(false),
+            "a copied file stays the tree's own"
+        );
+    }
 
     /// A `(device, inode)` pair — equal across two paths iff they are the same
     /// inode. The device is part of the key because an inode number alone can

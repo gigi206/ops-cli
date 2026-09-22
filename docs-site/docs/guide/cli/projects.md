@@ -36,7 +36,8 @@ on its own: its app mise pools, its home, its store's own database, and whatever
 into** its store rather than seeded there (a local `flake:`, or an in-cage
 `sbx mise install nix:` the shared store never had). The header prints both figures, so the number including the store is still
 there to read. On a filesystem that cannot share blocks (ext4), the seed is a real copy and a
-removal frees it, so there the column counts the whole tree. `sbx projects rm` announces the
+removal frees it, so there the column counts the whole tree. The seed records which of the two
+it did, so the listing reads that record rather than testing the filesystem. `sbx projects rm` announces the
 same figure the column shows.
 
 The column counts file data, and the space a removal really returns differs from it in both

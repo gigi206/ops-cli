@@ -84,8 +84,9 @@ pub(crate) fn bind_reaches_the_cage(dest: &Path, project: Option<&Path>) -> bool
             .any(|s| dest.starts_with(s))
 }
 
-/// A warning when a config bind at canonical `dest` cannot be established, or `None` when it can. The caller drops the bind on `Some`: a launch carrying it would fail in bwrap,
-/// before the cage exists, with a message naming a path the user never wrote.
+/// A warning when a config bind at canonical `dest` cannot be established, or `None` when it can.
+/// The caller drops the bind on `Some`: a launch carrying it would fail in bwrap, before the cage
+/// exists, with a message naming a path the user never wrote.
 ///
 /// The case is a bind that **contains** one of sbx's own mounts it cannot make room for. sbx
 /// mounts after the config binds, so each of its destinations under a bind has to be placed inside
@@ -101,17 +102,16 @@ pub(crate) fn bind_reaches_the_cage(dest: &Path, project: Option<&Path>) -> bool
 /// structural mounts are asked about: the [`LAUNCHER_DESTS`] are conditional, and dropping a bind
 /// over one on a launch that does not make it would refuse something that works.
 ///
-/// A **writable** bind is dropped for a link alone. A link fails in any mode, since bwrap refuses
-/// to replace an existing entry and the host keeps one at every such path. A missing mountpoint,
-/// by contrast, is created in the host directory itself where the host allows it (the
-/// write-through the ancestor note of [`structural_nesting_warning`] names), and whether it does
-/// cannot be known without trying, so that case fails at the launch as it did before.
+/// A **writable** bind is dropped for a link, which fails in any mode since bwrap refuses to
+/// replace an existing entry, and for a missing mountpoint the host will not let this uid create
+/// ([`Room::Missing`]). One it will is created in the host directory itself (the write-through the
+/// ancestor note of [`structural_nesting_warning`] names), and the bind is kept.
 pub(crate) fn unestablishable_bind_warning(
     dest: &Path,
     writable: bool,
     distro: bool,
 ) -> Option<String> {
-    let blocking = blocking_dest(dest, writable, distro, |p| p.symlink_metadata().is_ok())?;
+    let blocking = blocking_dest(dest, writable, distro, host_room)?;
     Some(dropped_note(
         dest,
         blocking,
@@ -125,7 +125,7 @@ pub(crate) fn unestablishable_bind_warning(
 /// launch, so it cannot be asked where the configuration is folded: a `/run` bind works on a launch
 /// that mounts none of them and fails on one that mounts any. `mounted` is this launch's own list.
 ///
-/// A missing mountpoint under a read-only bind is the one case, as for the structural mounts; the
+/// A missing mountpoint is the one case, read by [`Room`] as for the structural mounts; the
 /// launcher mounts no link. A destination under a structural mount that itself lies inside the bind
 /// is made in that mount rather than in the bind, so it blocks nothing.
 pub(crate) fn launch_unestablishable_bind_warning<'a>(
@@ -133,8 +133,7 @@ pub(crate) fn launch_unestablishable_bind_warning<'a>(
     writable: bool,
     mounted: impl IntoIterator<Item = &'a Path>,
 ) -> Option<String> {
-    let blocking =
-        blocked_launcher_dest(dest, writable, mounted, |p| p.symlink_metadata().is_ok())?;
+    let blocking = blocked_launcher_dest(dest, writable, mounted, host_room)?;
     Some(dropped_note(dest, &blocking.display().to_string(), false))
 }
 
@@ -143,14 +142,50 @@ pub(super) fn blocked_launcher_dest<'a>(
     dest: &Path,
     writable: bool,
     mounted: impl IntoIterator<Item = &'a Path>,
-    present: impl Fn(&Path) -> bool,
+    room: impl Fn(&Path) -> Room,
 ) -> Option<&'a Path> {
-    if writable {
-        return None;
+    mounted.into_iter().find(|&m| {
+        m != dest && m.starts_with(dest) && !covered_between(dest, m) && room(m).blocks(writable)
+    })
+}
+
+/// What the host holds at a path sbx will mount on, which decides whether a bind above it can make
+/// room: bwrap creates a missing mountpoint inside the bound directory, as this uid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Room {
+    /// An entry is already there.
+    Present,
+    /// Nothing is there, and this uid may write the nearest directory that exists above it.
+    Creatable,
+    /// Nothing is there, and the nearest directory that exists above it refuses this uid a write:
+    /// root-owned, or on a read-only mount.
+    Missing,
+}
+
+impl Room {
+    /// Whether a bind of the given mode cannot hold a mountpoint here. A read-only bind cannot
+    /// create anything, whatever the host would allow; a writable one creates what the host lets
+    /// it.
+    fn blocks(self, writable: bool) -> bool {
+        match self {
+            Room::Present => false,
+            Room::Creatable => !writable,
+            Room::Missing => true,
+        }
     }
-    mounted
-        .into_iter()
-        .find(|&m| m != dest && m.starts_with(dest) && !covered_between(dest, m) && !present(m))
+}
+
+/// What this host holds at `p`, asked of the kernel ([`crate::pathfind::access_ok`]) rather than
+/// read from mode bits, so ownership, ACLs and a read-only mount all count.
+fn host_room(p: &Path) -> Room {
+    if p.symlink_metadata().is_ok() {
+        return Room::Present;
+    }
+    let nearest = p.ancestors().skip(1).find(|a| a.symlink_metadata().is_ok());
+    match nearest {
+        Some(dir) if crate::pathfind::access_ok(dir, libc::W_OK) => Room::Creatable,
+        _ => Room::Missing,
+    }
 }
 
 /// Whether a structural mount lies strictly inside the bind at `dest` and at or above `inner`, in
@@ -185,13 +220,13 @@ fn dropped_note(dest: &Path, blocking: &str, link: bool) -> String {
 }
 
 /// The pure core of [`unestablishable_bind_warning`]: the first structural destination strictly
-/// under `dest` that a bind there cannot make room for, given `present`, which says whether the
-/// host carries an entry at a path. Taken as a closure so the rule is exercised without a host.
+/// under `dest` that a bind there cannot make room for, given `room`, which says what the host
+/// holds at a path. Taken as a closure so the rule is exercised without a host.
 pub(super) fn blocking_dest(
     dest: &Path,
     writable: bool,
     distro: bool,
-    present: impl Fn(&Path) -> bool,
+    room: impl Fn(&Path) -> Room,
 ) -> Option<&'static str> {
     STRUCTURAL_DESTS.iter().copied().find(|&s| {
         let structural = Path::new(s);
@@ -199,7 +234,7 @@ pub(super) fn blocking_dest(
             && structural.starts_with(dest)
             && !(distro && DISTRO_SUPPLIED.contains(&s))
             && !covered_between(dest, structural)
-            && (STRUCTURAL_SYMLINKS.contains(&s) || (!writable && !present(structural)))
+            && (STRUCTURAL_SYMLINKS.contains(&s) || room(structural).blocks(writable))
     })
 }
 

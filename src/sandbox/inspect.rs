@@ -487,13 +487,18 @@ fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
     None
 }
 
-/// The nix store roots a project tree has realized — the out-link names under
-/// `<data>/gcroots/projects/<id>/`. This is the project's **shared** store content: the roots accrue
-/// from the project baseline *and* every app launched in it (they share one per-project store). A
-/// `deb-<name>` / `appimage-<name>` name is a prebuilt build output; every other name is a `nix:`
-/// package (or a hole provision). Sorted.
-///
-/// A root is a **leaf** out-link, so a sub-*directory* is not one:
+/// The store path names the shared store holds, for [`store_built_here_against`]. Read once by a
+/// caller classifying several trees: the shared store is the larger of the two listings, and
+/// re-reading it per tree is the only part of this that would not be free.
+pub(crate) fn shared_store_names(
+    shared_store_dir: &Path,
+) -> std::collections::HashSet<std::ffi::OsString> {
+    match std::fs::read_dir(shared_store_dir.join("nix/store")) {
+        Ok(rd) => rd.flatten().map(|e| e.file_name()).collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
 /// How much of a runtime tree's store the tree holds **on its own**: the bytes under store paths
 /// that the shared store does not also have.
 ///
@@ -511,24 +516,8 @@ fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
 /// the seed.
 ///
 /// Read-only. A tree with no store, or no readable shared store, reports zero: nothing is claimed
-/// as built here that cannot be shown to be.
-pub(crate) fn store_built_here(tree_dir: &Path, shared_store_dir: &Path) -> u64 {
-    store_built_here_against(tree_dir, &shared_store_names(shared_store_dir))
-}
-
-/// The store path names the shared store holds, for [`store_built_here_against`]. Read once by a
-/// caller classifying several trees: the shared store is the larger of the two listings, and
-/// re-reading it per tree is the only part of this that would not be free.
-pub(crate) fn shared_store_names(
-    shared_store_dir: &Path,
-) -> std::collections::HashSet<std::ffi::OsString> {
-    match std::fs::read_dir(shared_store_dir.join("nix/store")) {
-        Ok(rd) => rd.flatten().map(|e| e.file_name()).collect(),
-        Err(_) => std::collections::HashSet::new(),
-    }
-}
-
-/// [`store_built_here`] against an already-read set of shared store path names.
+/// as built here that cannot be shown to be. The shared store's names arrive already read
+/// ([`shared_store_names`]), since a caller sizing a tree reads them once for every figure.
 ///
 /// An empty set means the shared store could not be read, and every path would then look built
 /// here. Reporting the whole store as the tree's own on a failed listing would be a far larger
@@ -551,6 +540,13 @@ pub(crate) fn store_built_here_against(
         .sum()
 }
 
+/// The nix store roots a project tree has realized — the out-link names under
+/// `<data>/gcroots/projects/<id>/`. This is the project's **shared** store content: the roots accrue
+/// from the project baseline *and* every app launched in it (they share one per-project store). A
+/// `deb-<name>` / `appimage-<name>` name is a prebuilt build output; every other name is a `nix:`
+/// package (or a hole provision). Sorted.
+///
+/// A root is a **leaf** out-link, so a sub-*directory* is not one:
 /// [`nixhub::provision`](crate::sandbox::nixhub::provision) roots the tree's `nix:` mise tools one
 /// level down, in the `nix-tools/` directory it keeps apart from the native `[packages]` roots so the
 /// two tool sources cannot collide on a shared name — and that directory entry was read as a root of

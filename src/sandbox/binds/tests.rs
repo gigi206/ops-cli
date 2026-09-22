@@ -353,31 +353,36 @@ fn structural_symlinks_lists_every_link_assemble_emits() {
     }
 }
 
-/// A launcher destination blocks a read-only bind only on a launch that mounts it: `/run` holds
-/// the audio socket when audio is on and nothing of sbx's otherwise.
+/// A launcher destination blocks a bind only on a launch that mounts it: `/run` holds the audio
+/// socket when audio is on and nothing of sbx's otherwise.
 #[test]
 fn a_launcher_destination_blocks_a_bind_only_on_the_launch_that_mounts_it() {
-    use super::nesting::blocked_launcher_dest;
-    let absent = |_: &Path| false;
+    use super::nesting::{Room, blocked_launcher_dest};
+    let creatable = |_: &Path| Room::Creatable;
     let pulse = Path::new(super::super::audio::CAGE_SOCK);
     assert_eq!(
-        blocked_launcher_dest(Path::new("/run"), false, [pulse], absent),
+        blocked_launcher_dest(Path::new("/run"), false, [pulse], creatable),
         Some(pulse)
     );
     assert_eq!(
-        blocked_launcher_dest(Path::new("/run"), false, [], absent),
+        blocked_launcher_dest(Path::new("/run"), false, [], creatable),
         None,
         "a launch that mounts nothing under the bind leaves it alone"
     );
     assert_eq!(
-        blocked_launcher_dest(Path::new("/run"), true, [pulse], absent),
+        blocked_launcher_dest(Path::new("/run"), true, [pulse], creatable),
         None,
-        "a writable bind may have the mountpoint created in it"
+        "a writable bind has the mountpoint created in it where the host allows"
+    );
+    assert_eq!(
+        blocked_launcher_dest(Path::new("/run"), true, [pulse], |_| Room::Missing),
+        Some(pulse),
+        "and not where the host refuses this uid the write"
     );
     // A destination under a structural mount inside the bind is made in that mount.
     let under_tmp = Path::new("/tmp/sbx-egress.sock");
     assert_eq!(
-        blocked_launcher_dest(Path::new("/"), false, [under_tmp], absent),
+        blocked_launcher_dest(Path::new("/"), false, [under_tmp], |_| Room::Missing),
         None
     );
 }
@@ -385,9 +390,17 @@ fn a_launcher_destination_blocks_a_bind_only_on_the_launch_that_mounts_it() {
 /// What a bind holding one of sbx's own mounts can make room for, decided without a host.
 #[test]
 fn a_bind_that_cannot_hold_an_sbx_mount_is_named_by_the_path_that_blocks_it() {
-    use super::nesting::blocking_dest;
-    // A host whose `/etc/ssl` carries the Debian bundle but not the NixOS one.
-    let debian = |p: &Path| p != Path::new(CAGE_CA_BUNDLE);
+    use super::nesting::{Room, blocking_dest};
+    let present = |_: &Path| Room::Present;
+    // A host whose `/etc/ssl` carries the Debian bundle but not the NixOS one, in a directory this
+    // uid may not write.
+    let debian = |p: &Path| {
+        if p == Path::new(CAGE_CA_BUNDLE) {
+            Room::Missing
+        } else {
+            Room::Present
+        }
+    };
     assert_eq!(
         blocking_dest(Path::new("/etc/ssl"), false, false, debian),
         Some(CAGE_CA_BUNDLE),
@@ -395,36 +408,52 @@ fn a_bind_that_cannot_hold_an_sbx_mount_is_named_by_the_path_that_blocks_it() {
     );
     // A host carrying both: nothing needs creating, so the bind is established.
     assert_eq!(
-        blocking_dest(Path::new("/etc/ssl"), false, false, |_| true),
+        blocking_dest(Path::new("/etc/ssl"), false, false, present),
         None
     );
     // A link blocks whatever the host holds.
     assert_eq!(
-        blocking_dest(Path::new("/etc"), false, false, |_| true),
+        blocking_dest(Path::new("/etc"), false, false, present),
         Some(CAGE_LOCALTIME)
     );
     // A declared distribution supplies its own `/etc/localtime`, so it no longer blocks.
-    assert_eq!(
-        blocking_dest(Path::new("/etc"), false, true, |_| true),
-        None
-    );
+    assert_eq!(blocking_dest(Path::new("/etc"), false, true, present), None);
     // Only an ancestor is concerned: the structural path itself, or a path beside it, is not.
     assert_eq!(
-        blocking_dest(Path::new(CAGE_CA_BUNDLE), false, false, |_| false),
+        blocking_dest(Path::new(CAGE_CA_BUNDLE), false, false, |_| Room::Missing),
         None
     );
     assert_eq!(
-        blocking_dest(Path::new("/etc/company-ca"), false, false, |_| false),
+        blocking_dest(Path::new("/etc/company-ca"), false, false, |_| {
+            Room::Missing
+        }),
         None
     );
-    // Writable, a missing path may be created on the host, so only a link blocks.
+    // Writable, a missing path blocks only where the host refuses this uid the write.
     assert_eq!(
         blocking_dest(Path::new("/etc/ssl"), true, false, debian),
+        Some(CAGE_CA_BUNDLE),
+        "a root-owned directory refuses the mountpoint in any mode"
+    );
+    let creatable = |p: &Path| {
+        if p == Path::new(CAGE_CA_BUNDLE) {
+            Room::Creatable
+        } else {
+            Room::Present
+        }
+    };
+    assert_eq!(
+        blocking_dest(Path::new("/etc/ssl"), true, false, creatable),
         None,
-        "a writable bind is not dropped for a path the host may create"
+        "a writable bind keeps a path the host lets it create"
     );
     assert_eq!(
-        blocking_dest(Path::new("/etc"), true, false, |_| true),
+        blocking_dest(Path::new("/etc/ssl"), false, false, creatable),
+        Some(CAGE_CA_BUNDLE),
+        "a read-only bind creates nothing, whatever the host would allow"
+    );
+    assert_eq!(
+        blocking_dest(Path::new("/etc"), true, false, present),
         Some(CAGE_LOCALTIME),
         "a link blocks in any mode"
     );

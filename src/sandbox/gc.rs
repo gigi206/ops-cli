@@ -1763,39 +1763,74 @@ pub(crate) fn tree_size(path: &Path) -> u64 {
 /// What removing a project tree gives back, for every surface that names that figure: `sbx
 /// projects` lists it, `show` reports it, and `rm` announces it.
 ///
-/// The answer turns on how the tree's store was seeded, which the tree does not record. Seeding
-/// reflinks each path from the shared store where the filesystem supports it and copies it where it
-/// does not (`projectstore`), and the two differ by the whole store: a reflinked store shares its
-/// data extents with the shared one, so removing it returns only what was built in the tree, while
-/// a copied store returns every byte it holds. The filesystem's own verdict is read instead, once,
-/// with the same probe the seeding uses; a probe that cannot run counts the whole tree, the upper
-/// bound. File data only: the metadata the filesystem keeps for the tree's inodes is freed too and
-/// is not counted.
+/// The answer turns on how the tree's store was seeded. Seeding reflinks each path from the shared
+/// store where the filesystem supports it and copies it where it does not (`projectstore`), and
+/// the two differ by the whole store: a reflinked store shares its data extents with the shared
+/// one, so removing it returns only what was built in the tree, while a copied store returns every
+/// byte it holds. The seed records which it did ([`super::projectstore::seed_mode`]); a tree seeded
+/// before that record was kept falls back on the filesystem's verdict, probed at most once per
+/// reader and only when such a tree is met, and a probe that cannot run counts the whole tree, the
+/// upper bound. File data only: the metadata the filesystem keeps for the tree's inodes is freed
+/// too and is not counted.
 pub(crate) struct Reclaim {
     /// The store path names the shared store holds.
     shared: std::collections::HashSet<OsString>,
-    /// Whether the project trees' filesystem clones rather than copies.
-    reflinks: bool,
+    /// Where the project trees live, for the fallback probe.
+    projects_dir: PathBuf,
+    /// The fallback verdict, probed on the first tree that has no record.
+    probed: std::cell::OnceCell<bool>,
 }
 
 impl Reclaim {
-    /// Read the shared store's names and probe the filesystem the project trees live on.
-    pub(crate) fn probe(layout: &crate::store::Layout) -> Self {
+    /// Read the shared store's names. Nothing is probed yet.
+    pub(crate) fn for_layout(layout: &crate::store::Layout) -> Self {
         Reclaim {
             shared: super::inspect::shared_store_names(&layout.store_dir()),
-            reflinks: super::reflink_verdict(&layout.data_dir().join("projects")) == Some(true),
+            projects_dir: layout.data_dir().join("projects"),
+            probed: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Whether the tree at `dir` had its store paths cloned rather than copied: its own record, or
+    /// the filesystem's verdict where it has none.
+    fn cloned(&self, dir: &Path) -> bool {
+        super::projectstore::seed_mode(dir).unwrap_or_else(|| {
+            *self
+                .probed
+                .get_or_init(|| super::reflink_verdict(&self.projects_dir) == Some(true))
+        })
     }
 
     /// What removing the tree at `dir` gives back, from figures its caller already walked:
     /// `total` for the whole tree and `seeded` for its [`seeded_store`].
     pub(crate) fn given_usage(&self, dir: &Path, total: u64, seeded: u64) -> u64 {
-        if !self.reflinks {
+        if !self.cloned(dir) {
             return total;
         }
         total
             .saturating_sub(seeded)
-            .saturating_add(super::inspect::store_built_here_against(dir, &self.shared))
+            .saturating_add(self.built_here(dir))
+    }
+
+    /// The bytes of the tree's store paths the shared store does not have, against the names this
+    /// reader holds ([`super::inspect::store_built_here_against`]).
+    pub(crate) fn built_here(&self, dir: &Path) -> u64 {
+        super::inspect::store_built_here_against(dir, &self.shared)
+    }
+
+    /// [`Reclaim::given_usage`] for a caller that already holds the built-here figure, so neither
+    /// the shared store's names nor the built-here paths are read a second time.
+    pub(crate) fn given_figures(
+        &self,
+        dir: &Path,
+        total: u64,
+        seeded: u64,
+        built_here: u64,
+    ) -> u64 {
+        if !self.cloned(dir) {
+            return total;
+        }
+        total.saturating_sub(seeded).saturating_add(built_here)
     }
 
     /// What removing the tree at `dir` gives back, walking it once.
@@ -2758,25 +2793,31 @@ mod tests {
         );
     }
 
-    /// What a removal gives back turns on how the store was seeded. Reflinked, the seeded store
-    /// shares its data with the shared one and gives nothing back, so only the rest of the tree
-    /// counts; copied, every byte does. Announcing the whole tree on a filesystem that reflinks
-    /// would name a figure the disk never gets back.
+    /// A reader over `projects`, with the shared store holding `shared`.
+    fn reclaim_over(projects: &Path, shared: &[&str]) -> Reclaim {
+        Reclaim {
+            shared: shared.iter().map(OsString::from).collect(),
+            projects_dir: projects.to_path_buf(),
+            probed: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// What a removal gives back turns on how the store was seeded, as the seed recorded it:
+    /// reflinked, the seeded store shares its data with the shared one and gives nothing back, so
+    /// only the rest of the tree counts; copied, every byte does. Announcing the whole tree on a
+    /// filesystem that reflinks would name a figure the disk never gets back.
     #[test]
     fn what_a_removal_gives_back_follows_how_the_store_was_seeded() {
         let tmp = TmpDir::new();
-        let dir = tmp.path().join("tree");
-        std::fs::create_dir_all(&dir).unwrap();
-        let reflinked = Reclaim {
-            shared: std::collections::HashSet::new(),
-            reflinks: true,
+        let reclaim = reclaim_over(tmp.path(), &[]);
+        let tree = |mode: &str| {
+            let dir = tmp.path().join(mode);
+            std::fs::create_dir_all(dir.join("store")).unwrap();
+            std::fs::write(dir.join("store/seeded-by"), format!("{mode}\n")).unwrap();
+            dir
         };
-        let copied = Reclaim {
-            shared: std::collections::HashSet::new(),
-            reflinks: false,
-        };
-        assert_eq!(reflinked.given_usage(&dir, 1000, 800), 200);
-        assert_eq!(copied.given_usage(&dir, 1000, 800), 1000);
+        assert_eq!(reclaim.given_usage(&tree("reflink"), 1000, 800), 200);
+        assert_eq!(reclaim.given_usage(&tree("copy"), 1000, 800), 1000);
     }
 
     /// Only the store paths are seeded. The store's database under `nix/var` is written for the
@@ -2791,16 +2832,35 @@ mod tests {
         std::fs::create_dir_all(&db).unwrap();
         std::fs::write(path.join("payload"), vec![b'x'; 64 * 1024]).unwrap();
         std::fs::write(db.join("db.sqlite"), vec![b'y'; 64 * 1024]).unwrap();
-        let reclaim = Reclaim {
-            shared: [OsString::from("abc-hello")].into_iter().collect(),
-            reflinks: true,
-        };
+        std::fs::write(dir.join("store/seeded-by"), "reflink\n").unwrap();
+        let reclaim = reclaim_over(tmp.path(), &["abc-hello"]);
         let seeded = tree_size(&seeded_store(&dir));
         let freed = reclaim.bytes(&dir);
         assert_eq!(freed, tree_size(&dir) - seeded);
         assert!(
             freed >= 64 * 1024,
             "the database is the tree's own and counts: {freed}"
+        );
+    }
+
+    /// A tree seeded before the record was kept falls back on the filesystem's verdict, probed
+    /// once for every such tree a reader meets, and never for a tree that carries a record.
+    #[test]
+    fn a_tree_without_a_record_falls_back_on_one_probe() {
+        let tmp = TmpDir::new();
+        let reclaim = reclaim_over(tmp.path(), &[]);
+        let recorded = tmp.path().join("recorded");
+        std::fs::create_dir_all(recorded.join("store")).unwrap();
+        std::fs::write(recorded.join("store/seeded-by"), "copy\n").unwrap();
+        assert_eq!(reclaim.given_usage(&recorded, 1000, 800), 1000);
+        assert!(reclaim.probed.get().is_none(), "a record needs no probe");
+
+        let legacy = tmp.path().join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let _ = reclaim.given_usage(&legacy, 1000, 800);
+        assert!(
+            reclaim.probed.get().is_some(),
+            "a tree with no record is probed for"
         );
     }
 

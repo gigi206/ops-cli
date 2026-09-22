@@ -41,7 +41,7 @@ fn reap_dead_trees(
     let (prune, prune_unidentified) = (apply && dead, apply && markerless);
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let projects_dir = layout.data_dir().join("projects");
-    let reclaim = super::gc::Reclaim::probe(layout);
+    let reclaim = super::gc::Reclaim::for_layout(layout);
     let report =
         super::gc::reap_dead_projects(&projects_dir, live_ids, prune, prune_unidentified, &|dir| {
             reclaim.bytes(dir)
@@ -204,7 +204,7 @@ fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> 
     let projects_dir = layout.data_dir().join("projects");
     // Read once for every tree: each one is sized against the same shared store and on the same
     // filesystem.
-    let reclaim = super::gc::Reclaim::probe(layout);
+    let reclaim = super::gc::Reclaim::for_layout(layout);
     let mut rows: Vec<ProjectTreeView> = match std::fs::read_dir(&projects_dir) {
         Ok(rd) => rd
             .flatten()
@@ -373,8 +373,11 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     // The store is seeded from the shared one path for path. Where it was reflinked, reporting it
     // as part of what the tree costs counts the seed against the tree, and what the tree adds is
     // what was built into it; where it was copied, every byte is the tree's.
-    let store_built_here_bytes = super::inspect::store_built_here(&dir, &layout.store_dir());
-    let own_bytes = super::gc::Reclaim::probe(&layout).given_usage(&dir, total_bytes, store_bytes);
+    // One probe for both figures: the shared store's names are read once, and the built-here paths
+    // walked once.
+    let reclaim = super::gc::Reclaim::for_layout(&layout);
+    let store_built_here_bytes = reclaim.built_here(&dir);
+    let own_bytes = reclaim.given_figures(&dir, total_bytes, store_bytes, store_built_here_bytes);
 
     // Realized signals, read once from the tree.
     let gcroots = super::inspect::gcroot_names(data, id);
@@ -768,7 +771,7 @@ pub(crate) fn projects_rm(
     let current = crate::current_project_id();
     let projects_dir = layout.data_dir().join("projects");
     // Probed once for every id named, before any removal: what each gives back is sized first.
-    let reclaim = super::gc::Reclaim::probe(&layout);
+    let reclaim = super::gc::Reclaim::for_layout(&layout);
     let mut had_error = false;
 
     for id in ids {
