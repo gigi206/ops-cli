@@ -73,12 +73,22 @@ mute = [
     "*.sentry.io",
     "www.redditstatic.com",
     "code.trygravity.ai",
+    # The sponsored-task creative image. A first-party creative is rewritten to the vendor site
+    # and travels under the rules above; a third-party one keeps the absolute URL the ads API
+    # returns, served from the provider's storage bucket. Denied, the sponsored card renders
+    # without its image; nothing else depends on it.
+    "itbtwqhcbagquwjizsre.supabase.co",
     # The in-cage browser's own Google background traffic, none of it required for function. The
     # group includes the leaked-password check, which would send password data to Google: denying
     # it is a feature, not a loss.
     "@chromium-background",
     # Chrome's page-translation service — same class, but not every browser embed reaches it.
     "translate.googleapis.com",
+    # The orchestrator's reachability probe. It polls the Codebuff API every few seconds, and only
+    # after two consecutive failures does it HEAD this endpoint, solely to label its offline banner
+    # "no internet" rather than "can't reach the servers". Denied, the banner carries the second
+    # wording and the app behaves identically, so the probe is diagnostic noise, not a dependency.
+    "www.cloudflare.com",
     "@npm-audit",
     "@npm-jsr",
 ]

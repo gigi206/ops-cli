@@ -328,7 +328,7 @@ The 67 shipped bundles, and what each carries:
 | `dirac` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 10 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `freebuff` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 28 egress entries, an `appimage:` resolver | `chromium-background`, `github`, `github-api`, `npm-audit`, `npm-jsr`, `npm-runtime` |
+| `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 30 egress entries, an `appimage:` resolver | `chromium-background`, `github`, `github-api`, `npm-audit`, `npm-jsr`, `npm-runtime` |
 | `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
 | `goose-desktop` | 1 (`deb:`) | 2 env vars | none |
 | `grok` | 1 (`binary:`) | 3 egress entries, 1 env var, a `binary:` resolver | none |

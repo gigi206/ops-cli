@@ -168,8 +168,9 @@ allow = [
 # the in-cage Chromium's own background phone-home (update / safe-browsing / time / checkin / on-device
 # model / translate) plus telemetry + third-party ad pixels pulled in by page content.
 mute = [
-  # Nothing here: the app/page telemetry, the ad pixels, `@chromium-background` and the translation
-  # service arrive with the bundle and are unioned in at resolution.
+  # Nothing here: the app/page telemetry, the ad pixels and the sponsored creative's image host,
+  # `@chromium-background`, the translation service and the reachability probe's fallback endpoint
+  # all arrive with the bundle and are unioned in at resolution.
 ]
 
 # CREDENTIAL POSTURE — account / OAuth, NOT a header-injectable API key.
