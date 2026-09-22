@@ -163,6 +163,11 @@ pub(crate) struct SandboxSpec {
     /// `to_argv` maps the cage back to these host credentials (the holder runs root-in-userns);
     /// None is the ordinary path (bwrap emits `--unshare-net`). See [`NetnsDummy`].
     pub(super) netns_dummy: Option<NetnsDummy>,
+    /// The resource-limit decision the launch already took, when it took one
+    /// ([`super::cgroup::Scope`]). The launch path decides once, names the properties in the
+    /// in-cage contract, and sets it here via [`SandboxSpec::with_limit_scope`] so the cage is
+    /// wrapped in the same answer; `None`, the default, has the launcher decide for itself.
+    pub(super) limit_scope: Option<super::cgroup::Scope>,
     /// Whether bwrap is given `--die-with-parent`, which arms `PR_SET_PDEATHSIG` so the cage cannot
     /// outlive the process supervising it. True for every launch but one, and
     /// [`SandboxSpec::outliving_its_launcher`] is the only thing that clears it.
@@ -261,6 +266,7 @@ impl SandboxSpec {
             as_root: false,
             seccomp: super::seccomp::SeccompPolicy::default(),
             netns_dummy: None,
+            limit_scope: None,
             dies_with_launcher: true,
         })
     }
@@ -303,6 +309,12 @@ impl SandboxSpec {
     /// derives it from the app or project via [`super::naming::cage_slug`].
     pub(crate) fn with_cage_slug(mut self, slug: String) -> Self {
         self.cage_slug = slug;
+        self
+    }
+
+    /// Carry the launch's resource-limit decision (see [`SandboxSpec::limit_scope`]).
+    pub(crate) fn with_limit_scope(mut self, scope: super::cgroup::Scope) -> Self {
+        self.limit_scope = Some(scope);
         self
     }
 

@@ -1057,7 +1057,15 @@ impl Resolved {
     /// capability/relaxation, never a wider posture), so they warn and skip rather than abort. On a hard error nothing is applied (the
     /// scalars are validated up front, before any mutation), so a caller that surfaces the error can
     /// still show the untouched baseline.
-    pub(crate) fn apply_override(&mut self, ov: Override) -> Result<(), Vec<String>> {
+    ///
+    /// `cwd` is the directory the override is applied for, `None` only where no project is in
+    /// view. It is what lets a `--bind` inside the project be named, as the same line in a config
+    /// file is: the project's own mount covers such a bind, so it does nothing whatever its mode.
+    pub(crate) fn apply_override(
+        &mut self,
+        ov: Override,
+        cwd: Option<&Path>,
+    ) -> Result<(), Vec<String>> {
         let Override { raw, .. } = ov;
         let RawConfig {
             allow_insecure_http,
@@ -1216,15 +1224,22 @@ impl Resolved {
                 binds,
             );
             let roots = sbx_control_plane_roots();
-            // No project here: a `Resolved` does not carry the root it was resolved for, and an
-            // override is applied to one that already exists. So a `--bind` inside the project
-            // goes unremarked where the same line in a config file is named. The asymmetry is
-            // deliberate rather than overlooked — an override is typed for one launch by someone
-            // watching it, and a config line is what sits there unremarked for months. Threading
-            // the root through is the fix if that ever stops being true.
-            // No per-layer re-keying either: an override's provenance is the constant
+            // The canonical project root, as `load` computes it for the layered binds, so a
+            // `--bind` inside the project is named the way the same line in a config file is. Left
+            // unremarked, it read as working: the bind has no effect, the project's read-write
+            // mount covering it, and a `:ro` one is then writable in the cage.
+            let project = cwd.and_then(|c| c.canonicalize().ok());
+            // No per-layer re-keying: an override's provenance is the constant
             // `Provenance::Override`, recorded below against the canonical path directly.
-            for bind in canonicalize_binds(resolved_binds, &roots, None, None, &mut self.warnings) {
+            // The resolved distribution is final here: an override does not set one.
+            for bind in canonicalize_binds(
+                resolved_binds,
+                &roots,
+                project.as_deref(),
+                self.distro.is_some(),
+                None,
+                &mut self.warnings,
+            ) {
                 self.bind_layer
                     .insert(bind.path.clone(), Provenance::Override);
                 if let Some(existing) = self.binds.iter_mut().find(|b| b.path == bind.path) {
@@ -4824,7 +4839,7 @@ mod a_layer_replaces_only_what_it_declares {
              from = \"env://DEMO_API_KEY\"\n\
              header = \"x-api-key\"\n\
              type = \"raw\"\n");
-        r.apply_override(Override::for_test(over))
+        r.apply_override(Override::for_test(over), None)
             .expect("the override applies");
         assert_eq!(
             headers(&r.secrets),
@@ -4864,7 +4879,7 @@ mod a_layer_replaces_only_what_it_declares {
             "and says so: {:?}",
             r.warnings
         );
-        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")))
+        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")), None)
             .expect("the override applies");
         assert_eq!(
             headers(&r.secrets),
@@ -4894,7 +4909,7 @@ mod a_layer_replaces_only_what_it_declares {
              header = \"Authorization\"\n\
              type = \"bearer\"\n",
         );
-        r.apply_override(Override::for_test(cfg("[env]\nFOO = \"bar\"\n")))
+        r.apply_override(Override::for_test(cfg("[env]\nFOO = \"bar\"\n")), None)
             .expect("the override applies");
         assert!(
             r.secrets.is_empty(),
@@ -4938,7 +4953,7 @@ mod a_layer_replaces_only_what_it_declares {
             "the precondition: the overlay injects the app's own credential"
         );
 
-        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")))
+        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")), None)
             .expect("the override applies");
         assert_eq!(
             headers(&r.secrets),
@@ -4988,7 +5003,7 @@ mod a_layer_replaces_only_what_it_declares {
             "the precondition: the app's credential shadows its baseline twin"
         );
 
-        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")))
+        r.apply_override(Override::for_test(cfg("network = \"deny\"\n")), None)
             .expect("the override applies");
         assert_eq!(
             named(&r.secrets),

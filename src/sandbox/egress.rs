@@ -191,6 +191,21 @@ pub(crate) struct Wiring {
     /// reports each name the cage resolves through it, so the resolutions land in the same record
     /// `sbx net logs` reads — the alternative being a second place to look.
     pub(crate) control_uds: Option<PathBuf>,
+    /// The destinations this proxy will attach a credential to, rendered, for the in-cage
+    /// contract to name.
+    ///
+    /// The set whose credential **resolved**, which is a subset of what the configuration
+    /// declared: one that did not resolve had its destination denied as the proxy started, and a
+    /// document that named it would hand the cage an access it does not have. Destinations only —
+    /// never a credential's name, its header or where it was read from.
+    pub(crate) authenticated: Vec<String>,
+    /// The destinations denied for this run because their credential did not resolve, rendered,
+    /// for the in-cage contract to take out of its reachable listing.
+    ///
+    /// The contract is rendered from the configured policy, and this deny is added to the proxy's
+    /// own copy as it starts, so without it the document would list as reachable a destination
+    /// every request to which is refused.
+    pub(crate) withdrawn: Vec<String>,
 }
 
 /// Wrap `cmd` so the cage starts the forwarder before running it: a static bash that
@@ -790,7 +805,7 @@ pub(crate) fn start(
     // come from the same resolved values, so they cannot disagree with the injections. A
     // relative `sops` file resolves against the project root (the `.sbx.toml`'s directory). A
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
-    let (injections, redactions, resolved) = {
+    let (injections, redactions, resolved, withdrawn) = {
         let kept = resolve_or_deny(
             secrets,
             project_root,
@@ -802,9 +817,18 @@ pub(crate) fn start(
         // Applied before the proxy is built, so no request is ever served against the policy as it
         // stood while a credential was still expected to resolve. Empty under an aborting launch
         // whose declarations are all required — the case that used to have its own branch here.
+        let withdrawn = kept.denied.iter().map(ToString::to_string).collect();
         policy.deny_also(kept.denied);
-        (kept.injections, kept.redactions, kept.declarations)
+        (
+            kept.injections,
+            kept.redactions,
+            kept.declarations,
+            withdrawn,
+        )
     };
+
+    // Taken here because `resolved` is about to move into the refresher.
+    let authenticated = announced(&resolved);
 
     // The credential state the proxy will read, built here so the refresher can hold the same one
     // and swap it in place. Re-resolution repeats exactly this call, which is why the inputs are
@@ -1160,8 +1184,24 @@ pub(crate) fn start(
             env,
             host_uds,
             control_uds: control_uds.clone(),
+            authenticated,
+            withdrawn,
         },
     ))
+}
+
+/// The destinations the in-cage contract may name as authenticated, rendered from the declarations
+/// whose credential **resolved**.
+///
+/// Fed [`Kept::declarations`] rather than the launch's declared set, and the difference is the
+/// point: a credential that did not resolve had its destination denied as this proxy started, so
+/// naming it would tell a process it has an access this run has closed. The contract is read by
+/// something that acts on it, which makes a generous listing worse than none.
+///
+/// Destinations only. A credential's name, its header and its source locator are all withheld —
+/// what a caller can act on is which destinations carry one.
+fn announced(resolved: &[HeaderSecret]) -> Vec<String> {
+    resolved.iter().map(|s| s.to.to_string()).collect()
 }
 
 /// Resolve each declared header secret into a proxy injection plus the outbound-redaction needles,
@@ -3311,6 +3351,15 @@ mod tests {
             "the credentials that resolved are kept, aligned with their injections"
         );
         assert_eq!(kept.injections.len(), kept.declarations.len());
+        // And the cage is told about the two that resolved, never the denied one: the contract is
+        // read by something that acts on it, so announcing a destination this run has closed would
+        // send it at a door it cannot open, holding a credential it does not have.
+        let announced = announced(&kept.declarations);
+        assert_eq!(announced.len(), 2, "{announced:?}");
+        assert!(
+            !announced.iter().any(|d| d.contains("absent.test")),
+            "a denied destination must not be announced as authenticated: {announced:?}"
+        );
 
         // The opt-out is per declaration: another unreadable one still refuses the launch.
         secrets[0] = secret(

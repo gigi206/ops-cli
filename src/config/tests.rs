@@ -4675,6 +4675,40 @@ fn a_trusted_project_overrides_env_and_adds_binds() {
     assert!(r.warnings.is_empty());
 }
 
+/// A `--bind` inside the project is named, as the same line in a config file is. The project's own
+/// mount covers it, so a `:ro` one is writable from the cage, and nothing else on the terminal would
+/// say the bind has done nothing.
+#[test]
+fn an_override_bind_inside_the_project_is_named() {
+    let tmp = TmpDir::new();
+    let project = tmp.path().join("proj");
+    let inside = project.join("vendor");
+    std::fs::create_dir_all(&inside).unwrap();
+    let inside = inside.to_str().unwrap();
+
+    let mut r = resolve_no_plugins(RawConfig::default(), None);
+    r.apply_override(Override::for_test(raw(&[], &[inside])), Some(&project))
+        .expect("the override applies");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("sits inside the project")),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(r.binds.len(), 1, "named, not dropped: the field is trusted");
+
+    // Without a project in view there is nothing for the bind to sit inside.
+    let mut r = resolve_no_plugins(RawConfig::default(), None);
+    r.apply_override(Override::for_test(raw(&[], &[inside])), None)
+        .expect("the override applies");
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("inside the project")),
+        "{:?}",
+        r.warnings
+    );
+}
+
 #[test]
 fn an_untrusted_project_keeps_free_env_but_drops_binds() {
     let r = resolve_no_plugins(
@@ -8974,7 +9008,7 @@ fn a_baseline_only_field_written_under_an_app_says_so_instead_of_vanishing() {
 /// Expects the override to be valid (the hard-error path is covered by its own test).
 fn with_override(mut resolved: Resolved, raw: RawConfig) -> Resolved {
     resolved
-        .apply_override(Override::for_test(raw))
+        .apply_override(Override::for_test(raw), None)
         .expect("the override applies");
     resolved
 }
@@ -9185,10 +9219,13 @@ fn a_set_but_invalid_override_security_value_is_a_hard_error_and_mutates_nothing
     let mut resolved = resolve_no_plugins(raw_network("shared"), None);
     assert_eq!(resolved.network, NetworkPolicy::Shared);
     let errs = resolved
-        .apply_override(Override::for_test(RawConfig {
-            network: Some(NetworkField::Posture("nonee".into())),
-            ..RawConfig::default()
-        }))
+        .apply_override(
+            Override::for_test(RawConfig {
+                network: Some(NetworkField::Posture("nonee".into())),
+                ..RawConfig::default()
+            }),
+            None,
+        )
         .unwrap_err();
     assert!(
         errs.iter().any(|e| e.contains("network")),
@@ -9270,7 +9307,7 @@ fn an_override_redaction_floor_applies_and_a_zero_is_a_hard_error() {
 
     let mut resolved = resolve_no_plugins(redact(16), None);
     let errs = resolved
-        .apply_override(Override::for_test(redact(0)))
+        .apply_override(Override::for_test(redact(0)), None)
         .unwrap_err();
     assert!(
         errs.iter().any(|e| e.contains("redact.min_len")),
@@ -9288,10 +9325,13 @@ fn an_override_dbus_flag_applies_the_bool() {
     let mut resolved = resolve_no_plugins(RawConfig::default(), None);
     assert!(!resolved.dbus);
     resolved
-        .apply_override(Override::for_test(RawConfig {
-            dbus: Some(true),
-            ..RawConfig::default()
-        }))
+        .apply_override(
+            Override::for_test(RawConfig {
+                dbus: Some(true),
+                ..RawConfig::default()
+            }),
+            None,
+        )
         .unwrap();
     assert!(resolved.dbus);
     assert_eq!(resolved.dbus_origin, Provenance::Override);
@@ -9377,10 +9417,13 @@ fn a_set_but_invalid_override_proc_mode_is_a_hard_error_and_mutates_nothing() {
     };
     let mut resolved = resolve_no_plugins(global, None);
     let errs = resolved
-        .apply_override(Override::for_test(RawConfig {
-            proc: Some(ProcField::Mode("enfroce".into())),
-            ..RawConfig::default()
-        }))
+        .apply_override(
+            Override::for_test(RawConfig {
+                proc: Some(ProcField::Mode("enfroce".into())),
+                ..RawConfig::default()
+            }),
+            None,
+        )
         .unwrap_err();
     assert!(
         errs.iter().any(|e| e.contains("proc")),
@@ -10470,7 +10513,7 @@ fn a_one_shot_credential_gets_its_plugins_table() {
         "api.example.com".to_string(),
         raw_secret_from(vec!["vault://secret/data/tok#v"]),
     )]));
-    r.apply_override(Override::for_test(over))
+    r.apply_override(Override::for_test(over), None)
         .expect("the override applies");
 
     let expected = vec![(
@@ -12733,10 +12776,13 @@ fn a_set_but_invalid_override_notify_mode_is_a_hard_error_and_mutates_nothing() 
     let global: RawConfig = toml::from_str("notify = \"off\"").unwrap();
     let mut resolved = resolve_no_plugins(global, None);
     let errs = resolved
-        .apply_override(Override::for_test(RawConfig {
-            notify: Some(NotifyField::Mode("alwyas".into())),
-            ..RawConfig::default()
-        }))
+        .apply_override(
+            Override::for_test(RawConfig {
+                notify: Some(NotifyField::Mode("alwyas".into())),
+                ..RawConfig::default()
+            }),
+            None,
+        )
         .unwrap_err();
     assert!(
         errs.iter().any(|e| e.contains("notify")),

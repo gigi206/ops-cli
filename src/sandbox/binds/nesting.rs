@@ -6,10 +6,15 @@
 //! trusted-only, so this is guidance rather than a control — and neither is visible from the
 //! resulting cage, which is why it is said at validation time instead.
 //!
-//! Prose only: nothing here is reached from a launch, and nothing here produces a mount. The list
-//! it reads, [`super::STRUCTURAL_DESTS`], stays with the mount plan that declares it.
+//! Nothing here produces a mount. The warnings are prose read at validation time, one of them
+//! ([`unestablishable_bind_warning`]) also dropping the bind it names; the one thing a launch reads
+//! is [`bind_reaches_the_cage`], the same shadowing asked as a predicate for the in-cage contract.
+//! The list all of them read, [`super::STRUCTURAL_DESTS`], stays with the mount plan that declares
+//! it.
 
-use super::{LAUNCHER_DESTS, STRUCTURAL_DESTS};
+use super::{
+    CAGE_CA_BUNDLE, DISTRO_SUPPLIED, LAUNCHER_DESTS, STRUCTURAL_DESTS, STRUCTURAL_SYMLINKS,
+};
 use std::path::Path;
 
 /// How a config bind's destination overlaps a structural mount destination.
@@ -60,6 +65,151 @@ fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
     })
 }
 
+/// Whether a config bind at canonical `dest` is what the cage finds at that path, or `false` when a
+/// mount the launch emits after the config binds replaces it: the project, at or under its root,
+/// and a structural or launcher destination, at or under it.
+///
+/// For the in-cage contract, which must not describe a bind the cage never sees. A read-only bind
+/// inside the project is covered by the project's read-write mount, so listing it as refusing a
+/// write would tell a process the opposite of what the mount does. The shadowing is the one
+/// [`structural_nesting_warning`] names host-side, asked here as a yes or no; the exact collision
+/// that warning passes over is included, since there the structural mount is what the cage finds.
+///
+/// `project` is the canonical project root, as for the warning.
+pub(crate) fn bind_reaches_the_cage(dest: &Path, project: Option<&Path>) -> bool {
+    project_over(dest, project).is_none()
+        && !STRUCTURAL_DESTS
+            .iter()
+            .chain(LAUNCHER_DESTS)
+            .any(|s| dest.starts_with(s))
+}
+
+/// A warning when a config bind at canonical `dest` cannot be established, or `None` when it can. The caller drops the bind on `Some`: a launch carrying it would fail in bwrap,
+/// before the cage exists, with a message naming a path the user never wrote.
+///
+/// The case is a bind that **contains** one of sbx's own mounts it cannot make room for. sbx
+/// mounts after the config binds, so each of its destinations under a bind has to be placed inside
+/// the bound directory: a missing file or directory there must be created, which a read-only bind
+/// refuses, and a symlink ([`STRUCTURAL_SYMLINKS`]) has to be created too, or replace an existing
+/// entry, which bwrap refuses outright. The two binds a user most plausibly writes are both of this
+/// shape: `/etc/ssl` holds sbx's `ca-bundle.crt`, which a Debian host does not carry, and `/etc`
+/// holds the `/etc/localtime` link.
+///
+/// Dropped rather than refused, because that is the failure the `binds` field already has: fewer
+/// binds, never a wider exposure, and the launch goes ahead. A declared distribution supplies the
+/// paths in [`DISTRO_SUPPLIED`] itself, so `distro` takes them out of the question. Only the fixed
+/// structural mounts are asked about: the [`LAUNCHER_DESTS`] are conditional, and dropping a bind
+/// over one on a launch that does not make it would refuse something that works.
+///
+/// A **writable** bind is dropped for a link alone. A link fails in any mode, since bwrap refuses
+/// to replace an existing entry and the host keeps one at every such path. A missing mountpoint,
+/// by contrast, is created in the host directory itself where the host allows it (the
+/// write-through the ancestor note of [`structural_nesting_warning`] names), and whether it does
+/// cannot be known without trying, so that case fails at the launch as it did before.
+pub(crate) fn unestablishable_bind_warning(
+    dest: &Path,
+    writable: bool,
+    distro: bool,
+) -> Option<String> {
+    let blocking = blocking_dest(dest, writable, distro, |p| p.symlink_metadata().is_ok())?;
+    Some(dropped_note(
+        dest,
+        blocking,
+        STRUCTURAL_SYMLINKS.contains(&blocking),
+    ))
+}
+
+/// The launch-time counterpart of [`unestablishable_bind_warning`], for the destinations the
+/// launcher adds on this launch only (the audio socket, the desktop portal, the GPU bridge, all
+/// under `/run`). Whether one is mounted is decided by the posture and by the hardware found at the
+/// launch, so it cannot be asked where the configuration is folded: a `/run` bind works on a launch
+/// that mounts none of them and fails on one that mounts any. `mounted` is this launch's own list.
+///
+/// A missing mountpoint under a read-only bind is the one case, as for the structural mounts; the
+/// launcher mounts no link. A destination under a structural mount that itself lies inside the bind
+/// is made in that mount rather than in the bind, so it blocks nothing.
+pub(crate) fn launch_unestablishable_bind_warning<'a>(
+    dest: &Path,
+    writable: bool,
+    mounted: impl IntoIterator<Item = &'a Path>,
+) -> Option<String> {
+    let blocking =
+        blocked_launcher_dest(dest, writable, mounted, |p| p.symlink_metadata().is_ok())?;
+    Some(dropped_note(dest, &blocking.display().to_string(), false))
+}
+
+/// The pure core of [`launch_unestablishable_bind_warning`], with the host taken as a closure.
+pub(super) fn blocked_launcher_dest<'a>(
+    dest: &Path,
+    writable: bool,
+    mounted: impl IntoIterator<Item = &'a Path>,
+    present: impl Fn(&Path) -> bool,
+) -> Option<&'a Path> {
+    if writable {
+        return None;
+    }
+    mounted
+        .into_iter()
+        .find(|&m| m != dest && m.starts_with(dest) && !covered_between(dest, m) && !present(m))
+}
+
+/// Whether a structural mount lies strictly inside the bind at `dest` and at or above `inner`, in
+/// which case `inner`'s mountpoint is made in that mount rather than in the bind.
+fn covered_between(dest: &Path, inner: &Path) -> bool {
+    STRUCTURAL_DESTS
+        .iter()
+        .map(Path::new)
+        .any(|s| s != dest && s != inner && s.starts_with(dest) && inner.starts_with(s))
+}
+
+/// The note naming a bind dropped because it holds `blocking`, one of sbx's own mounts it cannot
+/// make room for; `link` says whether that mount is a link rather than a missing path.
+fn dropped_note(dest: &Path, blocking: &str, link: bool) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let shown = elided(dest, home.as_deref());
+    let why = if link {
+        "a link the sandbox creates there, which cannot be placed inside a bind"
+    } else {
+        "a path the sandbox mounts there, which this host does not have and which cannot be \
+         created inside the bind"
+    };
+    let ca_note = if blocking == CAGE_CA_BUNDLE {
+        "; the cage's TLS does not need it, since sbx binds its own CA bundle"
+    } else {
+        ""
+    };
+    format!(
+        "bind `{shown}` is dropped: it contains `{blocking}`, {why}, so a launch could not \
+         establish it. Bind a narrower path beside it instead{ca_note}"
+    )
+}
+
+/// The pure core of [`unestablishable_bind_warning`]: the first structural destination strictly
+/// under `dest` that a bind there cannot make room for, given `present`, which says whether the
+/// host carries an entry at a path. Taken as a closure so the rule is exercised without a host.
+pub(super) fn blocking_dest(
+    dest: &Path,
+    writable: bool,
+    distro: bool,
+    present: impl Fn(&Path) -> bool,
+) -> Option<&'static str> {
+    STRUCTURAL_DESTS.iter().copied().find(|&s| {
+        let structural = Path::new(s);
+        structural != dest
+            && structural.starts_with(dest)
+            && !(distro && DISTRO_SUPPLIED.contains(&s))
+            && !covered_between(dest, structural)
+            && (STRUCTURAL_SYMLINKS.contains(&s) || (!writable && !present(structural)))
+    })
+}
+
+/// The project root when `dest` is at or under it, which the project's own mount, emitted after
+/// every config bind, then covers. One definition for the warning and for the predicate, so the
+/// contract never lists a bind the warning calls ineffective.
+fn project_over<'a>(dest: &Path, project: Option<&'a Path>) -> Option<&'a Path> {
+    project.filter(|p| dest.starts_with(p))
+}
+
 /// A bind path as a nesting note names it: the host home written `~`, everything else verbatim.
 ///
 /// These notes reach `sbx config show`'s compact view, whose contract is counts by default and
@@ -107,9 +257,7 @@ pub(crate) fn structural_nesting_warning(
     // the point: `[[binds]] path = "<project>", mode = "ro"` reads as making the project
     // read-only, and what actually happens is that the project's own read-write mount replaces it.
     // A bind that does the opposite of what it says is worth more than a bind that does nothing.
-    if let Some(project) = project
-        && dest.starts_with(project)
-    {
+    if let Some(project) = project_over(dest, project) {
         let what = if dest == project {
             "is the project itself".to_string()
         } else {

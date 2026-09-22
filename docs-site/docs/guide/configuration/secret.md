@@ -24,6 +24,27 @@ and injected into the matching outbound request on the wire; the plaintext never
 enters the sandbox. So a credential belongs in `[secret]`, **not** in
 [`env`](env) (which is visible inside the cage).
 
+## What the agent is told
+
+The invariant above has a cost the cage pays alone: a process that searches its environment for
+a key finds none, and concludes it is unauthenticated while its plain requests are already
+carrying a credential. What follows is the familiar shape. It asks the user for a token that
+already exists, writes one into a configuration file, or gives up on a destination it can reach.
+
+So the generated contract the cage reads at `/opt/sbx/egress-contract.md` names the
+**destinations** a credential is attached to, and states that the value is not in here and is not
+to be looked for. Destinations only: never a credential's name, its header, or the source it was
+read from. What a caller can act on is which destinations it is authenticated to, and none of
+those three changes that.
+
+The list is of the credentials that **resolved**. One that did not had its destination
+[denied for the run](#optional-what-an-unresolvable-credential-costs) as the proxy started, so it
+is absent from that list rather than promised in it. The same destination is taken out of the
+reachable hosts, and named under a heading of its own, **Refused for this run**, so that the `403`
+a request to it meets reads as this launch's decision rather than as a network fault. That is the
+one denial the document names: unlike a deny rule, it is a consequence of this launch, which one
+request would discover anyway.
+
 ## Keyed by host
 
 `secret` is a TOML *table* keyed by destination host, not an array: the host is the

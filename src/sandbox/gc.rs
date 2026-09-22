@@ -519,17 +519,22 @@ pub(crate) struct UnidentifiedTree {
 ///
 /// What a prune reports is what it removed: a tree whose removal fails lands in
 /// [`ReapReport::failed`] with its error, never in `dead`/`reaped_unidentified`.
+///
+/// Each tree is sized by `measure` before it is removed, so what is reported is the caller's figure
+/// for what a removal gives back ([`Reclaim::bytes`]).
 pub(crate) fn reap_dead_projects(
     projects_dir: &Path,
     live_ids: &BTreeSet<String>,
     prune: bool,
     prune_unidentified: bool,
+    measure: &dyn Fn(&Path) -> u64,
 ) -> ReapReport {
     reap_dead_projects_with(
         projects_dir,
         live_ids,
         prune,
         prune_unidentified,
+        measure,
         &force_remove_dir_all,
     )
 }
@@ -544,6 +549,7 @@ fn reap_dead_projects_with(
     live_ids: &BTreeSet<String>,
     prune: bool,
     prune_unidentified: bool,
+    measure: &dyn Fn(&Path) -> u64,
     remove: &dyn Fn(&Path) -> io::Result<()>,
 ) -> ReapReport {
     let mut dead = Vec::new();
@@ -579,7 +585,7 @@ fn reap_dead_projects_with(
         match marker {
             // Identified, and the project is gone with its parent still present — reclaimable.
             Some(path) if project_is_gone(&path) => {
-                let bytes = tree_size(&dir);
+                let bytes = measure(&dir);
                 // Reclaimed is what the removal did, not what it was asked to do: the failure
                 // carries the tree and its reason into `failed`, for the reason that field gives.
                 if prune && let Err(e) = remove(&dir) {
@@ -594,7 +600,7 @@ fn reap_dead_projects_with(
             // opt-in (`prune_unidentified`, independent of the dead reap), reclaim the tree too (no
             // deadness proof — the caller accepts that risk).
             None => {
-                let bytes = tree_size(&dir);
+                let bytes = measure(&dir);
                 if prune_unidentified {
                     if let Err(e) = remove(&dir) {
                         failed.push((dir, e));
@@ -638,7 +644,8 @@ pub(crate) enum ReapOneOutcome {
     NotFound,
     /// A running session holds the tree — never touch it.
     Live,
-    /// The tree was identified and (when `prune`) removed. `bytes` is its measured size.
+    /// The tree was identified and (when `prune`) removed. `bytes` is what the removal gives back,
+    /// as the caller's `measure` sized it.
     Tree { dir: PathBuf, bytes: u64 },
     /// The tree was identified and the removal failed — the directory, and the reason. Its own
     /// outcome rather than a `Tree` with a discarded error: the caller prints `removed` for a
@@ -675,8 +682,16 @@ pub(crate) fn reap_one(
     id: &str,
     live_ids: &BTreeSet<String>,
     prune: bool,
+    measure: &dyn Fn(&Path) -> u64,
 ) -> ReapOneOutcome {
-    reap_one_with(projects_dir, id, live_ids, prune, &force_remove_dir_all)
+    reap_one_with(
+        projects_dir,
+        id,
+        live_ids,
+        prune,
+        measure,
+        &force_remove_dir_all,
+    )
 }
 
 /// [`reap_one`] with the removal injected, for the reason [`reap_dead_projects_with`] gives.
@@ -685,6 +700,7 @@ fn reap_one_with(
     id: &str,
     live_ids: &BTreeSet<String>,
     prune: bool,
+    measure: &dyn Fn(&Path) -> u64,
     remove: &dyn Fn(&Path) -> io::Result<()>,
 ) -> ReapOneOutcome {
     // The id names a directory *under* `projects_dir` and reaches `force_remove_dir_all` — so it
@@ -702,7 +718,7 @@ fn reap_one_with(
     if live_ids.contains(id) {
         return ReapOneOutcome::Live;
     }
-    let bytes = tree_size(&dir);
+    let bytes = measure(&dir);
     if prune && let Err(error) = remove(&dir) {
         return ReapOneOutcome::Failed { dir, error };
     }
@@ -1744,6 +1760,63 @@ pub(crate) fn tree_size(path: &Path) -> u64 {
     tree_usage(path).bytes
 }
 
+/// What removing a project tree gives back, for every surface that names that figure: `sbx
+/// projects` lists it, `show` reports it, and `rm` announces it.
+///
+/// The answer turns on how the tree's store was seeded, which the tree does not record. Seeding
+/// reflinks each path from the shared store where the filesystem supports it and copies it where it
+/// does not (`projectstore`), and the two differ by the whole store: a reflinked store shares its
+/// data extents with the shared one, so removing it returns only what was built in the tree, while
+/// a copied store returns every byte it holds. The filesystem's own verdict is read instead, once,
+/// with the same probe the seeding uses; a probe that cannot run counts the whole tree, the upper
+/// bound. File data only: the metadata the filesystem keeps for the tree's inodes is freed too and
+/// is not counted.
+pub(crate) struct Reclaim {
+    /// The store path names the shared store holds.
+    shared: std::collections::HashSet<OsString>,
+    /// Whether the project trees' filesystem clones rather than copies.
+    reflinks: bool,
+}
+
+impl Reclaim {
+    /// Read the shared store's names and probe the filesystem the project trees live on.
+    pub(crate) fn probe(layout: &crate::store::Layout) -> Self {
+        Reclaim {
+            shared: super::inspect::shared_store_names(&layout.store_dir()),
+            reflinks: super::reflink_verdict(&layout.data_dir().join("projects")) == Some(true),
+        }
+    }
+
+    /// What removing the tree at `dir` gives back, from figures its caller already walked:
+    /// `total` for the whole tree and `seeded` for its [`seeded_store`].
+    pub(crate) fn given_usage(&self, dir: &Path, total: u64, seeded: u64) -> u64 {
+        if !self.reflinks {
+            return total;
+        }
+        total
+            .saturating_sub(seeded)
+            .saturating_add(super::inspect::store_built_here_against(dir, &self.shared))
+    }
+
+    /// What removing the tree at `dir` gives back, walking it once.
+    pub(crate) fn bytes(&self, dir: &Path) -> u64 {
+        let (total, parts) = tree_usage_parts(dir, &[seeded_store(dir)]);
+        self.given_usage(dir, total.bytes, parts[0].bytes)
+    }
+}
+
+/// The part of the project tree at `dir` that seeding fills from the shared store: its store
+/// paths, `store/nix/store`, and nothing else under `store/`.
+///
+/// The rest of that directory is the tree's own. `nix/var` holds the store's database, its roots
+/// and its profiles, written for this tree alone and shared with nothing, so counting it as seeded
+/// would leave its bytes out of what a removal gives back. Read by every figure that sets the seed
+/// apart ([`Reclaim`], `sbx projects show`), and the same directory
+/// [`super::inspect::store_built_here_against`] reads the built-here paths from.
+pub(crate) fn seeded_store(dir: &Path) -> PathBuf {
+    dir.join("store/nix/store")
+}
+
 /// Prune — or, in a dry run, list — the stale gc roots of the **shared** store, returning the root
 /// directories dropped. The shared store keeps one closure per channel revision and per project, so
 /// it is rooted under `<data>/gcroots/`: `base/<rev>/`, `gui/<rev>/`, `gpu/<rev>/`, and
@@ -2685,6 +2758,52 @@ mod tests {
         );
     }
 
+    /// What a removal gives back turns on how the store was seeded. Reflinked, the seeded store
+    /// shares its data with the shared one and gives nothing back, so only the rest of the tree
+    /// counts; copied, every byte does. Announcing the whole tree on a filesystem that reflinks
+    /// would name a figure the disk never gets back.
+    #[test]
+    fn what_a_removal_gives_back_follows_how_the_store_was_seeded() {
+        let tmp = TmpDir::new();
+        let dir = tmp.path().join("tree");
+        std::fs::create_dir_all(&dir).unwrap();
+        let reflinked = Reclaim {
+            shared: std::collections::HashSet::new(),
+            reflinks: true,
+        };
+        let copied = Reclaim {
+            shared: std::collections::HashSet::new(),
+            reflinks: false,
+        };
+        assert_eq!(reflinked.given_usage(&dir, 1000, 800), 200);
+        assert_eq!(copied.given_usage(&dir, 1000, 800), 1000);
+    }
+
+    /// Only the store paths are seeded. The store's database under `nix/var` is written for the
+    /// tree alone, so a removal gives it back even where the paths beside it are shared.
+    #[test]
+    fn the_store_database_counts_as_the_trees_own() {
+        let tmp = TmpDir::new();
+        let dir = tmp.path().join("tree");
+        let path = seeded_store(&dir).join("abc-hello");
+        let db = dir.join("store/nix/var/nix/db");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(path.join("payload"), vec![b'x'; 64 * 1024]).unwrap();
+        std::fs::write(db.join("db.sqlite"), vec![b'y'; 64 * 1024]).unwrap();
+        let reclaim = Reclaim {
+            shared: [OsString::from("abc-hello")].into_iter().collect(),
+            reflinks: true,
+        };
+        let seeded = tree_size(&seeded_store(&dir));
+        let freed = reclaim.bytes(&dir);
+        assert_eq!(freed, tree_size(&dir) - seeded);
+        assert!(
+            freed >= 64 * 1024,
+            "the database is the tree's own and counts: {freed}"
+        );
+    }
+
     /// The breakdown a report asks for — a tree, and two of its subtrees — has to add up: each part
     /// reports what sizing it alone would report, the total reports what sizing the whole tree
     /// alone would report, and what is left over is the rest of the tree. Sizing the tree and then
@@ -3325,7 +3444,7 @@ mod tests {
         let live = BTreeSet::from(["4444444444444444".to_string()]);
 
         // dry run: the one dead tree and the one unidentified tree are reported, nothing removed
-        let report = reap_dead_projects(&projects, &live, false, false);
+        let report = reap_dead_projects(&projects, &live, false, false, &tree_size);
         assert_eq!(report.dead.len(), 1, "exactly one tree is reclaimable");
         assert_eq!(report.dead[0].path, dead_path);
         assert_eq!(
@@ -3344,7 +3463,7 @@ mod tests {
         );
 
         // prune: only the dead, present-parent, not-busy, identified tree is removed
-        let report = reap_dead_projects(&projects, &live, true, false);
+        let report = reap_dead_projects(&projects, &live, true, false, &tree_size);
         assert_eq!(report.dead.len(), 1);
         assert!(
             !projects.join("2222222222222222").exists(),
@@ -3388,13 +3507,13 @@ mod tests {
         let live = BTreeSet::from(["cccccccccccccccc".to_string()]);
 
         // a missing id is reported, never silently succeeding.
-        match reap_one(&projects, "deadbeefdeadbeef", &live, true) {
+        match reap_one(&projects, "deadbeefdeadbeef", &live, true, &tree_size) {
             ReapOneOutcome::NotFound => {}
             other => panic!("a missing id must be NotFound, got {other:?}"),
         }
 
         // a live id is refused.
-        match reap_one(&projects, "cccccccccccccccc", &live, true) {
+        match reap_one(&projects, "cccccccccccccccc", &live, true, &tree_size) {
             ReapOneOutcome::Live => {}
             other => panic!("a live tree must be refused, got {other:?}"),
         }
@@ -3404,7 +3523,7 @@ mod tests {
         );
 
         // dry run on a markerless tree: reported as a Tree, not removed.
-        let out = reap_one(&projects, "aaaaaaaaaaaaaaaa", &live, false);
+        let out = reap_one(&projects, "aaaaaaaaaaaaaaaa", &live, false, &tree_size);
         let ReapOneOutcome::Tree { dir, bytes } = out else {
             panic!("markerless tree must be a Tree outcome, got {out:?}")
         };
@@ -3417,7 +3536,7 @@ mod tests {
 
         // prune on an idle tree (marker points at an existing project): reaped anyway, because the
         // user named it — `reap_one` does not apply the deadness check `reap_dead_projects` does.
-        let out = reap_one(&projects, "bbbbbbbbbbbbbbbb", &live, true);
+        let out = reap_one(&projects, "bbbbbbbbbbbbbbbb", &live, true, &tree_size);
         assert!(matches!(out, ReapOneOutcome::Tree { .. }));
         assert!(
             !projects.join("bbbbbbbbbbbbbbbb").exists(),
@@ -3468,7 +3587,7 @@ mod tests {
         std::fs::write(pool.join("f"), b"x").unwrap();
 
         let live = BTreeSet::new();
-        let out = reap_one(&projects, "aaaaaaaaaaaaaaaa", &live, true);
+        let out = reap_one(&projects, "aaaaaaaaaaaaaaaa", &live, true, &tree_size);
         assert!(matches!(out, ReapOneOutcome::Tree { .. }));
         assert!(!projects.join("aaaaaaaaaaaaaaaa").exists());
         // teeth: the mise pool went with the tree
@@ -3488,14 +3607,14 @@ mod tests {
         std::fs::create_dir_all(&victim).unwrap();
         let live = BTreeSet::new();
 
-        match reap_one(&projects, "../victim", &live, true) {
+        match reap_one(&projects, "../victim", &live, true, &tree_size) {
             ReapOneOutcome::NotFound => {}
             other => panic!("a traversal id must be NotFound, got {other:?}"),
         }
         assert!(victim.is_dir(), "the traversal target must be untouched");
 
         // An absolute id would `join`-replace the base; it too is refused, nothing removed.
-        match reap_one(&projects, "/", &live, true) {
+        match reap_one(&projects, "/", &live, true, &tree_size) {
             ReapOneOutcome::NotFound => {}
             other => panic!("an absolute id must be NotFound, got {other:?}"),
         }
@@ -3519,7 +3638,7 @@ mod tests {
         let live = BTreeSet::from(["bbbbbbbbbbbbbbbb".to_string()]);
 
         // dry run (neither switch): both reported as candidates, neither removed
-        let report = reap_dead_projects(&projects, &live, false, false);
+        let report = reap_dead_projects(&projects, &live, false, false, &tree_size);
         assert_eq!(
             report.unidentified.len(),
             1,
@@ -3540,7 +3659,7 @@ mod tests {
 
         // the markerless opt-in reaps the unheld markerless tree with the dead-prune OFF — the two
         // switches are independent — and the live one is still kept
-        let report = reap_dead_projects(&projects, &live, false, true);
+        let report = reap_dead_projects(&projects, &live, false, true, &tree_size);
         assert_eq!(
             report.reaped_unidentified.len(),
             1,

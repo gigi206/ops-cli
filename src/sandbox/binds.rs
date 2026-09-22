@@ -24,7 +24,10 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(crate) use self::nesting::structural_nesting_warning;
+pub(crate) use self::nesting::{
+    bind_reaches_the_cage, launch_unestablishable_bind_warning, structural_nesting_warning,
+    unestablishable_bind_warning,
+};
 pub(crate) use self::runtime::{
     Runtime, home_src, project_id, project_identity, project_runtime_id,
 };
@@ -1295,6 +1298,21 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     MISE_PROJECT_INCAGE,
     MISE_SHARED_INCAGE,
     super::contract::EGRESS_CONTRACT_INCAGE,
+];
+
+/// The entries of [`STRUCTURAL_DESTS`] that [`assemble`] lays down as a symlink rather than a mount.
+///
+/// bwrap cannot place one inside a config bind whatever the host holds there: an absent entry has
+/// to be created, which a read-only bind refuses, and an existing one is refused outright
+/// ("existing destination"). So a config bind that contains one cannot be established at all —
+/// see [`nesting::unestablishable_bind_warning`]. Kept in lockstep with `assemble` by
+/// `structural_symlinks_lists_every_link_assemble_emits`.
+pub(super) const STRUCTURAL_SYMLINKS: &[&str] = &[
+    SANDBOX_SHELL,
+    SANDBOX_BASH,
+    SANDBOX_ENV,
+    SANDBOX_LDD,
+    CAGE_LOCALTIME,
 ];
 
 /// The destinations the **launcher** binds into a cage, as opposed to the structural mounts

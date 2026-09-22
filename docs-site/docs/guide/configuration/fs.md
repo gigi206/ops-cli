@@ -436,12 +436,20 @@ write, so a process discovers that too, though only after producing the bytes. A
 **directory** lists **empty**, so trying teaches a process something false, and it acts on that
 instead of on a refusal.
 
+The section is shared with [`binds`](binds): a bind mounted read-only refuses a write the way a
+read-only mask does, so the two are listed together, sorted, under one heading. Which table
+closed a path is the host's business, while what a process needs to know is whether this path
+takes a write.
+
 The section therefore names the resolved paths and what each looks like from inside, never the
 `[fs]` entries that produced them: a path's name is already visible in a listing, so naming it
 discloses nothing new, while a pattern would describe files that do not exist. It also states its
-own limits, so the list is not read as the whole of `[fs]`: a path nobody listed is open, and an
-open may still be refused by [`scan`](#scan-closing-a-file-by-what-it-holds), whose shapes stay
-out of the document.
+own limits, so the list is not read as the whole of `[fs]`: a path nobody listed is covered by
+neither a mask nor a configured read-only bind, and an open may still be refused by
+[`scan`](#scan-closing-a-file-by-what-it-holds), whose shapes stay out of the document. The
+read-only paths `sbx` mounts for itself (the control plane inside a writable bind, the task
+output directory and client, the contract file) are not listed either, and the document says so
+rather than let an unlisted path read as writable.
 
 ## Related
 

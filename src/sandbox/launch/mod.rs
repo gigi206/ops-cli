@@ -168,7 +168,7 @@ pub(crate) fn run(
     };
     // The override is the authoritative final word over the resolved baseline (`sbx run` has no app
     // overlay, so here is that final point).
-    if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
+    if let Err(code) = apply_launch_override(&mut prep.cfg, ov, &prep.cwd) {
         return code;
     }
 
@@ -325,8 +325,9 @@ fn warn_observe_feed_absent(
 fn apply_launch_override(
     cfg: &mut crate::config::Resolved,
     ov: crate::config::Override,
+    cwd: &Path,
 ) -> Result<(), ExitCode> {
-    cfg.apply_override(ov).map_err(|errs| {
+    cfg.apply_override(ov, Some(cwd)).map_err(|errs| {
         for e in errs {
             crate::diag::error(&format!("sbx: {e}"));
         }
@@ -559,7 +560,7 @@ pub(crate) fn app(
     prep.cfg.merge_app(app);
     // The override is the authoritative final word — applied *after* the app overlay so a one-shot
     // `sbx app <name> --config …`/`SBX_*` beats the app's own posture, not the other way round.
-    if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
+    if let Err(code) = apply_launch_override(&mut prep.cfg, ov, &prep.cwd) {
         return AppOutcome::plain(code);
     }
 

@@ -41,7 +41,11 @@ fn reap_dead_trees(
     let (prune, prune_unidentified) = (apply && dead, apply && markerless);
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let projects_dir = layout.data_dir().join("projects");
-    let report = super::gc::reap_dead_projects(&projects_dir, live_ids, prune, prune_unidentified);
+    let reclaim = super::gc::Reclaim::probe(layout);
+    let report =
+        super::gc::reap_dead_projects(&projects_dir, live_ids, prune, prune_unidentified, &|dir| {
+            reclaim.bytes(dir)
+        });
     if report.dead.is_empty()
         && report.unidentified.is_empty()
         && report.reaped_unidentified.is_empty()
@@ -149,8 +153,9 @@ struct ProjectTreeView {
     /// On-disk size in bytes (an upper bound — reflinked content shared with another tree counts
     /// per file).
     bytes: u64,
-    /// What the tree holds that the shared store does not: `bytes` less the seeded part of its
-    /// store. The figure a removal would actually have to give back, and the one the listing shows.
+    /// What a removal gives back ([`super::gc::Reclaim`]): `bytes` less the store paths seeded
+    /// from the shared store where they were reflinked from it, `bytes` itself where they were
+    /// copied. The figure the listing shows and the one `rm` announces.
     own_bytes: u64,
     /// The `own_bytes` figure rendered human-readably (the text listing shows this).
     size: String,
@@ -197,9 +202,9 @@ fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> 
     let live_ids = registry_or_note(super::launch::session_housekeeping(layout), "projects");
     let current = crate::current_project_id();
     let projects_dir = layout.data_dir().join("projects");
-    // Read once for every tree: each one is classified against the same shared store, and that
-    // listing is the larger of the two.
-    let shared = super::inspect::shared_store_names(&layout.store_dir());
+    // Read once for every tree: each one is sized against the same shared store and on the same
+    // filesystem.
+    let reclaim = super::gc::Reclaim::probe(layout);
     let mut rows: Vec<ProjectTreeView> = match std::fs::read_dir(&projects_dir) {
         Ok(rd) => rd
             .flatten()
@@ -208,11 +213,10 @@ fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> 
                 let dir = e.path();
                 let id = e.file_name().to_string_lossy().into_owned();
                 let class = super::gc::classify_tree(&dir, live_ids.as_ref());
-                let (total, parts) = super::gc::tree_usage_parts(&dir, &[dir.join("store")]);
+                let (total, parts) =
+                    super::gc::tree_usage_parts(&dir, &[super::gc::seeded_store(&dir)]);
                 let bytes = total.bytes;
-                let own_bytes = bytes
-                    .saturating_sub(parts[0].bytes)
-                    .saturating_add(super::inspect::store_built_here_against(&dir, &shared));
+                let own_bytes = reclaim.given_usage(&dir, bytes, parts[0].bytes);
                 ProjectTreeView {
                     current: current.as_deref() == Some(id.as_str()),
                     id,
@@ -284,6 +288,8 @@ struct ProjectShowView {
     project: Option<String>,
     last_used: String,
     total_bytes: u64,
+    /// The store paths seeded from the shared store ([`super::gc::seeded_store`]), the ones built
+    /// here included; the store's own database and roots count under `other_bytes`.
     store_bytes: u64,
     home_bytes: u64,
     /// The per-project mise pools of the global apps launched here. Not app *homes*: a global app
@@ -346,11 +352,17 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     );
     let class = super::gc::classify_tree(&dir, live_ids.as_ref());
 
-    // One walk for all three figures: `store` and `home` are inside the tree, so sizing them
-    // separately visited every one of their inodes twice.
+    // One walk for all three figures: the seeded store paths and `home` are inside the tree, so
+    // sizing them separately visited every one of their inodes twice. The store part is its seeded
+    // paths alone ([`super::gc::seeded_store`]); the store's own database and roots under `nix/var`
+    // are the tree's, and land in `other`.
     let (total, parts) = super::gc::tree_usage_parts(
         &dir,
-        &[dir.join("store"), dir.join("home"), dir.join("apps")],
+        &[
+            super::gc::seeded_store(&dir),
+            dir.join("home"),
+            dir.join("apps"),
+        ],
     );
     let (total_bytes, store_bytes, home_bytes, pools_bytes) =
         (total.bytes, parts[0].bytes, parts[1].bytes, parts[2].bytes);
@@ -358,13 +370,11 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
         .saturating_sub(store_bytes)
         .saturating_sub(home_bytes)
         .saturating_sub(pools_bytes);
-    // The store is seeded from the shared one path for path, so reporting it as part of what the
-    // tree costs counts the seed against the tree. What the tree adds is what was built into it,
-    // which is the store paths the shared store does not have.
+    // The store is seeded from the shared one path for path. Where it was reflinked, reporting it
+    // as part of what the tree costs counts the seed against the tree, and what the tree adds is
+    // what was built into it; where it was copied, every byte is the tree's.
     let store_built_here_bytes = super::inspect::store_built_here(&dir, &layout.store_dir());
-    let own_bytes = total_bytes
-        .saturating_sub(store_bytes)
-        .saturating_add(store_built_here_bytes);
+    let own_bytes = super::gc::Reclaim::probe(&layout).given_usage(&dir, total_bytes, store_bytes);
 
     // Realized signals, read once from the tree.
     let gcroots = super::inspect::gcroot_names(data, id);
@@ -757,6 +767,8 @@ pub(crate) fn projects_rm(
     };
     let current = crate::current_project_id();
     let projects_dir = layout.data_dir().join("projects");
+    // Probed once for every id named, before any removal: what each gives back is sized first.
+    let reclaim = super::gc::Reclaim::probe(&layout);
     let mut had_error = false;
 
     for id in ids {
@@ -777,7 +789,9 @@ pub(crate) fn projects_rm(
             had_error = true;
             continue;
         }
-        match super::gc::reap_one(&projects_dir, id, &live_ids, apply) {
+        match super::gc::reap_one(&projects_dir, id, &live_ids, apply, &|dir| {
+            reclaim.bytes(dir)
+        }) {
             super::gc::ReapOneOutcome::NotFound => {
                 crate::diag::error(&format!(
                     "sbx projects rm: no project tree for id `{id}` under {}.",

@@ -46,6 +46,19 @@ protects **integrity**, not **confidentiality**: the process inside runs as your
 uid, so it can *read* whatever is bound. To keep a secret out of the cage, do not
 bind it at all; bind read-only only what the tool may read but must not modify.
 
+A read-only bind is named in the generated contract the cage reads at
+`/opt/sbx/egress-contract.md`, alongside the paths a [`[fs]`](fs) mask closes, under the
+heading that lists what refuses a write. The two mechanisms differ on the host and not from
+inside: either way the contents are the real ones and the write comes back refused, after the
+work that produced the bytes. A writable bind is named nowhere, being no restriction to
+announce.
+
+Nor is a bind the cage never sees. One [inside the project](#layering-with-the-structural-mounts),
+or under a structural mount such as `/tmp`, is covered by a mount emitted after it, so the cage
+finds that mount at the path instead. Inside the project that means the project's own read-write
+mount: listing the bind as read-only would tell a process that a path refuses a write when it
+takes one.
+
 ## Path rules
 
 - A bind path must be **absolute**. It is canonicalized (resolving symlinks) at
@@ -85,11 +98,29 @@ with a tmpfs) may be listed by `sbx config show` yet dropped by the launch; an
 *ancestor* (e.g. `/etc`) would over-expose that directory. `sbx` warns when a config
 bind's destination nests with a structural mount.
 
+A **read-only** ancestor can be impossible to establish at all. `sbx` mounts its own files
+after the config binds, so each one under the bind must find room inside the bound host
+directory: a path the host does not carry would have to be created, and a link `sbx` creates
+(`/etc/localtime`, `/bin/sh`) can never be placed there. Such a bind is **dropped** with a
+warning naming the path that blocks it, rather than failing the launch in `bwrap`. The two
+common cases are `/etc`, which holds the `/etc/localtime` link, and `/etc/ssl` on a host
+without `ca-bundle.crt` (Debian and Ubuntu); the cage's TLS never needs the latter, since `sbx`
+binds its own CA bundle. Bind a narrower path instead, such as the directory holding your own
+certificate. A declared [`distro`](distro) supplies some of those paths itself, so they no longer
+block. A **read-write** bind is dropped for a link alone, which fails in any mode: a missing path
+under it is created in the host directory where the host allows it.
+
+The same holds for what `sbx` mounts under `/run` on some launches only: the audio socket, the
+desktop portal, the GPU bridge. Whether one is there depends on the posture and on the hardware
+found, so a read-only bind of `/run` itself is checked at the launch rather than when the
+configuration is read: kept on a launch that mounts none of them, dropped with the same warning on
+one that does.
+
 **The project is one of those mounts.** A bind at a path inside your project, or at the
 project itself, is emitted before the project and then covered by it, so it does nothing
-at all. `sbx` names it, because the failure is silent otherwise and because a bind of the
-project itself reads as changing its mode when it does not: the project's own read-write
-mount is what the cage ends up with. To narrow a path inside the project, use an
+at all. `sbx` names it, from a config file or a one-shot `--bind` alike, because the
+failure is silent otherwise and because a bind of the project itself reads as changing its
+mode when it does not: the project's own read-write mount is what the cage ends up with. To narrow a path inside the project, use an
 [`[fs] deny`](fs) mask, which is applied after the project rather than before it. A bind
 that *contains* your project is the ordinary case and is not remarked on: the project
 still lands correctly inside it.

@@ -77,6 +77,32 @@ limits are hardening, never the boundary. See [Enforcement stack](../concepts/en
 The memory ceiling is honestly **per-cage**, not host-global (N concurrent cages can
 sum past total RAM); the task cap is the clean host-wide anti-DoS guarantee.
 
+## What the agent is told
+
+The ceilings a launch really carries are written into the generated contract the cage reads at
+`/opt/sbx/egress-contract.md`, named by `SBX_EGRESS_CONTRACT`.
+
+They are there because a cage cannot find them out for itself. It reads a fresh `procfs` rather
+than a cgroup-aware one, and no `/sys/fs/cgroup` is mounted, so `free` and `/proc/meminfo` answer
+for the **host**. A process that sizes a build or a heap from those figures aims above what its
+cage may spend, and the answer it gets is an out-of-memory kill that leaves nothing behind to
+read. Most of the file withholds what a process could discover by trying; this section exists
+for the opposite reason, because trying is not an option here.
+
+The note speaks of memory only, and deliberately. The profile caps memory and tasks and caps no
+CPU time, so naming `nproc` among the interfaces that answer for the host would imply a ceiling
+the cage does not carry: the false fact that document is written against.
+
+The properties appear as systemd receives them, a percentage included: `sbx` hands the token to
+`systemd-run` and never resolves it, and a systemd percentage is a fraction of physical RAM,
+which is the figure `/proc/meminfo` reports inside the cage. So the token is directly actionable
+from in there.
+
+Only what this host will actually apply is named. On a host where no limit can be applied the
+section is absent rather than aspirational, and where the memory controller is not delegated the
+task cap appears alone: announcing a ceiling nothing enforces would be the same false fact the
+document exists to prevent.
+
 ## Inspecting the scopes
 
 Each cage owns one transient unit named after it, so the running cages are visible from

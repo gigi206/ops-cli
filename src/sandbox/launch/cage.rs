@@ -276,8 +276,12 @@ pub(in crate::sandbox) fn cage_command(
     let (argv, keep_open) = crate::sandbox::argv::compose(spec)?;
     let (holder_prog, holder_argv) =
         crate::sandbox::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
-    let (prog, args) =
-        crate::sandbox::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
+    // The launch's own decision when it took one, so the cage carries the limits its contract
+    // names; otherwise the one `wrap` takes here.
+    let (prog, args) = match &spec.limit_scope {
+        Some(scope) => scope.wrap(&holder_prog, holder_argv, &spec.cage_slug),
+        None => crate::sandbox::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug),
+    };
     Ok((prog, args, keep_open))
 }
 

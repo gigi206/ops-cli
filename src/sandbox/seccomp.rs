@@ -280,6 +280,94 @@ fn eperm_rules(policy: &SeccompPolicy) -> Rules {
     m
 }
 
+/// The families of system call this cage still refuses with `EPERM`, in a form a process inside it
+/// can act on, or empty when a relaxation has lifted them all.
+///
+/// For the in-cage contract. A refusal here arrives as a permission error on a call the program
+/// was entitled to make on an ordinary host, so a process reads it as a broken installation and
+/// goes looking for what to fix: the same misreading a failed `ping` produces one plane over, and
+/// the same remedy — say that it was deliberate. Naming the families discloses nothing a single
+/// call would not: a refusal is static and total, with no human review to route around, which is
+/// what makes this different from `[proc]`, where a list would name by complement what reaches a
+/// person.
+///
+/// Derived from [`eperm_rules`], the same set the filter is compiled from, so a `[seccomp] allow`
+/// that lifts a syscall drops its family here rather than leaving the document asserting a refusal
+/// this cage no longer makes. The `ENOSYS` half is deliberately left out: it exists so a caller
+/// falls back to an older call and carries on, and a fallback that works is not a fact worth
+/// spending a reader's attention on.
+pub(crate) fn refused_families(policy: &SeccompPolicy) -> Vec<&'static str> {
+    let rules = eperm_rules(policy);
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut push = |family: &'static str| {
+        if !out.contains(&family) {
+            out.push(family);
+        }
+    };
+    for (name, nr) in eperm_unconditional_named() {
+        if rules.contains_key(&nr) {
+            push(family_of(name).unwrap_or(OTHER_PRIVILEGED));
+        }
+    }
+    // The two argument-filtered calls carry their family in the rule rather than in the name:
+    // `clone` is denied only for the namespace flags left unlifted, `ioctl` only for the terminal
+    // requests, so the whole syscall being present says nothing on its own.
+    if rules.contains_key(&libc::SYS_clone) {
+        push(NAMESPACES);
+    }
+    if rules.contains_key(&libc::SYS_ioctl) {
+        push(TERMINAL_INJECTION);
+    }
+    out
+}
+
+/// Which family a denied syscall belongs to, phrased as what a caller was trying to do rather than
+/// as a kernel subsystem: the reader is a process that just met an `EPERM`, not an author of the
+/// denylist.
+///
+/// The groupings are the ones [`eperm_unconditional_named`] already carries as comments, and every
+/// name on that list has an arm — asserted by `every_denied_syscall_belongs_to_a_named_family`,
+/// which is what makes a syscall added to the denylist fail a test rather than reach the document
+/// wearing another family's description. `None` is the honest answer for a name no arm claims, and
+/// the caller renders it as [`OTHER_PRIVILEGED`]: vague where it cannot be precise, since a
+/// confident wrong sentence is the one failure this document is written against.
+fn family_of(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "ptrace" | "process_vm_readv" | "process_vm_writev" => {
+            "reading or patching another process (a debugger, `strace`, a leak sanitizer)"
+        }
+        "init_module" | "finit_module" | "delete_module" | "kexec_load" | "kexec_file_load"
+        | "reboot" => "loading kernel modules, and rebooting",
+        "bpf" | "perf_event_open" => {
+            "BPF and performance counters (`perf` and profilers built on it)"
+        }
+        "io_uring_setup" | "io_uring_enter" | "io_uring_register" | "userfaultfd" => {
+            "io_uring and userfaultfd"
+        }
+        "keyctl" | "add_key" | "request_key" => "the kernel keyring",
+        "unshare" | "setns" | "mount" | "umount2" | "pivot_root" | "chroot" => NAMESPACES,
+        "ioperm" | "iopl" => "direct access to x86 I/O ports",
+        "swapon" | "swapoff" | "acct" | "syslog" | "sethostname" | "setdomainname" => {
+            "changing this machine's own settings (its hostname, swap, accounting, kernel log)"
+        }
+        "personality" => "changing this process's execution domain",
+        _ => return None,
+    })
+}
+
+/// What an unclassified denied syscall renders as. Reached only between a syscall being added to
+/// the denylist and its arm being written, which the test above turns into a red build rather than
+/// a wrong sentence in a document a process acts on.
+const OTHER_PRIVILEGED: &str = "other privileged calls";
+
+/// The family both the mount/namespace syscalls and an unlifted `clone` flag belong to. Named once
+/// because two arms reach it, and a second spelling would read as a second family in the document.
+const NAMESPACES: &str =
+    "mounting, and creating namespaces (so a nested container or sandbox does not start here)";
+
+/// The family an unlifted `ioctl` request belongs to.
+const TERMINAL_INJECTION: &str = "pushing input into the terminal this cage was started from";
+
 /// The ENOSYS filter's rules for a given relaxation policy: `clone3` and the new mount API, minus
 /// any the policy lifts wholesale. A default (empty) policy reproduces the full set.
 fn enosys_rules(policy: &SeccompPolicy) -> Rules {
@@ -746,6 +834,75 @@ mod tests {
         // Where `libc` names it, its own constant is the oracle for the number written here.
         #[cfg(target_arch = "x86_64")]
         assert_eq!(nr, libc::SYS_kexec_file_load);
+    }
+
+    /// What the in-cage contract is told tracks the filter, not the mandatory list.
+    ///
+    /// The baseline names the families a process actually meets, and a `[seccomp] allow` that
+    /// lifts a family drops it: the document would otherwise assert a refusal this cage no longer
+    /// makes, which is the class of false fact it exists to prevent. `ptrace` is the family to
+    /// exercise because it takes three tokens to lift, so a per-syscall check would keep claiming
+    /// the refusal after the first.
+    #[test]
+    fn the_families_named_in_the_contract_follow_the_filter() {
+        let base = refused_families(&SeccompPolicy::default());
+        assert!(
+            base.iter().any(|f| f.contains("`strace`")),
+            "the debugger family is on the mandatory denylist: {base:?}"
+        );
+        assert!(
+            base.contains(&NAMESPACES) && base.contains(&TERMINAL_INJECTION),
+            "the two argument-filtered calls carry families of their own: {base:?}"
+        );
+
+        let mut lifted = SeccompPolicy::default();
+        for nr in [
+            libc::SYS_ptrace,
+            libc::SYS_process_vm_readv,
+            libc::SYS_process_vm_writev,
+        ] {
+            lifted.allow(Allow::Whole(nr));
+        }
+        let after = refused_families(&lifted);
+        assert!(
+            !after.iter().any(|f| f.contains("`strace`")),
+            "a lifted family must leave the document with it: {after:?}"
+        );
+        assert!(
+            after.contains(&NAMESPACES),
+            "lifting one family says nothing about the others: {after:?}"
+        );
+    }
+
+    /// Every denied syscall has a description of its own, so none of them reaches the in-cage
+    /// contract wearing another family's.
+    ///
+    /// The catch-all exists for the window between a syscall joining the denylist and its arm
+    /// being written, and this is what closes that window at build time instead of leaving a
+    /// confident wrong sentence in a document a process acts on. It walks the denylist itself, so
+    /// it covers whatever this target's `cfg` put there.
+    #[test]
+    fn every_denied_syscall_belongs_to_a_named_family() {
+        for (name, _) in eperm_unconditional_named() {
+            assert!(
+                family_of(name).is_some(),
+                "`{name}` is denied but unclassified: it would be announced as \
+                 `{OTHER_PRIVILEGED}`, so give it an arm in `family_of`"
+            );
+        }
+    }
+
+    /// A policy that lifts everything leaves nothing to announce, and the section is then absent
+    /// rather than empty — the same shape every other plane of that document takes.
+    #[test]
+    fn a_fully_lifted_policy_names_no_family() {
+        let mut lifted = SeccompPolicy::default();
+        for (_, nr) in eperm_unconditional_named() {
+            lifted.allow(Allow::Whole(nr));
+        }
+        lifted.allow(Allow::Whole(libc::SYS_clone));
+        lifted.allow(Allow::Whole(libc::SYS_ioctl));
+        assert!(refused_families(&lifted).is_empty());
     }
 
     #[test]

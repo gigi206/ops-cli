@@ -333,6 +333,108 @@ fn structural_dests_lists_every_fixed_mount_assemble_emits() {
     }
 }
 
+#[test]
+fn structural_symlinks_lists_every_link_assemble_emits() {
+    // A bind containing a link sbx creates can never be established, so the rule that drops one
+    // reads this list; a new structural symlink missing from it would let such a bind through to a
+    // launch that fails in bwrap. Walked over the same fully-conditional spec as the list above.
+    let spec = assembled_with_every_conditional_mount();
+    for mount in &spec.mounts {
+        let dest = mount.dest();
+        let listed = STRUCTURAL_DESTS.iter().any(|s| Path::new(s) == dest);
+        let is_link = matches!(mount, crate::sandbox::spec::Mount::Symlink { .. });
+        if listed {
+            assert_eq!(
+                STRUCTURAL_SYMLINKS.iter().any(|s| Path::new(s) == dest),
+                is_link,
+                "{dest:?}: STRUCTURAL_SYMLINKS must list exactly the structural links"
+            );
+        }
+    }
+}
+
+/// A launcher destination blocks a read-only bind only on a launch that mounts it: `/run` holds
+/// the audio socket when audio is on and nothing of sbx's otherwise.
+#[test]
+fn a_launcher_destination_blocks_a_bind_only_on_the_launch_that_mounts_it() {
+    use super::nesting::blocked_launcher_dest;
+    let absent = |_: &Path| false;
+    let pulse = Path::new(super::super::audio::CAGE_SOCK);
+    assert_eq!(
+        blocked_launcher_dest(Path::new("/run"), false, [pulse], absent),
+        Some(pulse)
+    );
+    assert_eq!(
+        blocked_launcher_dest(Path::new("/run"), false, [], absent),
+        None,
+        "a launch that mounts nothing under the bind leaves it alone"
+    );
+    assert_eq!(
+        blocked_launcher_dest(Path::new("/run"), true, [pulse], absent),
+        None,
+        "a writable bind may have the mountpoint created in it"
+    );
+    // A destination under a structural mount inside the bind is made in that mount.
+    let under_tmp = Path::new("/tmp/sbx-egress.sock");
+    assert_eq!(
+        blocked_launcher_dest(Path::new("/"), false, [under_tmp], absent),
+        None
+    );
+}
+
+/// What a bind holding one of sbx's own mounts can make room for, decided without a host.
+#[test]
+fn a_bind_that_cannot_hold_an_sbx_mount_is_named_by_the_path_that_blocks_it() {
+    use super::nesting::blocking_dest;
+    // A host whose `/etc/ssl` carries the Debian bundle but not the NixOS one.
+    let debian = |p: &Path| p != Path::new(CAGE_CA_BUNDLE);
+    assert_eq!(
+        blocking_dest(Path::new("/etc/ssl"), false, false, debian),
+        Some(CAGE_CA_BUNDLE),
+        "the missing file blocks, not the first one listed"
+    );
+    // A host carrying both: nothing needs creating, so the bind is established.
+    assert_eq!(
+        blocking_dest(Path::new("/etc/ssl"), false, false, |_| true),
+        None
+    );
+    // A link blocks whatever the host holds.
+    assert_eq!(
+        blocking_dest(Path::new("/etc"), false, false, |_| true),
+        Some(CAGE_LOCALTIME)
+    );
+    // A declared distribution supplies its own `/etc/localtime`, so it no longer blocks.
+    assert_eq!(
+        blocking_dest(Path::new("/etc"), false, true, |_| true),
+        None
+    );
+    // Only an ancestor is concerned: the structural path itself, or a path beside it, is not.
+    assert_eq!(
+        blocking_dest(Path::new(CAGE_CA_BUNDLE), false, false, |_| false),
+        None
+    );
+    assert_eq!(
+        blocking_dest(Path::new("/etc/company-ca"), false, false, |_| false),
+        None
+    );
+    // Writable, a missing path may be created on the host, so only a link blocks.
+    assert_eq!(
+        blocking_dest(Path::new("/etc/ssl"), true, false, debian),
+        None,
+        "a writable bind is not dropped for a path the host may create"
+    );
+    assert_eq!(
+        blocking_dest(Path::new("/etc"), true, false, |_| true),
+        Some(CAGE_LOCALTIME),
+        "a link blocks in any mode"
+    );
+    let w = unestablishable_bind_warning(Path::new("/etc"), false, false).expect("dropped");
+    assert!(
+        w.contains("is dropped") && w.contains(CAGE_LOCALTIME),
+        "{w}"
+    );
+}
+
 /// A destination whose name the file already maps gets no second line: the built-in one wins the
 /// lookup, so a later line would only mislead a reader into thinking it took effect.
 #[test]
@@ -557,6 +659,45 @@ fn a_bind_at_one_of_the_launchers_own_destinations_is_named() {
     }
     // And an unrelated path is still not a conflict.
     assert!(structural_nesting_warning(Path::new("/run/user/1000"), false, None).is_none());
+}
+
+/// The contract's question and the warning's answer agree: a bind the cage never sees is one the
+/// warning names, and a bind the cage does see is listed.
+///
+/// The project case is the one that matters most: a read-only bind inside the project is covered
+/// by the project's read-write mount, so a write there reaches the host, and a contract naming it
+/// read-only would tell a process the opposite.
+#[test]
+fn a_bind_reaches_the_cage_only_where_no_later_mount_covers_it() {
+    let project = Path::new("/home/u/work/api");
+    for covered in [
+        "/home/u/work/api",
+        "/home/u/work/api/vendor",
+        "/tmp/scratch",
+        "/nix",
+        "/run/sbx-state",
+    ] {
+        assert!(
+            !bind_reaches_the_cage(Path::new(covered), Some(project)),
+            "`{covered}` is covered by a later mount"
+        );
+    }
+    // The exact structural collision is the one case the warning passes over: there the
+    // structural mount is what the cage finds, which is not the bind.
+    assert!(structural_nesting_warning(Path::new("/nix"), false, Some(project)).is_none());
+    for shadowed in ["/home/u/work/api/vendor", "/tmp/scratch", "/run/sbx-state"] {
+        assert!(
+            structural_nesting_warning(Path::new(shadowed), false, Some(project)).is_some(),
+            "the host is told about `{shadowed}` too"
+        );
+    }
+
+    for seen in ["/etc/company-ca", "/home/u", "/home/u/work/api-docs"] {
+        assert!(
+            bind_reaches_the_cage(Path::new(seen), Some(project)),
+            "`{seen}` is what the cage finds at that path"
+        );
+    }
 }
 
 #[test]

@@ -151,6 +151,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         declared,
         &sbx_roots,
         project.as_deref(),
+        resolved.distro.is_some(),
         Some(LayerRekey {
             declared: &raw_layer,
             canonical: &mut canon_layer,
@@ -163,12 +164,15 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // Each app's binds go through the same fold, into that app's own warnings — so an app overlay
     // also advertises only the binds the launch would actually make. No re-keying: the per-layer
     // provenance map is the baseline's.
+    // An app declares no distribution of its own, so the baseline's is the one its launch runs on.
+    let distro = resolved.distro.is_some();
     for app in resolved.apps.values_mut() {
         let declared = std::mem::take(&mut app.binds);
         app.binds = canonicalize_binds(
             declared,
             &sbx_roots,
             project.as_deref(),
+            distro,
             None,
             &mut app.warnings,
         );
@@ -231,11 +235,14 @@ pub(super) struct LayerRekey<'a> {
 ///
 /// `project` is the **canonical** project root (the bind paths here are canonical, so a symlinked
 /// root would otherwise never match its own binds), and `layer` re-keys the caller's per-layer
-/// provenance as the canonical paths are produced.
+/// provenance as the canonical paths are produced. `distro` says whether a distribution is
+/// declared, which supplies some of the paths a bind might otherwise be unable to hold
+/// ([`crate::sandbox::unestablishable_bind_warning`]).
 pub(super) fn canonicalize_binds(
     binds: Vec<Bind>,
     roots: &[PathBuf],
     project: Option<&Path>,
+    distro: bool,
     mut layer: Option<LayerRekey<'_>>,
     warnings: &mut Vec<String>,
 ) -> Vec<Bind> {
@@ -266,6 +273,22 @@ pub(super) fn canonicalize_binds(
             });
         }
     }
+    // A bind that holds one of sbx's own mounts it cannot make room for is dropped, with its reason:
+    // the launch carrying it would fail in bwrap before the cage exists. Dropped here rather than at
+    // the launch so `sbx config` shows the bind list the launch will really mount. Its provenance
+    // entry goes with it, so nothing names a bind that is gone.
+    out.retain(|bind| {
+        match crate::sandbox::unestablishable_bind_warning(&bind.path, bind.writable, distro) {
+            Some(w) => {
+                warnings.push(w);
+                if let Some(rekey) = layer.as_mut() {
+                    rekey.canonical.remove(&bind.path);
+                }
+                false
+            }
+            None => true,
+        }
+    });
     // Nesting warnings once per effective bind (after dedup, so the reported mode is the one the
     // launch will use): a bind that nests with a structural mount will not behave as declared (a
     // descendant is shadowed, an ancestor over-exposes). Trusted-only field, so this warns without

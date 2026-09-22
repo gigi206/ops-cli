@@ -2444,6 +2444,12 @@ pub(super) fn build(
     let mut egress_guard = None;
     let mut egress_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut egress_env: Vec<(String, String)> = Vec::new();
+    // The destinations the proxy will authenticate for the cage, for the in-cage contract to name.
+    // Empty under a posture that stands no proxy, which injects nothing.
+    let mut authenticated: Vec<String> = Vec::new();
+    // The destinations the proxy denied for this run because their credential did not resolve, for
+    // the in-cage contract to take out of the reachable listing. Empty under the same postures.
+    let mut withdrawn: Vec<String> = Vec::new();
     // The host-side egress socket, carried out of the block for the netns holder: the
     // transparent-capture tap dials it from *outside* the cage, so it needs the real path, not the
     // bind's in-cage name. `None` under any posture that stands no proxy up.
@@ -2561,6 +2567,8 @@ pub(super) fn build(
         }
         egress_binds = wiring.binds;
         egress_env = wiring.env;
+        authenticated = wiring.authenticated;
+        withdrawn = wiring.withdrawn;
         proxy_host_uds = Some(wiring.host_uds);
         proxy_control_uds = wiring.control_uds;
         egress_guard = Some(guard);
@@ -2733,26 +2741,82 @@ pub(super) fn build(
         &prep.cfg.packages,
         &prep.cfg.accepts_fresh_releases,
     );
+    // The config binds this launch can establish. The fold already dropped a bind holding one of the
+    // fixed structural mounts; what it could not know is what the launcher mounts on this launch
+    // alone, so a read-only bind holding one of those, missing on the host, is dropped here with the
+    // same note rather than failing in bwrap. Only read-only binds are dropped, so the control-plane
+    // pins above, which serve read-write ones, never outlive the bind they protect.
+    let config_binds: Vec<crate::config::Bind> = prep
+        .cfg
+        .binds
+        .iter()
+        .filter(|b| {
+            match binds::launch_unestablishable_bind_warning(
+                &b.path,
+                b.writable,
+                extra_binds.iter().map(|e| e.dest.as_path()),
+            ) {
+                Some(note) => {
+                    crate::diag::warn_config(&note);
+                    false
+                }
+                None => true,
+            }
+        })
+        .cloned()
+        .collect();
     let overlay = binds::Overlay {
         env: &extra_env,
-        binds: &prep.cfg.binds,
+        binds: &config_binds,
         bin_paths: &provisioned.bin_paths,
         timezone: &timezone,
         fresh_release_tokens: &fresh_release_tokens,
         ignored_mise_paths: &prep.cfg.mise_ignored,
         share_install_pools: prep.cfg.apps_share_install_pools,
     };
+    // The families the filter still refuses, from the same relaxation the filter is built from
+    // below, so a `[seccomp] allow` drops a family here instead of leaving the document claiming a
+    // refusal this cage no longer makes.
+    let refused_syscalls = crate::sandbox::seccomp::refused_families(&prep.cfg.seccomp);
+    // The limit decision, taken once: its properties go into the contract below, and the scope
+    // travels on the spec to the launch, so the ceilings the document names are the ones the cage
+    // is wrapped in.
+    let limit_scope = crate::sandbox::cgroup::Scope::decide(&prep.cfg.limits);
+    // The binds the cage really finds at their path. One inside the project, or under a structural
+    // mount, is covered by a mount emitted after it, so listing it would describe a mode the cage
+    // does not have: a read-only bind inside the project takes a write, through the project's own
+    // read-write mount. The root is canonical because the bind paths are.
+    let project_root = std::fs::canonicalize(&prep.cwd).ok();
+    let visible_binds: Vec<crate::config::Bind> = config_binds
+        .iter()
+        .filter(|b| binds::bind_reaches_the_cage(&b.path, project_root.as_deref()))
+        .cloned()
+        .collect();
     // Generate the in-cage contract from the resolved (post-`merge_app`) config, so a process
-    // inside the cage can see which hosts it can reach, why a direct connection or `ping` fails,
-    // and which declared operations it may invoke. The tasks are the gated ones — the same list the
-    // task plane serves — so the file never advertises an operation the socket would refuse to run.
-    // Informational only; bound read-only by `build_spec`.
-    let egress_contract = crate::sandbox::contract::cage_contract(
-        &prep.cfg.network,
-        &prep.cfg.tasks,
-        &fs.masks,
-        &prep.cfg.proc,
-    );
+    // inside the cage can see which hosts it can reach and which it is authenticated to, why a
+    // direct connection or `ping` fails, which paths a mask or a read-only bind covers, which
+    // system calls are refused, what it may spend, and which declared operations it may invoke.
+    // The tasks are the gated ones — the same list the task plane serves — so the file never
+    // advertises an operation the socket would refuse to run. The limits are the ones this host can
+    // really apply, taken from the decision the launch itself will take: read from the profile
+    // instead, the document would name a ceiling on every host that carries none. Informational
+    // only; bound read-only by `build_spec`.
+    let egress_contract =
+        crate::sandbox::contract::cage_contract(&crate::sandbox::contract::CageFacts {
+            policy: &prep.cfg.network,
+            // The proxy's own lists, not the declared ones: a credential that did not resolve had
+            // its destination denied as the proxy started, so it is withdrawn from what is
+            // reachable and absent from what is authenticated. Both empty under a posture that
+            // stands no proxy.
+            withdrawn: &withdrawn,
+            tasks: &prep.cfg.tasks,
+            masks: &fs.masks,
+            binds: &visible_binds,
+            authenticated: &authenticated,
+            proc: &prep.cfg.proc,
+            refused_syscalls: &refused_syscalls,
+            limits: limit_scope.properties(),
+        });
     // The device grant: the resolved `[devices]` plus, under `gpu = true`, this host's DRM **render**
     // nodes (`/dev/dri/renderD*`), so the cage can reach the GPU. Both become `--dev-bind-try`
     // mounts. Never the whole `/dev/dri` directory: that carries the `card*` primary nodes in with
@@ -2872,7 +2936,8 @@ pub(super) fn build(
     let spec = match holder {
         Some(nd) => spec.with_netns_dummy(nd),
         None => spec,
-    };
+    }
+    .with_limit_scope(limit_scope);
     // Stand the task plane up now: the spec is final (so a task cage can be derived from it) and the
     // launch has not happened yet (so bwrap finds the bound socket present). A failure here aborts
     // the launch rather than running a cage whose declared operations silently do not exist — the

@@ -90,6 +90,26 @@ opened:
 
 Cautions are informational: the token is still applied.
 
+## What the agent is told
+
+The generated contract the cage reads at `/opt/sbx/egress-contract.md` names the **families** of
+call the filter still refuses: reading or patching another process, loading kernel modules,
+mounting and creating namespaces, and so on. It says that the refusal is the sandbox's and
+that it does not depend on how a program is invoked.
+
+That is there because an `EPERM` on a call any program may make on an ordinary host reads as a
+broken installation, and the repairs it invites (reinstalling the tool, rebuilding it, running it
+under something else) are both futile and hard to tell apart from probing. The same reasoning
+wrote the `ping` note one plane over.
+
+Naming the families discloses nothing a single call would not: the refusal is static and total,
+with no human decision to route around, which is what makes this different from
+[`[proc]`](proc#what-the-agent-is-told), where a list of programs would name by complement what
+reaches a person. The families are derived from the **effective** filter, so an `allow` that
+lifts one drops it from the document rather than leaving it asserting a refusal the cage no
+longer makes. The `ENOSYS` half is left out: it exists so a caller falls back to an older call
+and carries on.
+
 ## Why it stays surface-reduction, not a boundary
 
 Blocking the mount/namespace family removes the

@@ -89,7 +89,7 @@ fn resolved_for(
             ExitCode::from(2)
         })?;
     let before = resolved.warnings.len();
-    let applied = resolved.apply_override(ov).map_err(|errs| {
+    let applied = resolved.apply_override(ov, Some(cwd)).map_err(|errs| {
         for e in &errs {
             diag::error(&format!("sbx: {verb}: {e}"));
         }

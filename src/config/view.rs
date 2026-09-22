@@ -1041,7 +1041,7 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
 ///
 /// Per-invocation CLI flags are not previewed (run the launch to see them); passing default (empty)
 /// CLI overrides reads only the ambient environment.
-fn apply_ambient_override(resolved: &mut Resolved) {
+fn apply_ambient_override(resolved: &mut Resolved, cwd: &Path) {
     let ov = match super::overrides::collect(&super::CliOverrides::default()) {
         Ok(ov) => ov,
         Err(e) => {
@@ -1058,7 +1058,7 @@ fn apply_ambient_override(resolved: &mut Resolved) {
     if let Err(e) = resolved.apply_override_channel(&ov) {
         resolved.warnings.push(e);
     }
-    if let Err(errs) = resolved.apply_override(ov) {
+    if let Err(errs) = resolved.apply_override(ov, Some(cwd)) {
         resolved.warnings.extend(errs);
     }
 }
@@ -1077,7 +1077,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     // contributes, which an override is not. Per-invocation CLI flags are not previewed here (run the
     // launch to see them); passing default (empty) CLI overrides reads only the ambient environment.
     if matches!(source, super::Source::All) {
-        apply_ambient_override(&mut resolved);
+        apply_ambient_override(&mut resolved, cwd);
     }
 
     let env = resolved
@@ -1648,7 +1648,7 @@ pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> 
     // field it does not set from the baseline, so a `SBX_NET` in the reader's shell decides the
     // posture this view is reporting. Without it `sbx config show --app <name>` named a network the
     // launch would not use — the one view where an app's inherited fields are the whole point.
-    apply_ambient_override(&mut resolved);
+    apply_ambient_override(&mut resolved, cwd);
     let app = resolved.apps.get(name)?;
     // Pinned identities keyed by a package's locator: flake refs → revision, deb/appimage URLs →
     // short content hash. Keys almost never collide across backends (a `.deb` URL, an `.AppImage`

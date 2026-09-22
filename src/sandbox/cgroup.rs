@@ -351,23 +351,6 @@ impl LimiterMiss {
     }
 }
 
-/// The `systemd-run` launcher and the argv prefix (ending with `--`) that wraps a
-/// command in a transient scope carrying the enforceable limits, or `None` when no
-/// limit can be applied on this host (graceful degradation).
-///
-/// Nothing here is dollar-escaped, and nothing needs to be: every value in the prefix is built from
-/// a charset that cannot contain a `$` — [`super::naming::cage_slug`] sanitizes to `[a-z0-9-]`, and
-/// a limit value has already passed [`is_valid_memory_value`] / [`is_valid_tasks_value`], neither of
-/// which admits one — while the command past `--` is protected by asking the launcher not to
-/// substitute at all.
-fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsString>)> {
-    let Ok((systemd_run, props)) = limiter(limits) else {
-        return None;
-    };
-    let prefix = scope_prefix(&systemd_run, &props, cage_slug);
-    Some((systemd_run, prefix))
-}
-
 /// How many transient scopes this process has asked for, which is the second half of what makes
 /// each one's unit name unique. See [`scope_prefix`] for the first half and why one is not enough.
 static SCOPE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -375,7 +358,7 @@ static SCOPE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 /// The argv `systemd-run` is invoked with, up to and including the `--` that ends it: how a scope is
 /// asked for, separate from whether one is worth asking for.
 ///
-/// Split from [`scope_wrapper`] so the two questions do not travel together. Whether any limit can
+/// Split from [`Scope::wrapper`] so the two questions do not travel together. Whether any limit can
 /// be applied here depends on a delegation root [`limiter`] looks for, and a host without one has
 /// nothing to say about how the arguments past `--` are treated — which is what the dollar guard
 /// asserts. Folded into one function, that guard could only run where limits were also available,
@@ -448,7 +431,58 @@ pub(crate) fn wrap(
     limits: &Limits,
     cage_slug: &str,
 ) -> (PathBuf, Vec<OsString>) {
-    compose(scope_wrapper(limits, cage_slug), bwrap, bwrap_argv)
+    Scope::decide(limits).wrap(bwrap, bwrap_argv, cage_slug)
+}
+
+/// The limit decision for one launch, taken once and read by everything that describes or builds
+/// that launch: the in-cage contract names its properties, and [`Scope::wrap`] wraps the cage in
+/// them.
+///
+/// Carried rather than re-asked because [`limiter`] reads the host each time it runs: a `PATH`
+/// search, the delegated controllers, and on a host whose `systemd-run` candidate is refused, a line
+/// naming the refusal. Asked once for the document and again for the argv, a launch would pay that
+/// twice, and the two answers would agree only while nothing changed in between. Holding the
+/// decision makes them one answer. A contract built from [`profile`] instead would announce a
+/// ceiling on every host where `systemd-run`, the user session or a delegated controller is
+/// missing, which are precisely the hosts where the cage runs **without** limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Scope(Option<(PathBuf, Vec<String>)>);
+
+impl Scope {
+    /// Take the decision [`limiter`] takes, the one `doctor` reports too.
+    pub(crate) fn decide(limits: &Limits) -> Self {
+        Scope(limiter(limits).ok())
+    }
+
+    /// The unit properties this launch will carry, or empty when it carries none.
+    pub(crate) fn properties(&self) -> &[String] {
+        self.0.as_ref().map_or(&[], |(_, props)| props.as_slice())
+    }
+
+    /// Wrap a bwrap invocation in this scope, as [`wrap`] does for a decision it takes itself.
+    pub(crate) fn wrap(
+        &self,
+        bwrap: &Path,
+        bwrap_argv: Vec<OsString>,
+        cage_slug: &str,
+    ) -> (PathBuf, Vec<OsString>) {
+        compose(self.wrapper(cage_slug), bwrap, bwrap_argv)
+    }
+
+    /// The `systemd-run` launcher and the argv prefix (ending with `--`) that wraps a
+    /// command in a transient scope carrying the enforceable limits, or `None` when no
+    /// limit can be applied on this host (graceful degradation).
+    ///
+    /// Nothing here is dollar-escaped, and nothing needs to be: every value in the prefix is built from
+    /// a charset that cannot contain a `$` — [`super::naming::cage_slug`] sanitizes to `[a-z0-9-]`, and
+    /// a limit value has already passed [`is_valid_memory_value`] / [`is_valid_tasks_value`], neither of
+    /// which admits one — while the command past `--` is protected by asking the launcher not to
+    /// substitute at all.
+    fn wrapper(&self, cage_slug: &str) -> Option<(PathBuf, Vec<OsString>)> {
+        let (systemd_run, props) = self.0.as_ref()?;
+        let prefix = scope_prefix(systemd_run, props, cage_slug);
+        Some((systemd_run.clone(), prefix))
+    }
 }
 
 /// The launcher pid encoded in a cage scope's unit name, or `None` when `name` is not one.
@@ -777,6 +811,37 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::process::Command;
 
+    /// What the in-cage contract names is what a launch will really carry, never the profile it
+    /// would like to.
+    ///
+    /// Two properties, and the host decides which of them is the interesting one. Nothing named
+    /// may be absent from the profile, on any host. And on a host that applies no limit at all,
+    /// or one whose memory controller is not delegated, the answer shrinks with the posture:
+    /// reading `profile` instead would write a ceiling into the document of a cage that has
+    /// none, which is the false fact that document exists to prevent.
+    ///
+    /// The equality with `doctor`'s own answer pins the wiring rather than a behaviour: both read
+    /// [`limiter`] today, and the assertion is what fails the day one of them is rewired to ask a
+    /// different question, which is how the contract and the report would come to describe the
+    /// same cage differently.
+    #[test]
+    fn the_properties_the_contract_names_are_the_ones_a_launch_would_carry() {
+        let limits = Limits::default();
+        let named = Scope::decide(&limits).properties().to_vec();
+        let asked: Vec<String> = profile(&limits).into_iter().map(|(_, p)| p).collect();
+        for prop in &named {
+            assert!(
+                asked.contains(prop),
+                "{prop} is not one the profile asks for"
+            );
+        }
+        assert_eq!(
+            named,
+            probe(&limits).properties,
+            "the contract and `doctor` read the same decision"
+        );
+    }
+
     #[test]
     fn the_profile_throttles_then_caps_memory_and_bounds_tasks() {
         let p = profile(&Limits::default());
@@ -1056,7 +1121,7 @@ mod tests {
     /// An argument carrying a dollar must reach the program byte-identical, or cage arguments are
     /// silently rewritten on their way in.
     ///
-    /// Driven through the production composition — [`scope_wrapper`] builds the prefix and
+    /// Driven through the production composition — [`Scope::wrapper`] builds the prefix and
     /// [`compose`] splices the command in — rather than through an invocation assembled here. They
     /// have to be the same one: a hand-written prefix goes on agreeing with itself while the launch
     /// it stands for breaks, and that is precisely how a doubled dollar shipped, on every host
@@ -1076,7 +1141,7 @@ mod tests {
         };
         // The production invocation, with no limit properties: what is under test is how the
         // arguments past `--` are treated, and that does not depend on whether this host delegates
-        // a controller. Going through `scope_wrapper` instead would tie the guard to a delegation
+        // a controller. Going through `Scope::wrapper` instead would tie the guard to a delegation
         // root, and it would fall silent on precisely the hosts whose launcher differs.
         let run = |slug: &str, args: &[&str]| -> Option<std::process::Output> {
             let prefix = scope_prefix(&systemd_run, &[], slug);
@@ -1138,7 +1203,8 @@ mod tests {
             skip_incapable!("skipping scope-unit test: no systemd user session");
             return;
         }
-        let Some((_launcher, prefix)) = scope_wrapper(&Limits::default(), "demo-app") else {
+        let Some((_launcher, prefix)) = Scope::decide(&Limits::default()).wrapper("demo-app")
+        else {
             skip_incapable!("skipping scope-unit test: no delegated controller");
             return;
         };

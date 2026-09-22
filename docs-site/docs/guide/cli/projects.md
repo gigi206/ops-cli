@@ -32,14 +32,18 @@ A tree's store is **seeded from the shared one**, path for path, and on a filesy
 shares blocks (btrfs, or xfs with reflinks) the seed shares them instead of copying. So
 removing a tree does not free its store: nearly all of it is storage the shared store still
 holds. The column therefore leaves the seeded part out, and counts only what the tree holds
-on its own: its app mise pools, its home, and whatever was **built into** its store rather
-than seeded there (a local `flake:`, or an in-cage `sbx mise install nix:` the shared store
-never had). The header prints both figures, so the number including the store is still
-there to read.
+on its own: its app mise pools, its home, its store's own database, and whatever was **built
+into** its store rather than seeded there (a local `flake:`, or an in-cage
+`sbx mise install nix:` the shared store never had). The header prints both figures, so the number including the store is still
+there to read. On a filesystem that cannot share blocks (ext4), the seed is a real copy and a
+removal frees it, so there the column counts the whole tree. `sbx projects rm` announces the
+same figure the column shows.
 
-Even the column is an upper bound. A volume with compression enabled stored those bytes
-smaller, so freeing a gigabyte of data returns fewer blocks than that; and on an image, the
-freed blocks return to the host only after a discard. Plan against
+The column counts file data, and the space a removal really returns differs from it in both
+directions. A volume with compression enabled stored those bytes smaller, so freeing them
+returns fewer blocks; the filesystem's own metadata for the tree's files is freed as well and
+is not counted, which on a seeded store of many thousand files can outweigh the data; and on
+an image, the freed blocks return to the host only after a discard. Plan against
 [`sbx storage status`](storage), which reports the volume's own numbers, and reclaim the
 closures a removal orphans with [`sbx gc`](gc).
 :::
