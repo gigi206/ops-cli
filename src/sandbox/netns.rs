@@ -108,14 +108,17 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
 /// either becomes the command or exits non-zero with a diagnostic.
 pub(crate) fn run_holder(argv: &[OsString]) -> ! {
     let Some((tap, argv)) = split_holder_args(argv) else {
-        die("__netns-holder: malformed arguments (no `--` before the command)");
+        die(
+            NEVER_STARTED,
+            "__netns-holder: malformed arguments (no `--` before the command)",
+        );
     };
     if argv.is_empty() {
-        die("__netns-holder: no command to exec");
+        die(NEVER_STARTED, "__netns-holder: no command to exec");
     }
 
     if let Err(e) = enter_user_and_net_ns() {
-        die(&format!("__netns-holder: {e}"));
+        die(NEVER_STARTED, &format!("__netns-holder: {e}"));
     }
 
     // Best-effort: loopback up + the black-hole dummy. A failure here (e.g. the `dummy` kernel
@@ -142,11 +145,14 @@ pub(crate) fn run_holder(argv: &[OsString]) -> ! {
     unsafe {
         libc::execv(prog.as_ptr(), ptrs.as_ptr());
     }
-    die(&format!(
-        "__netns-holder: execv {:?}: {}",
-        argv[0],
-        std::io::Error::last_os_error()
-    ));
+    die(
+        EXEC_FAILED,
+        &format!(
+            "__netns-holder: execv {:?}: {}",
+            argv[0],
+            std::io::Error::last_os_error()
+        ),
+    );
 }
 
 /// Enter a fresh user namespace mapped to root, then a fresh network namespace owned by it.
@@ -607,15 +613,33 @@ fn read_ack(fd: libc::c_int) -> io::Result<()> {
 
 fn to_cstring(s: &OsString) -> CString {
     CString::new(s.as_bytes()).unwrap_or_else(|_| {
-        die(&format!(
-            "__netns-holder: argument contains a NUL byte: {s:?}"
-        ))
+        die(
+            NEVER_STARTED,
+            &format!("__netns-holder: argument contains a NUL byte: {s:?}"),
+        )
     })
 }
 
-fn die(msg: &str) -> ! {
+/// What the holder exits with when it never reached the command it was asked to become.
+///
+/// This process *becomes* the cage — it execs bwrap — so whatever it exits with is read as the
+/// cage's own answer about that command. `125` is the number the launch path spells
+/// `CAGE_NEVER_STARTED` and `sbx task run` documents for a refusal that ran nothing, and it leaves
+/// the shell's own two answers to the cage.
+const NEVER_STARTED: i32 = 125;
+
+/// What the holder exits with when the `execv` itself failed: the shell convention for a program
+/// that could not be found, which is what has actually happened at that one site.
+const EXEC_FAILED: i32 = 127;
+
+/// End the holder with `msg` on stderr and `code` as its status.
+///
+/// The code is a parameter because this function serves both of the above, and spelling them all
+/// `127` had a namespace setup that failed report itself as bwrap being missing — the one reading
+/// that sends a caller after the wrong thing.
+fn die(code: i32, msg: &str) -> ! {
     eprintln!("{msg}");
-    std::process::exit(127);
+    std::process::exit(code);
 }
 
 #[cfg(test)]

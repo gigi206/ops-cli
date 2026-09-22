@@ -422,14 +422,18 @@ pub(super) unsafe fn enter_and_exec(
             // refuses that single join) would fail the whole call; retry without it — the
             // cgroup namespace only changes a cosmetic `/proc/self/cgroup` view.
             if libc::setns(pidfd, mask & !libc::CLONE_NEWCGROUP) != 0 {
-                libc::_exit(126);
+                libc::_exit(125);
             }
         }
         // Fork so the shell runs *in* the cage's pid namespace (a `setns` into a pid
         // namespace only moves the caller's future children into it).
+        // Both failures above this point are the attach never reaching the command: `125`, the
+        // number the launch path spells `CAGE_NEVER_STARTED`, rather than one of the two the shell
+        // convention keeps for what the cage answers about the program itself. The two below are a
+        // different case and take a different answer.
         let child = libc::fork();
         if child < 0 {
-            libc::_exit(126);
+            libc::_exit(125);
         }
         if child == 0 {
             confine_and_exec(filters, tty, argv, envp);
@@ -445,22 +449,25 @@ pub(super) unsafe fn enter_and_exec(
             libc::_exit(125);
         }
         // Parent of the shell: reap it and mirror its exit status up to the pty supervisor.
+        //
+        // From here the shell has been started, so neither of the answers above fits: `125` would
+        // say nothing ran when something did. A reap that fails outright leaves its fate unknown,
+        // and `1` is what this repository already answers to a status it cannot read — see the
+        // translation below, which is `pty::exit_code`'s own last arm.
         let mut status: libc::c_int = 0;
         loop {
             if libc::waitpid(child, &mut status, 0) >= 0 {
                 break;
             }
             if *libc::__errno_location() != libc::EINTR {
-                libc::_exit(126);
+                libc::_exit(1);
             }
         }
-        if libc::WIFEXITED(status) {
-            libc::_exit(libc::WEXITSTATUS(status));
-        }
-        if libc::WIFSIGNALED(status) {
-            libc::_exit(128 + libc::WTERMSIG(status));
-        }
-        libc::_exit(126);
+        // Through the one definition of that translation rather than a second copy of it: this was
+        // a copy, and its last arm disagreed with the original — `126` for a status that is neither
+        // an exit nor a signal, where `pty::exit_code` answers `1`. `exit_code` reads the integer
+        // with libc's own macros and allocates nothing, so it is safe on this side of the fork.
+        libc::_exit(super::pty::exit_code(status));
     }
 }
 
