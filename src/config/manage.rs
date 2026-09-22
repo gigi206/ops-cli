@@ -2001,7 +2001,15 @@ pub(crate) fn write_text(
         .map(|m| m.permissions().mode() & 0o777)
         .ok()
         .or(fresh_mode);
-    let tmp = dir.join(format!(".{name}.sbx-tmp.{}", std::process::id()));
+    // The temp name carries a sequence number as well as the pid. The pid separates two processes;
+    // within one it separates nothing, and two threads writing different config files under the same
+    // directory — a launch resolving while `sbx net allow --save` writes — would otherwise pick the
+    // same name and have one of them remove the other's temp on its way in.
+    let tmp = dir.join(format!(
+        ".{name}.sbx-tmp.{}.{}",
+        std::process::id(),
+        crate::sandbox::atomicfile::unique()
+    ));
     if let Err(e) = write_restricted(&tmp, text, mode) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err(e));
@@ -2009,7 +2017,13 @@ pub(crate) fn write_text(
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         err(e)
-    })
+    })?;
+    // The bytes are already on the device (`write_restricted` syncs before it returns); this is the
+    // directory entry the `rename` created. Together they are what makes a config file survive a
+    // power cut as either its old contents or its new ones — never as a present, right-sized file of
+    // zeros, which is the shape a reader cannot tell from a config the user emptied on purpose.
+    crate::sandbox::atomicfile::sync_dir(dir);
+    Ok(())
 }
 
 /// Fill `path` with `text`, never leaving the bytes in a file more readable than `mode` allows.
@@ -2029,13 +2043,19 @@ fn write_restricted(path: &Path, text: &str, mode: Option<u32>) -> std::io::Resu
     if let Some(mode) = mode {
         file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
-    Ok(())
+    // Durable before the caller renames it into place. A `rename` orders itself against the data
+    // only if the data is already on the device: without this, a machine that loses power just after
+    // the rename can come back with the config path pointing at an inode whose blocks were never
+    // written. What a config file is read for makes that the worst of the three outcomes — an empty
+    // one parses, and answers every question with a default.
+    file.sync_all()
 }
 
 /// Create `path` empty, owner-only when `mode` states one, ready to be written into.
 ///
 /// **Unlinked first, then created exclusively**, and that pairing is what keeps the write inside the
-/// directory it names. The temp is `.{name}.sbx-tmp.{pid}` — a name with no random part — and the
+/// directory it names. The temp is `.{name}.sbx-tmp.{pid}.{seq}` — a name with no random part; the
+/// sequence separates two writers inside one process, it is not a secret — and the
 /// directory it lands in is not always one sbx owns: [`write_restricted`]'s own doc names "a project
 /// tree" beside `~/.config/sbx`, and a project tree is bound **read-write into the cage**. Untrusted
 /// in-cage code can therefore pre-create that name, and pids are a small enough space to simply
@@ -2294,10 +2314,11 @@ mod tests {
         assert_eq!(mode_of(&plain), mode_of(&control));
     }
 
-    /// The temp is `.{name}.sbx-tmp.{pid}` — no random part — and `write_restricted`'s own doc
-    /// names "a project tree" as a directory it writes into. A project tree is bound **read-write
-    /// into the cage**, so untrusted in-cage code can pre-create that name, and the pid space is
-    /// small enough to simply cover. Following a symlink there sent the config sbx was about to
+    /// The temp is `.{name}.sbx-tmp.{pid}.{seq}` — no random part, the sequence being there to
+    /// separate two writers in one process rather than to be unguessable — and `write_restricted`'s
+    /// own doc names "a project tree" as a directory it writes into. A project tree is bound
+    /// **read-write into the cage**, so untrusted in-cage code can pre-create that name, and the
+    /// space of pids and small sequence numbers is one an attacker can simply cover. Following a symlink there sent the config sbx was about to
     /// write — which can carry a token — to whatever it pointed at, and the `rename` afterwards
     /// installed the link itself at the real config path.
     #[test]

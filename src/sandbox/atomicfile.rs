@@ -107,14 +107,26 @@ pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) ->
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
-    // And the directory entry itself, which is a second piece of metadata: the rename is atomic
-    // against a concurrent reader either way, but only this makes it survive a crash. Best-effort —
-    // a filesystem that will not open its own directory has already published the file, and failing
-    // the write here would report a failure that did not happen.
+    sync_dir(dir);
+    Ok(())
+}
+
+/// Flush a directory's own entries to the device, after a `rename` published one of them.
+///
+/// The directory entry is a second piece of metadata beside the file's contents: the rename is
+/// atomic against a concurrent reader either way, but only this makes it survive a crash.
+///
+/// Best-effort, and deliberately so at every call site: a filesystem that will not open its own
+/// directory has already published the file, and failing the write here would report a failure that
+/// did not happen.
+///
+/// Shared rather than written twice — [`crate::config::manage::write_text`] publishes config the
+/// same way, through a temp of its own whose creation it cannot delegate, and the durability half
+/// of the two is the same half.
+pub(crate) fn sync_dir(dir: &Path) {
     if let Ok(dir) = std::fs::File::open(dir) {
         let _ = dir.sync_all();
     }
-    Ok(())
 }
 
 /// A number no other staging in this process will use, for the temp name a content-keyed
