@@ -25,6 +25,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 // Aliased: `crate::store` — the locks and the `Layout` — is read in this file too, and two
 // modules spelled `store` a line apart read as one.
@@ -1916,8 +1917,9 @@ fn runtime_entry_pid(name: &str, prefixes: &[&str]) -> Option<u32> {
 /// A staging directory left by an interrupted unpack
 /// ([`distro_store::partial_staging_name`]) is swept on the same rule the runtime directories use,
 /// by the pid its name carries — no lock or marker will ever name one, and nothing else reaps them.
-/// One whose name this version cannot read is skipped instead, because the rule for a published
-/// tree makes no liveness check.
+/// One whose name this version cannot read is not put through the published-tree rule, which makes
+/// no liveness check; it is held until [`UNREADABLE_STAGING_MAX_AGE`] has passed with nothing
+/// touching it, and reclaimed then — otherwise nothing would ever reclaim it at all.
 ///
 /// Best-effort throughout: an unreadable directory is skipped and a failed removal is not an error,
 /// because this is housekeeping and never a reason to fail the caller. A removal that failed is
@@ -1959,11 +1961,20 @@ pub(crate) fn sweep_distro_trees(
             continue;
         }
         // A staging the branch above could not read is still a staging, and the rule from here down
-        // is the one for a *published* tree: no owner, so no liveness check. Left alone rather than
-        // parsed harder — a name this version does not write is one this version must not reclaim,
-        // and the cost of skipping it is disk space until an sbx that knows the spelling comes back
-        // to it, against the cost of removing a tree a live unpack is still filling.
+        // is the one for a *published* tree: no owner, so no liveness check. It is decided on its
+        // age instead, which is the one measure of abandonment left when the name says nothing.
         if name.contains(distro_store::PARTIAL_INFIX) {
+            if !staging_is_abandoned(&path) {
+                continue;
+            }
+            let usage = crate::sandbox::tree_usage(&path);
+            if prune {
+                let _ = make_writable(&path);
+                if std::fs::remove_dir_all(&path).is_err() {
+                    continue;
+                }
+            }
+            freed.push((name, usage.bytes));
             continue;
         }
         let held = sweep_distro_roots(&path.join(distro_store::ROOTS_DIR), live_projects, prune);
@@ -2050,6 +2061,38 @@ fn partial_unpack_pid(name: &str) -> Option<u32> {
         return None;
     }
     tail.split('.').next()?.parse().ok()
+}
+
+/// How long a staging directory whose name this version cannot read must sit untouched before it is
+/// reclaimed on its age alone.
+///
+/// The pid a staging's name carries is what says whether anything still owns it, and a spelling
+/// this version cannot parse leaves only the clock. Seven days is orders of magnitude past the
+/// longest unpack — a large image over a slow link is minutes — so a directory this old is not one
+/// being filled. The alternative it replaces is a leak with no reader: nothing else reaps these,
+/// and a name written by a later sbx would otherwise sit in the data directory for ever, since that
+/// later sbx writes its own spelling rather than coming back for this one.
+const UNREADABLE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// A day, for the tests that place a staging either side of the ceiling above.
+#[cfg(test)]
+const ONE_DAY: Duration = Duration::from_secs(24 * 3600);
+
+/// Whether a staging directory has been untouched long enough to be reclaimed without knowing whose
+/// it was.
+///
+/// The mtime read is the staging **root's**, which an unpack sets when it creates the two
+/// directories it fills (`blobs`, `rootfs`) and then leaves alone: what it dates is therefore the
+/// start of the unpack, not its progress, and that is the conservative end of the measurement.
+///
+/// Unreadable metadata, or a clock that has moved backwards since the directory was written, answer
+/// `false`: an age that cannot be measured is not an age past the ceiling, and the directory stays.
+/// A staging kept one pass too long costs disk; one removed while it is being filled costs the
+/// provision that is filling it.
+fn staging_is_abandoned(path: &Path) -> bool {
+    mtime_of(path)
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age >= UNREADABLE_STAGING_MAX_AGE)
 }
 
 /// Add the owner's write and search bits to every directory under `path`, so a tree unpacked from
@@ -4076,27 +4119,46 @@ mod tests {
         );
     }
 
-    /// A staging whose name this version cannot read is kept, not reclaimed.
+    /// A staging whose name this version cannot read is kept while it is fresh, and reclaimed once
+    /// it is old.
     ///
-    /// The forward half of the defect above: the sweep must not fall back on the published-tree
-    /// rule for anything that is a staging, because that rule removes without asking whether a
-    /// process is still filling it. A name that carries the infix but no pid this version can parse
-    /// is the shape a *later* sbx would leave here.
+    /// Two halves of one rule. The sweep must not fall back on the published-tree rule for anything
+    /// that is a staging, because that rule removes without asking whether a process is still
+    /// filling it — a name carrying the infix but no pid this version can parse is the shape a
+    /// *later* sbx leaves here. But skipping it for ever is a leak with no reader: that later sbx
+    /// writes its own spelling and never comes back for this one, and nothing else reaps these. Age
+    /// is what decides when the name cannot.
     #[test]
-    fn a_staging_this_version_cannot_read_is_left_alone() {
+    fn a_staging_this_version_cannot_read_is_kept_until_it_is_old() {
         let data = TmpDir::new();
         let dir = data.path().join("distro");
-        let unreadable = dir.join(format!(
-            "sha256-{}{}later-form",
-            "d".repeat(64),
-            distro_store::PARTIAL_INFIX
-        ));
-        std::fs::create_dir_all(unreadable.join("rootfs")).unwrap();
+        let staging = |c: char| {
+            dir.join(format!(
+                "sha256-{}{}later-form",
+                c.to_string().repeat(64),
+                distro_store::PARTIAL_INFIX
+            ))
+        };
+        let fresh = staging('d');
+        let old = staging('e');
+        for d in [&fresh, &old] {
+            std::fs::create_dir_all(d.join("rootfs")).unwrap();
+        }
+        // Older than the ceiling by a day, set on the staging root — the entry the predicate reads.
+        let stale = std::time::SystemTime::now() - (UNREADABLE_STAGING_MAX_AGE + ONE_DAY);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
 
         let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
         assert!(
-            unreadable.is_dir(),
-            "a staging is never reclaimed on the rule written for a published tree: {freed:?}"
+            fresh.is_dir(),
+            "a staging that could be filling is never reclaimed on the published-tree rule: {freed:?}"
+        );
+        assert!(
+            !old.exists(),
+            "one untouched past the ceiling is reclaimed on its age: {freed:?}"
         );
     }
 
