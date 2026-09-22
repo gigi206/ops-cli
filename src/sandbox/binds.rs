@@ -394,11 +394,19 @@ pub(super) fn create_distro_mountpoints(rootfs: &Path) -> io::Result<()> {
 ///   nothing and writes nothing into a tree other projects share;
 /// * the image carries **nothing above it but the root**: the one missing top-level directory is
 ///   created in the tree, then covered. That is one directory name in a shared artefact, which is
-///   the price of running a project from a path the image's distribution never imagined.
+///   the price of running a project from a path the image's distribution never imagined;
+/// * the deepest ancestor the image carries is a **populated** directory, and the destination lies
+///   **below a directory the image lacks** inside it: that one missing directory is created, then
+///   covered, by the same licence. The populated one keeps every entry, and what lands below is
+///   made in the tmpfs, so the tree learns one name and never the rest of the path. This is where
+///   the host's runtime directory goes: `/run/user/<uid>` (a brokered socket, the Wayland socket,
+///   the ssh agent) under an image `/run` that carries only `lock`, which creates `/run/user` and
+///   never the uid.
 ///
-/// The remaining case is refused by name: an ancestor that is a **populated** directory. Covering
-/// `/etc` to reach `/etc/myapp.conf` would empty the distribution's `/etc`, so the launch stops and
-/// says which directory it will not hide.
+/// The remaining case is refused by name: a destination that sits **directly** in a populated
+/// directory. Covering `/etc` to reach `/etc/myapp.conf` would empty the distribution's `/etc`, and
+/// creating the file would write a project's mountpoint into a tree other projects share, so the
+/// launch stops and says which directory it will not hide.
 pub(super) fn distro_writable(
     rootfs: &Path,
     project: &Path,
@@ -430,17 +438,35 @@ fn in_image(rootfs: &Path, dest: &Path) -> bool {
 /// for the rule; this is where it is applied to one destination.
 fn writable_anchor(rootfs: &Path, dest: &Path) -> io::Result<PathBuf> {
     // Deepest first: the shallowest tmpfs that works hides the most, so the deepest one that works
-    // is the one to take.
+    // is the one to take. `below` is the ancestor visited just before, the one the image lacks.
+    let mut below: Option<&Path> = None;
     for ancestor in dest.ancestors().skip(1) {
         if ancestor == Path::new("/") {
             break;
         }
         let on_image = rootfs.join(ancestor.strip_prefix("/").unwrap_or(ancestor));
         let Ok(meta) = on_image.symlink_metadata() else {
+            below = Some(ancestor);
             continue;
         };
         if meta.is_dir() && std::fs::read_dir(&on_image)?.next().is_none() {
             return Ok(ancestor.to_path_buf());
+        }
+        // A populated directory, with a directory the image lacks between it and the destination:
+        // create that one, refusing a link on the way, and cover it. A symlink the image placed is
+        // not a directory here, and is refused below rather than followed.
+        if let Some(missing) = below
+            && meta.is_dir()
+        {
+            // Refused rather than converted lossily: a replaced byte would name another directory.
+            let Some(rel) = missing.strip_prefix("/").unwrap_or(missing).to_str() else {
+                return Err(io::Error::other(format!(
+                    "`{}` is not a path sbx can create in the image",
+                    missing.display()
+                )));
+            };
+            crate::sandbox::cagedir::ensure_under(rootfs, rel, 0o755)?;
+            return Ok(missing.to_path_buf());
         }
         return Err(io::Error::other(format!(
             "the image carries no `{}`, and sbx will not cover `{}` to make room \

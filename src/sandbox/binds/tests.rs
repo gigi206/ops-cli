@@ -2688,6 +2688,58 @@ fn a_mount_that_would_hide_the_distributions_own_directory_is_refused() {
     );
 }
 
+/// The host's runtime directory under an image whose `/run` is populated: the one directory the
+/// image lacks, `/run/user`, is created and covered, so a brokered socket, the Wayland socket or the
+/// ssh agent can land below it. The uid is never written into the shared tree, and nothing of the
+/// image's `/run` is hidden.
+#[test]
+fn a_mount_below_a_missing_directory_in_a_populated_one_gets_that_directory() {
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = image_like(tmp.path());
+    std::fs::create_dir_all(rootfs.join("run/lock")).unwrap();
+    let bind = ExtraBind {
+        src: PathBuf::from("/host/S.gpg-agent"),
+        dest: PathBuf::from("/run/user/1000/gnupg/S.gpg-agent"),
+        writable: false,
+    };
+    let writable =
+        crate::sandbox::binds::distro_writable(&rootfs, Path::new("/home/u/proj"), &[bind])
+            .unwrap();
+    assert!(
+        writable.contains(&PathBuf::from("/run/user")),
+        "{writable:?}"
+    );
+    assert!(
+        !writable.contains(&PathBuf::from("/run")),
+        "the image's `/run` is not hidden"
+    );
+    assert!(rootfs.join("run/user").is_dir());
+    assert!(
+        !rootfs.join("run/user/1000").exists(),
+        "the uid lands in the tmpfs, never in the shared tree"
+    );
+    assert!(
+        rootfs.join("run/lock").is_dir(),
+        "the image keeps its own entries"
+    );
+
+    // A link the image placed where the missing directory would go is not followed.
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = image_like(tmp.path());
+    std::fs::create_dir_all(rootfs.join("run/lock")).unwrap();
+    std::os::unix::fs::symlink("/elsewhere", rootfs.join("run/user")).unwrap();
+    let bind = ExtraBind {
+        src: PathBuf::from("/host/sock"),
+        dest: PathBuf::from("/run/user/1000/sock"),
+        writable: false,
+    };
+    assert!(
+        crate::sandbox::binds::distro_writable(&rootfs, Path::new("/home/u/proj"), &[bind])
+            .is_err(),
+        "a link in the image is refused rather than followed"
+    );
+}
+
 #[test]
 fn the_mountpoints_a_tree_is_given_are_empty_and_of_the_right_kind() {
     let tmp = crate::testutil::TmpDir::new();

@@ -263,10 +263,16 @@ the same way as long as the image leaves that directory empty (`/srv`, `/mnt`, `
 a typical base image), and a top-level directory the image does not have at all is created
 empty and covered.
 
-What is refused, by name, is a mount whose destination sits inside a directory the
-distribution populated: covering `/etc` to make room for a `[[binds]]` entry at
-`/etc/myapp.conf` would empty the distribution's own `/etc`. Bind such a file somewhere the
-image leaves free, or build an image that carries it.
+A mount below a directory the image lacks, inside one it populated, is given that one
+directory the same way. This is where your runtime directory goes: an image's `/run`
+usually carries `lock` and no `user`, so `/run/user` is created empty and covered, and the
+brokered sockets, the Wayland socket and the ssh agent under `/run/user/<uid>` land in the
+tmpfs. The image keeps its own `/run`, and learns one directory name, never your uid.
+
+What is refused, by name, is a mount whose destination sits **directly** inside a
+directory the distribution populated: covering `/etc` to make room for a `[[binds]]` entry
+at `/etc/myapp.conf` would empty the distribution's own `/etc`. Bind such a file somewhere
+the image leaves free, or build an image that carries it.
 
 ## The userland is read-only
 
