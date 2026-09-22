@@ -26,6 +26,10 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Aliased: `crate::store` — the locks and the `Layout` — is read in this file too, and two
+// modules spelled `store` a line apart read as one.
+use crate::sandbox::distro::store as distro_store;
+
 /// What a gc pass reclaimed (or would reclaim, in a dry run).
 pub(crate) struct GcReport {
     /// Store paths the sweep collected, or would collect in a dry run.
@@ -1909,9 +1913,11 @@ fn runtime_entry_pid(name: &str, prefixes: &[&str]) -> Option<u32> {
 /// not its tree survives. That is what keeps the markers from accumulating without a teardown hook:
 /// they are read against liveness rather than maintained.
 ///
-/// A `<digest>.partial.<pid>` left by an interrupted unpack is swept on the same rule the runtime
-/// directories use, by the pid its name carries — no lock or marker will ever name one, and nothing
-/// else reaps them.
+/// A staging directory left by an interrupted unpack
+/// ([`distro_store::partial_staging_name`]) is swept on the same rule the runtime directories use,
+/// by the pid its name carries — no lock or marker will ever name one, and nothing else reaps them.
+/// One whose name this version cannot read is skipped instead, because the rule for a published
+/// tree makes no liveness check.
 ///
 /// Best-effort throughout: an unreadable directory is skipped and a failed removal is not an error,
 /// because this is housekeeping and never a reason to fail the caller. A removal that failed is
@@ -1952,11 +1958,15 @@ pub(crate) fn sweep_distro_trees(
         if !name.starts_with("sha256-") && !name.starts_with("derived-sha256-") {
             continue;
         }
-        let held = sweep_distro_roots(
-            &path.join(crate::sandbox::distro::store::ROOTS_DIR),
-            live_projects,
-            prune,
-        );
+        // A staging the branch above could not read is still a staging, and the rule from here down
+        // is the one for a *published* tree: no owner, so no liveness check. Left alone rather than
+        // parsed harder — a name this version does not write is one this version must not reclaim,
+        // and the cost of skipping it is disk space until an sbx that knows the spelling comes back
+        // to it, against the cost of removing a tree a live unpack is still filling.
+        if name.contains(distro_store::PARTIAL_INFIX) {
+            continue;
+        }
+        let held = sweep_distro_roots(&path.join(distro_store::ROOTS_DIR), live_projects, prune);
         if held || locked.contains(&name) {
             continue;
         }
@@ -2023,11 +2033,23 @@ fn sweep_distro_roots(
     held
 }
 
-/// The pid in a `<digest>.partial.<pid>` name, or `None` for anything else.
+/// The pid in a staging name built by [`distro_store::partial_staging_name`], or `None` for
+/// anything else.
+///
+/// The name carries a sequence number after the pid, so only the **first** component of the tail is
+/// the pid. Parsing the whole tail was how this stopped recognising its subject when the sequence
+/// number was added on the unpack side: `1234.7` is not a `u32`, the answer became `None`, and a
+/// staging directory then fell to the rule below for a published tree — which reclaims without
+/// asking whether anything still owns it.
+///
+/// A tail of the pid alone still answers, because it is what an sbx before that change wrote and a
+/// data directory outlives the version that filled it.
 fn partial_unpack_pid(name: &str) -> Option<u32> {
-    let (head, pid) = name.rsplit_once(".partial.")?;
-    (head.starts_with("sha256-") || head.starts_with("derived-sha256-"))
-        .then(|| pid.parse().ok())?
+    let (head, tail) = name.rsplit_once(distro_store::PARTIAL_INFIX)?;
+    if !head.starts_with("sha256-") && !head.starts_with("derived-sha256-") {
+        return None;
+    }
+    tail.split('.').next()?.parse().ok()
 }
 
 /// Add the owner's write and search bits to every directory under `path`, so a tree unpacked from
@@ -4009,17 +4031,32 @@ mod tests {
         assert!(kept.is_dir(), "and the tree its lock names stays");
     }
 
+    /// A staging is reclaimed on the pid its name carries, and only then.
+    ///
+    /// The names come from [`distro_store::partial_staging_name`] rather than being spelled here.
+    /// Spelled here, they stopped matching what the unpack writes the day a sequence number was
+    /// added to it: the sweep no longer recognised a staging at all, the name fell through to the
+    /// rule for a published tree — which has no owner and so makes no liveness check — and a live
+    /// unpack's directory was removed under it. This test passed throughout, because it was the
+    /// only place still writing the old spelling.
     #[test]
     fn an_interrupted_unpack_is_swept_by_the_pid_its_name_carries() {
         let data = TmpDir::new();
         let dir = data.path().join("distro");
-        let mine = dir.join(format!(
-            "sha256-{}.partial.{}",
-            "a".repeat(64),
-            std::process::id()
-        ));
-        let dead = dir.join(format!("sha256-{}.partial.999999999", "b".repeat(64)));
-        for d in [&mine, &dead] {
+        let staging = |digest: char, pid: u32, seq: u64| {
+            dir.join(distro_store::partial_staging_name(
+                &format!("sha256-{}", digest.to_string().repeat(64)),
+                pid,
+                seq,
+            ))
+        };
+        let mine = staging('a', std::process::id(), 0);
+        let dead = staging('b', 999_999_999, 3);
+        // The spelling an sbx from before the sequence number wrote, deliberately by hand: a data
+        // directory outlives the version that filled it, and one of these left behind must still be
+        // reclaimed rather than kept for ever.
+        let legacy = dir.join(format!("sha256-{}.partial.999999999", "c".repeat(64)));
+        for d in [&mine, &dead, &legacy] {
             std::fs::create_dir_all(d.join("rootfs")).unwrap();
         }
 
@@ -4032,6 +4069,34 @@ mod tests {
         assert!(
             !dead.exists(),
             "one whose process is gone is swept: {names:?}"
+        );
+        assert!(
+            !legacy.exists(),
+            "the pre-sequence spelling is swept on the same rule: {names:?}"
+        );
+    }
+
+    /// A staging whose name this version cannot read is kept, not reclaimed.
+    ///
+    /// The forward half of the defect above: the sweep must not fall back on the published-tree
+    /// rule for anything that is a staging, because that rule removes without asking whether a
+    /// process is still filling it. A name that carries the infix but no pid this version can parse
+    /// is the shape a *later* sbx would leave here.
+    #[test]
+    fn a_staging_this_version_cannot_read_is_left_alone() {
+        let data = TmpDir::new();
+        let dir = data.path().join("distro");
+        let unreadable = dir.join(format!(
+            "sha256-{}{}later-form",
+            "d".repeat(64),
+            distro_store::PARTIAL_INFIX
+        ));
+        std::fs::create_dir_all(unreadable.join("rootfs")).unwrap();
+
+        let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
+        assert!(
+            unreadable.is_dir(),
+            "a staging is never reclaimed on the rule written for a published tree: {freed:?}"
         );
     }
 

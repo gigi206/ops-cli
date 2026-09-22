@@ -265,17 +265,39 @@ fn locked_base(layout: &Layout, lock_path: &Path, locator: &str) -> Option<Strin
     reference::valid_digest(recorded.trim()).map(str::to_string)
 }
 
+/// What separates a staging directory's name from the pid that owns it.
+///
+/// Named because two modules spell it: the unpack that builds the name, and the sweep that reads
+/// it back.
+pub(crate) const PARTIAL_INFIX: &str = ".partial.";
+
+/// The name an unpack assembles a tree under before renaming it into place:
+/// `<final name>.partial.<pid>.<seq>`.
+///
+/// One definition because two parties depend on the shape. This side writes it; the sweep in
+/// [`mod@crate::sandbox::gc`] recognises a staging by it and reclaims one only when the pid it
+/// carries is gone. A spelling changed on this side alone leaves the sweep unable to see its own
+/// subject, and a staging directory then falls to the rule written for a *published* tree — which
+/// makes no liveness check, because a published tree has no owner to be alive.
+///
+/// `pid` and `seq` are parameters rather than read in here, so a caller naming a staging that is
+/// not this process's — the sweep's own test — derives the name instead of rewriting it.
+pub(crate) fn partial_staging_name(final_name: &str, pid: u32, seq: u64) -> String {
+    format!("{final_name}{PARTIAL_INFIX}{pid}.{seq}")
+}
+
 /// Fetch every layer of `image` and apply it, then move the result into place.
 ///
 /// The tree is assembled under a sibling name and renamed at the end, so the directory a launch
 /// binds at `/` exists only once every layer has landed: an interrupted unpack leaves a partial
 /// directory that no launch will ever name, rather than a root filesystem missing half its files.
-/// The name carries this process's pid **and a sequence number** so two launches provisioning the
-/// same image at once each assemble their own, and the loser of the rename finds the winner's tree
-/// already there. The pid alone did not say that: a single process provisions more than one image
-/// — a roll walks every declared one — and two of those sharing a name meant the second emptied
-/// the tree the first was still writing into, since the staging directory is cleared on the way
-/// in. The sequence number is what makes the name this *call's* rather than this process's.
+/// The name comes from [`partial_staging_name`], which carries this process's pid **and a sequence
+/// number** so two launches provisioning the same image at once each assemble their own, and the
+/// loser of the rename finds the winner's tree already there. The pid alone did not say that: a
+/// single process provisions more than one image — a roll walks every declared one — and two of
+/// those sharing a name meant the second emptied the tree the first was still writing into, since
+/// the staging directory is cleared on the way in. The sequence number is what makes the name this
+/// *call's* rather than this process's.
 fn unpack_into(
     image: &ImageRef,
     digest: &str,
@@ -287,11 +309,10 @@ fn unpack_into(
         .parent()
         .ok_or_else(|| io::Error::other(format!("`{}` has no parent directory", dir.display())))?;
     std::fs::create_dir_all(parent)?;
-    let partial = parent.join(format!(
-        "{}.partial.{}.{}",
-        dir.file_name().unwrap_or_default().to_string_lossy(),
+    let partial = parent.join(partial_staging_name(
+        &dir.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id(),
-        crate::sandbox::atomicfile::unique()
+        crate::sandbox::atomicfile::unique(),
     ));
     let _ = std::fs::remove_dir_all(&partial);
 
