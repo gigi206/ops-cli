@@ -124,10 +124,13 @@ impl Egress {
     ///
     /// It is the session's record, not the agent proxy's alone: a declared operation's
     /// per-invocation proxy appends to this same ring ([`Self::event_log`] says why), under a policy
-    /// of its own that is deliberately narrower. Each event names the proxy that pushed it
+    /// of its own that is deliberately narrower. Each event names the proxy it came from
     /// ([`super::control::LogEvent::plane`]), so a consumer that turns refusals into *policy* can
     /// keep to the agent's — [`super::netlearn`] is the one that does.
     pub(crate) fn observed_events(&self) -> Vec<super::control::LogEvent> {
+        // Every decision the proxy reported before this call, applied: the proxy logs through a
+        // queue, and the run's record is what it decided, not what had been applied so far.
+        self.events.flush();
         // The run's full record includes muted refusals (`--all`) — a `mute` rule only suppresses a
         // live log *view*, it never removes a decision from what `--net-learn` observed.
         self.log.snapshot(None, None, true).events
@@ -147,9 +150,9 @@ impl Egress {
     /// What it costs: the merged ring is the *display* record of a session, and the two planes it
     /// merges do not share a policy. Everything that reads it for display is right to; a reader that
     /// writes policy from it — `--net-learn`, through [`Self::observed_events`] — must separate the
-    /// two, which is why every event carries the plane that pushed it
-    /// ([`super::control::LogEvent::plane`]) and the per-invocation proxy taking this handle stamps
-    /// [`super::control::Plane::Task`] on everything it appends.
+    /// two, which is why every event carries the plane it came from
+    /// ([`super::control::LogEvent::plane`]), and what the per-invocation proxy taking this handle
+    /// reports is recorded under [`super::control::Plane::Task`].
     pub(crate) fn event_log(&self) -> Arc<super::control::LogRing> {
         Arc::clone(&self.log)
     }
@@ -782,8 +785,9 @@ pub(crate) fn start(
     // session's proxy, and every test). A task's per-invocation proxy passes the session's, for the
     // reason [`Egress::event_log`] states: its own control socket is not one `sbx net logs` finds.
     event_log: Option<Arc<super::control::LogRing>>,
-    // Whose policy this proxy enforces, stamped on every event it pushes so a consumer that writes
-    // policy from the shared ring can tell the planes apart — see [`super::control::Plane`].
+    // Whose policy this proxy enforces, recorded on every decision it reports so a consumer that
+    // writes policy from the shared ring can tell the planes apart — see [`super::control::Plane`].
+    // The launch says it, never the proxy: see [`super::proxy::events`].
     plane: super::control::Plane,
     // Where this proxy records what its signer plugins formed, or `None` when the launch declared
     // none (and in tests). The launch owns it, so a task's per-invocation proxy records into the
@@ -988,22 +992,6 @@ pub(crate) fn start(
     if let Some(refresh) = refresh {
         ctx = ctx.with_refresh(refresh);
     }
-    if let Some(capture) = &capture {
-        ctx = ctx.with_capture(capture.clone());
-    }
-    ctx = ctx.with_plane(plane);
-    // Where the proxy's reports are applied: the session's decision counters, its notifier, and its
-    // signer record. The last two are passed in rather than built here because they are shared: the
-    // agent's proxy and every per-invocation proxy a declared operation stands up report into the
-    // one notifier and the one ring a reader can reach. A proxy that built its own would be
-    // recording into a ring nothing serves. The proxy itself holds none of them — see
-    // [`super::proxy::events`].
-    let sinks = super::proxy::events::Sinks {
-        stats: stats.clone(),
-        notifier: notify.map(|wiring| Arc::clone(&wiring.notifier)),
-        signer_log,
-    };
-
     // Stand up the control socket the host-side `sbx net pending`/`sbx net log`/`sbx net allow
     // --session` reach. It lives under the `0700` egress dir beside `<data>` and is **never** bound
     // into the cage (only the proxy socket and the CA cross in) — in Mode B the in-cage agent must not
@@ -1023,6 +1011,21 @@ pub(crate) fn start(
                 .with_record(super::lens::open_record(record, &dir)),
         )
     });
+    // Where the proxy's reports are applied: the session's decision counters, its notifier, its
+    // signer record, its event ring and its traffic capture, with the plane this proxy's decisions
+    // are recorded under. The notifier, the signer record and the event ring can be passed in
+    // rather than built here because they are shared: the agent's proxy and every per-invocation
+    // proxy a declared operation stands up report into the one notifier and the one ring a reader
+    // can reach. A proxy that built its own would be recording into a ring nothing serves. The
+    // proxy itself holds none of them — see [`super::proxy::events`].
+    let sinks = super::proxy::events::Sinks {
+        stats: stats.clone(),
+        notifier: notify.map(|wiring| Arc::clone(&wiring.notifier)),
+        signer_log,
+        log: Some(log.clone()),
+        capture: capture.clone(),
+        plane,
+    };
     // One stop signal for both serve threads. Set by the guard's `Drop`, which then connects to each
     // socket once to unpark the `accept` that would otherwise block forever — see `Egress`.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1035,7 +1038,6 @@ pub(crate) fn start(
         // registers a flow per open tunnel; `sbx net live` reads them over the control socket).
         let flows = Arc::new(super::control::FlowRegistry::new());
         ctx = ctx.with_control(pending.clone(), manual.clone());
-        ctx = ctx.with_log(log.clone());
         ctx = ctx.with_flows(flows.clone());
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.

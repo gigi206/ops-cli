@@ -556,6 +556,7 @@ fn through_proxy_websocket(
     connect_host: &str,
     connect_port: u16,
 ) -> io::Result<String> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -797,8 +798,10 @@ fn an_allowed_request_is_proxied_to_a_validated_upstream() {
         ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
             .unwrap()
             .with_upstream(upstream_cfg)
-            .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(
+                log.clone(),
+                Some(stats.clone()),
+            ))
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
 
@@ -876,8 +879,10 @@ fn a_muted_deny_is_kept_out_of_the_default_log_yet_still_counted() {
     ]);
     let ctx = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy)
         .unwrap()
-        .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
-        .with_log(log.clone());
+        .with_events(crate::sandbox::proxy::events::for_log(
+            log.clone(),
+            Some(stats.clone()),
+        ));
 
     // One refusal to the muted host, one to an unmuted host.
     ctx.outcome(
@@ -898,6 +903,7 @@ fn a_muted_deny_is_kept_out_of_the_default_log_yet_still_counted() {
         StatKind::Deny,
         "denied-default",
     );
+    ctx.events.as_ref().unwrap().flush();
 
     // The default view shows ONLY the unmuted refusal.
     let default_view = log.snapshot(None, None, false).events;
@@ -919,7 +925,6 @@ fn a_muted_deny_is_kept_out_of_the_default_log_yet_still_counted() {
     assert!(muted_ev.muted, "the recovered refusal is tagged muted");
     assert_eq!(muted_ev.verdict, crate::sandbox::control::LogVerdict::Deny);
 
-    ctx.events.as_ref().unwrap().flush();
     // Both refusals are counted regardless of muting — the audit collapses, it is not destroyed.
     let snap = stats.snapshot();
     assert_eq!(
@@ -949,8 +954,10 @@ fn a_session_mute_overlay_suppresses_a_deny_like_a_config_mute() {
         crate::allowlist::EgressPolicy::new(vec![], vec![]),
     )
     .unwrap()
-    .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
-    .with_log(log.clone());
+    .with_events(crate::sandbox::proxy::events::for_log(
+        log.clone(),
+        Some(stats.clone()),
+    ));
     // Load a live session mute — exactly what `REMEMBER MUTE` does on the control socket.
     ctx.manual
         .remember_mute(crate::allowlist::classify("play.googleapis.com").unwrap());
@@ -964,6 +971,7 @@ fn a_session_mute_overlay_suppresses_a_deny_like_a_config_mute() {
         StatKind::Deny,
         "denied-default",
     );
+    ctx.events.as_ref().unwrap().flush();
 
     assert!(
         log.snapshot(None, None, false).events.is_empty(),
@@ -972,7 +980,6 @@ fn a_session_mute_overlay_suppresses_a_deny_like_a_config_mute() {
     let all = log.snapshot(None, None, true).events;
     assert_eq!(all.len(), 1, "--all recovers the session-muted refusal");
     assert!(all[0].muted, "the recovered refusal is tagged muted");
-    ctx.events.as_ref().unwrap().flush();
     assert_eq!(
         stats.snapshot()["play.googleapis.com"].deny,
         1,
@@ -1205,7 +1212,7 @@ fn an_upgrade_the_upstream_never_answers_is_refused_rather_than_dropped() {
             ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
                 .unwrap()
                 .with_upstream(upstream_cfg)
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         let transcript =
@@ -1583,6 +1590,7 @@ fn through_proxy_ws_bytes(
     connect_host: &str,
     connect_port: u16,
 ) -> io::Result<Vec<u8>> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -1719,6 +1727,7 @@ fn through_proxy_ws_read_exact(
     connect_port: u16,
     n: usize,
 ) -> io::Result<Vec<u8>> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -1819,8 +1828,10 @@ fn a_cleartext_http_request_is_forwarded_in_origin_form_when_allowed() {
     let ctx = Arc::new(
         ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
             .unwrap()
-            .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(
+                log.clone(),
+                Some(stats.clone()),
+            ))
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
     let request = format!(
@@ -2002,8 +2013,10 @@ fn the_cleartext_path_blocks_ssrf_to_private_and_metadata_addresses() {
             policy(&["http://*.corp.test"]),
         )
         .unwrap()
-        .with_events(crate::sandbox::proxy::events::for_stats(Arc::clone(&stats)))
-        .with_log(Arc::clone(&log))
+        .with_events(crate::sandbox::proxy::events::for_log(
+            Arc::clone(&log),
+            Some(Arc::clone(&stats)),
+        ))
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
     let resp = through_cleartext(
@@ -2993,7 +3006,7 @@ fn an_allowed_request_records_the_upstream_status_code() {
             ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
                 .unwrap()
                 .with_upstream(upstream_cfg)
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         let _ = through_proxy(
@@ -3057,7 +3070,7 @@ fn a_large_response_body_relays_intact_past_the_head_read() {
         ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
             .unwrap()
             .with_upstream(upstream_cfg)
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
     let got = through_proxy(
@@ -3389,6 +3402,7 @@ fn through_proxy_repeatedly(
     connect_port: u16,
     requests: &[&[u8]],
 ) -> io::Result<Vec<String>> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -3894,6 +3908,7 @@ fn through_one_tunnel_paused(
     pipelined: bool,
     pause: Duration,
 ) -> io::Result<Vec<String>> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -4450,11 +4465,12 @@ fn a_connection_over_the_cap_is_told_why() {
         .unwrap()
         .with_upstream(upstream_cfg)
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
-        .with_log(log.clone()),
+        .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
     );
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
+    let reported = ctx.events.clone().unwrap();
     thread::spawn(move || {
         let _ = serve(
             listener,
@@ -4503,6 +4519,7 @@ fn a_connection_over_the_cap_is_told_why() {
         refusal.contains("max_connections"),
         "and which setting moves it: {refusal:?}"
     );
+    reported.flush();
     assert!(
         log.snapshot(None, None, false)
             .events
@@ -5093,7 +5110,7 @@ fn a_logged_path_has_its_secret_query_redacted_at_push() {
     let ctx = Arc::new(
         ProxyCtx::new(ca, policy(&["host.test:*"]))
             .unwrap()
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
             .with_redactions(vec![SecretNeedle::named(
                 "test-secret",
                 b"s3cret-token-value".to_vec(),
@@ -5365,7 +5382,7 @@ fn a_first_head_that_never_finished_is_logged_and_answered() {
     let ctx = Arc::new(
         ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[]))
             .unwrap()
-            .with_log(log.clone()),
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
     );
 
     // A head that starts and stops: no blank line ever arrives, and the client keeps the connection
@@ -5394,6 +5411,7 @@ fn a_first_head_that_never_finished_is_logged_and_answered() {
         answer.contains("X-Sbx-Egress-Reason: bad-request:head"),
         "the caller must be able to tell this from a policy refusal: {answer:?}"
     );
+    ctx.events.as_ref().unwrap().flush();
     let events = log.snapshot(None, None, false).events;
     assert_eq!(events.len(), 1, "one event for the attempt: {events:?}");
     assert_eq!(
@@ -5452,7 +5470,7 @@ fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
             ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
                 .unwrap()
                 .with_upstream(upstream_cfg)
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
                 .with_timeout(Duration::from_millis(200))
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
@@ -5462,6 +5480,7 @@ fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
         let dir = TmpDir::new();
         let path = dir.join("proxy.sock");
         let listener = UnixListener::bind(&path).unwrap();
+        let reported = ctx.events.clone().unwrap();
         thread::spawn(move || {
             let _ = serve(
                 listener,
@@ -5528,6 +5547,7 @@ fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
             answer.contains("X-Sbx-Egress-Reason: bad-request:head"),
             "and it must say which refusal it is: {answer:?}"
         );
+        reported.flush();
         let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 2, "the allow, then the refusal: {events:?}");
         assert_eq!(events[1].reason, "bad-request:head");
@@ -5563,13 +5583,14 @@ fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
                     .with_root_certificates(roots2)
                     .with_no_client_auth(),
             ))
-            .with_log(quiet.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(quiet.clone(), None))
             .with_timeout(Duration::from_millis(200))
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
     let dir2 = TmpDir::new();
     let path2 = dir2.join("proxy.sock");
     let listener2 = UnixListener::bind(&path2).unwrap();
+    let reported2 = ctx2.events.clone().unwrap();
     thread::spawn(move || {
         let _ = serve(
             listener2,
@@ -5620,6 +5641,7 @@ fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
     tls2.sock.shutdown(std::net::Shutdown::Write).unwrap();
     let mut tail = Vec::new();
     let _ = tls2.read_to_end(&mut tail);
+    reported2.flush();
     assert_eq!(
         quiet.snapshot(None, None, false).events.len(),
         1,
@@ -5651,7 +5673,7 @@ fn a_client_that_refuses_the_minted_leaf_is_logged_rather_than_read_as_a_finishe
             policy(&["upstream.test:*"]),
         )
         .unwrap()
-        .with_log(log.clone()),
+        .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
     );
 
     let (mut test_end, cage_end) = UnixStream::pair().unwrap();
@@ -5693,6 +5715,7 @@ fn a_client_that_refuses_the_minted_leaf_is_logged_rather_than_read_as_a_finishe
     drop(tls);
     let _ = served.join().unwrap();
 
+    ctx.events.as_ref().unwrap().flush();
     let events = log.snapshot(None, None, false).events;
     assert_eq!(
         events.len(),
@@ -6184,7 +6207,7 @@ fn a_body_held_to_be_digested_still_reaches_the_capture() {
                 .with_no_client_auth(),
         );
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
-        let ctx = capturing_ctx(
+        let (ctx, store) = capturing_ctx(
             proxy_ca,
             upstream_cfg,
             log.clone(),
@@ -6207,7 +6230,7 @@ fn a_body_held_to_be_digested_still_reaches_the_capture() {
         assert!(resp.contains("200"), "{framing:?}: {resp:?}");
         up.join().unwrap();
 
-        let cap = one_capture(&ctx, &log);
+        let cap = one_capture(&ctx, &store, &log);
         assert_eq!(
             String::from_utf8(cap.req_body.bytes.clone()).unwrap(),
             "payload",
@@ -7327,7 +7350,7 @@ fn a_forged_upstream_is_refused_with_502() {
     let ctx = Arc::new(
         ProxyCtx::new(proxy_ca, policy(&["host.test:*"]))
             .unwrap()
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
     let resp = through_proxy(
@@ -7370,7 +7393,7 @@ fn a_dns_failure_for_an_allowed_host_is_a_clean_502_not_a_dropped_connection() {
     let ctx = Arc::new(
         ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
             .unwrap()
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
             .with_resolver(Box::new(|_| {
                 Err(io::Error::other("name resolution failed"))
             })),
@@ -7976,8 +7999,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["allowed.test:*"]))
                 .unwrap()
-                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    log.clone(),
+                    Some(s.clone()),
+                ))
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run for a denied host")
                 })),
@@ -8011,8 +8036,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, denylist)
                 .unwrap()
-                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    log.clone(),
+                    Some(s.clone()),
+                ))
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run for a deny-rule host")
                 })),
@@ -8052,8 +8079,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
                     .with_ask_timeout(Some(std::time::Duration::from_millis(50))),
             )
             .unwrap()
-            .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(
+                log.clone(),
+                Some(s.clone()),
+            ))
             .with_resolver(Box::new(|_| {
                 panic!("resolve must not run for a timed-out ask")
             })),
@@ -8085,8 +8114,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["allowed.test:*", "evil.test:*"]))
                 .unwrap()
-                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    log.clone(),
+                    Some(s.clone()),
+                ))
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run on a fronting attempt")
                 })),
@@ -8118,8 +8149,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["allowed.test:*"]))
                 .unwrap()
-                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    log.clone(),
+                    Some(s.clone()),
+                ))
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run on a host mismatch")
                 })),
@@ -8151,8 +8184,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
-                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    log.clone(),
+                    Some(s.clone()),
+                ))
                 .with_redactions(vec![SecretNeedle::named(
                     "test-secret",
                     b"s3cret-reflected-value".to_vec(),
@@ -8188,8 +8223,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
-                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    log.clone(),
+                    Some(s.clone()),
+                ))
                 // the cloud metadata address — always refused, even for an exact-host rule
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
         );
@@ -8222,8 +8259,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
-                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    log.clone(),
+                    Some(s.clone()),
+                ))
                 .with_injections(vec![digesting_injection()])
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
@@ -8263,8 +8302,10 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
-                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
-                .with_log(log.clone())
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    log.clone(),
+                    Some(s.clone()),
+                ))
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         ctx.held_bodies
@@ -9555,6 +9596,7 @@ fn through_proxy_raw(
     connect_port: u16,
     payload: &[u8],
 ) -> io::Result<Vec<u8>> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -9589,6 +9631,7 @@ fn through_proxy_raw(
 /// Connect and read just the CONNECT-stage reply (a `200`, or a pre-tunnel refusal), for the
 /// cases the proxy refuses before accepting the tunnel.
 fn splice_connect_reply(ctx: Arc<ProxyCtx>, connect_host: &str, connect_port: u16) -> String {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -9642,7 +9685,7 @@ fn an_ip_literal_target_without_a_tcp_rule_is_refused_and_logged_blocked() {
     let ctx = Arc::new(
         ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
             .unwrap()
-            .with_log(log.clone()),
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
     );
     let reply = splice_connect_reply(ctx, "127.0.0.1", 443);
     assert!(reply.contains("ip-literal"), "{reply:?}");
@@ -9667,11 +9710,12 @@ fn an_unroutable_non_connect_request_is_refused_and_logged() {
     let ctx = Arc::new(
         ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
             .unwrap()
-            .with_log(log.clone()),
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
     );
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
+    let reported = ctx.events.clone().unwrap();
     thread::spawn(move || {
         let _ = serve(
             listener,
@@ -9687,6 +9731,7 @@ fn an_unroutable_non_connect_request_is_refused_and_logged() {
     sock.flush().unwrap();
     let reply = read_until_blank(&mut sock).unwrap();
     assert!(reply.contains("method-not-allowed"), "{reply:?}");
+    reported.flush();
     let events = log.snapshot(None, None, false).events;
     assert_eq!(events.len(), 1, "one event: {events:?}");
     assert_eq!(events[0].verdict, LogVerdict::Blocked);
@@ -9731,7 +9776,8 @@ fn the_splice_guard_counts_open_tunnels() {
 
 // ── Traffic capture (`[network] capture`) ─────────────────────────────────────────────────────
 
-/// A capturing proxy, allowing `upstream.test` and capturing at `level`.
+/// A capturing proxy, allowing `upstream.test` and capturing at `level`, with the store it files
+/// its captures into.
 #[cfg(test)]
 fn capturing_ctx(
     proxy_ca: Arc<Ca>,
@@ -9741,26 +9787,29 @@ fn capturing_ctx(
     body_kb: u64,
     injections: Vec<HeaderInjection>,
     redactions: Vec<SecretNeedle>,
-) -> Arc<ProxyCtx> {
+) -> (Arc<ProxyCtx>, Arc<crate::sandbox::control::CaptureRing>) {
     use crate::sandbox::control::{CaptureCaps, CaptureRing};
-    let ring = Arc::new(CaptureRing::with_needles(
+    let store = Arc::new(CaptureRing::with_needles(
         CaptureCaps::new(level, body_kb),
         redactions.clone(),
     ));
-    Arc::new(
+    let ctx = Arc::new(
         ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
             .unwrap()
             .with_upstream(upstream_cfg)
-            .with_log(log)
-            .with_capture(ring)
+            .with_events(crate::sandbox::proxy::events::for_capture(
+                log,
+                Arc::clone(&store),
+            ))
             .with_injections(injections)
             .with_redactions(redactions)
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
-    )
+    );
+    (ctx, store)
 }
 
 /// The captured exchange for the single event in `log`, read back the way the control socket
-/// serves it (through the ring the ctx holds).
+/// serves it (through the store `ctx` files into).
 ///
 /// Waits for it: the capture is filed when the proxy's connection handler returns, which happens
 /// on the proxy thread *after* the client has read the last byte — so a test that reads the
@@ -9770,11 +9819,14 @@ fn capturing_ctx(
 #[cfg(test)]
 fn one_capture(
     ctx: &ProxyCtx,
+    ring: &crate::sandbox::control::CaptureRing,
     log: &crate::sandbox::control::LogRing,
 ) -> crate::sandbox::control::Capture {
+    // The decision was reported before the request was forwarded, so it is applied once what was
+    // reported so far is.
+    ctx.events.as_ref().expect("a reporting ctx").flush();
     let events = log.snapshot(None, None, false).events;
     assert_eq!(events.len(), 1, "one event expected: {events:?}");
-    let ring = ctx.capture.as_ref().expect("a capturing ctx");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(cap) = ring.get(&[events[0].seq]).0.into_iter().next() {
@@ -9828,7 +9880,10 @@ fn a_secret_leaving_through_a_websocket_crosses_or_not_by_the_configured_posture
             )
             .unwrap()
             .with_upstream(upstream_cfg)
-            .with_log(Arc::new(LogRing::new(LOG_RING_CAP)))
+            .with_events(crate::sandbox::proxy::events::for_log(
+                Arc::new(LogRing::new(LOG_RING_CAP)),
+                None,
+            ))
             .with_redactions(vec![SecretNeedle::named(
                 "demo-token",
                 b"SECRET-VALUE-0123456789".to_vec(),
@@ -9883,7 +9938,7 @@ fn a_secret_reflected_into_a_websocket_frame_is_reported_on_its_event() {
         ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
             .unwrap()
             .with_upstream(upstream_cfg)
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
             .with_redactions(vec![SecretNeedle::named(
                 "demo-token",
                 b"SECRET-VALUE-0123456789".to_vec(),
@@ -9944,7 +9999,7 @@ fn a_capturing_launch_records_both_directions_without_disturbing_the_relay() {
             .with_no_client_auth(),
     );
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ctx(
+    let (ctx, store) = capturing_ctx(
         proxy_ca,
         upstream_cfg,
         log.clone(),
@@ -9969,7 +10024,7 @@ fn a_capturing_launch_records_both_directions_without_disturbing_the_relay() {
         "the relayed response is untouched by the tee: {got:?}"
     );
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     let req_head = String::from_utf8(cap.req_head.bytes.clone()).unwrap();
     assert!(
         req_head.starts_with("POST /v1/messages HTTP/1.1"),
@@ -10010,7 +10065,7 @@ fn the_headers_level_captures_no_payload_at_all() {
             .with_no_client_auth(),
     );
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ctx(
+    let (ctx, store) = capturing_ctx(
         proxy_ca,
         upstream_cfg,
         log.clone(),
@@ -10034,7 +10089,7 @@ fn the_headers_level_captures_no_payload_at_all() {
         "the relay still works: {got:?}"
     );
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     assert!(!cap.req_head.bytes.is_empty() && !cap.res_head.bytes.is_empty());
     assert!(
         cap.req_body.is_empty(),
@@ -10070,7 +10125,7 @@ fn a_body_over_the_cap_is_marked_truncated_and_still_relayed_whole() {
             .with_no_client_auth(),
     );
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ctx(
+    let (ctx, store) = capturing_ctx(
         proxy_ca,
         upstream_cfg,
         log.clone(),
@@ -10095,7 +10150,7 @@ fn a_body_over_the_cap_is_marked_truncated_and_still_relayed_whole() {
         "the cage receives the whole body regardless of the capture cap"
     );
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     assert_eq!(cap.res_body.bytes.len(), 1024, "cut exactly at the cap");
     assert!(cap.res_body.truncated, "and the cut is reported");
 }
@@ -10120,7 +10175,7 @@ fn an_injected_credential_is_named_in_the_capture_but_never_valued() {
             .with_no_client_auth(),
     );
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ctx(
+    let (ctx, store) = capturing_ctx(
         proxy_ca,
         upstream_cfg,
         log.clone(),
@@ -10144,7 +10199,7 @@ fn an_injected_credential_is_named_in_the_capture_but_never_valued() {
     .unwrap();
     up.join().unwrap();
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     let whole: Vec<u8> = cap
         .parts()
         .into_iter()
@@ -10180,7 +10235,7 @@ fn a_reflected_secret_is_masked_out_of_the_capture() {
             .with_no_client_auth(),
     );
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ctx(
+    let (ctx, store) = capturing_ctx(
         proxy_ca,
         upstream_cfg,
         log.clone(),
@@ -10200,7 +10255,7 @@ fn a_reflected_secret_is_masked_out_of_the_capture() {
     .unwrap();
     up.join().unwrap();
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     let body = String::from_utf8(cap.res_body.bytes.clone()).unwrap();
     assert_eq!(
         body, "you sent ************ back",
@@ -10218,7 +10273,7 @@ fn a_cleartext_exchange_is_captured_in_both_directions() {
     );
     let port = addr.port();
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ring = Arc::new(CaptureRing::with_needles(
+    let store = Arc::new(CaptureRing::with_needles(
         CaptureCaps::new(CaptureLevel::Bodies, 8),
         vec![],
     ));
@@ -10226,8 +10281,10 @@ fn a_cleartext_exchange_is_captured_in_both_directions() {
     let ctx = Arc::new(
         ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
             .unwrap()
-            .with_log(log.clone())
-            .with_capture(ring)
+            .with_events(crate::sandbox::proxy::events::for_capture(
+                log.clone(),
+                Arc::clone(&store),
+            ))
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
     let request = format!(
@@ -10237,7 +10294,7 @@ fn a_cleartext_exchange_is_captured_in_both_directions() {
     let resp = through_cleartext(ctx.clone(), request.as_bytes()).unwrap();
     assert!(resp.contains("hello"), "the relay still works: {resp:?}");
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     assert!(
         String::from_utf8(cap.req_head.bytes.clone())
             .unwrap()
@@ -10281,7 +10338,7 @@ fn a_request_body_over_the_cap_is_marked_truncated_and_still_forwarded_whole() {
             .with_no_client_auth(),
     );
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ctx(
+    let (ctx, store) = capturing_ctx(
         proxy_ca,
         upstream_cfg,
         log.clone(),
@@ -10306,7 +10363,7 @@ fn a_request_body_over_the_cap_is_marked_truncated_and_still_forwarded_whole() {
     .unwrap();
     up.join().unwrap();
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     assert_eq!(cap.req_body.bytes.len(), 1024, "cut at the cap");
     assert!(
         cap.req_body.truncated,
@@ -10337,7 +10394,7 @@ fn a_non_capturing_launch_files_nothing() {
         ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
             .unwrap()
             .with_upstream(upstream_cfg)
-            .with_log(log.clone())
+            .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None))
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
     let _ = through_proxy(
@@ -10350,32 +10407,39 @@ fn a_non_capturing_launch_files_nothing() {
         )
         .unwrap();
     up.join().unwrap();
-    assert!(ctx.capture.is_none(), "no capture ring is even built");
+    assert!(
+        ctx.events.as_ref().unwrap().keeps().capture.is_none(),
+        "nothing is captured"
+    );
     // The event is still logged — only the traffic is absent.
     assert_eq!(log.snapshot(None, None, false).events.len(), 1);
 }
 
-/// A capturing ctx allowing a WebSocket upgrade to `upstream.test`.
+/// A capturing ctx allowing a WebSocket upgrade to `upstream.test`, with the store it files its
+/// captures into.
 #[cfg(test)]
 fn capturing_ws_ctx(
     proxy_ca: Arc<Ca>,
     upstream_cfg: Arc<ClientConfig>,
     log: Arc<crate::sandbox::control::LogRing>,
     level: crate::sandbox::control::CaptureLevel,
-) -> Arc<ProxyCtx> {
+) -> (Arc<ProxyCtx>, Arc<crate::sandbox::control::CaptureRing>) {
     use crate::sandbox::control::{CaptureCaps, CaptureRing};
-    let ring = Arc::new(CaptureRing::with_needles(
+    let store = Arc::new(CaptureRing::with_needles(
         CaptureCaps::new(level, 8),
         vec![],
     ));
-    Arc::new(
+    let ctx = Arc::new(
         ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
             .unwrap()
             .with_upstream(upstream_cfg)
-            .with_log(log)
-            .with_capture(ring)
+            .with_events(crate::sandbox::proxy::events::for_capture(
+                log,
+                Arc::clone(&store),
+            ))
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
-    )
+    );
+    (ctx, store)
 }
 
 /// A WebSocket upstream that REFLECTS a secret back inside a frame: it accepts the upgrade and
@@ -10589,7 +10653,10 @@ fn a_credential_learned_after_a_tunnel_opens_is_scanned(declared_at_open: bool) 
         )
         .unwrap()
         .with_upstream(upstream_cfg)
-        .with_log(Arc::new(LogRing::new(LOG_RING_CAP)))
+        .with_events(crate::sandbox::proxy::events::for_log(
+            Arc::new(LogRing::new(LOG_RING_CAP)),
+            None,
+        ))
         .with_redactions(declared)
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
@@ -10804,6 +10871,7 @@ fn through_proxy_ws_frames(
     connect_host: &str,
     connect_port: u16,
 ) -> io::Result<Vec<u8>> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -10872,7 +10940,7 @@ fn a_websocket_transcript_is_captured_in_both_directions_without_disturbing_the_
     let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
     let proxy_ca_der = proxy_ca.ca_cert_der();
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
+    let (ctx, store) = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
 
     let relayed =
         through_proxy_ws_frames(ctx.clone(), proxy_ca_der, "upstream.test", addr.port()).unwrap();
@@ -10891,7 +10959,7 @@ fn a_websocket_transcript_is_captured_in_both_directions_without_disturbing_the_
     // cap, and such a filing could show one of the two upstream frames without the other. The cap
     // is never reached here — these payloads are a few dozen bytes — so the only filing is the
     // final one, which carries both directions at once.
-    let ring = ctx.capture.as_ref().expect("a capturing ctx");
+    let ring = &*store;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let cap = loop {
         let seqs: Vec<u64> = log
@@ -10952,7 +11020,7 @@ fn a_websocket_handshake_is_captured_including_the_101_but_not_the_frames() {
     let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
     let proxy_ca_der = proxy_ca.ca_cert_der();
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
+    let (ctx, store) = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
 
     let transcript =
         through_proxy_websocket(ctx.clone(), proxy_ca_der, "upstream.test", addr.port()).unwrap();
@@ -10966,7 +11034,7 @@ fn a_websocket_handshake_is_captured_including_the_101_but_not_the_frames() {
         "the capture disturbed the relay: {transcript:?}"
     );
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     let req_head = String::from_utf8_lossy(&cap.req_head.bytes).into_owned();
     assert!(
         req_head.contains("GET /chat HTTP/1.1") && req_head.contains("Upgrade: websocket"),
@@ -11063,7 +11131,7 @@ fn a_websocket_capture_is_filed_while_the_tunnel_is_still_open() {
     let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
     let proxy_ca_der = proxy_ca.ca_cert_der();
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Headers);
+    let (ctx, store) = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Headers);
 
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
@@ -11104,7 +11172,7 @@ fn a_websocket_capture_is_filed_while_the_tunnel_is_still_open() {
         head
     });
 
-    let ring = ctx.capture.as_ref().expect("a capturing ctx");
+    let ring = &*store;
     // Generous on purpose: what is being asserted is an ORDERING (filed before the tunnel ends),
     // and the tunnel cannot end until the release at the bottom of this test. The deadline only
     // exists so a regression fails instead of hanging, so it costs nothing when passing and must
@@ -11172,7 +11240,7 @@ fn a_declined_websocket_upgrade_is_captured_like_an_ordinary_response() {
     let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
     let proxy_ca_der = proxy_ca.ca_cert_der();
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ctx = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
+    let (ctx, store) = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
 
     let transcript =
         through_proxy_websocket(ctx.clone(), proxy_ca_der, "upstream.test", addr.port()).unwrap();
@@ -11182,7 +11250,7 @@ fn a_declined_websocket_upgrade_is_captured_like_an_ordinary_response() {
         "the declined response was not relayed: {transcript:?}"
     );
 
-    let cap = one_capture(&ctx, &log);
+    let cap = one_capture(&ctx, &store, &log);
     assert!(
         String::from_utf8_lossy(&cap.res_head.bytes).contains("401 Unauthorized"),
         "{:?}",

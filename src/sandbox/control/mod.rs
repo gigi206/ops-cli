@@ -808,8 +808,9 @@ pub(crate) struct LogSnapshot {
 }
 
 /// A bounded ring of recent egress decisions, newest appended, oldest evicted past `cap`. Shared
-/// (via `Arc`) between the proxy serve threads (which [`push`](LogRing::push)) and the control serve
-/// thread (which [`snapshot`](LogRing::snapshot)s for `sbx net log`). Sequence numbers start at 1 and
+/// (via `Arc`) between the side that applies what each proxy reports (which
+/// [`push`](LogRing::push)es, see [`crate::sandbox::proxy::events`]) and the control serve thread
+/// (which [`snapshot`](LogRing::snapshot)s for `sbx net log`). Sequence numbers start at 1 and
 /// never repeat within a session, so a `--follow` cursor of 0 means "from the beginning" and can
 /// never collide with a real event.
 pub(crate) struct LogRing {
@@ -870,6 +871,11 @@ impl LogRing {
         }
     }
 
+    /// How many events each of the two rings holds before it evicts its oldest.
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
+    }
+
     /// Attach this session's record, so the decisions also reach a file that outlives the session.
     ///
     /// Attached where the ring is **created**, never where one is passed in: a task's per-invocation
@@ -881,13 +887,13 @@ impl LogRing {
     }
 
     /// Append one decision, assigning it the next sequence number and evicting the oldest if the ring
-    /// is full. Called from the proxy with the path already query-redacted. Returns the assigned
+    /// is full. Called with the path already query-redacted by the proxy. Returns the assigned
     /// sequence number, so a later [`set_status`](LogRing::set_status) can amend this same event once
     /// its upstream response returns.
     ///
-    /// `plane` names the proxy making the call, because a ring is shared by proxies enforcing
-    /// different policies — see [`Plane`]. It is a caller's property, not a per-request one: a
-    /// proxy passes the same value for every event it pushes.
+    /// `plane` names the proxy the decision is from, because a ring is shared by proxies enforcing
+    /// different policies — see [`Plane`]. It is a property of that proxy, not of a request: the
+    /// side applying one proxy's reports passes the same value for every event.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push(
         &self,

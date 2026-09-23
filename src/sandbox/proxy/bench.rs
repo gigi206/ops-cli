@@ -29,9 +29,9 @@
 //! ```
 //!
 //! `--test-threads=1` is not tidiness. Run in parallel, these measurements contend for the machine
-//! and for its page cache, and each one's figure is then partly the others': the WebSocket relay
-//! read 738 MiB/s against a plain 1184 that way and 1345 against 1412 on its own, which is the
-//! difference between "the capture costs a third of this path" and "the capture costs a twentieth".
+//! and for its page cache, and each one's figure is then partly the others': the gap between two
+//! variants of one path, which is what a variant exists to show, is then as much the contention as
+//! the thing the variant adds.
 
 use super::ca::CertResolver;
 use super::*;
@@ -238,6 +238,17 @@ fn read_head<S: Read>(src: &mut S) -> io::Result<()> {
             Ok(_) => {}
         }
     }
+}
+
+/// A reporter that files every exchange into `store`, beside the live log a capture is filed under:
+/// without a log, a proxy has no decision to file a capture for and captures nothing.
+fn capturing(store: crate::sandbox::control::CaptureRing) -> events::Emitter {
+    events::for_capture(
+        Arc::new(crate::sandbox::control::LogRing::new(
+            crate::sandbox::control::LOG_RING_CAP,
+        )),
+        Arc::new(store),
+    )
 }
 
 /// Start the real serve loop on its own Unix socket and return the path (with the directory that
@@ -706,7 +717,7 @@ fn websocket_throughput() {
             // not the other axis here: an upgrade to a credential-injected host is refused outright,
             // because past the `101` nothing can be redacted.
             ctx = ctx
-                .with_capture(Arc::new(CaptureRing::with_needles(
+                .with_events(capturing(CaptureRing::with_needles(
                     CaptureCaps::new(CaptureLevel::Bodies, 64),
                     needles.clone(),
                 )))
@@ -958,7 +969,7 @@ fn bulk_throughput() {
                 .with_redactions(needles.clone());
         }
         if label == "with capture = bodies" {
-            ctx = ctx.with_capture(Arc::new(CaptureRing::with_needles(
+            ctx = ctx.with_events(capturing(CaptureRing::with_needles(
                 CaptureCaps::new(CaptureLevel::Bodies, 64),
                 vec![],
             )));
@@ -1297,10 +1308,11 @@ fn refusal_cost() {
                 "/t".into(),
                 None,
             ));
+            let reported = crate::sandbox::proxy::events::for_stats(Arc::clone(&stats));
             let ctx = Arc::new(
                 ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[]))
                     .unwrap()
-                    .with_events(crate::sandbox::proxy::events::for_stats(Arc::clone(&stats)))
+                    .with_events(reported.clone())
                     .with_resolver(Box::new(|_| {
                         panic!("a default-deny refusal must not reach a name lookup")
                     })),
@@ -1318,6 +1330,9 @@ fn refusal_cost() {
                 );
                 one_http_request(&sock, req.as_bytes()).unwrap();
             }
+            // The counters are kept by the side that applies what the proxy reports, on a thread of
+            // its own: what it writes for these refusals belongs to this figure, however late.
+            reported.flush();
             let wrote = bytes_written().saturating_sub(wrote_before);
             elapsed.push(started.elapsed());
             let label = match distinct {

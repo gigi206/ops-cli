@@ -822,8 +822,10 @@ mod tests {
         )
         .unwrap()
         .with_upstream(upstream_cfg)
-        .with_events(crate::sandbox::proxy::events::for_stats(Arc::clone(&stats)))
-        .with_log(Arc::clone(&log))
+        .with_events(crate::sandbox::proxy::events::for_log(
+            Arc::clone(&log),
+            Some(Arc::clone(&stats)),
+        ))
         // loopback, permitted only because the deciding rule names this exact host
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
 

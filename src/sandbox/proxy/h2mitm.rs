@@ -1862,7 +1862,10 @@ mod tests {
                 EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
             )
             .unwrap()
-            .with_log(Arc::clone(&log))
+            .with_events(crate::sandbox::proxy::events::for_log(
+                Arc::clone(&log),
+                None,
+            ))
             .with_shared_credentials(Arc::new(Credentials::new(
                 Vec::new(),
                 vec![SecretNeedle::named("token", SECRET.as_bytes().to_vec())],
@@ -1922,6 +1925,7 @@ mod tests {
                 .await
                 .expect("the in-memory h2 exchange must not stall")
             });
+            ctx.events.as_ref().unwrap().flush();
             let reasons = log
                 .snapshot(None, None, false)
                 .events
@@ -1968,14 +1972,14 @@ mod tests {
         let dir = TmpDir::new();
         let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
-        let events = crate::sandbox::proxy::events::for_stats(Arc::clone(&stats));
+        let events =
+            crate::sandbox::proxy::events::for_log(Arc::clone(&log), Some(Arc::clone(&stats)));
         let ctx = ProxyCtx::new(
             Arc::new(super::super::Ca::ephemeral().unwrap()),
             EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
         )
         .unwrap()
         .with_events(events.clone())
-        .with_log(Arc::clone(&log))
         // the cloud-metadata address: refused whatever the rule, this exact-host one included
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])])));
 
@@ -2080,11 +2084,11 @@ mod tests {
         let dir = TmpDir::new();
         let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
-        let events = crate::sandbox::proxy::events::for_stats(Arc::clone(&stats));
+        let events =
+            crate::sandbox::proxy::events::for_log(Arc::clone(&log), Some(Arc::clone(&stats)));
         let ctx = ProxyCtx::new(Arc::new(super::super::Ca::ephemeral().unwrap()), policy)
             .unwrap()
             .with_events(events.clone())
-            .with_log(Arc::clone(&log))
             .with_resolver(Box::new(|_| {
                 panic!("a verdict refusal must be decided before any name is resolved")
             }));
@@ -2583,8 +2587,10 @@ mod tests {
             EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
         )
         .unwrap()
-        .with_events(crate::sandbox::proxy::events::for_stats(Arc::clone(&stats)))
-        .with_log(Arc::clone(&log))
+        .with_events(crate::sandbox::proxy::events::for_log(
+            Arc::clone(&log),
+            Some(Arc::clone(&stats)),
+        ))
         // loopback, permitted only because the deciding rule names this exact host
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
         ctx.upstream_h2 = trusting_h2(upstream_ca);
@@ -2837,6 +2843,7 @@ mod tests {
     ) -> Vec<H2Answer> {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
+        let _settle = super::super::events::Settle(ctx.events.clone());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3915,7 +3922,10 @@ mod tests {
                 EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
             )
             .unwrap()
-            .with_log(Arc::new(LogRing::new(LOG_RING_CAP)))
+            .with_events(crate::sandbox::proxy::events::for_log(
+                Arc::new(LogRing::new(LOG_RING_CAP)),
+                None,
+            ))
             // the cloud-metadata address: refused by the address guard whatever the rule says
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])])));
 

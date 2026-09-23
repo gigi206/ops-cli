@@ -116,22 +116,13 @@ pub(crate) struct ProxyCtx {
     /// the pending id without polling. Off by default (tests, non-ask launches); the launch turns
     /// it on when it wires the control socket.
     pub(super) notices: bool,
-    /// Where this proxy reports what it did — the decisions it counts for `sbx net stats`, the
-    /// refusals it announces, the credentials its signers form — or `None` when nothing is kept
-    /// (tests). Reports leave as messages the launch applies on its own side
+    /// Where this proxy reports what it did — the decisions it counts for `sbx net stats` and logs
+    /// for `sbx net logs`, what completes a logged decision (its status, its capture, a secret seen
+    /// in its tunnel), the refusals it announces, the credentials its signers form — or `None` when
+    /// nothing is kept (tests). Reports leave as messages the launch applies on its own side
     /// ([`super::events`]), so the proxy holds none of the structures they end up in. Attached by
     /// [`crate::sandbox::egress::start`] via [`Self::with_events`].
     pub(super) events: Option<super::events::Emitter>,
-    /// The live event ring this launch pushes each decision into, read by `sbx net log`, or `None`
-    /// when the log is off (tests). The launch ([`crate::sandbox::egress::start`]) attaches the session's
-    /// [`crate::sandbox::control::LogRing`] via [`Self::with_log`]; a decision's outcome is both counted in
-    /// `stats` and pushed here through the single [`Self::outcome`] chokepoint.
-    pub(super) log: Option<Arc<crate::sandbox::control::LogRing>>,
-    /// Which plane this proxy is — stamped on every event it pushes, because the ring above may be
-    /// shared with the per-invocation proxies of declared tasks, which enforce policies of their
-    /// own. [`crate::sandbox::control::Plane::Agent`] unless the launch says otherwise via
-    /// [`Self::with_plane`], since the session's own proxy is the common case and every test's.
-    pub(super) plane: crate::sandbox::control::Plane,
     /// The live registry of egress tunnels currently open, read by `sbx net live`, or `None` when
     /// off (tests). The launch ([`crate::sandbox::egress::start`]) attaches the session's
     /// [`crate::sandbox::control::FlowRegistry`] via [`Self::with_flows`]; each permitted tunnel registers a
@@ -162,11 +153,6 @@ pub(crate) struct ProxyCtx {
     /// suggestion in a `denied-default` refusal body to the app (`--app <name>`). `None` for a bare
     /// `sbx run`/`shell`.
     pub(super) app: Option<String>,
-    /// The session's traffic capture (`[network] capture`), or `None` — the default — when nothing
-    /// is captured. Attached by [`crate::sandbox::egress::start`] via [`Self::with_capture`]; every
-    /// inspected forwarding path opens a capture through the one [`Self::begin_capture`] entry
-    /// point, so a path that does not ask for one simply captures nothing.
-    pub(super) capture: Option<Arc<crate::sandbox::control::CaptureRing>>,
     /// The validated upstream connections a finished request left behind, for a later request to
     /// the same host with the same credentials to reuse (`[network] pool`), or `None` — the default
     /// — when the launch opens a fresh connection per request. Shared across connection threads
@@ -256,14 +242,11 @@ impl ProxyCtx {
             manual: Arc::new(crate::sandbox::control::ManualRules::new()),
             notices: false,
             events: None,
-            log: None,
-            plane: crate::sandbox::control::Plane::Agent,
             flows: None,
             splices: AtomicUsize::new(0),
             conns: AtomicUsize::new(0),
             held_bodies: std::sync::atomic::AtomicU64::new(0),
             app: None,
-            capture: None,
             pool,
             idle: policy_idle,
             max_conns: policy_max_conns,
@@ -287,22 +270,6 @@ impl ProxyCtx {
         self
     }
 
-    /// Attach the session's live event ring, so each request's decision is pushed for `sbx net log`.
-    /// Set once by the launch ([`crate::sandbox::egress::start`]) whenever the proxy runs.
-    pub(crate) fn with_log(mut self, log: Arc<crate::sandbox::control::LogRing>) -> Self {
-        self.log = Some(log);
-        self
-    }
-
-    /// Name the plane this proxy enforces for, so the events it pushes can be told apart from those
-    /// of another proxy sharing the same ring. Set once by the launch
-    /// ([`crate::sandbox::egress::start`]); the session's own proxy leaves the
-    /// [`crate::sandbox::control::Plane::Agent`] default.
-    pub(crate) fn with_plane(mut self, plane: crate::sandbox::control::Plane) -> Self {
-        self.plane = plane;
-        self
-    }
-
     /// Attach the session's live flow registry, so each permitted tunnel registers itself for its
     /// lifetime and `sbx net live` can read the tunnels open right now. Set once by the launch
     /// ([`crate::sandbox::egress::start`]) whenever the proxy runs.
@@ -317,54 +284,54 @@ impl ProxyCtx {
         self.events.as_ref().filter(|e| e.keeps().signatures)
     }
 
-    /// Attach the session's traffic capture, so each inspected exchange files what it carried for
-    /// `sbx net logs --with-headers/--with-body`. Set by the launch
-    /// ([`crate::sandbox::egress::start`]) only when a **trusted** layer turned the capture on;
-    /// left unset nothing is ever buffered on the forwarding path.
-    pub(crate) fn with_capture(
-        mut self,
-        capture: Arc<crate::sandbox::control::CaptureRing>,
-    ) -> Self {
-        self.capture = Some(capture);
-        self
-    }
-
-    /// Open a capture for the permitted exchange logged as `seq`, or `None` when this launch does
-    /// not capture (or nothing was logged). The returned guard files the exchange when it is
-    /// dropped, however the relay ends — hold it for the exchange's lifetime.
+    /// Open a capture for the permitted exchange logged as `id`, or `None` when this launch does
+    /// not capture (`[network] capture`, turned on only by a **trusted** layer) or nothing was
+    /// logged. The returned guard files the exchange when it is dropped, however the relay ends —
+    /// hold it for the exchange's lifetime. Every inspected forwarding path opens its capture here,
+    /// so a path that does not ask for one simply captures nothing.
     ///
     /// Call only for a *permitted* request: a refusal forwards nothing, so there is no traffic to
     /// show, and the decision itself is already the log event.
     pub(super) fn begin_capture(
         &self,
-        seq: Option<u64>,
+        id: Option<u64>,
         host: &str,
     ) -> Option<super::capture::CaptureGuard> {
-        let (capture, log, seq) = (self.capture.as_ref()?, self.log.as_ref()?, seq?);
+        let events = self.events.as_ref()?;
+        let (caps, id) = (events.keeps().capture?, id?);
         // Tell the event ring a capture is coming, so an arriving status waits for it and the event
         // is re-emitted exactly once with everything.
-        log.expect_capture(seq);
+        events.send(super::events::ProxyEvent::CaptureExpected { id });
         Some(super::capture::CaptureGuard::new(
-            capture.clone(),
-            log.clone(),
-            seq,
+            events.clone(),
+            caps,
+            id,
             host,
         ))
     }
 
     /// Record that the configured secret `name` was seen crossing the WebSocket tunnel logged as
-    /// `seq`, in the direction `way`. A no-op when nothing was logged (tests) or the launch has no
-    /// event ring.
+    /// `id`, in the direction `way`. A no-op when nothing was logged (tests) or the launch keeps no
+    /// log.
     ///
     /// This is a report, never a verdict: the tunnel stays open and its bytes are relayed exactly as
     /// they crossed. Blocking would mean tearing down a live tunnel on a byte-exact match, and
     /// masking would mean rewriting a stream two peers agreed the framing of — so what the proxy
     /// does here is tell the user, on the tunnel's own event, while it is still open.
-    pub(super) fn websocket_secret_seen(&self, seq: Option<u64>, name: &str, way: SecretWay) {
-        let (Some(log), Some(seq)) = (self.log.as_ref(), seq) else {
+    pub(super) fn websocket_secret_seen(&self, id: Option<u64>, name: &str, way: SecretWay) {
+        let (Some(events), Some(id)) = (self.logged(), id) else {
             return;
         };
-        log.secret_seen(seq, name, way);
+        events.send(super::events::ProxyEvent::SecretSeen {
+            id,
+            name: name.to_string(),
+            way,
+        });
+    }
+
+    /// Where a decision is logged, when the launch keeps a log.
+    fn logged(&self) -> Option<&super::events::Emitter> {
+        self.events.as_ref().filter(|e| e.keeps().log)
     }
 
     /// Register a permitted tunnel in the live flow registry, returning its RAII guard — hold it for
@@ -571,29 +538,27 @@ impl ProxyCtx {
         verdict: crate::sandbox::control::LogVerdict,
         reason: &str,
     ) -> Option<u64> {
-        let log = self.log.as_ref()?;
-        let redacted = path.map(|p| self.redact_query(host, p));
-        Some(log.push(
+        let events = self.logged()?;
+        Some(events.log(super::events::LogEntry {
             muted,
-            host,
+            host: host.to_string(),
             port,
-            method,
-            redacted.as_deref(),
+            method: method.map(str::to_string),
+            path: path.map(|p| self.redact_query(host, p)),
             verdict,
-            reason,
+            reason: reason.to_string(),
             proto,
             http_ver,
             rpc,
-            self.plane,
-        ))
+        }))
     }
 
-    /// Amend the event `seq` (returned by a prior [`outcome`](Self::outcome)) with the upstream HTTP
-    /// status its response returned. A clean no-op when no log is configured or no event was pushed
-    /// (`seq` is `None`), or when the event has already been evicted from the ring.
-    pub(super) fn set_status(&self, seq: Option<u64>, status: u16) {
-        if let (Some(log), Some(seq)) = (&self.log, seq) {
-            log.set_status(seq, status);
+    /// Amend the event `id` (returned by a prior [`outcome`](Self::outcome)) with the upstream HTTP
+    /// status its response returned. A clean no-op when no log is kept or no event was logged (`id`
+    /// is `None`), or when the event has already been evicted from the ring.
+    pub(super) fn set_status(&self, id: Option<u64>, status: u16) {
+        if let (Some(events), Some(id)) = (self.logged(), id) {
+            events.send(super::events::ProxyEvent::Status { id, status });
         }
     }
 

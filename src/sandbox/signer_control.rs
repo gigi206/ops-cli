@@ -194,7 +194,7 @@ impl std::ops::Deref for SignerRing {
     }
 }
 
-/// Serve the control socket, answering `LOG` from the ring the proxy pushes to.
+/// Serve the control socket, answering `LOG` from the ring the proxy's signatures are recorded in.
 pub(crate) fn serve(listener: UnixListener, ring: Arc<SignerRing>) -> io::Result<()> {
     super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
 }

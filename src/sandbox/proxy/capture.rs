@@ -26,7 +26,8 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::sandbox::control::{Capture, CaptureBytes, CaptureRing, LogRing};
+use super::events::{Emitter, ProxyEvent};
+use crate::sandbox::control::{Capture, CaptureBytes, CaptureCaps};
 use crate::sandbox::locks::locked;
 
 /// A byte sink with a hard cap, shared between the relay thread that fills it and the guard that
@@ -230,12 +231,16 @@ pub(super) fn tee_request_body<R: Read>(inner: R, capture: Option<&CaptureGuard>
 /// bodies stream. The response sink takes the raw response prefix — head and the start of the body
 /// in one buffer, since they arrive as one stream — and the split happens at filing time.
 pub(super) struct CaptureGuard {
-    ring: Arc<CaptureRing>,
-    log: Arc<LogRing>,
-    seq: u64,
-    /// The host this exchange is with. The ring's masking needs it: a needle the cage taught the
+    /// Where the filings go: the launch files them in its capture store, under the ring's number
+    /// for this exchange's logged decision.
+    events: Emitter,
+    /// The per-part caps the store enforces, so the buffers here are sized from the same numbers.
+    caps: CaptureCaps,
+    /// The number this proxy gave the exchange's logged decision.
+    id: u64,
+    /// The host this exchange is with. The store's masking needs it: a needle the cage taught the
     /// proxy on one service is masked out of the record of that service and nowhere else, so the
-    /// door has to know where the exchange went ([`CaptureRing::insert`]).
+    /// door has to know where the exchange went ([`crate::sandbox::control::CaptureRing::insert`]).
     host: String,
     req_head: Mutex<CaptureBytes>,
     injected: Mutex<CaptureBytes>,
@@ -263,13 +268,12 @@ pub(super) struct CaptureGuard {
 type FramesShape = ((usize, bool), (usize, bool));
 
 impl CaptureGuard {
-    /// Start capturing the exchange logged as `seq`, with `host`.
-    pub(super) fn new(ring: Arc<CaptureRing>, log: Arc<LogRing>, seq: u64, host: &str) -> Self {
-        let caps = ring.caps();
+    /// Start capturing the exchange logged as `id`, with `host`, at `caps`.
+    pub(super) fn new(events: Emitter, caps: CaptureCaps, id: u64, host: &str) -> Self {
         CaptureGuard {
-            ring,
-            log,
-            seq,
+            events,
+            caps,
+            id,
             host: host.to_string(),
             req_head: Mutex::new(CaptureBytes::default()),
             injected: Mutex::new(CaptureBytes::default()),
@@ -331,18 +335,20 @@ impl CaptureGuard {
             }
             *last = shape;
         }
-        let mut capture = Capture::new(self.seq);
+        let mut capture = Capture::new(self.id);
         capture.ws_up = up;
         capture.ws_down = down;
-        self.ring.insert(capture, &self.host);
-        self.log.capture_grew(self.seq);
+        self.events.send(ProxyEvent::CaptureGrew {
+            id: self.id,
+            host: self.host.clone(),
+            capture,
+        });
     }
 
     /// Record the client's request head — the bytes exactly as they arrived, **before** any sbx
     /// credential injection, and the names (never the values) of the headers sbx injected.
     pub(super) fn set_request(&self, head: &[u8], injected: &[(String, String)]) {
-        let caps = self.ring.caps();
-        let take = caps.head.min(head.len());
+        let take = self.caps.head.min(head.len());
         *locked(&self.req_head) = CaptureBytes {
             bytes: head[..take].to_vec(),
             truncated: take < head.len(),
@@ -399,31 +405,31 @@ impl CaptureGuard {
         self.response.clone()
     }
 
-    /// File the exchange into the ring and amend its log event once, so a `--follow` reader shows
-    /// the capture in a single pass. Idempotent; called by [`Drop`], so a relay that fails partway
-    /// still files what it saw.
+    /// File the exchange and have its log event amended once, so a `--follow` reader shows the
+    /// capture in a single pass. Idempotent; called by [`Drop`], so a relay that fails partway still
+    /// files what it saw.
     fn file(&self) {
         if self.filed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let mut capture = Capture::new(self.seq);
+        let mut capture = Capture::new(self.id);
         capture.req_head = std::mem::take(&mut *locked(&self.req_head));
         capture.injected = std::mem::take(&mut *locked(&self.injected));
         capture.req_body = self.req_body.take();
         let (head, body) = split_response(
             self.response.take(),
-            self.keeps_body.then(|| self.ring.caps().body),
+            self.keeps_body.then_some(self.caps.body),
         );
         capture.res_head = head;
         capture.res_body = body;
-        // Nothing captured (an exchange that failed before any head was recorded) still settles the
-        // event: a status that arrived while the capture was pending is held back from re-emission
-        // until now, and would otherwise never be shown.
-        let filed = !capture.is_empty();
-        if filed {
-            self.ring.insert(capture, &self.host);
-        }
-        self.log.capture_settled(self.seq, filed);
+        // Sent even when nothing was captured (an exchange that failed before any head was
+        // recorded): it still settles the event, whose status was held back while the capture was
+        // pending and would otherwise never be shown.
+        self.events.send(ProxyEvent::CaptureFiled {
+            id: self.id,
+            host: self.host.clone(),
+            capture,
+        });
     }
 }
 
@@ -502,7 +508,9 @@ fn find_head_end(bytes: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::control::{CaptureCaps, CaptureLevel, LOG_RING_CAP};
+    use crate::sandbox::control::{
+        CaptureLevel, CaptureRing, LOG_RING_CAP, LogRing, LogSnapshot, LogVerdict,
+    };
 
     fn ring(level: CaptureLevel, kb: u64) -> Arc<CaptureRing> {
         Arc::new(CaptureRing::with_needles(
@@ -511,30 +519,70 @@ mod tests {
         ))
     }
 
-    /// A guard over a real log ring, with an event already pushed at seq 1 so the amendment has a
-    /// target.
-    fn guard(level: CaptureLevel, kb: u64) -> (CaptureGuard, Arc<CaptureRing>, Arc<LogRing>) {
-        let ring = ring(level, kb);
+    /// The capture store and the log ring a guard's filings reach, read the way a reader reads them
+    /// once they are applied: every read first waits for what was queued before it, and a status is
+    /// sent the way the proxy sends one, behind whatever the guard queued first.
+    #[derive(Clone)]
+    struct Settled {
+        ring: Arc<CaptureRing>,
+        log: Arc<LogRing>,
+        events: Emitter,
+    }
+
+    impl Settled {
+        fn get(&self, seqs: &[u64]) -> (Vec<Capture>, u64) {
+            self.events.flush();
+            self.ring.get(seqs)
+        }
+
+        fn snapshot(
+            &self,
+            after: Option<u64>,
+            after_amend: Option<u64>,
+            include_muted: bool,
+        ) -> LogSnapshot {
+            self.events.flush();
+            self.log.snapshot(after, after_amend, include_muted)
+        }
+
+        fn set_status(&self, id: u64, status: u16) {
+            self.events.send(ProxyEvent::Status { id, status });
+        }
+    }
+
+    /// A guard over a real capture store and log ring, its exchange already logged so the
+    /// amendments have a target. Returned twice, as the store and as the ring, under the names the
+    /// tests read them by.
+    fn guard(level: CaptureLevel, kb: u64) -> (CaptureGuard, Settled, Settled) {
+        guard_over(ring(level, kb))
+    }
+
+    /// [`guard`] over a store the caller built.
+    fn guard_over(ring: Arc<CaptureRing>) -> (CaptureGuard, Settled, Settled) {
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
-        let seq = log.push(
-            false,
-            "api.example.com",
-            443,
-            Some("POST"),
-            Some("/v1/messages"),
-            crate::sandbox::control::LogVerdict::Allow,
-            "allowed",
-            crate::sandbox::control::Proto::Https,
-            crate::sandbox::control::HttpVer::H1,
-            crate::sandbox::control::RpcKind::None,
-            crate::sandbox::control::Plane::Agent,
-        );
-        log.expect_capture(seq);
-        (
-            CaptureGuard::new(ring.clone(), log.clone(), seq, "api.example.com"),
-            ring,
-            log,
-        )
+        let events = super::super::events::for_capture(log.clone(), ring.clone());
+        let id = events.log(super::super::events::LogEntry {
+            muted: false,
+            host: "api.example.com".into(),
+            port: 443,
+            method: Some("POST".into()),
+            path: Some("/v1/messages".into()),
+            verdict: LogVerdict::Allow,
+            reason: "allowed".into(),
+            proto: crate::sandbox::control::Proto::Https,
+            http_ver: crate::sandbox::control::HttpVer::H1,
+            rpc: crate::sandbox::control::RpcKind::None,
+        });
+        // What opening a capture does ([`super::super::ProxyCtx::begin_capture`]).
+        events.send(ProxyEvent::CaptureExpected { id });
+        let guard = CaptureGuard::new(events.clone(), ring.caps(), id, "api.example.com");
+        let settled = Settled { ring, log, events };
+        // The tests read the store under the guard's number, which is the ring's in a ring this
+        // exchange was the first to reach.
+        let logged = settled.snapshot(None, None, false).events;
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].seq, id);
+        (guard, settled.clone(), settled)
     }
 
     #[test]
@@ -660,26 +708,11 @@ mod tests {
     #[test]
     fn a_secret_split_across_two_reads_is_still_masked_because_masking_sees_the_whole_buffer() {
         use crate::sandbox::proxy::SecretNeedle;
-        let ring = Arc::new(CaptureRing::with_needles(
+        let (g, ring, _log) = guard_over(Arc::new(CaptureRing::with_needles(
             CaptureCaps::new(CaptureLevel::Bodies, 8),
             vec![SecretNeedle::named("TOKEN", b"abcdef".to_vec())],
-        ));
-        let log = Arc::new(LogRing::new(LOG_RING_CAP));
-        let seq = log.push(
-            false,
-            "api.example.com",
-            443,
-            Some("POST"),
-            Some("/"),
-            crate::sandbox::control::LogVerdict::Allow,
-            "allowed",
-            crate::sandbox::control::Proto::Https,
-            crate::sandbox::control::HttpVer::H1,
-            crate::sandbox::control::RpcKind::None,
-            crate::sandbox::control::Plane::Agent,
-        );
-        log.expect_capture(seq);
-        let g = CaptureGuard::new(ring.clone(), log, seq, "api.example.com");
+        )));
+        let seq = g.id;
         // Two pushes that split the needle down the middle — as two socket reads would.
         g.set_request_body(b"xx abc");
         g.set_request_body(b"def yy");
@@ -695,7 +728,7 @@ mod tests {
     #[test]
     fn the_response_prefix_splits_into_head_and_body() {
         let (g, ring, _log) = guard(CaptureLevel::Bodies, 8);
-        let seq = g.seq;
+        let seq = g.id;
         let sink = g.response_sink();
         let raw = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"ok\":true}";
         let mut reader = CaptureReader::new(&raw[..], sink);
@@ -720,7 +753,7 @@ mod tests {
     #[test]
     fn a_framed_response_pushed_head_then_frames_splits_like_a_relayed_one() {
         let (g, ring, _log) = guard(CaptureLevel::Bodies, 8);
-        let seq = g.seq;
+        let seq = g.id;
         g.push_response(b"HTTP/2 200\r\ncontent-type: application/grpc\r\n\r\n");
         g.push_response(b"\x00\x00\x00\x00\x05hello");
         g.push_response(b" again");
@@ -743,7 +776,7 @@ mod tests {
     #[test]
     fn the_headers_level_keeps_the_head_and_drops_the_body_it_had_to_read_past() {
         let (g, ring, _log) = guard(CaptureLevel::Headers, 8);
-        let seq = g.seq;
+        let seq = g.id;
         let sink = g.response_sink();
         let raw = b"HTTP/1.1 200 OK\r\n\r\nsecret-ish payload";
         let mut reader = CaptureReader::new(&raw[..], sink);
@@ -775,7 +808,7 @@ mod tests {
     #[test]
     fn the_request_head_is_captured_verbatim_with_the_injected_names_but_never_their_values() {
         let (g, ring, _log) = guard(CaptureLevel::Bodies, 8);
-        let seq = g.seq;
+        let seq = g.id;
         g.set_request(
             b"POST /v1/messages HTTP/1.1\r\nhost: api.example.com\r\n\r\n",
             &[
@@ -806,7 +839,7 @@ mod tests {
     #[test]
     fn the_guard_files_once_and_amends_its_event_once() {
         let (g, ring, log) = guard(CaptureLevel::Bodies, 8);
-        let seq = g.seq;
+        let seq = g.id;
         g.set_request(b"GET / HTTP/1.1\r\n\r\n", &[]);
         // A status arriving before the capture is filed must not amend on its own — the capture is
         // what completes the record, and one amendment is what keeps `--follow` from reprinting.
@@ -826,7 +859,7 @@ mod tests {
     #[test]
     fn an_exchange_that_captured_nothing_still_releases_its_held_back_status() {
         let (g, ring, log) = guard(CaptureLevel::Bodies, 8);
-        let seq = g.seq;
+        let seq = g.id;
         log.set_status(seq, 502);
         drop(g);
         assert!(ring.get(&[seq]).0.is_empty(), "nothing to store");
@@ -846,7 +879,7 @@ mod tests {
     #[test]
     fn a_transcript_filed_while_the_tunnel_is_open_is_marked_cut_then_superseded_whole() {
         let (g, ring, log) = guard(CaptureLevel::Bodies, 8);
-        let seq = g.seq;
+        let seq = g.id;
         let (up, down) = g.ws_sinks();
         up.push(b"first");
         down.push(b"reply");
@@ -899,7 +932,7 @@ mod tests {
     #[test]
     fn a_tunnels_whole_life_is_re_emitted_at_most_four_times_and_never_with_nothing_new() {
         let (g, _ring, log) = guard(CaptureLevel::Bodies, 1); // 1 KiB per direction
-        let seq = g.seq;
+        let seq = g.id;
         g.set_request(b"GET /chat HTTP/1.1\r\n\r\n", &[]);
         let (up, down) = g.ws_sinks();
 
@@ -961,7 +994,7 @@ mod tests {
     #[test]
     fn a_tunnel_that_ends_before_filling_is_shown_once_more_with_its_transcript_complete() {
         let (g, ring, log) = guard(CaptureLevel::Bodies, 1);
-        let seq = g.seq;
+        let seq = g.id;
         let (up, _down) = g.ws_sinks();
         up.push(b"a few frames");
         g.file_frames_snapshot();
@@ -991,7 +1024,7 @@ mod tests {
     #[test]
     fn a_tunnel_that_carried_nothing_is_not_re_emitted_for_its_frames() {
         let (g, ring, log) = guard(CaptureLevel::Bodies, 8);
-        let seq = g.seq;
+        let seq = g.id;
         g.set_request(b"GET /chat HTTP/1.1\r\n\r\n", &[]);
         let _ = g.ws_sinks();
         g.file_now(); // the handshake, at the `101`
@@ -1013,7 +1046,7 @@ mod tests {
     #[test]
     fn an_exchange_with_neither_capture_nor_status_is_not_re_emitted_at_all() {
         let (g, _ring, log) = guard(CaptureLevel::Bodies, 8);
-        let seq = g.seq;
+        let seq = g.id;
         drop(g);
         let snap = log.snapshot(Some(seq), Some(0), false);
         assert!(

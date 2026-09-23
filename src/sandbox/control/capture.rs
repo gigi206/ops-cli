@@ -293,7 +293,7 @@ impl Capture {
     }
 
     /// This capture's weight against the ring's byte budget.
-    fn weight(&self) -> usize {
+    pub(crate) fn weight(&self) -> usize {
         self.req_head.weight()
             + self.injected.weight()
             + self.req_body.weight()
