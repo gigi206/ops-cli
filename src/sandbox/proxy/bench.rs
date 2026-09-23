@@ -719,10 +719,10 @@ fn websocket_throughput() {
             // not the other axis here: an upgrade to a credential-injected host is refused outright,
             // because past the `101` nothing can be redacted.
             ctx = ctx
-                .with_events(capturing(CaptureRing::with_needles(
-                    CaptureCaps::new(CaptureLevel::Bodies, 64),
-                    needles.clone(),
-                )))
+                .with_events(capturing(CaptureRing::new(CaptureCaps::new(
+                    CaptureLevel::Bodies,
+                    64,
+                ))))
                 .with_redactions(needles.clone());
         }
         let (_dir, path) = serve_on_uds(Arc::new(ctx));
@@ -971,10 +971,10 @@ fn bulk_throughput() {
                 .with_redactions(needles.clone());
         }
         if label == "with capture = bodies" {
-            ctx = ctx.with_events(capturing(CaptureRing::with_needles(
-                CaptureCaps::new(CaptureLevel::Bodies, 64),
-                vec![],
-            )));
+            ctx = ctx.with_events(capturing(CaptureRing::new(CaptureCaps::new(
+                CaptureLevel::Bodies,
+                64,
+            ))));
         }
         let (_dir, path) = serve_on_uds(Arc::new(ctx));
         let cfg = client_config(proxy_ca_der);

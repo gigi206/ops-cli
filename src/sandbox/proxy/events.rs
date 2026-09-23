@@ -30,7 +30,7 @@
 
 use crate::notify::Block;
 use crate::sandbox::control::{
-    Capture, CaptureCaps, CaptureRing, FlowRegistry, HttpVer, LogRing, LogVerdict, Plane, Proto,
+    CaptureCaps, CaptureRing, FlowRegistry, HttpVer, LogRing, LogVerdict, Masked, Plane, Proto,
     RpcKind, SecretWay,
 };
 use crate::sandbox::egress_stats::{EgressStats, StatKind};
@@ -75,18 +75,11 @@ pub(crate) enum ProxyEvent {
     Status { id: u64, status: u16 },
     /// A capture of the exchange logged as `id` is coming, so an arriving status waits for it.
     CaptureExpected { id: u64 },
-    /// The exchange logged as `id` is over: what was captured of it, possibly nothing, filed once.
-    CaptureFiled {
-        id: u64,
-        host: String,
-        capture: Capture,
-    },
+    /// The exchange logged as `id` is over: what was captured of it, possibly nothing, masked by the
+    /// proxy and filed once.
+    CaptureFiled { id: u64, capture: Masked },
     /// The WebSocket logged as `id` carried more after its handshake was filed.
-    CaptureGrew {
-        id: u64,
-        host: String,
-        capture: Capture,
-    },
+    CaptureGrew { id: u64, capture: Masked },
     /// The configured secret `name` crossed the tunnel logged as `id`, in the direction `way`.
     SecretSeen {
         id: u64,
@@ -119,8 +112,9 @@ impl ProxyEvent {
             ProxyEvent::Signer { detail, .. } => detail.len(),
             ProxyEvent::Logged { entry, .. } => entry.weight(),
             ProxyEvent::Status { .. } | ProxyEvent::CaptureExpected { .. } => 0,
-            ProxyEvent::CaptureFiled { host, capture, .. }
-            | ProxyEvent::CaptureGrew { host, capture, .. } => host.len() + capture.weight(),
+            ProxyEvent::CaptureFiled { capture, .. } | ProxyEvent::CaptureGrew { capture, .. } => {
+                capture.weight()
+            }
             ProxyEvent::SecretSeen { name, .. } => name.len(),
             ProxyEvent::FlowOpened { host, .. } => host.len(),
             ProxyEvent::FlowCounts(moved) => std::mem::size_of_val(moved.as_slice()),
@@ -410,7 +404,7 @@ impl Applier {
 
     /// File `capture` for the decision the ring numbered `seq`, if the launch captures and the
     /// capture is one the proxy can have taken. Reports whether it was filed.
-    fn file(&self, seq: u64, host: &str, mut capture: Capture) -> bool {
+    fn file(&self, seq: u64, capture: Masked) -> bool {
         let Some(ring) = &self.sinks.capture else {
             return false;
         };
@@ -419,11 +413,10 @@ impl Applier {
         // one shares its buffer with the start of the body), the three bodies and the two tunnel
         // directions at the body cap, and the injected header names bounded like any logged field.
         let most = 2 * caps.head + 4 * caps.body + MAX_FIELD;
-        if capture.is_empty() || capture.weight() > most || host.len() > MAX_FIELD {
+        if capture.is_empty() || capture.weight() > most {
             return false;
         }
-        capture.seq = seq;
-        ring.insert(capture, host);
+        ring.insert(capture.filed_as(seq));
         true
     }
 
@@ -489,17 +482,17 @@ impl Applier {
                     log.expect_capture(seq);
                 }
             }
-            ProxyEvent::CaptureFiled { id, host, capture } => {
+            ProxyEvent::CaptureFiled { id, capture } => {
                 if let (Some(log), Some(seq)) = (&sinks.log, self.seq(id)) {
                     // Settled whether or not anything was filed: a status that arrived while the
                     // capture was pending is held back until now, and would otherwise never show.
-                    let filed = self.file(seq, &host, capture);
+                    let filed = self.file(seq, capture);
                     log.capture_settled(seq, filed);
                 }
             }
-            ProxyEvent::CaptureGrew { id, host, capture } => {
+            ProxyEvent::CaptureGrew { id, capture } => {
                 if let (Some(log), Some(seq)) = (&sinks.log, self.seq(id))
-                    && self.file(seq, &host, capture)
+                    && self.file(seq, capture)
                 {
                     log.capture_grew(seq);
                 }
@@ -667,7 +660,7 @@ mod tests {
         assert!(!none.stats && !none.refusals && !none.signatures && !none.log);
 
         let caps = CaptureCaps::new(CaptureLevel::Headers, 8);
-        let capture = || Some(Arc::new(CaptureRing::with_needles(caps, Vec::new())));
+        let capture = || Some(Arc::new(CaptureRing::new(caps)));
         let unlogged = spawn(Sinks {
             capture: capture(),
             ..Sinks::default()
@@ -767,10 +760,7 @@ mod tests {
     #[test]
     fn a_capture_is_filed_under_the_rings_number_and_releases_the_status() {
         let ring = Arc::new(LogRing::new(LOG_RING_CAP));
-        let store = Arc::new(CaptureRing::with_needles(
-            CaptureCaps::new(CaptureLevel::Headers, 8),
-            Vec::new(),
-        ));
+        let store = Arc::new(CaptureRing::new(CaptureCaps::new(CaptureLevel::Headers, 8)));
         // The ring already holds another proxy's decision, so the two numbers differ.
         ring.push(
             false,
@@ -800,15 +790,14 @@ mod tests {
             "the status waits for the capture"
         );
 
-        let mut capture = Capture::new(id);
+        let mut capture = crate::sandbox::control::Capture::new(id);
         capture.req_head = CaptureBytes {
             bytes: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
             truncated: false,
         };
         events.send(ProxyEvent::CaptureFiled {
             id,
-            host: "api.example.com".into(),
-            capture,
+            capture: capture.mask(&[], "api.example.com"),
         });
         events.flush();
         let (found, _) = store.get(&[2]);

@@ -26,8 +26,9 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::Credentials;
 use super::events::{Emitter, ProxyEvent};
-use crate::sandbox::control::{Capture, CaptureBytes, CaptureCaps};
+use crate::sandbox::control::{Capture, CaptureBytes, CaptureCaps, Masked};
 use crate::sandbox::locks::locked;
 
 /// A byte sink with a hard cap, shared between the relay thread that fills it and the guard that
@@ -238,9 +239,14 @@ pub(super) struct CaptureGuard {
     caps: CaptureCaps,
     /// The number this proxy gave the exchange's logged decision.
     id: u64,
-    /// The host this exchange is with. The store's masking needs it: a needle the cage taught the
-    /// proxy on one service is masked out of the record of that service and nowhere else, so the
-    /// door has to know where the exchange went ([`crate::sandbox::control::CaptureRing::insert`]).
+    /// The launch's credential state, whose every value is masked out of each filing before it
+    /// leaves the proxy ([`Credentials::masking_needles`]). Read at filing time rather than copied
+    /// here, because a credential re-resolved while the exchange ran is the one it most likely
+    /// carried.
+    credentials: Arc<Credentials>,
+    /// The host this exchange is with. The masking needs it: a needle the cage taught the proxy on
+    /// one service is masked out of the record of that service and nowhere else
+    /// ([`Capture::mask`]).
     host: String,
     req_head: Mutex<CaptureBytes>,
     injected: Mutex<CaptureBytes>,
@@ -268,12 +274,20 @@ pub(super) struct CaptureGuard {
 type FramesShape = ((usize, bool), (usize, bool));
 
 impl CaptureGuard {
-    /// Start capturing the exchange logged as `id`, with `host`, at `caps`.
-    pub(super) fn new(events: Emitter, caps: CaptureCaps, id: u64, host: &str) -> Self {
+    /// Start capturing the exchange logged as `id`, with `host`, at `caps`, masking what it files
+    /// against `credentials`.
+    pub(super) fn new(
+        events: Emitter,
+        caps: CaptureCaps,
+        id: u64,
+        credentials: Arc<Credentials>,
+        host: &str,
+    ) -> Self {
         CaptureGuard {
             events,
             caps,
             id,
+            credentials,
             host: host.to_string(),
             req_head: Mutex::new(CaptureBytes::default()),
             injected: Mutex::new(CaptureBytes::default()),
@@ -340,8 +354,7 @@ impl CaptureGuard {
         capture.ws_down = down;
         self.events.send(ProxyEvent::CaptureGrew {
             id: self.id,
-            host: self.host.clone(),
-            capture,
+            capture: self.masked(capture),
         });
     }
 
@@ -427,9 +440,14 @@ impl CaptureGuard {
         // pending and would otherwise never be shown.
         self.events.send(ProxyEvent::CaptureFiled {
             id: self.id,
-            host: self.host.clone(),
-            capture,
+            capture: self.masked(capture),
         });
+    }
+
+    /// `capture` with every value this launch's credentials have carried masked out of it, which is
+    /// the only form it leaves the proxy in.
+    fn masked(&self, capture: Capture) -> Masked {
+        capture.mask(&self.credentials.masking_needles(), &self.host)
     }
 }
 
@@ -513,10 +531,7 @@ mod tests {
     };
 
     fn ring(level: CaptureLevel, kb: u64) -> Arc<CaptureRing> {
-        Arc::new(CaptureRing::with_needles(
-            CaptureCaps::new(level, kb),
-            vec![],
-        ))
+        Arc::new(CaptureRing::new(CaptureCaps::new(level, kb)))
     }
 
     /// The capture store and the log ring a guard's filings reach, read the way a reader reads them
@@ -554,11 +569,14 @@ mod tests {
     /// amendments have a target. Returned twice, as the store and as the ring, under the names the
     /// tests read them by.
     fn guard(level: CaptureLevel, kb: u64) -> (CaptureGuard, Settled, Settled) {
-        guard_over(ring(level, kb))
+        guard_over(ring(level, kb), Vec::new())
     }
 
-    /// [`guard`] over a store the caller built.
-    fn guard_over(ring: Arc<CaptureRing>) -> (CaptureGuard, Settled, Settled) {
+    /// [`guard`] over a store the caller built, masking what it files against `needles`.
+    fn guard_over(
+        ring: Arc<CaptureRing>,
+        needles: Vec<crate::sandbox::proxy::SecretNeedle>,
+    ) -> (CaptureGuard, Settled, Settled) {
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
         let events = super::super::events::for_capture(log.clone(), ring.clone());
         let id = events.log(super::super::events::LogEntry {
@@ -575,7 +593,19 @@ mod tests {
         });
         // What opening a capture does ([`super::super::ProxyCtx::begin_capture`]).
         events.send(ProxyEvent::CaptureExpected { id });
-        let guard = CaptureGuard::new(events.clone(), ring.caps(), id, "api.example.com");
+        let credentials = Arc::new(Credentials::new(
+            Vec::new(),
+            needles,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        let guard = CaptureGuard::new(
+            events.clone(),
+            ring.caps(),
+            id,
+            credentials,
+            "api.example.com",
+        );
         let settled = Settled { ring, log, events };
         // The tests read the store under the guard's number, which is the ring's in a ring this
         // exchange was the first to reach.
@@ -708,10 +738,10 @@ mod tests {
     #[test]
     fn a_secret_split_across_two_reads_is_still_masked_because_masking_sees_the_whole_buffer() {
         use crate::sandbox::proxy::SecretNeedle;
-        let (g, ring, _log) = guard_over(Arc::new(CaptureRing::with_needles(
-            CaptureCaps::new(CaptureLevel::Bodies, 8),
+        let (g, ring, _log) = guard_over(
+            ring(CaptureLevel::Bodies, 8),
             vec![SecretNeedle::named("TOKEN", b"abcdef".to_vec())],
-        )));
+        );
         let seq = g.id;
         // Two pushes that split the needle down the middle — as two socket reads would.
         g.set_request_body(b"xx abc");

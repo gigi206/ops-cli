@@ -1162,8 +1162,8 @@ async fn relay_body_redacting(
         let chunk = chunk?;
         let len = chunk.len();
         bytes.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
-        // Captured before the masking, like the HTTP/1.1 path: the capture ring masks whatever it
-        // stores at filing time, over whole buffers rather than per frame.
+        // Captured before the masking, like the HTTP/1.1 path: the capture is masked when it is
+        // filed, over whole buffers rather than per frame.
         if let Some(cap) = &cap {
             cap.push(&chunk);
         }

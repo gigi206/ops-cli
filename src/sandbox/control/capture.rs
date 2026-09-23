@@ -6,13 +6,15 @@
 //! definition the most sensitive thing the proxy holds: the plaintext of an inspected exchange.
 //! Three properties make it safe to hold at all:
 //!
-//! - **Redacted once, at the door.** [`CaptureRing::insert`] is the only way bytes enter the ring
-//!   and it masks every configured secret before storing them, so the ring never holds a credential
-//!   and no reader can forget to mask. Masking a *complete* buffer (rather than each streamed
-//!   chunk) is what makes it exact — a secret split across two reads is still one contiguous run by
-//!   the time it is masked. A value the launch has since **re-resolved** is masked too
-//!   ([`crate::sandbox::proxy::Credentials::masking_needles`]): a capture is filed after its
-//!   exchange ends, so the credential it carries is often the one the `401` just replaced.
+//! - **Redacted before it leaves the proxy.** A capture is masked where it is taken
+//!   ([`Capture::mask`], called by the proxy's filing), and the ring accepts nothing else: its one
+//!   door, [`CaptureRing::insert`], takes a [`Masked`] capture, which only masking produces. So the
+//!   ring never holds a credential, no reader can forget to mask, and the process that holds the
+//!   ring never needs the credentials at all. Masking a *complete* buffer (rather than each
+//!   streamed chunk) is what makes it exact — a secret split across two reads is still one
+//!   contiguous run by the time it is masked. A value the launch has since **re-resolved** is
+//!   masked too ([`crate::sandbox::proxy::Credentials::masking_needles`]): a capture is filed after
+//!   its exchange ends, so the credential it carries is often the one the `401` just replaced.
 //! - **Bounded three ways.** Each part is capped on its own ([`CaptureCaps`]), the number of
 //!   captured exchanges is capped, and the ring holds a total byte budget past which the *oldest*
 //!   captures are dropped. An in-cage agent streaming gigabytes therefore costs a fixed amount of
@@ -35,7 +37,6 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use crate::sandbox::locks::locked;
-#[cfg(test)]
 use crate::sandbox::proxy::SecretNeedle;
 use crate::sandbox::proxy::redact_record_in_place;
 
@@ -302,16 +303,58 @@ impl Capture {
             + self.ws_up.weight()
             + self.ws_down.weight()
     }
+
+    /// This capture with every `needles` value masked out of every part, as an exchange with `host`
+    /// records it (a needle the cage taught the proxy on one service masks that service's record and
+    /// no other, see [`SecretNeedle`]). Runs on whole parts rather than on streamed chunks, so a
+    /// secret that arrived split across two reads is a contiguous run here and is masked exactly.
+    pub(crate) fn mask(mut self, needles: &[SecretNeedle], host: &str) -> Masked {
+        for part in [
+            &mut self.req_head,
+            &mut self.injected,
+            &mut self.req_body,
+            &mut self.res_head,
+            &mut self.res_body,
+            &mut self.ws_up,
+            &mut self.ws_down,
+        ] {
+            redact_record_in_place(&mut part.bytes, needles, host);
+        }
+        Masked(self)
+    }
 }
 
-/// The bounded store of captured exchanges, shared (via `Arc`) between the proxy threads that
-/// [`insert`](CaptureRing::insert) a finished exchange and the control thread that reads captures
-/// back for `sbx net logs`.
+/// A capture every configured secret has been masked out of — the only form [`CaptureRing::insert`]
+/// accepts. Built by [`Capture::mask`] alone, so holding one is holding the masking's result.
+#[derive(Debug)]
+pub(crate) struct Masked(Capture);
+
+impl Masked {
+    /// File it under `seq` instead: the number the proxy knows an exchange by is not the ring's.
+    pub(crate) fn filed_as(mut self, seq: u64) -> Self {
+        self.0.seq = seq;
+        self
+    }
+
+    /// Whether nothing at all was captured.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The capture's weight against a byte budget.
+    pub(crate) fn weight(&self) -> usize {
+        self.0.weight()
+    }
+}
+
+/// The bounded store of captured exchanges, shared (via `Arc`) between the side applying what the
+/// proxy reports, which [`insert`](CaptureRing::insert)s a finished exchange, and the control thread
+/// that reads captures back for `sbx net logs`.
 ///
 /// Its lock is taken through [`crate::sandbox::locks::locked`], because this ring is a record kept
 /// for a reader and propagating a poisoning would destroy the one thing it is for. Each side
-/// has its own reason to survive: a filing runs in `CaptureGuard`'s destructor, where an `Err` from
-/// the lock would panic a thread that may already be unwinding and abort the process, and a read
+/// has its own reason to survive: a filing runs on the thread applying every report the proxy
+/// makes, where a panic would end the log, the counters and the live view with it, and a read
 /// runs on the per-connection control thread, where it would drop the socket `sbx net logs
 /// --with-headers` is waiting on for the rest of the launch.
 ///
@@ -324,13 +367,6 @@ impl Capture {
 pub(crate) struct CaptureRing {
     inner: Mutex<CaptureInner>,
     caps: CaptureCaps,
-    /// The live credential state, shared with the proxy rather than copied from it. A capture is
-    /// filed after the exchange it describes, and a credential can be re-resolved in between, so a
-    /// private copy would eventually mask against a superseded value — which is the one failure
-    /// that matters here, since an unmasked token is a token written into `sbx net logs`. What the
-    /// masking runs against is every value that state has carried, not only the live ones
-    /// ([`crate::sandbox::proxy::Credentials::masking_needles`]).
-    credentials: std::sync::Arc<crate::sandbox::proxy::Credentials>,
 }
 
 struct CaptureInner {
@@ -345,12 +381,8 @@ struct CaptureInner {
 }
 
 impl CaptureRing {
-    /// A ring capturing at `caps`, masking the current credential values out of everything it
-    /// stores.
-    pub(crate) fn new(
-        caps: CaptureCaps,
-        credentials: std::sync::Arc<crate::sandbox::proxy::Credentials>,
-    ) -> Self {
+    /// A ring capturing at `caps`.
+    pub(crate) fn new(caps: CaptureCaps) -> Self {
         CaptureRing {
             inner: Mutex::new(CaptureInner {
                 entries: VecDeque::new(),
@@ -358,23 +390,7 @@ impl CaptureRing {
                 evicted: 0,
             }),
             caps,
-            credentials,
         }
-    }
-
-    /// A ring masking a fixed needle set, with no live state behind it. **Tests only**: production
-    /// shares the proxy's credentials so a refresh reaches the masking too.
-    #[cfg(test)]
-    pub(crate) fn with_needles(caps: CaptureCaps, needles: Vec<SecretNeedle>) -> Self {
-        Self::new(
-            caps,
-            std::sync::Arc::new(crate::sandbox::proxy::Credentials::new(
-                Vec::new(),
-                needles,
-                crate::sandbox::redact::MIN_LEN_DEFAULT,
-                Vec::new(),
-            )),
-        )
     }
 
     /// The per-part caps this ring was built with, so the forwarding path sizes its buffers from the
@@ -383,31 +399,19 @@ impl CaptureRing {
         self.caps
     }
 
-    /// Store one finished exchange with `host`, masking every secret out of every part first.
+    /// Store one finished exchange, already masked.
     ///
-    /// This is the **only** door into the ring, which is what makes the masking unmissable. It runs
-    /// on whole parts rather than on streamed chunks, so a secret that arrived split across two
-    /// reads is a contiguous run here and is masked exactly.
+    /// This is the **only** door into the ring, and it takes nothing but a [`Masked`] capture, which
+    /// is what makes the masking unmissable.
     ///
     /// An entry over the ring cap or the byte budget evicts the oldest captures (counted, not
     /// silently forgotten) until the newest fits; a capture larger than the whole budget on its own
     /// is stored anyway — it is already bounded by the per-part caps, and refusing it would silently
     /// lose the one exchange the user is most likely watching.
-    pub(crate) fn insert(&self, mut capture: Capture, host: &str) {
+    pub(crate) fn insert(&self, capture: Masked) {
+        let Masked(capture) = capture;
         if capture.is_empty() {
             return;
-        }
-        let needles = self.credentials.masking_needles();
-        for part in [
-            &mut capture.req_head,
-            &mut capture.injected,
-            &mut capture.req_body,
-            &mut capture.res_head,
-            &mut capture.res_body,
-            &mut capture.ws_up,
-            &mut capture.ws_down,
-        ] {
-            redact_record_in_place(&mut part.bytes, &needles, host);
         }
         let weight = capture.weight();
         let mut g = locked(&self.inner);
@@ -519,7 +523,7 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::proxy::NEEDLE_HISTORY_MAX;
+    use crate::sandbox::proxy::{Credentials, NEEDLE_HISTORY_MAX};
 
     fn bytes(b: &[u8]) -> CaptureBytes {
         CaptureBytes {
@@ -566,17 +570,21 @@ mod tests {
         );
     }
 
+    /// File `cap` into `ring` the way the proxy files one: masked against every value
+    /// `credentials` has carried, as an exchange with `host`.
+    fn file(ring: &CaptureRing, credentials: &Credentials, cap: Capture, host: &str) {
+        ring.insert(cap.mask(&credentials.masking_needles(), host));
+    }
+
     #[test]
-    fn a_capture_is_masked_on_the_way_in_so_the_ring_never_holds_a_secret() {
-        let ring = CaptureRing::with_needles(
-            CaptureCaps::new(CaptureLevel::Bodies, 8),
-            vec![needle("s3cr3t-value")],
-        );
+    fn a_masked_capture_holds_no_secret_in_any_part() {
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
+        let needles = vec![needle("s3cr3t-value")];
         let mut cap = Capture::new(1);
         cap.req_head = bytes(b"POST /v1 HTTP/1.1\r\nhost: api.example.com\r\n\r\n");
         cap.req_body = bytes(br#"{"key":"s3cr3t-value"}"#);
         cap.res_body = bytes(b"echoed s3cr3t-value back");
-        ring.insert(cap, "api.example.com");
+        ring.insert(cap.mask(&needles, "api.example.com"));
 
         let (found, _) = ring.get(&[1]);
         let stored = &found[0];
@@ -616,10 +624,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             Vec::new(),
         ));
-        let ring = CaptureRing::new(
-            CaptureCaps::new(CaptureLevel::Bodies, 8),
-            credentials.clone(),
-        );
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
         // The upstream rejected it and the launch re-resolved: the old value is now retired.
         credentials.replace(CredentialSet {
             injections: Vec::new(),
@@ -635,7 +640,7 @@ mod tests {
             );
             let mut churn = Capture::new(10 + i as u64);
             churn.req_head = bytes(b"GET /x HTTP/1.1\r\n\r\n");
-            ring.insert(churn, "api.test");
+            file(&ring, &credentials, churn, "api.test");
         }
 
         // The exchange that was in flight across the refresh is filed last, still carrying the
@@ -643,7 +648,7 @@ mod tests {
         let mut late = Capture::new(99_999);
         late.req_head =
             bytes(format!("GET /v1 HTTP/1.1\r\nauthorization: Bearer {OLD}\r\n\r\n").as_bytes());
-        ring.insert(late, "api.test");
+        file(&ring, &credentials, late, "api.test");
 
         let (found, _) = ring.get(&[99_999]);
         let head = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
@@ -666,10 +671,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             Vec::new(),
         ));
-        let ring = CaptureRing::new(
-            CaptureCaps::new(CaptureLevel::Bodies, 8),
-            credentials.clone(),
-        );
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
         for value in [MIDDLE, "third-t0ken-value-012"] {
             credentials.replace(CredentialSet {
                 injections: Vec::new(),
@@ -679,7 +681,7 @@ mod tests {
         let mut late = Capture::new(1);
         late.req_head =
             bytes(format!("GET /v1 HTTP/1.1\r\nauthorization: Bearer {MIDDLE}\r\n\r\n").as_bytes());
-        ring.insert(late, "api.test");
+        file(&ring, &credentials, late, "api.test");
 
         let (found, _) = ring.get(&[1]);
         let head = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
@@ -715,18 +717,18 @@ mod tests {
             credentials.observe("authorization", &format!("Bearer {VALUE}"), "api.test"),
             "a learned needle is the premise of this test"
         );
-        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8), credentials);
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
 
         // The service it was learned on: the app's own credential, where it belongs.
         let mut own = Capture::new(1);
         own.req_head =
             bytes(format!("GET /v1 HTTP/1.1\r\nauthorization: Bearer {VALUE}\r\n\r\n").as_bytes());
-        ring.insert(own, "api.test");
+        file(&ring, &credentials, own, "api.test");
 
         // Anywhere else: the same bytes leaving for another host is the event the record is for.
         let mut elsewhere = Capture::new(2);
         elsewhere.req_body = bytes(format!("payload={VALUE}").as_bytes());
-        ring.insert(elsewhere, "elsewhere.test");
+        file(&ring, &credentials, elsewhere, "elsewhere.test");
 
         let (found, _) = ring.get(&[1, 2]);
         let own = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
@@ -756,10 +758,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             Vec::new(),
         ));
-        let ring = CaptureRing::new(
-            CaptureCaps::new(CaptureLevel::Bodies, 8),
-            credentials.clone(),
-        );
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
         // The upstream rejected the old value and the proxy re-resolved it, all while the exchange
         // below was still in flight — its capture is filed only afterwards.
         credentials.replace(CredentialSet {
@@ -770,7 +769,7 @@ mod tests {
         let mut cap = Capture::new(1);
         cap.req_head = bytes(b"GET /v1 HTTP/1.1\r\nauthorization: Bearer old-t0ken-value\r\n\r\n");
         cap.res_body = bytes(b"retry with new-t0ken-value please");
-        ring.insert(cap, "api.example.com");
+        file(&ring, &credentials, cap, "api.example.com");
 
         let (found, _) = ring.get(&[1]);
         let stored = &found[0];
@@ -810,10 +809,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             Vec::new(),
         ));
-        let ring = CaptureRing::new(
-            CaptureCaps::new(CaptureLevel::Bodies, 8),
-            credentials.clone(),
-        );
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
         // Enough refreshes to carry the union past its ceiling twice over. The static credential
         // stays declared throughout — that is the point: it is live on every one of these rounds.
         for i in 0..NEEDLE_HISTORY_MAX * 2 {
@@ -828,7 +824,7 @@ mod tests {
             let mut cap = Capture::new(seq);
             cap.req_head =
                 bytes(b"GET /v1 HTTP/1.1\r\nauthorization: Bearer static-api-k3y\r\n\r\n");
-            ring.insert(cap, "api.example.com");
+            file(&ring, &credentials, cap, "api.example.com");
 
             let (found, _) = ring.get(&[seq]);
             let head = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
@@ -843,13 +839,13 @@ mod tests {
 
     #[test]
     fn the_byte_budget_evicts_the_oldest_captures_and_counts_them() {
-        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
         // Each capture is a third of the budget, so the fifth leaves room for only the last three.
         let chunk = vec![b'x'; CAPTURE_TOTAL_BUDGET / 3];
         for seq in 1..=5u64 {
             let mut cap = Capture::new(seq);
             cap.res_body = bytes(&chunk);
-            ring.insert(cap, "api.example.com");
+            ring.insert(cap.mask(&[], "api.example.com"));
         }
         let (found, evicted) = ring.get(&[1, 2, 3, 4, 5]);
         let kept: Vec<u64> = found.iter().map(|c| c.seq).collect();
@@ -866,16 +862,16 @@ mod tests {
     /// the fold, or a long session's accounting drifts until it evicts captures it should have kept.
     #[test]
     fn a_second_filing_of_the_same_exchange_folds_into_the_first() {
-        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
         let mut handshake = Capture::new(4);
         handshake.req_head = bytes(b"GET /chat HTTP/1.1\r\n\r\n");
         handshake.res_head = bytes(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
-        ring.insert(handshake, "api.example.com");
+        ring.insert(handshake.mask(&[], "api.example.com"));
 
         let mut frames = Capture::new(4);
         frames.ws_up = bytes(br#"{"from":"cage"}"#);
         frames.ws_down = bytes(br#"{"from":"server"}"#);
-        ring.insert(frames, "api.example.com");
+        ring.insert(frames.mask(&[], "api.example.com"));
 
         let (found, _) = ring.get(&[4]);
         assert_eq!(found.len(), 1, "one entry per exchange");
@@ -897,18 +893,18 @@ mod tests {
     /// while the tunnel is open) — pinned here so the fold's contract is explicit.
     #[test]
     fn a_later_filing_replaces_a_part_it_carries_and_leaves_the_others_alone() {
-        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
         let mut first = Capture::new(1);
         first.res_head = bytes(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
         first.ws_down = CaptureBytes {
             bytes: b"partial".to_vec(),
             truncated: true,
         };
-        ring.insert(first, "api.example.com");
+        ring.insert(first.mask(&[], "api.example.com"));
 
         let mut second = Capture::new(1);
         second.ws_down = bytes(b"partial-and-the-rest");
-        ring.insert(second, "api.example.com");
+        ring.insert(second.mask(&[], "api.example.com"));
 
         let (found, _) = ring.get(&[1]);
         assert_eq!(found[0].ws_down.bytes, b"partial-and-the-rest");
@@ -924,12 +920,12 @@ mod tests {
 
     #[test]
     fn entries_stay_in_sequence_order_even_when_exchanges_finish_out_of_order() {
-        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Headers, 8), vec![]);
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Headers, 8));
         // A long-running exchange (seq 1) finishes after two later ones.
         for seq in [3u64, 2, 1] {
             let mut cap = Capture::new(seq);
             cap.req_head = bytes(b"GET / HTTP/1.1\r\n\r\n");
-            ring.insert(cap, "api.example.com");
+            ring.insert(cap.mask(&[], "api.example.com"));
         }
         let (found, _) = ring.get(&[1, 2, 3]);
         let order: Vec<u64> = found.iter().map(|c| c.seq).collect();
@@ -937,20 +933,17 @@ mod tests {
     }
 
     /// A panic in an unrelated holder must not cost the captures already filed, nor the ability to
-    /// file more. Both sides matter and for different reasons: a filing runs in `CaptureGuard`'s
-    /// destructor, where propagating would panic a possibly-unwinding thread and abort the process,
-    /// and a read runs on the control thread answering `sbx net logs --with-headers`, which would
-    /// otherwise drop that socket for the rest of the launch while the captures sat in memory. See
-    /// [`crate::sandbox::locks`].
+    /// file more. Both sides matter and for different reasons: a filing runs on the thread applying
+    /// every report the proxy makes, where a panic would end the log, the counters and the live view
+    /// with it, and a read runs on the control thread answering `sbx net logs --with-headers`, which
+    /// would otherwise drop that socket for the rest of the launch while the captures sat in memory.
+    /// See [`crate::sandbox::locks`].
     #[test]
     fn a_poisoned_capture_ring_keeps_filing_and_reading_rather_than_panicking_again() {
-        let ring = std::sync::Arc::new(CaptureRing::with_needles(
-            CaptureCaps::new(CaptureLevel::Bodies, 8),
-            vec![needle("s3cr3t-value")],
-        ));
+        let ring = std::sync::Arc::new(CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8)));
         let mut before = Capture::new(1);
         before.req_head = bytes(b"GET /one HTTP/1.1\r\n\r\n");
-        ring.insert(before, "api.example.com");
+        ring.insert(before.mask(&[], "api.example.com"));
 
         // Poison the lock the only way it can be poisoned: panic on another thread while a guard on
         // it is still held, so the unwind marks it. The assertion is the fixture's own — a body
@@ -973,8 +966,8 @@ mod tests {
         );
 
         let mut after = Capture::new(2);
-        after.req_body = bytes(br#"{"key":"s3cr3t-value"}"#);
-        ring.insert(after, "api.example.com");
+        after.req_body = bytes(b"after the poisoning");
+        ring.insert(after.mask(&[], "api.example.com"));
 
         let (found, _) = ring.get(&[1, 2]);
         let seqs: Vec<u64> = found.iter().map(|c| c.seq).collect();
@@ -983,17 +976,13 @@ mod tests {
             vec![1, 2],
             "the capture filed before the poisoning is still readable, and a later one still files"
         );
-        assert_eq!(
-            String::from_utf8(found[1].req_body.bytes.clone()).unwrap(),
-            r#"{"key":"************"}"#,
-            "and the masking still runs, so recovery does not put a secret in the ring"
-        );
+        assert_eq!(found[1].req_body.bytes, b"after the poisoning");
     }
 
     #[test]
     fn an_empty_capture_is_not_stored_at_all() {
-        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
-        ring.insert(Capture::new(7), "api.example.com");
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
+        ring.insert(Capture::new(7).mask(&[], "api.example.com"));
         assert!(ring.get(&[7]).0.is_empty());
     }
 

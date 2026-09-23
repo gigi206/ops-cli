@@ -98,7 +98,8 @@ pub(crate) struct ProxyCtx {
     pub(super) timeout: Duration,
     /// The live credential state: the injections to apply and the needles to scan for, as one
     /// unit. Shared rather than owned because a credential can be re-resolved mid-session, and
-    /// because the capture ring masks with the same needles — one state, three consumers.
+    /// because a capture is masked with the same needles when it is filed — one state, three
+    /// consumers.
     pub(super) credentials: Arc<Credentials>,
     /// How to re-resolve those credentials when an injection target refuses one. `None` for a
     /// launch with nothing to refresh.
@@ -305,6 +306,7 @@ impl ProxyCtx {
             events.clone(),
             caps,
             id,
+            Arc::clone(&self.credentials),
             host,
         ))
     }

@@ -964,13 +964,12 @@ pub(crate) fn start(
         super::notify_sink::publish_needles(&wiring.needles, &credentials.snapshot().needles);
     }
 
-    // The traffic capture (`[network] capture`), off unless a trusted layer asked for it. It holds
-    // the same needles the proxy redacts with, so every captured byte is masked on the way in.
+    // The traffic capture (`[network] capture`), off unless a trusted layer asked for it. What it
+    // stores the proxy has already masked against the credentials, so the store holds none of them.
     let capture_level = policy.capture_level();
     let capture = capture_level.captures().then(|| {
         Arc::new(super::control::CaptureRing::new(
             super::control::CaptureCaps::new(capture_level, policy.capture_body_kb()),
-            credentials.clone(),
         ))
     });
 

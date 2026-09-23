@@ -9789,10 +9789,7 @@ fn capturing_ctx(
     redactions: Vec<SecretNeedle>,
 ) -> (Arc<ProxyCtx>, Arc<crate::sandbox::control::CaptureRing>) {
     use crate::sandbox::control::{CaptureCaps, CaptureRing};
-    let store = Arc::new(CaptureRing::with_needles(
-        CaptureCaps::new(level, body_kb),
-        redactions.clone(),
-    ));
+    let store = Arc::new(CaptureRing::new(CaptureCaps::new(level, body_kb)));
     let ctx = Arc::new(
         ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
             .unwrap()
@@ -10273,10 +10270,7 @@ fn a_cleartext_exchange_is_captured_in_both_directions() {
     );
     let port = addr.port();
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let store = Arc::new(CaptureRing::with_needles(
-        CaptureCaps::new(CaptureLevel::Bodies, 8),
-        vec![],
-    ));
+    let store = Arc::new(CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8)));
     let rule = format!("http://upstream.test:{port}");
     let ctx = Arc::new(
         ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
@@ -10425,10 +10419,7 @@ fn capturing_ws_ctx(
     level: crate::sandbox::control::CaptureLevel,
 ) -> (Arc<ProxyCtx>, Arc<crate::sandbox::control::CaptureRing>) {
     use crate::sandbox::control::{CaptureCaps, CaptureRing};
-    let store = Arc::new(CaptureRing::with_needles(
-        CaptureCaps::new(level, 8),
-        vec![],
-    ));
+    let store = Arc::new(CaptureRing::new(CaptureCaps::new(level, 8)));
     let ctx = Arc::new(
         ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
             .unwrap()
