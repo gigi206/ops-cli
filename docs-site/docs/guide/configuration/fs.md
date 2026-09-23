@@ -14,7 +14,7 @@ path **inside the cage** and leaves the file untouched on your disk.
 ```toml
 [fs]
 deny     = ["prod.key", "certs/*.pem", "secrets/"]
-readonly = ["Cargo.lock", ".git/config"]
+readonly = ["Cargo.lock", "docs/generated/"]
 ```
 
 What the cage sees:
@@ -42,11 +42,13 @@ and there is no syntax for reopening anything. Layers **union**: a project adds 
 global config closed, an app adds to what the project closed, and no layer can undo one
 below it.
 
-One key is the exception, and it is gated like any other security field: `scan_max_kb`
-(see [`scan`](#scan-closing-a-file-by-what-it-holds)). It is a ceiling on how much of a file is
-*read*, not a mask, so lowering it closes fewer files. An untrusted project setting it,
-whether on the project itself or on an app it declares, is refused and told so; the scan
-patterns it listed still apply.
+Two keys are the exception, and they are gated like any other security field, because each
+widens what the cage may do. `scan_max_kb` (see [`scan`](#scan-closing-a-file-by-what-it-holds))
+is a ceiling on how much of a file is *read*, not a mask, so lowering it closes fewer files.
+`git_writable` (see [below](#read-only-without-an-entry-the-project-config-and-git)) lifts the
+read-only default on `.git/hooks/` and `.git/config`. An untrusted project setting either,
+whether on the project itself or on an app it declares, is refused and told so; the masks and
+scan patterns it listed still apply.
 
 See also: [Declared operations](../tasks/) · [`binds`](binds) · [The trust gate](../concepts/trust) · [Enforcement stack](../concepts/enforcement)
 
@@ -56,7 +58,7 @@ See also: [Declared operations](../tasks/) · [`binds`](binds) · [The trust gat
 |---|---|---|
 | `deny` on a file | the name, and `EACCES` on open. `stat` reports size 0 and mode 000 | a key, a token, a `.env` |
 | `deny` on a directory | an empty directory; everything inside is `ENOENT` | a whole `secrets/` tree |
-| `readonly` | the real content, and `EROFS` on write | a lockfile, `.git/config`, a generated file |
+| `readonly` | the real content, and `EROFS` on write | a lockfile, a generated file |
 
 Both work by mounting over the path inside the cage. Your file is never modified, moved or
 copied, and the rest of the project stays writable. Removing a masked path from inside the
@@ -77,13 +79,62 @@ the one file inside it that the cage may not read.
 
 Be careful pointing `readonly` at `.git/` itself, though: git needs to write `.git/index.lock` to
 commit, so `readonly = [".git/"]` leaves `git log`, `git status` and `git diff` working while making
-every `git add` and `git commit` fail. Naming the files you actually mean (`.git/config`,
-`.git/hooks`) does what you want and leaves committing alone.
+every `git add` and `git commit` fail. The two files that matter, `.git/config` and `.git/hooks/`,
+are already read-only [without an entry](#read-only-without-an-entry-the-project-config-and-git).
 
-Those two are worth setting even when nothing in the project is secret, and for a different
-reason than the rest of this page: they are what stops an agent from leaving a hook that your
-next `commit` runs on the host, outside any cage. See [where the protection
-stops](../concepts/security-model#where-the-protection-stops).
+### Read-only without an entry: the project config and git
+
+One protection needs no `[fs]` line. When the project has a `.sbx.toml`, it is read-only in
+every agent cage, and so is each [mise file the trust gate hashes](../concepts/trust) beside
+it (`mise.toml`, `.mise.toml`, `.tool-versions` and the rest) that is present at launch. The
+effect is exactly a `readonly` entry: the real content, `EROFS` on write, `EBUSY` on removal
+or rename.
+
+These are the files that govern the cage, sitting in a tree the cage can write. A write to
+one does not grant anything by itself, since the trust gate drops a changed file's security
+fields, but it asks you to re-approve, and a re-approval made to silence a warning is how an
+addition you never wrote gets granted. Refusing the write takes that step away from the
+agent. A file the cage *creates* cannot be protected this way (a mount needs something to
+land on), which is why [`sbx trust`](../cli/trust) shows the diff of what it approves.
+
+Without a `.sbx.toml`, sbx honors no mise file, so nothing is protected and a project that
+only uses mise keeps writing its own config. The verbs that edit `.sbx.toml` for you
+(`sbx net allow`, `sbx config set`, …) run on the host and are unaffected; a cage already
+running keeps seeing the contents it started with.
+
+The same holds, with or without a `.sbx.toml`, for **`.git/hooks/` and `.git/config`** when the
+project's `.git` is a directory. A hook, or a key of the config that names a program
+(`core.hooksPath`, `core.fsmonitor`, `core.pager`, a filter, an alias), runs on the host at
+your next git command, outside any cage: it is the sharpest of the carriers in [where the
+protection stops](../concepts/security-model#where-the-protection-stops). The hooks
+*directory* is protected, so a hook created halfway through the session is refused too.
+
+Everyday git keeps working: `status`, `add`, `commit`, `switch`, `stash`, `tag`, `fetch`,
+`pull` and `push` with their arguments, and a worktree created inside the cage. What writes
+the config is refused: `git remote add`, `git config user.*`, and the upstream a
+`push -u` (or `switch` to a remote branch) records. The push itself succeeds; git prints
+`could not write config file .git/config`, and a later bare `git push` or `git pull` asks
+for the remote and branch, which `git push origin HEAD` supplies. Installing a hook from
+inside the cage (husky, `pre-commit install`, `lefthook install`) is refused.
+
+A project that needs those opens them from a trusted layer:
+
+```toml
+[fs]
+git_writable = true
+```
+
+It is the one key in `[fs]` that opens rather than closes, so it is honored only from a
+trusted project (where it appears in the diff [`sbx trust`](../cli/trust) shows), from the
+global config, or from an app profile; from an untrusted project it is dropped with a warning.
+A layer above decides in either direction: `git_writable = false` in a trusted project
+restores the protection the global config lifted. A `.git` that is a file (a linked worktree
+or a submodule) points at a directory outside the project, which the cage does not hold, so
+nothing is added for it.
+
+[`sbx test fs`](#seeing-what-is-closed) reports all of these as `READ-ONLY`, protected by sbx
+itself, and [`sbx config show`](../cli/config) prints `fs git: writable` when a layer lifted
+the git pair.
 
 ## The grammar
 

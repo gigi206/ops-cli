@@ -5,7 +5,7 @@ description: "Vouch for a project config's current contents, so its security fie
 # `sbx trust`
 
 ```
-sbx trust [path]
+sbx trust [--yes] [path]
 sbx trust --show [path]
 ```
 
@@ -17,6 +17,7 @@ edit re-arms the gate.
 |---|---|
 | `[path]` | the config to act on (default `./.sbx.toml`) |
 | `--show` | report the trust state without changing it (accepted before or after `[path]`) |
+| `--yes` | record without asking; required when there is no terminal to confirm at |
 
 See also: [The trust gate](../concepts/trust) · [`sbx untrust`](untrust) · [Configuration overview](../configuration/).
 
@@ -31,17 +32,32 @@ bytes it parses:
   (distinct from untrusted).
 - **Untrusted**: no record; security fields are dropped.
 
+Before recording, `sbx trust` prints what the trust grants: the lines of the config and
+of its mise files that changed since they were last approved, as a diff, or every line
+when nothing was approved before. It then asks for confirmation on a terminal. Without a
+terminal it refuses unless `--yes` is given, so a script that trusts a config has to say
+so. A config that already matches its approval is recorded without a question, since it
+grants nothing new. The bytes recorded are the ones shown: a change written to the file
+while the prompt waits is not covered by the trust.
+
+The review matters because the project tree is writable from inside the cage. A
+re-approval prompted by a change you did not make is exactly the moment to read the
+diff: a launch names each bind it drops from a changed file, and `sbx trust` shows the
+line that added it.
+
 The global config and app profiles are **trusted by location**: they need no `sbx
 trust`, and asking for one says so and records nothing, since no reader looks for a
 marker on either. Only a project `.sbx.toml` uses content trust. One exception: [`[fs]`](../configuration/fs)
 is the one table this does not govern, since it can only close project paths off inside
-the cage, so it applies whether or not the file is trusted. See
+the cage, so it applies whether or not the file is trusted. Its two keys that widen
+instead, `scan_max_kb` and `git_writable`, are gated like any security field. See
 [The trust gate](../concepts/trust).
 
 ## Examples
 
 ```sh
-sbx trust                 # trust ./.sbx.toml
+sbx trust                 # review and trust ./.sbx.toml
+sbx trust --yes           # the same, without the prompt (scripts, CI)
 sbx trust --show          # report the state
 sbx trust path/to/.sbx.toml
 ```

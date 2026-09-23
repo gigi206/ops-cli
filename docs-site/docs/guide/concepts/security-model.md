@@ -242,21 +242,22 @@ lean on it:
   session. It is a live account, not an audit trail; redirect `--json` to a file to keep
   one.
 
-**[`[fs] readonly`](../configuration/fs) closes the carrier the feed misses.** A git hook
-is the one entry in the table above that no legitimate agent task needs to write:
+**The git carrier is closed by default.** A git hook is the one entry in the table above
+that no legitimate agent task needs to write, and the feed does not show it. So
+`.git/hooks/` and `.git/config` are [read-only in every cage](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)
+without any entry: the directory, so a hook created halfway through the session is refused
+as well as one that was already there, and the config, because `core.hooksPath`,
+`core.fsmonitor`, a filter or an alias names a program as surely as a hook does. Committing,
+switching branches, fetching and pushing still work; what is refused is writing the config
+(`remote add`, the upstream `push -u` records) and installing a hook. A project that needs
+those sets `[fs] git_writable = true` from a trusted layer, the one key of `[fs]` that opens
+rather than closes and therefore the one the trust gate decides.
 
-```toml
-[fs]
-readonly = [".git/hooks/", ".git/config"]
-```
-
-Both entries are needed, and for different reasons: the first stops a hook from being
-written, the second stops `core.hooksPath` from being pointed at a directory the first
-does not cover. Naming the **directory** is what makes the first one hold: a mask is a
-mount, resolved once at launch, so a directory refuses a hook created halfway through the
-session as well as one that was already there. Committing still works, which
-`readonly = [".git/"]` would break, since git writes `.git/index.lock`. And because an `[fs]` mask is honored from **any** source and no
-layer can undo one below it, this holds for a project you never trusted.
+A carrier of the same kind is closed the same way: the project's own `.sbx.toml` and the
+mise files beside it are [read-only in the cage](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)
+without any entry, and [`sbx trust`](../cli/trust) shows the diff of what it approves, so an
+edit the agent makes to the config is refused, and one it manages anyway (a mise file it
+creates) is shown to you before it is granted.
 
 The other carriers stay open deliberately: the `package.json`, the `Makefile` and the
 workflow files *are* the work. Closing them would close the job. They are reported by the

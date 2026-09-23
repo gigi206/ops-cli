@@ -3,10 +3,36 @@
 //! install/rm`, `plugins store add/update/publish`, and the trust prompts). Grouped here
 //! because one cross-family pair of tests (`transactional_confirmations_*`) exercises them
 //! together; each family calls the ones it needs via `crate::cli::confirm::`.
+//!
+//! [`ask`] is the one interactive prompt beside them: the `[y/N]` question a verb puts before an
+//! action it will not take unattended.
 
+use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::style;
+use crate::{diag, style};
+
+/// Ask a terminal to confirm an action, `question` followed by `[y/N]`.
+///
+/// Without a terminal there is nobody to ask, and an action a verb gates on this must not happen
+/// unattended: the answer is no, with a hint that `--yes` is how a script says it meant it —
+/// `intent` completes that hint (`pass --yes if <intent>`). Anything but an explicit yes is a no.
+pub(crate) fn ask(question: &str, intent: &str) -> bool {
+    use std::io::{BufRead, Write};
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        diag::hint(&format!(
+            "     pass --yes if {intent} (no terminal to confirm at)"
+        ));
+        return false;
+    }
+    eprint!("  {question} [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
 
 /// The confirmation for a config write: the verb (`set`/`updated`/`unset`) in green over the
 /// dotted key, with the target file highlighted. A pure presenter — every span is empty under a

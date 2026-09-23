@@ -1251,6 +1251,70 @@ fn an_untrusted_project_app_may_not_lower_the_scan_ceiling() {
     );
 }
 
+/// `[fs] git_writable` is the one key of the table that opens rather than closes, so it is gated
+/// where the rest of `[fs]` is not: an untrusted project's is dropped and named, a trusted one's
+/// applies, and the global config's applies by location — at the baseline and on a project app.
+#[test]
+fn git_writable_is_honored_only_from_a_trusted_layer() {
+    let fs = |v: bool| {
+        Some(schema::RawFs {
+            git_writable: Some(v),
+            ..Default::default()
+        })
+    };
+    let project = || RawConfig {
+        fs: fs(true),
+        ..RawConfig::default()
+    };
+
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((project(), TrustState::Untrusted)),
+    );
+    assert!(
+        !r.fs.git_writable(),
+        "an untrusted project cannot open `.git`"
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("`[fs] git_writable`") && is_trust_drop(w)),
+        "{:?}",
+        r.warnings
+    );
+
+    let r = resolve_no_plugins(RawConfig::default(), Some((project(), TrustState::Trusted)));
+    assert!(r.fs.git_writable(), "a trusted project can");
+
+    let global = RawConfig {
+        fs: fs(true),
+        ..RawConfig::default()
+    };
+    assert!(
+        resolve_no_plugins(global, None).fs.git_writable(),
+        "the global config can"
+    );
+
+    let mut app = raw_app(&["id"], &[], &[], &[], None);
+    app.fs = fs(true);
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((raw_with_app("probe", app), TrustState::Untrusted)),
+    );
+    assert!(
+        !r.apps["probe"].fs.git_writable(),
+        "nor through an app it declares"
+    );
+    assert!(
+        r.apps["probe"]
+            .warnings
+            .iter()
+            .any(|w| w.contains("`[fs] git_writable`") && is_trust_drop(w)),
+        "{:?}",
+        r.apps["probe"].warnings
+    );
+}
+
 #[test]
 fn an_untrusted_project_app_cannot_widen_its_default_methods() {
     // The flagship-analog for `default_methods`: the override rides the trusted-only `[network]`
@@ -12072,6 +12136,29 @@ fn an_untrusted_projects_unknown_key_is_reported_too() {
     );
 }
 
+/// A dropped bind is named, so the warning that precedes a re-approval says what it would grant;
+/// and the name, which comes from a file nobody vouched for, cannot forge a line of its own.
+#[test]
+fn a_dropped_bind_warning_names_each_path_on_one_line() {
+    let binds = [
+        RawBind::Path("/home/u/.ssh".into()),
+        RawBind::Detailed(schema::RawBindTable {
+            path: Some("/srv/data\nwarning: all clear\x1b[2K".into()),
+            mode: Some("rw".into()),
+        }),
+    ];
+    let w = super::dropped_binds_warning(TrustState::Changed, &binds);
+    assert!(
+        w.contains("dropping 2 bind(s) (/home/u/.ssh, /srv/data"),
+        "{w}"
+    );
+    assert!(w.contains("(rw)"), "a writable bind says so: {w}");
+    assert!(
+        !w.contains('\n') && !w.contains('\x1b'),
+        "one line, no escape: {w:?}"
+    );
+}
+
 /// EVERY producer of a dropped-for-want-of-trust warning must be recognised as one.
 ///
 /// There is more than one, and they are worded differently: the `ignoring \`<field>\` (…)` family
@@ -12091,7 +12178,10 @@ fn every_dropped_security_field_warning_is_recognised_as_a_trust_drop() {
         );
         // `binds` does not use `untrusted_reason` — it has its own wording, and it is the field
         // whose silent absence is hardest to diagnose from inside the cage.
-        let from_binds = super::dropped_binds_warning(state, 2);
+        let from_binds = super::dropped_binds_warning(
+            state,
+            &[RawBind::Path("/a".into()), RawBind::Path("/b".into())],
+        );
         assert!(
             super::is_trust_drop(&from_binds),
             "{state:?} binds must be recognised: {from_binds}"

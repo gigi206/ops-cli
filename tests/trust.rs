@@ -20,13 +20,92 @@ fn sbx() -> Command {
     cmd
 }
 
-/// Count the marker files under a redirected trust store.
+/// Count the marker files under a redirected trust store — not the `.approved` record of what
+/// each approved, which sits beside it and goes with it.
 fn marker_count(state_home: &Path) -> usize {
     let trusted = state_home.join("sbx/trusted");
     match std::fs::read_dir(&trusted) {
-        Ok(entries) => entries.filter_map(Result::ok).count(),
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|e| !e.file_name().to_string_lossy().ends_with(".approved"))
+            .count(),
         Err(_) => 0,
     }
+}
+
+/// Without a terminal and without `--yes`, `sbx trust` shows what it would grant and records
+/// nothing: an unattended run is not an approval.
+#[test]
+fn trust_without_a_terminal_or_yes_shows_the_contents_and_records_nothing() {
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
+    let cfg = proj.path().join(".sbx.toml");
+    std::fs::write(&cfg, b"binds = [\"/srv/data\"]\n").unwrap();
+
+    let out = sbx()
+        .arg("trust")
+        .arg(&cfg)
+        .env("XDG_STATE_HOME", state.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn sbx trust");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "no terminal, no --yes: refused\n{stderr}"
+    );
+    assert!(stderr.contains("+binds = [\"/srv/data\"]"), "{stderr}");
+    assert!(
+        stderr.contains("pass --yes"),
+        "the refusal names the way through:\n{stderr}"
+    );
+    assert_eq!(marker_count(state.path()), 0, "nothing was trusted");
+}
+
+/// The scenario the review exists for, end to end: a trusted config gains a bind it was not
+/// approved with; the launch-time warning names the path, and the re-approval shows the line.
+#[test]
+fn re_trusting_a_changed_config_shows_the_added_line_only() {
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
+    let cfg = proj.path().join(".sbx.toml");
+    std::fs::write(&cfg, b"network = \"isolated\"\n").unwrap();
+    let trust = || {
+        sbx()
+            .args(["trust", "--yes"])
+            .arg(&cfg)
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("spawn sbx trust")
+    };
+    assert!(trust().status.success());
+
+    std::fs::write(&cfg, b"network = \"isolated\"\nbinds = [\"/srv/decoy\"]\n").unwrap();
+    let show = sbx()
+        .args(["config", "show"])
+        .current_dir(proj.path())
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("spawn sbx config show");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&show.stdout),
+        String::from_utf8_lossy(&show.stderr)
+    );
+    assert!(
+        text.contains("dropping 1 bind(s) (/srv/decoy)"),
+        "the dropped bind is named:\n{text}"
+    );
+
+    let again = trust();
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "{stderr}");
+    assert!(stderr.contains("changed since it was trusted"), "{stderr}");
+    assert!(stderr.contains("+binds = [\"/srv/decoy\"]"), "{stderr}");
+    assert!(
+        !stderr.contains("network = \"isolated\""),
+        "an unchanged line is not shown:\n{stderr}"
+    );
 }
 
 #[test]
@@ -40,6 +119,7 @@ fn trust_then_untrust_records_and_revokes_a_marker() {
 
     let trust = sbx()
         .arg("trust")
+        .arg("--yes")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .output()
@@ -96,6 +176,7 @@ fn show_reports_untrusted_then_trusted_then_changed() {
 
     sbx()
         .arg("trust")
+        .arg("--yes")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .status()
@@ -128,6 +209,7 @@ fn trust_covers_a_sibling_mise_file_and_editing_it_re_arms() {
 
     sbx()
         .arg("trust")
+        .arg("--yes")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .status()
@@ -153,6 +235,7 @@ fn trust_refuses_a_world_writable_mise_file() {
 
     let out = sbx()
         .arg("trust")
+        .arg("--yes")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .output()
@@ -177,6 +260,7 @@ fn trust_refuses_a_world_writable_config() {
 
     let out = sbx()
         .arg("trust")
+        .arg("--yes")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .output()
@@ -201,6 +285,7 @@ fn an_unresolvable_store_is_a_hard_failure() {
     // rather than write a marker somewhere unexpected.
     let out = sbx()
         .arg("trust")
+        .arg("--yes")
         .arg(&cfg)
         .env("XDG_STATE_HOME", "relative/state")
         .env_remove("HOME")
@@ -238,6 +323,7 @@ fn a_rule_write_that_changes_nothing_leaves_the_project_trusted() {
 
         let trusted = sbx()
             .arg("trust")
+            .arg("--yes")
             .arg(&cfg)
             .env("XDG_STATE_HOME", state.path())
             .output()
@@ -300,6 +386,7 @@ fn a_file_trusted_by_location_is_told_so_rather_than_given_a_marker() {
     for path in [&global, &profile] {
         let out = sbx()
             .arg("trust")
+            .arg("--yes")
             .arg(path)
             .env("XDG_CONFIG_HOME", config.path())
             .env("XDG_STATE_HOME", state.path())
@@ -327,6 +414,7 @@ fn a_file_trusted_by_location_is_told_so_rather_than_given_a_marker() {
     std::fs::write(&cfg, b"network = \"deny\"\n").unwrap();
     let out = sbx()
         .arg("trust")
+        .arg("--yes")
         .arg(&cfg)
         .env("XDG_CONFIG_HOME", config.path())
         .env("XDG_STATE_HOME", state.path())

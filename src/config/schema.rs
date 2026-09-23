@@ -724,6 +724,11 @@ pub(crate) struct RawFs {
     /// value that is not a size is dropped there, alone and named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scan_max_kb: Option<i64>,
+    /// `true` lets the cage write `.git/hooks/` and `.git/config`, read-only in it by default: what
+    /// a project needs to install a hook from inside (husky, `pre-commit install`) or to record a
+    /// branch's upstream. Honored only from a trusted layer, since it opens what the default closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) git_writable: Option<bool>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,

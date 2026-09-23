@@ -2398,7 +2398,7 @@ fn resolve(
                     proj.binds,
                 );
             } else {
-                warnings.push(dropped_binds_warning(state, proj.binds.len()));
+                warnings.push(dropped_binds_warning(state, &proj.binds));
             }
         }
         // `packages` are carried with the project's trust stamped on each — never
@@ -2773,18 +2773,25 @@ fn resolve(
         // project asked to close wide open, which is the failure that actually matters. Unions onto
         // the global set, like `[devices]`.
         //
-        // `scan_max_kb` is the exception, and the only
-        // gated key in the table: it is not a mask but a ceiling on how many bytes of a file the
-        // content lens *reads* before letting the open through, so lowering it closes fewer files.
-        // An untrusted project setting `scan_max_kb = 1` therefore widens what its cage may read
-        // past, which is the one direction the exemption above does not cover. Stripped and named
-        // rather than left to lose a fold, so the author reads why the ceiling did not apply — and
-        // stripped *before* `declares_nothing`, so a layer whose only key was this one contributes
-        // nothing and does not move the provenance.
+        // `scan_max_kb` and `git_writable` are the exceptions, the only gated keys in the table,
+        // because each widens what the cage may do. `git_writable` opens `.git/hooks/` and
+        // `.git/config`, which the cage otherwise gets read-only. `scan_max_kb` is not a mask but a
+        // ceiling on how many bytes of a file the content lens *reads* before letting the open
+        // through, so lowering it closes fewer files: an untrusted project setting
+        // `scan_max_kb = 1` widens what its cage may read past. Both are the direction the
+        // exemption above does not cover. Stripped and named rather than left to lose a fold, so
+        // the author reads why the key did not apply, and stripped *before* `declares_nothing`, so
+        // a layer whose only key was one of these contributes nothing and does not move the
+        // provenance.
         if let Some(raw) = proj.fs {
             let mut project_fs = apply_fs(&mut warnings, PROJECT_CONFIG, Some(raw));
             if !gate.trusted && project_fs.scan_max_kb.take().is_some() {
                 gate.refuse("`[fs] scan_max_kb`", &mut warnings);
+            }
+            // `git_writable` opens what the built-in default closes, so an untrusted project may not
+            // set it: that is the whole difference between the cage writing a hook and not.
+            if !gate.trusted && project_fs.git_writable.take().is_some() {
+                gate.refuse("`[fs] git_writable`", &mut warnings);
             }
             if !project_fs.declares_nothing() {
                 fs_origin = Provenance::Project;
@@ -3343,6 +3350,7 @@ fn apply_fs(warnings: &mut Vec<String>, source: &str, raw: Option<schema::RawFs>
             )),
         },
     }
+    policy.git_writable = raw.git_writable;
     policy
 }
 

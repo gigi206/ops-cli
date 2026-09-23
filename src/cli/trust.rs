@@ -1,5 +1,10 @@
-//! `sbx trust [--show] [path]` and `sbx untrust [path]`: the trust gate's recording side — vouch
-//! for a project config's current contents (content-hashed, direnv model) or revoke that trust.
+//! `sbx trust [--show] [--yes] [path]` and `sbx untrust [path]`: the trust gate's recording side —
+//! vouch for a project config's current contents (content-hashed, direnv model) or revoke that
+//! trust.
+//!
+//! Recording shows what it records. The project tree is writable from the cage, so the contents
+//! a user is asked to approve may not be the ones they wrote: `sbx trust` prints how they differ
+//! from what was last approved — or all of them, when nothing was — and asks before granting.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -27,15 +32,18 @@ fn trust_store_dir() -> Result<std::path::PathBuf, ExitCode> {
     })
 }
 
-/// `sbx trust [path]` vouches for a project config's current contents;
+/// `sbx trust [--yes] [path]` vouches for a project config's current contents, after showing them;
 /// `sbx trust --show [path]` reports its trust state without changing it. `--show` is honored in
 /// any position, and an unknown flag or a second path is a usage error — recording trust is the
 /// most security-sensitive write in the tool, so a mistyped `--show` must never fall through to it.
 pub(crate) fn trust_cmd(args: Vec<OsString>) -> ExitCode {
-    let (show, path) = match parse_trust_args(args) {
+    let TrustArgs { show, yes, path } = match parse_trust_args(args) {
         Ok(parsed) => parsed,
         Err(msg) => {
-            crate::diag::error(&format!("sbx: {msg} — usage: sbx trust [--show] [path]"));
+            crate::diag::error(&format!(
+                "sbx: {msg} — usage: {}",
+                help::synopsis_of(&["trust"])
+            ));
             return ExitCode::from(2);
         }
     };
@@ -55,7 +63,7 @@ pub(crate) fn trust_cmd(args: Vec<OsString>) -> ExitCode {
     if show {
         show_trust(&path)
     } else {
-        record_trust(&path)
+        record_trust(&path, yes)
     }
 }
 
@@ -88,35 +96,79 @@ fn trusted_by_location(path: &Path) -> bool {
     }
 }
 
-/// Parse `sbx trust`'s arguments into `(show, path)`. `--show` is honored in any position and an
-/// unknown flag or a second path is an error — recording trust is the tool's most security-sensitive
+/// `sbx trust`'s parsed arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct TrustArgs {
+    /// `--show`: report the state, change nothing.
+    show: bool,
+    /// `--yes`: record without asking — the answer a script gives, since it has no terminal.
+    yes: bool,
+    /// The config to act on; the project `.sbx.toml` of the current directory when absent.
+    path: Option<OsString>,
+}
+
+/// Parse `sbx trust`'s arguments. `--show` and `--yes` are honored in any position and an unknown
+/// flag or a second path is an error — recording trust is the tool's most security-sensitive
 /// write, so a mistyped or trailing `--show` must never fall through to it. A pure helper (tested).
-fn parse_trust_args(args: Vec<OsString>) -> Result<(bool, Option<OsString>), String> {
-    let mut show = false;
-    let mut path: Option<OsString> = None;
+fn parse_trust_args(args: Vec<OsString>) -> Result<TrustArgs, String> {
+    let mut parsed = TrustArgs {
+        show: false,
+        yes: false,
+        path: None,
+    };
     for arg in args {
         match arg.to_str() {
-            Some("--show") => show = true,
+            Some("--show") => parsed.show = true,
+            Some("--yes") => parsed.yes = true,
             Some(tok) if tok.starts_with('-') => return Err(format!("unknown flag {tok}")),
             _ => {
-                if path.is_some() {
+                if parsed.path.is_some() {
                     return Err("trust takes a single path".to_string());
                 }
-                path = Some(arg);
+                parsed.path = Some(arg);
             }
         }
     }
-    Ok((show, path))
+    Ok(parsed)
 }
 
-/// Record trust for a config's current contents, so its security-relevant fields
-/// are honored until the file changes again.
-fn record_trust(path: &Path) -> ExitCode {
+/// Record trust for a config's current contents, so its security-relevant fields are honored
+/// until the file changes again.
+///
+/// The contents are read once, shown, and those very bytes are what gets hashed
+/// ([`trust::trust_written`]): the tree is writable from the cage, so a second read after the
+/// question would attest to whatever was written while the user was reading. A config that already
+/// matches its marker grants nothing new and is re-recorded without a question.
+fn record_trust(path: &Path, yes: bool) -> ExitCode {
     let store_dir = match trust_store_dir() {
         Ok(d) => d,
         Err(code) => return code,
     };
-    match trust::trust(&store_dir, path) {
+    let read = crate::config::safety::read_safe_bytes(path)
+        .and_then(|sbx| Ok((sbx, trust::mise_inputs_for(path)?)));
+    let (sbx_bytes, mise) = match read {
+        Ok(read) => read,
+        Err(e) => {
+            crate::diag::error(&format!("sbx: cannot trust {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let current = trust::content_hash(&sbx_bytes, &mise);
+    if trust::verdict_for_hash(&store_dir, path, &current) != trust::TrustState::Trusted {
+        let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
+        let before = trust::approved(&store_dir, path);
+        let now = contents_of(path, &sbx_bytes, &mise);
+        let was = before
+            .as_ref()
+            .map(|(sbx, mise)| contents_of(path, sbx, mise));
+        eprint!("{}", render_trust_review(path, was.as_deref(), &now, &epal));
+        if !yes && !crate::cli::confirm::ask("trust these contents?", "these contents are intended")
+        {
+            diag::error(&format!("sbx: not trusting {}", path.display()));
+            return ExitCode::FAILURE;
+        }
+    }
+    match trust::trust_written(&store_dir, path, &sbx_bytes, &mise) {
         Ok(()) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_trust_recorded(path, &pal));
@@ -127,6 +179,158 @@ fn record_trust(path: &Path) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// One file of what a trust covers: the name it is shown under, and its text.
+type Shown = (String, String);
+
+/// The files a trust covers, named for display: the config as it was given, then each mise file
+/// by its path relative to the project. Bytes that are not UTF-8 are shown lossily — the review is
+/// for a reader, and the hash is over the bytes whatever is displayed.
+fn contents_of(path: &Path, sbx: &[u8], mise: &trust::MiseInputs) -> Vec<Shown> {
+    let mut out = vec![(
+        path.display().to_string(),
+        String::from_utf8_lossy(sbx).into_owned(),
+    )];
+    for (name, bytes) in mise {
+        out.push((name.clone(), String::from_utf8_lossy(bytes).into_owned()));
+    }
+    out
+}
+
+/// The review printed before a trust is recorded: per file, what changed since the approved
+/// contents — or, when none are recorded, every line, since all of it is being granted. A file
+/// that appeared shows as all added, one that went away as all removed, and an unchanged file is
+/// not shown. A pure presenter (its layout is asserted in a test).
+fn render_trust_review(
+    path: &Path,
+    approved: Option<&[Shown]>,
+    now: &[Shown],
+    pal: &style::Palette,
+) -> String {
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    let mut out = match approved {
+        Some(_) => format!(
+            "sbx: {n}{}{r} changed since it was trusted; trusting it grants:\n",
+            path.display()
+        ),
+        None => format!(
+            "sbx: {n}{}{r} {dim}(no approved contents on record){r}; trusting it grants:\n",
+            path.display()
+        ),
+    };
+    let find = |set: &[Shown], name: &str| {
+        set.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, text)| text.clone())
+    };
+    let mut names: Vec<&str> = now.iter().map(|(k, _)| k.as_str()).collect();
+    for (k, _) in approved.unwrap_or_default() {
+        if !names.contains(&k.as_str()) {
+            names.push(k);
+        }
+    }
+    for name in names {
+        let old = approved.and_then(|set| find(set, name)).unwrap_or_default();
+        let new = find(now, name).unwrap_or_default();
+        if approved.is_some() && old == new {
+            continue;
+        }
+        out.push_str(&format!("{n}--- {name}{r}\n"));
+        out.push_str(&render_line_diff(&old, &new, pal));
+    }
+    out
+}
+
+/// A line diff of `old` against `new`: removed lines under `-`, added ones under `+`, each run of
+/// changes introduced by the line numbers it starts at, unchanged lines left out. A pure presenter.
+///
+/// The common head and tail are set aside first, and the middle is matched by longest common
+/// subsequence. A middle too large for that table is shown as removed in full and added in full:
+/// more than the change, never less, which is the direction a review may err in.
+fn render_line_diff(old: &str, new: &str, pal: &style::Palette) -> String {
+    let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let tail = a[head..]
+        .iter()
+        .rev()
+        .zip(b[head..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (am, bm) = (&a[head..a.len() - tail], &b[head..b.len() - tail]);
+    let ops = diff_ops(am, bm);
+    let (mut out, mut i, mut j, mut in_run) = (String::new(), 0, 0, false);
+    for op in ops {
+        if op == Op::Same {
+            (i, j, in_run) = (i + 1, j + 1, false);
+            continue;
+        }
+        if !in_run {
+            out.push_str(&format!(
+                "{}@@ -{} +{} @@{}\n",
+                pal.dim,
+                head + i + 1,
+                head + j + 1,
+                pal.reset
+            ));
+            in_run = true;
+        }
+        if op == Op::Del {
+            out.push_str(&format!("{}-{}{}\n", pal.err, am[i], pal.reset));
+            i += 1;
+        } else {
+            out.push_str(&format!("{}+{}{}\n", pal.ok, bm[j], pal.reset));
+            j += 1;
+        }
+    }
+    out
+}
+
+/// One step of a line diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    Same,
+    Del,
+    Add,
+}
+
+/// The largest LCS table [`diff_ops`] builds, in cells; past it the middle is replaced whole.
+const MAX_DIFF_CELLS: usize = 4_000_000;
+
+/// The edit script from `a` to `b`, by longest common subsequence. Every line of `a` is consumed
+/// by a `Same` or a `Del`, every line of `b` by a `Same` or an `Add`, in order.
+fn diff_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
+    let (n, m) = (a.len(), b.len());
+    if n.saturating_mul(m) > MAX_DIFF_CELLS {
+        return std::iter::repeat_n(Op::Del, n)
+            .chain(std::iter::repeat_n(Op::Add, m))
+            .collect();
+    }
+    // `lcs[i][j]`: the longest common subsequence of `a[i..]` and `b[j..]`.
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j, mut ops) = (0, 0, Vec::with_capacity(n + m));
+    while i < n || j < m {
+        if i < n && j < m && a[i] == b[j] {
+            ops.push(Op::Same);
+            (i, j) = (i + 1, j + 1);
+        } else if j < m && (i == n || lcs[i][j + 1] >= lcs[i + 1][j]) {
+            ops.push(Op::Add);
+            j += 1;
+        } else {
+            ops.push(Op::Del);
+            i += 1;
+        }
+    }
+    ops
 }
 
 /// The confirmation line for a recorded trust — the resulting `trusted` state word in green,
@@ -264,21 +468,149 @@ mod tests {
     fn parse_trust_args_honors_show_in_any_position_and_rejects_stray_tokens() {
         let os = |s: &str| OsString::from(s);
         // `--show` after the path must SHOW, not record trust — the security-sensitive default.
-        let (show, path) = parse_trust_args(vec![os("./repo/.sbx.toml"), os("--show")]).unwrap();
-        assert!(show, "trailing --show must be honored");
-        assert_eq!(
-            path.as_deref(),
-            Some(std::ffi::OsStr::new("./repo/.sbx.toml"))
-        );
+        let parsed = parse_trust_args(vec![os("./repo/.sbx.toml"), os("--show")]).unwrap();
+        assert!(parsed.show, "trailing --show must be honored");
+        assert_eq!(parsed.path, Some(os("./repo/.sbx.toml")));
         // `--show` first, path after.
-        let (show, path) = parse_trust_args(vec![os("--show"), os("p.toml")]).unwrap();
-        assert!(show);
-        assert_eq!(path.as_deref(), Some(std::ffi::OsStr::new("p.toml")));
-        // No args: record the default path.
-        assert_eq!(parse_trust_args(vec![]).unwrap(), (false, None));
+        let parsed = parse_trust_args(vec![os("--show"), os("p.toml")]).unwrap();
+        assert!(parsed.show);
+        assert_eq!(parsed.path, Some(os("p.toml")));
+        // `--yes` in either position, and not mistaken for `--show`.
+        let parsed = parse_trust_args(vec![os("p.toml"), os("--yes")]).unwrap();
+        assert_eq!(
+            parsed,
+            TrustArgs {
+                show: false,
+                yes: true,
+                path: Some(os("p.toml"))
+            }
+        );
+        // No args: record the default path, asking first.
+        assert_eq!(
+            parse_trust_args(vec![]).unwrap(),
+            TrustArgs {
+                show: false,
+                yes: false,
+                path: None
+            }
+        );
         // An unknown flag or a second path is rejected (so a typo cannot fall through to a record).
         assert!(parse_trust_args(vec![os("--shwo")]).is_err());
+        assert!(parse_trust_args(vec![os("--y")]).is_err());
         assert!(parse_trust_args(vec![os("a.toml"), os("b.toml")]).is_err());
+    }
+
+    fn shown(set: &[(&str, &str)]) -> Vec<Shown> {
+        set.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_review_shows_what_changed_since_the_approval_and_nothing_else() {
+        // The scenario the review exists for: the cage appends a bind to a trusted config, and the
+        // user is asked to re-approve. The added path is what they must see.
+        let p = style::Palette::plain();
+        let was = shown(&[
+            (".sbx.toml", "network = \"filter\"\nenv = { A = \"1\" }\n"),
+            ("mise.toml", "[tools]\nnode = \"22\"\n"),
+        ]);
+        let now = shown(&[
+            (
+                ".sbx.toml",
+                "network = \"filter\"\nbinds = [\"/home/u/.ssh\"]\nenv = { A = \"1\" }\n",
+            ),
+            ("mise.toml", "[tools]\nnode = \"22\"\n"),
+        ]);
+        assert_eq!(
+            render_trust_review(Path::new(".sbx.toml"), Some(&was), &now, &p),
+            "sbx: .sbx.toml changed since it was trusted; trusting it grants:\n\
+             --- .sbx.toml\n\
+             @@ -2 +2 @@\n\
+             +binds = [\"/home/u/.ssh\"]\n"
+        );
+    }
+
+    #[test]
+    fn the_review_shows_every_line_when_nothing_was_approved_and_a_file_that_appeared() {
+        let p = style::Palette::plain();
+        let now = shown(&[(".sbx.toml", "binds = [\"/a\"]\n")]);
+        assert_eq!(
+            render_trust_review(Path::new(".sbx.toml"), None, &now, &p),
+            "sbx: .sbx.toml (no approved contents on record); trusting it grants:\n\
+             --- .sbx.toml\n\
+             @@ -1 +1 @@\n\
+             +binds = [\"/a\"]\n"
+        );
+        // A mise file created since the approval shows whole; one removed shows as removed.
+        let was = shown(&[(".sbx.toml", "x = 1\n"), (".tool-versions", "node 20\n")]);
+        let now = shown(&[(".sbx.toml", "x = 1\n"), ("mise.toml", "[tools]\n")]);
+        let out = render_trust_review(Path::new(".sbx.toml"), Some(&was), &now, &p);
+        assert!(
+            out.contains("--- mise.toml\n@@ -1 +1 @@\n+[tools]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("--- .tool-versions\n@@ -1 +1 @@\n-node 20\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("--- .sbx.toml"),
+            "an unchanged file is not shown:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_line_diff_replays_into_the_new_text() {
+        // Whatever the script, applying it to the old lines must give the new ones — including the
+        // fallback past the table limit, which replaces the middle whole.
+        let cases = [
+            ("a\nb\nc\n", "a\nx\nc\n"),
+            ("", "a\nb\n"),
+            ("a\nb\n", ""),
+            ("a\nb\nc\nd\n", "b\nd\ne\n"),
+            ("same\n", "same\n"),
+        ];
+        for (old, new) in cases {
+            let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+            let (mut i, mut j, mut out) = (0, 0, Vec::new());
+            for op in diff_ops(&a, &b) {
+                match op {
+                    Op::Same => {
+                        assert_eq!(a[i], b[j]);
+                        out.push(a[i]);
+                        (i, j) = (i + 1, j + 1);
+                    }
+                    Op::Del => i += 1,
+                    Op::Add => {
+                        out.push(b[j]);
+                        j += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                (i, j, out),
+                (a.len(), b.len(), b.clone()),
+                "{old:?} -> {new:?}"
+            );
+        }
+        let big: Vec<String> = (0..3000).map(|n| n.to_string()).collect();
+        let big: Vec<&str> = big.iter().map(String::as_str).collect();
+        let ops = diff_ops(&big, &big[1..]);
+        assert_eq!(
+            ops.iter().filter(|o| **o == Op::Del).count(),
+            3000,
+            "past the limit"
+        );
+        assert_eq!(ops.iter().filter(|o| **o == Op::Add).count(), 2999);
+    }
+
+    #[test]
+    fn the_review_colors_removals_and_additions() {
+        let p = style::Palette::colored();
+        let out = render_line_diff("a\n", "b\n", &p);
+        assert!(out.contains(&format!("{}-a{}", p.err, p.reset)), "{out:?}");
+        assert!(out.contains(&format!("{}+b{}", p.ok, p.reset)), "{out:?}");
     }
 
     #[test]

@@ -21,6 +21,11 @@
 //! hash folds in the mise file's contents too, and editing either file re-arms
 //! the gate. The mise file is anchored on the `.sbx.toml`: it is hashed (and
 //! later honored) only beside one, keyed by the `.sbx.toml` path.
+//!
+//! Beside each marker sits the record of what it approved: the bytes of the `.sbx.toml` and of
+//! every mise file, as they were hashed ([`approved`]). The hash alone answers *whether* the
+//! project changed; `sbx trust` needs *what* changed, so that re-approving shows the reader the
+//! contents they are about to grant instead of asking them to vouch for bytes they never saw.
 
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -59,7 +64,7 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
 /// than a filename. Two of them end in `config.toml`, which is why [`mise_inputs_for`] tags a
 /// part of the hash with this whole path: two files sharing a tag would cost the framing the
 /// property it exists for.
-const MISE_CONFIG_NAMES: &[&str] = &[
+pub(crate) const MISE_CONFIG_NAMES: &[&str] = &[
     ".mise.local.toml",
     "mise.local.toml",
     ".mise.toml",
@@ -147,6 +152,49 @@ fn frame(buf: &mut Vec<u8>, tag: &[u8], bytes: &[u8]) {
     buf.push(0);
     buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     buf.extend_from_slice(bytes);
+}
+
+/// Split a buffer written by [`frame`] back into its `(tag, bytes)` parts, or `None` when it is
+/// not a whole sequence of frames — a truncated or hand-edited record is no record at all.
+fn unframe(mut buf: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        let nul = buf.iter().position(|&b| b == 0)?;
+        let tag = std::str::from_utf8(&buf[..nul]).ok()?.to_string();
+        let rest = &buf[nul + 1..];
+        let len_bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+        let len = usize::try_from(u64::from_le_bytes(len_bytes)).ok()?;
+        let body = rest.get(8..8usize.checked_add(len)?)?;
+        out.push((tag, body.to_vec()));
+        buf = &rest[8 + len..];
+    }
+    Some(out)
+}
+
+/// The tag the `.sbx.toml` part of an approved record is written under. A mise part is tagged by
+/// its path relative to the project, which never has this spelling.
+const APPROVED_SBX_TAG: &str = "sbx.toml";
+
+/// Where the approved contents of `config_path` are kept: beside its marker, under the marker's
+/// name with an `.approved` suffix. `None` exactly when [`marker_path`] is.
+fn approved_path(store_dir: &Path, config_path: &Path) -> Option<PathBuf> {
+    let mut name = marker_path(store_dir, config_path)?.into_os_string();
+    name.push(".approved");
+    Some(PathBuf::from(name))
+}
+
+/// The contents a recorded trust approved: the `.sbx.toml` bytes and the mise files beside it, as
+/// they were hashed. `None` when nothing is recorded — never trusted, trusted by a version of sbx
+/// that kept only the hash, or a record that cannot be read back whole.
+///
+/// This is a display input, never a verdict: whether the project is trusted is the marker's hash
+/// alone ([`verdict_for_hash`]), so a record that was tampered with can mislead a diff but cannot
+/// make anything trusted.
+pub(crate) fn approved(store_dir: &Path, config_path: &Path) -> Option<(Vec<u8>, MiseInputs)> {
+    let bytes = std::fs::read(approved_path(store_dir, config_path)?).ok()?;
+    let mut parts = unframe(&bytes)?.into_iter();
+    let (tag, sbx) = parts.next()?;
+    (tag == APPROVED_SBX_TAG).then(|| (sbx, parts.collect()))
 }
 
 /// Trust state of a project config relative to a store dir.
@@ -476,7 +524,24 @@ fn trust_inner(
     // share, and a shared temp is the one thing the rename cannot make atomic — the second writer
     // truncates the inode the first is still filling. That the marker's torn form reads `Changed`
     // makes the outcome safe, not correct.
-    crate::sandbox::atomicfile::write_atomic(&marker, body.as_bytes()).map_err(&store_err)
+    crate::sandbox::atomicfile::write_atomic(&marker, body.as_bytes()).map_err(&store_err)?;
+    // The record of what was approved, after the marker. The other order has a failure that lies:
+    // a record written and a marker that is not leaves the previous approval in force beside a
+    // record of the new contents, and the next `sbx trust` shows no change where there is one.
+    // This order fails towards showing more — a record that could not be written is removed, and
+    // the next review shows the whole file. The trust itself is recorded either way, which is why a
+    // record that fails is not this function's error.
+    let mut record = Vec::new();
+    frame(&mut record, APPROVED_SBX_TAG.as_bytes(), &sbx_bytes);
+    for (name, bytes) in &mise_inputs {
+        frame(&mut record, name.as_bytes(), bytes);
+    }
+    if let Some(at) = approved_path(store_dir, config_path)
+        && crate::sandbox::atomicfile::write_atomic(&at, &record).is_err()
+    {
+        let _ = std::fs::remove_file(at);
+    }
+    Ok(())
 }
 
 /// Remove any trust marker for `config_path`. Returns whether one existed, so the
@@ -488,6 +553,14 @@ pub(crate) fn untrust(store_dir: &Path, config_path: &Path) -> io::Result<bool> 
     let Some(marker) = marker_path(store_dir, config_path) else {
         return Ok(false);
     };
+    // The record of approved contents goes with the trust it documents; without a marker it
+    // describes an approval that no longer exists.
+    if let Some(at) = approved_path(store_dir, config_path)
+        && let Err(e) = std::fs::remove_file(at)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(e);
+    }
     match std::fs::remove_file(marker) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -513,15 +586,14 @@ mod tests {
     /// satisfies it by absence. So every `.rs` under `src/` is read, and each is asked the same
     /// question.
     ///
-    /// Two callers legitimately hash the path, and both are named with the count they carry:
+    /// One caller legitimately hashes the path, and it is named with the count it carries:
+    /// `src/cli/config/edit.rs`, the `sbx config edit --trust` path — the editor showed the user
+    /// the file and left what they saved, and sbx composed none of it. The `sbx trust <path>` verb
+    /// is not one: it prints the contents it is about to grant and asks, so the bytes it attests to
+    /// are the ones it showed, and it sits in the second table.
     ///
-    /// - `src/cli/trust.rs`, the `sbx trust <path>` verb — the user is pointing at a file on disk
-    ///   and approving exactly what it holds;
-    /// - `src/cli/config/edit.rs`, the `sbx config edit --trust` path — the editor showed the user
-    ///   the file and left what they saved, and sbx composed none of it.
-    ///
-    /// The counts are pinned rather than the file merely admitted, so a second re-reading call added
-    /// inside one of those two files fails here as loudly as one added anywhere else.
+    /// The count is pinned rather than the file merely admitted, so a second re-reading call added
+    /// inside that file fails here as loudly as one added anywhere else.
     ///
     /// The second table is the other half of the same rule: the writers that do attest to their own
     /// text, with how many such calls each holds. It is what catches a verb that drops its re-trust
@@ -530,13 +602,16 @@ mod tests {
     #[test]
     fn every_re_trust_after_a_write_sbx_composed_attests_to_that_text() {
         /// The files admitted to hash the path, and how many such calls each holds.
-        const HASHES_THE_PATH: &[(&str, usize)] =
-            &[("src/cli/trust.rs", 1), ("src/cli/config/edit.rs", 1)];
-        /// The files that re-trust what they composed, and how many such calls each holds: the
+        const HASHES_THE_PATH: &[(&str, usize)] = &[("src/cli/config/edit.rs", 1)];
+        /// The files that attest to bytes they hold, and how many such calls each holds: the
         /// egress, proc and `[fs]` mask add paths, the proc-learn write, the shared removal path,
-        /// and the tail of the four key-writing `sbx config` verbs.
-        const HASHES_ITS_OWN_TEXT: &[(&str, usize)] =
-            &[("src/main.rs", 5), ("src/cli/config/edit.rs", 1)];
+        /// the tail of the four key-writing `sbx config` verbs, and `sbx trust` over the contents
+        /// it showed.
+        const HASHES_ITS_OWN_TEXT: &[(&str, usize)] = &[
+            ("src/main.rs", 5),
+            ("src/cli/config/edit.rs", 1),
+            ("src/cli/trust.rs", 1),
+        ];
 
         let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
         let mut reread: Vec<(String, usize)> = Vec::new();
@@ -572,8 +647,8 @@ mod tests {
             reread,
             expect(HASHES_THE_PATH),
             "a re-trust after a write sbx composed must hash that text (`trust_written`), never \
-             read the file back; only `sbx trust` and `sbx config edit` bless bytes sbx did not \
-             author"
+             read the file back; only `sbx config edit` blesses bytes sbx neither authored nor \
+             showed"
         );
         assert_eq!(
             attested,
@@ -850,30 +925,28 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_trust_leaves_the_marker_and_nothing_beside_it() {
-        // The marker is written through a temporary and renamed. What a test can hold is the
-        // aftermath: the store carries the marker and no leftover, so a reader listing it never
-        // sees a half-written record, and a failed rename does not accumulate debris.
+    fn a_recorded_trust_leaves_the_marker_its_record_and_nothing_else() {
+        // The marker and the record are written through temporaries and renamed. What a test can
+        // hold is the aftermath: the store carries the marker, the record of what it approved and
+        // no leftover, so a reader listing it never sees a half-written file, and a failed rename
+        // does not accumulate debris.
         let tmp = TmpDir::new();
         let store = tmp.path().join("store");
         let cfg = tmp.path().join(".sbx.toml");
         std::fs::write(&cfg, b"network = \"none\"\n").unwrap();
 
         trust(&store, &cfg).expect("the fixture path is representable");
-        let entries: Vec<_> = std::fs::read_dir(&store)
+        let mut entries: Vec<_> = std::fs::read_dir(&store)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            entries.len(),
-            1,
-            "the store should hold the marker alone, found {entries:?}"
-        );
+        entries.sort();
         let marker = marker_path(&store, &cfg).expect("a UTF-8 fixture path");
+        let marker = marker.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
-            entries[0],
-            marker.file_name().unwrap().to_string_lossy(),
-            "the surviving entry is the marker, not the temporary"
+            entries,
+            [marker.clone(), format!("{marker}.approved")],
+            "the store should hold the marker and its record alone"
         );
         assert_eq!(state(&store, &cfg), TrustState::Trusted);
     }
@@ -1275,5 +1348,56 @@ mod tests {
         // ...and is never reported Trusted even if the .sbx.toml was trusted earlier
         // (here it was not), failing closed on the unverifiable file.
         assert_eq!(state(store.path(), &cfg), TrustState::Untrusted);
+    }
+
+    #[test]
+    fn a_recorded_trust_keeps_the_bytes_it_approved_and_untrust_drops_them() {
+        let tmp = TmpDir::new();
+        let store = tmp.path().join("store");
+        let cfg = tmp.path().join(".sbx.toml");
+        std::fs::write(&cfg, b"binds = [\"/srv/a\"]\n").unwrap();
+        std::fs::write(tmp.path().join("mise.toml"), b"[tools]\nnode = \"22\"\n").unwrap();
+
+        assert_eq!(
+            approved(&store, &cfg),
+            None,
+            "nothing is recorded before a trust"
+        );
+        trust(&store, &cfg).unwrap();
+        let (sbx, mise) = approved(&store, &cfg).expect("a trust records what it approved");
+        assert_eq!(sbx, b"binds = [\"/srv/a\"]\n");
+        assert_eq!(
+            mise,
+            vec![(
+                "mise.toml".to_string(),
+                b"[tools]\nnode = \"22\"\n".to_vec()
+            )]
+        );
+
+        // An edit after the trust does not move the record: it is what was approved, not what is.
+        std::fs::write(&cfg, b"binds = [\"/srv/b\"]\n").unwrap();
+        assert_eq!(approved(&store, &cfg).unwrap().0, b"binds = [\"/srv/a\"]\n");
+
+        assert!(untrust(&store, &cfg).unwrap());
+        assert_eq!(
+            approved(&store, &cfg),
+            None,
+            "a revoked trust keeps no record"
+        );
+    }
+
+    #[test]
+    fn a_truncated_record_reads_as_no_record() {
+        let mut buf = Vec::new();
+        frame(&mut buf, b"sbx.toml", b"network = \"none\"\n");
+        frame(&mut buf, b"mise.toml", b"[tools]\n");
+        assert_eq!(unframe(&buf).map(|p| p.len()), Some(2));
+        for cut in 1..buf.len() {
+            let parts = unframe(&buf[..cut]);
+            assert!(
+                parts.as_ref().is_none_or(|p| p.len() < 2),
+                "a record cut at {cut} must never read back whole: {parts:?}"
+            );
+        }
     }
 }

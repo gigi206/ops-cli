@@ -521,6 +521,131 @@ fn fs_scan_closes_a_matching_file_inside_a_real_cage() {
     );
 }
 
+/// The files that govern the cage are read-only in it by default: a write, a removal and a rename
+/// over them are all refused, while the rest of the project stays writable. An untrusted fixture on
+/// purpose, like a launch of a freshly cloned repository: the protection is a restriction, so it
+/// needs no trust to apply.
+#[test]
+fn the_project_config_and_its_mise_file_are_read_only_inside_a_real_cage() {
+    let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "built-in read-only config cage e2e",
+        sandbox_probe(project.path(), data.path())
+    );
+    let config = b"network = \"none\"\n";
+    let mise = b"[tools]\n";
+    std::fs::write(project.path().join(".sbx.toml"), config).unwrap();
+    std::fs::write(project.path().join("mise.toml"), mise).unwrap();
+
+    let script = "for f in .sbx.toml mise.toml; do \
+          (echo x >> $f) 2>/dev/null && echo WROTE-$f || echo REFUSED-$f; \
+          rm -f $f 2>/dev/null && echo REMOVED-$f || echo KEPT-$f; \
+          (echo y > new && mv new $f) 2>/dev/null && echo REPLACED-$f || echo HELD-$f; \
+        done; echo z > other.txt && echo WROTE-OTHER";
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for f in [".sbx.toml", "mise.toml"] {
+        for word in ["REFUSED", "KEPT", "HELD"] {
+            assert!(
+                stdout.contains(&format!("{word}-{f}")),
+                "{f}: expected {word}\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+    }
+    // Teeth: a cage that could write nothing would satisfy every line above.
+    assert!(
+        stdout.contains("WROTE-OTHER"),
+        "the rest of the project stays writable\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join(".sbx.toml")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("mise.toml")).unwrap(),
+        mise
+    );
+}
+
+/// The git carrier is read-only in the cage by default, whatever the project's trust: a hook
+/// cannot be written, created or replaced, and the config cannot be appended to. A trusted
+/// `[fs] git_writable = true` lifts both, and an untrusted one does not.
+#[test]
+fn the_git_hooks_and_config_are_read_only_inside_a_real_cage_until_a_trusted_layer_opens_them() {
+    let (project, data, state) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "built-in read-only git cage e2e",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+    std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+
+    let script = "(echo x >> .git/config) 2>/dev/null && echo WROTE-CONFIG || echo REFUSED-CONFIG; \
+        (printf '#!/bin/sh\\n' > .git/hooks/pre-commit) 2>/dev/null \
+          && echo WROTE-HOOK || echo REFUSED-HOOK; \
+        echo z > other.txt && echo WROTE-OTHER";
+    let run = || {
+        let out = sbx_isolated()
+            .args(["run", "--", "sh", "-c", script])
+            .current_dir(root)
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("run the cage");
+        format!(
+            "{}\n--- stderr\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // No `.sbx.toml` at all: the default holds without one.
+    let out = run();
+    for word in ["REFUSED-CONFIG", "REFUSED-HOOK", "WROTE-OTHER"] {
+        assert!(out.contains(word), "no config: expected {word}\n{out}");
+    }
+    assert_eq!(
+        std::fs::read(root.join(".git/config")).unwrap(),
+        b"[core]\n"
+    );
+    assert!(!root.join(".git/hooks/pre-commit").exists());
+
+    // Untrusted, the opening is dropped and named.
+    std::fs::write(root.join(".sbx.toml"), "[fs]\ngit_writable = true\n").unwrap();
+    let out = run();
+    assert!(
+        out.contains("REFUSED-HOOK"),
+        "untrusted: still closed\n{out}"
+    );
+    assert!(
+        out.contains("`[fs] git_writable`"),
+        "and the drop is named\n{out}"
+    );
+
+    // Trusted, it opens.
+    let trusted = sbx_isolated()
+        .args(["trust", "--yes"])
+        .current_dir(root)
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("trust");
+    assert!(trusted.status.success(), "{trusted:?}");
+    let out = run();
+    for word in ["WROTE-CONFIG", "WROTE-HOOK"] {
+        assert!(
+            out.contains(word),
+            "trusted git_writable: expected {word}\n{out}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `sbx fs deny|undeny|readonly|unreadonly` — the mask-writing verbs.
 //
@@ -699,7 +824,10 @@ fn test_fs_reports_what_the_masks_would_do_to_each_shape() {
     let p = masked_project();
     // The project config must be trusted for its security fields to apply, exactly as a launch
     // requires — otherwise this would test the empty baseline and pass for the wrong reason.
-    assert!(p.run(&["trust"]).status.success(), "trust the fixture");
+    assert!(
+        p.run(&["trust", "--yes"]).status.success(),
+        "trust the fixture"
+    );
 
     let verdict = |path: &str| -> String {
         let out = p.run(&["test", "fs", path]);
@@ -734,6 +862,19 @@ fn test_fs_reports_what_the_masks_would_do_to_each_shape() {
     assert!(open.contains("OPEN"), "{open}");
 }
 
+/// The project config is read-only in the cage without a `[fs]` line saying so, and the tester
+/// says who protects it rather than pointing at an entry that is in no config.
+#[test]
+fn test_fs_names_the_builtin_protection_of_the_project_config() {
+    let p = masked_project();
+    let out = p.run(&["test", "fs", ".sbx.toml"]);
+    assert!(out.status.success(), "{:?}", out.status);
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(body.contains("READ-ONLY"), "{body}");
+    assert!(body.contains("by sbx itself"), "{body}");
+    assert!(!body.contains("entry `.sbx.toml`"), "{body}");
+}
+
 #[test]
 fn test_fs_masks_apply_from_an_untrusted_project_like_a_launch_would() {
     // `[fs]` is the security table that is NOT trust-gated, and the tester has to match that or it
@@ -758,7 +899,10 @@ fn test_fs_refuses_a_path_outside_the_project() {
     // the expansion refuses an outside entry with. Answering OPEN here would read as a policy
     // decision about a path the table could never reach.
     let p = masked_project();
-    assert!(p.run(&["trust"]).status.success(), "trust the fixture");
+    assert!(
+        p.run(&["trust", "--yes"]).status.success(),
+        "trust the fixture"
+    );
     let out = p.run(&["test", "fs", "/etc/hostname"]);
     assert_eq!(out.status.code(), Some(2), "{:?}", out.status);
     let err = String::from_utf8_lossy(&out.stderr);
@@ -776,7 +920,10 @@ fn test_fs_refuses_a_path_outside_the_project() {
 #[test]
 fn test_fs_prints_no_escape_a_project_path_carried_into_it() {
     let p = masked_project();
-    assert!(p.run(&["trust"]).status.success(), "trust the fixture");
+    assert!(
+        p.run(&["trust", "--yes"]).status.success(),
+        "trust the fixture"
+    );
 
     // The project spells the names; the caller says only `link.key` and `deep`, so an escape can
     // only enter through the resolution, never through the argument. The entries themselves are
@@ -792,7 +939,7 @@ fn test_fs_prints_no_escape_a_project_path_carried_into_it() {
     std::os::unix::fs::symlink(hidden.join("inside"), root.join("deep")).unwrap();
     p.write_project("[fs]\ndeny = [\"*.key\", \"*evil\"]\n");
     assert!(
-        p.run(&["trust"]).status.success(),
+        p.run(&["trust", "--yes"]).status.success(),
         "re-trust after the write"
     );
 

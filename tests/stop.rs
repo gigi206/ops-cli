@@ -386,7 +386,7 @@ fn stop_tears_down_a_supervised_app_session() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -494,7 +494,7 @@ fn stop_all_stops_every_session() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),

@@ -28,7 +28,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"github.com\", \"*.nixos.org\"]\ndeny = [\"evil.nixos.org\"]\n",
     );
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["net", "rules"]);
     assert!(out.status.success());
@@ -86,7 +86,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
 fn net_rules_json_emits_the_mode_and_tagged_rules() {
     let fx = Project::new("net");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["net", "rules", "--source", "config", "--json"]);
     assert!(out.status.success());
@@ -102,7 +102,7 @@ fn net_rules_json_emits_the_mode_and_tagged_rules() {
 fn net_rules_under_a_non_filtering_posture_has_no_rules() {
     let fx = Project::new("net");
     fx.write_project("network = \"shared\"\n");
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
     let out = fx.run(&["net", "rules"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // No rules at all — not even the built-in set, which the proxy unions only under a filtering
@@ -115,7 +115,7 @@ fn net_rules_under_a_non_filtering_posture_has_no_rules() {
     );
 
     fx.write_project("network = \"none\"\n");
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
     let out = fx.run(&["net", "rules"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -165,7 +165,7 @@ fn net_rejects_an_unknown_subcommand_and_source() {
 
     // an unknown rule source (`config`/`builtin`/`session` are the known ones)
     fx.write_project("network = \"deny\"\n");
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
     let out = fx.run(&["net", "rules", "--source", "bogus"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
@@ -641,7 +641,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"tcp://api.example.com:443\"]\ndeny = [\"api.example.com/secret\"]\n",
     );
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["net", "rules"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -656,7 +656,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"tcp://ssh.example.com:22\", \"api.example.com\"]\n",
     );
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
     let clean = fx.run(&["net", "rules"]);
     assert!(
         !String::from_utf8_lossy(&clean.stderr).contains("splice is uninspected"),
@@ -1361,7 +1361,7 @@ fn a_catch_all_rule_carries_its_reach_from_the_config_to_the_listing() {
     // reason the label exists at all.
     let fx = Project::new("net");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"re:\", \"github.com\"]\n");
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["net", "rules"]);
     let s = String::from_utf8_lossy(&out.stdout);
@@ -1432,7 +1432,12 @@ fn the_catch_all_refusal_names_each_verbs_own_way_out() {
     // answers "every URL is reachable" without ever looking at the target it was handed.
     let filtered = Project::new("net");
     filtered.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
-    assert!(filtered.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(
+        filtered
+            .run(&["trust", "--yes", ".sbx.toml"])
+            .status
+            .success()
+    );
     let target = stderr(&filtered.run(&["test", "net", "https://*"]));
     assert!(
         target.contains("not a host") && !target.contains("mode ="),
@@ -1449,7 +1454,7 @@ fn ask_mode_renders_across_config_rules_and_the_tester() {
     fx.write_project(
         "[network]\nmode = \"ask\"\nask_timeout = \"90s\"\nallow = [\"github.com\"]\ndeny = [\"evil.com\"]\n",
     );
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // `sbx config show` names the ask posture and surfaces the configured timeout.
     let show = fx.run(&["config", "show"]);
@@ -2674,7 +2679,7 @@ fn test_net_reflects_the_built_in_set_both_directions() {
     let fx = Project::new("net");
     // A trusted project allowlist that lists one host which is ALSO a built-in self-equip host.
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // A built-in host the user did NOT list: allowed only by the built-in union, and tagged so.
     let cache = fx.run(&["test", "net", "https://cache.nixos.org/nix-cache-info"]);
@@ -2701,7 +2706,7 @@ fn test_net_method_scopes_a_rule_to_its_verbs() {
     let fx = Project::new("net");
     // a GET/HEAD-only allow for the host
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"{GET,HEAD} api.test:443\"]\n");
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // the prefix is shown in the rule listing, with the implicit scheme (443 is the default → bare)
     let rules = fx.run(&["net", "rules", "--source", "config"]);
@@ -2733,7 +2738,7 @@ fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
     let fx = Project::new("net");
     // a tcp:// (raw L4) allow for a specific host:port
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"tcp://ssh.example.com:22\"]\n");
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // the rule listing shows the `tcp://` scheme, so the layer (the proto) is visible
     let rules = fx.run(&["net", "rules", "--source", "config"]);
@@ -2775,7 +2780,7 @@ fn test_net_reports_a_deny_suppressed_splice() {
         "[network]\nmode = \"deny\"\n\
          allow = [\"tcp://evil.com:443\"]\ndeny = [\"re:^https://evil\\\\.com\"]\n",
     );
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["test", "net", "tcp://evil.com:443"]);
     let o = String::from_utf8_lossy(&out.stdout);
@@ -2795,7 +2800,7 @@ fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
         "[network]\nmode = \"deny\"\nallow = [\"shared.test\"]\n\
          [app.agent]\ncmd = \"true\"\n",
     );
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // Baseline (no --app): all verbs — a POST is allowed.
     let base_post = fx.run(&["test", "net", "-X", "POST", "https://shared.test/x"]);
@@ -2844,7 +2849,7 @@ fn an_app_declares_a_write_host_with_a_star_prefix() {
         "[app.agent]\ncmd = \"true\"\n\
          [app.agent.network]\nmode = \"deny\"\nallow = [\"read.test\", \"{*} write.test\"]\n",
     );
-    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
     // `net rules --app` shows the unscoped host narrowed and the {*} host kept.
     let rules = fx.run(&["net", "rules", "--app", "agent"]);

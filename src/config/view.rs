@@ -153,6 +153,9 @@ pub(crate) struct ConfigView {
     /// How much of one file the scan reads, in KiB, when a layer bounded it below the built-in
     /// ceiling. `None` leaves that ceiling, which is what a reader should not have to guess at.
     pub(crate) fs_scan_max_kb: Option<u64>,
+    /// Whether a trusted layer set `[fs] git_writable`, lifting the read-only default on
+    /// `.git/hooks/` and `.git/config`. Shown because it is the one opening the table can hold.
+    pub(crate) fs_git_writable: bool,
     /// Which layer supplied the masks (`Default` when no config did).
     pub(crate) fs_origin: ProvenanceView,
     /// The declared operations (`[task.<name>]`) a cage would offer, after the trust gate. This is
@@ -962,6 +965,8 @@ pub(crate) struct AppDetailView {
     /// The effective scan set — the app's own ∪ the baseline's, under the tighter ceiling.
     pub(crate) fs_scan: Vec<String>,
     pub(crate) fs_scan_max_kb: Option<u64>,
+    /// The effective `[fs] git_writable`: the app's own when it set one, else the baseline's.
+    pub(crate) fs_git_writable: bool,
     pub(crate) fs_origin: ProvenanceView,
     /// The effective ssh-agent grant — the app's own ∪ the baseline's. The origin is `Inherited`
     /// when the app named no key of its own (it signs with whatever the baseline granted).
@@ -1231,6 +1236,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         fs_readonly: resolved.fs.readonly.clone(),
         fs_scan: resolved.fs.scan.clone(),
         fs_scan_max_kb: resolved.fs.scan_max_kb,
+        fs_git_writable: resolved.fs.git_writable(),
         fs_origin: resolved.fs_origin.into(),
         tasks: task_views(&resolved.tasks),
         ssh_agent: resolved.ssh_agent.clone(),
@@ -1890,6 +1896,7 @@ fn app_detail_view(
         seccomp_origin,
         devices: device_paths(&eff_devices),
         devices_origin,
+        fs_git_writable: eff_fs.git_writable(),
         fs_deny: eff_fs.deny,
         fs_readonly: eff_fs.readonly,
         fs_scan: eff_fs.scan,
@@ -2120,6 +2127,7 @@ mod tests {
             fs_readonly: Vec::new(),
             fs_scan: Vec::new(),
             fs_scan_max_kb: None,
+            fs_git_writable: false,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,

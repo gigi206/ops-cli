@@ -1450,17 +1450,27 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["trust"],
-        synopsis: "sbx trust [path] | sbx trust --show [path]",
+        synopsis: "sbx trust [--yes] [path] | sbx trust --show [path]",
         summary: "vouch for a project config's current contents",
         options: &[
             ("[path]", "the config to act on (default ./.sbx.toml)"),
             ("--show", "report the trust state without changing it"),
+            (
+                "--yes",
+                "record without asking (required without a terminal, e.g. in a script)",
+            ),
         ],
         details: "Vouches for a config's current contents, so its security-relevant fields are\n\
             honored until the file changes again. Trust is bound to the file's contents, so\n\
             any edit re-arms the gate. `[fs]` is the one table this does not govern: it can only\n\
             close project paths off inside the cage, so it applies whether or not the file is\n\
-            trusted.",
+            trusted, except its two keys that widen instead (`scan_max_kb`, `git_writable`).\n\
+            \n\
+            Before recording, it prints what the trust grants: the lines of the config and of its\n\
+            mise files that changed since they were last approved, or every line when nothing was\n\
+            approved before. It then asks a terminal to confirm; without one it refuses unless\n\
+            --yes is given. A config that already matches its approval is recorded without a\n\
+            question, since it grants nothing new.",
     },
     Page {
         path: &["untrust"],
@@ -2497,9 +2507,11 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             Unlike its siblings, this one does not report a trust gate on the masks, because there\n\
             is none: a project closing its own files off gains nothing it could turn on the user,\n\
-            so `deny` and `readonly` apply from an untrusted project too. The one gated key is\n\
-            `scan_max_kb`, which raises how much of a file the content lens reads past. No launch,\n\
-            no nix.",
+            so `deny` and `readonly` apply from an untrusted project too. The two gated keys are\n\
+            `scan_max_kb`, which raises how much of a file the content lens reads past, and\n\
+            `git_writable`, which lifts the read-only default on `.git/hooks/` and `.git/config`.\n\
+            Those defaults, and the project config and its mise files, are reported as protected\n\
+            by sbx itself. No launch, no nix.",
     },
     Page {
         path: &["test", "proc"],

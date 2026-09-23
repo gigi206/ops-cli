@@ -169,18 +169,32 @@ pub(crate) fn is_trust_drop(warning: &str) -> bool {
     warning.contains(TRUST_DROP_MARKER)
 }
 
-/// The warning for security binds dropped from an untrusted project, made
-/// actionable: a *changed* file points at re-approval, a never-trusted one at the
-/// first approval.
-pub(super) fn dropped_binds_warning(state: TrustState, count: usize) -> String {
+/// The warning for security binds dropped from an untrusted project, made actionable: a *changed*
+/// file points at re-approval, a never-trusted one at the first approval.
+///
+/// The binds are named, not only counted. The project tree is writable from the cage, so a bind
+/// that appears in a changed file may be one the user never wrote, and this warning is what they
+/// read just before the re-approval it suggests: a count tells them something was added, a path
+/// tells them what they would be granting. The paths come from a file nothing has vouched for, so
+/// the list goes through [`load::one_display_line`] — a newline or an escape sequence in one must
+/// not forge or erase the lines around it.
+pub(super) fn dropped_binds_warning(state: TrustState, binds: &[RawBind]) -> String {
+    let count = binds.len();
+    let named = load::one_display_line(
+        &binds
+            .iter()
+            .map(load::describe_raw_bind)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     match state {
         TrustState::Changed => format!(
-            "{PROJECT_CONFIG} changed since it was trusted: dropping {count} bind(s) — \
-             re-run `sbx trust` to re-approve"
+            "{PROJECT_CONFIG} changed since it was trusted: dropping {count} bind(s) ({named}) — \
+             re-run `sbx trust` to review and re-approve"
         ),
         _ => format!(
-            "{PROJECT_CONFIG} is untrusted: dropping {count} bind(s) — \
-             run `sbx trust` to apply them"
+            "{PROJECT_CONFIG} is untrusted: dropping {count} bind(s) ({named}) — \
+             run `sbx trust` to review and apply them"
         ),
     }
 }

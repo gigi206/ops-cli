@@ -78,7 +78,7 @@ fn captured_output_carries_no_ansi_escapes() {
         // The egress-stats table (empty here) — its header + "nothing recorded" line must be plain.
         &["net", "stats"],
         &["trust", "--show"],
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
         &["untrust", ".sbx.toml"],
         &["doctor"],
     ];

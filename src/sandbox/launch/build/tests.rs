@@ -196,6 +196,7 @@ fn a_control_plane_pin_that_lands_on_an_fs_mask_is_dropped() {
         path,
         is_dir: true,
         pattern: String::from(".config/"),
+        builtin: false,
     };
 
     // `deny = [".config/"]`: the decoy is bound at the intermediate, so both it and everything

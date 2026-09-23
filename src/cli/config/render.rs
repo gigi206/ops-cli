@@ -476,6 +476,16 @@ fn grants_section(view: &config::view::ConfigView, pal: &style::Palette) -> Opti
             provenance_tag(view.fs_origin, pal)
         );
     }
+    // Only the opening is shown: the read-only default is every cage's, and a line saying so on
+    // each view would be noise about the one state nobody chose.
+    if view.fs_git_writable {
+        let _ = writeln!(
+            o,
+            "  {h}fs git:{r} writable {dim}(`.git/hooks/` and `.git/config`; the cage may install a \
+             hook your next git command runs){r}{}",
+            provenance_tag(view.fs_origin, pal)
+        );
+    }
     if !view.ssh_agent.is_empty() {
         let _ = writeln!(
             o,
@@ -1426,6 +1436,7 @@ mod tests {
             fs_readonly: Vec::new(),
             fs_scan: Vec::new(),
             fs_scan_max_kb: None,
+            fs_git_writable: false,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,

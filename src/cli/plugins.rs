@@ -1554,7 +1554,8 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
         "{}",
         render_store_rekey_alert(name, &catalogue::to_hex(&cfg.pubkey), &new_shown, &epal)
     );
-    if !yes && !confirm_rotation() {
+    if !yes && !crate::cli::confirm::ask("rotate this store's key?", "this rotation is intentional")
+    {
         diag::error("sbx: not rotating the store's key");
         return ExitCode::FAILURE;
     }
@@ -1581,24 +1582,6 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Ask a terminal to confirm a key rotation. Without a terminal there is nobody to ask, and an
-/// unattended run must not rotate a signing identity on its own — `--yes` is how a script says it
-/// meant to. Anything but an explicit yes is a no.
-fn confirm_rotation() -> bool {
-    use std::io::{BufRead, Write};
-    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
-        diag::hint("     pass --yes if this rotation is intentional (no terminal to confirm at)");
-        return false;
-    }
-    eprint!("  rotate this store's key? [y/N] ");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// `sbx plugins store rm <name>`: remove a configured remote store from the cache. Host-level,

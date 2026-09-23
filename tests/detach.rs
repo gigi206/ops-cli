@@ -198,7 +198,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),

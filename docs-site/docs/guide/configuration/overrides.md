@@ -307,7 +307,9 @@ stops being published: an override moves a forward, it never closes one. See
 guarantee: an override can close *more* of the project for one launch
 (`--config '[fs] deny = ["scratch.key"]'`), and there is no spelling that reopens what a
 config layer closed. Its `scan_max_kb` ceiling folds the same way between override tiers:
-the larger window wins.
+the larger window wins. `git_writable` is a setting rather than a list: the higher tier
+decides when it says anything, so `--config '[fs] git_writable = true'` lets one launch
+write `.git/hooks/` and `.git/config`, which the cage otherwise gets read-only.
 
 ## Fail-closed on an invalid value
 

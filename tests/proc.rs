@@ -460,7 +460,7 @@ fn enforce_decides_the_interpreter_a_shebang_names_in_a_real_cage() {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let trusted = sbx_isolated()
-            .args(["trust"])
+            .args(["trust", "--yes"])
             .current_dir(project.path())
             .env("XDG_DATA_HOME", data.path())
             .env("XDG_STATE_HOME", data.path())
@@ -539,7 +539,7 @@ fn enforce_blocks_a_denied_binary_in_a_real_cage() {
     // Trust the project so the security-gated `[proc]` applies; isolate the trust state alongside the
     // data dir so the run below reads the same marker.
     let trusted = sbx_isolated()
-        .args(["trust"])
+        .args(["trust", "--yes"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", data.path())
@@ -666,7 +666,7 @@ fn a_typed_proc_off_override_disables_a_trusted_projects_enforcement() {
         sandbox_probe(project.path(), data.path())
     );
     let trusted = sbx_isolated()
-        .args(["trust"])
+        .args(["trust", "--yes"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", data.path())
@@ -868,7 +868,7 @@ fn proc_unallow_and_undeny_round_trip_through_config() {
     )
     .unwrap();
     let trusted = sbx_config_write(
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
         proj.path(),
         state.path(),
         config.path(),
@@ -1088,7 +1088,7 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
         sandbox_probe(project.path(), data.path())
     );
     let trusted = sbx_isolated()
-        .args(["trust"])
+        .args(["trust", "--yes"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", data.path())
@@ -1167,7 +1167,10 @@ fn test_proc_reports_the_verdict_the_policy_would_reach() {
     p.write_project("[proc]\nmode = \"enforce\"\ndeny = [\"curl\"]\n");
     // The project config must be trusted for its security fields to apply, exactly as a launch
     // requires — otherwise this would test the empty baseline and pass for the wrong reason.
-    assert!(p.run(&["trust"]).status.success(), "trust the fixture");
+    assert!(
+        p.run(&["trust", "--yes"]).status.success(),
+        "trust the fixture"
+    );
 
     let verdict = |program: &str| -> String {
         let out = p.run(&["test", "proc", program]);

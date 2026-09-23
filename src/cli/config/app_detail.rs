@@ -419,6 +419,12 @@ fn app_detail_fs(o: &mut String, view: &config::view::AppDetailView, pal: &style
             view.fs_readonly.join(", ")
         );
     }
+    if view.fs_git_writable {
+        let _ = writeln!(
+            o,
+            "  {h}fs git:{r} writable {dim}(`.git/hooks/` and `.git/config`){r}{fs_tag}"
+        );
+    }
 }
 
 /// The effective ssh-agent grant: the keys the cage may sign with, and whether each signature
@@ -702,6 +708,7 @@ pub(super) fn sample_app_detail_view() -> config::view::AppDetailView {
         fs_readonly: Vec::new(),
         fs_scan: Vec::new(),
         fs_scan_max_kb: None,
+        fs_git_writable: false,
         notify: Default::default(),
         notify_origin: Default::default(),
         ssh_agent_confirm: false,
@@ -837,6 +844,7 @@ fn all_defaults_app_detail_view() -> config::view::AppDetailView {
         fs_readonly: Vec::new(),
         fs_scan: vec!["/home/demo/.ssh".into()],
         fs_scan_max_kb: None,
+        fs_git_writable: false,
         fs_origin: ProvenanceView::Default,
         ssh_agent: vec!["id_ed25519".into()],
         ssh_agent_confirm: false,
@@ -965,6 +973,7 @@ fn filled_app_detail_view() -> config::view::AppDetailView {
         fs_readonly: vec!["/home/demo/src".into()],
         fs_scan: vec!["/home/demo/.config".into(), "/home/demo/.local".into()],
         fs_scan_max_kb: Some(128),
+        fs_git_writable: false,
         fs_origin: ProvenanceView::Global,
         ssh_agent: vec!["id_ed25519".into(), "id_rsa".into()],
         ssh_agent_confirm: true,

@@ -161,7 +161,7 @@ fn show_reports_store_roots_and_declared_but_not_built() {
     )
     .unwrap();
     // Trust the config so its packages resolve as trusted (declared, not withheld).
-    let out = fx.run(&["trust"]);
+    let out = fx.run(&["trust", "--yes"]);
     assert!(out.status.success(), "trust failed: {}", text(&out));
 
     let out = fx.run(&["projects", "show", tree]);
@@ -246,7 +246,7 @@ fn show_counts_a_remote_flake_built_into_the_store_as_realized() {
     )
     .unwrap();
     fx.make_gcroot(tree, "agent");
-    let out = fx.run(&["trust"]);
+    let out = fx.run(&["trust", "--yes"]);
     assert!(out.status.success(), "trust failed: {}", text(&out));
 
     let out = fx.run(&["projects", "show", tree, "--json"]);
@@ -964,7 +964,7 @@ fn gc_reclaims_without_provisioning_the_declared_distribution() {
     // A registry that refuses rather than one that is slow: port 1 on loopback answers
     // `Connection refused` at once, so nothing here waits on a network or reaches one.
     fx.write_project("distro = \"oci:127.0.0.1:1/nope:latest\"\n");
-    let trusted = fx.run(&["trust", ".sbx.toml"]);
+    let trusted = fx.run(&["trust", "--yes", ".sbx.toml"]);
     assert!(
         trusted.status.success(),
         "sbx trust failed:\n{}",

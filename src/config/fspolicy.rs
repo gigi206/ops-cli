@@ -33,6 +33,13 @@ pub(crate) struct FsPolicy {
     pub(crate) scan: Vec<String>,
     /// How much of one file the content scan reads, in KiB. `None` leaves the built-in ceiling.
     pub(crate) scan_max_kb: Option<u64>,
+    /// Whether the cage may write `.git/hooks/` and `.git/config` (`[fs] git_writable`), which are
+    /// otherwise read-only in it without any entry. `None` leaves that default.
+    ///
+    /// The one field of the table that **opens** rather than closes, so the one the rest of it
+    /// cannot be likened to: it is honored only from a layer that is trusted, by location or by
+    /// content, and an untrusted project's is stripped where the project is resolved, named.
+    pub(crate) git_writable: Option<bool>,
 }
 
 impl FsPolicy {
@@ -63,8 +70,18 @@ impl FsPolicy {
             readonly,
             scan,
             scan_max_kb,
+            git_writable,
         } = self;
-        deny.is_empty() && readonly.is_empty() && scan.is_empty() && scan_max_kb.is_none()
+        deny.is_empty()
+            && readonly.is_empty()
+            && scan.is_empty()
+            && scan_max_kb.is_none()
+            && git_writable.is_none()
+    }
+
+    /// Whether this cage gets `.git/hooks/` and `.git/config` writable: only when a layer said so.
+    pub(crate) fn git_writable(&self) -> bool {
+        self.git_writable.unwrap_or(false)
     }
 
     /// Union `extra` onto this policy, deduped and order-preserving.
@@ -109,6 +126,13 @@ impl FsPolicy {
             (Some(a), Some(b)) => Some(a.max(b)),
             (None, other) | (other, None) => other,
         };
+        // The layer above decides when it says anything, in either direction: a trusted project
+        // may lift the default the global config keeps, or restore one the global config lifted.
+        // No monotone rule is needed here, unlike every field above, because no layer that is not
+        // trusted reaches this line with a value — it is stripped where that layer is resolved.
+        if extra.git_writable.is_some() {
+            self.git_writable = extra.git_writable;
+        }
     }
 }
 
@@ -507,5 +531,31 @@ mod tests {
         for entry in [".env", "secrets/", "sub/*.env", "./config/prod.key"] {
             validate_entry(entry).unwrap_or_else(|e| panic!("`{entry}` is an ordinary entry: {e}"));
         }
+    }
+
+    /// `git_writable` is a setting, not a list: the layer above decides when it says anything, in
+    /// either direction, and a layer that says nothing keeps what is below.
+    #[test]
+    fn git_writable_is_decided_by_the_highest_layer_that_sets_it() {
+        let with = |v: Option<bool>| FsPolicy {
+            git_writable: v,
+            ..FsPolicy::default()
+        };
+        let mut base = with(Some(true));
+        base.union(with(None));
+        assert!(base.git_writable(), "silence keeps the layer below");
+        base.union(with(Some(false)));
+        assert!(
+            !base.git_writable(),
+            "a higher layer may restore the default"
+        );
+        assert!(
+            !FsPolicy::default().git_writable(),
+            "read-only unless a layer says so"
+        );
+        assert!(
+            !with(Some(false)).declares_nothing(),
+            "setting it is declaring something"
+        );
     }
 }

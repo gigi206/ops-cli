@@ -234,7 +234,7 @@ fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -553,7 +553,7 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -1125,7 +1125,7 @@ fn a_trusted_mise_env_reaches_the_sandbox_only_once_trusted() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -1183,7 +1183,7 @@ fn a_mise_env_that_names_the_nix_backend_resolves_at_launch() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -1419,7 +1419,7 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
             project.path(),
             data.path(),
             state.path(),
-            &["trust", ".sbx.toml"],
+            &["trust", "--yes", ".sbx.toml"],
         );
         assert!(
             trusted.status.success(),
@@ -1692,7 +1692,7 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(trusted.status.success());
 
@@ -1819,7 +1819,7 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -1967,7 +1967,7 @@ fn a_signer_that_asked_for_a_body_digest_is_told_it_and_the_body_still_arrives()
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -2085,7 +2085,7 @@ fn a_launch_execs_into_the_cage_unless_something_host_side_must_outlive_it() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -2219,7 +2219,7 @@ fn a_gui_wayland_launch_connects_to_the_host_compositor() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -2278,7 +2278,7 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
         gui.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         t.status.success(),
@@ -2306,7 +2306,7 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
         plain.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         t2.status.success(),
@@ -2356,7 +2356,7 @@ fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -2463,7 +2463,7 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -2567,7 +2567,7 @@ fn an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -2681,7 +2681,7 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -2797,7 +2797,7 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -2905,7 +2905,7 @@ fn a_keyfile_rewrite_makes_the_in_cage_portal_re_emit_setting_changed() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3006,7 +3006,7 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3083,7 +3083,7 @@ fn a_trailing_argument_reaches_a_shell_profile_without_being_eaten_as_argv0() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3272,7 +3272,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3419,7 +3419,7 @@ fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3523,7 +3523,7 @@ fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3636,7 +3636,7 @@ fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3717,7 +3717,7 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3831,7 +3831,7 @@ fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -3983,7 +3983,7 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
             };
             std::fs::write(proj.join(".sbx.toml"), cfg).unwrap();
             // Trust so the security fields (network, forward) are honored.
-            let trusted = sbx_in(proj, data, state, &["trust", ".sbx.toml"]);
+            let trusted = sbx_in(proj, data, state, &["trust", "--yes", ".sbx.toml"]);
             assert!(
                 trusted.status.success(),
                 "trust: {}",
@@ -4083,7 +4083,7 @@ fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -4187,7 +4187,7 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -4342,7 +4342,7 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -4517,7 +4517,7 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -4581,7 +4581,7 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -4708,7 +4708,7 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -4913,7 +4913,7 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -4975,7 +4975,7 @@ fn a_tarball_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -5045,7 +5045,7 @@ fn a_deb_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -5116,7 +5116,7 @@ fn the_deb_roll_runs_a_deb_resolve_command_through_the_upgrade_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -5182,7 +5182,7 @@ fn an_appimage_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validat
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -5246,7 +5246,7 @@ fn the_appimage_roll_runs_an_appimage_resolve_command_through_the_upgrade_cage()
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -5393,7 +5393,7 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -5521,7 +5521,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -5594,7 +5594,7 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -5739,7 +5739,12 @@ fn a_global_app_splits_mise_pools_across_two_projects() {
     // trust both projects so their `[packages]` (a trusted-only field) is honored — otherwise the
     // app package is withheld and Lane 1 never runs.
     for project in [project_a.path(), project_b.path()] {
-        let trusted = sbx_in(project, data.path(), state.path(), &["trust", ".sbx.toml"]);
+        let trusted = sbx_in(
+            project,
+            data.path(),
+            state.path(),
+            &["trust", "--yes", ".sbx.toml"],
+        );
         assert!(
             trusted.status.success(),
             "sbx trust failed: {}",
@@ -5935,7 +5940,7 @@ fn a_shared_pool_lets_the_second_app_reuse_what_the_first_installed() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -6053,7 +6058,7 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -6144,7 +6149,7 @@ fn sbx_upgrade_mise_rolls_a_global_apps_app_global_tool() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -6229,7 +6234,12 @@ fn a_flake_package_builds_host_side_into_the_shared_store_and_a_fresh_project_re
 
     let launch = |project: &Path| {
         // trust so the app's `[packages] flake:` (a trusted-only field) is admitted.
-        let t = sbx_in(project, data.path(), state.path(), &["trust", ".sbx.toml"]);
+        let t = sbx_in(
+            project,
+            data.path(),
+            state.path(),
+            &["trust", "--yes", ".sbx.toml"],
+        );
         assert!(
             t.status.success(),
             "sbx trust failed: {}",
@@ -6350,7 +6360,12 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     let trust = |project: &Path| {
         // Trust so the app's inline `[flakes]` and its network posture (both security fields) are
         // honored; editing the file re-arms the gate, hence trusting per phase.
-        let t = sbx_in(project, data.path(), state.path(), &["trust", ".sbx.toml"]);
+        let t = sbx_in(
+            project,
+            data.path(),
+            state.path(),
+            &["trust", "--yes", ".sbx.toml"],
+        );
         assert!(
             t.status.success(),
             "sbx trust failed: {}",
@@ -6457,7 +6472,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -6665,7 +6680,12 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
     );
 
     let trust = |proj: &Path| {
-        let t = sbx_in(proj, data.path(), state.path(), &["trust", ".sbx.toml"]);
+        let t = sbx_in(
+            proj,
+            data.path(),
+            state.path(),
+            &["trust", "--yes", ".sbx.toml"],
+        );
         assert!(
             t.status.success(),
             "sbx trust failed: {}",
@@ -6960,7 +6980,7 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7057,7 +7077,7 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7138,7 +7158,7 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7308,7 +7328,7 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7396,7 +7416,7 @@ fn a_trusted_seccomp_relaxation_launches_a_working_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7474,7 +7494,7 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7568,7 +7588,7 @@ fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7680,7 +7700,7 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7811,7 +7831,7 @@ fi"#;
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -7996,7 +8016,7 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["trust", "--yes", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
@@ -8981,9 +9001,14 @@ fn a_task_reads_the_key_its_own_unmask_names_and_nothing_else() {
 
     probe_or_skip!("unmask e2e", run_in(p, data.path(), &["true"]));
     assert!(
-        sbx_in(p, data.path(), state.path(), &["trust", ".sbx.toml"])
-            .status
-            .success(),
+        sbx_in(
+            p,
+            data.path(),
+            state.path(),
+            &["trust", "--yes", ".sbx.toml"]
+        )
+        .status
+        .success(),
         "the project must be trusted for its `[task]` blocks to be honored"
     );
 

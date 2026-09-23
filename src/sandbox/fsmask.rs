@@ -80,6 +80,9 @@ pub(crate) struct Masked {
     pub(crate) is_dir: bool,
     /// The `[fs]` entry that matched, for a message that points at what to edit.
     pub(crate) pattern: String,
+    /// Whether sbx added the entry itself rather than a config declaring it, so a message does not
+    /// send its reader to edit a line nobody wrote ([`BUILTIN_READONLY`]).
+    pub(crate) builtin: bool,
 }
 
 /// The project paths a launch will close, expanded from a policy against the project on disk.
@@ -196,7 +199,7 @@ pub(crate) fn stage_decoys(dir: &Path) -> io::Result<Decoys> {
 /// bounded on a repository with millions of files.
 pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     let mut out = Expanded::default();
-    if policy.is_empty() {
+    if policy.is_empty() && builtin_readonly_names(project, policy.git_writable()).is_empty() {
         return out;
     }
     let Ok(root) = project.canonicalize() else {
@@ -227,6 +230,27 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         &mut out.warnings,
         &mut out.refused,
     );
+    // The built-in entries join after the declared ones, and only where nothing declared already
+    // covers them: a path a `deny` closes needs no protection, and one a declared `readonly` names
+    // needs no second mount.
+    let builtin = resolve_list(
+        &root,
+        &builtin_readonly_names(&root, policy.git_writable()),
+        BUILTIN_READONLY,
+        &mut out.warnings,
+        &mut out.refused,
+    );
+    for mut m in builtin {
+        m.builtin = true;
+        let covered = out
+            .denied
+            .iter()
+            .chain(&out.readonly)
+            .any(|c| c.path == m.path || (c.is_dir && m.path.starts_with(&c.path)));
+        if !covered {
+            out.readonly.push(m);
+        }
+    }
 
     // A denied *directory* already covers everything under it: the cage sees an empty directory, so
     // nothing inside is nameable. Any other mask below one is therefore redundant — and worse than
@@ -287,6 +311,61 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
             "`[fs]` masks {count} paths — past about {MASK_WARN} the launch slows down noticeably \
              (each mask is a mount). Naming a directory closes it in one entry, at constant cost"
         ));
+    }
+    out
+}
+
+/// How a built-in entry is named in a message, in place of the `[fs]` field a declared one comes
+/// from: nobody wrote it, so a warning must not send its reader looking for it in their config.
+/// See [`builtin_readonly_names`].
+const BUILTIN_READONLY: &str = "readonly (built-in)";
+
+/// The project files every cage gets read-only without anyone listing them.
+///
+/// **The project config.** The `.sbx.toml` and each of the mise files the trust gate hashes beside
+/// it, those present at launch. These are the files that govern the cage, and the tree they sit in
+/// is writable from inside it. A write to one re-arms the trust gate, and the re-approval that
+/// follows is where an addition the user never made gets granted by reflex; refusing the write
+/// takes that step away from the agent. Only a file present at launch can be protected — a mount
+/// needs something to land on — so a file the cage creates is answered by the review `sbx trust`
+/// shows, not here. The mise files are protected only beside a `.sbx.toml`: without one sbx does
+/// not honor them, and there is nothing for a write to them to re-arm.
+///
+/// **The git carrier.** `.git/hooks/` and `.git/config`, when the project's `.git` is a directory.
+/// A hook, or a key of the config that names a program (`core.hooksPath`, `core.fsmonitor`,
+/// `core.pager`, a filter, an alias), runs on the host at the user's next git command, outside any
+/// cage. The directory is named, so a hook created mid-session is refused too. What it costs is
+/// what writes the config: `remote add`, `config user.*`, and the upstream `push -u` records
+/// (the push itself succeeds). `git_writable` lifts both — the one opening in `[fs]`, and why it is
+/// honored only from a trusted layer. A `.git` that is a file (a linked worktree, a submodule)
+/// points at a directory outside the project, which the cage does not hold; nothing is added.
+///
+/// Returned as `[fs]` entries relative to the project, for [`resolve_list`], which is what refuses
+/// one that cannot be looked at: an absent file is left out here, every other answer goes through.
+fn builtin_readonly_names(root: &Path, git_writable: bool) -> Vec<String> {
+    let present = |name: &str| {
+        !matches!(
+            std::fs::symlink_metadata(root.join(name)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    };
+    let mut out: Vec<String> = Vec::new();
+    if present(crate::config::PROJECT_CONFIG) {
+        out.extend(
+            std::iter::once(crate::config::PROJECT_CONFIG)
+                .chain(crate::trust::MISE_CONFIG_NAMES.iter().copied())
+                .filter(|name| present(name))
+                .map(str::to_string),
+        );
+    }
+    let git_is_dir = std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir());
+    if git_is_dir && !git_writable {
+        out.extend(
+            [".git/hooks/", ".git/config"]
+                .into_iter()
+                .filter(|name| present(name.trim_end_matches('/')))
+                .map(str::to_string),
+        );
     }
     out
 }
@@ -525,6 +604,7 @@ fn admit(
         path: canon,
         is_dir,
         pattern: entry.to_string(),
+        builtin: false,
     }))
 }
 
@@ -1165,6 +1245,126 @@ mod tests {
             "{:?}",
             e.warnings
         );
+    }
+
+    /// The files that govern the cage are read-only in it without anyone listing them: the
+    /// `.sbx.toml` and the mise files beside it that are present at launch.
+    #[test]
+    fn the_config_and_its_present_mise_files_are_read_only_by_default() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::write(root.join(".sbx.toml"), b"network = \"none\"\n").unwrap();
+        std::fs::write(root.join("mise.toml"), b"[tools]\n").unwrap();
+        std::fs::create_dir_all(root.join(".config/mise")).unwrap();
+        std::fs::write(root.join(".config/mise/config.toml"), b"[tools]\n").unwrap();
+
+        let e = expand(&root, &FsPolicy::default());
+        let ro: Vec<&Path> = e.readonly.iter().map(|m| m.path.as_path()).collect();
+        assert_eq!(
+            ro,
+            vec![
+                root.join(".sbx.toml").as_path(),
+                root.join("mise.toml").as_path(),
+                root.join(".config/mise/config.toml").as_path(),
+            ],
+            "the present files only, in the gate's order"
+        );
+        assert!(e.denied.is_empty());
+        assert!(
+            e.warnings.is_empty(),
+            "an absent mise file is no warning: {:?}",
+            e.warnings
+        );
+        assert!(
+            matches!(
+                e.covering(&root.join(".sbx.toml")),
+                Some(Cover::ReadOnly(_))
+            ),
+            "`sbx test fs` answers from the same expansion"
+        );
+    }
+
+    /// Without a `.sbx.toml` sbx honors no mise file, so there is nothing a write to one re-arms,
+    /// and a project that only uses mise keeps writing its own config.
+    #[test]
+    fn without_a_project_config_nothing_is_read_only_by_default() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::write(root.join("mise.toml"), b"[tools]\n").unwrap();
+        let e = expand(&root, &FsPolicy::default());
+        assert!(e.is_empty(), "{:?}", e.readonly);
+    }
+
+    /// A declared entry that already covers a built-in one takes its place: a `deny` closes the
+    /// file outright, and a declared `readonly` of it or of a directory above needs no second
+    /// mount.
+    #[test]
+    fn a_declared_entry_covering_a_builtin_one_takes_its_place() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::write(root.join(".sbx.toml"), b"").unwrap();
+        std::fs::create_dir_all(root.join(".mise")).unwrap();
+        std::fs::write(root.join(".mise/config.toml"), b"").unwrap();
+        std::fs::write(root.join(".tool-versions"), b"").unwrap();
+
+        let e = expand(&root, &policy(&[".tool-versions"], &[".mise/"]));
+        let ro: Vec<&Path> = e.readonly.iter().map(|m| m.path.as_path()).collect();
+        assert_eq!(
+            ro,
+            vec![
+                root.join(".mise").as_path(),
+                root.join(".sbx.toml").as_path()
+            ],
+            "the declared directory, then the one built-in entry nothing declared covers"
+        );
+        let denied: Vec<&Path> = e.denied.iter().map(|m| m.path.as_path()).collect();
+        assert_eq!(denied, vec![root.join(".tool-versions").as_path()]);
+        assert!(e.warnings.is_empty(), "{:?}", e.warnings);
+    }
+
+    /// The git carrier is read-only by default, with or without a `.sbx.toml`: the hooks
+    /// directory, so a hook created mid-session is refused too, and the config, whose keys can name
+    /// a program as surely as a hook can.
+    #[test]
+    fn the_git_hooks_and_config_are_read_only_by_default_and_git_writable_lifts_them() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+
+        let e = expand(&root, &FsPolicy::default());
+        let ro: Vec<(&Path, bool)> = e
+            .readonly
+            .iter()
+            .map(|m| (m.path.as_path(), m.is_dir))
+            .collect();
+        assert_eq!(
+            ro,
+            vec![
+                (root.join(".git/hooks").as_path(), true),
+                (root.join(".git/config").as_path(), false),
+            ]
+        );
+        assert!(e.readonly.iter().all(|m| m.builtin));
+
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        assert!(
+            expand(&root, &lifted).is_empty(),
+            "the one opening in the table"
+        );
+    }
+
+    /// A `.git` that is a file points at a directory outside the project, which the cage does not
+    /// hold, so there is nothing of it inside the project to protect.
+    #[test]
+    fn a_git_file_adds_nothing() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::write(root.join(".git"), b"gitdir: /elsewhere/.git/worktrees/w\n").unwrap();
+        assert!(expand(&root, &FsPolicy::default()).is_empty());
     }
 
     #[test]

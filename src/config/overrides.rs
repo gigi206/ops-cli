@@ -872,6 +872,7 @@ fn union_fs_opt(base: Option<RawFs>, higher: Option<RawFs>) -> Option<RawFs> {
                 readonly,
                 scan,
                 scan_max_kb,
+                git_writable,
                 rest,
             } = h;
             b.deny.extend(deny);
@@ -881,6 +882,11 @@ fn union_fs_opt(base: Option<RawFs>, higher: Option<RawFs>) -> Option<RawFs> {
                 (Some(a), Some(c)) => Some(a.max(c)),
                 (None, other) | (other, None) => other,
             };
+            // The higher tier decides when it says anything, as `FsPolicy::union` does one layer
+            // down: this is a setting, not a list of things closed.
+            if git_writable.is_some() {
+                b.git_writable = git_writable;
+            }
             b.rest.extend(rest);
             Some(b)
         }

@@ -36,7 +36,9 @@ later interactive sessions. See [`env`](../configuration/env).
 
 [`[fs]`](../configuration/fs) is the one *closing* field, and the only one outside the split.
 It names project paths the cage may not read or may not write, so every entry **subtracts**
-access and there is no syntax for granting any. The gate exists to decide who may widen what
+access and there is no syntax for granting any, with two keys excepted and gated like security
+fields: `scan_max_kb`, which lowers how much of a file the content scan reads, and
+`git_writable`, which lifts the read-only default on `.git/hooks/` and `.git/config`. The gate exists to decide who may widen what
 the cage can reach; a table that can only narrow it has nothing for the gate to decide, and
 dropping it from an untrusted project would leave open exactly the file that project asked to
 close. Layers union, so no layer can reopen what another closed.
@@ -98,6 +100,24 @@ stays the property of one directory.
 Because the hash covers the *whole file*, any edit, even to a free field, re-arms
 the gate. This is deliberate: after editing a trusted file, its security fields stop
 applying until you run `sbx trust` again.
+
+## What a re-approval shows
+
+The hash says *whether* the file changed, not *what* changed. So beside each trust record
+sits a copy of the bytes it approved, the `.sbx.toml` and every mise file, and
+`sbx trust` compares the current contents against that copy before recording anything.
+It prints the lines that differ, per file, and asks for confirmation; with no copy on
+record (a first approval) every line is shown, since all of it is being granted.
+
+This closes the loop the project tree opens. The tree is writable from the cage, so an
+agent can add a line to `.sbx.toml` (a bind to a directory of your home, say). The next
+launch drops that bind and names its path in the warning; `sbx trust`, run to make the
+warning go away, shows the added line before granting it. Without the review, the one
+command the warning suggests would also be the one that grants the addition unseen.
+
+The copy is a display input, never a verdict: whether a project is trusted is the hash
+alone. A copy that was tampered with could mislead the diff, but cannot make anything
+trusted. Without a terminal, `sbx trust` refuses unless `--yes` is given.
 
 When a project also has mise config files, they are hashed **together** with
 `.sbx.toml`, so editing either re-arms the gate and a mise `[env]` cannot change under

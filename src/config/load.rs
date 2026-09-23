@@ -921,7 +921,7 @@ fn referenced_groups(network: Option<&NetworkField>) -> Vec<String> {
 /// bind is read-write (the more-privileged, exceptional case worth flagging before import). An
 /// unrecognized mode is shown verbatim (`(mode X?)`) so a typo is visible, and a table missing its
 /// `path` reads as `(bind without a path)` so a malformed entry is not silently blank.
-fn describe_raw_bind(bind: &RawBind) -> String {
+pub(super) fn describe_raw_bind(bind: &RawBind) -> String {
     match bind {
         RawBind::Path(p) => p.clone(),
         RawBind::Detailed(t) => {
@@ -949,7 +949,7 @@ fn describe_raw_bind(bind: &RawBind) -> String {
 ///
 /// Unlike `sanitize_description`, nothing is truncated: a line is long here because the profile
 /// grants that much, and dropping its tail would conceal exactly what the report exists to show.
-fn one_display_line(line: &str) -> String {
+pub(super) fn one_display_line(line: &str) -> String {
     let cleaned: String = line
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

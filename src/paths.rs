@@ -242,7 +242,7 @@ const CONFIG_ENTRIES: &[Entry] = &[
 const STATE_ENTRIES: &[Entry] = &[Entry {
     label: "trusted/",
     rel: "trusted",
-    desc: "trust markers (one per trusted config file)",
+    desc: "trust markers (one per trusted config file, with the contents it approved)",
     enumerate: Enumerate::None,
 }];
 

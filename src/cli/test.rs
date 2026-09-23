@@ -1068,40 +1068,42 @@ fn fs_test(args: &[OsString]) -> ExitCode {
     }
 
     let (word, hue, why) = match expanded.covering(&path) {
-        Some(crate::sandbox::fsmask::Cover::Denied(m)) => (
-            "DENIED",
-            pal.err,
-            Some(("deny", m.pattern.clone(), m.path.clone(), m.is_dir)),
-        ),
-        Some(crate::sandbox::fsmask::Cover::ReadOnly(m)) => (
-            "READ-ONLY",
-            pal.warn,
-            Some(("readonly", m.pattern.clone(), m.path.clone(), m.is_dir)),
-        ),
+        Some(crate::sandbox::fsmask::Cover::Denied(m)) => ("DENIED", pal.err, Some(("deny", m))),
+        Some(crate::sandbox::fsmask::Cover::ReadOnly(m)) => {
+            ("READ-ONLY", pal.warn, Some(("readonly", m)))
+        }
         None => ("OPEN", pal.ok, None),
     };
     println!("  {hue}{word}{r}  {}", shown(&path));
     match why {
-        Some((field, pattern, masked, is_dir)) if masked == path => {
+        // An entry sbx added itself is named as such: pointing at a `[fs]` line would send the
+        // reader to look for, or remove, a line that is in no config.
+        Some((_, m)) if m.builtin => println!(
+            "  {dim}by sbx itself: the project config, its mise files, `.git/hooks/` and \
+             `.git/config` are read-only in the cage by default{r}",
+            dim = pal.dim
+        ),
+        Some((field, m)) if m.path == path => {
             println!(
-                "  {dim}by `[fs] {field}` entry `{pattern}`{r}",
+                "  {dim}by `[fs] {field}` entry `{}`{r}",
+                m.pattern,
                 dim = pal.dim
             );
-            let _ = is_dir;
         }
         // Naming the *covering* path, not just the entry: under a denied directory the pattern
         // alone does not say why this name is closed, and the answer holds for names that do not
         // exist yet. The verb follows the field, because the two masks do different things: one
         // takes the contents away, the other leaves them and refuses the write.
-        Some((field, pattern, masked, _)) => {
+        Some((field, m)) => {
             let verb = if field == "deny" {
                 "closes"
             } else {
                 "protects"
             };
             println!(
-                "  {dim}by `[fs] {field}` entry `{pattern}`, which {verb} `{}` above it{r}",
-                shown(&masked),
+                "  {dim}by `[fs] {field}` entry `{}`, which {verb} `{}` above it{r}",
+                m.pattern,
+                shown(&m.path),
                 dim = pal.dim
             )
         }

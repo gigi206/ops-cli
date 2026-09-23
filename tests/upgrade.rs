@@ -7,8 +7,18 @@ use common::fixture::TmpDir;
 use std::path::Path;
 use std::process::Command;
 
+/// The built binary, with the global config isolated the way every other suite isolates it.
+///
+/// Without it, `sbx upgrade` reads the developer's own `~/.config/sbx` and rolls every app declared
+/// there: each launches a cage in the fixture project, provisions that project's packages, and the
+/// suite then measures that machine's catalogue — and its network — rather than the one package the
+/// test declares.
 fn sbx() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_sbx"))
+    let config = common::fixtures_root().join("upgrade-isolated-config");
+    let _ = std::fs::create_dir_all(&config);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    cmd.env("XDG_CONFIG_HOME", config);
+    cmd
 }
 
 #[test]
@@ -66,7 +76,7 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
 
     // The flake package is a trusted-only field, so the project must be trusted to be rolled.
     let trusted = sbx()
-        .args(["trust", ".sbx.toml"])
+        .args(["trust", "--yes", ".sbx.toml"])
         .current_dir(proj.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
