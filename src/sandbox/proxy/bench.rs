@@ -1300,7 +1300,7 @@ fn refusal_cost() {
             let ctx = Arc::new(
                 ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[]))
                     .unwrap()
-                    .with_stats(Arc::clone(&stats))
+                    .with_events(crate::sandbox::proxy::events::for_stats(Arc::clone(&stats)))
                     .with_resolver(Box::new(|_| {
                         panic!("a default-deny refusal must not reach a name lookup")
                     })),

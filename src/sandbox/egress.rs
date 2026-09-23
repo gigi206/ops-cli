@@ -113,6 +113,9 @@ pub(crate) struct Egress {
     /// The stop signal both serve loops read, set by [`Drop`] — see the header above for why the
     /// threads cannot be ended any other way.
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// The proxy's report queue, held so [`Drop`] can wait for what it queued to be applied before
+    /// the counters are written for the last time.
+    events: super::proxy::events::Emitter,
 }
 
 impl Egress {
@@ -170,6 +173,9 @@ impl Drop for Egress {
         if let Some(control) = &self.control_uds {
             let _ = std::fs::remove_file(control);
         }
+        // What the proxy reported and the applying side has not reached yet, applied before the
+        // counters are written for the last time.
+        self.events.flush();
         // A final flush for a graceful exit; the per-decision flush already keeps the file current
         // for the common case of a killed session, where this Drop never runs.
         if let Some(stats) = &self.stats {
@@ -986,17 +992,17 @@ pub(crate) fn start(
         ctx = ctx.with_capture(capture.clone());
     }
     ctx = ctx.with_plane(plane);
-    if let Some(wiring) = notify {
-        ctx = ctx.with_notifier(Arc::clone(&wiring.notifier));
-    }
-
-    // The session's signer record, when the launch stood one up. Passed in rather than built here
-    // because it is shared: the agent's proxy and every per-invocation proxy a declared operation
-    // stands up push into the one ring a reader can reach, exactly as they share one notifier. A
-    // proxy that built its own would be recording into a ring nothing serves.
-    if let Some(ring) = signer_log {
-        ctx = ctx.with_signer_log(ring);
-    }
+    // Where the proxy's reports are applied: the session's decision counters, its notifier, and its
+    // signer record. The last two are passed in rather than built here because they are shared: the
+    // agent's proxy and every per-invocation proxy a declared operation stands up report into the
+    // one notifier and the one ring a reader can reach. A proxy that built its own would be
+    // recording into a ring nothing serves. The proxy itself holds none of them — see
+    // [`super::proxy::events`].
+    let sinks = super::proxy::events::Sinks {
+        stats: stats.clone(),
+        notifier: notify.map(|wiring| Arc::clone(&wiring.notifier)),
+        signer_log,
+    };
 
     // Stand up the control socket the host-side `sbx net pending`/`sbx net log`/`sbx net allow
     // --session` reach. It lives under the `0700` egress dir beside `<data>` and is **never** bound
@@ -1058,8 +1064,9 @@ pub(crate) fn start(
         // The trailing write, so the debounce below only bounds how *often* the file is rewritten
         // and never how much of the session it reflects once the traffic stops.
         super::egress_stats::start_flusher(stats);
-        ctx = ctx.with_stats(stats.clone());
     }
+    let events = super::proxy::events::spawn(sinks);
+    ctx = ctx.with_events(events.clone());
     let ctx = Arc::new(ctx);
 
     // The control plane is serving from here on, and the only thing that stops its accept thread
@@ -1183,6 +1190,7 @@ pub(crate) fn start(
             stats,
             log,
             stop,
+            events,
         },
         Wiring {
             binds,
@@ -2101,6 +2109,7 @@ mod tests {
             log: Arc::new(super::super::control::LogRing::new(
                 super::super::control::LOG_RING_CAP,
             )),
+            events: super::super::proxy::events::spawn(Default::default()),
         });
         for path in &paths {
             assert!(!path.exists(), "left behind: {}", path.display());

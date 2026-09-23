@@ -15,7 +15,7 @@ use rustls::{ClientConfig, ServerConfig};
 
 use crate::allowlist::{self, EgressPolicy, Rule};
 use crate::sandbox::control::SecretWay;
-use crate::sandbox::egress_stats::{EgressStats, StatKind};
+use crate::sandbox::egress_stats::StatKind;
 
 use super::ca::{Ca, CertResolver, ensure_provider, upstream_config, upstream_config_h2};
 use super::dns::{Resolver, caching_resolver};
@@ -116,10 +116,12 @@ pub(crate) struct ProxyCtx {
     /// the pending id without polling. Off by default (tests, non-ask launches); the launch turns
     /// it on when it wires the control socket.
     pub(super) notices: bool,
-    /// The per-host decision counters this launch records (one outcome per request), or `None` when
-    /// stats are off. The launch ([`crate::sandbox::egress::start`]) attaches the session's
-    /// [`EgressStats`] via [`Self::with_stats`]; tests leave it unset.
-    pub(super) stats: Option<Arc<EgressStats>>,
+    /// Where this proxy reports what it did — the decisions it counts for `sbx net stats`, the
+    /// refusals it announces, the credentials its signers form — or `None` when nothing is kept
+    /// (tests). Reports leave as messages the launch applies on its own side
+    /// ([`super::events`]), so the proxy holds none of the structures they end up in. Attached by
+    /// [`crate::sandbox::egress::start`] via [`Self::with_events`].
+    pub(super) events: Option<super::events::Emitter>,
     /// The live event ring this launch pushes each decision into, read by `sbx net log`, or `None`
     /// when the log is off (tests). The launch ([`crate::sandbox::egress::start`]) attaches the session's
     /// [`crate::sandbox::control::LogRing`] via [`Self::with_log`]; a decision's outcome is both counted in
@@ -160,11 +162,6 @@ pub(crate) struct ProxyCtx {
     /// suggestion in a `denied-default` refusal body to the app (`--app <name>`). `None` for a bare
     /// `sbx run`/`shell`.
     pub(super) app: Option<String>,
-    /// Where a refused request is announced (`[notify] events.network`), or `None` when the launch
-    /// wired none (tests). Attached by [`crate::sandbox::egress::start`] via [`Self::with_notifier`]
-    /// and consulted from the one [`Self::outcome_l7`] chokepoint, so a refusal site added later
-    /// cannot forget to announce itself.
-    pub(super) notifier: Option<Arc<crate::sandbox::notify_sink::Notifier>>,
     /// The session's traffic capture (`[network] capture`), or `None` — the default — when nothing
     /// is captured. Attached by [`crate::sandbox::egress::start`] via [`Self::with_capture`]; every
     /// inspected forwarding path opens a capture through the one [`Self::begin_capture`] entry
@@ -189,12 +186,6 @@ pub(crate) struct ProxyCtx {
     /// connection. Resolved here so the refusal, the reservation and the message that explains
     /// them cannot read three different numbers.
     pub(super) body: super::BodyLimits,
-    /// The session's record of what its signer plugins formed, read by `sbx logs --feed signer`, or
-    /// `None` when the launch declared no signer (and in tests). Attached by
-    /// [`crate::sandbox::egress::start`] via [`Self::with_signer_log`]; every path that forms a
-    /// credential reaches it through the one [`super::inject::pairs_for`] call, so a request whose
-    /// signature was formed elsewhere does not exist.
-    pub(super) signer_log: Option<Arc<crate::sandbox::signer_control::SignerRing>>,
 }
 
 impl ProxyCtx {
@@ -264,7 +255,7 @@ impl ProxyCtx {
             pending: Arc::new(crate::sandbox::control::PendingState::new()),
             manual: Arc::new(crate::sandbox::control::ManualRules::new()),
             notices: false,
-            stats: None,
+            events: None,
             log: None,
             plane: crate::sandbox::control::Plane::Agent,
             flows: None,
@@ -272,24 +263,19 @@ impl ProxyCtx {
             conns: AtomicUsize::new(0),
             held_bodies: std::sync::atomic::AtomicU64::new(0),
             app: None,
-            notifier: None,
             capture: None,
             pool,
             idle: policy_idle,
             max_conns: policy_max_conns,
             body: policy_body,
-            signer_log: None,
         })
     }
 
-    /// Attach the launch's refusal notifier, so every request this policy turns down is announced.
-    /// Left unset (tests, and any path with no notification policy) nothing is announced and the
-    /// decision path is unchanged.
-    pub(crate) fn with_notifier(
-        mut self,
-        notifier: Arc<crate::sandbox::notify_sink::Notifier>,
-    ) -> Self {
-        self.notifier = Some(notifier);
+    /// Attach where this proxy reports what it did: the decisions it counts, the refusals it
+    /// announces, the credentials its signers form. Left unset (tests, and any path that keeps none
+    /// of them) nothing is reported and the decision path is unchanged.
+    pub(crate) fn with_events(mut self, events: super::events::Emitter) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -298,14 +284,6 @@ impl ProxyCtx {
     /// `sbx run`/`shell`) the suggestion targets the project baseline.
     pub(crate) fn with_app(mut self, app: Option<String>) -> Self {
         self.app = app;
-        self
-    }
-
-    /// Attach the session's per-host decision counters, so each request's outcome is recorded.
-    ///
-    /// Set once by the launch ([`crate::sandbox::egress::start`]) when stats are enabled.
-    pub(crate) fn with_stats(mut self, stats: Arc<EgressStats>) -> Self {
-        self.stats = Some(stats);
         self
     }
 
@@ -333,21 +311,10 @@ impl ProxyCtx {
         self
     }
 
-    /// Attach the session's signer feed, so every credential a plugin forms — and every request it
-    /// would not sign — is recorded for `sbx logs --feed signer`. Set by the launch
-    /// ([`crate::sandbox::egress::start`]) only when a signer is declared; left unset the forming
-    /// path is unchanged and records nothing.
-    pub(crate) fn with_signer_log(
-        mut self,
-        log: Arc<crate::sandbox::signer_control::SignerRing>,
-    ) -> Self {
-        self.signer_log = Some(log);
-        self
-    }
-
-    /// The session's signer feed, for the one call that forms credentials.
-    pub(super) fn signer_log(&self) -> Option<&crate::sandbox::signer_control::SignerRing> {
-        self.signer_log.as_deref()
+    /// Where a credential a signer forms is reported, for the one call that forms credentials —
+    /// `None` when the launch keeps no signer feed.
+    pub(super) fn signer_events(&self) -> Option<&super::events::Emitter> {
+        self.events.as_ref().filter(|e| e.keeps().signatures)
     }
 
     /// Attach the session's traffic capture, so each inspected exchange files what it carried for
@@ -469,8 +436,11 @@ impl ProxyCtx {
         kind: StatKind,
         reason: &str,
     ) -> Option<u64> {
-        if let Some(stats) = &self.stats {
-            stats.record(host, kind);
+        if let Some(events) = self.events.as_ref().filter(|e| e.keeps().stats) {
+            events.send(super::events::ProxyEvent::Stat {
+                host: host.to_string(),
+                kind,
+            });
         }
         let verdict = match kind {
             StatKind::Allow => crate::sandbox::control::LogVerdict::Allow,
@@ -520,7 +490,7 @@ impl ProxyCtx {
         reason: &str,
         muted: bool,
     ) {
-        let Some(notifier) = &self.notifier else {
+        let Some(events) = self.events.as_ref().filter(|e| e.keeps().refusals) else {
             return;
         };
         if let Some(block) = refusal_block(
@@ -532,7 +502,7 @@ impl ProxyCtx {
             self.notices,
             &self.allow_suggestion(&super::rule_destination(proto, host, port)),
         ) {
-            notifier.block(block);
+            events.send(super::events::ProxyEvent::Refusal(block));
         }
     }
 
@@ -1012,7 +982,7 @@ mod wiring_tests {
     ///
     /// The unit tests above pin what `refusal_block` *decides*; this pins that `outcome` actually
     /// calls it. Without this, removing the announcement from the chokepoint — or dropping the
-    /// `with_notifier` a launch attaches — would leave every test green and every refusal silent,
+    /// `with_events` a launch attaches — would leave every test green and every refusal silent,
     /// which is the one regression nothing else here would catch.
     #[test]
     fn a_refusal_recorded_through_the_chokepoint_reaches_the_notifier() {
@@ -1021,13 +991,18 @@ mod wiring_tests {
             NotifyPolicy::uniform(NotifyMode::Once),
             Box::new(Recorder(Arc::clone(&seen))),
         ));
+        let (events, applier) =
+            crate::sandbox::proxy::events::spawn_joinable(crate::sandbox::proxy::events::Sinks {
+                notifier: Some(Arc::clone(&notifier)),
+                ..Default::default()
+            });
         {
             let ctx = ProxyCtx::new(
                 Arc::new(crate::sandbox::proxy::ca::Ca::ephemeral().unwrap()),
                 EgressPolicy::default(),
             )
             .unwrap()
-            .with_notifier(Arc::clone(&notifier));
+            .with_events(events);
 
             ctx.outcome(
                 crate::sandbox::control::Proto::Https,
@@ -1049,6 +1024,9 @@ mod wiring_tests {
                 "allowed",
             );
         }
+        // Every reporter is gone with the context, so the applying side ends and lets go of the
+        // notifier.
+        applier.join().unwrap();
         drop(
             Arc::try_unwrap(notifier)
                 .map_err(|_| "the notifier is still shared")
@@ -1078,13 +1056,19 @@ mod wiring_tests {
                 NotifyPolicy::uniform(NotifyMode::Once),
                 Box::new(Recorder(Arc::clone(&seen))),
             ));
+            let (events, applier) = crate::sandbox::proxy::events::spawn_joinable(
+                crate::sandbox::proxy::events::Sinks {
+                    notifier: Some(Arc::clone(&notifier)),
+                    ..Default::default()
+                },
+            );
             {
                 let ctx = ProxyCtx::new(
                     Arc::new(crate::sandbox::proxy::ca::Ca::ephemeral().unwrap()),
                     EgressPolicy::default(),
                 )
                 .unwrap()
-                .with_notifier(Arc::clone(&notifier));
+                .with_events(events);
                 ctx.outcome(
                     proto,
                     "api.test",
@@ -1095,6 +1079,7 @@ mod wiring_tests {
                     "denied-default",
                 );
             }
+            applier.join().unwrap();
             drop(
                 Arc::try_unwrap(notifier)
                     .map_err(|_| "the notifier is still shared")

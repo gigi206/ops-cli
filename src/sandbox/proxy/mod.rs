@@ -202,6 +202,7 @@ mod capture;
 mod cleartext;
 mod ctx;
 mod dns;
+pub(crate) mod events;
 mod forward;
 mod h2mitm;
 mod inject;
@@ -1465,7 +1466,7 @@ fn body_too_large_message(body_len: u64, limits: BodyLimits) -> String {
 /// **Redacted before it is written, because this one is answered into the cage.** Every other
 /// refusal body is sbx's own words about its own policy; a signer's carries the plugin's, and a
 /// signer whose manifest declares `reads_secret` holds the credential in clear. The feed already
-/// scrubs the same text ([`super::signer_control::SignerRing::push`]); the sink that matters more
+/// scrubs the same text ([`super::signer_control::signer_detail`]); the sink that matters more
 /// is this one, since the cage is the adversary and the log is not. Masked in place rather than
 /// named, matching what the cage already sees where a reflected secret is taken out of a response
 /// body.

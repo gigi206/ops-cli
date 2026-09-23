@@ -286,7 +286,7 @@ pub(super) fn handle_https_forward(
             headers: &head.headers,
             body: body_facts.as_ref(),
         },
-        ctx.signer_log(),
+        ctx.signer_events(),
     ) {
         Ok(pairs) => pairs,
         Err(refusal) => {
@@ -822,7 +822,7 @@ mod tests {
         )
         .unwrap()
         .with_upstream(upstream_cfg)
-        .with_stats(Arc::clone(&stats))
+        .with_events(crate::sandbox::proxy::events::for_stats(Arc::clone(&stats)))
         .with_log(Arc::clone(&log))
         // loopback, permitted only because the deciding rule names this exact host
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
@@ -851,6 +851,7 @@ mod tests {
             Some("WS"),
             "the one `allow` record must name the verb the verdict was reached under"
         );
+        ctx.events.as_ref().unwrap().flush();
         assert_eq!(stats.snapshot()["ws-host.test"].allow, 1);
     }
 

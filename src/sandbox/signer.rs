@@ -268,7 +268,7 @@ struct RawAnswer {
 /// The `label` is the plugin's own account — the region and service a SigV4 signature was scoped to,
 /// the identity it signed as — and it lands on the signer feed beside what sbx observed. It is
 /// optional, and a plugin that sends none simply has sbx's account stand alone. It is third-party
-/// text: [`super::signer_control::SignerRing::push`] writes it *after* sbx's own account, redacts it
+/// text: [`super::signer_control::signer_detail`] writes it *after* sbx's own account, redacts it
 /// against the launch's credential needles, and caps it. On a **refusal** the plugin's words travel
 /// too — they are what the `403` names and what the feed's refusal line carries.
 #[derive(Debug, Clone, PartialEq, Eq)]

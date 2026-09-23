@@ -64,8 +64,8 @@ impl SignerKind {
     }
 }
 
-/// One request's credential. `detail` is redacted, sanitised and capped by [`SignerRing::push`], so
-/// it is safe on the line-based wire and safe to print.
+/// One request's credential. `detail` is redacted by [`signer_detail`] and sanitised and capped by
+/// [`SignerRing::push_detail`], so it is safe on the line-based wire and safe to print.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SignerEvent {
     pub(crate) seq: u64,
@@ -127,46 +127,52 @@ impl SignerRing {
         self
     }
 
-    /// Append one signature or refusal. `observed` is sbx's own account and is written first;
-    /// `claimed` is the plugin's — its label on an answer, its reason on a refusal — and is appended
-    /// only when it said something.
-    ///
-    /// The order is deliberate, and it is the broker lens's rule for the same reason: a reader
-    /// scanning a column of events reads the front of each line, so putting sbx's account there
-    /// means a plugin cannot make a refusal *look* like a signature by choosing its words.
-    ///
-    /// `needles` are the launch's credential needles, and they are applied to the **whole** detail
-    /// before it is capped, in that order and not the other way round. A signer is the one plugin
-    /// type that may be handed a credential in plaintext, so a value echoed into a label is a real
-    /// path to this record; and a cap applied first would cut a value in half, leaving the front of
-    /// it in the line and no needle left to match.
-    pub(crate) fn push(
-        &self,
-        kind: SignerKind,
-        signer: &str,
-        observed: &str,
-        claimed: Option<&str>,
-        needles: &[SecretNeedle],
-    ) -> u64 {
-        let detail = match claimed {
-            Some(c) if !c.is_empty() => format!("{signer}: {observed} — {c}"),
-            _ => format!("{signer}: {observed}"),
-        };
-        let (detail, _) = crate::sandbox::redact::redact_string(
-            &detail,
-            needles,
-            &crate::sandbox::redact::Placeholder::Plain,
-        );
+    /// Append one signature or refusal whose detail [`signer_detail`] composed — already in its
+    /// final order and redacted. The detail is sanitised and capped here, on the side that owns the
+    /// ring, because it arrives from the proxy, which is to run as a process of its own.
+    pub(crate) fn push_detail(&self, kind: SignerKind, detail: &str) -> u64 {
         self.0.push_with(|seq, at_epoch_ms| SignerEvent {
             seq,
             at_epoch_ms,
             kind,
-            detail: super::lens::sanitize_detail(&detail),
+            detail: super::lens::sanitize_detail(detail),
         })
     }
 }
 
-// The events are already redacted and capped by `push`, but a `Debug` that dumped a session's
+/// The feed line for one signature or refusal, redacted. `observed` is sbx's own account and comes
+/// first; `claimed` is the plugin's — its label on an answer, its reason on a refusal — and is
+/// appended only when it said something.
+///
+/// The order is deliberate, and it is the broker lens's rule for the same reason: a reader scanning
+/// a column of events reads the front of each line, so putting sbx's account there means a plugin
+/// cannot make a refusal *look* like a signature by choosing its words.
+///
+/// `needles` are the launch's credential needles, and they are applied to the **whole** detail
+/// before [`SignerRing::push_detail`] caps it, in that order and not the other way round. A signer
+/// is the one plugin type that may be handed a credential in plaintext, so a value echoed into a
+/// label is a real path to this record; and a cap applied first would cut a value in half, leaving
+/// the front of it in the line and no needle left to match. Composed on the proxy's side, so no
+/// value a signer was handed leaves the proxy in the clear.
+pub(crate) fn signer_detail(
+    signer: &str,
+    observed: &str,
+    claimed: Option<&str>,
+    needles: &[SecretNeedle],
+) -> String {
+    let detail = match claimed {
+        Some(c) if !c.is_empty() => format!("{signer}: {observed} — {c}"),
+        _ => format!("{signer}: {observed}"),
+    };
+    crate::sandbox::redact::redact_string(
+        &detail,
+        needles,
+        &crate::sandbox::redact::Placeholder::Plain,
+    )
+    .0
+}
+
+// The events are already redacted and capped by `push_detail`, but a `Debug` that dumped a session's
 // whole record would be noise wherever a holder of this ring renders itself. The count is what a
 // reader of such a line actually wants.
 impl std::fmt::Debug for SignerRing {
@@ -268,6 +274,18 @@ pub(crate) fn read_signer_log(socket: &Path, after: Option<u64>) -> io::Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signature or refusal as the proxy records one: composed and redacted, then pushed.
+    fn push(
+        ring: &SignerRing,
+        kind: SignerKind,
+        signer: &str,
+        observed: &str,
+        claimed: Option<&str>,
+        needles: &[SecretNeedle],
+    ) -> u64 {
+        ring.push_detail(kind, &signer_detail(signer, observed, claimed, needles))
+    }
     use crate::sandbox::lens::Event as _;
 
     fn ring() -> SignerRing {
@@ -279,7 +297,8 @@ mod tests {
     #[test]
     fn every_signature_names_the_signer_that_formed_it() {
         let ring = ring();
-        ring.push(
+        push(
+            &ring,
             SignerKind::Sign,
             "demo-sigv4",
             "PUT s3.example.com/bucket/key set Authorization",
@@ -296,7 +315,8 @@ mod tests {
     #[test]
     fn what_sbx_observed_is_written_before_what_the_plugin_said() {
         let ring = ring();
-        ring.push(
+        push(
+            &ring,
             SignerKind::Refuse,
             "demo-sigv4",
             "GET s3.example.com/bucket",
@@ -317,7 +337,8 @@ mod tests {
     #[test]
     fn a_label_cannot_forge_a_second_event() {
         let ring = ring();
-        ring.push(
+        push(
+            &ring,
             SignerKind::Sign,
             "demo-sigv4",
             "GET s3.example.com/bucket",
@@ -344,7 +365,8 @@ mod tests {
             "aws_secret",
             b"wJalrXUtnFEMI-EXAMPLEKEY".to_vec(),
         )];
-        ring.push(
+        push(
+            &ring,
             SignerKind::Refuse,
             "demo-sigv4",
             "GET s3.example.com/bucket",
@@ -368,7 +390,8 @@ mod tests {
             b"wJalrXUtnFEMI-EXAMPLEKEY".to_vec(),
         )];
         let filler = "x".repeat(140);
-        ring.push(
+        push(
+            &ring,
             SignerKind::Refuse,
             "demo-sigv4",
             "GET s3.example.com/bucket",
@@ -386,7 +409,8 @@ mod tests {
     #[test]
     fn an_event_survives_the_wire_round_trip() {
         let ring = ring();
-        ring.push(
+        push(
+            &ring,
             SignerKind::Sign,
             "demo-sigv4",
             "PUT s3.example.com/bucket/key?x=1 set Authorization, X-Amz-Date",

@@ -262,6 +262,7 @@ fn through_proxy(
     connect_port: u16,
     request: &[u8],
 ) -> io::Result<String> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -395,6 +396,7 @@ fn through_proxy_clean_close(
     connect_port: u16,
     request: &[u8],
 ) -> io::Result<String> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -672,6 +674,7 @@ fn spawn_plain_upstream(
 /// bound UDS — no CONNECT, no TLS, exactly what a tool with `http_proxy` set sends. Returns the
 /// plaintext response the proxy relayed (or its refusal).
 fn through_cleartext(ctx: Arc<ProxyCtx>, request: &[u8]) -> io::Result<String> {
+    let _settle = super::events::Settle(ctx.events.clone());
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -794,7 +797,7 @@ fn an_allowed_request_is_proxied_to_a_validated_upstream() {
         ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
             .unwrap()
             .with_upstream(upstream_cfg)
-            .with_stats(stats.clone())
+            .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
             .with_log(log.clone())
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
@@ -873,7 +876,7 @@ fn a_muted_deny_is_kept_out_of_the_default_log_yet_still_counted() {
     ]);
     let ctx = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy)
         .unwrap()
-        .with_stats(stats.clone())
+        .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
         .with_log(log.clone());
 
     // One refusal to the muted host, one to an unmuted host.
@@ -916,6 +919,7 @@ fn a_muted_deny_is_kept_out_of_the_default_log_yet_still_counted() {
     assert!(muted_ev.muted, "the recovered refusal is tagged muted");
     assert_eq!(muted_ev.verdict, crate::sandbox::control::LogVerdict::Deny);
 
+    ctx.events.as_ref().unwrap().flush();
     // Both refusals are counted regardless of muting — the audit collapses, it is not destroyed.
     let snap = stats.snapshot();
     assert_eq!(
@@ -945,7 +949,7 @@ fn a_session_mute_overlay_suppresses_a_deny_like_a_config_mute() {
         crate::allowlist::EgressPolicy::new(vec![], vec![]),
     )
     .unwrap()
-    .with_stats(stats.clone())
+    .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
     .with_log(log.clone());
     // Load a live session mute — exactly what `REMEMBER MUTE` does on the control socket.
     ctx.manual
@@ -968,6 +972,7 @@ fn a_session_mute_overlay_suppresses_a_deny_like_a_config_mute() {
     let all = log.snapshot(None, None, true).events;
     assert_eq!(all.len(), 1, "--all recovers the session-muted refusal");
     assert!(all[0].muted, "the recovered refusal is tagged muted");
+    ctx.events.as_ref().unwrap().flush();
     assert_eq!(
         stats.snapshot()["play.googleapis.com"].deny,
         1,
@@ -1814,7 +1819,7 @@ fn a_cleartext_http_request_is_forwarded_in_origin_form_when_allowed() {
     let ctx = Arc::new(
         ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
             .unwrap()
-            .with_stats(stats.clone())
+            .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
             .with_log(log.clone())
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
@@ -1997,7 +2002,7 @@ fn the_cleartext_path_blocks_ssrf_to_private_and_metadata_addresses() {
             policy(&["http://*.corp.test"]),
         )
         .unwrap()
-        .with_stats(Arc::clone(&stats))
+        .with_events(crate::sandbox::proxy::events::for_stats(Arc::clone(&stats)))
         .with_log(Arc::clone(&log))
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
     );
@@ -6797,7 +6802,7 @@ fn an_asked_request_is_refused_when_denied() {
         .with_resolver(Box::new(|_| {
             panic!("resolve must not run for a denied ask")
         }))
-        .with_stats(stats.clone())
+        .with_events(crate::sandbox::proxy::events::for_stats(stats.clone()))
         .with_pending_silent(state.clone()),
     );
     let answerer = {
@@ -7971,7 +7976,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["allowed.test:*"]))
                 .unwrap()
-                .with_stats(s.clone())
+                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
                 .with_log(log.clone())
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run for a denied host")
@@ -8006,7 +8011,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, denylist)
                 .unwrap()
-                .with_stats(s.clone())
+                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
                 .with_log(log.clone())
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run for a deny-rule host")
@@ -8047,7 +8052,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
                     .with_ask_timeout(Some(std::time::Duration::from_millis(50))),
             )
             .unwrap()
-            .with_stats(s.clone())
+            .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
             .with_log(log.clone())
             .with_resolver(Box::new(|_| {
                 panic!("resolve must not run for a timed-out ask")
@@ -8080,7 +8085,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["allowed.test:*", "evil.test:*"]))
                 .unwrap()
-                .with_stats(s.clone())
+                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
                 .with_log(log.clone())
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run on a fronting attempt")
@@ -8113,7 +8118,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["allowed.test:*"]))
                 .unwrap()
-                .with_stats(s.clone())
+                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
                 .with_log(log.clone())
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run on a host mismatch")
@@ -8146,7 +8151,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
-                .with_stats(s.clone())
+                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
                 .with_log(log.clone())
                 .with_redactions(vec![SecretNeedle::named(
                     "test-secret",
@@ -8183,7 +8188,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
-                .with_stats(s.clone())
+                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
                 .with_log(log.clone())
                 // the cloud metadata address — always refused, even for an exact-host rule
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
@@ -8217,7 +8222,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
-                .with_stats(s.clone())
+                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
                 .with_log(log.clone())
                 .with_injections(vec![digesting_injection()])
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
@@ -8258,7 +8263,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         let ctx = Arc::new(
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
-                .with_stats(s.clone())
+                .with_events(crate::sandbox::proxy::events::for_stats(s.clone()))
                 .with_log(log.clone())
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );

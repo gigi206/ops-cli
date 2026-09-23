@@ -213,11 +213,12 @@ pub(crate) struct SignRefusal {
 /// sent unsigned, since it would arrive at the destination as an anonymous one and come back an
 /// authentication error for a reason that has nothing to do with the credential.
 ///
-/// `log` is the session's signer feed, where each answer and each refusal is recorded. It is passed
-/// in rather than held on the injection because a credential refresh rebuilds every signed injection
-/// from scratch (see [`super::CredentialRefresh`]): a ring carried on one would have to survive that
-/// rebuild, and the feed would go quiet after the first refresh with every unit test still green.
-/// `None` where no feed was stood up (the tests, and any launch that declares no signer).
+/// `events` is where each answer and each refusal is reported for the session's signer feed. It is
+/// passed in rather than held on the injection because a credential refresh rebuilds every signed
+/// injection from scratch (see [`super::CredentialRefresh`]): a reporter carried on one would have
+/// to survive that rebuild, and the feed would go quiet after the first refresh with every unit test
+/// still green. `None` where no feed was stood up (the tests, and any launch that declares no
+/// signer).
 ///
 /// One session's proxies share that feed — the agent's, and one per invocation of a declared
 /// operation — but each records against **its own** needles, which are the ones in `creds` here.
@@ -230,9 +231,19 @@ pub(crate) fn pairs_for(
     creds: &CredentialSet,
     ids: &[usize],
     req: &RequestFacts<'_>,
-    log: Option<&crate::sandbox::signer_control::SignerRing>,
+    events: Option<&super::events::Emitter>,
 ) -> Result<Vec<(String, String)>, SignRefusal> {
-    use crate::sandbox::signer_control::SignerKind;
+    use crate::sandbox::signer_control::{SignerKind, signer_detail};
+    // Composed and redacted here, on the proxy's side, so the line that leaves carries no value a
+    // signer was handed.
+    let record = |kind: SignerKind, signer: &str, observed: &str, claimed: Option<&str>| {
+        if let Some(events) = events {
+            events.send(super::events::ProxyEvent::Signer {
+                kind,
+                detail: signer_detail(signer, observed, claimed, &creds.needles),
+            });
+        }
+    };
 
     let mut out = Vec::with_capacity(ids.len());
     for &i in ids {
@@ -290,15 +301,14 @@ pub(crate) fn pairs_for(
                     // declared. A plugin that placed the marker gets the credential on the wire; it
                     // never learns what it was.
                     Ok(sig) => {
-                        if let Some(log) = log {
+                        if events.is_some() {
                             let names: Vec<&str> =
                                 sig.headers.iter().map(|(n, _)| n.as_str()).collect();
-                            log.push(
+                            record(
                                 SignerKind::Sign,
                                 &signed.name,
                                 &format!("{} set {}", asked(), names.join(", ")),
                                 sig.label.as_deref(),
-                                &creds.needles,
                             );
                         }
                         out.extend(sig.headers.into_iter().map(
@@ -309,15 +319,7 @@ pub(crate) fn pairs_for(
                         ))
                     }
                     Err(why) => {
-                        if let Some(log) = log {
-                            log.push(
-                                SignerKind::Refuse,
-                                &signed.name,
-                                &asked(),
-                                Some(&why),
-                                &creds.needles,
-                            );
-                        }
+                        record(SignerKind::Refuse, &signed.name, &asked(), Some(&why));
                         return Err(SignRefusal {
                             signer: signed.name.clone(),
                             why,
@@ -2253,7 +2255,11 @@ mod tests {
     fn every_signature_and_every_refusal_reaches_the_feed() {
         use crate::sandbox::signer_control::{SIGNER_RING_CAP, SignerKind, SignerRing};
 
-        let ring = SignerRing::new(SIGNER_RING_CAP);
+        let ring = std::sync::Arc::new(SignerRing::new(SIGNER_RING_CAP));
+        let events = super::super::events::spawn(super::super::events::Sinks {
+            signer_log: Some(std::sync::Arc::clone(&ring)),
+            ..Default::default()
+        });
         let signs = CredentialSet {
             injections: vec![signed_injection(
                 Ok(vec![("Authorization", "SIG abc")]),
@@ -2262,7 +2268,7 @@ mod tests {
             needles: Vec::new(),
         };
         let headers = Vec::new();
-        pairs_for(&signs, &[0], &facts(&headers), Some(&ring))
+        pairs_for(&signs, &[0], &facts(&headers), Some(&events))
             .unwrap_or_else(|e| panic!("{}", e.why));
 
         let refuses = CredentialSet {
@@ -2273,10 +2279,11 @@ mod tests {
             needles: Vec::new(),
         };
         assert!(
-            pairs_for(&refuses, &[0], &facts(&headers), Some(&ring)).is_err(),
+            pairs_for(&refuses, &[0], &facts(&headers), Some(&events)).is_err(),
             "the scripted refusal refuses"
         );
 
+        events.flush();
         let events = ring.snapshot(None).events;
         assert_eq!(events.len(), 2, "{events:?}");
 

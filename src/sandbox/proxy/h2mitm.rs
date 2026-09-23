@@ -533,7 +533,7 @@ async fn relay(
             headers: &H2Headers(req.headers()),
             body: body_facts.as_ref(),
         },
-        ctx.signer_log(),
+        ctx.signer_events(),
     ) {
         Ok(pairs) => pairs,
         Err(refusal) => {
@@ -1968,12 +1968,13 @@ mod tests {
         let dir = TmpDir::new();
         let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let events = crate::sandbox::proxy::events::for_stats(Arc::clone(&stats));
         let ctx = ProxyCtx::new(
             Arc::new(super::super::Ca::ephemeral().unwrap()),
             EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
         )
         .unwrap()
-        .with_stats(Arc::clone(&stats))
+        .with_events(events.clone())
         .with_log(Arc::clone(&log))
         // the cloud-metadata address: refused whatever the rule, this exact-host one included
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])])));
@@ -2031,6 +2032,7 @@ mod tests {
         });
 
         assert_eq!(status, StatusCode::FORBIDDEN, "the stream is refused");
+        events.flush();
         assert_eq!(
             stats
                 .snapshot()
@@ -2078,9 +2080,10 @@ mod tests {
         let dir = TmpDir::new();
         let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let events = crate::sandbox::proxy::events::for_stats(Arc::clone(&stats));
         let ctx = ProxyCtx::new(Arc::new(super::super::Ca::ephemeral().unwrap()), policy)
             .unwrap()
-            .with_stats(Arc::clone(&stats))
+            .with_events(events.clone())
             .with_log(Arc::clone(&log))
             .with_resolver(Box::new(|_| {
                 panic!("a verdict refusal must be decided before any name is resolved")
@@ -2134,6 +2137,7 @@ mod tests {
                 .expect("the in-memory h2 exchange must not stall")
             });
 
+        events.flush();
         let counts = stats
             .snapshot()
             .get("grpc.test")
@@ -2579,7 +2583,7 @@ mod tests {
             EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
         )
         .unwrap()
-        .with_stats(Arc::clone(&stats))
+        .with_events(crate::sandbox::proxy::events::for_stats(Arc::clone(&stats)))
         .with_log(Arc::clone(&log))
         // loopback, permitted only because the deciding rule names this exact host
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
@@ -3193,6 +3197,7 @@ mod tests {
 
         // The allow is recorded only once the upstream is connected, and the response status is
         // amended onto that same event when the head returns.
+        ctx.events.as_ref().unwrap().flush();
         assert_eq!(stats.snapshot()["grpc.test"].allow, 1);
         let events = log.snapshot(None, None, false).events;
         assert_eq!(
@@ -3758,6 +3763,7 @@ mod tests {
         );
 
         // The allow stands, because the request was forwarded; what never came is its status.
+        ctx.events.as_ref().unwrap().flush();
         assert_eq!(stats.snapshot()["grpc.test"].allow, 1);
         let events: Vec<(LogVerdict, String, Option<u16>)> = log
             .snapshot(None, None, false)

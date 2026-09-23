@@ -463,7 +463,7 @@ pub(super) fn serve_tunneled_request(
             headers: &inner.headers,
             body: body_facts.as_ref(),
         },
-        ctx.signer_log(),
+        ctx.signer_events(),
     ) {
         Ok(pairs) => pairs,
         Err(refusal) => {
