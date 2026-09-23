@@ -109,6 +109,20 @@ your next git command, outside any cage: it is the sharpest of the carriers in [
 protection stops](../concepts/security-model#where-the-protection-stops). The hooks
 *directory* is protected, so a hook created halfway through the session is refused too.
 
+The hooks directory is the one git will run hooks from: `.git/hooks`, and also the directory
+`core.hooksPath` names when it is inside the project. husky, for one, points it at `.husky/_`,
+a directory git ignores, where a rewritten hook would not even show in `git status`. That
+closes the invisible half of husky only: each `.husky/_/<hook>` is a relay that runs
+`.husky/<hook>`, a script you wrote and git tracks, and the cage can still edit one or add one
+(`.husky/post-checkout`). Those show in `git status` and in the diff, like a `Makefile`, and
+they run at your next commit, so read them before committing. The value
+is read from your host's own `git` at launch, so an include file or your global config counts;
+a directory outside the project is left alone, since the cage does not hold it, and with no
+`git` on the host there is nothing to ask and no hook to run. A hooks directory that does not
+exist yet is **created empty at launch** and then protected, which is what `git init` makes:
+otherwise the cage could create it and fill it. It is made one component at a time, and a
+symbolic link found on the way refuses the launch rather than being followed.
+
 Everyday git keeps working: `status`, `add`, `commit`, `switch`, `stash`, `tag`, `fetch`,
 `pull` and `push` with their arguments, and a worktree created inside the cage. What writes
 the config is refused: `git remote add`, `git config user.*`, and the upstream a
@@ -329,6 +343,13 @@ This is different, and it has three named holes:
 The cage cannot open any of these itself: it cannot create a hard link across a mask, and
 it cannot write a file into a denied directory. They are ways the *host side* can leave a
 path open, which is why they are worth knowing rather than worth panicking about.
+
+The [git protection](#read-only-without-an-entry-the-project-config-and-git) has a hole of
+the other kind, one the cage *can* use when your repository already opens it:
+`.git/config` is read-only, but an `include.path` or `includeIf` in it that names a file
+inside the working tree makes that file part of the effective configuration, and the cage
+can write that file. Keep included configuration outside the project. The same holds for a
+hook script a relay runs from the tree, such as husky's `.husky/<hook>` described above.
 
 Nor can it hide a masked path from the resolver. The cage owns the project tree under your
 own uid, so it can make a directory untraversable; a path that cannot be looked at is then

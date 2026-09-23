@@ -2130,6 +2130,17 @@ fn stage_fs_masks(
         crate::diag::error(&format!("sbx: {reason}"));
         return Err(ExitCode::FAILURE);
     }
+    // A built-in directory mask may name a directory that is not there yet (a hooks directory git
+    // has not made); it is made now, empty, or the launch refuses, since an unbound mask would
+    // leave the cage free to create it and fill it.
+    let root = prep.cwd.canonicalize().unwrap_or_else(|_| prep.cwd.clone());
+    if let Err(e) = crate::sandbox::fsmask::create_absent_dirs(&fs_masks, &root) {
+        crate::diag::error(&format!(
+            "sbx: cannot prepare a directory the cage must not write ({e}) — refusing to launch \
+             with it open"
+        ));
+        return Err(ExitCode::FAILURE);
+    }
     let fs_decoys = if fs_masks.is_empty() {
         None
     } else {

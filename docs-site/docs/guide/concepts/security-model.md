@@ -245,8 +245,10 @@ lean on it:
 **The git carrier is closed by default.** A git hook is the one entry in the table above
 that no legitimate agent task needs to write, and the feed does not show it. So
 `.git/hooks/` and `.git/config` are [read-only in every cage](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)
-without any entry: the directory, so a hook created halfway through the session is refused
-as well as one that was already there, and the config, because `core.hooksPath`,
+without any entry, as is the directory `core.hooksPath` names inside the project (husky's
+`.husky/_`): the directory, so a hook created halfway through the session is refused as
+well as one that was already there (and made empty at launch when it is absent, so the cage
+cannot create it), and the config, because `core.hooksPath`,
 `core.fsmonitor`, a filter or an alias names a program as surely as a hook does. Committing,
 switching branches, fetching and pushing still work; what is refused is writing the config
 (`remote add`, the upstream `push -u` records) and installing a hook. A project that needs

@@ -646,6 +646,63 @@ fn the_git_hooks_and_config_are_read_only_inside_a_real_cage_until_a_trusted_lay
     }
 }
 
+/// The two hook directories a mask needs care to reach: `.git/hooks` when the repository has
+/// none (the cage would create it), and the directory `core.hooksPath` names inside the project
+/// (husky's `.husky/_`, ignored by git, where a rewritten hook does not show in `git status`). Both
+/// are refused from inside a real cage, and a hook written there would have run at the host's next
+/// commit.
+#[test]
+fn a_hook_cannot_be_planted_through_an_absent_hooks_dir_or_core_hooks_path() {
+    let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "hook directories in a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    let git = |args: &[&str]| Command::new("git").args(args).current_dir(root).output();
+    let Ok(init) = git(&["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    std::fs::remove_dir_all(root.join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(root.join(".husky/_")).unwrap();
+    std::fs::write(root.join(".husky/_/.gitignore"), "*\n").unwrap();
+    assert!(
+        git(&["config", "core.hooksPath", ".husky/_"])
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let script = "for d in .git/hooks .husky/_; do \
+          (mkdir -p $d && printf 'x' > $d/pre-commit) 2>/dev/null \
+            && echo WROTE-$d || echo REFUSED-$d; \
+        done";
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(root)
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for d in [".git/hooks", ".husky/_"] {
+        assert!(
+            stdout.contains(&format!("REFUSED-{d}")),
+            "{d}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !root.join(d).join("pre-commit").exists(),
+            "{d}: no hook on the host"
+        );
+    }
+    assert!(
+        root.join(".git/hooks").is_dir(),
+        "the launch made the directory it binds"
+    );
+}
+
 /// With `.git/config` read-only, git cannot record the upstream `push -u` sets, so the cage's git is
 /// told to push a branch to its namesake: a bare `git push` still publishes a new branch, and the
 /// repository's config is left as it was.

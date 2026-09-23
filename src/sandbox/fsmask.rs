@@ -199,7 +199,10 @@ pub(crate) fn stage_decoys(dir: &Path) -> io::Result<Decoys> {
 /// bounded on a repository with millions of files.
 pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     let mut out = Expanded::default();
-    if policy.is_empty() && builtin_readonly_names(project, policy.git_writable()).is_empty() {
+    if policy.is_empty()
+        && builtin_readonly_names(project, policy.git_writable()).is_empty()
+        && !git_protected(project, policy.git_writable())
+    {
         return out;
     }
     let Ok(root) = project.canonicalize() else {
@@ -240,7 +243,13 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         &mut out.warnings,
         &mut out.refused,
     );
-    for mut m in builtin {
+    let hooks = git_hook_dirs(
+        &root,
+        policy.git_writable(),
+        &mut out.warnings,
+        &mut out.refused,
+    );
+    for mut m in builtin.into_iter().chain(hooks) {
         m.builtin = true;
         let covered = out
             .denied
@@ -358,16 +367,169 @@ fn builtin_readonly_names(root: &Path, git_writable: bool) -> Vec<String> {
                 .map(str::to_string),
         );
     }
-    let git_is_dir = std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir());
-    if git_is_dir && !git_writable {
-        out.extend(
-            [".git/hooks/", ".git/config"]
-                .into_iter()
-                .filter(|name| present(name.trim_end_matches('/')))
-                .map(str::to_string),
-        );
+    if git_protected(root, git_writable) && present(".git/config") {
+        out.push(".git/config".to_string());
     }
     out
+}
+
+/// Whether this launch protects the git carrier: the project's `.git` is a directory, and no
+/// trusted layer set `git_writable`.
+fn git_protected(root: &Path, git_writable: bool) -> bool {
+    !git_writable && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir())
+}
+
+/// The directories git runs hooks from, as read-only masks: `.git/hooks`, and the directory
+/// `core.hooksPath` names when it is inside the project.
+///
+/// **Absent ones included.** A mount needs something to land on, and the cage can create a
+/// directory it does not find: a repository initialised without the template's `hooks/`, or a
+/// `core.hooksPath` whose directory does not exist yet, would otherwise take a hook written from
+/// inside the cage and run it at the user's next commit. So an absent directory is masked here all
+/// the same, and the launch creates it, empty, before binding it ([`create_absent_dirs`]) —
+/// which is what `git init` makes. `sbx test fs` and the in-cage contract read this same list, so
+/// they describe the directory the launch will protect, not the absence it found.
+///
+/// **`core.hooksPath` is asked of the host's own git** (`git --git-dir <project>/.git config --get`),
+/// because the value that matters is the one the host's git will act on, include files and the
+/// global config among what decides it. husky points it at `.husky/_`, inside the working tree and
+/// ignored by git: a hook rewritten there does not even show in `git status`. With no git on the
+/// host, no hook can run on it, and there is nothing to ask. A value outside the project is left
+/// alone: the cage does not hold it.
+fn git_hook_dirs(
+    root: &Path,
+    git_writable: bool,
+    warnings: &mut Vec<String>,
+    refused: &mut Option<String>,
+) -> Vec<Masked> {
+    if !git_protected(root, git_writable) {
+        return Vec::new();
+    }
+    let mut dirs = vec![(root.join(".git/hooks"), ".git/hooks/".to_string())];
+    if let Some(named) = git_hooks_path(root) {
+        let shown = format!("core.hooksPath = {}", named.display());
+        dirs.push((named, shown));
+    }
+    let mut out: Vec<Masked> = Vec::new();
+    for (path, pattern) in dirs {
+        let canon = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                crate::trust::canonicalize_existing_prefix(&path)
+            }
+            Err(e) => {
+                refused.get_or_insert_with(|| {
+                    format!("{pattern}: {}", unreadable_refusal("look at", &path, &e))
+                });
+                continue;
+            }
+            Ok(_) => match path.canonicalize() {
+                Ok(c) if c.is_dir() => c,
+                // A file where hooks are looked for runs none; nothing to protect.
+                Ok(_) => continue,
+                Err(e) => {
+                    refused.get_or_insert_with(|| {
+                        format!("{pattern}: {}", unreadable_refusal("resolve", &path, &e))
+                    });
+                    continue;
+                }
+            },
+        };
+        if !canon.starts_with(root) {
+            continue;
+        }
+        if canon == root {
+            warnings.push(format!(
+                "`{pattern}` names the project root itself: its hooks cannot be protected without \
+                 making the whole project read-only, so they stay writable to the cage"
+            ));
+            continue;
+        }
+        if !out.iter().any(|m| m.path == canon) {
+            out.push(Masked {
+                path: canon,
+                is_dir: true,
+                pattern,
+                builtin: true,
+            });
+        }
+    }
+    out
+}
+
+/// The host git's `core.hooksPath` for the repository at `<root>/.git`, resolved the way git
+/// resolves it for a working tree (a relative value against the top of the tree, `~/` against the
+/// home), or `None` when it is unset, when there is no trusted git on the host, or when git does not
+/// read `<root>/.git` as a repository. `--git-dir` rather than `-C`, so a `.git` git does not
+/// recognise is not answered by a repository discovered above it.
+fn git_hooks_path(root: &Path) -> Option<PathBuf> {
+    let git = crate::store::resolve_git()?;
+    let out = std::process::Command::new(git)
+        .arg("--git-dir")
+        .arg(root.join(".git"))
+        .args(["config", "--get", "core.hooksPath"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(out.stdout).ok()?;
+    let value = value.trim_end_matches('\n');
+    if value.is_empty() {
+        return None;
+    }
+    let path = match value.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => PathBuf::from(value),
+    };
+    Some(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
+/// Create, empty, each built-in directory mask whose directory is absent, so its bind has
+/// something to land on. See [`git_hook_dirs`] for why an absent one is masked at all.
+///
+/// One component at a time below `root`, each checked with `symlink_metadata` and made with a
+/// non-recursive `mkdir`: `create_dir_all` would follow a link the cage planted in an intermediate
+/// component and make the directory wherever it points. A component that exists and is not a
+/// directory is an error, and the launch refuses on it, since the mask it was for cannot be placed.
+pub(crate) fn create_absent_dirs(expanded: &Expanded, root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    for m in expanded.readonly.iter().filter(|m| m.builtin && m.is_dir) {
+        let Ok(rel) = m.path.strip_prefix(root) else {
+            continue;
+        };
+        let mut at = root.to_path_buf();
+        for part in rel.components() {
+            at.push(part);
+            match std::fs::symlink_metadata(&at) {
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} is not a directory", at.display()),
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            match std::fs::DirBuilder::new().mode(0o755).create(&at) {
+                Ok(()) => {}
+                // Made by someone else in between: acceptable only if it is a directory.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir()) {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The refusal a path that cannot be looked at earns, whichever call could not look at it.
@@ -1341,8 +1503,8 @@ mod tests {
         assert_eq!(
             ro,
             vec![
-                (root.join(".git/hooks").as_path(), true),
                 (root.join(".git/config").as_path(), false),
+                (root.join(".git/hooks").as_path(), true),
             ]
         );
         assert!(e.readonly.iter().all(|m| m.builtin));
@@ -1355,6 +1517,108 @@ mod tests {
             expand(&root, &lifted).is_empty(),
             "the one opening in the table"
         );
+    }
+
+    /// A hooks directory that is not there is masked all the same, and the launch makes it before
+    /// binding it: otherwise the cage would create it and fill it. The creation walks the path one
+    /// component at a time and refuses a link planted in the way rather than following it.
+    #[test]
+    fn an_absent_hooks_directory_is_masked_and_made_empty_but_never_through_a_link() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+
+        let e = expand(&root, &FsPolicy::default());
+        let hooks = root.join(".git/hooks");
+        assert!(
+            e.readonly
+                .iter()
+                .any(|m| m.path == hooks && m.is_dir && m.builtin),
+            "{:?}",
+            e.readonly
+        );
+        assert!(
+            !hooks.exists(),
+            "expanding is read-only: the launch makes it"
+        );
+        create_absent_dirs(&e, &root).unwrap();
+        assert!(hooks.is_dir() && std::fs::read_dir(&hooks).unwrap().next().is_none());
+
+        // A link where a component should be is refused, never followed.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::remove_dir(&hooks).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &hooks).unwrap();
+        let planted = Expanded {
+            readonly: vec![Masked {
+                path: hooks.join("sub"),
+                is_dir: true,
+                pattern: String::new(),
+                builtin: true,
+            }],
+            ..Expanded::default()
+        };
+        assert!(create_absent_dirs(&planted, &root).is_err());
+        assert!(
+            !elsewhere.join("sub").exists(),
+            "nothing made through the link"
+        );
+    }
+
+    /// `core.hooksPath` inside the project is protected like `.git/hooks` — husky's `.husky/_`,
+    /// ignored by git, is where a rewritten hook would not even show in `git status`. Read from the
+    /// host's git, so this needs one.
+    #[test]
+    fn the_directory_core_hooks_path_names_inside_the_project_is_read_only() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+        };
+        let Ok(init) = git(&["init", "-q"]) else {
+            return; // no git on this host: no hook can run on it either
+        };
+        assert!(init.status.success());
+        std::fs::create_dir_all(root.join(".husky/_")).unwrap();
+        assert!(
+            git(&["config", "core.hooksPath", ".husky/_"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let e = expand(&root, &FsPolicy::default());
+        assert!(
+            e.readonly
+                .iter()
+                .any(|m| m.path == root.join(".husky/_") && m.is_dir && m.builtin),
+            "{:?}",
+            e.readonly
+        );
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        assert!(
+            expand(&root, &lifted).readonly.is_empty(),
+            "git_writable lifts it too"
+        );
+
+        // Outside the project: the cage does not hold it, so nothing is added.
+        let outside = tmp.path().join("hooks-elsewhere");
+        let value = outside.display().to_string();
+        assert!(
+            git(&["config", "core.hooksPath", &value])
+                .unwrap()
+                .status
+                .success()
+        );
+        let e = expand(&root, &FsPolicy::default());
+        assert!(!e.readonly.iter().any(|m| m.path.starts_with(&outside)));
     }
 
     /// A `.git` that is a file points at a directory outside the project, which the cage does not
