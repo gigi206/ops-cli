@@ -366,11 +366,13 @@ fn one_https_session(
 }
 
 /// Read one response to the end of its **message** and report its size. The tunnel it came down may
-/// carry another request, so it never reaches an end of stream to read to.
+/// carry another request, so it never reaches an end of stream to read to — except after a `101`:
+/// the connection then belongs to the protocol it switched to, a `101` frames no body, and what
+/// follows its head is the upgraded stream, read to its end.
 fn read_framed_response<R: BufRead>(br: &mut R) -> io::Result<usize> {
     let (head, complete) = read_response_head(br, HEAD_MAX);
     assert!(!head.is_empty(), "the proxy answered nothing");
-    let framing = if complete {
+    let framing = if complete && parse_status_code(&head) != Some(101) {
         response_framing(&head, "GET")
     } else {
         BodyFraming::ToEof
