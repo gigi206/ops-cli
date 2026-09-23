@@ -2773,6 +2773,10 @@ pub(super) fn build(
         fresh_release_tokens: &fresh_release_tokens,
         ignored_mise_paths: &prep.cfg.mise_ignored,
         share_install_pools: prep.cfg.apps_share_install_pools,
+        // Read off the masks this launch lays down, not re-derived: the cage's git is told what
+        // the mounts do, whichever entry (sbx's default or a declared one) closed the file.
+        git_config_read_only: std::fs::canonicalize(&prep.cwd)
+            .is_ok_and(|root| fs.masks.covering(&root.join(".git/config")).is_some()),
     };
     // The families the filter still refuses, from the same relaxation the filter is built from
     // below, so a `[seccomp] allow` drops a family here instead of leaving the document claiming a

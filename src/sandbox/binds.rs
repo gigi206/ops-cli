@@ -583,6 +583,11 @@ pub(crate) struct Overlay<'a> {
     /// (`apps_share_install_pools`, a trusted project's grant). Only a global app has such a pool,
     /// so it changes nothing for the other runtimes.
     pub(crate) share_install_pools: bool,
+    /// Whether the cage cannot write the project's `.git/config` (sbx's own read-only default, or a
+    /// declared mask). Then git cannot record the upstream a `push -u` sets, and the cage's git is
+    /// told to push a branch to its namesake instead ([`git_config_env`]), so a bare `git push`
+    /// keeps working without anything written to the repository.
+    pub(crate) git_config_read_only: bool,
 }
 
 /// Host-side locations of one sandbox's mount sources, passed to [`assemble`].
@@ -1279,7 +1284,42 @@ fn cage_env(
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
     }
+    // After the configured entries, so a trusted `[env]` that already passes git configuration
+    // keeps its pairs and this one is counted after them rather than overwriting their count.
+    if overlay.git_config_read_only {
+        git_config_env(&mut env, "push.autoSetupRemote", "true");
+    }
     env
+}
+
+/// Add one git configuration setting to a cage's environment through git's indexed channel
+/// (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`), which overrides every
+/// configuration file and writes nothing to one.
+///
+/// The pair is appended after whatever the environment already counts, since a trusted `[env]` may
+/// pass settings of its own this way. Two cases leave the environment as it is: a count that is not
+/// a number, because extending a list sbx cannot read would renumber someone else's pairs; and a
+/// key the environment already sets, compared as git compares it (section and name ignore case),
+/// because the setting a user wrote wins over the one sbx supplies.
+fn git_config_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    let count = match env.iter().find(|(k, _)| k == "GIT_CONFIG_COUNT") {
+        None => 0,
+        Some((_, n)) => match n.trim().parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return,
+        },
+    };
+    let already = (0..count).any(|i| {
+        let name = format!("GIT_CONFIG_KEY_{i}");
+        env.iter()
+            .any(|(k, v)| *k == name && v.eq_ignore_ascii_case(key))
+    });
+    if already {
+        return;
+    }
+    upsert_env(env, &format!("GIT_CONFIG_KEY_{count}"), key);
+    upsert_env(env, &format!("GIT_CONFIG_VALUE_{count}"), value);
+    upsert_env(env, "GIT_CONFIG_COUNT", &(count + 1).to_string());
 }
 
 /// The fixed in-cage destinations the structural mounts in [`assemble`] occupy — every mount

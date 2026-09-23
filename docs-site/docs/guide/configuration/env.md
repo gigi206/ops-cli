@@ -74,7 +74,10 @@ few structural keys:
   pairs it counts, plus `GIT_EXEC_PATH` and `GIT_TEMPLATE_DIR`. A git configuration
   file carries `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.pager`,
   `diff.external` and `credential.helper`, so naming one reaches every command the
-  line above does and more.
+  line above does and more. `sbx` itself adds one pair when the cage cannot write
+  `.git/config` (`push.autoSetupRemote`, see
+  [`[fs]`](fs#read-only-without-an-entry-the-project-config-and-git)), counted after the
+  pairs a trusted `[env]` sets.
 - A module directory a desktop library loads from: `GIO_EXTRA_MODULES`,
   `GST_PLUGIN_SYSTEM_PATH_1_0`, `GST_PLUGIN_PATH`, `ALSA_PLUGIN_DIR`, `GTK_MODULES`,
   `GTK_PATH`, `QT_PLUGIN_PATH`, alongside the GPU driver paths below. `sbx` sets these

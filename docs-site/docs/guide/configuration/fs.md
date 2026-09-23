@@ -112,10 +112,14 @@ protection stops](../concepts/security-model#where-the-protection-stops). The ho
 Everyday git keeps working: `status`, `add`, `commit`, `switch`, `stash`, `tag`, `fetch`,
 `pull` and `push` with their arguments, and a worktree created inside the cage. What writes
 the config is refused: `git remote add`, `git config user.*`, and the upstream a
-`push -u` (or `switch` to a remote branch) records. The push itself succeeds; git prints
-`could not write config file .git/config`, and a later bare `git push` or `git pull` asks
-for the remote and branch, which `git push origin HEAD` supplies. Installing a hook from
-inside the cage (husky, `pre-commit install`, `lefthook install`) is refused.
+`push -u` (or `switch` to a remote branch) records. The push itself succeeds, and git
+prints `could not write config file .git/config`. So that a bare `git push` still works
+without that upstream, sbx gives the cage's git `push.autoSetupRemote=true` through the
+environment (`GIT_CONFIG_COUNT`, after any pair a trusted `[env]` passes, and never over a
+value it sets for that key): a branch is pushed to its namesake, and nothing is written to
+the repository. A bare `git pull` still asks for the remote and branch
+(`git pull origin <branch>`). Installing a hook from inside the cage (husky,
+`pre-commit install`, `lefthook install`) is refused.
 
 A project that needs those opens them from a trusted layer:
 

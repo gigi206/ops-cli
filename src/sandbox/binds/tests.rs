@@ -108,6 +108,7 @@ fn assembled_from(paths: &SandboxPaths) -> SandboxSpec {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     assemble(
         paths,
@@ -194,6 +195,7 @@ fn assembled_on_distro() -> SandboxSpec {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     let mut userland = userland();
     userland.distro = Some(PathBuf::from("/store/distro/rootfs"));
@@ -840,6 +842,7 @@ fn assemble_binds_a_device_after_the_minimal_dev() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     let devices = [PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")];
     let spec = assemble(
@@ -1087,6 +1090,7 @@ fn assemble_emits_launcher_extra_binds_after_the_structural_mounts() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     let extra = [
         ExtraBind {
@@ -1165,6 +1169,7 @@ fn assemble_with_zone(
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     assemble(
         &paths,
@@ -1480,6 +1485,7 @@ fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     let err = build_spec(
         data.path(),
@@ -1773,6 +1779,7 @@ fn a_writable_nix_mount_is_a_read_write_bind_of_the_per_project_store() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     let spec = assemble(
         &paths,
@@ -2205,6 +2212,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     let spec = assemble(
         &paths,
@@ -2306,6 +2314,7 @@ fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     let spec = build_spec(
         data.path(),
@@ -2441,6 +2450,7 @@ fn every_runtime_names_the_host_directory_a_declared_tool_installs_into() {
             fresh_release_tokens: &[],
             ignored_mise_paths: &[],
             share_install_pools: false,
+            git_config_read_only: false,
         };
         let spec = build_spec(
             data.path(),
@@ -2511,6 +2521,7 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
             fresh_release_tokens: &[],
             ignored_mise_paths: &[],
             share_install_pools: share,
+            git_config_read_only: false,
         };
         build_spec(
             data.path(),
@@ -2881,6 +2892,7 @@ fn the_capture_tap_replaces_the_cages_resolver_with_exactly_one_mount() {
         fresh_release_tokens: &[],
         ignored_mise_paths: &[],
         share_install_pools: false,
+        git_config_read_only: false,
     };
     let spec_of = |capture: bool| {
         build_spec(
@@ -2948,4 +2960,57 @@ fn the_capture_tap_replaces_the_cages_resolver_with_exactly_one_mount() {
         !src.exists(),
         "the synthetic file is removed when no tap is wired, so a later launch cannot read a stale one"
     );
+}
+
+/// With `.git/config` closed to the cage, git is told to push a branch to its namesake, through the
+/// channel that writes nothing; and the pairs a trusted `[env]` passes the same way survive it.
+#[test]
+fn a_protected_git_config_gets_push_auto_setup_remote_after_the_users_own_pairs() {
+    let get = |env: &[(String, String)], k: &str| {
+        env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+    };
+    let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+
+    let mut env = Vec::new();
+    git_config_env(&mut env, "push.autoSetupRemote", "true");
+    assert_eq!(get(&env, "GIT_CONFIG_COUNT").as_deref(), Some("1"));
+    assert_eq!(
+        get(&env, "GIT_CONFIG_KEY_0").as_deref(),
+        Some("push.autoSetupRemote")
+    );
+    assert_eq!(get(&env, "GIT_CONFIG_VALUE_0").as_deref(), Some("true"));
+
+    // Appended after the user's, never over them.
+    let mut env = owned(&[
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "user.name"),
+        ("GIT_CONFIG_VALUE_0", "someone"),
+    ]);
+    git_config_env(&mut env, "push.autoSetupRemote", "true");
+    assert_eq!(get(&env, "GIT_CONFIG_COUNT").as_deref(), Some("2"));
+    assert_eq!(get(&env, "GIT_CONFIG_KEY_0").as_deref(), Some("user.name"));
+    assert_eq!(
+        get(&env, "GIT_CONFIG_KEY_1").as_deref(),
+        Some("push.autoSetupRemote")
+    );
+
+    // A setting the user wrote wins, whatever its case; a count sbx cannot read is left alone.
+    for pairs in [
+        vec![
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "PUSH.autosetupremote"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+        ],
+        vec![("GIT_CONFIG_COUNT", "two")],
+    ] {
+        let before = owned(&pairs);
+        let mut env = before.clone();
+        git_config_env(&mut env, "push.autoSetupRemote", "true");
+        assert_eq!(env, before);
+    }
 }

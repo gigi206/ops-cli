@@ -646,6 +646,76 @@ fn the_git_hooks_and_config_are_read_only_inside_a_real_cage_until_a_trusted_lay
     }
 }
 
+/// With `.git/config` read-only, git cannot record the upstream `push -u` sets, so the cage's git is
+/// told to push a branch to its namesake: a bare `git push` still publishes a new branch, and the
+/// repository's config is left as it was.
+#[test]
+fn a_bare_git_push_works_in_a_cage_whose_git_config_is_read_only() {
+    let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "git push under a read-only .git/config",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+    };
+    let Ok(init) = git(&["init", "-q", "-b", "main"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    // The remote lives inside the project, the one tree the cage holds.
+    std::fs::write(root.join(".git/info/exclude"), "remote.git/\n").unwrap();
+    for args in [
+        &["commit", "-q", "--allow-empty", "-m", "init"][..],
+        &["init", "-q", "--bare", "remote.git"],
+        &["remote", "add", "origin", "remote.git"],
+    ] {
+        assert!(git(args).unwrap().status.success(), "git {args:?}");
+    }
+    let config_before = std::fs::read(root.join(".git/config")).unwrap();
+
+    let script = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t \
+          GIT_COMMITTER_EMAIL=t@t; \
+        git switch -qc work && git commit -q --allow-empty -m w && git push -q 2>/dev/null; \
+        echo PUSH=$?";
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(root)
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("PUSH=0"),
+        "a bare push must succeed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let remote = git(&[
+        "--git-dir",
+        "remote.git",
+        "rev-parse",
+        "--verify",
+        "-q",
+        "work",
+    ])
+    .unwrap();
+    assert!(remote.status.success(), "the branch reached the remote");
+    assert_eq!(
+        std::fs::read(root.join(".git/config")).unwrap(),
+        config_before,
+        "nothing was written to the repository's config"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // `sbx fs deny|undeny|readonly|unreadonly` — the mask-writing verbs.
 //
