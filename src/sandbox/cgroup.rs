@@ -565,6 +565,17 @@ enum Occupancy {
     /// One cage init that never forked a payload — bubblewrap's own setup was cut short, so
     /// nothing ever ran here and nothing ever will.
     Stillborn,
+    /// A cage whose init has lost its bubblewrap monitor: the init's parent is not in this cgroup.
+    ///
+    /// A live cage always holds its monitor. The outer bwrap is the process the scope was created
+    /// for — `systemd-run --scope` execs it in place — and it waits on the init for as long as the
+    /// init lives, so the init's parent is inside the cgroup. An init whose parent is outside it has
+    /// been reparented to the user's subreaper: its monitor died while the init was still setting
+    /// up, before the init re-armed its own parent-death signal, and the payload runs on with no one
+    /// to stop it — held open, in the case measured, by the egress forwarder long after the command
+    /// had exited. Read from the processes themselves rather than from the launcher's pid, so it
+    /// does not depend on which pid namespace the reader shares with the launcher.
+    Unmonitored,
     /// Anything else, every unreadable case included.
     Running,
 }
@@ -574,11 +585,56 @@ enum Occupancy {
 /// The root is a parameter so the classification is exercised against a written tree rather than
 /// only against the host's `/proc`, the way [`cage_scope_dirs_under`] takes its own root.
 fn occupancy(procs: &str, proc_root: &Path) -> Occupancy {
-    match procs.split_whitespace().collect::<Vec<_>>().as_slice() {
+    let pids: Vec<&str> = procs.split_whitespace().collect();
+    match pids.as_slice() {
         [] => Occupancy::Empty,
         [pid] if is_childless_cage_init(pid, proc_root) => Occupancy::Stillborn,
+        _ if lost_its_monitor(&pids, proc_root) => Occupancy::Unmonitored,
         _ => Occupancy::Running,
     }
+}
+
+/// Whether the cgroup holding `pids` has exactly one cage init, and that init's parent is outside
+/// the cgroup (see [`Occupancy::Unmonitored`]).
+///
+/// Every process is read, and any read that fails answers `false`: the caller reclaims what this
+/// returns true for, so a process that cannot be looked at keeps the cage. More than one init is a
+/// shape no launch makes, and is left alone like every shape this does not claim to understand.
+fn lost_its_monitor(pids: &[&str], proc_root: &Path) -> bool {
+    let mut inits = 0usize;
+    for pid in pids {
+        let Ok(status) = std::fs::read_to_string(proc_root.join(pid).join("status")) else {
+            return false;
+        };
+        if !leads_a_pid_namespace(&status) {
+            continue;
+        }
+        let Some(parent) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .map(str::trim)
+        else {
+            return false;
+        };
+        if pids.contains(&parent) {
+            return false;
+        }
+        inits += 1;
+    }
+    inits == 1
+}
+
+/// Whether a `/proc/<pid>/status` describes the init of a nested pid namespace: `NSpid` lists one
+/// id per namespace the process is visible in, so an init lists more than one and its innermost
+/// is `1`, where an ordinary process lists a single id.
+fn leads_a_pid_namespace(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .is_some_and(|ids| {
+            let ids: Vec<&str> = ids.split_whitespace().collect();
+            ids.len() > 1 && ids.last() == Some(&"1")
+        })
 }
 
 /// Whether `pid` leads a nested pid namespace and has no child.
@@ -598,14 +654,7 @@ fn is_childless_cage_init(pid: &str, proc_root: &Path) -> bool {
     let Ok(status) = std::fs::read_to_string(dir.join("status")) else {
         return false;
     };
-    let leads_a_namespace = status
-        .lines()
-        .find_map(|line| line.strip_prefix("NSpid:"))
-        .is_some_and(|ids| {
-            let ids: Vec<&str> = ids.split_whitespace().collect();
-            ids.len() > 1 && ids.last() == Some(&"1")
-        });
-    if !leads_a_namespace {
+    if !leads_a_pid_namespace(&status) {
         return false;
     }
     // One `children` file per thread, and every one of them has to be both readable and empty.
@@ -634,11 +683,12 @@ fn is_childless_cage_init(pid: &str, proc_root: &Path) -> bool {
 /// is what covers that window. A cgroup that lists a running process means the cage outlived its
 /// launcher (it was reparented), and that is a live cage whatever the pid segment says.
 ///
-/// [`Occupancy::Stillborn`] is the one occupied shape that is nevertheless reclaimable, because it
-/// is not a cage: bubblewrap's parent-death signal does not survive the `clone` that creates the
+/// [`Occupancy::Stillborn`] and [`Occupancy::Unmonitored`] are the occupied shapes that are
+/// nevertheless reclaimable. The first is not a cage: bubblewrap's parent-death signal does not survive the `clone` that creates the
 /// cage init, and the init re-arms it only at the end of its own setup, so a launcher that dies
 /// inside that window leaves an init blocked on a handshake that will never come. It holds no
-/// payload and can reach none.
+/// payload and can reach none. The second is a cage that got past that handshake and lost its
+/// monitor before re-arming the signal: it runs on, and nothing that supervised it is left.
 ///
 /// An unreadable cgroup answers [`Occupancy::Running`]: leave an orphan behind rather than risk a
 /// live cage.
@@ -659,8 +709,9 @@ fn is_reclaimable(launcher_alive: bool, occupancy: Occupancy) -> bool {
 /// fallback for that case and for any other reason a scope outlives its cage.
 ///
 /// The second case it answers is a scope that is *not* empty and is over all the same: a launcher
-/// killed while bubblewrap was still building the cage leaves an init that will wait forever, and
-/// nothing else ever collects it. [`Occupancy`] is where that shape is told apart from a cage that
+/// killed while bubblewrap was still building the cage leaves an init that will wait forever, or,
+/// a moment later in the same setup, a cage running with no monitor and no supervisor, which
+/// nothing else ever collects. [`Occupancy`] is where those shapes are told apart from a cage that
 /// is genuinely running.
 ///
 /// [`is_reclaimable`] holds the decision and fails toward leaving an orphan. The launcher pid is
@@ -1279,13 +1330,26 @@ mod tests {
     /// thread whose `children` is written only when `children` is `Some` — `None` writes the
     /// directory without the file, which is the kernel built without `CONFIG_PROC_CHILDREN`.
     fn fake_proc(root: &Path, pid: &str, nspid: &str, children: Option<&str>) {
+        fake_proc_lines(root, pid, &format!("NSpid:\t{nspid}\n"), children);
+    }
+
+    /// [`fake_proc`] with the `PPid` line [`lost_its_monitor`] reads. The plain one writes none,
+    /// which that rule reads as a process it cannot judge.
+    fn fake_proc_with_parent(
+        root: &Path,
+        pid: &str,
+        ppid: &str,
+        nspid: &str,
+        children: Option<&str>,
+    ) {
+        let lines = format!("PPid:\t{ppid}\nNSpid:\t{nspid}\n");
+        fake_proc_lines(root, pid, &lines, children);
+    }
+
+    fn fake_proc_lines(root: &Path, pid: &str, lines: &str, children: Option<&str>) {
         let dir = root.join(pid);
         std::fs::create_dir_all(dir.join("task").join(pid)).unwrap();
-        std::fs::write(
-            dir.join("status"),
-            format!("Name:\tbwrap\nNSpid:\t{nspid}\n"),
-        )
-        .unwrap();
+        std::fs::write(dir.join("status"), format!("Name:\tbwrap\n{lines}")).unwrap();
         if let Some(children) = children {
             std::fs::write(dir.join("task").join(pid).join("children"), children).unwrap();
         }
@@ -1296,12 +1360,52 @@ mod tests {
         // The launcher being gone is necessary but never sufficient.
         assert!(is_reclaimable(false, Occupancy::Empty));
         assert!(is_reclaimable(false, Occupancy::Stillborn));
+        assert!(is_reclaimable(false, Occupancy::Unmonitored));
         assert!(!is_reclaimable(false, Occupancy::Running));
         // A live launcher holds its scope whatever the cgroup holds — including while it is
         // momentarily empty, the window between the unit's creation and bwrap being moved into it.
         assert!(!is_reclaimable(true, Occupancy::Empty));
         assert!(!is_reclaimable(true, Occupancy::Stillborn));
+        assert!(!is_reclaimable(true, Occupancy::Unmonitored));
         assert!(!is_reclaimable(true, Occupancy::Running));
+    }
+
+    /// The shape measured on a host whose launcher was killed as its cage appeared: the init and
+    /// the forwarder it kept, the init reparented to the user's subreaper, the monitor gone.
+    #[test]
+    fn a_cage_init_whose_parent_is_outside_the_cgroup_reads_unmonitored() {
+        let tmp = TmpDir::new();
+        // `2745` is the subreaper, outside the cgroup; `4712` is the payload inside it.
+        fake_proc_with_parent(tmp.path(), "4711", "2745", "4711 1", Some("4712\n"));
+        fake_proc_with_parent(tmp.path(), "4712", "4711", "4712 2", Some(""));
+        assert_eq!(
+            occupancy("4711\n4712\n", tmp.path()),
+            Occupancy::Unmonitored
+        );
+        // Two inits in one scope is a shape no launch makes: left alone.
+        fake_proc_with_parent(tmp.path(), "4713", "2745", "4713 1", Some(""));
+        assert_eq!(
+            occupancy("4711\n4712\n4713\n", tmp.path()),
+            Occupancy::Running
+        );
+    }
+
+    /// A live cage holds its monitor, so its init's parent is in the cgroup: running, whatever
+    /// else is there.
+    #[test]
+    fn a_cage_init_whose_monitor_is_in_the_cgroup_reads_running() {
+        let tmp = TmpDir::new();
+        fake_proc_with_parent(tmp.path(), "4710", "2000", "4710", Some("4711\n"));
+        fake_proc_with_parent(tmp.path(), "4711", "4710", "4711 1", Some("4712\n"));
+        fake_proc_with_parent(tmp.path(), "4712", "4711", "4712 2", Some(""));
+        assert_eq!(
+            occupancy("4710\n4711\n4712\n", tmp.path()),
+            Occupancy::Running
+        );
+        // No init at all is not a lost monitor either.
+        assert_eq!(occupancy("4710\n4712\n", tmp.path()), Occupancy::Running);
+        // One process of the set that cannot be read keeps the cage.
+        assert_eq!(occupancy("4711\n4799\n", tmp.path()), Occupancy::Running);
     }
 
     #[test]
@@ -1432,14 +1536,25 @@ mod tests {
             skip_incapable!("skipping the cage calibration: the cage never ran its payload");
             return;
         }
-        let init_verdict = occupancy(&init, proc);
+        // What a real scope holds: the monitor, the init and its payload.
+        let payload_pids = std::fs::read_to_string(children_of(&init)).unwrap_or_default();
+        let whole = format!("{outer_pid}\n{init}\n{payload_pids}");
+        let whole_verdict = occupancy(&whole, proc);
+        // The same init with its monitor left out of the set: `PPid` read across the namespace
+        // boundary names the outer bwrap, which is what the lost-monitor rule turns on.
+        let init_verdict = occupancy(&format!("{init}\n{payload_pids}"), proc);
         let outer_verdict = occupancy(&outer_pid.to_string(), proc);
         let _ = outer.kill();
         let _ = outer.wait();
         assert_eq!(
-            init_verdict,
+            whole_verdict,
             Occupancy::Running,
-            "a cage init running a payload must never read as reclaimable"
+            "a cage running a payload under its monitor must never read as reclaimable"
+        );
+        assert_eq!(
+            init_verdict,
+            Occupancy::Unmonitored,
+            "an init whose parent is not in the set reads as having lost its monitor"
         );
         assert_eq!(
             outer_verdict,

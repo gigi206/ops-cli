@@ -94,6 +94,13 @@ there is no setuid binary to attack. The hardening flags below are emitted
 > replaces itself with bwrap. The cage's parent is then the launcher that prints the session
 > id and exits, which is precisely the process `--detach` exists to outlive, and the flag is
 > omitted there. Every other launch, detached ones included, keeps it.
+>
+> The flag has one window of its own, at startup: bubblewrap re-arms the signal on the cage's
+> init only at the end of that init's setup, so a supervisor killed in the first moments of a
+> launch (a `kill -9`, the OOM killer) can leave the cage running without it, kept alive by
+> its egress forwarder. Such a cage stays in the systemd scope named after its launcher, and
+> the next launch, or `sbx gc`, stops it: a scope whose launcher is gone and whose init has
+> lost the bubblewrap process that supervised it holds nothing anyone still controls.
 
 The cage's `/dev` is also **minimal and hostless**: `null`/`zero`/`urandom`/`tty` and the
 standard descriptor symlinks, never a real host device. A tool that genuinely needs the GPU,
