@@ -6,6 +6,8 @@ use std::fmt;
 
 use crate::allowlist::Rule;
 
+mod transfer;
+
 /// A resolved credential the proxy injects into requests matching its host/path rule. Injection
 /// happens only after a request is ALLOWED, and only when `rule` matches the verified CONNECT host
 /// and the decrypted path, so the credential reaches exactly one known destination.
@@ -1136,10 +1138,22 @@ impl CredentialRefresh {
         if let Some(shared) = &self.needles {
             crate::sandbox::notify_sink::publish_needles(shared, &needles);
         }
-        self.credentials.replace(CredentialSet {
+        // Installed through the form the proxy will receive it in once it runs apart, as the
+        // launch's own set is. A set that cannot make the crossing is not installed, and the one in
+        // force stays: that is the direction a failing source already takes.
+        let crossed = CredentialSet {
             injections,
             needles,
-        });
+        }
+        .encode()
+        .and_then(CredentialSet::decode);
+        let Ok(set) = crossed else {
+            if let Ok(mut state) = self.state.lock() {
+                state.stopped = true;
+            }
+            return false;
+        };
+        self.credentials.replace(set);
         true
     }
 }

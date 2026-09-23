@@ -845,16 +845,23 @@ pub(crate) fn start(
     // cloned rather than re-derived — the floor among them: a refresh that consulted different
     // sources, or scanned to a different depth, than the launch did would silently change what the
     // cage authenticates as and what it is watched for.
-    let credentials = std::sync::Arc::new(super::proxy::Credentials::new(
-        injections,
-        redactions,
-        redact_min_len,
-        policy
-            .shared_credential()
-            .iter()
-            .map(|group| group.to_vec())
-            .collect(),
-    ));
+    //
+    // Handed over the way the policy is below: as the form the proxy will receive once it runs in a
+    // process of its own, so a field that form drops is dropped on every launch that injects a
+    // credential. See [`super::proxy::Credentials::encode`].
+    let credentials = std::sync::Arc::new(super::proxy::Credentials::decode(
+        super::proxy::Credentials::new(
+            injections,
+            redactions,
+            redact_min_len,
+            policy
+                .shared_credential()
+                .iter()
+                .map(|group| group.to_vec())
+                .collect(),
+        )
+        .encode()?,
+    )?);
     // Armed over the declarations the set above was actually built from, which under
     // [`Unresolved::DenyDestination`] is a subset of what the launch declared. Handing it every
     // declaration instead would break both halves of the refresh contract: [`resolve_injections`]

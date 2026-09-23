@@ -127,6 +127,23 @@ impl SecretMarker {
         String::from_utf8_lossy(&self.marker).into_owned()
     }
 
+    /// The marker's three fields, for the one place a marker is handed to another process: the
+    /// credential set the egress proxy receives. The process on the other side must substitute the
+    /// same secret for the same bytes the plugin was told at its handshake, which a marker drawn
+    /// again would not.
+    pub(crate) fn parts(&self) -> (&[u8], &[u8], bool) {
+        (&self.marker, &self.secret, self.watch)
+    }
+
+    /// The marker [`Self::parts`] described.
+    pub(crate) fn from_parts(marker: Vec<u8>, secret: Vec<u8>, watch: bool) -> Self {
+        Self {
+            marker,
+            secret,
+            watch,
+        }
+    }
+
     /// Whether these bytes carry the marker.
     fn present_in(&self, frame: &[u8]) -> bool {
         contains(frame, &self.marker)
