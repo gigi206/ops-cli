@@ -650,7 +650,8 @@ fn the_git_hooks_and_config_are_read_only_inside_a_real_cage_until_a_trusted_lay
 /// none (the cage would create it), and the directory `core.hooksPath` names inside the project
 /// (husky's `.husky/_`, ignored by git, where a rewritten hook does not show in `git status`). Both
 /// are refused from inside a real cage, and a hook written there would have run at the host's next
-/// commit.
+/// commit. A file `.git/config` includes is refused the same way, since git reads it as
+/// configuration.
 #[test]
 fn a_hook_cannot_be_planted_through_an_absent_hooks_dir_or_core_hooks_path() {
     let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
@@ -674,11 +675,21 @@ fn a_hook_cannot_be_planted_through_an_absent_hooks_dir_or_core_hooks_path() {
             .status
             .success()
     );
+    // A file `.git/config` includes is configuration too: `core.fsmonitor` in it would run.
+    std::fs::write(root.join("extra.gitconfig"), "").unwrap();
+    assert!(
+        git(&["config", "include.path", "../extra.gitconfig"])
+            .unwrap()
+            .status
+            .success()
+    );
 
     let script = "for d in .git/hooks .husky/_; do \
           (mkdir -p $d && printf 'x' > $d/pre-commit) 2>/dev/null \
             && echo WROTE-$d || echo REFUSED-$d; \
-        done";
+        done; \
+        (printf '[core]\\n\\tfsmonitor = x\\n' >> extra.gitconfig) 2>/dev/null \
+          && echo WROTE-include || echo REFUSED-include";
     let out = sbx_isolated()
         .args(["run", "--", "sh", "-c", script])
         .current_dir(root)
@@ -700,6 +711,15 @@ fn a_hook_cannot_be_planted_through_an_absent_hooks_dir_or_core_hooks_path() {
     assert!(
         root.join(".git/hooks").is_dir(),
         "the launch made the directory it binds"
+    );
+    assert!(
+        stdout.contains("REFUSED-include"),
+        "an included configuration file is read-only\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        std::fs::read(root.join("extra.gitconfig"))
+            .unwrap()
+            .is_empty()
     );
 }
 

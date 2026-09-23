@@ -119,6 +119,14 @@ exist yet is **created empty at launch** and then protected, which is what `git 
 otherwise the cage could create it and fill it. It is made one component at a time, and a
 symbolic link found on the way refuses the launch rather than being followed.
 
+A file the configuration **includes** is configuration too: an `include.path` or
+`includeIf.<condition>.path` that names a file inside the project (from `.git/config`, from
+your global config, or from an included file) makes that file read-only as well, whether or
+not the condition holds today. The list is the one your host's `git` reports. An include that
+names a project file that does not exist **refuses the launch**, naming the file: the cage
+could create it and git would read it, and sbx does not write a configuration file into your
+tree. Create it (empty is enough), remove the include, or set `git_writable`.
+
 **What this does not close: the hooks a project already has run its code.** The protection
 closes the hooks git would run without a trace: an untracked script in the hooks directory, a
 configuration key that names a program. It cannot close the hooks a project already uses,
@@ -361,13 +369,8 @@ The cage cannot open any of these itself: it cannot create a hard link across a 
 it cannot write a file into a denied directory. They are ways the *host side* can leave a
 path open, which is why they are worth knowing rather than worth panicking about.
 
-The [git protection](#read-only-without-an-entry-the-project-config-and-git) has a hole of
-the other kind, one the cage *can* use when your repository already opens it:
-`.git/config` is read-only, but an `include.path` or `includeIf` in it that names a file
-inside the working tree makes that file part of the effective configuration, and the cage
-can write that file. Keep included configuration outside the project. The larger case of
-the same family, the hooks a project already has, is described
-[with the protection](#read-only-without-an-entry-the-project-config-and-git).
+The [git protection](#read-only-without-an-entry-the-project-config-and-git) has a larger
+limit of its own, the hooks a project already has, which is described with it.
 
 Nor can it hide a masked path from the resolver. The cage owns the project tree under your
 own uid, so it can make a directory untraversable; a path that cannot be looked at is then

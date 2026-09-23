@@ -249,7 +249,8 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         &mut out.warnings,
         &mut out.refused,
     );
-    for mut m in builtin.into_iter().chain(hooks) {
+    let includes = git_include_files(&root, policy.git_writable(), &mut out.refused);
+    for mut m in builtin.into_iter().chain(hooks).chain(includes) {
         m.builtin = true;
         let covered = out
             .denied
@@ -456,38 +457,147 @@ fn git_hook_dirs(
     out
 }
 
-/// The host git's `core.hooksPath` for the repository at `<root>/.git`, resolved the way git
-/// resolves it for a working tree (a relative value against the top of the tree, `~/` against the
-/// home), or `None` when it is unset, when there is no trusted git on the host, or when git does not
-/// read `<root>/.git` as a repository. `--git-dir` rather than `-C`, so a `.git` git does not
-/// recognise is not answered by a repository discovered above it.
-fn git_hooks_path(root: &Path) -> Option<PathBuf> {
+/// Ask the host's own git a `config` question about the repository at `<root>/.git`, returning
+/// its standard output, or `None` when there is no trusted git on the host, when git does not read
+/// `<root>/.git` as a repository, or when nothing matches (git's exit status 1).
+///
+/// `--git-dir` rather than `-C`, so a `.git` git does not recognise is not answered by a repository
+/// discovered above it. The answer is the one the host's git acts on — the global and system files
+/// and every include count — which is the point of asking git rather than reading the file. And
+/// `git config` reads configuration and runs nothing it names: no hook, no fsmonitor, no pager.
+fn host_git_config(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let git = crate::store::resolve_git()?;
     let out = std::process::Command::new(git)
         .arg("--git-dir")
         .arg(root.join(".git"))
-        .args(["config", "--get", "core.hooksPath"])
+        .arg("config")
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(out.stdout).ok()?;
-    let value = value.trim_end_matches('\n');
-    if value.is_empty() {
-        return None;
-    }
+    out.status.success().then_some(out.stdout)
+}
+
+/// A path as git reads one in its configuration: `~/` against the home, a relative one against
+/// `base`, or `None` when it is relative and there is no base to read it against.
+fn git_config_path(value: &str, base: Option<&Path>) -> Option<PathBuf> {
     let path = match value.strip_prefix("~/") {
         Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
         None => PathBuf::from(value),
     };
-    Some(if path.is_absolute() {
-        path
+    if path.is_absolute() {
+        Some(path)
     } else {
-        root.join(path)
-    })
+        base.map(|b| b.join(path))
+    }
+}
+
+/// The host git's `core.hooksPath` for the repository at `<root>/.git`, resolved the way git
+/// resolves it for a working tree (a relative value against the top of the tree), or `None` when it
+/// is unset or cannot be asked ([`host_git_config`]).
+fn git_hooks_path(root: &Path) -> Option<PathBuf> {
+    let out = host_git_config(root, &["--get", "core.hooksPath"])?;
+    let value = String::from_utf8(out).ok()?;
+    let value = value.trim_end_matches('\n');
+    if value.is_empty() {
+        return None;
+    }
+    git_config_path(value, Some(root))
+}
+
+/// The files inside the project that an `include.path` or `includeIf.<condition>.path` makes part
+/// of the configuration the host's git reads, as read-only masks.
+///
+/// `.git/config` being read-only is worth nothing if a file it includes is writable: git reads the
+/// included file as configuration, `core.hooksPath` and `core.fsmonitor` included. So every include
+/// the host's git reports is followed, from whichever file declares it (the global config among
+/// them, and an included file's own includes, each listed with its origin), and one that lands in
+/// the project is protected. A conditional include is protected whether or not its condition holds
+/// today: the condition is a property of where the repository is, which the cage does not decide
+/// but a later move could change.
+///
+/// An include naming a file inside the project that does not exist refuses the launch rather than
+/// being created: the cage could create it and git would read it, and a configuration file is not
+/// sbx's to write into the user's tree the way an empty hooks directory is. The refusal names the
+/// file and the way out.
+fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<String>) -> Vec<Masked> {
+    if !git_protected(root, git_writable) {
+        return Vec::new();
+    }
+    let Some(out) = host_git_config(
+        root,
+        &[
+            "-z",
+            "--show-origin",
+            "--get-regexp",
+            r"^include(if\..*)?\.path$",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    // `-z` records: `file:<origin>` NUL `<key>` LF `<value>` NUL.
+    let text = String::from_utf8_lossy(&out);
+    let mut fields = text.split('\0');
+    let mut masks: Vec<Masked> = Vec::new();
+    while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+        let Some((key, value)) = entry.split_once('\n') else {
+            continue;
+        };
+        let base = origin
+            .strip_prefix("file:")
+            .and_then(|f| Path::new(f).parent().map(Path::to_path_buf));
+        let Some(path) = git_config_path(value, base.as_deref()) else {
+            continue;
+        };
+        let pattern = format!("{key} = {value}");
+        let canon = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let canon = crate::trust::canonicalize_existing_prefix(&path);
+                if canon.starts_with(root) {
+                    refused.get_or_insert_with(|| {
+                        format!(
+                            "git includes `{}` as configuration ({pattern}), and it does not \
+                             exist: the cage could create it and your git would read it. Create \
+                             it (empty is enough), remove the include, or set `[fs] git_writable \
+                             = true` from a trusted layer, then launch again",
+                            canon.display()
+                        )
+                    });
+                }
+                continue;
+            }
+            Err(e) => {
+                refused.get_or_insert_with(|| {
+                    format!("{pattern}: {}", unreadable_refusal("look at", &path, &e))
+                });
+                continue;
+            }
+            Ok(_) => match path.canonicalize() {
+                Ok(c) => c,
+                Err(e) => {
+                    refused.get_or_insert_with(|| {
+                        format!("{pattern}: {}", unreadable_refusal("resolve", &path, &e))
+                    });
+                    continue;
+                }
+            },
+        };
+        // A directory is not a configuration file git can read; outside the project, the cage
+        // does not hold it.
+        if !canon.starts_with(root) || canon.is_dir() {
+            continue;
+        }
+        if !masks.iter().any(|m| m.path == canon) {
+            masks.push(Masked {
+                path: canon,
+                is_dir: false,
+                pattern,
+                builtin: true,
+            });
+        }
+    }
+    masks
 }
 
 /// Create, empty, each built-in directory mask whose directory is absent, so its bind has
@@ -1619,6 +1729,96 @@ mod tests {
         );
         let e = expand(&root, &FsPolicy::default());
         assert!(!e.readonly.iter().any(|m| m.path.starts_with(&outside)));
+    }
+
+    /// A file an include makes part of the host's git configuration is protected when it is in
+    /// the project, nested includes and conditional ones alike; one that does not exist refuses
+    /// the launch instead of being created; one outside the project is left alone.
+    #[test]
+    fn a_file_git_includes_as_configuration_is_read_only_or_the_launch_refuses() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+        };
+        let Ok(init) = git(&["init", "-q"]) else {
+            return; // no git on this host: no configuration to read either
+        };
+        assert!(init.status.success());
+        let root = root.canonicalize().unwrap();
+        std::fs::write(
+            root.join("inc.gitconfig"),
+            "[include]\n\tpath = nested.cfg\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("nested.cfg"), "[core]\n").unwrap();
+        // Relative to the file that declares it: `.git/config` is in `.git`.
+        assert!(
+            git(&["config", "include.path", "../inc.gitconfig"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let outside = tmp.path().join("outside.cfg");
+        std::fs::write(&outside, "").unwrap();
+        let cond = format!("{}", outside.display());
+        assert!(
+            git(&["config", "includeIf.gitdir:/nowhere/.path", &cond])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let e = expand(&root, &FsPolicy::default());
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        let files: Vec<&Path> = e
+            .readonly
+            .iter()
+            .filter(|m| m.builtin && !m.is_dir)
+            .map(|m| m.path.as_path())
+            .collect();
+        assert!(
+            files.contains(&root.join("inc.gitconfig").as_path()),
+            "{files:?}"
+        );
+        assert!(
+            files.contains(&root.join("nested.cfg").as_path()),
+            "nested: {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.starts_with(tmp.path().join("outside.cfg")))
+        );
+
+        // An include of a project file that is not there: refused, named, nothing created.
+        assert!(
+            git(&["config", "--add", "include.path", "../later.cfg"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let e = expand(&root, &FsPolicy::default());
+        let why = e
+            .refused
+            .expect("an absent included file refuses the launch");
+        assert!(
+            why.contains("later.cfg") && why.contains("git_writable"),
+            "{why}"
+        );
+        assert!(!root.join("later.cfg").exists());
+
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        assert!(
+            expand(&root, &lifted).refused.is_none(),
+            "git_writable lifts it"
+        );
     }
 
     /// A `.git` that is a file points at a directory outside the project, which the cage does not

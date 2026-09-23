@@ -1079,8 +1079,8 @@ fn fs_test(args: &[OsString]) -> ExitCode {
         // An entry sbx added itself is named as such: pointing at a `[fs]` line would send the
         // reader to look for, or remove, a line that is in no config.
         Some((_, m)) if m.builtin => println!(
-            "  {dim}by sbx itself: the project config, its mise files, git's hooks directory \
-             and `.git/config` are read-only in the cage by default{r}",
+            "  {dim}by sbx itself: the project config, its mise files, git's hooks directory, \
+             `.git/config` and the files it includes are read-only in the cage by default{r}",
             dim = pal.dim
         ),
         Some((field, m)) if m.path == path => {
