@@ -263,8 +263,9 @@ splice), how long it has been open, and the bytes each way (`↑` client→upstr
 upstream→client): grouped by session and redrawn in place like `top`. This is the *open
 connections*, distinct from [`logs`](#sbx-net-logs) (the *history of decided requests*).
 
-Because the proxy closes each inspected request after one response, short API calls flash by
-in under a second; the durable rows are raw `tcp://` tunnels (SSH, a database wire),
+Because each inspected request is a flow of its own, from its decision to the end of its
+response, short API calls flash by in under a second, even down a tunnel that carries many of
+them; the durable rows are raw `tcp://` tunnels (SSH, a database wire),
 WebSockets, and large L7 transfers in progress. Byte counts are application bytes on an
 inspected `https`/`http` flow, encrypted bytes on a raw `tcp` splice. The redraw needs a
 terminal; `--json` emits one snapshot object per tick (NDJSON) for a pipe. Only a filtering

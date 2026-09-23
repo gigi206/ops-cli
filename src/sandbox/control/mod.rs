@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1217,11 +1216,13 @@ impl LogRing {
 // same per-session control socket. Unlike the event log (a *history* of decisions), this is volatile
 // state: a flow appears when its tunnel is established and vanishes when it closes. It is never
 // persisted and never crosses into the cage — it lives in the launch process's owner-only RAM for the
-// session's lifetime, at the same trust level as the log the proxy already holds.
+// session's lifetime, at the same trust level as the log.
 //
-// The two byte counters (`up` = client→upstream, `down` = upstream→client) are lock-free
-// `Arc<AtomicU64>` the relay increments per read/write; the registry mutex is taken only at
-// register / deregister / snapshot — never per byte — so the hot relay path stays unlocked.
+// The registry is written by the side that applies what the proxy reports
+// ([`crate::sandbox::proxy::events`]): a flow's opening and closing as they happen, and its two byte
+// totals (`up` = client→upstream, `down` = upstream→client) on the proxy's reporting tick. The
+// counting itself stays in the proxy, on lock-free counters the relay bumps per read/write
+// ([`crate::sandbox::proxy::flows::FlowGuard`]), so the hot relay path never touches this lock.
 
 /// One open tunnel captured for `sbx net live`: where it goes, how it is carried, when it opened, and
 /// how much has flowed each way so far. `up`/`down` are byte totals — application-plaintext bytes on
@@ -1238,125 +1239,72 @@ pub(crate) struct FlowSnapshot {
     pub(crate) down: u64,
 }
 
-struct FlowEntry {
-    host: String,
-    port: u16,
-    proto: Proto,
-    start_epoch_ms: u128,
-    up: Arc<AtomicU64>,
-    down: Arc<AtomicU64>,
-}
+/// The most flows the registry lists at once. A proxy has no more tunnels open than its connection
+/// cap and each connection's streams allow, so this is reached only by a proxy reporting flows it
+/// does not have; past it an opening is not listed, and the view stays bounded.
+const MAX_OPEN_FLOWS: usize = 65_536;
 
-/// The set of currently-open egress tunnels. Shared (via `Arc`) between the proxy serve threads
-/// (which [`register`](FlowRegistry::register) a flow for the tunnel's lifetime) and the control serve
-/// thread (which [`snapshot`](FlowRegistry::snapshot)s for `sbx net live`). Ids start at 1 and never
-/// repeat within a session, so the snapshot order is stable (oldest-open first).
+/// The set of currently-open egress tunnels, keyed by the number the proxy gave each. Shared (via
+/// `Arc`) between the side applying the proxy's reports and the control serve thread (which
+/// [`snapshot`](FlowRegistry::snapshot)s for `sbx net live`). One registry serves one proxy, and that
+/// proxy numbers its flows in the order it opens them, so the snapshot order is stable
+/// (oldest-open first).
 pub(crate) struct FlowRegistry {
-    inner: Mutex<FlowInner>,
-}
-
-struct FlowInner {
-    next_id: u64,
-    flows: BTreeMap<u64, FlowEntry>,
-}
-
-/// RAII handle for one open flow: it is registered on [`register`](FlowRegistry::register) and
-/// deregistered when this guard drops (the tunnel closed). It always carries the two byte counters the
-/// relay increments — `up` (client→upstream) and `down` (upstream→client) — so the counting wrappers
-/// can bump them without touching the registry lock. A **detached** guard ([`detached`](Self::detached))
-/// carries live counters but is not in any registry (its `registry` is `None`), so the relay counts
-/// unconditionally without a branch and a session with no registry (tests) still works.
-pub(crate) struct FlowGuard {
-    registry: Option<Arc<FlowRegistry>>,
-    id: u64,
-    pub(crate) up: Arc<AtomicU64>,
-    pub(crate) down: Arc<AtomicU64>,
-}
-
-impl FlowGuard {
-    /// A guard not tied to any registry — it carries counters (so the relay's counting wrappers work
-    /// uniformly) but registers/deregisters nothing. Used when no flow registry is attached (tests).
-    pub(crate) fn detached() -> Self {
-        FlowGuard {
-            registry: None,
-            id: 0,
-            up: Arc::new(AtomicU64::new(0)),
-            down: Arc::new(AtomicU64::new(0)),
-        }
-    }
-}
-
-impl Drop for FlowGuard {
-    fn drop(&mut self) {
-        // Remove the flow from the live view the instant its tunnel closes (a detached guard has no
-        // registry and nothing to remove). Recovering rather than skipping the removal on a poisoned
-        // lock is what keeps the registry a view of what is *open*: a skipped removal leaves a closed
-        // tunnel listed by `sbx net live` for the rest of the session, with no way for it to ever go
-        // away. `locked` cannot panic, so this is also safe to run while a thread is unwinding.
-        if let Some(registry) = &self.registry {
-            locked(&registry.inner).flows.remove(&self.id);
-        }
-    }
+    inner: Mutex<BTreeMap<u64, FlowSnapshot>>,
 }
 
 impl FlowRegistry {
     pub(crate) fn new() -> Self {
         FlowRegistry {
-            inner: Mutex::new(FlowInner {
-                next_id: 1,
-                flows: BTreeMap::new(),
-            }),
+            inner: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// Register an open tunnel and return its RAII guard, which deregisters it on drop. Call this only
-    /// after the request is permitted and the upstream connection is established — a flow is a live
-    /// *allowed* tunnel, never a refused request. The returned guard carries fresh zeroed `up`/`down`
-    /// counters for the relay to increment.
-    pub(crate) fn register(self: &Arc<Self>, host: &str, port: u16, proto: Proto) -> FlowGuard {
-        let up = Arc::new(AtomicU64::new(0));
-        let down = Arc::new(AtomicU64::new(0));
+    /// List the tunnel the proxy opened as `id`, with zeroed totals and the current time as its
+    /// start. An `id` already listed, or one past [`MAX_OPEN_FLOWS`], changes nothing.
+    pub(crate) fn open(&self, id: u64, host: &str, port: u16, proto: Proto) {
         let start_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut g = locked(&self.inner);
-        let id = g.next_id;
-        g.next_id += 1;
-        g.flows.insert(
+        let mut flows = locked(&self.inner);
+        if flows.len() >= MAX_OPEN_FLOWS || flows.contains_key(&id) {
+            return;
+        }
+        flows.insert(
             id,
-            FlowEntry {
+            FlowSnapshot {
                 host: host.to_string(),
                 port,
                 proto,
                 start_epoch_ms,
-                up: up.clone(),
-                down: down.clone(),
+                up: 0,
+                down: 0,
             },
         );
-        FlowGuard {
-            registry: Some(self.clone()),
-            id,
-            up,
-            down,
+    }
+
+    /// Set the totals of the tunnel `id` to what the proxy last counted. Absolute rather than added,
+    /// so a report applied late or twice still shows the right figure. A tunnel no longer listed is
+    /// left closed.
+    pub(crate) fn count(&self, id: u64, up: u64, down: u64) {
+        if let Some(flow) = locked(&self.inner).get_mut(&id) {
+            flow.up = up;
+            flow.down = down;
         }
     }
 
-    /// A snapshot of every currently-open flow, oldest-open first (ascending id). Reads each flow's
-    /// live byte counters — a value climbing between two snapshots is a transfer in progress.
+    /// Remove the tunnel `id` from the live view: it has closed. Recovering rather than skipping the
+    /// removal on a poisoned lock is what keeps the registry a view of what is *open*: a skipped
+    /// removal would leave a closed tunnel listed by `sbx net live` for the rest of the session.
+    pub(crate) fn close(&self, id: u64) {
+        locked(&self.inner).remove(&id);
+    }
+
+    /// A snapshot of every currently-open flow, oldest-open first. A total climbing between two
+    /// snapshots is a transfer in progress.
     pub(crate) fn snapshot(&self) -> Vec<FlowSnapshot> {
-        let g = locked(&self.inner);
-        g.flows
-            .values()
-            .map(|e| FlowSnapshot {
-                host: e.host.clone(),
-                port: e.port,
-                proto: e.proto,
-                start_epoch_ms: e.start_epoch_ms,
-                up: e.up.load(Ordering::Relaxed),
-                down: e.down.load(Ordering::Relaxed),
-            })
-            .collect()
+        locked(&self.inner).values().cloned().collect()
     }
 }
 
@@ -2441,12 +2389,12 @@ mod tests {
     }
 
     #[test]
-    fn flow_registry_registers_counts_and_deregisters() {
-        let reg = Arc::new(FlowRegistry::new());
+    fn flow_registry_opens_counts_and_closes() {
+        let reg = FlowRegistry::new();
         assert!(reg.snapshot().is_empty(), "a fresh registry has no flows");
 
-        let g1 = reg.register("api.test", 443, Proto::Https);
-        let g2 = reg.register("db.test", 5432, Proto::Tcp);
+        reg.open(1, "api.test", 443, Proto::Https);
+        reg.open(2, "db.test", 5432, Proto::Tcp);
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 2, "two open tunnels are visible");
         // Oldest-open first (ascending id).
@@ -2457,21 +2405,43 @@ mod tests {
         assert_eq!(snap[1].host, "db.test");
         assert_eq!(snap[1].proto, Proto::Tcp);
 
-        // The snapshot reads the live shared atomics the relay's counting wrappers bump.
-        g1.up.fetch_add(1024, Ordering::Relaxed);
-        g1.down.fetch_add(2048, Ordering::Relaxed);
+        // Totals are absolute: a repeated or late report sets the same figure again.
+        reg.count(1, 1024, 2048);
+        reg.count(1, 1024, 2048);
         let snap = reg.snapshot();
         assert_eq!((snap[0].up, snap[0].down), (1024, 2048));
 
-        drop(g1);
+        reg.close(1);
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 1, "a closed tunnel drops off the view");
         assert_eq!(snap[0].host, "db.test");
-        drop(g2);
+        reg.close(2);
         assert!(
             reg.snapshot().is_empty(),
-            "no flow remains once every guard is dropped"
+            "no flow remains once every tunnel closed"
         );
+    }
+
+    /// What reaches the registry is the proxy's account, so it is bounded on arrival: an opening
+    /// under a number already listed does not reset that flow, a count or a closing for a number
+    /// never opened changes nothing, and a count after a closing does not bring the flow back.
+    #[test]
+    fn flow_registry_ignores_what_names_no_open_flow() {
+        let reg = FlowRegistry::new();
+        reg.open(1, "api.test", 443, Proto::Https);
+        reg.count(1, 10, 20);
+        reg.open(1, "other.test", 80, Proto::Http);
+        reg.count(9, 1, 1);
+        reg.close(9);
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            (snap[0].host.as_str(), snap[0].up, snap[0].down),
+            ("api.test", 10, 20)
+        );
+        reg.close(1);
+        reg.count(1, 30, 40);
+        assert!(reg.snapshot().is_empty(), "a closed flow stays closed");
     }
 
     /// A panic in one unrelated handler must not take the whole control plane with it.
@@ -2547,23 +2517,13 @@ mod tests {
             let _held = locked(&poisoner.inner);
             panic!("an unrelated holder gives up mid-flight");
         });
-        let guard = flows.register("api.test", 8443, Proto::Https);
+        flows.open(1, "api.test", 8443, Proto::Https);
         assert_eq!(flows.snapshot().len(), 1);
-        drop(guard);
+        flows.close(1);
         assert!(
             flows.snapshot().is_empty(),
             "a closed tunnel must leave the live view even after a poisoning"
         );
-    }
-
-    #[test]
-    fn detached_flow_guard_counts_but_registers_nothing() {
-        // A detached guard (no registry) still carries usable counters, and dropping it is a no-op —
-        // the relay counts uniformly whether or not a registry is attached (tests).
-        let g = FlowGuard::detached();
-        g.up.fetch_add(10, Ordering::Relaxed);
-        assert_eq!(g.up.load(Ordering::Relaxed), 10);
-        drop(g); // must not panic: there is no registry to touch
     }
 
     #[test]
@@ -2575,9 +2535,8 @@ mod tests {
         let log = LogRing::new(LOG_RING_CAP);
         let flows = Arc::new(FlowRegistry::new());
 
-        let g = flows.register("api.test", 8443, Proto::Https);
-        g.up.fetch_add(100, Ordering::Relaxed);
-        g.down.fetch_add(200, Ordering::Relaxed);
+        flows.open(1, "api.test", 8443, Proto::Https);
+        flows.count(1, 100, 200);
 
         let resp = dispatch("FLOWS", &state, &manual, &log, &flows, None, None);
         assert!(resp.ends_with("ok\n"), "the reply ends with ok: {resp:?}");
@@ -2590,7 +2549,7 @@ mod tests {
         assert_eq!((f.up, f.down), (100, 200));
 
         // An empty registry lists no flow, just `ok`.
-        drop(g);
+        flows.close(1);
         assert_eq!(
             dispatch("FLOWS", &state, &manual, &log, &flows, None, None),
             "ok\n"

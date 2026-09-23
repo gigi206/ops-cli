@@ -30,8 +30,8 @@
 
 use crate::notify::Block;
 use crate::sandbox::control::{
-    Capture, CaptureCaps, CaptureRing, HttpVer, LogRing, LogVerdict, Plane, Proto, RpcKind,
-    SecretWay,
+    Capture, CaptureCaps, CaptureRing, FlowRegistry, HttpVer, LogRing, LogVerdict, Plane, Proto,
+    RpcKind, SecretWay,
 };
 use crate::sandbox::egress_stats::{EgressStats, StatKind};
 use crate::sandbox::notify_sink::Notifier;
@@ -93,6 +93,19 @@ pub(crate) enum ProxyEvent {
         name: String,
         way: SecretWay,
     },
+    /// A permitted tunnel opened, numbered `id` by the proxy for its later reports
+    /// ([`super::flows`]).
+    FlowOpened {
+        id: u64,
+        host: String,
+        port: u16,
+        proto: Proto,
+    },
+    /// The absolute byte totals `(id, up, down)` of the open flows that moved since their last
+    /// report.
+    FlowCounts(Vec<(u64, u64, u64)>),
+    /// The tunnel `id` closed.
+    FlowClosed { id: u64 },
 }
 
 impl ProxyEvent {
@@ -109,6 +122,9 @@ impl ProxyEvent {
             ProxyEvent::CaptureFiled { host, capture, .. }
             | ProxyEvent::CaptureGrew { host, capture, .. } => host.len() + capture.weight(),
             ProxyEvent::SecretSeen { name, .. } => name.len(),
+            ProxyEvent::FlowOpened { host, .. } => host.len(),
+            ProxyEvent::FlowCounts(moved) => std::mem::size_of_val(moved.as_slice()),
+            ProxyEvent::FlowClosed { .. } => 0,
         }
     }
 }
@@ -162,6 +178,8 @@ pub(crate) struct Sinks {
     pub(crate) log: Option<Arc<LogRing>>,
     /// Kept only beside a `log`: a capture is filed under the number of its logged decision.
     pub(crate) capture: Option<Arc<CaptureRing>>,
+    /// The tunnels open right now, for `sbx net live`.
+    pub(crate) flows: Option<Arc<FlowRegistry>>,
     pub(crate) plane: Plane,
 }
 
@@ -176,6 +194,7 @@ impl Default for Sinks {
             signer_log: None,
             log: None,
             capture: None,
+            flows: None,
             plane: Plane::Agent,
         }
     }
@@ -230,6 +249,7 @@ pub(crate) struct Keeps {
     pub(crate) log: bool,
     /// The caps a capture is taken at, when the launch captures.
     pub(crate) capture: Option<CaptureCaps>,
+    pub(crate) flows: bool,
 }
 
 impl Emitter {
@@ -316,6 +336,7 @@ fn start(sinks: Sinks) -> (Emitter, std::thread::JoinHandle<()>) {
         signatures: sinks.signer_log.is_some(),
         log,
         capture: sinks.capture.as_ref().filter(|_| log).map(|c| c.caps()),
+        flows: sinks.flows.is_some(),
     };
     let (tx, rx) = sync_channel(QUEUE);
     let progress = Arc::new(Progress::default());
@@ -488,6 +509,32 @@ impl Applier {
                     && name.len() <= MAX_FIELD
                 {
                     log.secret_seen(seq, &name, way);
+                }
+            }
+            // One registry serves one proxy, so the proxy's own numbers key it: a proxy can open,
+            // count and close only flows in its own view.
+            ProxyEvent::FlowOpened {
+                id,
+                host,
+                port,
+                proto,
+            } => {
+                if let Some(flows) = &sinks.flows
+                    && host.len() <= MAX_FIELD
+                {
+                    flows.open(id, &host, port, proto);
+                }
+            }
+            ProxyEvent::FlowCounts(moved) => {
+                if let Some(flows) = &sinks.flows {
+                    for (id, up, down) in moved {
+                        flows.count(id, up, down);
+                    }
+                }
+            }
+            ProxyEvent::FlowClosed { id } => {
+                if let Some(flows) = &sinks.flows {
+                    flows.close(id);
                 }
             }
         }

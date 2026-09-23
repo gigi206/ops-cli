@@ -2394,6 +2394,9 @@ mod tests {
     // deciding rule names the exact host).
     // ------------------------------------------------------------------------------------------
 
+    /// Reads the live flow view as it stands, for [`H2Trace::flows`].
+    type FlowsView = Box<dyn Fn() -> Vec<crate::sandbox::control::FlowSnapshot> + Send>;
+
     /// Where an exchange got to, recorded from both ends.
     ///
     /// An in-memory h2 exchange either completes in microseconds or does not complete at all, and
@@ -2416,14 +2419,15 @@ mod tests {
         pushes_accepted: std::sync::atomic::AtomicUsize,
         /// ...and how many its own h2 stack refused because the proxy disabled server push
         pushes_refused: std::sync::atomic::AtomicUsize,
-        /// The live flow registry a test attached, and the rows it held the moment each request
-        /// head reached the upstream.
+        /// How a test reads the live flow view, and the rows it held the moment each request head
+        /// reached the upstream.
         ///
-        /// A flow is deregistered when its stream ends, so a row that existed only while the stream
-        /// was open cannot be read after the exchange returns. The upstream receiving a head is
-        /// proof the proxy had already registered — the registration sits between the allow and the
-        /// forward — so this is the one deterministic window onto the live view.
-        flows: std::sync::Mutex<Option<Arc<crate::sandbox::control::FlowRegistry>>>,
+        /// A flow is closed when its stream ends, so a row that existed only while the stream was
+        /// open cannot be read after the exchange returns. The upstream receiving a head is proof
+        /// the proxy had already opened the flow — the opening sits between the allow and the
+        /// forward — so this is the one deterministic window onto the live view. The reader has the
+        /// proxy report its counts and waits for them to be applied, rather than waiting on a tick.
+        flows: std::sync::Mutex<Option<FlowsView>>,
         flows_when_forwarded: std::sync::Mutex<Vec<crate::sandbox::control::FlowSnapshot>>,
     }
 
@@ -2661,12 +2665,8 @@ mod tests {
         trace.seen.lock().unwrap().push(seen);
         // Read the live view here and nowhere else: the proxy registers the stream's flow between
         // the allow and the forward, so a head that has arrived is a row that is up right now.
-        if let Some(registry) = trace.flows.lock().unwrap().as_ref() {
-            trace
-                .flows_when_forwarded
-                .lock()
-                .unwrap()
-                .extend(registry.snapshot());
+        if let Some(view) = trace.flows.lock().unwrap().as_ref() {
+            trace.flows_when_forwarded.lock().unwrap().extend(view());
         }
         // Offered before the response, as RFC 9113 §8.4 requires. A peer that disabled server push
         // makes h2 refuse this locally, which is exactly what is being asserted.
@@ -4022,8 +4022,18 @@ mod tests {
         );
         let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
         let flows = Arc::new(FlowRegistry::new());
-        let ctx = ctx.with_flows(Arc::clone(&flows));
-        *trace.flows.lock().unwrap() = Some(Arc::clone(&flows));
+        let events = crate::sandbox::proxy::events::spawn(crate::sandbox::proxy::events::Sinks {
+            flows: Some(Arc::clone(&flows)),
+            ..crate::sandbox::proxy::events::Sinks::default()
+        });
+        let ctx = ctx.with_events(events.clone());
+        let live = Arc::clone(ctx.flows.as_ref().expect("a live view"));
+        let registry = Arc::clone(&flows);
+        *trace.flows.lock().unwrap() = Some(Box::new(move || {
+            live.report();
+            events.flush();
+            registry.snapshot()
+        }));
 
         let answer = through_h2_proxy(
             &ctx,

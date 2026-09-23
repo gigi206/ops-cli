@@ -203,6 +203,7 @@ mod cleartext;
 mod ctx;
 mod dns;
 pub(crate) mod events;
+pub(crate) mod flows;
 mod forward;
 mod h2mitm;
 mod inject;

@@ -123,12 +123,12 @@ pub(crate) struct ProxyCtx {
     /// ([`super::events`]), so the proxy holds none of the structures they end up in. Attached by
     /// [`crate::sandbox::egress::start`] via [`Self::with_events`].
     pub(super) events: Option<super::events::Emitter>,
-    /// The live registry of egress tunnels currently open, read by `sbx net live`, or `None` when
-    /// off (tests). The launch ([`crate::sandbox::egress::start`]) attaches the session's
-    /// [`crate::sandbox::control::FlowRegistry`] via [`Self::with_flows`]; each permitted tunnel registers a
-    /// flow for its lifetime through a [`crate::sandbox::control::FlowGuard`], and the relay increments the
-    /// guard's byte counters. Shared through the `Arc<ProxyCtx>`.
-    pub(super) flows: Option<Arc<crate::sandbox::control::FlowRegistry>>,
+    /// The egress tunnels this proxy has open, reported for `sbx net live`, or `None` when the launch
+    /// keeps no live view (tests). Built by [`Self::with_events`] when the reports have a registry to
+    /// reach; each permitted tunnel opens a flow for its lifetime through a
+    /// [`super::flows::FlowGuard`], and the relay increments the guard's byte counters. Shared
+    /// through the `Arc<ProxyCtx>`.
+    pub(super) flows: Option<Arc<super::flows::LiveFlows>>,
     /// The number of raw L4 (`tcp://`) splices currently open. Each splice holds a host thread (and
     /// its fds) for the connection's lifetime, so this caps how many an in-cage agent can open at
     /// once (see `splice::MAX_CONCURRENT_SPLICES`); the inspected L7 path never touches it. Shared
@@ -254,10 +254,17 @@ impl ProxyCtx {
         })
     }
 
-    /// Attach where this proxy reports what it did: the decisions it counts, the refusals it
-    /// announces, the credentials its signers form. Left unset (tests, and any path that keeps none
-    /// of them) nothing is reported and the decision path is unchanged.
+    /// Attach where this proxy reports what it did: the decisions it counts and logs, the refusals it
+    /// announces, the credentials its signers form, the tunnels it has open. Left unset (tests, and
+    /// any path that keeps none of them) nothing is reported and the decision path is unchanged.
     pub(crate) fn with_events(mut self, events: super::events::Emitter) -> Self {
+        // The live view's table and its reporting thread, when the reports have a registry to
+        // reach. Started here, with the proxy, rather than on the first tunnel: a connection
+        // thread is the one place a refused `spawn` must not end up.
+        self.flows = events
+            .keeps()
+            .flows
+            .then(|| super::flows::LiveFlows::start(events.clone()));
         self.events = Some(events);
         self
     }
@@ -267,14 +274,6 @@ impl ProxyCtx {
     /// `sbx run`/`shell`) the suggestion targets the project baseline.
     pub(crate) fn with_app(mut self, app: Option<String>) -> Self {
         self.app = app;
-        self
-    }
-
-    /// Attach the session's live flow registry, so each permitted tunnel registers itself for its
-    /// lifetime and `sbx net live` can read the tunnels open right now. Set once by the launch
-    /// ([`crate::sandbox::egress::start`]) whenever the proxy runs.
-    pub(crate) fn with_flows(mut self, flows: Arc<crate::sandbox::control::FlowRegistry>) -> Self {
-        self.flows = Some(flows);
         self
     }
 
@@ -334,20 +333,20 @@ impl ProxyCtx {
         self.events.as_ref().filter(|e| e.keeps().log)
     }
 
-    /// Register a permitted tunnel in the live flow registry, returning its RAII guard — hold it for
+    /// Open a flow for a permitted tunnel in the live view, returning its RAII guard — hold it for
     /// the tunnel's lifetime so the flow stays visible until it closes, then drops off the
     /// `sbx net live` view. Always returns a guard (a **detached** one, counting into throwaway
-    /// counters, when no registry is attached — tests), so the relay's counting wrappers work
+    /// counters, when the launch keeps no live view — tests), so the relay's counting wrappers work
     /// uniformly with no branch. Call only after the request is permitted and the upstream is connected.
     pub(super) fn register_flow(
         &self,
         host: &str,
         port: u16,
         proto: crate::sandbox::control::Proto,
-    ) -> crate::sandbox::control::FlowGuard {
+    ) -> super::flows::FlowGuard {
         match &self.flows {
-            Some(f) => f.register(host, port, proto),
-            None => crate::sandbox::control::FlowGuard::detached(),
+            Some(f) => f.open(host, port, proto),
+            None => super::flows::FlowGuard::detached(),
         }
     }
 

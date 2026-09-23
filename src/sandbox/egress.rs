@@ -1018,12 +1018,16 @@ pub(crate) fn start(
     // proxy a declared operation stands up report into the one notifier and the one ring a reader
     // can reach. A proxy that built its own would be recording into a ring nothing serves. The
     // proxy itself holds none of them — see [`super::proxy::events`].
+    // The live flow registry — the applying side writes it, the control thread reads it for
+    // `sbx net live`.
+    let flows = Arc::new(super::control::FlowRegistry::new());
     let sinks = super::proxy::events::Sinks {
         stats: stats.clone(),
         notifier: notify.map(|wiring| Arc::clone(&wiring.notifier)),
         signer_log,
         log: Some(log.clone()),
         capture: capture.clone(),
+        flows: Some(Arc::clone(&flows)),
         plane,
     };
     // One stop signal for both serve threads. Set by the guard's `Drop`, which then connects to each
@@ -1034,11 +1038,7 @@ pub(crate) fn start(
         let _ = std::fs::remove_file(&control_uds);
         let pending = Arc::new(super::control::PendingState::new());
         let manual = Arc::new(super::control::ManualRules::new());
-        // The live flow registry — the proxy and the control thread share the same `Arc` (the proxy
-        // registers a flow per open tunnel; `sbx net live` reads them over the control socket).
-        let flows = Arc::new(super::control::FlowRegistry::new());
         ctx = ctx.with_control(pending.clone(), manual.clone());
-        ctx = ctx.with_flows(flows.clone());
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.
         let control_listener = UnixListener::bind(&control_uds)?;
