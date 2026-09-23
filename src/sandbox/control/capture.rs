@@ -40,7 +40,7 @@ use crate::sandbox::proxy::redact_record_in_place;
 
 /// How much of each exchange a launch captures. `Off` is the default and costs nothing — no buffer
 /// is ever allocated on the forwarding path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CaptureLevel {
     /// No capture at all.
     #[default]

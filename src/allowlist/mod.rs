@@ -83,8 +83,10 @@ use std::fmt;
 use std::net::IpAddr;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 mod grammar;
+mod transfer;
 // The rule/target parser is re-exported so callers keep reaching it as `allowlist::…`.
 pub(crate) use grammar::*;
 
@@ -94,7 +96,7 @@ pub(crate) use grammar::*;
 /// context default by `apply_default_methods`); a method-qualified rule (`{GET,HEAD} host`) applies
 /// only to those verbs, and an explicit `{*}` is [`Methods::Any`]. A bare or `https://` rule is
 /// [`Layer::L7`] (inspected, the default); a `tcp://` rule is [`Layer::L4`] (raw-spliced, host:port).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Rule {
     pub(crate) kind: RuleKind,
     pub(crate) methods: Methods,
@@ -156,7 +158,7 @@ impl Eq for Rule {}
 /// outbound tripwire are all inert); cleartext keeps the outbound tripwire (it has a head to scan)
 /// but not injection. Both opt-in paths are trusted-only and self-authored, the blast radius stays
 /// that one host, and each is loud, so both are within the threat model.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Layer {
     /// Inspected over TLS (a bare or `https://` rule) — the MITM path. The default.
     #[default]
@@ -189,7 +191,8 @@ impl Layer {
 
 /// The syntactic kind of a match rule, inferred from an entry's syntax at config resolution; an
 /// entry that matches none is a hard error, never a silent drop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "transfer::RuleKindWire", into = "transfer::RuleKindWire")]
 pub(crate) enum RuleKind {
     /// A literal IP with a port set: matches a request whose host is exactly this address
     /// and whose port the set admits (any path).
@@ -234,7 +237,7 @@ pub(crate) enum RuleKind {
 /// forbids writes to that host. It bounds what the agent can drive the upstream's API to do per the
 /// upstream's own verb semantics; it is **not** raw-exfiltration protection (a GET URL still carries
 /// data out).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) enum Methods {
     /// No method prefix — all verbs, but subject to a per-app `default_methods` rewrite.
     #[default]
@@ -306,7 +309,7 @@ impl Methods {
 /// and/or inclusive `lo-hi` ranges; `:*` admits any port. The least privilege of the bare default
 /// keeps `allow github.com` from being CONNECT-tunnelled to an arbitrary port like 22 (open the
 /// HTTP port explicitly with `:80`/`:*`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Ports {
     /// `:*` — any port.
     Any,
@@ -850,7 +853,7 @@ impl fmt::Display for RuleKind {
 /// the filtering proxy still active so deny carve-outs, the SSRF guard, credential injection,
 /// and redaction all keep working. `Ask` parks an undecided request for a live human decision
 /// (allow rules auto-pass, deny rules auto-fail, everything else waits).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DefaultAction {
     /// No rule matched ⇒ deny (the classic allowlist; the default).
     #[default]
@@ -870,7 +873,7 @@ pub(crate) enum DefaultAction {
 /// because past the `101` there are no requests: there is one tunnel two peers agreed the framing
 /// of, relayed byte for byte. So the only refusal available is tearing the tunnel down, which is
 /// why this is a choice rather than the posture.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum WebsocketSecret {
     /// Record the sighting on the tunnel's own event and keep relaying (the default). What the user
     /// gets is the fact, while the tunnel is still open.
@@ -913,7 +916,7 @@ impl WebsocketSecret {
 /// the `re:` and `host/path` rule kinds have no http2 analogue). Caution: the designated transport is
 /// ALPN-h2-**only**, so a wildcard that also covers a host the client speaks HTTP/1.1 to will fail
 /// that host's TLS handshake (no common ALPN) — prefer exact hosts unless every subdomain is gRPC/h2.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Http2Host {
     /// The exact host, or — when `subdomain` is set — the wildcard's apex domain (the part after `*.`).
     host: String,
@@ -1037,7 +1040,7 @@ pub(crate) const DEFAULT_BODY_MAX: u64 = 64 * 1024 * 1024;
 /// [`DefaultAction::Ask`] `ask_timeout` bounds how long a parked request waits for a decision
 /// (`None` = wait indefinitely until answered); it is inert under the other defaults. The `ask`
 /// park notice is printed to stderr by default; a policy may suppress it (the request still parks).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
     deny: Vec<Rule>,

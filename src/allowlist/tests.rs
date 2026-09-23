@@ -2824,3 +2824,82 @@ fn a_host_is_bracketed_for_display_exactly_when_a_port_would_be_ambiguous() {
         ("::1".to_string(), 5432)
     );
 }
+
+/// Every field of a policy crosses to the proxy, each carrying a value its constructor would not
+/// give it: the literal below names every field and fills none from a default, so a field added
+/// to [`EgressPolicy`] fails to compile here until someone says what it crosses as.
+#[test]
+fn every_field_of_a_policy_survives_the_transfer() {
+    use std::time::Duration;
+    let mut grouped = rule("{GET,POST} api.example.com:443,8443/v1/*");
+    grouped.group = Some("example".to_string());
+    let mut builtin = rule("*.nixos.org");
+    builtin.builtin = true;
+    let policy = EgressPolicy {
+        allow: vec![
+            grouped,
+            builtin,
+            rule("re:^https://github\\.com/myorg/"),
+            rule("10.0.0.7:22"),
+            rule("tcp://db.internal:5432"),
+            rule("http://cleartext.example.com"),
+        ],
+        deny: vec![rule("{*} example.com/secret")],
+        mute: vec![rule("telemetry.example.com")],
+        default_action: DefaultAction::Ask,
+        ask_timeout: Some(Duration::from_millis(1500)),
+        suppress_ask_notice: true,
+        dns_cache_ttl: Some(Duration::from_secs(7)),
+        http2: vec![Http2Host::parse("*.grpc.example.com:8443").unwrap()],
+        capture: crate::sandbox::control::CaptureLevel::Bodies,
+        capture_body_kb: Some(12),
+        websocket_secret: WebsocketSecret::Block,
+        pool: false,
+        ca_roots: false,
+        idle_timeout: Some(Duration::from_secs(33)),
+        max_connections: Some(17),
+        body_max: Some(4096),
+        shared_credential: Some(
+            vec![vec!["a.example.com".to_string(), "b.example.com".to_string()].into_boxed_slice()]
+                .into_boxed_slice(),
+        ),
+    };
+    let bytes = policy.encode().unwrap();
+    let back = EgressPolicy::decode(&bytes).unwrap();
+    assert_eq!(back, policy);
+    assert_eq!(back.encode().unwrap(), bytes, "a second encoding differs");
+    // `==` on a rule ignores both, so they are asked of each rule.
+    let flags = |p: &EgressPolicy| -> Vec<(Option<String>, bool)> {
+        p.allow_rules()
+            .iter()
+            .map(|r| (r.group.clone(), r.builtin))
+            .collect()
+    };
+    assert_eq!(flags(&back), flags(&policy));
+    // And the compiled pattern is a working one, not only a matching string.
+    let re = back
+        .allow_rules()
+        .iter()
+        .find_map(|r| match &r.kind {
+            RuleKind::Regex { re, .. } => Some(re),
+            _ => None,
+        })
+        .expect("the `re:` rule crossed");
+    assert!(re.is_match("https://github.com/myorg/repo"));
+}
+
+/// A `re:` pattern that does not compile on arrival refuses the whole policy: a proxy started on
+/// the rest would enforce a policy nobody wrote.
+#[test]
+fn a_pattern_that_does_not_compile_on_arrival_refuses_the_policy() {
+    let policy = EgressPolicy::new(vec![rule("re:^https://ok\\.example/")], Vec::new());
+    let text = String::from_utf8(policy.encode().unwrap()).unwrap();
+    let broken = text.replace("^https://ok\\\\.example/", "(unclosed");
+    assert_ne!(broken, text, "the pattern was found in the encoding");
+    let err = EgressPolicy::decode(broken.as_bytes()).expect_err("an invalid pattern is refused");
+    assert!(err.to_string().contains("invalid regex"), "{err}");
+    assert!(
+        EgressPolicy::decode(b"{\"allow\": 3}").is_err(),
+        "a malformed document is refused"
+    );
+}

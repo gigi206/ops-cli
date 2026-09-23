@@ -971,6 +971,11 @@ pub(crate) fn start(
     let splices_any = policy.splices_any();
     let wants_ca_roots = policy.ca_roots();
 
+    // The proxy is handed its policy as the bytes it will receive once it runs in a process of its
+    // own, not as the value built above: everything the launch did to the policy is done by now,
+    // and a field the encoding drops is then dropped on every launch rather than on the day the
+    // proxy moves. See [`crate::allowlist::EgressPolicy::encode`].
+    let policy = EgressPolicy::decode(&policy.encode()?)?;
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_shared_credentials(credentials)
         .with_app(app.map(str::to_string));

@@ -1859,3 +1859,105 @@ fn no_shipped_package_is_frozen_at_the_version_it_names() {
         "expected the whole catalogue to be read, saw {checked} package declarations"
     );
 }
+
+/// Every shipped app's egress policy reaches the proxy intact through the form it is handed
+/// ([`crate::allowlist::EgressPolicy::encode`]), with the built-in self-equip rules the proxy
+/// unions in, and the rules the shipped groups contribute.
+///
+/// `==` on a rule ignores `group` and `builtin`, and the SSRF guard reads `builtin`, so equality of
+/// the decoded policy proves nothing about them: each rule's two flags are compared on their own,
+/// and the bytes are compared after a second encoding. The counts at the end are what keep this
+/// from passing on a corpus that never carried the fields it is meant to watch.
+#[test]
+fn every_shipped_egress_policy_survives_the_transfer_to_the_proxy() {
+    use crate::allowlist::{EgressPolicy, Rule};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let toml_files = |dir: &str| -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(root.join(dir))
+            .unwrap_or_else(|e| panic!("{dir}/ exists: {e}"))
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .map(|p| {
+                let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+                (stem, std::fs::read(&p).unwrap())
+            })
+            .collect();
+        out.sort();
+        out
+    };
+
+    // The shipped groups, declared where the loader puts them: the global config's own table.
+    let mut text = String::from("[network]\nmode = \"deny\"\n\n[network.groups]\n");
+    for (name, bytes) in toml_files("examples/net-groups") {
+        let group = schema::parse_group(&bytes).unwrap_or_else(|e| panic!("group {name}: {e}"));
+        let entries =
+            toml::Value::Array(group.entries.into_iter().map(toml::Value::String).collect());
+        text.push_str(&format!("\"{name}\" = {entries}\n"));
+    }
+    let mut global = schema::parse(text.as_bytes()).expect("the groups parse as a global config");
+    for (name, bytes) in toml_files("examples/app") {
+        let app = schema::parse_app(&bytes).unwrap_or_else(|e| panic!("app {name}: {e}"));
+        global.app.insert(name, app);
+    }
+    let resolved = super::resolve(global, None, &super::PluginRegistry::default());
+
+    let flags = |rules: &[Rule]| -> Vec<(Option<String>, bool)> {
+        rules.iter().map(|r| (r.group.clone(), r.builtin)).collect()
+    };
+    let (mut policies, mut grouped, mut builtin) = (0usize, 0usize, 0usize);
+    for (name, app) in &resolved.apps {
+        let Some(super::NetworkPolicy::Allowlist(policy)) = &app.network else {
+            continue;
+        };
+        // What the proxy works from: the built-ins are unioned in when its context is built.
+        let mut allow = policy.allow_rules().to_vec();
+        allow.extend(crate::sandbox::builtin_allow_rules());
+        let policy = (**policy)
+            .clone()
+            .with_rules(allow, policy.deny_rules().to_vec());
+
+        let bytes = policy.encode().unwrap();
+        let back = EgressPolicy::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(back, policy, "{name}: the decoded policy differs");
+        assert_eq!(
+            back.encode().unwrap(),
+            bytes,
+            "{name}: a second encoding differs"
+        );
+        for (list, a, b) in [
+            ("allow", back.allow_rules(), policy.allow_rules()),
+            ("deny", back.deny_rules(), policy.deny_rules()),
+            ("mute", back.mute_rules(), policy.mute_rules()),
+        ] {
+            assert_eq!(
+                flags(a),
+                flags(b),
+                "{name}: `{list}` lost a rule's group or builtin flag"
+            );
+        }
+        policies += 1;
+        grouped += [
+            policy.allow_rules(),
+            policy.deny_rules(),
+            policy.mute_rules(),
+        ]
+        .iter()
+        .flat_map(|rules| rules.iter())
+        .filter(|r| r.group.is_some())
+        .count();
+        builtin += policy.allow_rules().iter().filter(|r| r.builtin).count();
+    }
+    assert!(
+        policies > 30,
+        "only {policies} shipped allowlist policies were checked"
+    );
+    assert!(
+        grouped > 0,
+        "no checked rule came from a group, so `group` went unwatched"
+    );
+    assert!(
+        builtin > 0,
+        "no checked rule was a built-in, so `builtin` went unwatched"
+    );
+}
