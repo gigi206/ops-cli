@@ -35,13 +35,17 @@ denylist** blocks loader-control variables (`LD_*`, `NIX_LD`, `GCONV_PATH`, `PAT
 later interactive sessions. See [`env`](../configuration/env).
 
 [`[fs]`](../configuration/fs) is the one *closing* field, and the only one outside the split.
-It names project paths the cage may not read or may not write, so every entry **subtracts**
-access and there is no syntax for granting any, with two keys excepted and gated like security
-fields: `scan_max_kb`, which lowers how much of a file the content scan reads, and
-`git_writable`, which lifts the read-only default on `.git/hooks/` and `.git/config`. The gate exists to decide who may widen what
-the cage can reach; a table that can only narrow it has nothing for the gate to decide, and
-dropping it from an untrusted project would leave open exactly the file that project asked to
-close. Layers union, so no layer can reopen what another closed.
+It names project paths the cage may not read or may not write, so every mask **subtracts**
+access and there is no syntax for granting any. The gate exists to decide who may widen what
+the cage can reach; a mask can only narrow it, so there is nothing for the gate to decide, and
+dropping one from an untrusted project would leave open exactly the file that project asked to
+close. Layers union, so no layer can reopen a mask another declared.
+
+Two keys of the table widen instead, and they are gated like security fields:
+`scan_max_kb`, which lowers how much of a file the content scan reads, and `git_writable`,
+which lifts the read-only default sbx itself puts on `.git/hooks/` and `.git/config`. An
+untrusted project setting either is refused and told so; a trusted project's appears in the
+diff `sbx trust` shows.
 
 Every other field is a *security* field: it changes what the cage can see, reach, or
 do, so it is honored only from a trusted source. One nuance worth knowing: `[fs]` closes a

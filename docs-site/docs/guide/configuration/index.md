@@ -69,9 +69,11 @@ The schema is split by the [trust gate](../concepts/trust), not by two schemas:
   global config, an app profile, or a project you have run [`sbx trust`](../cli/trust)
   on).
 - **[`[fs]`](fs)** sits outside the split, and it is the only field that does. Every other
-  table can grant something, which is what the gate is there to decide; `[fs]` can only
-  close a path of the project it is declared in, so it applies from any source. Dropping it
-  from an untrusted project would leave open exactly the file that project asked to close.
+  table can grant something, which is what the gate is there to decide; the masks of `[fs]`
+  can only close a path of the project it is declared in, so they apply from any source.
+  Dropping them from an untrusted project would leave open exactly the file that project
+  asked to close. Its two keys that widen instead, `scan_max_kb` and `git_writable`, are
+  gated like security fields.
 
 The global config and imported app profiles are **trusted by location**; a project
 `.sbx.toml` is **trusted by content**.
@@ -95,7 +97,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[limits]` | security | [limits](limits) |
 | `[seccomp]` | security | [seccomp](seccomp) |
 | `[devices]` | security | [devices](devices) |
-| `[fs]` | ungated (only closes) | [fs](fs) |
+| `[fs]` | ungated masks; `scan_max_kb` and `git_writable` are security | [fs](fs) |
 | `[ssh_agent]` | security | [ssh-agent](ssh-agent) |
 | `gui` | security | [gui](gui) |
 | `gpu` | security | [gpu](gpu) |
