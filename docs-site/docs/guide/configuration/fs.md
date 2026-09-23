@@ -111,17 +111,34 @@ protection stops](../concepts/security-model#where-the-protection-stops). The ho
 
 The hooks directory is the one git will run hooks from: `.git/hooks`, and also the directory
 `core.hooksPath` names when it is inside the project. husky, for one, points it at `.husky/_`,
-a directory git ignores, where a rewritten hook would not even show in `git status`. That
-closes the invisible half of husky only: each `.husky/_/<hook>` is a relay that runs
-`.husky/<hook>`, a script you wrote and git tracks, and the cage can still edit one or add one
-(`.husky/post-checkout`). Those show in `git status` and in the diff, like a `Makefile`, and
-they run at your next commit, so read them before committing. The value
+a directory git ignores, where a rewritten hook would not even show in `git status`. The value
 is read from your host's own `git` at launch, so an include file or your global config counts;
 a directory outside the project is left alone, since the cage does not hold it, and with no
 `git` on the host there is nothing to ask and no hook to run. A hooks directory that does not
 exist yet is **created empty at launch** and then protected, which is what `git init` makes:
 otherwise the cage could create it and fill it. It is made one component at a time, and a
 symbolic link found on the way refuses the launch rather than being followed.
+
+**What this does not close: the hooks a project already has run its code.** The protection
+closes the hooks git would run without a trace: an untracked script in the hooks directory, a
+configuration key that names a program. It cannot close the hooks a project already uses,
+because they run the project's own code: husky's `.husky/pre-commit` running `npm test`, a
+pre-commit `repo: local` entry, a lefthook `run:` line, lint-staged and a linter's JavaScript
+configuration, a test suite's `conftest.py`. The agent writes that code as part of its work,
+and the hook runs it on the host at your next `git commit`, and `post-checkout` or
+`post-merge` at your next `git switch` or `git pull`. It is the same carrier as `npm install`
+or `make` in [where the protection stops](../concepts/security-model#where-the-protection-stops),
+and no mount can close it without closing the work. What keeps those hooks off the host is
+how you run git on the agent's work:
+
+| How git runs on the agent's work | Hooks that run |
+|---|---|
+| `git commit --no-verify`, on the host | `post-commit` still runs: not enough |
+| `git -c core.hooksPath=/dev/null commit`, on the host (the same `-c` before `switch`, `pull`, `merge`) | none |
+| `sbx run -- git commit …` | all of them, inside a cage |
+
+A commit from a cage works with `.git` protected. The cage's git needs an identity, which
+`git config --global user.name …` inside the cage records in the cage's own home.
 
 Everyday git keeps working: `status`, `add`, `commit`, `switch`, `stash`, `tag`, `fetch`,
 `pull` and `push` with their arguments, and a worktree created inside the cage. What writes
@@ -348,8 +365,9 @@ The [git protection](#read-only-without-an-entry-the-project-config-and-git) has
 the other kind, one the cage *can* use when your repository already opens it:
 `.git/config` is read-only, but an `include.path` or `includeIf` in it that names a file
 inside the working tree makes that file part of the effective configuration, and the cage
-can write that file. Keep included configuration outside the project. The same holds for a
-hook script a relay runs from the tree, such as husky's `.husky/<hook>` described above.
+can write that file. Keep included configuration outside the project. The larger case of
+the same family, the hooks a project already has, is described
+[with the protection](#read-only-without-an-entry-the-project-config-and-git).
 
 Nor can it hide a masked path from the resolver. The cage owns the project tree under your
 own uid, so it can make a directory untraversable; a path that cannot be looked at is then

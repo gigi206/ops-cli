@@ -255,6 +255,15 @@ switching branches, fetching and pushing still work; what is refused is writing 
 those sets `[fs] git_writable = true` from a trusted layer, the one key of `[fs]` that opens
 rather than closes and therefore the one the trust gate decides.
 
+What this cannot close is a hook the project already has. Those run the project's own code
+(`npm test`, a linter and its configuration, a script the hook manager names), which is the
+agent's work, so a `git commit` on the host runs what the agent wrote, and so do
+`post-checkout` and `post-merge` at a `git switch` or `git pull`. Keep them off the host:
+commit from a cage (`sbx run -- git commit …`), where they run caged, or run git on the host
+with `-c core.hooksPath=/dev/null`, which runs none. `--no-verify` is not enough, since
+`post-commit` still runs. The [`[fs]` page](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)
+has the measured table.
+
 A carrier of the same kind is closed the same way: the project's own `.sbx.toml` and the
 mise files beside it are [read-only in the cage](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)
 without any entry, and [`sbx trust`](../cli/trust) shows the diff of what it approves, so an
