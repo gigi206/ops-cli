@@ -11,8 +11,8 @@
 //!   and no reader can forget to mask. Masking a *complete* buffer (rather than each streamed
 //!   chunk) is what makes it exact — a secret split across two reads is still one contiguous run by
 //!   the time it is masked. A value the launch has since **re-resolved** is masked too
-//!   ([`CaptureRing::needles`]): a capture is filed after its exchange ends, so the credential it
-//!   carries is often the one the `401` just replaced.
+//!   ([`crate::sandbox::proxy::Credentials::masking_needles`]): a capture is filed after its
+//!   exchange ends, so the credential it carries is often the one the `401` just replaced.
 //! - **Bounded three ways.** Each part is capped on its own ([`CaptureCaps`]), the number of
 //!   captured exchanges is capped, and the ring holds a total byte budget past which the *oldest*
 //!   captures are dropped. An in-cage agent streaming gigabytes therefore costs a fixed amount of
@@ -35,6 +35,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use crate::sandbox::locks::locked;
+#[cfg(test)]
 use crate::sandbox::proxy::SecretNeedle;
 use crate::sandbox::proxy::redact_record_in_place;
 
@@ -107,13 +108,6 @@ pub(crate) const CAPTURE_RING_CAP: usize = 200;
 /// captures until the newest fits, so memory is flat regardless of how long a session runs or how
 /// large the per-body cap is.
 pub(crate) const CAPTURE_TOTAL_BUDGET: usize = 16 * 1024 * 1024;
-
-/// How many needle values the ring keeps to mask with — the live ones plus the superseded ones it
-/// has seen (see [`CaptureRing::needles`]). A ceiling rather than an unbounded union because every
-/// needle is scanned over every captured part, so the set bounds the masking cost as well as the
-/// memory: a launch declaring a handful of credentials and refreshing them all session stays far
-/// inside it, and past it the least recently seen values are dropped first.
-const NEEDLE_HISTORY_MAX: usize = 256;
 
 /// The per-part byte caps a launch captures with, derived once from the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,34 +308,29 @@ impl Capture {
 /// [`insert`](CaptureRing::insert) a finished exchange and the control thread that reads captures
 /// back for `sbx net logs`.
 ///
-/// Both locks are taken through [`crate::sandbox::locks::locked`], because this ring is a record
-/// kept for a reader and propagating a poisoning would destroy the one thing it is for. Each side
+/// Its lock is taken through [`crate::sandbox::locks::locked`], because this ring is a record kept
+/// for a reader and propagating a poisoning would destroy the one thing it is for. Each side
 /// has its own reason to survive: a filing runs in `CaptureGuard`'s destructor, where an `Err` from
 /// the lock would panic a thread that may already be unwinding and abort the process, and a read
 /// runs on the per-connection control thread, where it would drop the socket `sbx net logs
 /// --with-headers` is waiting on for the rest of the launch.
 ///
-/// Recovery is sound because neither critical section writes a value and its own qualifier as two
-/// steps an unwind could separate — the caveat `sandbox::locks` names. A part's `truncated` flag
+/// Recovery is sound because no critical section writes a value and its own qualifier as two steps
+/// an unwind could separate — the caveat `sandbox::locks` names. A part's `truncated` flag
 /// is settled on the forwarding side before the bytes ever reach this ring, so no recovered guard
 /// can present a cut capture as whole; the byte budget is the only state an unwind mid-insert
 /// could leave out of step with the entries, and it can be out by at most the one capture being
-/// filed, which shifts when the oldest is evicted and nothing else. The needle history is replaced
-/// as a single assignment, so a recovered guard yields a complete set — at worst the one from
-/// before the merge that panicked, which the next filing rebuilds, since
-/// [`needles`](CaptureRing::needles) compares against the live state every time.
+/// filed, which shifts when the oldest is evicted and nothing else.
 pub(crate) struct CaptureRing {
     inner: Mutex<CaptureInner>,
     caps: CaptureCaps,
     /// The live credential state, shared with the proxy rather than copied from it. A capture is
     /// filed after the exchange it describes, and a credential can be re-resolved in between, so a
     /// private copy would eventually mask against a superseded value — which is the one failure
-    /// that matters here, since an unmasked token is a token written into `sbx net logs`.
+    /// that matters here, since an unmasked token is a token written into `sbx net logs`. What the
+    /// masking runs against is every value that state has carried, not only the live ones
+    /// ([`crate::sandbox::proxy::Credentials::masking_needles`]).
     credentials: std::sync::Arc<crate::sandbox::proxy::Credentials>,
-    /// Every needle value the live state has carried since this ring was built, which is what the
-    /// masking actually runs against. See [`CaptureRing::needles`] for why sharing the live state
-    /// is necessary but not sufficient.
-    history: Mutex<std::sync::Arc<[SecretNeedle]>>,
 }
 
 struct CaptureInner {
@@ -368,9 +357,6 @@ impl CaptureRing {
                 bytes: 0,
                 evicted: 0,
             }),
-            // Seeded with the state as first resolved, so a credential re-resolved before this ring
-            // ever files anything is still masked out of the exchange that carried the old value.
-            history: Mutex::new(std::sync::Arc::from(credentials.snapshot().needles.clone())),
             caps,
             credentials,
         }
@@ -411,7 +397,7 @@ impl CaptureRing {
         if capture.is_empty() {
             return;
         }
-        let needles = self.needles();
+        let needles = self.credentials.masking_needles();
         for part in [
             &mut capture.req_head,
             &mut capture.injected,
@@ -455,76 +441,6 @@ impl CaptureRing {
             g.bytes = g.bytes.saturating_sub(dropped.weight());
             g.evicted += 1;
         }
-    }
-
-    /// The needle set the masking runs against: every value the live credential state has carried
-    /// since this ring was built, not only the ones it carries now.
-    ///
-    /// Sharing the live state is necessary — a credential resolved or refreshed after the launch has
-    /// to be masked too — and it is not sufficient, because a capture is filed *after* the exchange
-    /// it describes and the refresh commonly lands in between: a `401` on this very exchange is the
-    /// ordinary way a token is re-resolved. Masking against the live set alone therefore missed
-    /// exactly the value the exchange contained, and the superseded token went into the ring in
-    /// cleartext for `sbx net logs --with-headers` to print. Retiring a value from injection is not
-    /// retiring it from *scanning*.
-    ///
-    /// The union is rebuilt only when the live state introduces a value this ring has not seen, so
-    /// the ordinary insert pays one comparison per needle and no allocation. What it costs is the
-    /// retired values kept in host memory for the life of the launch — never written, never
-    /// rendered, and exactly what the live credential state already does with the current ones.
-    fn needles(&self) -> std::sync::Arc<[SecretNeedle]> {
-        let current = self.credentials.snapshot();
-        let mut history = locked(&self.history);
-        if current
-            .needles
-            .iter()
-            .all(|n| history.iter().any(|h| h.as_bytes() == n.as_bytes()))
-        {
-            return history.clone();
-        }
-        let mut merged: Vec<SecretNeedle> = history.to_vec();
-        for n in &current.needles {
-            if !merged.iter().any(|h| h.as_bytes() == n.as_bytes()) {
-                merged.push(n.clone());
-            }
-        }
-        // Bounded, because every needle here is scanned over every captured part and a session that
-        // re-resolves a credential on a schedule would otherwise grow the set for as long as it
-        // runs.
-        //
-        // "The live values are appended last" was not enough to make dropping from the front safe,
-        // and this is what the split repairs. A value already in `history` is not re-appended by
-        // the loop above — it is already there — so a credential declared once and never
-        // re-resolved (a static `API_KEY`) stays at index 0 for the life of the launch while a
-        // refreshing OAuth token pushes the set past the cap. The drain then took the static one,
-        // and the very `insert` that trimmed it filed its capture masked against a set no longer
-        // containing it: `sbx net logs --with-headers` would print that key in cleartext.
-        //
-        // `partition` keeps relative order within each half, which is what the drain depends on:
-        // each half stays least-recently-seen-first. And the cap yields before a live value does —
-        // the drain never reaches into `live` — because exceeding a ceiling that exists to bound
-        // scan cost is a cost, while dropping a live needle is a disclosure.
-        let (retired, live): (Vec<SecretNeedle>, Vec<SecretNeedle>) = merged
-            .into_iter()
-            .partition(|h| !current.needles.iter().any(|n| n.as_bytes() == h.as_bytes()));
-        // The retired half holds two unlike things, and the cage decides how much of one there is.
-        // A retired *declared* value is one sbx issued and the cage never held: a capture filed
-        // after the re-resolution that retired it still contains it, which is the disclosure this
-        // history exists to prevent. A retired *learned* value is one the cage taught the proxy and
-        // has since rotated past, produced one per request for as long as it likes. Draining the
-        // cage's leftovers first is what keeps a few hundred requests from emptying the history of
-        // every superseded credential the launch declared.
-        let (mut spent, mut superseded): (Vec<SecretNeedle>, Vec<SecretNeedle>) =
-            retired.into_iter().partition(|h| h.is_observed());
-        let over = (spent.len() + superseded.len() + live.len()).saturating_sub(NEEDLE_HISTORY_MAX);
-        let from_spent = over.min(spent.len());
-        spent.drain(..from_spent);
-        superseded.drain(..(over - from_spent).min(superseded.len()));
-        let mut merged = superseded;
-        merged.extend(spent);
-        merged.extend(live);
-        *history = std::sync::Arc::from(merged);
-        history.clone()
     }
 
     /// The captures for `seqs` (those still retained), plus how many captures have been evicted over
@@ -603,6 +519,7 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::proxy::NEEDLE_HISTORY_MAX;
 
     fn bytes(b: &[u8]) -> CaptureBytes {
         CaptureBytes {
@@ -703,11 +620,6 @@ mod tests {
             CaptureCaps::new(CaptureLevel::Bodies, 8),
             credentials.clone(),
         );
-        // One filing, so the declared value is in the history before anything else is.
-        let mut seed = Capture::new(1);
-        seed.req_head = bytes(b"GET /seed HTTP/1.1\r\n\r\n");
-        ring.insert(seed, "api.test");
-
         // The upstream rejected it and the launch re-resolved: the old value is now retired.
         credentials.replace(CredentialSet {
             injections: Vec::new(),
@@ -738,6 +650,42 @@ mod tests {
         assert!(
             !head.contains(OLD) && head.contains(&"*".repeat(OLD.len())),
             "a superseded declared credential must stay masked however much the cage churns: {head}"
+        );
+    }
+
+    /// A declared value that was live only between two re-resolutions, with no capture filed while
+    /// it was, is still masked out of an exchange that carried it and is filed after both.
+    #[test]
+    fn a_value_live_only_between_two_refreshes_is_masked_in_a_later_capture() {
+        use crate::sandbox::proxy::{CredentialSet, Credentials};
+        const MIDDLE: &str = "middle-t0ken-value-01";
+
+        let credentials = std::sync::Arc::new(Credentials::new(
+            Vec::new(),
+            vec![needle("first-t0ken-value-012")],
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        let ring = CaptureRing::new(
+            CaptureCaps::new(CaptureLevel::Bodies, 8),
+            credentials.clone(),
+        );
+        for value in [MIDDLE, "third-t0ken-value-012"] {
+            credentials.replace(CredentialSet {
+                injections: Vec::new(),
+                needles: vec![needle(value)],
+            });
+        }
+        let mut late = Capture::new(1);
+        late.req_head =
+            bytes(format!("GET /v1 HTTP/1.1\r\nauthorization: Bearer {MIDDLE}\r\n\r\n").as_bytes());
+        ring.insert(late, "api.test");
+
+        let (found, _) = ring.get(&[1]);
+        let head = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
+        assert!(
+            !head.contains(MIDDLE),
+            "a value superseded before any filing saw it must stay masked: {head}"
         );
     }
 
@@ -1004,8 +952,8 @@ mod tests {
         before.req_head = bytes(b"GET /one HTTP/1.1\r\n\r\n");
         ring.insert(before, "api.example.com");
 
-        // Poison each lock the only way it can be poisoned: panic on another thread while a guard
-        // on it is still held, so the unwind marks it. The assertion is the fixture's own — a body
+        // Poison the lock the only way it can be poisoned: panic on another thread while a guard on
+        // it is still held, so the unwind marks it. The assertion is the fixture's own — a body
         // that released its guard before panicking would poison nothing and prove nothing.
         fn poisoning(hold_and_panic: impl FnOnce() + Send + 'static) {
             let panicked = std::thread::spawn(hold_and_panic).join();
@@ -1019,14 +967,9 @@ mod tests {
             let _held = locked(&poisoner.inner);
             panic!("an unrelated holder gives up mid-flight");
         });
-        let poisoner = std::sync::Arc::clone(&ring);
-        poisoning(move || {
-            let _held = locked(&poisoner.history);
-            panic!("an unrelated holder gives up mid-flight");
-        });
         assert!(
-            ring.inner.lock().is_err() && ring.history.lock().is_err(),
-            "…and the standard take must see both poisoned"
+            ring.inner.lock().is_err(),
+            "…and the standard take must see it poisoned"
         );
 
         let mut after = Capture::new(2);

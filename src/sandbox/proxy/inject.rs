@@ -618,6 +618,14 @@ pub(crate) struct Credentials {
     /// [`SecretNeedle::scanned_for`] runs against every request head: resolving the group at learn
     /// time keeps that a membership test with no reachback.
     shared_credential: Vec<Vec<String>>,
+    /// Every needle value this state has carried, bounded: what a traffic capture is masked with.
+    /// See [`Credentials::masking_needles`].
+    ///
+    /// Updated at the two places a value leaves the live set, [`Credentials::replace`] and the
+    /// eviction in [`Credentials::observe`], under the write lock that installs the new set, so no
+    /// value can be live and then gone without passing through it. Taken while that lock is held
+    /// or on its own, never the other way round.
+    masking: std::sync::Mutex<std::sync::Arc<[SecretNeedle]>>,
 }
 
 impl Credentials {
@@ -629,6 +637,7 @@ impl Credentials {
         shared_credential: Vec<Vec<String>>,
     ) -> Self {
         Self {
+            masking: std::sync::Mutex::new(std::sync::Arc::from(needles.clone())),
             current: std::sync::RwLock::new(std::sync::Arc::new(CredentialSet {
                 injections,
                 needles,
@@ -690,6 +699,29 @@ impl Credentials {
         }
     }
 
+    /// The needle set a traffic capture is masked with: every value this state has carried, not
+    /// only the ones it carries now.
+    ///
+    /// The live set is necessary and not sufficient, because a capture is filed *after* the
+    /// exchange it describes and a re-resolution commonly lands in between: a `401` on this very
+    /// exchange is the ordinary way a token is replaced. Retiring a value from injection is not
+    /// retiring it from *scanning*. The retired values are recorded when they leave the live set,
+    /// rather than noticed by whoever next reads it, so a value that was live only between two
+    /// re-resolutions is kept as surely as one a capture happened to see.
+    ///
+    /// What it costs is the retired values kept in host memory for the life of the launch, never
+    /// written, never rendered, and exactly what this state already does with the current ones.
+    pub(crate) fn masking_needles(&self) -> std::sync::Arc<[SecretNeedle]> {
+        crate::sandbox::locks::locked(&self.masking).clone()
+    }
+
+    /// Fold the live set about to be installed into [`Self::masking`]. Called with the write lock on
+    /// the live set held, so the two change together.
+    fn record_masking(&self, live: &[SecretNeedle]) {
+        let mut masking = crate::sandbox::locks::locked(&self.masking);
+        *masking = masking_after(&masking, live);
+    }
+
     /// Install a newly resolved state. Exchanges already in flight keep the snapshot they took, so
     /// a refresh never changes what a running request injects halfway through.
     pub(crate) fn replace(&self, set: CredentialSet) {
@@ -716,6 +748,7 @@ impl Credentials {
             .cloned()
             .collect();
         needles.extend(learned);
+        self.record_masking(&needles);
         *current = std::sync::Arc::new(CredentialSet {
             injections: set.injections,
             needles,
@@ -790,6 +823,7 @@ impl Credentials {
             bytes.to_vec(),
             self.service_of(dest),
         ));
+        self.record_masking(&needles);
         *current = std::sync::Arc::new(CredentialSet {
             injections: current.injections.clone(),
             needles,
@@ -841,6 +875,67 @@ impl Credentials {
         }
         kept
     }
+}
+
+/// How many needle values [`Credentials::masking_needles`] keeps: the live ones plus the retired
+/// ones. A ceiling rather than an unbounded union because every needle is scanned over every
+/// captured part, so the set bounds the masking cost as well as the memory: a launch declaring a
+/// handful of credentials and refreshing them all session stays far inside it, and past it the
+/// least recently seen values are dropped first.
+pub(crate) const NEEDLE_HISTORY_MAX: usize = 256;
+
+/// The masking set once `live` is installed over `history`: `history` with every live value it
+/// lacks appended, trimmed to [`NEEDLE_HISTORY_MAX`] without ever dropping a live value.
+fn masking_after(
+    history: &std::sync::Arc<[SecretNeedle]>,
+    live: &[SecretNeedle],
+) -> std::sync::Arc<[SecretNeedle]> {
+    // The ordinary case, a set that introduces nothing new, costs one comparison per needle and no
+    // allocation.
+    if live
+        .iter()
+        .all(|n| history.iter().any(|h| h.as_bytes() == n.as_bytes()))
+    {
+        return history.clone();
+    }
+    let mut merged: Vec<SecretNeedle> = history.to_vec();
+    for n in live {
+        if !merged.iter().any(|h| h.as_bytes() == n.as_bytes()) {
+            merged.push(n.clone());
+        }
+    }
+    // "The live values are appended last" is not enough to make dropping from the front safe, and
+    // this is what the split repairs. A value already in the history is not re-appended by the loop
+    // above, since it is already there, so a credential declared once and never re-resolved (a
+    // static `API_KEY`) stays at index 0 for the life of the launch while a refreshing OAuth token
+    // pushes the set past the cap. A drain from the front then took the static one, and the next
+    // capture was masked against a set no longer containing it: `sbx net logs --with-headers` would
+    // print that key in cleartext.
+    //
+    // `partition` keeps relative order within each half, which is what the drain depends on: each
+    // half stays least-recently-seen-first. And the cap yields before a live value does, since the
+    // drain never reaches into `live`: exceeding a ceiling that exists to bound scan cost is a
+    // cost, while dropping a live needle is a disclosure.
+    let (retired, live): (Vec<SecretNeedle>, Vec<SecretNeedle>) = merged
+        .into_iter()
+        .partition(|h| !live.iter().any(|n| n.as_bytes() == h.as_bytes()));
+    // The retired half holds two unlike things, and the cage decides how much of one there is. A
+    // retired *declared* value is one sbx issued and the cage never held: a capture filed after the
+    // re-resolution that retired it still contains it, which is the disclosure this history exists
+    // to prevent. A retired *learned* value is one the cage taught the proxy and has since rotated
+    // past, produced one per request for as long as it likes. Draining the cage's leftovers first
+    // is what keeps a few hundred requests from emptying the history of every superseded
+    // credential the launch declared.
+    let (mut spent, mut superseded): (Vec<SecretNeedle>, Vec<SecretNeedle>) =
+        retired.into_iter().partition(|h| h.is_observed());
+    let over = (spent.len() + superseded.len() + live.len()).saturating_sub(NEEDLE_HISTORY_MAX);
+    let from_spent = over.min(spent.len());
+    spent.drain(..from_spent);
+    superseded.drain(..(over - from_spent).min(superseded.len()));
+    let mut merged = superseded;
+    merged.extend(spent);
+    merged.extend(live);
+    std::sync::Arc::from(merged)
 }
 
 /// The Knuth-Morris-Pratt failure table for `pattern` — see [`SecretNeedle::fail`].
@@ -1076,6 +1171,49 @@ mod tests {
         Credentials::new(injections, needles, MIN_LEN_DEFAULT, Vec::new())
     }
 
+    /// A panic in an unrelated holder of the masking set must not stop the set from being read or
+    /// from recording the next re-resolution: a capture is masked with it, and a set that could no
+    /// longer grow would file the next token in the clear.
+    #[test]
+    fn a_poisoned_masking_set_is_still_read_and_still_records_a_re_resolution() {
+        let creds = Arc::new(default_creds(
+            Vec::new(),
+            vec![SecretNeedle::named(
+                "declared",
+                b"declared-value-v1".to_vec(),
+            )],
+        ));
+        let poisoner = Arc::clone(&creds);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.masking.lock();
+            panic!("an unrelated holder gives up mid-flight");
+        })
+        .join();
+        assert!(
+            panicked.is_err(),
+            "the fixture must actually poison the lock"
+        );
+        assert!(
+            creds.masking.lock().is_err(),
+            "…and the standard take must see it poisoned"
+        );
+
+        creds.replace(CredentialSet {
+            injections: Vec::new(),
+            needles: vec![SecretNeedle::named(
+                "declared",
+                b"declared-value-v2".to_vec(),
+            )],
+        });
+        let masking = creds.masking_needles();
+        let masking: Vec<&[u8]> = masking.iter().map(SecretNeedle::as_bytes).collect();
+        assert_eq!(
+            masking,
+            [&b"declared-value-v1"[..], &b"declared-value-v2"[..]],
+            "the retired value is kept and the new one recorded"
+        );
+    }
+
     /// A credential sbx **learned** survives a re-resolution; a declared one is replaced by it.
     ///
     /// The two are not symmetric, and the asymmetry is the whole point. A re-resolution answers for
@@ -1086,11 +1224,9 @@ mod tests {
     /// way back, and the capture stopped masking it at filing. One `401` from any host carrying a
     /// refreshable declared credential was enough to trigger it.
     ///
-    /// Residual, stated rather than fixed: the *previous* declared value is gone the moment the new
-    /// one lands, so an exchange still in flight that is filed after a re-resolution has its
-    /// reflected copy of the old value masked against the new needles. Keeping a generation of
-    /// superseded values alive to close that would mean masking values that are no longer
-    /// credentials, and holding them for a window nothing can pick correctly.
+    /// The *previous* declared value leaves the live set the moment the new one lands, so it is no
+    /// longer scanned for on the wire. A traffic capture filed afterwards is still masked against
+    /// it, through [`Credentials::masking_needles`].
     #[test]
     fn a_learned_credential_survives_a_re_resolution_and_a_declared_one_is_replaced() {
         let creds = default_creds(

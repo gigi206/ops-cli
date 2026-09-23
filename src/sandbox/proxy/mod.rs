@@ -220,6 +220,8 @@ use cleartext::handle_cleartext;
 use ctx::effective_policy;
 pub(crate) use ctx::{ProxyCtx, builtin_allow_rules, union_with_builtin};
 use forward::handle_https_forward;
+#[cfg(test)]
+pub(crate) use inject::NEEDLE_HISTORY_MAX;
 pub(crate) use inject::{
     CredentialRefresh, CredentialSet, Credentials, Form, HeaderInjection, SecretNeedle, Signed,
 };
