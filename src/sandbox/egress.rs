@@ -113,9 +113,9 @@ pub(crate) struct Egress {
     /// The stop signal both serve loops read, set by [`Drop`] — see the header above for why the
     /// threads cannot be ended any other way.
     stop: Arc<std::sync::atomic::AtomicBool>,
-    /// The proxy's report queue, held so [`Drop`] can wait for what it queued to be applied before
-    /// the counters are written for the last time.
-    events: super::proxy::events::Emitter,
+    /// The supervisor's end of the link to the proxy, held so [`Drop`] and
+    /// [`Self::observed_events`] can ask the proxy to wait until what it reported is applied.
+    supervisor: super::proxy::link::Supervisor,
 }
 
 impl Egress {
@@ -130,7 +130,7 @@ impl Egress {
     pub(crate) fn observed_events(&self) -> Vec<super::control::LogEvent> {
         // Every decision the proxy reported before this call, applied: the proxy logs through a
         // queue, and the run's record is what it decided, not what had been applied so far.
-        self.events.flush();
+        self.supervisor.flush();
         // The run's full record includes muted refusals (`--all`) — a `mute` rule only suppresses a
         // live log *view*, it never removes a decision from what `--net-learn` observed.
         self.log.snapshot(None, None, true).events
@@ -160,6 +160,11 @@ impl Egress {
 
 impl Drop for Egress {
     fn drop(&mut self) {
+        // What the proxy reported and the applying side has not reached yet, applied before the
+        // counters are written for the last time. Asked first, while the serve thread still holds
+        // the proxy and so its end of the link: once it stops, the last hold on that end may go
+        // with it, and a flush asked through a link that has ended returns without waiting.
+        self.supervisor.flush();
         // Stop the two serve threads before the paths go, and in this order: the flag first, then
         // one throwaway connection per socket to unpark the `accept` they are blocked in. The loops
         // read the flag the moment `accept` returns — with the connection or with an error, either
@@ -176,9 +181,6 @@ impl Drop for Egress {
         if let Some(control) = &self.control_uds {
             let _ = std::fs::remove_file(control);
         }
-        // What the proxy reported and the applying side has not reached yet, applied before the
-        // counters are written for the last time.
-        self.events.flush();
         // A final flush for a graceful exit; the per-decision flush already keeps the file current
         // for the common case of a killed session, where this Drop never runs.
         if let Some(stats) = &self.stats {
@@ -1034,7 +1036,11 @@ pub(crate) fn start(
     // One stop signal for both serve threads. Set by the guard's `Drop`, which then connects to each
     // socket once to unpark the `accept` that would otherwise block forever — see `Egress`.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let control_uds = {
+    // Before the control plane, which the link below joins to it: a failure here has nothing yet to
+    // unwind.
+    let events = super::proxy::events::spawn(sinks)?;
+    ctx = ctx.with_events(events.clone());
+    let (control_uds, supervisor) = {
         let control_uds = dir.join(format!("control-{pid}{instance}.sock"));
         let _ = std::fs::remove_file(&control_uds);
         let pending = Arc::new(super::control::PendingState::new());
@@ -1043,8 +1049,9 @@ pub(crate) fn start(
         // before the command that made it returns; the requests the proxy parks come up the same
         // link into the queue served here, held to the cap and timeout this end sets, and so do its
         // requests to re-resolve the credentials, held to the bounds the refresher sets.
-        let (link, supervisor) = super::proxy::link::serving(ctx.parks(pending.clone()), refresh);
-        manual.attach(supervisor)?;
+        let (link, supervisor) =
+            super::proxy::link::serving(ctx.parks(pending.clone()), refresh, Some(events))?;
+        manual.attach(supervisor.clone())?;
         ctx = ctx.with_control(link);
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.
@@ -1067,7 +1074,7 @@ pub(crate) fn start(
                 control_stop,
             );
         });
-        Some(control_uds)
+        (Some(control_uds), supervisor)
     };
     if let Some(stats) = &stats {
         // The trailing write, so the debounce below only bounds how *often* the file is rewritten
@@ -1090,8 +1097,6 @@ pub(crate) fn start(
         }
         e
     };
-    let events = super::proxy::events::spawn(sinks).map_err(&unwind_control)?;
-    ctx = ctx.with_events(events.clone());
     let ctx = Arc::new(ctx);
 
     // Write the CA bundle owner-only, outside every writable mount, then bind it read-only — the
@@ -1199,7 +1204,7 @@ pub(crate) fn start(
             stats,
             log,
             stop,
-            events,
+            supervisor,
         },
         Wiring {
             binds,
@@ -2119,7 +2124,7 @@ mod tests {
             log: Arc::new(super::super::control::LogRing::new(
                 super::super::control::LOG_RING_CAP,
             )),
-            events: super::super::proxy::events::spawn(Default::default()).unwrap(),
+            supervisor: super::super::proxy::link::pair().1,
         });
         for path in &paths {
             assert!(!path.exists(), "left behind: {}", path.display());

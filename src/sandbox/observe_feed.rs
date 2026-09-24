@@ -98,6 +98,9 @@ fn command_of(info: &ProcInfo) -> String {
     sanitize(&raw)
 }
 
+/// The most characters [`sanitize`] keeps of a value; a longer one keeps one fewer and ends in `…`.
+pub(crate) const SANITIZED_CHARS: usize = 512;
+
 /// Replace ASCII/Unicode control characters with a space and cap the length (on a char boundary), so
 /// the value is safe on the line-based control wire, the stderr feed, and any terminal reading
 /// either. A Linux filename may carry a newline exactly as a hostile argv can.
@@ -123,7 +126,7 @@ fn command_of(info: &ProcInfo) -> String {
 /// what this replaces, or moving it somewhere a caller stops finding it, reopens all of them at once
 /// and nothing will fail to say so — a forged line is well-formed by construction.
 pub(crate) fn sanitize(s: &str) -> String {
-    const MAX: usize = 512;
+    const MAX: usize = SANITIZED_CHARS;
     let cleaned: String = s
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

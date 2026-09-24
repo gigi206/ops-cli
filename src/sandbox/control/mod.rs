@@ -44,7 +44,7 @@ pub(crate) use client::*;
 use client::parse_flow_line;
 
 /// A human's answer to a parked request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Verdict {
     Allow,
     Deny,
@@ -2472,7 +2472,9 @@ mod tests {
                 notices: false,
             },
             None,
-        );
+            None,
+        )
+        .unwrap();
         manual.attach(supervisor).unwrap();
         let link = Arc::new(link);
         let log = Arc::new(LogRing::new(LOG_RING_CAP));

@@ -174,7 +174,7 @@ pub(crate) use nixhub::{ToolUpgrade, current_system, parse_nix_tools, upgrade_to
 /// The one way a value the cage chose is made fit for a line-based wire or a terminal. Re-exported
 /// because the host-side process view (`sbx proc ls`) renders the same argv the exec feed does, from
 /// outside this module, and a second definition of the rule is how the two would come to disagree.
-pub(crate) use observe_feed::sanitize;
+pub(crate) use observe_feed::{SANITIZED_CHARS, sanitize};
 /// The `flake:` references a set of packages rides, withheld ones dropped. Re-exported for the
 /// same reason as its `mise:` sibling below: `sbx upgrade`'s closing note asks which apps a
 /// replaced flake pin repointed, and it must ask the selection the roll actually makes rather than

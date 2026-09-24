@@ -706,7 +706,9 @@ impl ProxyCtx {
             notices: false,
             ..self.parks(pending)
         };
-        self.link = super::link::serving(parks, None).0;
+        self.link = super::link::serving(parks, None, None)
+            .expect("a link starts")
+            .0;
         self
     }
 

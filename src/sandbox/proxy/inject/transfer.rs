@@ -34,6 +34,19 @@ pub(crate) struct Transfer {
     signers: Vec<OwnedFd>,
 }
 
+impl Transfer {
+    /// The document and the descriptors, for a channel that carries them apart.
+    pub(in crate::sandbox::proxy) fn into_parts(self) -> (Vec<u8>, Vec<OwnedFd>) {
+        (self.bytes, self.signers)
+    }
+
+    /// A state received as its document and the descriptors handed over with it, in the order they
+    /// were sent.
+    pub(in crate::sandbox::proxy) fn from_parts(bytes: Vec<u8>, signers: Vec<OwnedFd>) -> Self {
+        Transfer { bytes, signers }
+    }
+}
+
 impl CredentialSet {
     /// This set as it is handed to the proxy. Only the supervisor's copy crosses: a set holding a
     /// conversation rather than a plugin is refused.

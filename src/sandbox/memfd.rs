@@ -46,6 +46,18 @@ pub(super) fn write(name: &CStr, bytes: &[u8]) -> io::Result<File> {
     Ok(file)
 }
 
+/// Write `bytes` into an anonymous in-memory file, rewound, to be handed to another process over a
+/// socket rather than to an exec.
+///
+/// The same file as [`write()`], under a name of its own because the guard over [`write()`] asks
+/// every caller to prepare the exec that inherits the file, and a file handed over a socket has no
+/// exec to prepare: the receiver gets its own copy with the message that carries it. It stays
+/// close-on-exec here, and the caller drops it once it is sent, since it may hold a credential set.
+/// No seal: the receiver trusts the writer and copies the file once.
+pub(super) fn handed(name: &CStr, bytes: &[u8]) -> io::Result<std::os::fd::OwnedFd> {
+    write(name, bytes).map(Into::into)
+}
+
 /// Let the exec `command` performs inherit `files`, and only that one.
 ///
 /// Registered as a `pre_exec` closure, which `std` runs in the child between the fork and the
