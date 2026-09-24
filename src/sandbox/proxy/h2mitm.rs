@@ -11,11 +11,11 @@
 //! call, so there is one policy decision rather than three that must be kept in step. This path
 //! passes [`AskPosture::RefuseUnsupported`](super::AskPosture), which is the single way it diverges —
 //! see the call site for why it cannot park. The `:authority`
-//! is re-verified against the CONNECT host **per stream** (h2 lets a client vary it), the SSRF guard
-//! resolves and validates the address as the supervisor does for the other planes (connect the
-//! checked IP, no re-resolve; this plane still resolves and dials for itself), the upstream cert is
-//! validated as [`connect_upstream`](super::connect_upstream) validates it, and gRPC is HTTP/2
-//! end-to-end (no downgrade). The
+//! is re-verified against the CONNECT host **per stream** (h2 lets a client vary it), every stream's
+//! connection is the supervisor's as it is on the other planes (a check where the name would be
+//! resolved, the connection itself where one is opened, the address guard applied by the supervisor
+//! to both), the upstream cert is validated as [`connect_upstream`](super::connect_upstream)
+//! validates it, and gRPC is HTTP/2 end-to-end (no downgrade). The
 //! secret machinery is replicated too: the outbound tripwire ([`carries_secret`]) refuses a request
 //! whose head carries a configured secret verbatim, matching host-scoped credentials are injected
 //! (strip-and-replace) onto the upstream request, and a reflected secret is masked out of the
@@ -28,10 +28,12 @@
 
 use super::capture::CapBuf;
 use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
+use super::link::{Asked, Checked};
+use super::ssrf::{ConnectRefusal, ip_refusal};
 use super::{
     AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, carries_secret, decide_https,
     header_name_eq, is_connection_bound_challenge, matching_injection_ids, note_final_status,
-    redact_in_place, resolve_checked, signer_refusal_message, upstream_server_name,
+    redact_in_place, signer_refusal_message, upstream_server_name,
 };
 use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -65,11 +67,15 @@ pub(super) fn handle(
     port: u16,
     ctx: &ProxyCtx,
 ) -> io::Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    runtime()?.block_on(serve(client, connect_host, port, ctx))
+}
+
+/// The runtime one tunnel runs on. Dropped when the tunnel ends, which waits for the questions its
+/// streams still have in flight to the supervisor ([`answer`]).
+fn runtime() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(io::Error::other)?;
-    rt.block_on(serve(client, connect_host, port, ctx))
 }
 
 /// Accept the tunnel, terminate TLS as h2, then drive stream acceptance and every in-flight
@@ -78,12 +84,8 @@ pub(super) fn handle(
 ///
 /// What that costs is a real bound rather than a free choice, so it is written down. Everything
 /// runs on one current-thread runtime, so a synchronous call inside a stream stalls every sibling
-/// stream on this tunnel, and the accept loop with them. Three such calls exist, and measuring them
-/// separates one from the other two:
+/// stream on this tunnel, and the accept loop with them. Two such calls exist:
 ///
-/// - The name resolution in [`resolve_checked`] goes through a short-TTL cache, and every stream of
-///   a CONNECT shares one authority, so it blocks once per host per TTL window. It blocks per
-///   stream only where `[network] dns_cache_ttl = 0` turns the cache off.
 /// - The signer plugin in [`super::inject::pairs_for`] is IPC to a child process, held under a
 ///   mutex. Per request, and the one worth naming: a stream needing no signer waits behind one that
 ///   does. Signing is serialized by that mutex whatever thread it runs on, so moving it off would
@@ -91,12 +93,19 @@ pub(super) fn handle(
 /// - The credential refresh a `401` triggers ([`super::note_final_status`]) runs a resolver, which
 ///   is another child process. Rare, and bounded by the refresher's own minimum gap.
 ///
-/// None is moved off-thread, because `tokio::task::spawn_blocking` wants `Send + 'static` and that
-/// is precisely the borrow this shape exists to avoid: buying it means carrying an
-/// `Arc<ProxyCtx>` through every stream. Two things would justify paying that. A launch whose
-/// signer latency is the tunnel's limit, visible as sibling streams whose time to first byte tracks
-/// a signer they never invoked; or a default that stops caching resolutions, which would move the
-/// first item into the second's class.
+/// Neither is moved off-thread, because `tokio::task::spawn_blocking` wants `Send + 'static` and
+/// that is precisely the borrow this shape exists to avoid: buying it means carrying an
+/// `Arc<ProxyCtx>` through every stream. A launch whose signer latency is the tunnel's limit would
+/// justify paying that, visible as sibling streams whose time to first byte tracks a signer they
+/// never invoked.
+///
+/// The questions a stream puts to the supervisor are the exception, because one of them waits for
+/// a dial and a dial may take its whole bound. They need only the link, which is shared for this
+/// ([`ProxyCtx::link`]), so they wait on a thread of the runtime's blocking pool ([`answer`]); and a
+/// tunnel puts at most one check and one opening to it at a time ([`UpstreamPool`]), the two a
+/// connection of this proxy is allowed ([`super::link::Judge`]). A runtime that is dropped waits for
+/// its blocking threads, so a tunnel that ends with a question in flight holds its connection until
+/// the answer comes.
 async fn serve(
     client: std::os::unix::net::UnixStream,
     connect_host: &str,
@@ -376,22 +385,15 @@ async fn stream(
     // HTTP/1.1 path: a request that passes the verdict but then fails SSRF/DNS/upstream is
     // logged (an `Error`/`Blocked` line) but never counted as an allow in `sbx net stats`.
 
-    // Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata
-    // address is refused unless the rule names the exact host) — then connect the checked IP with
-    // no re-resolution, exactly like the HTTP/1.1 path.
-    let ips = match resolve_checked(
-        ctx,
-        Proto::Https,
-        connect_host,
-        port,
-        Some(method.as_str()),
-        Some(&path),
-        deciding.as_ref(),
-    ) {
-        Ok(ips) => ips,
+    // Whether the stream may connect, asked of the supervisor where the HTTP/1.1 planes ask it: it
+    // decides again, resolves, and applies the SSRF guard against its own deciding rule (a
+    // private/metadata address is refused unless the rule names the exact host), and the
+    // connection this stream opens later names this check.
+    let asked = Asked::inspected(connect_host, port, method.as_str(), &path);
+    let checked = match check(ctx, pool, &asked).await {
+        Ok(checked) => checked,
         Err(refusal) => {
-            // The refusal is already recorded — the shared guard counts an SSRF block and logs a
-            // resolution failure, so this path answers the client and nothing else.
+            // Recorded where the answer came in; only the answer is written here.
             let _ = refuse(respond, refusal.status(), refusal.tag());
             return;
         }
@@ -400,7 +402,8 @@ async fn stream(
     relay(
         req,
         respond,
-        &ips,
+        &checked,
+        deciding.as_ref(),
         port,
         connect_host,
         method.as_str(),
@@ -468,13 +471,14 @@ fn upstream_uri(uri: http::Uri) -> Result<http::Uri, http::Error> {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Connect the checked upstream over HTTP/2 (validate cert, require ALPN `h2`) and relay the RPC —
-/// request headers + body, then the response headers + body + trailers (`grpc-status`). A
-/// pre-forward failure answers the client with a `502`; a mid-stream error just ends the stream.
+/// Connect the upstream `checked` cleared over HTTP/2 (validate cert, require ALPN `h2`) and relay
+/// the RPC: request headers + body, then the response headers + body + trailers (`grpc-status`).
+/// A pre-forward failure answers the client with a `502`; a mid-stream error just ends the stream.
 async fn relay(
     req: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
-    ips: &[IpAddr],
+    checked: &Checked,
+    deciding: Option<&Rule>,
     port: u16,
     host: &str,
     method: &str,
@@ -575,21 +579,18 @@ async fn relay(
     // and returned: several streams use it at once and none of them gives it back.
     //
     // Nothing about the decision is reused. The `:authority` re-check, the outbound tripwire, the
-    // verdict, the resolution and the address guard all ran above, per stream, and a stream that any
-    // of them refuses never reaches this line. What is reused is the handshake.
-    // Walked in order, like the HTTP/1.1 planes: `checked_address` passed the guard on every one
-    // of these, so moving on from an address that will not connect cannot reach one it refused.
-    // Written as a loop of its own because each attempt is awaited.
-    let mut attempt = Err("no permitted address for this host");
-    for ip in ips {
-        attempt = ready_upstream(pool, &injected_ids, *ip, port, host, ctx).await;
-        if attempt.is_ok() {
-            break;
-        }
-    }
-    let send_req = match attempt {
+    // verdict, and the supervisor's check (its own verdict, the resolution and the address guard)
+    // all ran above, per stream, and a stream that any of them refuses never reaches this line.
+    // What is reused is the handshake, and only to an address this stream's own connection could
+    // have reached.
+    let send_req = match ready_upstream(pool, &injected_ids, checked, deciding, ctx).await {
         Ok(send) => send,
-        Err(reason) => {
+        // Recorded where the supervisor's answer came in; only the answer is written here.
+        Err(Unopened::Refused(refusal)) => {
+            let _ = refuse(respond, refusal.status(), refusal.tag());
+            return;
+        }
+        Err(Unopened::Failed(reason)) => {
             refuse_upstream(respond, ctx, host, port, method, path, reason);
             return;
         }
@@ -789,7 +790,7 @@ async fn relay(
     // Stop sharing a connection the upstream has just bound an identity to — see
     // [`binds_identity_to_the_connection`].
     if binds_identity_to_the_connection(&rparts.headers) {
-        pool.open.borrow_mut().retain(|(k, _)| *k != injected_ids);
+        pool.open.borrow_mut().retain(|p| p.ids != injected_ids);
     }
 
     // Capture the response head, rendered from the framed status + headers. Teed ahead of the
@@ -1290,7 +1291,8 @@ fn redact_header_map(headers: &mut http::HeaderMap, needles: &[SecretNeedle]) {
 /// tunnel simply stops keeping it — the same stance the leaf cache takes.
 const MAX_POOLED: usize = 8;
 
-/// The upstream connections one tunnel has opened, shared by the streams riding it.
+/// The upstream side of one tunnel: the connections it has opened, shared by the streams riding
+/// it, and its turns at asking the supervisor for them.
 ///
 /// HTTP/2 multiplexes, so this is not the HTTP/1.1 pool's take-and-return: a connection is handed to
 /// every stream that may use it, all at once, and none of them gives it back. It lives exactly as
@@ -1299,16 +1301,47 @@ const MAX_POOLED: usize = 8;
 /// **Keyed by the injected credential set**, which is the whole of the HTTP/1.1 pool's key that is
 /// left once the host and port are fixed by the CONNECT. It is also the half that matters: a
 /// connection that carried a credential is never offered to a stream that does not receive the same
-/// one.
+/// one. Each connection keeps the address it reached, so it is offered only to a stream whose own
+/// connection could reach that address ([`pooled`]).
+///
+/// **One check and one opening at a time.** A connection of this proxy asks the supervisor one
+/// question at a time, and the supervisor answers at most twice the connection bound at once; a
+/// tunnel carries up to [`MAX_STREAMS`] streams, so its streams take turns rather than filling the
+/// supervisor for every other connection. Two turns rather than one, so a stream the pool serves,
+/// which only needs its check, never waits behind another stream's opening; and the opening turn
+/// covers the whole of it, handshakes included, so streams that arrive together share the one
+/// connection the first of them opens instead of each asking for its own.
 #[derive(Default)]
 struct UpstreamPool {
     // A `RefCell` rather than a lock: every stream of a tunnel runs on that tunnel's single
     // current-thread runtime. No borrow is ever held across an await.
-    open: std::cell::RefCell<Vec<(Vec<usize>, h2::client::SendRequest<Bytes>)>>,
+    open: std::cell::RefCell<Vec<Pooled>>,
+    /// The turn at asking whether a stream may connect.
+    checking: futures_util::lock::Mutex<()>,
+    /// The turn at opening a connection: asking the supervisor for it and completing its
+    /// handshakes.
+    opening: futures_util::lock::Mutex<()>,
 }
 
-/// A connection ready to carry this stream: the tunnel's, if it has one for this credential set,
-/// else a new one. `Err` carries the reason token the client is refused with.
+/// A connection a tunnel keeps: the credential set it was opened for, the address it reached, and
+/// the handle its streams are sent on.
+struct Pooled {
+    ids: Vec<usize>,
+    peer: IpAddr,
+    send: h2::client::SendRequest<Bytes>,
+}
+
+/// Why a stream has no upstream connection. The supervisor's refusals are recorded where its answer
+/// came in; a failure of this proxy's own (the handshakes) is the caller's to record.
+enum Unopened {
+    Refused(ConnectRefusal),
+    Failed(&'static str),
+}
+
+/// A connection ready to carry this stream: the tunnel's, if it has one for this credential set to
+/// an address this stream may reach, else a new one. A new one is opened under the tunnel's opening
+/// turn, and the pool is read again once the turn is had: the stream that held it may have just
+/// opened what this one needs.
 ///
 /// A pooled connection the far side closed while it sat idle only reveals that here — and here is
 /// **before** the request is handed over, because `ready` resolves on the connection and
@@ -1319,63 +1352,138 @@ struct UpstreamPool {
 async fn ready_upstream(
     pool: &UpstreamPool,
     ids: &[usize],
-    ip: IpAddr,
-    port: u16,
-    host: &str,
+    checked: &Checked,
+    deciding: Option<&Rule>,
     ctx: &ProxyCtx,
-) -> Result<h2::client::SendRequest<Bytes>, &'static str> {
+) -> Result<h2::client::SendRequest<Bytes>, Unopened> {
     // `[network] pool = false` means what it says on this plane too: a launch that asked for no
     // upstream reuse gets a connection per stream, as it did before this pool existed.
     if ctx.pool.is_none() {
-        return open_upstream(ip, port, host, ctx)
-            .await?
-            .ready()
-            .await
-            .map_err(|_| "upstream-closed");
+        let _turn = pool.opening.lock().await;
+        return open_upstream(checked, ctx).await.map(|(send, _)| send);
     }
+    let host = checked.asked.host.as_str();
+    if let Some(send) = pooled(pool, ids, host, deciding).await {
+        return Ok(send);
+    }
+    let _turn = pool.opening.lock().await;
+    if let Some(send) = pooled(pool, ids, host, deciding).await {
+        return Ok(send);
+    }
+    let (send, peer) = open_upstream(checked, ctx).await?;
+    // A connection whose address cannot be read carries its stream and is not kept: no later
+    // stream could be shown it may reach it.
+    if let Some(peer) = peer {
+        let mut open = pool.open.borrow_mut();
+        if open.len() < MAX_POOLED {
+            open.push(Pooled {
+                ids: ids.to_vec(),
+                peer,
+                send: send.clone(),
+            });
+        }
+    }
+    Ok(send)
+}
+
+/// The tunnel's connection for the credential set `ids`, ready for a stream to `host` its policy
+/// permitted by `deciding`: one whose address passes the guard this stream's own connection would,
+/// so a connection opened under a rule naming the host exactly is not handed to a stream a wildcard
+/// admitted. A kept connection that turns out closed is let go.
+async fn pooled(
+    pool: &UpstreamPool,
+    ids: &[usize],
+    host: &str,
+    deciding: Option<&Rule>,
+) -> Option<h2::client::SendRequest<Bytes>> {
     // Cloned out, and the borrow dropped, before anything is awaited.
-    let pooled = pool
+    let send = pool
         .open
         .borrow()
         .iter()
-        .find(|(k, _)| k == ids)
-        .map(|(_, send)| send.clone());
-    if let Some(send) = pooled {
-        match send.ready().await {
-            Ok(ready) => return Ok(ready),
-            Err(_) => pool.open.borrow_mut().retain(|(k, _)| k != ids),
+        .find(|p| p.ids == ids && ip_refusal(p.peer, host, deciding).is_none())
+        .map(|p| p.send.clone())?;
+    match send.ready().await {
+        Ok(ready) => Some(ready),
+        Err(_) => {
+            pool.open.borrow_mut().retain(|p| p.ids != ids);
+            None
         }
     }
-    let send = open_upstream(ip, port, host, ctx).await?;
-    {
-        let mut open = pool.open.borrow_mut();
-        if open.len() < MAX_POOLED {
-            open.push((ids.to_vec(), send.clone()));
-        }
-    }
-    send.ready().await.map_err(|_| "upstream-closed")
 }
 
-/// Open one validated HTTP/2 connection to the checked address: connect, terminate TLS with the
-/// certificate validated and ALPN `h2` required, then run the client handshake. `Err` carries the
-/// reason token, so a caller answers the same refusal whether the connection was opened for this
-/// stream or for the one before it.
+/// Open one validated HTTP/2 connection for the stream `checked` cleared, ready to carry it, and
+/// the address it reached. The TCP connection is the supervisor's, to an address its guard
+/// approved; this proxy completes the handshakes over it ([`handshaken`]). A handshake that fails
+/// moves on to the host's next address, as a dial that fails does: the supervisor says at which of
+/// how many addresses it connected, and is asked again from the one after. The failure reported is
+/// the last one.
 async fn open_upstream(
-    ip: IpAddr,
-    port: u16,
+    checked: &Checked,
+    ctx: &ProxyCtx,
+) -> Result<(h2::client::SendRequest<Bytes>, Option<IpAddr>), Unopened> {
+    let mut from = 0;
+    loop {
+        let (link, asked, id) = (Arc::clone(&ctx.link), checked.asked.clone(), checked.id);
+        let (tcp, at, of) = answer(ctx, &checked.asked, move || {
+            link.connect(&asked, Some(id), from)
+        })
+        .await
+        .map_err(Unopened::Refused)?;
+        let peer = tcp.peer_addr().ok().map(|addr| addr.ip());
+        match handshaken(tcp, &checked.asked.host, ctx).await {
+            Ok(send) => return Ok((send, peer)),
+            Err(_) if at + 1 < of => from = at + 1,
+            Err(reason) => return Err(Unopened::Failed(reason)),
+        }
+    }
+}
+
+/// Ask the supervisor whether the stream `asked` may connect, once the tunnel's checking turn is
+/// this stream's: the check the connection it opens will name, or why it may not.
+async fn check(
+    ctx: &ProxyCtx,
+    pool: &UpstreamPool,
+    asked: &Asked,
+) -> Result<Checked, ConnectRefusal> {
+    let _turn = pool.checking.lock().await;
+    let (link, question) = (Arc::clone(&ctx.link), asked.clone());
+    answer(ctx, asked, move || link.check(&question)).await
+}
+
+/// The supervisor's answer to a question `ask` puts about the request `asked`, waited for on a
+/// thread of the runtime's blocking pool so the tunnel's other streams go on meanwhile. A refusal
+/// is recorded where every plane's is ([`ProxyCtx::answered`]); a question whose thread could not
+/// give an answer (it panicked, or the runtime is shutting down) is one that did not reach the
+/// host.
+async fn answer<T: Send + 'static>(
+    ctx: &ProxyCtx,
+    asked: &Asked,
+    ask: impl FnOnce() -> Result<T, ConnectRefusal> + Send + 'static,
+) -> Result<T, ConnectRefusal> {
+    let answer = tokio::task::spawn_blocking(ask)
+        .await
+        .unwrap_or(Err(ConnectRefusal::Unreachable));
+    ctx.answered(asked, answer)
+}
+
+/// The HTTP/2 session to `host` over the supervisor's connection `tcp`, ready for a stream:
+/// terminate TLS with the certificate validated and ALPN `h2` required, then run the client
+/// handshake. `Err` carries the reason token, so a caller answers the same refusal whether the
+/// connection was opened for this stream or for the one before it.
+async fn handshaken(
+    tcp: std::net::TcpStream,
     host: &str,
     ctx: &ProxyCtx,
 ) -> Result<h2::client::SendRequest<Bytes>, &'static str> {
-    let tcp =
-        match tokio::time::timeout(ctx.timeout, tokio::net::TcpStream::connect((ip, port))).await {
-            Ok(Ok(t)) => {
-                // Nagle off, as on the HTTP/1.1 paths: h2 writes headers and DATA as separate
-                // frames, so the coalescing Nagle waits for is latency this plane adds per stream.
-                let _ = t.set_nodelay(true);
-                t
-            }
-            _ => return Err("upstream-unreachable"),
-        };
+    // Nagle off, as on the HTTP/1.1 paths: h2 writes headers and DATA as separate frames, so the
+    // coalescing Nagle waits for is latency this plane adds per stream.
+    let _ = tcp.set_nodelay(true);
+    // A connection this runtime cannot drive is one this stream did not reach.
+    let tcp = tcp
+        .set_nonblocking(true)
+        .and_then(|()| tokio::net::TcpStream::from_std(tcp))
+        .map_err(|_| "upstream-unreachable")?;
     let name = upstream_server_name(host).map_err(|_| "upstream-cert-rejected")?;
     let connector = tokio_rustls::TlsConnector::from(ctx.upstream_h2.clone());
     let upstream_tls = match tokio::time::timeout(ctx.timeout, connector.connect(name, tcp)).await {
@@ -1420,7 +1528,7 @@ async fn open_upstream(
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    Ok(send_req)
+    send_req.ready().await.map_err(|_| "upstream-closed")
 }
 
 /// Whether a response binds an authenticated identity to the **connection** rather than to the
@@ -2065,9 +2173,12 @@ mod tests {
 
     /// Drive ONE h2 stream through the real handler over an in-memory duplex and read back BOTH
     /// halves of the decision: what the client was told (the status and the `x-sbx-egress-reason`
-    /// token) and what the proxy recorded (the host's stats bucket, and the log events). The
-    /// resolver PANICS on purpose — a verdict is settled from the policy alone, so a refusal that
-    /// reaches a name lookup is a refusal that ran too late.
+    /// token) and what the proxy recorded (the host's stats bucket, and the log events). A verdict
+    /// is settled from the policy alone, so a refusal that reaches the supervisor's check ran too
+    /// late; the supervisor decides before it resolves, and answers a resolver that panics as a host
+    /// it could not reach, so such a refusal comes back under the supervisor's token rather than
+    /// its own, and the token is what these tests read. The resolver PANICS all the same, so one
+    /// that is reached says so.
     fn h2_verdict(
         policy: EgressPolicy,
         method: Method,
@@ -2581,6 +2692,23 @@ mod tests {
         crate::testutil::TmpDir,
     ) {
         use crate::allowlist::classify;
+
+        relaying_ctx_under(
+            upstream_ca,
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+        )
+    }
+
+    /// [`relaying_ctx`] under `policy`.
+    fn relaying_ctx_under(
+        upstream_ca: rustls::pki_types::CertificateDer<'static>,
+        policy: EgressPolicy,
+    ) -> (
+        ProxyCtx,
+        Arc<crate::sandbox::egress_stats::EgressStats>,
+        Arc<crate::sandbox::control::LogRing>,
+        crate::testutil::TmpDir,
+    ) {
         use crate::sandbox::control::{LOG_RING_CAP, LogRing};
         use crate::sandbox::egress_stats::EgressStats;
         use crate::testutil::TmpDir;
@@ -2588,17 +2716,14 @@ mod tests {
         let dir = TmpDir::new();
         let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
-        let mut ctx = ProxyCtx::new(
-            Arc::new(super::super::Ca::ephemeral().unwrap()),
-            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
-        )
-        .unwrap()
-        .with_events(crate::sandbox::proxy::events::for_log(
-            Arc::clone(&log),
-            Some(Arc::clone(&stats)),
-        ))
-        // loopback, permitted only because the deciding rule names this exact host
-        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        let mut ctx = ProxyCtx::new(Arc::new(super::super::Ca::ephemeral().unwrap()), policy)
+            .unwrap()
+            .with_events(crate::sandbox::proxy::events::for_log(
+                Arc::clone(&log),
+                Some(Arc::clone(&stats)),
+            ))
+            // loopback, permitted only because the deciding rule names this exact host
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
         ctx.upstream_h2 = trusting_h2(upstream_ca);
         (ctx, stats, log, dir)
     }
@@ -2828,7 +2953,7 @@ mod tests {
     }
 
     /// Several streams over **one** tunnel, answered in order — the shape a multiplexing client
-    /// actually has, and the only way to see what the tunnel's upstream pool does.
+    /// actually has, and a way to see what the tunnel's upstream pool does one stream at a time.
     ///
     /// Both legs run through the real handler and on to whatever upstream `ctx` points at: the
     /// client leg over an in-memory duplex, the proxy leg driven exactly as [`serve`] drives it.
@@ -4064,6 +4189,566 @@ mod tests {
         assert!(
             flows.snapshot().is_empty(),
             "and the row is gone once the stream closes"
+        );
+    }
+
+    /// Several streams over one tunnel, each sent at its own offset from the start whether or not
+    /// the ones before it were answered, and read back as each one's status and how long its answer
+    /// took from the moment it was sent. The shape in which the streams of a tunnel overlap, which
+    /// [`through_h2_proxy_streams`] never produces since it waits for each answer before sending the
+    /// next request.
+    fn through_h2_proxy_at(
+        ctx: &ProxyCtx,
+        connect_host: &str,
+        port: u16,
+        requests: Vec<(std::time::Duration, Request<()>)>,
+    ) -> Vec<(StatusCode, std::time::Duration)> {
+        use std::time::Duration;
+        let _settle = super::super::events::Settle(ctx.events.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+            let client = async {
+                let (send, conn) = h2::client::handshake(client_io).await.unwrap();
+                let driver = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let started = tokio::time::Instant::now();
+                let streams: Vec<_> = requests
+                    .into_iter()
+                    .map(|(at, request)| {
+                        let send = send.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep_until(started + at).await;
+                            let sent = tokio::time::Instant::now();
+                            let mut send = send.ready().await.unwrap();
+                            let (answer, _) = send.send_request(request, true).unwrap();
+                            let (parts, mut recv) = answer.await.unwrap().into_parts();
+                            while let Some(chunk) = recv.data().await {
+                                let _ = recv.flow_control().release_capacity(chunk.unwrap().len());
+                            }
+                            let _ = recv.trailers().await;
+                            (parts.status, sent.elapsed())
+                        })
+                    })
+                    .collect();
+                let mut answers = Vec::new();
+                for stream in streams {
+                    answers.push(stream.await.unwrap());
+                }
+                driver.abort();
+                answers
+            };
+            let proxy = async {
+                let mut conn = h2::server::handshake(server_io).await.unwrap();
+                let pool = UpstreamPool::default();
+                let mut inflight = FuturesUnordered::new();
+                loop {
+                    tokio::select! {
+                        accepted = conn.accept() => match accepted {
+                            Some(Ok((req, respond))) => inflight.push(
+                                stream(req, respond, connect_host, port, ctx, &pool),
+                            ),
+                            _ => break,
+                        },
+                        Some(()) = inflight.next(), if !inflight.is_empty() => {}
+                    }
+                }
+                while inflight.next().await.is_some() {}
+            };
+            tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::select! {
+                    answer = client => answer,
+                    () = proxy => panic!("the proxy leg ended before the client had its answers"),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the h2 exchange stalled"))
+        })
+    }
+
+    /// [`through_h2_proxy_at`] with every stream sent at once, read back as their statuses.
+    fn through_h2_proxy_at_once(
+        ctx: &ProxyCtx,
+        connect_host: &str,
+        port: u16,
+        requests: Vec<Request<()>>,
+    ) -> Vec<StatusCode> {
+        let at_once = requests
+            .into_iter()
+            .map(|request| (std::time::Duration::ZERO, request))
+            .collect();
+        through_h2_proxy_at(ctx, connect_host, port, at_once)
+            .into_iter()
+            .map(|(status, _)| status)
+            .collect()
+    }
+
+    /// A listener on `ip:port` whose accept queue is full, so a connection to it is never
+    /// answered: the kernel drops the SYN of a listener with no room, and the dial waits out its
+    /// bound. The first return value keeps the queue full for as long as it lives.
+    fn unanswering_at(ip: [u8; 4], port: u16) -> (std::os::fd::OwnedFd, std::net::TcpStream) {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // SAFETY: plain socket creation; the descriptor is owned at once.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        // SAFETY: `fd` was just returned by `socket` and is owned by nothing else.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(ip),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: `addr` is a valid `sockaddr_in` of the length given.
+        let bound = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                (&raw const addr).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(bound, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: `fd` is a bound stream socket.
+        assert_eq!(unsafe { libc::listen(fd.as_raw_fd(), 0) }, 0);
+        let filler = std::net::TcpStream::connect((IpAddr::from(ip), port)).unwrap();
+        (fd, filler)
+    }
+
+    /// Streams of one tunnel that arrive together share the one connection the first of them opens,
+    /// when the launch reuses connections, and each opens its own when it does not. The host's first
+    /// address never answers, so the first opening waits out the dial bound while the others wait
+    /// for their turn: the overlap the opening turn is there for, and the pool is read again once
+    /// it is theirs.
+    #[test]
+    fn streams_that_arrive_together_share_the_first_opening_when_connections_are_reused() {
+        use crate::allowlist::classify;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            8,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let _stalled = unanswering_at([127, 0, 0, 2], addr.port());
+        for (reuse, connections) in [(true, 1), (false, 3)] {
+            let mut ctx = ProxyCtx::new(
+                Arc::new(super::super::Ca::ephemeral().unwrap()),
+                EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]).with_pool(reuse),
+            )
+            .unwrap()
+            .with_timeout(Duration::from_millis(200))
+            .with_resolver(Box::new(|_| {
+                Ok(vec![
+                    IpAddr::from([127, 0, 0, 2]),
+                    IpAddr::from([127, 0, 0, 1]),
+                ])
+            }));
+            ctx.upstream_h2 = trusting_h2(upstream_ca.clone());
+            let before = trace.upstream_tcp.load(Ordering::SeqCst);
+            let statuses = through_h2_proxy_at_once(
+                &ctx,
+                "grpc.test",
+                addr.port(),
+                (0..3).map(|_| grpc_request(&[])).collect(),
+            );
+            assert_eq!(statuses, [StatusCode::OK; 3], "pool = {reuse}");
+            assert_eq!(
+                trace.upstream_tcp.load(Ordering::SeqCst) - before,
+                connections,
+                "pool = {reuse}"
+            );
+        }
+    }
+
+    /// A stream the tunnel's pool serves does not wait for another stream's opening: the check it
+    /// needs has a turn of its own. The first stream opens a connection and it is kept; the second
+    /// receives a credential the first did not, so it opens its own, and waits out a dial to an
+    /// address that never answers; the third, sent meanwhile, rides the kept connection.
+    #[test]
+    fn a_stream_the_pool_serves_does_not_wait_for_another_streams_opening() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::HeaderInjection;
+        use std::time::Duration;
+        let request = |path: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("https://grpc.test{path}"))
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap()
+        };
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            4,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let _stalled = unanswering_at([127, 0, 0, 2], addr.port());
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx
+            .with_timeout(Duration::from_secs(1))
+            .with_resolver(Box::new(|_| {
+                Ok(vec![
+                    IpAddr::from([127, 0, 0, 2]),
+                    IpAddr::from([127, 0, 0, 1]),
+                ])
+            }))
+            .with_injections(vec![HeaderInjection::fixed(
+                classify("grpc.test:*/pkg.Svc/Secret").unwrap(),
+                "authorization".to_string(),
+                "Bearer sbx-issued".to_string(),
+            )]);
+        let answers = through_h2_proxy_at(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            vec![
+                (Duration::ZERO, request("/pkg.Svc/Method")),
+                (Duration::from_millis(1200), request("/pkg.Svc/Secret")),
+                (Duration::from_millis(1300), request("/pkg.Svc/Method")),
+            ],
+        );
+        assert!(
+            answers.iter().all(|(status, _)| *status == StatusCode::OK),
+            "{answers:?} {}",
+            trace.render()
+        );
+        assert!(
+            answers[1].1 >= Duration::from_secs(1),
+            "the second stream's opening waited out the dial: {answers:?}"
+        );
+        // Wide of both: sent a tenth of a second into the second stream's dial, the third would
+        // otherwise wait out the rest of it.
+        assert!(
+            answers[2].1 < Duration::from_millis(600),
+            "the third stream was answered while the second was still opening: {answers:?}"
+        );
+    }
+
+    /// A tunnel puts at most one check and one opening to the supervisor at a time, which is what
+    /// the supervisor's bound allows a connection of this proxy. With a judge answering two
+    /// questions at once, three streams whose checks are slow and whose first opening waits out a
+    /// dial all get their answer, and none is refused busy.
+    #[test]
+    fn a_tunnel_asks_the_supervisor_one_check_and_one_opening_at_a_time() {
+        use crate::allowlist::classify;
+        use std::time::Duration;
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            8,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let _stalled = unanswering_at([127, 0, 0, 2], addr.port());
+        let policy = EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]);
+        let judge = super::super::link::Judge::new(&policy.encode().unwrap())
+            .unwrap()
+            .with_cap(2);
+        judge.set_resolver(Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(vec![
+                IpAddr::from([127, 0, 0, 2]),
+                IpAddr::from([127, 0, 0, 1]),
+            ])
+        }));
+        judge.set_timeout(Duration::from_millis(200));
+        let (link, _) = super::super::link::joined(Arc::new(judge), None, None);
+        let (ctx, _stats, log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx.with_control(link);
+        let statuses = through_h2_proxy_at_once(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            (0..3).map(|_| grpc_request(&[])).collect(),
+        );
+        assert_eq!(statuses, [StatusCode::OK; 3], "{}", trace.render());
+        assert!(
+            log.snapshot(None, None, false)
+                .events
+                .iter()
+                .all(|e| e.reason != "supervisor-busy")
+        );
+    }
+
+    /// The supervisor's copy of the policy is the last word on a stream's connection too: one that
+    /// is ahead of the proxy's (a `--session` deny sent and not yet installed) refuses a stream the
+    /// proxy admitted, under its own reason and counted as a denial, before the credentials the
+    /// stream carries are learned and before the upstream is reached.
+    #[test]
+    fn a_stream_the_supervisors_copy_refuses_is_refused_before_anything_else() {
+        use crate::allowlist::classify;
+        use std::sync::atomic::Ordering;
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let (ctx, stats, log, _dir) = relaying_ctx(upstream_ca);
+        ctx.link.judge().unwrap().sent(
+            1,
+            &super::super::link::Overlay {
+                deny: vec![classify("grpc.test:*").unwrap()],
+                ..super::super::link::Overlay::default()
+            },
+        );
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[("authorization", "Bearer learned-only-once-cleared")]),
+            None,
+            &trace,
+        );
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{}", trace.render());
+        assert_eq!(
+            answer.header("x-sbx-egress-reason"),
+            Some("supervisor-denied")
+        );
+        assert_eq!(
+            stats
+                .snapshot()
+                .get("grpc.test")
+                .copied()
+                .unwrap_or_default(),
+            Counts {
+                deny: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            log.snapshot(None, None, false)
+                .events
+                .iter()
+                .map(|e| (e.verdict, e.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(LogVerdict::Deny, "supervisor-denied")]
+        );
+        assert!(
+            !ctx.credentials
+                .snapshot()
+                .needles
+                .iter()
+                .any(|n| n.as_bytes() == b"learned-only-once-cleared"),
+            "a stream refused at its check teaches nothing"
+        );
+        assert_eq!(trace.upstream_tcp.load(Ordering::Relaxed), 0);
+    }
+
+    /// A host whose first address takes the connection and then fails the TLS handshake is reached
+    /// at its second on this plane too, and resolved once: the supervisor opens the connections and
+    /// the proxy completes the handshakes, so a failed one asks again from the next address of the
+    /// list the stream's check kept, and leaves nothing behind.
+    #[test]
+    fn a_host_whose_first_address_fails_its_handshake_is_reached_at_its_second() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let not_tls = super::super::tests::refuse_tls_at([127, 0, 0, 2], addr.port());
+        let resolved = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&resolved);
+        let (ctx, _stats, log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx.with_resolver(Box::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![
+                IpAddr::from([127, 0, 0, 2]),
+                IpAddr::from([127, 0, 0, 1]),
+            ])
+        }));
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[]),
+            None,
+            &trace,
+        );
+        assert_eq!(answer.status, StatusCode::OK, "{}", trace.render());
+        assert_eq!(not_tls.load(Ordering::SeqCst), 1);
+        assert_eq!(trace.upstream_tcp.load(Ordering::Relaxed), 1);
+        assert_eq!(resolved.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            log.snapshot(None, None, false)
+                .events
+                .iter()
+                .map(|e| (e.verdict, e.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(LogVerdict::Allow, "allowed")]
+        );
+    }
+
+    /// A stream no address serves is refused once, under the last failure, whichever kind it was:
+    /// the handshakes that failed before the last address leave nothing behind.
+    #[test]
+    fn a_stream_no_address_serves_leaves_one_line_naming_the_last_failure() {
+        let trace = Arc::new(H2Trace::default());
+        // Only its port is used: no address below is the upstream's.
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let _first = super::super::tests::refuse_tls_at([127, 0, 0, 2], addr.port());
+        let _second = super::super::tests::refuse_tls_at([127, 0, 0, 3], addr.port());
+        // 127.0.0.4 has nothing listening on the port, so its dial is refused.
+        for (last, reason) in [
+            ([127, 0, 0, 3], "upstream-cert-rejected"),
+            ([127, 0, 0, 4], "upstream-unreachable"),
+        ] {
+            let (ctx, _stats, log, _dir) = relaying_ctx(upstream_ca.clone());
+            let ctx = ctx.with_resolver(Box::new(move |_| {
+                Ok(vec![IpAddr::from([127, 0, 0, 2]), IpAddr::from(last)])
+            }));
+            let answer = through_h2_proxy(
+                &ctx,
+                "grpc.test",
+                addr.port(),
+                grpc_request(&[]),
+                None,
+                &trace,
+            );
+            assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{reason}");
+            assert_eq!(answer.header("x-sbx-egress-reason"), Some(reason));
+            assert_eq!(
+                log.snapshot(None, None, false)
+                    .events
+                    .iter()
+                    .map(|e| (e.verdict, e.reason.as_str()))
+                    .collect::<Vec<_>>(),
+                [(LogVerdict::Error, reason)]
+            );
+        }
+    }
+
+    /// A kept connection is handed only to a stream whose own connection could reach the address it
+    /// is connected to. The first stream is admitted by a rule naming the host, which opens a
+    /// private address, and leaves its connection kept; the second is admitted by a wildcard, which
+    /// does not, while the host now resolves to a public address. The second passes the
+    /// supervisor's check, and must not ride the connection the first left.
+    #[test]
+    fn a_kept_connection_to_an_address_the_stream_may_not_reach_is_not_shared() {
+        use crate::allowlist::classify;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            2,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx_under(
+            upstream_ca,
+            EgressPolicy::new(
+                vec![
+                    classify("{GET} grpc.test:*").unwrap(),
+                    classify("*.test:*").unwrap(),
+                ],
+                vec![],
+            ),
+        );
+        let resolved = AtomicUsize::new(0);
+        let ctx = ctx
+            // The public address is never answered here: the dial gives up on this bound.
+            .with_timeout(Duration::from_millis(300))
+            .with_resolver(Box::new(move |_| {
+                Ok(vec![if resolved.fetch_add(1, Ordering::SeqCst) == 0 {
+                    IpAddr::from([127, 0, 0, 1])
+                } else {
+                    IpAddr::from([1, 2, 3, 4])
+                }])
+            }));
+        let get = Request::builder()
+            .method(Method::GET)
+            .uri("https://grpc.test/pkg.Svc/Method")
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let answers = through_h2_proxy_streams(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            vec![(get, None), (grpc_request(&[]), None)],
+            &trace,
+        );
+        assert_eq!(answers[0].status, StatusCode::OK, "{}", trace.render());
+        assert_eq!(answers[1].status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            trace.seen.lock().unwrap().len(),
+            1,
+            "the second stream never reached the connection the first left"
+        );
+    }
+
+    /// A tunnel that ends with a question in flight holds on until the supervisor has answered it:
+    /// the runtime it ran on waits for the question when it is dropped, so a connection this proxy
+    /// no longer counts has nothing left in the supervisor's count either.
+    #[test]
+    fn a_tunnel_that_ends_mid_question_waits_for_the_answer() {
+        use crate::allowlist::classify;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let answered = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&answered);
+        let ctx = ProxyCtx::new(
+            Arc::new(super::super::Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+        )
+        .unwrap()
+        .with_resolver(Box::new(move |_| {
+            std::thread::sleep(Duration::from_millis(300));
+            seen.store(true, Ordering::SeqCst);
+            Ok(vec![IpAddr::from([127, 0, 0, 1])])
+        }));
+        let pool = UpstreamPool::default();
+        let asked = Asked::inspected("grpc.test", 443, "POST", "/");
+        let rt = runtime().unwrap();
+        let ended = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(20), check(&ctx, &pool, &asked)).await
+        });
+        assert!(ended.is_err(), "the tunnel ended while its check was out");
+        drop(rt);
+        assert!(answered.load(Ordering::SeqCst));
+    }
+
+    /// A question whose thread gives no answer (it panicked, or the runtime is going away) is one
+    /// that did not reach the host: refused as unreachable, and recorded once.
+    #[test]
+    fn a_question_whose_thread_gives_no_answer_is_one_unreachable_line() {
+        let ca = super::super::Ca::ephemeral().unwrap().ca_cert_der();
+        let (ctx, _stats, log, _dir) = relaying_ctx(ca);
+        let asked = Asked::inspected("grpc.test", 443, "POST", "/");
+        let got = runtime()
+            .unwrap()
+            .block_on(answer(&ctx, &asked, || -> Result<(), _> {
+                panic!("a question that gives no answer")
+            }));
+        assert_eq!(got, Err(ConnectRefusal::Unreachable));
+        ctx.events.as_ref().unwrap().flush();
+        assert_eq!(
+            log.snapshot(None, None, false)
+                .events
+                .iter()
+                .map(|e| (e.verdict, e.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(LogVerdict::Error, "upstream-unreachable")]
         );
     }
 }

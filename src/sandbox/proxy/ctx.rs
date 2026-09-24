@@ -1,7 +1,7 @@
 //! The proxy's running context and the policy it evaluates against.
 //!
 //! [`ProxyCtx`] holds the cert machinery, the upstream-validation configs, the resolved (and
-//! built-in-augmented) egress policy, the name resolver, the per-socket timeout, the host-side
+//! built-in-augmented) egress policy, the per-socket timeout, the host-side
 //! credential injections and redaction needles, and the live control/stats/log/flow handles a
 //! launch attaches. [`union_with_builtin`] augments a user policy with the always-on self-equip
 //! allow-set, and [`effective_policy`] folds a live `--session` overlay onto the config policy, by
@@ -19,7 +19,6 @@ use crate::sandbox::control::SecretWay;
 use crate::sandbox::egress_stats::StatKind;
 
 use super::ca::{Ca, CertResolver, ensure_provider, upstream_config, upstream_config_h2};
-use super::dns::{SharedResolver, caching_resolver};
 use super::inject::Credentials;
 #[cfg(test)]
 use super::inject::{HeaderInjection, SecretNeedle};
@@ -101,9 +100,6 @@ pub(crate) struct ProxyCtx {
     /// so the proxy negotiates HTTP/2 with the real gRPC server (validated against the same roots).
     pub(super) upstream_h2: Arc<ClientConfig>,
     pub(super) policy: EgressPolicy,
-    /// The name resolver of the one plane that still resolves for itself, HTTP/2. Every other
-    /// plane's connections are the supervisor's, which resolves with its own.
-    pub(super) resolve: SharedResolver,
     pub(super) timeout: Duration,
     /// The live credential state: the injections to apply and the needles to scan for, as one
     /// unit. Shared between the connection threads, and replaced whole when the supervisor hands
@@ -115,8 +111,9 @@ pub(crate) struct ProxyCtx {
     /// the supervisor queues for the control socket ([`crate::sandbox::control`]) and holds to its
     /// own cap and timeout; and every upstream connection, which the supervisor checks and opens
     /// ([`super::link::Link::check`], [`super::link::Link::connect`]). The launch builds the proxy
-    /// on its end ([`Self::linked`]) and serves the other.
-    pub(super) link: super::link::Link,
+    /// on its end ([`Self::linked`]) and serves the other. Shared, so the HTTP/2 plane can wait for
+    /// an answer on a thread of its own ([`super::h2mitm`]).
+    pub(super) link: Arc<Link>,
     /// Whether the launch announces a parked request on stderr (`[network] ask_notice`), which the
     /// supervisor does. Read here for what follows a denied ask: the person was already shown that
     /// request, so its refusal is not announced a second time ([`refusal_block`]). Off by default
@@ -220,15 +217,6 @@ impl ProxyCtx {
         server_config_h2.alpn_protocols = vec![b"h2".to_vec()];
         let server_config_h2 = Arc::new(server_config_h2);
         let policy = union_with_builtin(user_policy);
-        // The proxy re-resolves per request; a long build fetching one host thousands of times would
-        // re-hit the resolver each time (and any hiccup fails a fetch). A short-TTL cache resolves
-        // each host once and reuses it — tunable via `[network] dns_cache_ttl`, where `0` disables
-        // the cache and an unset field takes the named default.
-        let resolve: SharedResolver = Arc::from(caching_resolver(
-            policy
-                .dns_cache_ttl()
-                .unwrap_or(crate::allowlist::DEFAULT_DNS_CACHE_TTL),
-        ));
         // Built only when the launch asks for reuse, so a launch that does not is byte-for-byte the
         // connection-per-request path and cannot inherit any of reuse's failure modes.
         // Both resolved once, here, so every place that asks reads the same answer.
@@ -253,7 +241,6 @@ impl ProxyCtx {
             upstream: upstream_config(),
             upstream_h2: upstream_config_h2(),
             policy,
-            resolve,
             timeout: UPSTREAM_TIMEOUT,
             // Empty, and on the built-in floor: a launch with credentials replaces this wholesale
             // with the set it resolved (and that set's own floor) through `with_shared_credentials`.
@@ -263,7 +250,7 @@ impl ProxyCtx {
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
                 Vec::new(),
             )),
-            link,
+            link: Arc::new(link),
             notices: false,
             events: None,
             flows: None,
@@ -610,9 +597,7 @@ impl ProxyCtx {
     /// refusal is recorded here, once, the way the proxy's own resolution and address guard recorded
     /// it: the plane only answers it.
     pub(super) fn check(&self, asked: &Asked) -> Result<Checked, ConnectRefusal> {
-        self.link
-            .check(asked)
-            .inspect_err(|refusal| self.refused(asked, *refusal))
+        self.answered(asked, self.link.check(asked))
     }
 
     /// Ask the supervisor for a connection for the request `asked`, cleared by the check named
@@ -625,16 +610,23 @@ impl ProxyCtx {
         check: Option<u64>,
         from: usize,
     ) -> Result<(std::net::TcpStream, usize, usize), ConnectRefusal> {
-        let (stream, at, of) = self
-            .link
-            .connect(asked, check, from)
-            .inspect_err(|refusal| self.refused(asked, *refusal))?;
+        let (stream, at, of) = self.answered(asked, self.link.connect(asked, check, from))?;
         let _ = stream.set_read_timeout(Some(self.timeout));
         let _ = stream.set_write_timeout(Some(self.timeout));
         // Nagle off. Every relay here writes a head and then a body, and on a connection that stays
         // open the second write would wait for the delayed ACK of the first.
         let _ = stream.set_nodelay(true);
         Ok((stream, at, of))
+    }
+
+    /// The supervisor's `answer` to the request `asked`, a refusal recorded on its way through: the
+    /// one place a plane's connection is turned down, whichever plane asked and however it waited.
+    pub(super) fn answered<T>(
+        &self,
+        asked: &Asked,
+        answer: Result<T, ConnectRefusal>,
+    ) -> Result<T, ConnectRefusal> {
+        answer.inspect_err(|refusal| self.refused(asked, *refusal))
     }
 
     /// Record the refusal the supervisor gave the request `asked`: an error when the policy said yes
@@ -749,14 +741,11 @@ impl ProxyCtx {
 #[cfg(test)]
 impl ProxyCtx {
     /// Replace the name resolver, so a test can map a host to a fixed address deterministically:
-    /// the supervisor's, which resolves for every connection it opens, and this proxy's own, which
-    /// the HTTP/2 plane still resolves with.
-    pub(super) fn with_resolver(mut self, resolve: super::dns::Resolver) -> Self {
-        let resolve: SharedResolver = Arc::from(resolve);
+    /// the supervisor's, which resolves for every connection it opens.
+    pub(super) fn with_resolver(self, resolve: super::dns::Resolver) -> Self {
         if let Some(judge) = self.link.judge() {
-            judge.set_resolver(Arc::clone(&resolve));
+            judge.set_resolver(Arc::from(resolve));
         }
-        self.resolve = resolve;
         self
     }
 
@@ -774,7 +763,7 @@ impl ProxyCtx {
     /// unless the policy suppressed them (`[network] ask_notice = false`), as the launch's
     /// [`ProxyCtx::linked`] does.
     pub(crate) fn with_control(mut self, link: Link) -> Self {
-        self.link = link;
+        self.link = Arc::new(link);
         self.notices = self.policy.ask_notice();
         self
     }
@@ -813,14 +802,14 @@ impl ProxyCtx {
             notices: false,
             ..self.parks(pending)
         };
-        self.link = super::link::joined(self.judge(), Some(parks), None).0;
+        self.link = Arc::new(super::link::joined(self.judge(), Some(parks), None).0);
         self
     }
 
     /// Serve this proxy's requests to re-resolve its credentials with `refresh`, the supervisor's
     /// side, as the launch does.
     pub(super) fn with_refresh(mut self, refresh: Arc<super::inject::CredentialRefresh>) -> Self {
-        self.link = super::link::joined(self.judge(), None, Some(refresh)).0;
+        self.link = Arc::new(super::link::joined(self.judge(), None, Some(refresh)).0);
         self
     }
 
@@ -833,7 +822,7 @@ impl ProxyCtx {
         manual
             .attach(supervisor)
             .expect("a proxy just joined confirms the rules already held");
-        self.link = link;
+        self.link = Arc::new(link);
         self
     }
 }

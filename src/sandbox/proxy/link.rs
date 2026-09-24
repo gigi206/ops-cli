@@ -38,7 +38,8 @@
 //! whether the request may connect ([`Link::check`]), and where it would dial it asks for the
 //! connection ([`Link::connect`]), which crosses as a descriptor. The supervisor answers both from
 //! its own copy of what the decision reads ([`Judge`]), each on a thread of its own and no more of
-//! them at once than the policy's connection bound: the reader never waits on a name or a dial.
+//! them at once than twice the policy's connection bound (a connection of the proxy asks one at a
+//! time, an HTTP/2 tunnel two): the reader never waits on a name or a dial.
 
 mod judge;
 mod wire;

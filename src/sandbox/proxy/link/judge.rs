@@ -93,12 +93,32 @@ impl Asked {
             plane: Plane::Splice,
         }
     }
+}
 
-    /// Whether `other` asks about the same destination under the same decision.
-    fn same_destination(&self, other: &Asked) -> bool {
-        self.host == other.host
-            && self.port == other.port
-            && std::mem::discriminant(&self.plane) == std::mem::discriminant(&other.plane)
+/// Where a request goes, and under which of the policy's decisions: what a connection has to share
+/// with the check it names. Kept in place of the request itself, whose method and path the check no
+/// longer needs once it is answered, so a record holds a name that resolved and not a path the
+/// caller chose the length of.
+struct Destination {
+    host: String,
+    port: u16,
+    plane: std::mem::Discriminant<Plane>,
+}
+
+impl Destination {
+    fn of(asked: &Asked) -> Self {
+        Destination {
+            host: asked.host.clone(),
+            port: asked.port,
+            plane: std::mem::discriminant(&asked.plane),
+        }
+    }
+
+    /// Whether `asked` goes here under the same decision.
+    fn holds(&self, asked: &Asked) -> bool {
+        self.host == asked.host
+            && self.port == asked.port
+            && self.plane == std::mem::discriminant(&asked.plane)
     }
 }
 
@@ -138,7 +158,7 @@ struct Grant {
 /// What a check found: the addresses its host resolved to, and whether it took an operator's allow.
 struct Kept {
     id: u64,
-    asked: Asked,
+    destination: Destination,
     ips: Vec<IpAddr>,
     granted: bool,
     at: Instant,
@@ -155,17 +175,25 @@ impl Drop for Serving {
 
 impl Judge {
     /// A judge over the policy `bytes` encode, with the resolver, the dial bound and the cap that
-    /// policy sets.
+    /// policy sets: twice its connection bound.
     pub(crate) fn new(bytes: &[u8]) -> io::Result<Self> {
         let policy = crate::sandbox::proxy::union_with_builtin(EgressPolicy::decode(bytes)?);
+        // Every request is resolved again, and a long build fetching one host thousands of times
+        // would hit the resolver each time (and any hiccup fails a fetch). A short-TTL cache
+        // resolves each host once and reuses it: `[network] dns_cache_ttl`, where `0` disables the
+        // cache and an unset field takes the named default.
         let resolve = caching_resolver(
             policy
                 .dns_cache_ttl()
                 .unwrap_or(crate::allowlist::DEFAULT_DNS_CACHE_TTL),
         );
+        // Twice the proxy's own connection bound: a connection of an honest proxy asks one question
+        // at a time, and an HTTP/2 tunnel two (a stream's check beside another's connection), so an
+        // honest proxy never meets this bound.
         let cap = policy
             .max_connections()
-            .unwrap_or(crate::allowlist::DEFAULT_MAX_CONNECTIONS);
+            .unwrap_or(crate::allowlist::DEFAULT_MAX_CONNECTIONS)
+            .saturating_mul(2);
         Ok(Judge {
             policy,
             overlay: RwLock::new((0, Arc::new(Overlay::default()))),
@@ -237,7 +265,7 @@ impl Judge {
         }
         kept.push_back(Kept {
             id,
-            asked: asked.clone(),
+            destination: Destination::of(asked),
             ips,
             granted,
             at: Instant::now(),
@@ -259,7 +287,7 @@ impl Judge {
             locked(&self.kept)
                 .iter()
                 .find(|k| {
-                    k.id == id && k.asked.same_destination(asked) && k.at.elapsed() < self.grant_ttl
+                    k.id == id && k.destination.holds(asked) && k.at.elapsed() < self.grant_ttl
                 })
                 .map(|k| (k.ips.clone(), k.granted))
         });
@@ -445,6 +473,57 @@ mod tests {
         assert!(judge.connect(&asked, Some(1), 0).is_ok());
     }
 
+    /// A connection takes from the check it names only what that check was for: named by a
+    /// connection to another host, port or plane, the check gives neither the operator's allow it
+    /// took nor the addresses it found, which are resolved again.
+    #[test]
+    fn a_check_gives_nothing_to_a_connection_for_another_destination() {
+        let (_listener, port) = listening(LOOPBACK);
+        let judge_asking = judge(&[], DefaultAction::Ask, vec![IpAddr::from(LOOPBACK)]);
+        judge_asking.grant("api.test", port);
+        let asked = Asked::inspected("api.test", port, "GET", "/");
+        assert_eq!(judge_asking.check(1, &asked), Ok(()));
+        assert_eq!(
+            judge_asking
+                .connect(
+                    &Asked::inspected("other.test", port, "GET", "/"),
+                    Some(1),
+                    0
+                )
+                .map(|_| ()),
+            Err(ConnectRefusal::Supervisor),
+            "an allow taken for one host is not another's"
+        );
+
+        let splice = format!("tcp://api.test:{port}");
+        // Named exactly, so the loopback address each resolves to is one it may reach.
+        let judge = judge(
+            &["api.test:*", "other.test:*", &splice],
+            DefaultAction::Deny,
+            vec![],
+        );
+        let resolved = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&resolved);
+        judge.set_resolver(Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![IpAddr::from(LOOPBACK)])
+        }));
+        assert_eq!(judge.check(1, &asked), Ok(()));
+        for other in [
+            Asked::inspected("other.test", port, "GET", "/"),
+            Asked::inspected("api.test", port.wrapping_add(1), "GET", "/"),
+            Asked::splice("api.test", port),
+        ] {
+            let before = resolved.load(Ordering::SeqCst);
+            let _ = judge.connect(&other, Some(1), 0);
+            assert_eq!(
+                resolved.load(Ordering::SeqCst),
+                before + 1,
+                "addresses found for one destination are not another's: {other:?}"
+            );
+        }
+    }
+
     /// A request left to an operator that no operator allowed is refused, checked or not.
     #[test]
     fn a_request_left_to_an_operator_that_none_allowed_is_refused() {
@@ -583,6 +662,18 @@ mod tests {
                 .connect(&Asked::splice("127.0.0.1", port), None, 0)
                 .is_ok()
         );
+    }
+
+    /// The judge answers twice the policy's connection bound at once: a connection of an honest
+    /// proxy asks one question at a time and an HTTP/2 tunnel two, so an honest proxy never meets
+    /// it.
+    #[test]
+    fn the_cap_is_twice_the_connection_bound() {
+        let policy = EgressPolicy::default().with_max_connections(Some(3));
+        let judge = Arc::new(Judge::new(&policy.encode().unwrap()).unwrap());
+        let held: Vec<Serving> = (0..6).map(|_| judge.enter().expect("room")).collect();
+        assert!(judge.enter().is_none(), "no room past twice the bound");
+        drop(held);
     }
 
     /// No more questions are answered at once than the cap, and one that ends makes room.

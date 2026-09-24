@@ -1218,11 +1218,9 @@ async fn one_h2_stream(send: &mut h2::client::SendRequest<bytes::Bytes>, host: &
 /// The four rows are the same work with those two removed one at a time. Direct means no proxy, so
 /// the pair of direct rows prices an h2 connection on this machine and shows what multiplexing is
 /// worth when nothing is in the middle. Through the proxy, reusing the tunnel removes the client
-/// leg — and only the client leg. This plane opens a TCP connection, a TLS handshake and an h2
-/// handshake **for every stream it relays**, multiplexed or not, because it has no upstream pool
-/// (the HTTP/1.1 path does, which is what its own pooled row prices). What stays in the last row is
-/// therefore that per-stream upstream connection, which no amount of client-side multiplexing folds
-/// away.
+/// leg, and the tunnel's pool removes the upstream one: the streams of one tunnel ride the
+/// connection the first of them opened. What stays in the last row is the work each stream is
+/// given on its own, the verdict, the supervisor's check and the relay.
 #[test]
 #[ignore = "a measurement, not an assertion: run explicitly, in release"]
 fn h2_stream_cost() {
@@ -1246,8 +1244,8 @@ fn h2_stream_cost() {
             REQUESTS,
         ),
     ] {
-        // One upstream connection per stream through the proxy, whichever way the client groups
-        // them; direct, the client's own grouping is the upstream's.
+        // Through the proxy, one upstream connection per tunnel; direct, the client's own grouping
+        // is the upstream's.
         let (addr, up_ca) = spawn_h2_bench_upstream(REQUESTS + 4, body.clone());
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
         let proxy_ca_der = proxy_ca.ca_cert_der();

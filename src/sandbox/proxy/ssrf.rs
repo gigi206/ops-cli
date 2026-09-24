@@ -8,14 +8,11 @@
 //! connection it opens on the proxy's behalf, and the proxy records what it was refused in one place
 //! ([`ProxyCtx::check`](super::ProxyCtx::check), [`ProxyCtx::connect`](super::ProxyCtx::connect)),
 //! so a connect path cannot be turned down without the counter, the log and the notification saying
-//! so. The HTTP/2 plane still resolves and dials for itself, through [`resolve_checked`] /
-//! [`checked_address`], which record the refusal as they make it.
+//! so.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use super::{ProxyCtx, StatKind};
 use crate::allowlist::{self, Rule, RuleKind};
-use crate::sandbox::control::{LogVerdict, Proto};
 
 /// Whether a resolved address is public, a private/internal range, or one that is refused
 /// outright. The proxy runs on the host with full network reach, so an allowlisted *hostname*
@@ -153,9 +150,9 @@ pub(crate) enum AddrRefusal {
 /// via `deciding`, or `None` when it may connect. Public addresses are reachable; a private address
 /// is reachable only when [`opens_private_address`] says so (a deliberate internal target — not a
 /// `*.domain`/regex/built-in match, which would turn into an SSRF wildcard); a blocked address never
-/// is. The single decision behind both callers: the proxy's guarded resolution
-/// ([`checked_address`]) and the `sbx test net` tester, which would otherwise mispredict a private
-/// target.
+/// is. The single decision behind the guard every upstream connection passes ([`permitted`]), the
+/// check a reused connection passes, and the `sbx test net` tester, which would otherwise
+/// mispredict a private target.
 pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Option<AddrRefusal> {
     match classify_ip(ip) {
         IpClass::Public => None,
@@ -211,9 +208,9 @@ fn decided_by_builtin(deciding: Option<&Rule>) -> bool {
 }
 
 /// Whether the proxy may connect to `ip` for a request to `host` the policy permitted via
-/// `deciding` — [`ip_refusal`] read as a boolean, which is all the connect paths need. Private to
-/// this module: a path reaches it through [`checked_address`], never directly, so the refusal is
-/// always recorded.
+/// `deciding`: [`ip_refusal`] read as a boolean, which is all the guard needs. Private to this
+/// module: a connection reaches it through [`permitted`], whose refusal the proxy records where the
+/// supervisor's answer comes in.
 fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
     ip_refusal(ip, host, deciding).is_none()
 }
@@ -294,64 +291,6 @@ impl ConnectRefusal {
             }
         }
     }
-}
-
-/// Resolve `host` host-side, then hand back every address the proxy may dial for it: the resolved
-/// addresses the guard permits for `deciding`, in resolution order. A resolution failure for an
-/// allowed host is an error the client is told about (a clean `502`), not a dropped connection.
-///
-/// A list rather than one address, because one was a bug: a host whose first record is out of
-/// service was answered `502` where any ordinary client would have tried the next. Dial them in
-/// order, as the supervisor does for the planes that ask it for their connections.
-pub(super) fn resolve_checked(
-    ctx: &ProxyCtx,
-    proto: Proto,
-    host: &str,
-    port: u16,
-    method: Option<&str>,
-    path: Option<&str>,
-    deciding: Option<&Rule>,
-) -> Result<Vec<IpAddr>, ConnectRefusal> {
-    let Ok(ips) = (ctx.resolve)(host) else {
-        ctx.push_log(
-            proto,
-            host,
-            port,
-            method,
-            path,
-            LogVerdict::Error,
-            ConnectRefusal::Dns.tag(),
-        );
-        return Err(ConnectRefusal::Dns);
-    };
-    checked_address(ctx, proto, host, port, method, path, deciding, ips)
-}
-
-/// The guard alone, over addresses already in hand — for the raw splice, whose target may be an IP
-/// literal it holds without resolving anything. [`resolve_checked`] is this with the resolution in
-/// front of it.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn checked_address(
-    ctx: &ProxyCtx,
-    proto: Proto,
-    host: &str,
-    port: u16,
-    method: Option<&str>,
-    path: Option<&str>,
-    deciding: Option<&Rule>,
-    ips: Vec<IpAddr>,
-) -> Result<Vec<IpAddr>, ConnectRefusal> {
-    permitted(&ips, host, deciding).inspect_err(|refusal| {
-        ctx.outcome(
-            proto,
-            host,
-            port,
-            method,
-            path,
-            StatKind::Blocked,
-            refusal.tag(),
-        );
-    })
 }
 
 /// The addresses among `ips` the guard lets a request to `host`, permitted by `deciding`, reach, in

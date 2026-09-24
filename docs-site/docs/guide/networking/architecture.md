@@ -477,7 +477,15 @@ plane the proxy learns a connection is stale *before* the request is handed to i
 stale one costs the stream only the handshake it was trying to save. Everything a stream
 is checked for happens before any of this: the `:authority` re-check, the outbound
 tripwire, the verdict, the resolution and the address guard all run per stream, and one
-that any of them refuses never reaches the connection at all.
+that any of them refuses never reaches the connection at all. The address guard holds
+for a shared connection as it does for a parked one: a stream rides it only if its own
+connection could reach the address it is connected to.
+
+Streams that arrive together on a new tunnel share the connection the first of them
+opens, rather than each opening its own: a tunnel opens one connection at a time, and a
+stream whose turn comes looks for a connection it may share before it opens another.
+With `pool = false`, where each stream opens its own, those openings therefore follow
+one another.
 
 `pool = false` turns reuse off on both planes alike.
 
@@ -514,11 +522,9 @@ the permitted addresses in order and reporting the last error; a connection whos
 handshake fails moves on to the next address the same way.
 
 The resolution, this guard and the dial are done by sbx's supervisor, not by the part of
-the proxy that serves the cage's connections (an
-[`http2`](../configuration/network#http2-and-grpc) host excepted: its plane still
-resolves and dials in the proxy). That part asks the supervisor for every other upstream
-connection, and the supervisor decides the request again from its own copy of the policy
-before it resolves or dials anything. The two copies agree, since they are
+the proxy that serves the cage's connections. That part asks the supervisor for every
+upstream connection, and the supervisor decides the request again from its own copy of
+the policy before it resolves or dials anything. The two copies agree, since they are
 read from the same bytes; they can differ only for the moment a `--session` rule has
 been sent and is not yet in force, and a connection refused then carries
 `supervisor-denied`.
@@ -571,7 +577,7 @@ copy of the policy refused a connection the proxy had admitted, described under
 `bad-request` (including `bad-request:head`, a head that never arrived whole),
 `outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
 `connection-cap`, `supervisor-busy` (the supervisor was already opening as many
-connections as it opens at once, `[network] max_connections`), `splice-cap` (the
+connections as it opens at once, twice `[network] max_connections`), `splice-cap` (the
 concurrent raw `tcp://` tunnel ceiling),
 `injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
 `upstream-cert-rejected`, `upstream-http2-unsupported`, `upstream-closed`,

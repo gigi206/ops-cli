@@ -3717,7 +3717,7 @@ fn a_host_whose_first_address_refuses_is_reached_at_its_second() {
 
 /// A listener on `ip:port` that accepts TCP and then answers with bytes no TLS client accepts, so a
 /// handshake with it fails after the connection succeeded. Counts what it accepted.
-fn refuse_tls_at(ip: [u8; 4], port: u16) -> Arc<AtomicUsize> {
+pub(super) fn refuse_tls_at(ip: [u8; 4], port: u16) -> Arc<AtomicUsize> {
     let listener = TcpListener::bind((IpAddr::from(ip), port)).unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
     let counter = accepted.clone();

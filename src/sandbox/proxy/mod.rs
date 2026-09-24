@@ -111,7 +111,7 @@
 //! | `403` | `signer-refused`         | a signer plugin would not form this request's credential; the body carries the plugin's own reason, scrubbed of every declared credential |
 //! | `413` | `signer-body-too-large`  | a signer asked to be told a digest over the request body, and the request declares a `Content-Length` above what the proxy holds. No plugin refused: sbx did, from the head, before the body was invited. An over-cap `chunked` body declares no length and is discovered while being read, so it keeps the `bad-request:chunked` above |
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
-//! | `503` | `supervisor-busy`        | the supervisor was already opening as many connections for this proxy as it opens at once (the policy's `[network] max_connections`), or could not start the thread to open this one (retry when one completes) |
+//! | `503` | `supervisor-busy`        | the supervisor was already opening as many connections for this proxy as it opens at once (twice the policy's `[network] max_connections`), or could not start the thread to open this one (retry when one completes) |
 //! | `503` | `connection-cap`         | the proxy is already serving as many client connections as it will serve at once (`[network] max_connections`). Answered on the accept loop, before anything is read, so the caller's own request is still unread when the connection closes and the refusal arrives followed by a reset |
 //! | `503` | `body-buffer-cap`        | the proxy is already holding as much request-body data as it will hold at one time (retry when one in flight completes). Nothing is wrong with the request: it is a shared ceiling on host memory, since the proxy buffers host-side and the cage's own `MemoryMax` does not reach it |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
@@ -233,7 +233,6 @@ pub(crate) use inject::{
 use inject::{SignRefusal, pairs_for as injection_values};
 use pool::{PoolKey, UpstreamTls};
 use splice::splice_l4;
-use ssrf::resolve_checked;
 pub(crate) use ssrf::{AddrRefusal, ip_refusal, names_exact_host};
 use tunnel::{Turn, serve_tunneled_request};
 use websocket::*;
