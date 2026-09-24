@@ -835,6 +835,8 @@ mod tests {
             "the upgrade had to be admitted and forwarded for there to be an allow: {transcript:?}"
         );
 
+        // The events are applied on a thread of their own: read once every one queued has been.
+        ctx.events.as_ref().unwrap().flush();
         let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 1, "one exchange, one event: {events:?}");
         assert_eq!(events[0].verdict, LogVerdict::Allow);
@@ -843,7 +845,6 @@ mod tests {
             Some("WS"),
             "the one `allow` record must name the verb the verdict was reached under"
         );
-        ctx.events.as_ref().unwrap().flush();
         assert_eq!(stats.snapshot()["ws-host.test"].allow, 1);
     }
 
