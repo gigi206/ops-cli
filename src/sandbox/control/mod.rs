@@ -554,7 +554,7 @@ pub(crate) const LOG_RING_CAP: usize = 1000;
 /// can therefore carry a decision off the end of the live log; the count is what is left to say it
 /// happened. It is a number, never a list: naming them is this log's job, for as long as it holds
 /// them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum LogVerdict {
     /// The request was permitted and egressed.
     Allow,
@@ -699,7 +699,7 @@ pub(crate) enum Plane {
 /// the honest fallback for a request refused before its transport was known (a malformed `CONNECT`
 /// line, a non-routable non-`CONNECT` request). Shown as a column in `sbx net logs` because the port
 /// alone is ambiguous — a `tcp://` splice can ride 443, and an inspected host can ride any port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Proto {
     /// Inspected over TLS (a MITM'd `CONNECT`) — the default `https://` path, WebSockets included.
     Https,
@@ -772,7 +772,7 @@ impl Proto {
 /// `https/h2`, never a bare `h2` that would drop the "it was TLS" signal. Only a completed inspected
 /// request has a version; a refusal (no HTTP exchange) or a raw `tcp://` splice (no HTTP at all) is
 /// [`Unknown`](Self::Unknown), rendered without a suffix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum HttpVer {
     /// HTTP/1.1 — the default MITM path, and the only version cleartext (`http://`) ever uses.
     H1,
@@ -820,7 +820,7 @@ impl HttpVer {
 /// worth knowing: **Connect *unary*** rides bare `application/proto`/`application/json` (byte-for-byte
 /// indistinguishable from a plain protobuf POST), so it reads as `None`; only gRPC, gRPC-web, and
 /// Connect *streaming* (`application/connect+…`) carry a self-identifying content-type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum RpcKind {
     /// `application/grpc[+…]` — native gRPC (HTTP/2 framed).
     Grpc,
@@ -937,7 +937,7 @@ pub(crate) struct LogEvent {
 }
 
 /// Which way a configured secret was seen crossing an open WebSocket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SecretWay {
     /// Cage → upstream: the agent sent it out.
     Out,

@@ -8,13 +8,14 @@
 //!
 //! - **Redacted before it leaves the proxy.** A capture is masked where it is taken
 //!   ([`Capture::mask`], called by the proxy's filing), and the ring accepts nothing else: its one
-//!   door, [`CaptureRing::insert`], takes a [`Masked`] capture, which only masking produces. So the
-//!   ring never holds a credential, no reader can forget to mask, and the process that holds the
-//!   ring never needs the credentials at all. Masking a *complete* buffer (rather than each
-//!   streamed chunk) is what makes it exact — a secret split across two reads is still one
-//!   contiguous run by the time it is masked. A value the launch has since **re-resolved** is
-//!   masked too ([`crate::sandbox::proxy::Credentials::masking_needles`]): a capture is filed after
-//!   its exchange ends, so the credential it carries is often the one the `401` just replaced.
+//!   door, [`CaptureRing::insert`], takes a [`Masked`] capture, which only masking produces, or the
+//!   proxy's report of one as the supervisor reads it ([`Masked::received`]). So the ring never
+//!   holds a credential, no reader can forget to mask, and the process that holds the ring never
+//!   needs the credentials at all. Masking a *complete* buffer (rather than each streamed chunk) is
+//!   what makes it exact — a secret split across two reads is still one contiguous run by the time
+//!   it is masked. A value the launch has since **re-resolved** is masked too
+//!   ([`crate::sandbox::proxy::Credentials::masking_needles`]): a capture is filed after its
+//!   exchange ends, so the credential it carries is often the one the `401` just replaced.
 //! - **Bounded three ways.** Each part is capped on its own ([`CaptureCaps`]), the number of
 //!   captured exchanges is capped, and the ring holds a total byte budget past which the *oldest*
 //!   captures are dropped. An in-cage agent streaming gigabytes therefore costs a fixed amount of
@@ -324,12 +325,69 @@ impl Capture {
     }
 }
 
-/// A capture every configured secret has been masked out of — the only form [`CaptureRing::insert`]
-/// accepts. Built by [`Capture::mask`] alone, so holding one is holding the masking's result.
+/// How many parts a capture carries, in the order [`Masked::into_parts`] gives them.
+pub(crate) const CAPTURE_PARTS: usize = 7;
+
+/// A capture every configured secret has been masked out of: the only form [`CaptureRing::insert`]
+/// accepts. The proxy builds it with [`Capture::mask`], which is the one place a capture is masked;
+/// the supervisor rebuilds the proxy's with [`Masked::received`] when it reads the proxy's report.
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct Masked(Capture);
 
 impl Masked {
+    /// The number the capture is filed under and its parts, in the order they cross the proxy's
+    /// report: the request head, the injected header names, the request body, the response head,
+    /// the response body, then the WebSocket's two directions.
+    pub(crate) fn into_parts(self) -> (u64, [CaptureBytes; CAPTURE_PARTS]) {
+        let Capture {
+            seq,
+            req_head,
+            injected,
+            req_body,
+            res_head,
+            res_body,
+            ws_up,
+            ws_down,
+        } = self.0;
+        (
+            seq,
+            [
+                req_head, injected, req_body, res_head, res_body, ws_up, ws_down,
+            ],
+        )
+    }
+
+    /// A capture as the supervisor reads it from the proxy's report, in the order
+    /// [`Self::into_parts`] gives.
+    ///
+    /// The proxy masked it before sending, and only the proxy can: the needles a capture is masked
+    /// against include the ones it learned from the cage's own traffic, which exist nowhere else.
+    /// So the supervisor holds the result of a masking it did not run. That is the same standing as
+    /// every other part of the proxy's account (see [`crate::sandbox::proxy::events`]), and the
+    /// reason no caller but the report's reader builds one this way.
+    pub(in crate::sandbox) fn received(seq: u64, parts: [CaptureBytes; CAPTURE_PARTS]) -> Self {
+        let [
+            req_head,
+            injected,
+            req_body,
+            res_head,
+            res_body,
+            ws_up,
+            ws_down,
+        ] = parts;
+        Masked(Capture {
+            seq,
+            req_head,
+            injected,
+            req_body,
+            res_head,
+            res_body,
+            ws_up,
+            ws_down,
+        })
+    }
+
     /// File it under `seq` instead: the number the proxy knows an exchange by is not the ring's.
     pub(crate) fn filed_as(mut self, seq: u64) -> Self {
         self.0.seq = seq;

@@ -1074,9 +1074,6 @@ pub(crate) fn start(
         // and never how much of the session it reflects once the traffic stops.
         super::egress_stats::start_flusher(stats);
     }
-    let events = super::proxy::events::spawn(sinks);
-    ctx = ctx.with_events(events.clone());
-    let ctx = Arc::new(ctx);
 
     // The control plane is serving from here on, and the only thing that stops its accept thread
     // and unlinks its socket is the `Egress` guard's `Drop` — a guard this function does not build
@@ -1093,6 +1090,9 @@ pub(crate) fn start(
         }
         e
     };
+    let events = super::proxy::events::spawn(sinks).map_err(&unwind_control)?;
+    ctx = ctx.with_events(events.clone());
+    let ctx = Arc::new(ctx);
 
     // Write the CA bundle owner-only, outside every writable mount, then bind it read-only — the
     // agent gets a trust anchor it cannot rewrite. It always opens with the per-session MITM CA,
@@ -2118,7 +2118,7 @@ mod tests {
             log: Arc::new(super::super::control::LogRing::new(
                 super::super::control::LOG_RING_CAP,
             )),
-            events: super::super::proxy::events::spawn(Default::default()),
+            events: super::super::proxy::events::spawn(Default::default()).unwrap(),
         });
         for path in &paths {
             assert!(!path.exists(), "left behind: {}", path.display());

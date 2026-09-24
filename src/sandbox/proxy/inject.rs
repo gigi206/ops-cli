@@ -2451,7 +2451,8 @@ mod tests {
         let events = super::super::events::spawn(super::super::events::Sinks {
             signer_log: Some(std::sync::Arc::clone(&ring)),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let signs = CredentialSet {
             injections: vec![signed_injection(
                 Ok(vec![("Authorization", "SIG abc")]),

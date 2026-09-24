@@ -177,7 +177,8 @@ mod tests {
         let emitter = events::spawn(events::Sinks {
             flows: Some(Arc::clone(registry)),
             ..events::Sinks::default()
-        });
+        })
+        .unwrap();
         (LiveFlows::start(emitter.clone()), emitter)
     }
 
@@ -246,7 +247,7 @@ mod tests {
     #[test]
     fn a_flow_that_did_not_move_is_not_reported_again() {
         let flows = Arc::new(LiveFlows {
-            events: events::spawn(events::Sinks::default()),
+            events: events::spawn(events::Sinks::default()).unwrap(),
             inner: Mutex::new(Inner {
                 next_id: 1,
                 open: BTreeMap::new(),

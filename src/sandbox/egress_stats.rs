@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Which bucket a recorded request falls into — one per request (see the module note).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum StatKind {
     /// The request egressed (the policy permitted it and it was forwarded).
     Allow,

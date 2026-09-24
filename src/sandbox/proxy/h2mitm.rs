@@ -4027,7 +4027,8 @@ mod tests {
         let events = crate::sandbox::proxy::events::spawn(crate::sandbox::proxy::events::Sinks {
             flows: Some(Arc::clone(&flows)),
             ..crate::sandbox::proxy::events::Sinks::default()
-        });
+        })
+        .unwrap();
         let ctx = ctx.with_events(events.clone());
         let live = Arc::clone(ctx.flows.as_ref().expect("a live view"));
         let registry = Arc::clone(&flows);

@@ -38,7 +38,7 @@ pub(crate) const SIGNER_RING_CAP: usize = 1000;
 
 /// What became of one request's credential, as **sbx observed it** — never as the plugin described
 /// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SignerKind {
     /// The plugin formed the headers, and they went on the request.
     Sign,

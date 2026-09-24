@@ -3,17 +3,17 @@
 //! The proxy is to run in a process of its own, holding none of the session's shared state. What it
 //! reports — a decision counted, a refusal to announce, a credential a signer formed, a decision
 //! logged and what later completes it — therefore leaves it as owned values on a bounded queue
-//! ([`Emitter`]), and one thread on the supervisor's side ([`spawn`]) applies them to the structures
-//! a reader consults. The queue is in-process today; when the proxy moves, the applying side stays
-//! as it is and reads a socket instead, so this is the one path, not a second one kept beside the
-//! direct calls it replaces.
+//! ([`Emitter`]), written to a socket, and one thread on the supervisor's side ([`applying`]) reads
+//! them and applies them to the structures a reader consults. The socket is already the one the
+//! report crosses: until the proxy moves, both ends are a pair within one process ([`spawn`]), so
+//! this is the one path, and every test that reads a count reads it through the bytes.
 //!
 //! **Delivery is asynchronous, and backpressure blocks.** A full queue makes the sender wait rather
-//! than lose an event: the supervisor's memory stays bounded, only the proxy slows down, and that is
-//! the semantics the socket will have. The queue is bounded twice, in events ([`QUEUE`]) and in the
-//! bytes they own ([`QUEUE_BYTES`]), because an event can carry a captured exchange. A reader that
-//! needs every event sent so far to be applied — the session's end, `--net-learn`, a test reading a
-//! count — asks for it with [`Emitter::flush`].
+//! than lose an event: the proxy's memory stays bounded, only the proxy slows down, and the
+//! supervisor reads one frame at a time, each held to [`wire::MAX_FRAME`]. The queue is bounded
+//! twice, in events ([`QUEUE`]) and in the bytes they own ([`QUEUE_BYTES`]), because an event can
+//! carry a captured exchange. A reader that needs every event sent so far to be applied — the
+//! session's end, `--net-learn`, a test reading a count — asks for it with [`Emitter::flush`].
 //!
 //! **A logged decision is numbered by the proxy.** The event ring numbers what it holds, and it is
 //! shared with other proxies of the same session, so the number it assigns is not one the proxy can
@@ -28,6 +28,8 @@
 //! reach — are taken by the supervisor itself, and so is the plane an event is recorded under: which
 //! proxy this is, is not the proxy's to say.
 
+mod wire;
+
 use crate::notify::Block;
 use crate::sandbox::control::{
     CaptureCaps, CaptureRing, FlowRegistry, HttpVer, LogRing, LogVerdict, Masked, Plane, Proto,
@@ -37,6 +39,8 @@ use crate::sandbox::egress_stats::{EgressStats, StatKind};
 use crate::sandbox::notify_sink::Notifier;
 use crate::sandbox::signer_control::{SignerKind, SignerRing};
 use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -59,8 +63,11 @@ const MAX_HOST: usize = 253;
 /// Not [`MAX_HOST`]: a refusal logs the host the cage *asked* for, which need not be a name at all.
 const MAX_FIELD: usize = 64 * 1024;
 
-/// One thing the proxy did, as the supervisor learns it.
-pub(crate) enum ProxyEvent {
+/// One thing the proxy did, as the supervisor learns it, with its capture as `C`: the proxy's
+/// [`Masked`], or the form it crosses in ([`wire`]).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub(crate) enum ProxyEvent<C = Masked> {
     /// A decision, counted for `sbx net stats`.
     Stat { host: String, kind: StatKind },
     /// A refusal to announce on the desktop.
@@ -77,9 +84,9 @@ pub(crate) enum ProxyEvent {
     CaptureExpected { id: u64 },
     /// The exchange logged as `id` is over: what was captured of it, possibly nothing, masked by the
     /// proxy and filed once.
-    CaptureFiled { id: u64, capture: Masked },
+    CaptureFiled { id: u64, capture: C },
     /// The WebSocket logged as `id` carried more after its handshake was filed.
-    CaptureGrew { id: u64, capture: Masked },
+    CaptureGrew { id: u64, capture: C },
     /// The configured secret `name` crossed the tunnel logged as `id`, in the direction `way`.
     SecretSeen {
         id: u64,
@@ -123,8 +130,50 @@ impl ProxyEvent {
     }
 }
 
+impl<C> ProxyEvent<C> {
+    /// This event with its capture, if it carries one, turned into a `D` by `convert`: how the
+    /// capture's bytes are taken out of the document that crosses, and put back.
+    fn try_map_capture<D, E>(
+        self,
+        convert: impl FnOnce(C) -> Result<D, E>,
+    ) -> Result<ProxyEvent<D>, E> {
+        Ok(match self {
+            ProxyEvent::Stat { host, kind } => ProxyEvent::Stat { host, kind },
+            ProxyEvent::Refusal(block) => ProxyEvent::Refusal(block),
+            ProxyEvent::Signer { kind, detail } => ProxyEvent::Signer { kind, detail },
+            ProxyEvent::Logged { id, entry } => ProxyEvent::Logged { id, entry },
+            ProxyEvent::Status { id, status } => ProxyEvent::Status { id, status },
+            ProxyEvent::CaptureExpected { id } => ProxyEvent::CaptureExpected { id },
+            ProxyEvent::CaptureFiled { id, capture } => ProxyEvent::CaptureFiled {
+                id,
+                capture: convert(capture)?,
+            },
+            ProxyEvent::CaptureGrew { id, capture } => ProxyEvent::CaptureGrew {
+                id,
+                capture: convert(capture)?,
+            },
+            ProxyEvent::SecretSeen { id, name, way } => ProxyEvent::SecretSeen { id, name, way },
+            ProxyEvent::FlowOpened {
+                id,
+                host,
+                port,
+                proto,
+            } => ProxyEvent::FlowOpened {
+                id,
+                host,
+                port,
+                proto,
+            },
+            ProxyEvent::FlowCounts(moved) => ProxyEvent::FlowCounts(moved),
+            ProxyEvent::FlowClosed { id } => ProxyEvent::FlowClosed { id },
+        })
+    }
+}
+
 /// One decision for the live log, as the proxy composes it. What the ring adds — its own number,
 /// the time, and the plane — is the supervisor's.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) struct LogEntry {
     /// A denial a `mute` rule keeps out of the default view.
     pub(crate) muted: bool,
@@ -194,41 +243,55 @@ impl Default for Sinks {
     }
 }
 
-/// How far the applying side has got, for [`Emitter::flush`] and [`QUEUE_BYTES`].
+/// How far the proxy's report has got, for [`Emitter::flush`] and [`QUEUE_BYTES`].
 #[derive(Default)]
 struct Progress {
     state: Mutex<Applied>,
     advanced: Condvar,
 }
 
-/// What [`Progress`] guards: the applying side's count, the bytes still waiting, and whether it has
-/// ended.
+/// What [`Progress`] guards.
 #[derive(Default)]
 struct Applied {
-    /// Events applied so far.
-    count: u64,
-    /// The bytes owned by events queued and not yet applied.
+    /// The last barrier the applying side acknowledged: everything queued before it is applied.
+    acked: u64,
+    /// The bytes owned by events queued and not yet written to the channel.
     in_flight: usize,
-    /// The applying side has ended, and nothing more will be applied.
+    /// The channel has ended, and nothing more will be written, applied or acknowledged.
     closed: bool,
 }
 
 /// What [`Emitter::sent`] guards.
 #[derive(Default)]
 struct Sent {
-    /// Events accepted by the queue so far, across every clone.
-    events: u64,
     /// The last number given to a logged decision. Given under the lock the event is queued under,
     /// so the numbers reach the applying side in increasing order.
     logged: u64,
+    /// The last barrier queued, under the same lock, so a barrier follows every event queued before
+    /// it.
+    barriers: u64,
+}
+
+// An event runs to a few hundred bytes against a barrier's eight, which the size lint flags. The
+// queue's slots held a whole event before barriers crossed it, and a barrier is one per flush, so a
+// slot is the size of an event either way; boxing would add an allocation to every event the proxy
+// reports for no memory saved. Written above the doc block rather than under it: a `//` between the
+// `///` and the item severs the two.
+/// What the queue carries to the thread writing the channel.
+#[allow(clippy::large_enum_variant)]
+enum Outgoing {
+    /// An event, with the bytes it holds against [`QUEUE_BYTES`] until it is written.
+    Event { event: ProxyEvent, weight: usize },
+    /// A mark for [`Emitter::flush`] to wait on.
+    Barrier(u64),
 }
 
 /// The proxy's end of the queue. Cheap to clone: every connection thread holds the same queue.
 #[derive(Clone)]
 pub(crate) struct Emitter {
-    tx: SyncSender<ProxyEvent>,
-    /// Which kinds of event the launch keeps a structure for, fixed at [`spawn`], so the proxy
-    /// neither composes nor queues an event nothing would apply.
+    tx: SyncSender<Outgoing>,
+    /// Which kinds of event the launch keeps a structure for, fixed when the queue is made, so the
+    /// proxy neither composes nor queues an event nothing would apply.
     keeps: Keeps,
     sent: Arc<Mutex<Sent>>,
     progress: Arc<Progress>,
@@ -246,14 +309,29 @@ pub(crate) struct Keeps {
     pub(crate) flows: bool,
 }
 
+impl Keeps {
+    /// What `sinks` keeps: a capture only beside a log, since it is filed under a logged decision.
+    fn of(sinks: &Sinks) -> Self {
+        let log = sinks.log.is_some();
+        Keeps {
+            stats: sinks.stats.is_some(),
+            refusals: sinks.notifier.is_some(),
+            signatures: sinks.signer_log.is_some(),
+            log,
+            capture: sinks.capture.as_ref().filter(|_| log).map(|c| c.caps()),
+            flows: sinks.flows.is_some(),
+        }
+    }
+}
+
 impl Emitter {
     /// Which kinds of event this launch keeps.
     pub(crate) fn keeps(&self) -> Keeps {
         self.keeps
     }
 
-    /// Queue `event`, waiting for room when the queue is full. An event the applying side can no
-    /// longer take — it has ended — has nobody left to apply it and is dropped.
+    /// Queue `event`, waiting for room when the queue is full. An event the channel can no longer
+    /// carry (it has ended) has nobody left to apply it and is dropped.
     pub(crate) fn send(&self, event: ProxyEvent) {
         self.queue(event.weight(), |_| event);
     }
@@ -273,17 +351,15 @@ impl Emitter {
     /// Queue the event `compose` builds, once `weight` bytes of room are free.
     fn queue(&self, weight: usize, compose: impl FnOnce(&mut Sent) -> ProxyEvent) {
         self.reserve(weight);
-        // Counted under the lock the send happens under, so `flush` never waits for an event that
-        // was counted and then not queued.
         let mut sent = lock(&self.sent);
         let event = compose(&mut sent);
-        if self.tx.send(event).is_ok() {
-            sent.events += 1;
+        if self.tx.send(Outgoing::Event { event, weight }).is_err() {
+            release(&self.progress, weight);
         }
     }
 
-    /// Wait until `weight` more bytes fit in [`QUEUE_BYTES`], or nothing is waiting, or the applying
-    /// side has ended, then count them as waiting.
+    /// Wait until `weight` more bytes fit in [`QUEUE_BYTES`], or nothing is waiting, or the channel
+    /// has ended, then count them as waiting.
     fn reserve(&self, weight: usize) {
         let mut applied = lock(&self.progress.state);
         while applied.in_flight > 0
@@ -299,12 +375,19 @@ impl Emitter {
         applied.in_flight = applied.in_flight.saturating_add(weight);
     }
 
-    /// Wait until every event queued before this call has been applied, or until the applying
-    /// side has ended.
+    /// Wait until every event queued before this call has been applied, or until the channel has
+    /// ended.
     pub(crate) fn flush(&self) {
-        let target = lock(&self.sent).events;
+        let barrier = {
+            let mut sent = lock(&self.sent);
+            sent.barriers += 1;
+            if self.tx.send(Outgoing::Barrier(sent.barriers)).is_err() {
+                return;
+            }
+            sent.barriers
+        };
         let mut applied = lock(&self.progress.state);
-        while applied.count < target && !applied.closed {
+        while applied.acked < barrier && !applied.closed {
             applied = self
                 .progress
                 .advanced
@@ -314,58 +397,127 @@ impl Emitter {
     }
 }
 
-/// Start the applying side for one proxy, returning the proxy's end of its queue. The thread ends
-/// once every clone of the returned [`Emitter`] is dropped, after applying what they queued.
-pub(crate) fn spawn(sinks: Sinks) -> Emitter {
-    start(sinks).0
+/// Start the applying side for one proxy, returning the proxy's end of its queue. The two ends are a
+/// socket pair within this process; the applying thread ends once every clone of the returned
+/// [`Emitter`] is dropped, after applying what they queued.
+pub(crate) fn spawn(sinks: Sinks) -> io::Result<Emitter> {
+    Ok(start(sinks)?.0)
 }
 
 /// [`spawn`], keeping the applying thread's handle: a caller that joins it knows the structures it
 /// was handed are no longer held.
-fn start(sinks: Sinks) -> (Emitter, std::thread::JoinHandle<()>) {
-    let log = sinks.log.is_some();
-    let keeps = Keeps {
-        stats: sinks.stats.is_some(),
-        refusals: sinks.notifier.is_some(),
-        signatures: sinks.signer_log.is_some(),
-        log,
-        capture: sinks.capture.as_ref().filter(|_| log).map(|c| c.caps()),
-        flows: sinks.flows.is_some(),
-    };
+fn start(sinks: Sinks) -> io::Result<(Emitter, std::thread::JoinHandle<()>)> {
+    let keeps = Keeps::of(&sinks);
+    let (proxy, supervisor) = UnixStream::pair()?;
+    let applier = applying(sinks, supervisor)?;
+    Ok((emitter(proxy, keeps)?, applier))
+}
+
+/// The proxy's end of a report written to `channel`, for a launch that keeps what `keeps` says.
+///
+/// Two threads serve it: one writes what the queue holds, in order, and one reads the applying
+/// side's acknowledgements. Both end with the channel, the writer once every clone of the returned
+/// [`Emitter`] is dropped, after writing what they queued.
+pub(crate) fn emitter(channel: UnixStream, keeps: Keeps) -> io::Result<Emitter> {
     let (tx, rx) = sync_channel(QUEUE);
     let progress = Arc::new(Progress::default());
-    let applier = Arc::clone(&progress);
-    let handle = std::thread::spawn(move || apply_all(&rx, Applier::new(sinks), &applier));
-    let emitter = Emitter {
+    let acks = channel.try_clone()?;
+    let writing = Arc::clone(&progress);
+    std::thread::Builder::new()
+        .name("sbx-report".into())
+        .spawn(move || write_all(&rx, channel, &writing))?;
+    let acknowledged = Arc::clone(&progress);
+    std::thread::Builder::new()
+        .name("sbx-report-acks".into())
+        .spawn(move || read_acks(acks, &acknowledged))?;
+    Ok(Emitter {
         tx,
         keeps,
         sent: Arc::new(Mutex::new(Sent::default())),
         progress,
-    };
-    (emitter, handle)
+    })
 }
 
-/// Apply every event until the queue closes, reporting progress as it goes.
-fn apply_all(rx: &Receiver<ProxyEvent>, mut applier: Applier, progress: &Progress) {
-    // Marks the end even when an apply panics, so a `flush` or a sender waiting on this thread
-    // returns.
-    struct Closing<'a>(&'a Progress);
-    impl Drop for Closing<'_> {
-        fn drop(&mut self) {
-            lock(&self.0.state).closed = true;
-            self.0.advanced.notify_all();
+/// Write every event the queue holds to `channel`, in the order it was queued, until every sender is
+/// gone, then end the channel's writing side so the applying side finishes.
+fn write_all(rx: &Receiver<Outgoing>, mut channel: UnixStream, progress: &Progress) {
+    for outgoing in rx {
+        let (frame, weight) = match outgoing {
+            Outgoing::Event { event, weight } => (wire::Frame::Event(event), weight),
+            Outgoing::Barrier(n) => (wire::Frame::Barrier(n), 0),
+        };
+        // An event too large to cross is one no request can have produced (see
+        // [`wire::MAX_FRAME`]), and the applying side would drop it and the channel with it: it is
+        // dropped here instead, and what follows it still crosses.
+        let written = match wire::encode(frame) {
+            Ok(Some(bytes)) => channel.write_all(&bytes).is_ok(),
+            Ok(None) | Err(_) => true,
+        };
+        release(progress, weight);
+        if !written {
+            // Returning drops the queue's receiver, so a sender waiting for room is let go.
+            close(progress);
+            return;
         }
     }
-    let _closing = Closing(progress);
-    for event in rx {
-        let weight = event.weight();
-        applier.apply(event);
+    let _ = channel.shutdown(std::net::Shutdown::Write);
+}
+
+/// Record each barrier the applying side acknowledges, until the channel ends.
+fn read_acks(mut channel: UnixStream, progress: &Progress) {
+    let mut ack = [0u8; 8];
+    while channel.read_exact(&mut ack).is_ok() {
         {
-            let mut state = lock(&progress.state);
-            state.count += 1;
-            state.in_flight = state.in_flight.saturating_sub(weight);
+            let mut applied = lock(&progress.state);
+            applied.acked = applied.acked.max(u64::from_le_bytes(ack));
         }
         progress.advanced.notify_all();
+    }
+    close(progress);
+}
+
+/// Count `weight` bytes as no longer waiting.
+fn release(progress: &Progress, weight: usize) {
+    {
+        let mut applied = lock(&progress.state);
+        applied.in_flight = applied.in_flight.saturating_sub(weight);
+    }
+    progress.advanced.notify_all();
+}
+
+/// Mark the channel ended, so no sender or `flush` waits on it any more.
+fn close(progress: &Progress) {
+    lock(&progress.state).closed = true;
+    progress.advanced.notify_all();
+}
+
+/// Apply what a proxy reports on `channel` to `sinks`, on a thread of its own.
+///
+/// The thread ends with the channel: when the proxy's end has written its last event, or at the
+/// first frame that cannot be read, since past it there is no telling where the next one starts.
+pub(crate) fn applying(
+    sinks: Sinks,
+    channel: UnixStream,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    let acks = channel.try_clone()?;
+    std::thread::Builder::new()
+        .name("sbx-apply".into())
+        .spawn(move || apply_all(channel, acks, Applier::new(sinks)))
+}
+
+/// Apply every frame until the channel ends, acknowledging each barrier once everything before it
+/// is applied.
+fn apply_all(channel: UnixStream, mut acks: UnixStream, mut applier: Applier) {
+    let mut frames = io::BufReader::new(channel);
+    while let Ok(Some(frame)) = wire::read(&mut frames) {
+        match frame {
+            wire::Frame::Event(event) => applier.apply(event),
+            wire::Frame::Barrier(n) => {
+                if acks.write_all(&n.to_le_bytes()).is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -544,7 +696,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// over are released: join the handle once every clone of the reporter is dropped.
 #[cfg(test)]
 pub(crate) fn spawn_joinable(sinks: Sinks) -> (Emitter, std::thread::JoinHandle<()>) {
-    start(sinks)
+    start(sinks).unwrap()
 }
 
 /// An applying side that keeps only decision counters, for the tests of the paths that count.
@@ -554,6 +706,7 @@ pub(crate) fn for_stats(stats: Arc<EgressStats>) -> Emitter {
         stats: Some(stats),
         ..Sinks::default()
     })
+    .unwrap()
 }
 
 /// An applying side that keeps the live log, and the decision counters when `stats` is given, for
@@ -565,6 +718,7 @@ pub(crate) fn for_log(log: Arc<LogRing>, stats: Option<Arc<EgressStats>>) -> Emi
         log: Some(log),
         ..Sinks::default()
     })
+    .unwrap()
 }
 
 /// An applying side that keeps the live log and files captures into `store`, for the tests that
@@ -576,6 +730,7 @@ pub(crate) fn for_capture(log: Arc<LogRing>, store: Arc<CaptureRing>) -> Emitter
         capture: Some(store),
         ..Sinks::default()
     })
+    .unwrap()
 }
 
 /// Waits, when dropped, for every event the held reporter queued to be applied — for a test helper
@@ -629,7 +784,8 @@ mod tests {
             stats: Some(Arc::clone(&counts)),
             signer_log: Some(Arc::clone(&ring)),
             ..Sinks::default()
-        });
+        })
+        .unwrap();
         for _ in 0..500 {
             events.send(ProxyEvent::Stat {
                 host: "api.example.com".into(),
@@ -653,10 +809,11 @@ mod tests {
         let only_stats = spawn(Sinks {
             stats: Some(stats(&dir)),
             ..Sinks::default()
-        });
+        })
+        .unwrap();
         let keeps = only_stats.keeps();
         assert!(keeps.stats && !keeps.refusals && !keeps.signatures && !keeps.log);
-        let none = spawn(Sinks::default()).keeps();
+        let none = spawn(Sinks::default()).unwrap().keeps();
         assert!(!none.stats && !none.refusals && !none.signatures && !none.log);
 
         let caps = CaptureCaps::new(CaptureLevel::Headers, 8);
@@ -664,13 +821,15 @@ mod tests {
         let unlogged = spawn(Sinks {
             capture: capture(),
             ..Sinks::default()
-        });
+        })
+        .unwrap();
         assert!(unlogged.keeps().capture.is_none());
         let logged = spawn(Sinks {
             log: Some(Arc::new(LogRing::new(LOG_RING_CAP))),
             capture: capture(),
             ..Sinks::default()
-        });
+        })
+        .unwrap();
         assert_eq!(logged.keeps().capture, Some(caps));
     }
 
@@ -695,27 +854,29 @@ mod tests {
         assert!(snap.contains_key(&"b".repeat(MAX_HOST)));
     }
 
-    /// A `flush` never waits on an applying side that has ended: the reporter's queue is then
-    /// closed, and nothing sent to it can be applied any more.
+    /// A `flush` never waits on an applying side that has ended: the channel is then closed, and
+    /// nothing sent to it can be applied any more.
     #[test]
     fn a_flush_does_not_wait_on_an_applying_side_that_has_ended() {
-        let (events, applier) = spawn_joinable(Sinks::default());
-        let (tx, rx) = sync_channel::<ProxyEvent>(1);
-        drop(rx);
-        // A reporter whose queue nobody reads any more, sharing the ended thread's progress.
-        let orphan = Emitter {
-            tx,
-            keeps: events.keeps(),
-            sent: Arc::clone(&events.sent),
-            progress: Arc::clone(&events.progress),
-        };
-        drop(events);
+        let (proxy, supervisor) = UnixStream::pair().unwrap();
+        let mut unreadable = proxy.try_clone().unwrap();
+        let events = emitter(proxy, Keeps::of(&Sinks::default())).unwrap();
+        let applier = applying(Sinks::default(), supervisor).unwrap();
+        // A frame claiming more pieces than any event carries: the applying side stops at it.
+        unreadable.write_all(&[0, 0, 0, 0, 0xff, 0, 0, 0]).unwrap();
         applier.join().unwrap();
-        orphan.send(ProxyEvent::Stat {
-            host: "api.example.com".into(),
-            kind: StatKind::Allow,
+        let (done, returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            events.send(ProxyEvent::Stat {
+                host: "api.example.com".into(),
+                kind: StatKind::Allow,
+            });
+            events.flush();
+            let _ = done.send(());
         });
-        orphan.flush();
+        returned
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the flush returned");
     }
 
     /// An amendment reaches the event the proxy numbered, even when the ring numbers it otherwise:
@@ -728,7 +889,8 @@ mod tests {
             log: Some(Arc::clone(&ring)),
             plane: Plane::Task,
             ..Sinks::default()
-        });
+        })
+        .unwrap();
         let first = task.log(entry("task.example.com", LogVerdict::Allow, false));
         task.flush();
         let mine = agent.log(entry("api.example.com", LogVerdict::Allow, false));
@@ -779,7 +941,8 @@ mod tests {
             log: Some(Arc::clone(&ring)),
             capture: Some(Arc::clone(&store)),
             ..Sinks::default()
-        });
+        })
+        .unwrap();
         let id = events.log(entry("api.example.com", LogVerdict::Allow, false));
         events.send(ProxyEvent::CaptureExpected { id });
         events.send(ProxyEvent::Status { id, status: 200 });
@@ -849,17 +1012,14 @@ mod tests {
     }
 
     /// The queue holds a bounded number of bytes: a sender waits while the events already queued own
-    /// too many, and goes on once they are applied. One event heavier than the whole bound is queued
+    /// too many, and goes on once they are written. One event heavier than the whole bound is queued
     /// when nothing else is waiting, rather than never.
     #[test]
     fn a_sender_waits_while_the_queued_events_own_too_many_bytes() {
-        let (tx, rx) = sync_channel::<ProxyEvent>(QUEUE);
-        let emitter = Emitter {
-            tx,
-            keeps: spawn(Sinks::default()).keeps(),
-            sent: Arc::new(Mutex::new(Sent::default())),
-            progress: Arc::new(Progress::default()),
-        };
+        let (proxy, supervisor) = UnixStream::pair().unwrap();
+        // Nothing reads the channel yet, so the first event stays in flight: the socket's own buffer
+        // holds its writer until the applying side starts.
+        let emitter = emitter(proxy, Keeps::of(&Sinks::default())).unwrap();
         let heavy = || ProxyEvent::Signer {
             kind: SignerKind::Sign,
             detail: "x".repeat(QUEUE_BYTES + 1),
@@ -875,16 +1035,289 @@ mod tests {
             finished
                 .recv_timeout(std::time::Duration::from_millis(300))
                 .is_err(),
-            "a second heavy event must wait for the first to be applied"
+            "a second heavy event must wait for the first to be written"
         );
-        let progress = Arc::clone(&emitter.progress);
-        drop(emitter);
-        let applier =
-            std::thread::spawn(move || apply_all(&rx, Applier::new(Sinks::default()), &progress));
+        let applier = applying(Sinks::default(), supervisor).unwrap();
         finished
             .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("the waiting sender goes on once the first event is applied");
+            .expect("the waiting sender goes on once the first event is written");
         waiting.join().unwrap();
+        drop(emitter);
         applier.join().unwrap();
+    }
+
+    /// Every part of a capture carrying something the others do not: bytes that are no UTF-8, a
+    /// length of its own, and a cut flag that alternates.
+    fn captured(seq: u64) -> Masked {
+        let part = |n: u8| CaptureBytes {
+            bytes: (0..=255u8)
+                .cycle()
+                .skip(usize::from(n))
+                .take(300 + usize::from(n))
+                .collect(),
+            truncated: n.is_multiple_of(2),
+        };
+        crate::sandbox::control::Capture {
+            seq,
+            req_head: part(0),
+            injected: part(1),
+            req_body: part(2),
+            res_head: part(3),
+            res_body: part(4),
+            ws_up: part(5),
+            ws_down: part(6),
+        }
+        .mask(&[], "api.example.com")
+    }
+
+    /// One event of each kind, every field away from its default and every text field holding
+    /// something JSON has to escape.
+    fn one_of_each() -> Vec<ProxyEvent> {
+        vec![
+            ProxyEvent::Stat {
+                host: "api.example.com".into(),
+                kind: StatKind::Blocked,
+            },
+            ProxyEvent::Refusal(Block {
+                event: crate::notify::NotifyEvent::Network,
+                subject: "api.example.com:8443".into(),
+                reason: "denied-default".into(),
+                detail: "a \"quoted\" \u{1b}[31m sentence\n".into(),
+                fix: "sbx net allow api.example.com:8443".into(),
+            }),
+            ProxyEvent::Signer {
+                kind: SignerKind::Refuse,
+                detail: "demo: GET api.example.com/ \u{0}".into(),
+            },
+            ProxyEvent::Logged {
+                id: 7,
+                entry: LogEntry {
+                    muted: true,
+                    host: "api.example.com".into(),
+                    port: 8443,
+                    method: Some("PATCH".into()),
+                    path: Some("/v1/é?q=\u{7f}".into()),
+                    verdict: LogVerdict::Resolved,
+                    reason: "outbound-secret".into(),
+                    proto: Proto::Dns,
+                    http_ver: HttpVer::H2,
+                    rpc: RpcKind::GrpcWeb,
+                },
+            },
+            ProxyEvent::Status { id: 7, status: 418 },
+            ProxyEvent::CaptureExpected { id: 7 },
+            ProxyEvent::CaptureFiled {
+                id: 7,
+                capture: captured(7),
+            },
+            ProxyEvent::CaptureGrew {
+                id: 8,
+                capture: captured(8),
+            },
+            ProxyEvent::SecretSeen {
+                id: 7,
+                name: "GITHUB_TOKEN".into(),
+                way: SecretWay::Back,
+            },
+            ProxyEvent::FlowOpened {
+                id: 3,
+                host: "db.internal".into(),
+                port: 5432,
+                proto: Proto::Tcp,
+            },
+            ProxyEvent::FlowCounts(vec![(3, u64::MAX, 0), (4, 1, 2)]),
+            ProxyEvent::FlowClosed { id: 3 },
+        ]
+    }
+
+    /// The kind of `event`. Exhaustive, so a kind added to [`ProxyEvent`] fails to compile here
+    /// until it is named, and then [`one_of_each`] has to carry it for the count below to hold.
+    fn kind(event: &ProxyEvent) -> &'static str {
+        match event {
+            ProxyEvent::Stat { .. } => "stat",
+            ProxyEvent::Refusal(_) => "refusal",
+            ProxyEvent::Signer { .. } => "signer",
+            ProxyEvent::Logged { .. } => "logged",
+            ProxyEvent::Status { .. } => "status",
+            ProxyEvent::CaptureExpected { .. } => "capture-expected",
+            ProxyEvent::CaptureFiled { .. } => "capture-filed",
+            ProxyEvent::CaptureGrew { .. } => "capture-grew",
+            ProxyEvent::SecretSeen { .. } => "secret-seen",
+            ProxyEvent::FlowOpened { .. } => "flow-opened",
+            ProxyEvent::FlowCounts(_) => "flow-counts",
+            ProxyEvent::FlowClosed { .. } => "flow-closed",
+        }
+    }
+
+    /// Every kind of event crosses the channel as it was sent, capture bytes included, and frames
+    /// written one after another are read back one by one, up to a clean end.
+    #[test]
+    fn every_kind_of_event_crosses_the_channel_unchanged() {
+        let sent = one_of_each();
+        let kinds: std::collections::BTreeSet<_> = sent.iter().map(kind).collect();
+        assert_eq!(kinds.len(), 12, "one event of each kind: {kinds:?}");
+
+        let mut stream = Vec::new();
+        for event in one_of_each() {
+            stream.extend(wire::encode(wire::Frame::Event(event)).unwrap().unwrap());
+        }
+        stream.extend(wire::encode(wire::Frame::Barrier(9)).unwrap().unwrap());
+        let mut reading = stream.as_slice();
+        for expected in sent {
+            let what = kind(&expected);
+            assert_eq!(
+                wire::read(&mut reading).unwrap(),
+                Some(wire::Frame::Event(expected)),
+                "{what}"
+            );
+        }
+        assert_eq!(
+            wire::read(&mut reading).unwrap(),
+            Some(wire::Frame::Barrier(9))
+        );
+        assert!(wire::read(&mut reading).unwrap().is_none(), "a clean end");
+    }
+
+    /// A frame the supervisor cannot read is refused, whatever is wrong with it: the channel then
+    /// ends, and nothing after it is applied.
+    #[test]
+    fn a_frame_that_cannot_be_read_is_refused_and_ends_the_channel() {
+        let frame = |event: ProxyEvent| wire::encode(wire::Frame::Event(event)).unwrap().unwrap();
+        let stat = || ProxyEvent::Stat {
+            host: "api.example.com".into(),
+            kind: StatKind::Allow,
+        };
+        let header = |doc: u32, pieces: u32| -> Vec<u8> {
+            let mut h = doc.to_le_bytes().to_vec();
+            h.extend(pieces.to_le_bytes());
+            h
+        };
+        // A capture event with one piece short, and a plain event with one piece too many.
+        let short = {
+            let whole = frame(ProxyEvent::CaptureFiled {
+                id: 1,
+                capture: captured(1),
+            });
+            let mut doc_len = [0u8; 4];
+            doc_len.copy_from_slice(&whole[..4]);
+            let doc_len = u32::from_le_bytes(doc_len) as usize;
+            let mut cut = header(doc_len as u32, 6);
+            cut.extend(&whole[8..8 + doc_len]);
+            let mut rest = &whole[8 + doc_len..];
+            for _ in 0..6 {
+                let mut len = [0u8; 4];
+                len.copy_from_slice(&rest[..4]);
+                let len = u32::from_le_bytes(len) as usize;
+                cut.extend(&rest[..4 + len]);
+                rest = &rest[4 + len..];
+            }
+            cut
+        };
+        let extra = {
+            let mut plain = frame(stat());
+            plain[4] = 1;
+            plain.extend(3u32.to_le_bytes());
+            plain.extend(b"abc");
+            plain
+        };
+        // A document whose length alone crosses the bound, though every byte of it is valid.
+        let oversized_doc = {
+            let doc = serde_json::to_vec(&wire::Frame::<wire::CaptureDoc>::Barrier(1)).unwrap();
+            let len = wire::MAX_FRAME;
+            let mut f = header(len as u32, 0);
+            f.extend(&doc);
+            f.resize(8 + len, b' ');
+            f
+        };
+        // A piece whose length takes the frame past the bound.
+        let oversized_piece = {
+            let whole = frame(ProxyEvent::CaptureFiled {
+                id: 1,
+                capture: captured(1),
+            });
+            let mut f = whole.clone();
+            let mut doc_len = [0u8; 4];
+            doc_len.copy_from_slice(&whole[..4]);
+            let at = 8 + u32::from_le_bytes(doc_len) as usize;
+            f[at..at + 4].copy_from_slice(&(wire::MAX_FRAME as u32).to_le_bytes());
+            f
+        };
+        // Each named by the refusal it must meet, so a check that went missing is not hidden by
+        // another one failing further on.
+        let cases: [(&str, Vec<u8>); 7] = [
+            ("unexpected end of file", vec![1, 0, 0]),
+            ("more pieces than any event carries", header(2, 8)),
+            ("fewer pieces than the capture has parts", short),
+            ("pieces the document does not name", extra),
+            ("a document larger than a frame carries", oversized_doc),
+            ("a frame larger than the channel carries", oversized_piece),
+            ("a document that does not parse", {
+                let mut f = header(5, 0);
+                f.extend(b"{nope");
+                f
+            }),
+        ];
+        for (what, bytes) in cases {
+            let refused = wire::read(&mut bytes.as_slice())
+                .expect_err(what)
+                .to_string();
+            assert!(
+                refused.contains(what),
+                "{what}: refused for another reason: {refused}"
+            );
+
+            // Through the applying side: the frame after it is never applied, and the thread ends.
+            let dir = TmpDir::new();
+            let counts = stats(&dir);
+            let (mut proxy, supervisor) = UnixStream::pair().unwrap();
+            let applier = applying(
+                Sinks {
+                    stats: Some(Arc::clone(&counts)),
+                    ..Sinks::default()
+                },
+                supervisor,
+            )
+            .unwrap();
+            let mut after = bytes;
+            after.extend(frame(stat()));
+            // Written from a thread of its own: past the refused frame nothing reads the channel,
+            // so a write larger than its buffer would never finish.
+            let writer = std::thread::spawn(move || {
+                let _ = proxy.write_all(&after);
+            });
+            applier.join().unwrap();
+            writer.join().unwrap();
+            assert!(counts.snapshot().is_empty(), "{what}: applied past it");
+        }
+    }
+
+    /// An event too large to cross is one no request can have produced: the proxy drops it rather
+    /// than write a frame the supervisor would refuse, and what follows it still crosses.
+    #[test]
+    fn an_event_too_large_to_cross_is_dropped_and_what_follows_still_crosses() {
+        let dir = TmpDir::new();
+        let counts = stats(&dir);
+        let ring = Arc::new(SignerRing::new(SIGNER_RING_CAP));
+        let events = spawn(Sinks {
+            stats: Some(Arc::clone(&counts)),
+            signer_log: Some(Arc::clone(&ring)),
+            ..Sinks::default()
+        })
+        .unwrap();
+        events.send(ProxyEvent::Signer {
+            kind: SignerKind::Sign,
+            detail: "x".repeat(wire::MAX_FRAME),
+        });
+        events.send(ProxyEvent::Stat {
+            host: "api.example.com".into(),
+            kind: StatKind::Allow,
+        });
+        events.flush();
+        assert!(ring.snapshot(None).events.is_empty());
+        assert_eq!(
+            counts.snapshot().get("api.example.com").map(|c| c.allow),
+            Some(1),
+            "the event after the dropped one was applied"
+        );
     }
 }

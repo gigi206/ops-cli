@@ -31,12 +31,13 @@
 //! the second behind the first. Identity is held in RAM for the session and never persisted: a refusal
 //! silenced yesterday must not stay silent today, when it may mean something new.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// A refusal sbx can announce. One variant per **config section that governs the refusal**, so the
 /// name in `[notify.events]` is also the name of the setting to go and change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum NotifyEvent {
     /// An egress request the network policy turned down — governed by `[network]`.
     Network,
@@ -235,7 +236,7 @@ impl NotifyPolicy {
 /// Every field can carry text the agent chose (a host it asked for, a path it ran), and a notification
 /// body may be journaled by the desktop daemon — so a block is redacted at the sink, before it leaves
 /// the process, exactly like every other outward-facing sink.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Block {
     /// Which lens refused.
     pub(crate) event: NotifyEvent,
