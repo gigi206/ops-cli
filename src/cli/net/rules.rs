@@ -527,6 +527,7 @@ fn net_inject_session(
     let context = pending_session_context(&data_dir);
     let mut loaded: Vec<u32> = Vec::new();
     let mut refused: Vec<u32> = Vec::new();
+    let mut unconfirmed: Vec<u32> = Vec::new();
     for pid in sandbox::control::session_pids(&data_dir) {
         if !in_scope(pid, &project_pids, &app_pids) {
             continue;
@@ -548,6 +549,7 @@ fn net_inject_session(
         match injected {
             Ok(sandbox::control::InjectOutcome::Loaded) => loaded.push(pid),
             Ok(sandbox::control::InjectOutcome::Refused) => refused.push(pid),
+            Ok(sandbox::control::InjectOutcome::Unconfirmed) => unconfirmed.push(pid),
             // A dead/stale socket (the session went away) — skip it.
             Err(_) => {}
         }
@@ -555,15 +557,26 @@ fn net_inject_session(
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!(
         "{}",
-        render_inject(verb, rule, all, app, &loaded, &refused, &context, &pal)
+        render_inject(
+            verb,
+            rule,
+            all,
+            app,
+            &loaded,
+            &refused,
+            &unconfirmed,
+            &context,
+            &pal
+        )
     );
     ExitCode::SUCCESS
 }
 
 /// Render a `--session` rule load: which live sessions took the rule (with their agent/project
-/// context, so a cross-agent reach is visible) and which an older server refused. When no session in
-/// scope took it, it says so and points at the config write as the persistent alternative. A pure
-/// presenter — its palette comes from the caller.
+/// context, so a cross-agent reach is visible), which an older server refused, and which kept it
+/// without their proxy confirming it decides requests. When no session in scope took it, it says so
+/// and points at the config write as the persistent alternative. A pure presenter — its palette
+/// comes from the caller.
 #[allow(clippy::too_many_arguments)]
 fn render_inject(
     verb: &str,
@@ -572,6 +585,7 @@ fn render_inject(
     app: Option<&str>,
     loaded: &[u32],
     refused: &[u32],
+    unconfirmed: &[u32],
     context: &[(u32, PathBuf, String)],
     pal: &style::Palette,
 ) -> String {
@@ -618,11 +632,23 @@ fn render_inject(
              support).{r}"
         );
     }
+    if !unconfirmed.is_empty() {
+        let pids = unconfirmed
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            o,
+            "{warn}session(s) {pids} kept the rule, but their proxy did not confirm it decides \
+             requests — run the command again to push it once more.{r}"
+        );
+    }
     // Nothing took the rule: no session with egress filtering is running in scope. Point at the
     // persistent path (which pre-decides the host for the next launch), carrying the `--app <name>`
     // scope when one was given so the hint is copy-pasteable.
     if loaded.is_empty() {
-        if refused.is_empty() {
+        if refused.is_empty() && unconfirmed.is_empty() {
             let scope = match (app, all) {
                 (Some(a), _) => format!("app `{a}`"),
                 (None, true) => "any session".to_string(),

@@ -949,6 +949,7 @@ fn a_session_mute_overlay_suppresses_a_deny_like_a_config_mute() {
         crate::sandbox::control::LOG_RING_CAP,
     ));
     // The policy carries NO config mute — the suppression can only come from the overlay.
+    let manual = Arc::new(crate::sandbox::control::ManualRules::new());
     let ctx = ProxyCtx::new(
         Arc::new(Ca::ephemeral().unwrap()),
         crate::allowlist::EgressPolicy::new(vec![], vec![]),
@@ -957,10 +958,12 @@ fn a_session_mute_overlay_suppresses_a_deny_like_a_config_mute() {
     .with_events(crate::sandbox::proxy::events::for_log(
         log.clone(),
         Some(stats.clone()),
-    ));
+    ))
+    .with_manual(manual.clone());
     // Load a live session mute — exactly what `REMEMBER MUTE` does on the control socket.
-    ctx.manual
-        .remember_mute(crate::allowlist::classify("play.googleapis.com").unwrap());
+    manual
+        .remember_mute(crate::allowlist::classify("play.googleapis.com").unwrap())
+        .expect("the proxy confirms the mute");
 
     ctx.outcome(
         crate::sandbox::control::Proto::Https,
@@ -1882,10 +1885,12 @@ fn a_session_http_overlay_opens_a_cleartext_host_for_an_allowlist_agent() {
         );
         let port = addr.port();
         let manual = Arc::new(ManualRules::new());
-        manual.remember_rule(
-            Verdict::Allow,
-            classify(&format!("http://target.test:{port}")).unwrap(),
-        );
+        manual
+            .remember_rule(
+                Verdict::Allow,
+                classify(&format!("http://target.test:{port}")).unwrap(),
+            )
+            .unwrap();
         // An allowlist session (deny-by-default) that allows only an unrelated host — the target
         // is NOT config-permitted, so without the overlay a cleartext request is denied-default.
         let ctx = Arc::new(
@@ -1913,7 +1918,9 @@ fn a_session_deny_blocks_a_config_allowed_host() {
     // allowlist permits it. The resolver panics if reached — a deny refuses before resolving.
     use crate::sandbox::control::{ManualRules, Verdict};
     let manual = Arc::new(ManualRules::new());
-    manual.remember_rule(Verdict::Deny, classify("api.test").unwrap());
+    manual
+        .remember_rule(Verdict::Deny, classify("api.test").unwrap())
+        .unwrap();
     let ca = Arc::new(Ca::ephemeral().unwrap());
     let der = ca.ca_cert_der();
     let ctx = Arc::new(
@@ -5149,12 +5156,11 @@ fn a_logged_path_has_its_secret_query_redacted_at_push() {
 #[test]
 fn with_control_honors_the_policy_ask_notice() {
     let pending = Arc::new(crate::sandbox::control::PendingState::new());
-    let manual = Arc::new(crate::sandbox::control::ManualRules::new());
 
     // Default policy → the notice is on under `with_control`.
     let on = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), EgressPolicy::default())
         .unwrap()
-        .with_control(pending.clone(), manual.clone());
+        .with_control(pending.clone(), super::link::Link::detached());
     assert!(on.notices, "the park notice is on by default");
 
     // A policy that silenced the notice → off, surviving the built-in union in `new`.
@@ -5163,7 +5169,7 @@ fn with_control_honors_the_policy_ask_notice() {
         EgressPolicy::default().with_ask_notice(false),
     )
     .unwrap()
-    .with_control(pending, manual);
+    .with_control(pending, super::link::Link::detached());
     assert!(
         !off.notices,
         "ask_notice = false suppresses the park notice"
@@ -6877,7 +6883,9 @@ fn a_manual_rule_decides_an_ask_without_parking() {
             .with_no_client_auth(),
     );
     let manual = Arc::new(ManualRules::new());
-    manual.remember(Verdict::Allow, "ask.test", addr.port());
+    manual
+        .remember(Verdict::Allow, "ask.test", addr.port())
+        .unwrap();
     let ctx = Arc::new(
         ProxyCtx::new(
             proxy_ca,
@@ -6907,7 +6915,7 @@ fn a_manual_rule_decides_an_ask_without_parking() {
     let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
     let proxy_ca_der = proxy_ca.ca_cert_der();
     let manual = Arc::new(ManualRules::new());
-    manual.remember(Verdict::Deny, "blocked.test", 443);
+    manual.remember(Verdict::Deny, "blocked.test", 443).unwrap();
     let ctx = Arc::new(
         ProxyCtx::new(
             proxy_ca,
@@ -6947,7 +6955,9 @@ fn a_config_deny_is_not_overridable_by_a_session_overlay_allow() {
     let ca = Arc::new(Ca::ephemeral().unwrap());
     let der = ca.ca_cert_der();
     let manual = Arc::new(ManualRules::new());
-    manual.remember_rule(Verdict::Allow, classify("blocked.test").unwrap());
+    manual
+        .remember_rule(Verdict::Allow, classify("blocked.test").unwrap())
+        .unwrap();
     let ctx = Arc::new(
         ProxyCtx::new(
             ca,
@@ -6989,7 +6999,9 @@ fn a_broad_session_overlay_allow_does_not_unlock_a_private_ip() {
     let ca = Arc::new(Ca::ephemeral().unwrap());
     let der = ca.ca_cert_der();
     let manual = Arc::new(ManualRules::new());
-    manual.remember_rule(Verdict::Allow, classify("*.internal.test:*").unwrap());
+    manual
+        .remember_rule(Verdict::Allow, classify("*.internal.test:*").unwrap())
+        .unwrap();
     let ctx = Arc::new(
         ProxyCtx::new(ca, EgressPolicy::default().with_default(DefaultAction::Ask))
             .unwrap()
@@ -7026,7 +7038,9 @@ fn a_broad_session_overlay_allow_does_not_unlock_a_private_ip() {
             .with_no_client_auth(),
     );
     let manual = Arc::new(ManualRules::new());
-    manual.remember(Verdict::Allow, "exact.internal.test", addr.port());
+    manual
+        .remember(Verdict::Allow, "exact.internal.test", addr.port())
+        .unwrap();
     let ctx = Arc::new(
         ProxyCtx::new(
             proxy_ca,

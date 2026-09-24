@@ -207,6 +207,7 @@ pub(crate) mod flows;
 mod forward;
 mod h2mitm;
 mod inject;
+pub(crate) mod link;
 mod pool;
 mod splice;
 mod ssrf;

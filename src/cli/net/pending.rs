@@ -361,12 +361,29 @@ fn render_pending(
     o
 }
 
-/// Answer every parked request in each session `keep` accepts, and report what happened.
-///
-/// Returns the hosts answered per session (in `session_pids` order, sessions with nothing parked
-/// omitted) and the pids of sessions running an sbx too old to understand the command — those keep
-/// their requests parked, so they are named rather than folded into a misleading "nothing parked".
-/// A dead or stale socket is a session that went away and is skipped.
+/// What a drain across sessions did, session by session.
+#[derive(Default)]
+struct Drain {
+    /// The hosts answered per session, in `session_pids` order, sessions with nothing parked
+    /// omitted.
+    answered: Vec<(u32, Vec<String>)>,
+    /// Sessions running an sbx too old to understand the command. Their requests stay parked, so
+    /// they are named rather than folded into a misleading "nothing parked".
+    unsupported: Vec<u32>,
+    /// Sessions whose proxy did not confirm the `--session` rules. Nothing was answered there, and
+    /// their requests stay parked.
+    unconfirmed: Vec<u32>,
+}
+
+impl Drain {
+    /// Whether some session in scope still has requests this drain did not answer.
+    fn left_parked(&self) -> bool {
+        !self.unsupported.is_empty() || !self.unconfirmed.is_empty()
+    }
+}
+
+/// Answer every parked request in each session `keep` accepts, and report what happened. A dead or
+/// stale socket is a session that went away and is skipped.
 ///
 /// `keep` is evaluated **before** the drain, never after: this writes, and answering a parked
 /// request cannot be undone, so a session the caller meant to skip must not be drained first and
@@ -377,23 +394,23 @@ fn drain_sessions(
     verdict: sandbox::control::Verdict,
     session: bool,
     keep: impl Fn(u32) -> bool,
-) -> (Vec<(u32, Vec<String>)>, Vec<u32>) {
-    let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
-    let mut unsupported: Vec<u32> = Vec::new();
+) -> Drain {
+    let mut drain = Drain::default();
     for pid in sandbox::control::session_pids(data_dir) {
         if !keep(pid) {
             continue;
         }
         match sandbox::control::drain_session(data_dir, pid, verdict, session) {
             Ok(sandbox::control::DrainOutcome::Drained(hosts)) if !hosts.is_empty() => {
-                answered.push((pid, hosts))
+                drain.answered.push((pid, hosts))
             }
             Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
-            Ok(sandbox::control::DrainOutcome::Unsupported) => unsupported.push(pid),
+            Ok(sandbox::control::DrainOutcome::Unsupported) => drain.unsupported.push(pid),
+            Ok(sandbox::control::DrainOutcome::Unconfirmed) => drain.unconfirmed.push(pid),
             Err(_) => {}
         }
     }
-    (answered, unsupported)
+    drain
 }
 
 /// `sbx net pending allow|deny <id> [--save --local|--global|--app <name>]`: answer one parked
@@ -552,6 +569,13 @@ pub(super) fn net_pending_answer(
             ));
             return ExitCode::from(2);
         }
+        Ok(sandbox::control::AnswerOutcome::Unconfirmed) => {
+            diag::error(&format!(
+                "sbx: the session did not confirm the --session rule for '{id}', so nothing was \
+                 answered (run the command again: it pushes the rule once more)"
+            ));
+            return ExitCode::from(2);
+        }
         Err(_) => {
             diag::error(&format!(
                 "sbx: no live session for '{id}' (the launch may have ended, or its socket is \
@@ -567,7 +591,14 @@ pub(super) fn net_pending_answer(
     } else {
         String::new()
     };
-    if session {
+    if count == 0 {
+        // The request was gone while its `--session` rule was being confirmed: the rule is in
+        // force, and only a retry is left for it to decide.
+        println!(
+            "{verb}ed {host} for this session; {id} itself was no longer waiting (it timed out, or \
+             another answer came first)"
+        );
+    } else if session {
         println!("{verb}ed {host}{times} for {id} (remembered for this session)");
     } else {
         println!("{verb}ed {host}{times} for {id}");
@@ -638,13 +669,13 @@ fn net_pending_answer_all(
     // `--app <name>` scopes the drain to that app's session pids (from the registry); an unregistered
     // session has no known app, so it is excluded under a filter.
     let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
-    let (answered, unsupported) = drain_sessions(&data_dir, verdict, session, |pid| {
+    let drain = drain_sessions(&data_dir, verdict, session, |pid| {
         app_pids.as_ref().is_none_or(|pids| pids.contains(&pid))
     });
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!(
         "{}",
-        render_drain(past, session, app, &answered, &unsupported, &context, &pal)
+        render_drain(past, session, app, &drain, &context, &pal)
     );
     ExitCode::SUCCESS
 }
@@ -674,20 +705,20 @@ fn render_drain(
     past: &str,
     session: bool,
     app: Option<&str>,
-    answered: &[(u32, Vec<String>)],
-    unsupported: &[u32],
+    drain: &Drain,
     context: &[(u32, PathBuf, String)],
     pal: &style::Palette,
 ) -> String {
     use std::fmt::Write as _;
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let mut o = String::new();
-    let total: usize = answered.iter().map(|(_, hosts)| hosts.len()).sum();
+    let total: usize = drain.answered.iter().map(|(_, hosts)| hosts.len()).sum();
     if total == 0 {
-        // Nothing answered. Distinguish "every session is healthy but empty" from "the only sessions
-        // present were launched by an older sbx that does not understand `--all`" — the latter would
+        // Nothing answered. Distinguish "every session is healthy but empty" from sessions that
+        // still hold parked requests this drain could not answer — an older sbx that does not
+        // understand `--all`, or a proxy that did not confirm the `--session` rules — which would
         // otherwise read as "nothing parked" while requests are in fact still blocked.
-        if unsupported.is_empty() {
+        if !drain.left_parked() {
             match app {
                 Some(name) => {
                     let _ = writeln!(
@@ -710,11 +741,11 @@ fn render_drain(
                 }
             }
         }
-        write_unsupported_note(&mut o, unsupported, pal);
+        write_left_parked_notes(&mut o, drain, pal);
         return o;
     }
     let _ = writeln!(o, "{h}{past} {total} parked request(s):{r}");
-    for (pid, hosts) in answered {
+    for (pid, hosts) in &drain.answered {
         // A per-session header from the registry, so with several agents the user can tell which one
         // each grant belongs to — the cross-agent reach made visible, not silent.
         write_session_header(&mut o, *pid, context, pal);
@@ -731,8 +762,43 @@ fn render_drain(
     if session {
         let _ = writeln!(o, "  {dim}(remembered for each session — not re-asked){r}");
     }
-    write_unsupported_note(&mut o, unsupported, pal);
+    write_left_parked_notes(&mut o, drain, pal);
     o
+}
+
+/// Append to a drain report the sessions whose parked requests it left parked, each with why.
+fn write_left_parked_notes(o: &mut String, drain: &Drain, pal: &style::Palette) {
+    write_unsupported_note(o, &drain.unsupported, pal);
+    write_unconfirmed_note(o, &drain.unconfirmed, pal);
+}
+
+/// Append the unconfirmed-rules warning to a drain report: name the sessions whose proxy did not
+/// confirm the `--session` rules, which therefore answered nothing, and say that running the command
+/// again pushes the rules once more.
+fn write_unconfirmed_note(o: &mut String, unconfirmed: &[u32], pal: &style::Palette) {
+    use std::fmt::Write as _;
+    if unconfirmed.is_empty() {
+        return;
+    }
+    let (warn, r) = (pal.warn, pal.reset);
+    let pids = unconfirmed
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        o,
+        "{warn}session(s) {pids} did not confirm the --session rules, so nothing was answered \
+         there — their parked requests stay blocked.{r}"
+    );
+    let _ = writeln!(
+        o,
+        "  {}",
+        style::dim_prose(
+            "run the command again: it pushes the rules to the session once more.",
+            pal
+        )
+    );
 }
 
 /// Append the older-session warning to a drain report: name the sessions whose control server is too
@@ -853,21 +919,22 @@ fn net_pending_drain_and_save(
     let context = pending_session_context(&data_dir);
     // Both filters must pass: `--app` and `--local` compose rather than override, so a session is
     // drained only when every active scope accepts it.
-    let (answered, unsupported) = drain_sessions(&data_dir, verdict, session, |pid| {
+    let drain = drain_sessions(&data_dir, verdict, session, |pid| {
         in_scope(pid, &project_pids, &app_pids)
     });
     // The flat host list the rule-writing below turns into rules, derived from what was answered
     // rather than accumulated a second time, so the two can never disagree about order.
-    let hosts: Vec<String> = answered
+    let hosts: Vec<String> = drain
+        .answered
         .iter()
         .flat_map(|(_, h)| h.iter().cloned())
         .collect();
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    let total: usize = answered.iter().map(|(_, h)| h.len()).sum();
+    let total: usize = drain.answered.iter().map(|(_, h)| h.len()).sum();
     if total == 0 {
         let mut out = String::new();
-        if unsupported.is_empty() {
+        if !drain.left_parked() {
             let scope_note = drain_scope_note(local, app);
             out.push_str(&style::dim_prose(
                 &format!("no pending requests {scope_note} — nothing to answer or save"),
@@ -875,7 +942,7 @@ fn net_pending_drain_and_save(
             ));
             out.push('\n');
         }
-        write_unsupported_note(&mut out, &unsupported, &pal);
+        write_left_parked_notes(&mut out, &drain, &pal);
         print!("{out}");
         return ExitCode::SUCCESS;
     }
@@ -908,7 +975,7 @@ fn net_pending_drain_and_save(
 
     print!(
         "{}",
-        render_drain(past, session, app, &answered, &unsupported, &context, &pal)
+        render_drain(past, session, app, &drain, &context, &pal)
     );
     // Name the real write target — the same resolution the per-host save just used — so a global
     // app's save is reported as its profile file, not "the global config under app" (the profile is
@@ -1232,16 +1299,50 @@ mod tests {
         );
     }
 
+    /// A session whose proxy did not confirm the `--session` rules answered nothing, so a drain
+    /// that reached only it must not read as "nothing parked": it names the session and says the
+    /// command can be run again.
+    #[test]
+    fn render_drain_names_a_session_that_did_not_confirm_its_rules() {
+        let p = style::Palette::plain();
+        let out = render_drain(
+            "allowed",
+            true,
+            None,
+            &Drain {
+                unconfirmed: vec![4242],
+                ..Drain::default()
+            },
+            &[],
+            &p,
+        );
+        assert!(
+            !out.contains("no pending requests")
+                && out.contains("4242")
+                && out.contains("did not confirm")
+                && out.contains("run the command again"),
+            "an unconfirmed drain must name the session and the retry, not claim emptiness:\n{out}"
+        );
+    }
+
     #[test]
     fn render_drain_reports_each_session_and_a_total() {
         let p = style::Palette::plain();
 
         // Empty drain → the "nothing parked" line, no total.
         assert!(
-            render_drain("allowed", false, None, &[], &[], &[], &p).contains("no pending requests")
+            render_drain("allowed", false, None, &Drain::default(), &[], &p)
+                .contains("no pending requests")
         );
         // An empty drain under an `--app` filter names the app (not "nothing anywhere").
-        let scoped = render_drain("allowed", false, Some("demo-app"), &[], &[], &[], &p);
+        let scoped = render_drain(
+            "allowed",
+            false,
+            Some("demo-app"),
+            &Drain::default(),
+            &[],
+            &p,
+        );
         assert!(
             scoped.contains("for app `demo-app`"),
             "the empty filtered drain must name the app:\n{scoped}"
@@ -1249,7 +1350,17 @@ mod tests {
 
         // An empty drain whose only sessions are too old to understand `--all` does NOT say "nothing
         // parked" — it names the older sessions and points at relaunching.
-        let old = render_drain("allowed", false, None, &[], &[99999u32], &[], &p);
+        let old = render_drain(
+            "allowed",
+            false,
+            None,
+            &Drain {
+                unsupported: vec![99999],
+                ..Drain::default()
+            },
+            &[],
+            &p,
+        );
         assert!(
             !old.contains("no pending requests")
                 && old.contains("99999")
@@ -1258,13 +1369,16 @@ mod tests {
             "an unsupported-only drain must name the older session and the fix, not claim emptiness:\n{old}"
         );
 
-        let answered = vec![
-            (
-                12345u32,
-                vec!["api.example.com".to_string(), "cdn.example.com".to_string()],
-            ),
-            (67890u32, vec!["files.example.org".to_string()]),
-        ];
+        let answered = Drain {
+            answered: vec![
+                (
+                    12345u32,
+                    vec!["api.example.com".to_string(), "cdn.example.com".to_string()],
+                ),
+                (67890u32, vec!["files.example.org".to_string()]),
+            ],
+            ..Drain::default()
+        };
         // Only the first session is registered, so the two headers render differently.
         let context = vec![(
             12345u32,
@@ -1272,7 +1386,7 @@ mod tests {
             "app:demo".to_string(),
         )];
 
-        let out = render_drain("allowed", true, None, &answered, &[], &context, &p);
+        let out = render_drain("allowed", true, None, &answered, &context, &p);
         // The total counts every answered host across every session.
         assert!(out.contains("allowed 3 parked request(s)"), "{out}");
         // Each session is named (the cross-agent grant made visible), and each host listed.
@@ -1290,7 +1404,7 @@ mod tests {
         assert!(out.contains("remembered for each session"), "{out}");
 
         // Without `--session`, no remembered note; "denied" past tense for a deny drain.
-        let out = render_drain("denied", false, None, &answered, &[], &context, &p);
+        let out = render_drain("denied", false, None, &answered, &context, &p);
         assert!(out.contains("denied 3 parked request(s)"), "{out}");
         assert!(!out.contains("remembered for each session"), "{out}");
 
@@ -1298,8 +1412,11 @@ mod tests {
         // must list that host ONCE with a ×count, not once per request.
         let mut hosts = vec!["ziglang.org".to_string(); 20];
         hosts.push("downloads.example.com".to_string());
-        let bursty = vec![(285706u32, hosts)];
-        let out = render_drain("allowed", false, None, &bursty, &[], &[], &p);
+        let bursty = Drain {
+            answered: vec![(285706u32, hosts)],
+            ..Drain::default()
+        };
+        let out = render_drain("allowed", false, None, &bursty, &[], &p);
         // Teeth: on the un-folded code this count is 20, so the assert fails without the fix.
         assert_eq!(
             out.matches("ziglang.org").count(),

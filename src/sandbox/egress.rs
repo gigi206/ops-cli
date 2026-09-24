@@ -1044,7 +1044,11 @@ pub(crate) fn start(
         let _ = std::fs::remove_file(&control_uds);
         let pending = Arc::new(super::control::PendingState::new());
         let manual = Arc::new(super::control::ManualRules::new());
-        ctx = ctx.with_control(pending.clone(), manual.clone());
+        // The rules the control plane keeps reach the proxy down a link, which confirms each change
+        // before the command that made it returns.
+        let (link, supervisor) = super::proxy::link::pair();
+        manual.attach(supervisor)?;
+        ctx = ctx.with_control(pending.clone(), link);
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.
         let control_listener = UnixListener::bind(&control_uds)?;

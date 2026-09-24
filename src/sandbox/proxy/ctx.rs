@@ -109,10 +109,11 @@ pub(crate) struct ProxyCtx {
     /// throwaway internal queue by default (so a non-ask launch never touches it); the launch
     /// injects the one the control thread also holds via [`Self::with_control`].
     pub(super) pending: Arc<crate::sandbox::control::PendingState>,
-    /// The live manual-rule overlay (`--session` answers). Consulted on the `ask` branch *before*
-    /// parking, so a remembered host:port is decided without re-asking. A throwaway empty overlay by
-    /// default; the launch injects the shared one via [`Self::with_control`].
-    pub(super) manual: Arc<crate::sandbox::control::ManualRules>,
+    /// This proxy's end of what the supervisor tells it: the live `--session` rules it folds into
+    /// its policy for every decision ([`effective_policy`]), pushed whole and confirmed before the
+    /// command that loaded them returns. Detached, with no rule, by default; the launch joins it to
+    /// the control plane's rules via [`Self::with_control`].
+    pub(super) link: super::link::Link,
     /// Whether to print a one-line stderr notice when a request parks, so an interactive user sees
     /// the pending id without polling. Off by default (tests, non-ask launches); the launch turns
     /// it on when it wires the control socket.
@@ -240,7 +241,7 @@ impl ProxyCtx {
             )),
             refresh: None,
             pending: Arc::new(crate::sandbox::control::PendingState::new()),
-            manual: Arc::new(crate::sandbox::control::ManualRules::new()),
+            link: super::link::Link::detached(),
             notices: false,
             events: None,
             flows: None,
@@ -582,18 +583,20 @@ impl ProxyCtx {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// Wire the proxy to the launch's shared pending queue and manual-rule overlay, and turn on the
-    /// park notices unless the policy suppressed them (`[network] ask_notice = false`). The launch
-    /// ([`crate::sandbox::egress::start`]) passes the same [`crate::sandbox::control::PendingState`] and
-    /// [`crate::sandbox::control::ManualRules`] it serves on the control socket, so a request parked here is
-    /// answerable by `sbx net pending` and a `--session` answer it adds is honored here.
+    /// Wire the proxy to the launch's shared pending queue and to its end of the link the
+    /// supervisor pushes the `--session` rules down, and turn on the park notices unless the policy
+    /// suppressed them (`[network] ask_notice = false`). The launch
+    /// ([`crate::sandbox::egress::start`]) passes the same [`crate::sandbox::control::PendingState`]
+    /// it serves on the control socket, and attaches the other end of `link` to the
+    /// [`crate::sandbox::control::ManualRules`] it serves there, so a request parked here is
+    /// answerable by `sbx net pending` and a `--session` rule loaded there decides requests here.
     pub(crate) fn with_control(
         mut self,
         pending: Arc<crate::sandbox::control::PendingState>,
-        manual: Arc<crate::sandbox::control::ManualRules>,
+        link: super::link::Link,
     ) -> Self {
         self.pending = pending;
-        self.manual = manual;
+        self.link = link;
         self.notices = self.policy.ask_notice();
         self
     }
@@ -700,10 +703,15 @@ impl ProxyCtx {
         self
     }
 
-    /// Wire the manual-rule overlay alone (notices off), so a test can pre-populate a remembered
-    /// decision and assert the proxy honors it without ever parking.
+    /// Join the proxy to `manual` alone (notices off), so a test can load a rule, before or after,
+    /// and assert the proxy honors it without ever parking. The rules reach the proxy the way the
+    /// launch's do: pushed down a link and confirmed.
     pub(super) fn with_manual(mut self, manual: Arc<crate::sandbox::control::ManualRules>) -> Self {
-        self.manual = manual;
+        let (link, supervisor) = super::link::pair();
+        manual
+            .attach(supervisor)
+            .expect("a proxy just joined confirms the rules already held");
+        self.link = link;
         self
     }
 }
@@ -791,19 +799,20 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
 /// raw splice) — not only when a request would otherwise park. The common case (an empty overlay)
 /// borrows the config policy with no allocation.
 pub(super) fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPolicy> {
-    if ctx.manual.is_empty() {
+    // One overlay for the whole decision: a push landing midway is the next decision's.
+    let overlay = ctx.link.overlay();
+    if overlay.is_empty() {
         return std::borrow::Cow::Borrowed(&ctx.policy);
     }
-    let (overlay_allow, overlay_deny) = ctx.manual.snapshot();
     let mut allow = ctx.policy.allow_rules().to_vec();
-    allow.extend(overlay_allow);
+    allow.extend(overlay.allow.iter().cloned());
     let mut deny = ctx.policy.deny_rules().to_vec();
-    deny.extend(overlay_deny);
+    deny.extend(overlay.deny.iter().cloned());
     // The mute (`dontaudit`) overlay — a live `sbx net mute --session` — folds onto the config
     // mutes, so a suppressed refusal is honored identically whether it came from config or the
     // session. Carried through this rebuild (like default_action/ask), or it would be dropped.
     let mut mute = ctx.policy.mute_rules().to_vec();
-    mute.extend(ctx.manual.mute_snapshot());
+    mute.extend(overlay.mute.iter().cloned());
     // Amended, not rebuilt, for the reason [`union_with_builtin`] gives: a merge that names the
     // settings it carries loses the ones it does not, and a `--session` overlay must change what is
     // allowed and nothing else.

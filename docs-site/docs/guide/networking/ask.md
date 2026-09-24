@@ -103,11 +103,16 @@ sbx net pending allow 12345.7@9657137 --save -g  # write it to the global config
 sbx net pending deny  12345.7@9657137 --session  # remember as denied for the session
 ```
 
-`--session` and `--save` combine. The unblock **sticks even if a save fails** (the
-network decision is not held hostage to a config write). A `--save` to the project
-config **re-trusts** it (a save must find the file absent or already trusted first);
-the global config is trusted by location. A saved rule is scoped to a host; the id
-addresses one live session's destination.
+`--session` and `--save` combine. With `--session`, the destination is remembered
+**before** the request is freed, so a client that retries at once is decided by the
+rule rather than asked again. If the session's proxy does not confirm the rule,
+nothing is answered (exit code 2) and the request stays parked; run the command again.
+If the request times out while its rule is being confirmed, the rule is still
+remembered, and the command says the request was no longer waiting. The unblock
+**sticks even if a save fails** (the network decision is not held hostage to a config
+write). A `--save` to the project config **re-trusts** it (a save must find the file
+absent or already trusted first); the global config is trusted by location. A saved
+rule is scoped to a host; the id addresses one live session's destination.
 
 A saved rule goes through the same grammar as one you type at
 [`sbx net allow`](rules): a destination no rule can be written for is refused, with

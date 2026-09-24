@@ -557,18 +557,26 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
 /// The outcome of answering a request over the control socket.
 pub(crate) enum AnswerOutcome {
     /// The request was answered: the host it was for (for a `--save`) and how many parked requests to
-    /// that destination the answer woke (identical retries collapse to one decision).
+    /// that destination the answer woke (identical retries collapse to one decision). A count of 0
+    /// is a request gone (timed out, or answered by another command) while its `--session` rule was
+    /// being confirmed: the rule is in force, and nothing was woken.
     Answered { host: String, count: usize },
     /// No such request is parked (already answered, timed out, or a wrong id).
     NotFound,
+    /// The answer was to remember its destination for the session, and the session's proxy did not
+    /// confirm the rule: nothing was answered ([`super::UNCONFIRMED`]).
+    Unconfirmed,
 }
 
 /// Parse a control `ALLOW`/`DENY` reply line into an outcome. `ok host=<h> count=<n>` is an answer;
 /// `count` is **optional** (defaults to 1) so a freshly-built client degrades cleanly against an
 /// older server that omits it — a long-lived session serves the wire protocol of the binary that
 /// launched it, so new-client ↔ older-server skew is real before a release. Anything else (`err …`)
-/// is [`AnswerOutcome::NotFound`].
+/// is [`AnswerOutcome::NotFound`], but for [`super::UNCONFIRMED`].
 fn parse_answer_reply(line: &str) -> AnswerOutcome {
+    if line == super::UNCONFIRMED {
+        return AnswerOutcome::Unconfirmed;
+    }
     if let Some(rest) = line.strip_prefix("ok ") {
         let mut host = None;
         let mut count = 1usize;
@@ -642,6 +650,9 @@ pub(crate) enum DrainOutcome {
     /// destination-grouping is server-side, so an old server's `ALLOW <seq>` wakes one connection of
     /// the group, leaving the retries parked.)
     Unsupported,
+    /// The drain was to remember each destination for the session, and the session's proxy did not
+    /// confirm the rules: nothing was answered ([`super::UNCONFIRMED`]).
+    Unconfirmed,
 }
 
 /// Drain *every* parked request in one session (`ALLOW *`/`DENY *`): connect, send the bulk verdict,
@@ -678,9 +689,11 @@ pub(crate) fn drain_session(
         }
         if let Some(host) = line.strip_prefix("answered host=") {
             hosts.push(host.to_string());
+        } else if line == super::UNCONFIRMED {
+            return Ok(DrainOutcome::Unconfirmed);
         } else if line.starts_with("err ") {
-            // A current server never answers a bulk drain with `err` — so any `err` line is an older
-            // server that does not understand `ALLOW *`/`DENY *`.
+            // A current server answers a bulk drain with no other `err` — so any other `err` line is
+            // an older server that does not understand `ALLOW *`/`DENY *`.
             return Ok(DrainOutcome::Unsupported);
         }
     }
@@ -712,6 +725,9 @@ pub(crate) enum InjectOutcome {
     /// The server refused it (a rule it could not classify, or a control server too old to know
     /// `REMEMBER`) — reported so the caller does not present it as loaded.
     Refused,
+    /// The session kept the rule, and its proxy did not confirm it holds it
+    /// ([`super::UNCONFIRMED`]): reported so the caller does not present it as deciding requests.
+    Unconfirmed,
 }
 
 /// Load a proactive egress `rule` into one session's live manual overlay (`REMEMBER ALLOW|DENY
@@ -751,6 +767,7 @@ fn send_remember(data_dir: &Path, pid: u32, verb: &str, rule: &str) -> io::Resul
     BufReader::new((&stream).take(REPLY_MAX)).read_line(&mut response)?;
     Ok(match response.trim() {
         "ok" => InjectOutcome::Loaded,
+        reply if reply == super::UNCONFIRMED => InjectOutcome::Unconfirmed,
         _ => InjectOutcome::Refused,
     })
 }
@@ -802,7 +819,9 @@ mod tests {
                 assert_eq!(host, "api.test");
                 assert_eq!(count, 9);
             }
-            AnswerOutcome::NotFound => panic!("a well-formed ok must answer"),
+            AnswerOutcome::NotFound | AnswerOutcome::Unconfirmed => {
+                panic!("a well-formed ok must answer")
+            }
         }
         // An older server omits `count` → defaults to 1 (new-client ↔ older-server version skew).
         match parse_answer_reply("ok host=api.test") {
@@ -810,7 +829,9 @@ mod tests {
                 assert_eq!(host, "api.test");
                 assert_eq!(count, 1);
             }
-            AnswerOutcome::NotFound => panic!("a countless ok must still answer"),
+            AnswerOutcome::NotFound | AnswerOutcome::Unconfirmed => {
+                panic!("a countless ok must still answer")
+            }
         }
         assert!(matches!(
             parse_answer_reply("err not-found"),

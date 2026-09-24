@@ -202,7 +202,7 @@ impl PendingState {
     /// This is the destination-grained answer the grouped listing addresses: a tool that retries one
     /// URL re-parks it many times, and they are a single decision, so `allow <id>`/`deny <id>` on the
     /// representative id decides the whole group at once. A *different* destination stays parked — this
-    /// is not the blanket [`answer_all`](PendingState::answer_all) drain.
+    /// is not the blanket [`answer_all_after`](PendingState::answer_all_after) drain.
     pub(crate) fn answer_like(&self, seq: u64, verdict: Verdict) -> Option<(String, u16, usize)> {
         let mut inner = locked(&self.inner);
         let (host, port, path) = {
@@ -226,48 +226,128 @@ impl PendingState {
         Some((host, port, count))
     }
 
-    /// Answer *every* currently-parked request with `verdict`: drain the queue under one lock, wake
-    /// each proxy thread, and return the `(host, port)` of each, oldest id first (the `BTreeMap`
-    /// orders by sequence). A point-in-time drain — a request that parks after this returns is not
-    /// affected. The lock is released before the sends, so a woken `park` thread's idempotent
-    /// self-`remove` does not contend (the entry is already gone — taken with the rest of the map).
-    pub(crate) fn answer_all(&self, verdict: Verdict) -> Vec<(String, u16)> {
-        let entries = {
-            let mut inner = locked(&self.inner);
-            std::mem::take(&mut inner.entries)
+    /// [`answer_like`](Self::answer_like), with `first` run on the destination **before** any request
+    /// is woken. A `--session` answer remembers the destination there, so the retry of a request it
+    /// frees is decided by the rule instead of parking again. When `first` fails, nothing is answered
+    /// and its error is returned.
+    ///
+    /// `first` runs with the queue unlocked. Remembering waits for the proxy to confirm the rule, and
+    /// the proxy must be able to park a request meanwhile: a queue held across that wait would stall
+    /// every request deciding to park behind an answer waiting on the proxy. The request may time
+    /// out, or be answered by someone else, in between: what `first` did then stands, and the
+    /// answer names the destination with a count of 0, which a caller tells apart from a request
+    /// that was not parked at all (`None`, `first` not run).
+    pub(crate) fn answer_like_after(
+        &self,
+        seq: u64,
+        verdict: Verdict,
+        first: impl FnOnce(&str, u16) -> io::Result<()>,
+    ) -> io::Result<Option<(String, u16, usize)>> {
+        let Some((host, port)) = locked(&self.inner)
+            .entries
+            .get(&seq)
+            .map(|e| (e.host.clone(), e.port))
+        else {
+            return Ok(None);
         };
-        entries
-            .into_values()
+        first(&host, port)?;
+        Ok(Some(
+            self.answer_like(seq, verdict).unwrap_or((host, port, 0)),
+        ))
+    }
+
+    /// [`answer_all_after`](Self::answer_all_after) with nothing to do first: what the tests of the
+    /// queue itself call.
+    #[cfg(test)]
+    pub(crate) fn answer_all(&self, verdict: Verdict) -> Vec<(String, u16)> {
+        self.answer_all_after(verdict, |_, _| Ok(()))
+            .unwrap_or_default()
+    }
+
+    /// Answer every request parked when this is called with `verdict`, wake each proxy thread, and
+    /// return the `(host, port)` of each, oldest id first (the `BTreeMap` orders by sequence). A
+    /// point-in-time drain: a request that parks after the call began is not affected, save for the
+    /// one below, and one that timed out meanwhile is not reported.
+    ///
+    /// `first` is run on every parked destination before any request is woken, with the queue
+    /// unlocked, for the reasons [`answer_like_after`](Self::answer_like_after) gives. When `first`
+    /// fails, nothing is answered. A request that parked while `first` ran is answered when its
+    /// destination is one `first` ran on, as the answer by id answers it: the rule remembered there
+    /// decides its retry as it does the others'. Any other stays parked, so none is freed without
+    /// the rule that was to decide its retry.
+    pub(crate) fn answer_all_after(
+        &self,
+        verdict: Verdict,
+        mut first: impl FnMut(&str, u16) -> io::Result<()>,
+    ) -> io::Result<Vec<(String, u16)>> {
+        let seen: Vec<(u64, String, u16)> = locked(&self.inner)
+            .entries
+            .iter()
+            .map(|(&seq, e)| (seq, e.host.clone(), e.port))
+            .collect();
+        let mut remembered: Vec<(&str, u16)> = Vec::new();
+        for (_, host, port) in &seen {
+            if !remembered.contains(&(host.as_str(), *port)) {
+                first(host, *port)?;
+                remembered.push((host, *port));
+            }
+        }
+        let answered: Vec<Entry> = {
+            let mut inner = locked(&self.inner);
+            let taken: Vec<u64> = inner
+                .entries
+                .iter()
+                .filter(|&(seq, e)| {
+                    seen.iter().any(|(s, _, _)| s == seq)
+                        || remembered.contains(&(e.host.as_str(), e.port))
+                })
+                .map(|(&seq, _)| seq)
+                .collect();
+            taken
+                .iter()
+                .filter_map(|seq| inner.entries.remove(seq))
+                .collect()
+        };
+        // The lock is released before the sends, so a woken `park` thread's idempotent
+        // self-`remove` does not contend (its entry is already gone).
+        Ok(answered
+            .into_iter()
             .map(|e| {
                 let _ = e.answer.send(verdict);
                 (e.host, e.port)
             })
-            .collect()
+            .collect())
     }
 }
 
 /// The live, per-session manual egress rules a user adds at runtime — either by answering an `ask`
 /// with `--session` (an exact `host:port` for the answered request) or by loading a rule ahead of
 /// time with `sbx net allow|deny <rule> --session` (any egress rule). A runtime overlay distinct
-/// from the (immutable) config policy, shared via `Arc` between the proxy serve threads and the
-/// control thread (which appends to it). The proxy consults it by **folding these rules into the
-/// effective policy** it evaluates per request — so an overlay allow/deny is enforced through the
-/// same allow/deny/path/method/deny-wins machinery as a config rule, in every filtering posture
+/// from the (immutable) config policy. The proxy folds these rules into the effective policy it
+/// evaluates per request — so an overlay allow/deny is enforced through the same
+/// allow/deny/path/method/deny-wins machinery as a config rule, in every filtering posture
 /// (allowlist, denylist, and `ask`), not only when a request would otherwise park.
+///
+/// This is the supervisor's copy, the one `RULES` lists. The proxy decides with its own, which every
+/// change is pushed to whole and **confirmed** before the change returns
+/// ([`crate::sandbox::proxy::link`]): the command that loaded a rule answers once the rule decides
+/// the next request, and says so when the proxy did not confirm it. Until [`attach`](Self::attach)
+/// names a proxy there is nobody to confirm, and a change is in force as soon as it is made.
 ///
 /// Its lock recovers from a poisoning panic ([`crate::sandbox::locks`]) on the argument
 /// [`super::proc_enforce::ProcOverlay`] gives rather than the module's, because it is the same
-/// shape: **live policy**, not a record kept for a reader, so it owes that argument here. Two things
-/// settle it. The lists cannot be left incomplete by an unwind — every mutation is a `contains`
-/// followed by a `push`, neither of which can unwind, so a poisoned overlay holds exactly what a
-/// completed [`remember_rule`](Self::remember_rule) put there. And the alternative is worse in the
-/// direction that matters: [`is_empty`](Self::is_empty) and [`snapshot`](Self::snapshot) are taken
-/// on **every** request the proxy decides, so propagating the panic would end each deciding thread
-/// in turn and leave a session whose live `--session` allows, denies and mutes are unreachable while
-/// the rest of the plane keeps running.
+/// shape: **live policy**, not a record kept for a reader, so it owes that argument here. The lists
+/// cannot be left incomplete by an unwind — every mutation is a `contains` followed by a `push`,
+/// neither of which can unwind, so a poisoned overlay holds exactly what a completed
+/// [`remember_rule`](Self::remember_rule) put there. And the alternative is worse in the direction
+/// that matters: propagating the panic would make every later `--session` command fail while the
+/// rest of the plane keeps running.
 #[derive(Default)]
 pub(crate) struct ManualRules {
     inner: RwLock<ManualInner>,
+    /// The proxy these rules are pushed to, once attached. Held across a push, so two changes reach
+    /// the proxy in the order they were made.
+    proxy: Mutex<Option<crate::sandbox::proxy::link::Supervisor>>,
 }
 
 #[derive(Default)]
@@ -279,6 +359,9 @@ struct ManualInner {
     /// alongside the config mutes; carried separately from allow/deny because it is a log filter,
     /// not a verdict rule.
     mute: Vec<Rule>,
+    /// Counts the changes, so the proxy installs the newest overlay it was sent and the supervisor
+    /// knows which one it confirmed.
+    version: u64,
 }
 
 impl ManualRules {
@@ -286,55 +369,107 @@ impl ManualRules {
         Self::default()
     }
 
+    /// Push these rules to `proxy` from now on, starting with the ones already held, and wait until
+    /// it confirms them.
+    pub(crate) fn attach(&self, proxy: crate::sandbox::proxy::link::Supervisor) -> io::Result<()> {
+        let mut held = locked(&self.proxy);
+        *held = Some(proxy);
+        self.confirm(held.as_ref())
+    }
+
     /// Remember an answered `host:port` as a manual allow or deny, so re-running that exact request
     /// is decided without re-asking. Deduped — re-answering the same `host:port` does not stack.
-    pub(crate) fn remember(&self, verdict: Verdict, host: &str, port: u16) {
-        self.remember_rule(verdict, crate::allowlist::host_port_rule(host, port));
+    pub(crate) fn remember(&self, verdict: Verdict, host: &str, port: u16) -> io::Result<()> {
+        self.remember_rule(verdict, crate::allowlist::host_port_rule(host, port))
     }
 
     /// Add an arbitrary egress `rule` to the overlay as a manual allow or deny — the proactive
     /// `sbx net allow|deny <rule> --session` path. Deduped, so re-loading the same rule does not
     /// stack. A deny takes precedence over an allow at decision time (deny wins in the policy).
-    pub(crate) fn remember_rule(&self, verdict: Verdict, rule: Rule) {
-        let mut inner = write_locked(&self.inner);
-        let list = match verdict {
-            Verdict::Allow => &mut inner.allow,
-            Verdict::Deny => &mut inner.deny,
-        };
-        if !list.contains(&rule) {
+    ///
+    /// An error when the proxy did not confirm the overlay holding it: the rule is kept here, and
+    /// the next change, or the same one again, pushes it once more.
+    pub(crate) fn remember_rule(&self, verdict: Verdict, rule: Rule) -> io::Result<()> {
+        self.change(|inner| {
+            let list = match verdict {
+                Verdict::Allow => &mut inner.allow,
+                Verdict::Deny => &mut inner.deny,
+            };
+            if list.contains(&rule) {
+                return false;
+            }
             list.push(rule);
-        }
+            true
+        })
     }
 
     /// Add an egress `rule` to the live **mute** overlay — the `sbx net mute <rule> --session` path.
     /// A `dontaudit` log filter: a denied request matching it is still refused (and still counted),
     /// only its log line is suppressed for this session. Deduped, so re-loading does not stack. Kept
     /// off [`Verdict`] deliberately — a mute is not a park answer, so it never touches the
-    /// allow/deny/ask verdict paths.
-    pub(crate) fn remember_mute(&self, rule: Rule) {
-        let mut inner = write_locked(&self.inner);
-        if !inner.mute.contains(&rule) {
+    /// allow/deny/ask verdict paths. Fails as [`Self::remember_rule`] does.
+    pub(crate) fn remember_mute(&self, rule: Rule) -> io::Result<()> {
+        self.change(|inner| {
+            if inner.mute.contains(&rule) {
+                return false;
+            }
             inner.mute.push(rule);
-        }
+            true
+        })
     }
 
-    /// Whether the overlay is empty — the common case, letting the proxy skip building an effective
-    /// policy and evaluate its immutable config policy directly (no per-request allocation). Includes
-    /// the mute overlay, so a live `--session` mute is folded in like an allow/deny.
+    /// Apply `edit`, which reports whether it changed anything, and bring the proxy up to date.
+    fn change(&self, edit: impl FnOnce(&mut ManualInner) -> bool) -> io::Result<()> {
+        let held = locked(&self.proxy);
+        {
+            let mut inner = write_locked(&self.inner);
+            if edit(&mut inner) {
+                inner.version += 1;
+            }
+        }
+        self.confirm(held.as_ref())
+    }
+
+    /// Push the overlay unless the proxy has already confirmed it. Checked on every change, the ones
+    /// that change nothing included: loading a rule again after the proxy failed to confirm it must
+    /// push it again, not report the rule it still cannot vouch for.
+    fn confirm(&self, proxy: Option<&crate::sandbox::proxy::link::Supervisor>) -> io::Result<()> {
+        let Some(proxy) = proxy else {
+            return Ok(());
+        };
+        let (version, overlay) = {
+            let inner = read_locked(&self.inner);
+            (
+                inner.version,
+                crate::sandbox::proxy::link::Overlay {
+                    allow: inner.allow.clone(),
+                    deny: inner.deny.clone(),
+                    mute: inner.mute.clone(),
+                },
+            )
+        };
+        if proxy.installed() >= version {
+            return Ok(());
+        }
+        proxy.push(version, overlay)
+    }
+
+    /// Whether no rule is held. The proxy asks its own overlay ([`crate::sandbox::proxy::link`]);
+    /// this copy is asked only by the tests of what it holds.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         let inner = read_locked(&self.inner);
         inner.allow.is_empty() && inner.deny.is_empty() && inner.mute.is_empty()
     }
 
     /// A snapshot of the manual verdict rules `(allow, deny)` — cloned out so the read lock is not
-    /// held across the fold into the effective policy, listing, or I/O.
+    /// held across listing or I/O.
     pub(crate) fn snapshot(&self) -> (Vec<Rule>, Vec<Rule>) {
         let inner = read_locked(&self.inner);
         (inner.allow.clone(), inner.deny.clone())
     }
 
-    /// A snapshot of the manual **mute** rules — cloned out (like [`Self::snapshot`]) so the read
-    /// lock is not held across the fold into the effective policy.
+    /// A snapshot of the manual **mute** rules — cloned out like [`Self::snapshot`].
     pub(crate) fn mute_snapshot(&self) -> Vec<Rule> {
         read_locked(&self.inner).mute.clone()
     }
@@ -1389,6 +1524,12 @@ pub(crate) fn serve(
 /// cannot make us buffer unboundedly. The peer is the owner-only, host-side control client.
 const CMD_MAX: u64 = 8 * 1024;
 
+/// The reply to a `--session` rule the proxy did not confirm it holds: the rule is kept by the
+/// session and pushed again with the next change, but nothing vouches that it decides requests yet,
+/// so the command that asked for it reports that instead of the rule. An answer that was to remember
+/// its destination answers nothing.
+pub(crate) const UNCONFIRMED: &str = "err unconfirmed";
+
 /// The largest control *reply* accepted. A reply carries the destination the agent reached
 /// (`ok host=<h> …`), which for a URL rule is far longer than a terse command: a bound sized for
 /// `ALLOW <seq>` would truncate the host and, with `--save`, persist a wrong (agent-influenceable)
@@ -1435,16 +1576,18 @@ fn handle(
 /// then `ok`; `ALLOW <seq>`/`DENY <seq>` answer every parked request to that request's destination
 /// (its `host:port/path` — identical retries are one decision; a trailing `session` token also
 /// remembers it as a manual rule), replying `ok host=<host> count=<n>` or `err not-found`;
-/// `ALLOW *`/`DENY *`
-/// drain *every* parked request, replying one `answered host=<host>` line each then `ok` (the
-/// `session` token remembers each); `REMEMBER ALLOW|DENY <rule>` loads a proactive `--session` rule
-/// into the overlay (`ok`, or `err bad-request` for an unclassifiable/absent rule), which the proxy
-/// folds into its effective policy; `RULES` returns the session's manual rules
-/// (`manual allow|deny <rule>` lines) then `ok`. `LOG` returns the recent egress events (a `dropped=`
-/// line when a `--follow` cursor fell behind the ring, a `head=` cursor, then one `event …` line
-/// each) then `ok`; `LOG after=<seq>` returns only events past that cursor. `path` is emitted last on
-/// a `pending`/`event` line so a query string's `=` cannot be mistaken for a field separator (the
-/// reader splits each token on its first `=`).
+/// `ALLOW *`/`DENY *` drain *every* parked request, replying one `answered host=<host>` line each
+/// then `ok` (the `session` token remembers each); `REMEMBER ALLOW|DENY|MUTE <rule>` loads a
+/// proactive `--session` rule into the overlay (`ok`, or `err bad-request` for an
+/// unclassifiable/absent rule), which the proxy folds into its effective policy. Every verb that
+/// remembers a rule replies [`UNCONFIRMED`] instead when the proxy did not confirm it holds it, and
+/// an answer that was to remember then answers nothing; one whose request timed out while its rule
+/// was being confirmed keeps the rule and replies `ok host=<host> count=0`. `RULES` returns the
+/// session's manual rules (`manual allow|deny <rule>` lines) then `ok`. `LOG` returns the recent
+/// egress events (a `dropped=` line when a `--follow` cursor fell behind the ring, a `head=`
+/// cursor, then one `event …` line each) then `ok`; `LOG after=<seq>` returns only events past that
+/// cursor. `path` is emitted last on a `pending`/`event` line so a query string's `=` cannot be
+/// mistaken for a field separator (the reader splits each token on its first `=`).
 ///
 /// `RESOLVED <host>` and `BYPASSED <addr> <port>` are the transparent-capture tap's two reports —
 /// the names a cage asked for, and a connection it made to an address no name was handed out for —
@@ -1519,14 +1662,21 @@ fn dispatch(
                 // Answered as a request this session does not have, which is exactly what it is.
                 return "err not-found\n".to_string();
             }
+            // With `session`, the destination is remembered before the request is freed, so its
+            // retry is decided by the rule rather than parked again, and a rule the proxy did not
+            // confirm answers nothing: the operator is told, and nothing is half done.
+            let first = |host: &str, port: u16| match remember {
+                true => manual.remember(verdict, host, port),
+                false => Ok(()),
+            };
             if target == "*" {
                 // Drain framing mirrors `LIST`: one `answered host=…` line per request, then `ok`.
                 // An empty queue is a clean `ok` (nothing to answer is not an error).
+                let Ok(answered) = state.answer_all_after(verdict, first) else {
+                    return format!("{UNCONFIRMED}\n");
+                };
                 let mut out = String::new();
-                for (host, port) in state.answer_all(verdict) {
-                    if remember {
-                        manual.remember(verdict, &host, port);
-                    }
+                for (host, _) in answered {
                     out.push_str(&format!("answered host={}\n", head_field(&host)));
                 }
                 out.push_str("ok\n");
@@ -1535,16 +1685,17 @@ fn dispatch(
             let Some(seq) = target.parse::<u64>().ok() else {
                 return "err bad-request\n".to_string();
             };
-            match state.answer_like(seq, verdict) {
-                Some((host, port, count)) => {
-                    if remember {
-                        manual.remember(verdict, &host, port);
-                    }
-                    // `host` is not the last token here — `count` follows it — so whitespace in it
-                    // would shift what the reader reads as the count.
+            match state.answer_like_after(seq, verdict, first) {
+                // A count of 0 is a request gone while `first` ran: with `session` its rule is in
+                // force and the reply says so, without it nothing was done.
+                //
+                // `host` is not the last token here — `count` follows it — so whitespace in it would
+                // shift what the reader reads as the count.
+                Ok(Some((host, _, count))) if count > 0 || remember => {
                     format!("ok host={} count={count}\n", head_field(&host))
                 }
-                None => "err not-found\n".to_string(),
+                Ok(_) => "err not-found\n".to_string(),
+                Err(_) => format!("{UNCONFIRMED}\n"),
             }
         }
         Some("REMEMBER") => {
@@ -1568,15 +1719,16 @@ fn dispatch(
             } else {
                 return "err bad-request\n".to_string();
             };
-            match crate::allowlist::classify(rule_text) {
-                Ok(rule) => {
-                    match kind {
-                        Kind::Verdict(v) => manual.remember_rule(v, rule),
-                        Kind::Mute => manual.remember_mute(rule),
-                    }
-                    "ok\n".to_string()
-                }
-                Err(_) => "err bad-request\n".to_string(),
+            let Ok(rule) = crate::allowlist::classify(rule_text) else {
+                return "err bad-request\n".to_string();
+            };
+            let loaded = match kind {
+                Kind::Verdict(v) => manual.remember_rule(v, rule),
+                Kind::Mute => manual.remember_mute(rule),
+            };
+            match loaded {
+                Ok(()) => "ok\n".to_string(),
+                Err(_) => format!("{UNCONFIRMED}\n"),
             }
         }
         Some("RULES") => {
@@ -2082,7 +2234,7 @@ mod tests {
         assert!(m.is_empty());
 
         // An ask answer records the exact host:port on the right list.
-        m.remember(Verdict::Allow, "api.test", 8080);
+        m.remember(Verdict::Allow, "api.test", 8080).unwrap();
         assert!(!m.is_empty());
         assert_eq!(
             m.snapshot().0,
@@ -2091,7 +2243,7 @@ mod tests {
 
         // A proactive `--session` load records an arbitrary (wildcard) rule.
         let wildcard = crate::allowlist::classify("*.internal.test").unwrap();
-        m.remember_rule(Verdict::Allow, wildcard.clone());
+        m.remember_rule(Verdict::Allow, wildcard.clone()).unwrap();
         let (allow, deny) = m.snapshot();
         assert!(allow.contains(&wildcard) && deny.is_empty());
 
@@ -2099,16 +2251,188 @@ mod tests {
         m.remember_rule(
             Verdict::Deny,
             crate::allowlist::classify("bad.internal.test").unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(m.snapshot().1.len(), 1);
 
         // Dedup: re-loading the same rule does not stack.
-        m.remember(Verdict::Allow, "api.test", 8080);
-        m.remember_rule(Verdict::Allow, wildcard);
+        m.remember(Verdict::Allow, "api.test", 8080).unwrap();
+        m.remember_rule(Verdict::Allow, wildcard).unwrap();
         assert_eq!(
             m.snapshot().0.len(),
             2,
             "a re-loaded rule is not duplicated"
+        );
+    }
+
+    /// A `--session` answer puts its rule in force in the proxy before it frees the request, so the
+    /// request's retry is decided by the rule rather than parked again — one answer, one decision,
+    /// for a tool that retries at once. Both the answer by id and the drain.
+    ///
+    /// The proxy is held from installing the rule while the answer waits on it, so the request
+    /// still being parked at that point is checked exactly, not raced: its rule is in the
+    /// supervisor's copy, and the answer cannot have gone past the confirmation.
+    #[test]
+    fn a_session_answer_is_in_force_before_the_request_it_frees() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let (link, supervisor) = crate::sandbox::proxy::link::pair();
+        manual.attach(supervisor).unwrap();
+        let link = Arc::new(link);
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let flows = Arc::new(FlowRegistry::new());
+        for (port, target) in [(8080u16, None), (8081, Some("*"))] {
+            let (s, l) = (state.clone(), link.clone());
+            let parked = thread::spawn(move || {
+                let verdict = s.park("api.test", port, "/", None, 256, |_| {});
+                (verdict, l.overlay().allow.clone())
+            });
+            let seq = wait_for_one(&state);
+            let target = target.map_or_else(|| seq.to_string(), str::to_string);
+            let stall = link.stall_installs();
+            let answer = {
+                let (state, manual) = (state.clone(), manual.clone());
+                let (log, flows) = (log.clone(), flows.clone());
+                thread::spawn(move || {
+                    let cmd = format!("ALLOW {target} session");
+                    dispatch(&cmd, &state, &manual, &log, &flows, None, None)
+                })
+            };
+            let rule = crate::allowlist::host_port_rule("api.test", port);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !manual.snapshot().0.contains(&rule) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let still_parked = state.list().len();
+            drop(stall);
+            let reply = answer.join().unwrap();
+            state.answer_all(Verdict::Deny);
+            assert_eq!(
+                still_parked, 1,
+                "the request was freed before its rule was confirmed"
+            );
+            assert!(
+                reply.ends_with("ok\n") || reply.starts_with("ok "),
+                "{reply}"
+            );
+            let (verdict, in_force) = parked.join().unwrap();
+            assert_eq!(verdict, Verdict::Allow);
+            assert!(
+                in_force.contains(&crate::allowlist::host_port_rule("api.test", port)),
+                "the freed request found its rule already in force: {in_force:?}"
+            );
+        }
+    }
+
+    /// A `--session` answer waiting for the proxy to confirm its rule does not hold the queue: a
+    /// request parking meanwhile is queued at once, and the answer is confirmed once the proxy
+    /// installs the rule. A request that parked meanwhile for the destination being remembered is
+    /// freed with the others, one for another destination stays parked. Both the answer by id and
+    /// the drain.
+    #[test]
+    fn a_request_parks_while_a_session_answer_waits_for_its_confirmation() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let (link, supervisor) = crate::sandbox::proxy::link::pair();
+        manual.attach(supervisor).unwrap();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let flows = Arc::new(FlowRegistry::new());
+        let park = |port: u16| {
+            let s = state.clone();
+            thread::spawn(move || s.park("api.test", port, "/", None, 256, |_| {}))
+        };
+        for (port, other, target, freed) in [
+            (8080u16, 9080u16, None, "ok host=api.test count=2\n"),
+            (
+                8081,
+                9081,
+                Some("*"),
+                "answered host=api.test\nanswered host=api.test\nok\n",
+            ),
+        ] {
+            let first = park(port);
+            let seq = wait_for_one(&state);
+            let stall = link.stall_installs();
+            let target = target.map_or_else(|| seq.to_string(), str::to_string);
+            let answer = {
+                let (state, manual) = (state.clone(), manual.clone());
+                let (log, flows) = (log.clone(), flows.clone());
+                thread::spawn(move || {
+                    let cmd = format!("ALLOW {target} session");
+                    dispatch(&cmd, &state, &manual, &log, &flows, None, None)
+                })
+            };
+            // The answer is waiting for its confirmation once its rule is in the supervisor's copy.
+            let rule = crate::allowlist::host_port_rule("api.test", port);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !manual.snapshot().0.contains(&rule) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let (same, elsewhere) = (park(port), park(other));
+            // Nothing here is asserted on a duration: a queue held across the confirmation takes
+            // these two only once the answer has given up, and the answer then reports its rule
+            // unconfirmed.
+            while state.list().len() < 3 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            drop(stall);
+            let reply = answer.join().unwrap();
+            let left: Vec<u16> = state.list().iter().map(|row| row.port).collect();
+            state.answer_all(Verdict::Deny);
+            let verdicts = [first, same, elsewhere].map(|h| h.join().unwrap());
+            assert_eq!(reply, freed);
+            assert_eq!(left, [other], "only the other destination is still parked");
+            assert_eq!(verdicts, [Verdict::Allow, Verdict::Allow, Verdict::Deny]);
+        }
+    }
+
+    /// A `--session` answer whose request is gone while its rule is being confirmed (here answered
+    /// by another command; a timeout takes the same path) keeps the rule, and says so: `ok` with a
+    /// count of 0, not the `err not-found` of a request that was never parked, which would tell the
+    /// operator nothing was done.
+    #[test]
+    fn a_session_answer_whose_request_is_gone_meanwhile_keeps_its_rule() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let (link, supervisor) = crate::sandbox::proxy::link::pair();
+        manual.attach(supervisor).unwrap();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let flows = Arc::new(FlowRegistry::new());
+        let s = state.clone();
+        let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
+        let seq = wait_for_one(&state);
+        let stall = link.stall_installs();
+        let answer = {
+            let (state, manual) = (state.clone(), manual.clone());
+            let (log, flows) = (log.clone(), flows.clone());
+            thread::spawn(move || {
+                let cmd = format!("ALLOW {seq} session");
+                dispatch(&cmd, &state, &manual, &log, &flows, None, None)
+            })
+        };
+        let rule = crate::allowlist::host_port_rule("api.test", 8080);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !manual.snapshot().0.contains(&rule) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let other = dispatch(
+            &format!("DENY {seq}"),
+            &state,
+            &manual,
+            &log,
+            &flows,
+            None,
+            None,
+        );
+        drop(stall);
+        let reply = answer.join().unwrap();
+        state.answer_all(Verdict::Deny);
+        assert_eq!(parked.join().unwrap(), Verdict::Deny);
+        assert_eq!(other, "ok host=api.test count=1\n");
+        assert_eq!(reply, "ok host=api.test count=0\n");
+        assert!(
+            link.overlay().allow.contains(&rule),
+            "the rule stays in force"
         );
     }
 
@@ -2504,7 +2828,7 @@ mod tests {
             let _held = write_locked(&poisoner.inner);
             panic!("an unrelated holder gives up mid-flight");
         });
-        manual.remember(Verdict::Allow, "api.test", 443);
+        manual.remember(Verdict::Allow, "api.test", 443).unwrap();
         assert!(!manual.is_empty());
         assert_eq!(manual.snapshot().0.len(), 1);
 
@@ -2648,6 +2972,86 @@ mod tests {
         );
     }
 
+    /// A `--session` rule the proxy did not confirm is reported as such by every verb that loads
+    /// one, over the real socket, and an answer that was to remember its destination answers
+    /// nothing: the request stays parked, for an answer that can be confirmed.
+    #[test]
+    fn a_session_rule_the_proxy_did_not_confirm_is_reported_and_answers_nothing() {
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let pid = 24681u32;
+        let listener = UnixListener::bind(control_socket(data.path(), pid)).unwrap();
+        let pending = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        // A proxy that is gone: nothing will confirm what is pushed to it. Attaching pushes
+        // nothing, since no rule is held yet.
+        let (link, supervisor) = crate::sandbox::proxy::link::pair();
+        drop(link);
+        manual.attach(supervisor).unwrap();
+        {
+            let (pending, manual) = (pending.clone(), manual.clone());
+            thread::spawn(move || {
+                let _ = serve(
+                    listener,
+                    Planes {
+                        state: pending,
+                        manual,
+                        log: Arc::new(LogRing::new(LOG_RING_CAP)),
+                        flows: Arc::new(FlowRegistry::new()),
+                        capture: None,
+                        stats: None,
+                    },
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
+            });
+        }
+        assert!(matches!(
+            inject_rule(data.path(), pid, Verdict::Deny, "evil.test").unwrap(),
+            InjectOutcome::Unconfirmed
+        ));
+        assert!(matches!(
+            inject_mute(data.path(), pid, "noise.test").unwrap(),
+            InjectOutcome::Unconfirmed
+        ));
+
+        let s = pending.clone();
+        let parked = thread::spawn(move || s.park("api.test", 443, "/x", None, 256, |_| {}));
+        let seq = wait_for_one(&pending);
+        assert!(matches!(
+            answer_request(data.path(), pid, seq, None, Verdict::Allow, true).unwrap(),
+            AnswerOutcome::Unconfirmed
+        ));
+        assert!(matches!(
+            drain_session(data.path(), pid, Verdict::Allow, true).unwrap(),
+            DrainOutcome::Unconfirmed
+        ));
+        assert_eq!(pending.list().len(), 1, "nothing was answered");
+        // Without `session` there is nothing to confirm, and the answer goes through.
+        assert!(matches!(
+            answer_request(data.path(), pid, seq, None, Verdict::Allow, false).unwrap(),
+            AnswerOutcome::Answered { .. }
+        ));
+        assert_eq!(parked.join().unwrap(), Verdict::Allow);
+    }
+
+    /// A rule the proxy did not confirm is kept, and reaches the next proxy attached: an unconfirmed
+    /// push loses nothing.
+    #[test]
+    fn a_rule_left_unconfirmed_reaches_the_next_proxy_attached() {
+        let manual = ManualRules::new();
+        let (gone, supervisor) = crate::sandbox::proxy::link::pair();
+        drop(gone);
+        manual.attach(supervisor).unwrap();
+        let rule = crate::allowlist::classify("evil.test").unwrap();
+        assert!(manual.remember_rule(Verdict::Deny, rule.clone()).is_err());
+        assert_eq!(manual.snapshot().1, vec![rule.clone()], "kept all the same");
+
+        let (link, supervisor) = crate::sandbox::proxy::link::pair();
+        manual.attach(supervisor).unwrap();
+        assert_eq!(link.overlay().deny, vec![rule]);
+    }
+
     #[test]
     fn the_control_socket_round_trips_answer_and_rules() {
         // The integration seam: drive the client functions (`answer_request`, `query_manual`)
@@ -2696,7 +3100,9 @@ mod tests {
                 assert_eq!(host, "api.test");
                 assert_eq!(count, 1);
             }
-            AnswerOutcome::NotFound => panic!("the live request must be answered"),
+            AnswerOutcome::NotFound | AnswerOutcome::Unconfirmed => {
+                panic!("the live request must be answered")
+            }
         }
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
 
@@ -2709,7 +3115,9 @@ mod tests {
         // The consumed seq is now gone — a second answer is NotFound (not a phantom success).
         match answer_request(data.path(), pid, seq, incarnation(), Verdict::Allow, false).unwrap() {
             AnswerOutcome::NotFound => {}
-            AnswerOutcome::Answered { .. } => panic!("an already-answered seq must be NotFound"),
+            AnswerOutcome::Answered { .. } | AnswerOutcome::Unconfirmed => {
+                panic!("an already-answered seq must be NotFound")
+            }
         }
     }
 
@@ -2777,7 +3185,7 @@ mod tests {
         .unwrap()
         {
             AnswerOutcome::NotFound => {}
-            AnswerOutcome::Answered { .. } => {
+            AnswerOutcome::Answered { .. } | AnswerOutcome::Unconfirmed => {
                 panic!("an id minted by another incarnation must not answer this queue")
             }
         }
@@ -2791,7 +3199,9 @@ mod tests {
         // than the socket.
         match answer_request(data.path(), pid, seq, incarnation(), Verdict::Allow, false).unwrap() {
             AnswerOutcome::Answered { host, .. } => assert_eq!(host, "api.test"),
-            AnswerOutcome::NotFound => panic!("the live id must still be answered"),
+            AnswerOutcome::NotFound | AnswerOutcome::Unconfirmed => {
+                panic!("the live id must still be answered")
+            }
         }
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
     }
@@ -3134,7 +3544,7 @@ mod tests {
             DrainOutcome::Drained(hosts) => {
                 assert_eq!(hosts, vec!["one.test".to_string(), "two.test".to_string()])
             }
-            DrainOutcome::Unsupported => {
+            DrainOutcome::Unsupported | DrainOutcome::Unconfirmed => {
                 panic!("a current server must drain, not report unsupported")
             }
         }
@@ -3149,7 +3559,7 @@ mod tests {
         // A drain on the now-empty queue is a clean *empty* Drained — distinct from Unsupported.
         match drain_session(data.path(), pid, Verdict::Allow, false).unwrap() {
             DrainOutcome::Drained(hosts) => assert!(hosts.is_empty()),
-            DrainOutcome::Unsupported => {
+            DrainOutcome::Unsupported | DrainOutcome::Unconfirmed => {
                 panic!("an empty healthy queue is Drained, not Unsupported")
             }
         }
