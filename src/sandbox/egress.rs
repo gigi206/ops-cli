@@ -840,28 +840,21 @@ pub(crate) fn start(
     // Taken here because `resolved` is about to move into the refresher.
     let authenticated = announced(&resolved);
 
-    // The credential state the proxy will read, built here so the refresher can hold the same one
-    // and swap it in place. Re-resolution repeats exactly this call, which is why the inputs are
+    // The supervisor's copy of the credential state, which the refresher compares a re-resolution
+    // against and replaces. Re-resolution repeats exactly this call, which is why the inputs are
     // cloned rather than re-derived — the floor among them: a refresh that consulted different
     // sources, or scanned to a different depth, than the launch did would silently change what the
     // cage authenticates as and what it is watched for.
-    //
-    // Handed over the way the policy is below: as the form the proxy will receive once it runs in a
-    // process of its own, so a field that form drops is dropped on every launch that injects a
-    // credential. See [`super::proxy::Credentials::encode`].
-    let credentials = std::sync::Arc::new(super::proxy::Credentials::decode(
-        super::proxy::Credentials::new(
-            injections,
-            redactions,
-            redact_min_len,
-            policy
-                .shared_credential()
-                .iter()
-                .map(|group| group.to_vec())
-                .collect(),
-        )
-        .encode()?,
-    )?);
+    let credentials = std::sync::Arc::new(super::proxy::Credentials::new(
+        injections,
+        redactions,
+        redact_min_len,
+        policy
+            .shared_credential()
+            .iter()
+            .map(|group| group.to_vec())
+            .collect(),
+    ));
     // Armed over the declarations the set above was actually built from, which under
     // [`Unresolved::DenyDestination`] is a subset of what the launch declared. Handing it every
     // declaration instead would break both halves of the refresh contract: [`resolve_injections`]
@@ -992,12 +985,14 @@ pub(crate) fn start(
     // and a field the encoding drops is then dropped on every launch rather than on the day the
     // proxy moves. See [`crate::allowlist::EgressPolicy::encode`].
     let policy = EgressPolicy::decode(&policy.encode()?)?;
+    // The proxy's copy of the credentials is handed over the same way: as the form it will receive
+    // once it runs apart, so a field that form drops is dropped on every launch that injects a
+    // credential. See [`super::proxy::Credentials::encode`].
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
-        .with_shared_credentials(credentials)
+        .with_shared_credentials(std::sync::Arc::new(super::proxy::Credentials::decode(
+            credentials.encode()?,
+        )?))
         .with_app(app.map(str::to_string));
-    if let Some(refresh) = refresh {
-        ctx = ctx.with_refresh(refresh);
-    }
     // Stand up the control socket the host-side `sbx net pending`/`sbx net log`/`sbx net allow
     // --session` reach. It lives under the `0700` egress dir beside `<data>` and is **never** bound
     // into the cage (only the proxy socket and the CA cross in) — in Mode B the in-cage agent must not
@@ -1046,8 +1041,9 @@ pub(crate) fn start(
         let manual = Arc::new(super::control::ManualRules::new());
         // The rules the control plane keeps reach the proxy down a link, which confirms each change
         // before the command that made it returns; the requests the proxy parks come up the same
-        // link into the queue served here, held to the cap and timeout this end sets.
-        let (link, supervisor) = super::proxy::link::serving(ctx.parks(pending.clone()));
+        // link into the queue served here, held to the cap and timeout this end sets, and so do its
+        // requests to re-resolve the credentials, held to the bounds the refresher sets.
+        let (link, supervisor) = super::proxy::link::serving(ctx.parks(pending.clone()), refresh);
         manual.attach(supervisor)?;
         ctx = ctx.with_control(link);
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment

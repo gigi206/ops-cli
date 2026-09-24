@@ -2464,13 +2464,15 @@ mod tests {
     fn a_request_parked_through_the_link_is_queued_while_a_session_answer_waits() {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
-        let (link, supervisor) =
-            crate::sandbox::proxy::link::serving(crate::sandbox::proxy::link::Parks {
+        let (link, supervisor) = crate::sandbox::proxy::link::serving(
+            crate::sandbox::proxy::link::Parks {
                 pending: state.clone(),
                 cap: ASK_PENDING_CAP,
                 timeout: None,
                 notices: false,
-            });
+            },
+            None,
+        );
         manual.attach(supervisor).unwrap();
         let link = Arc::new(link);
         let log = Arc::new(LogRing::new(LOG_RING_CAP));

@@ -8465,8 +8465,11 @@ fn run_with_refresh(
     ));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = calls.clone();
+    // The supervisor's copy, apart from the proxy's: what the test reads afterwards is what the
+    // proxy installed from the set it was handed back.
+    let supervisors = Arc::new(Credentials::decode(credentials.encode().unwrap()).unwrap());
     let refresh = Arc::new(CredentialRefresh::new(
-        credentials.clone(),
+        supervisors,
         Box::new(move |_| {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok((
@@ -8875,9 +8878,10 @@ fn an_observed_credential_is_refused_toward_another_host_and_allowed_back_to_its
 }
 
 /// The mechanism end to end: an injection target answering `401` says the credential it was just
-/// given is no longer accepted, so the proxy re-resolves and the *next* request will carry the new
-/// value. The refused request itself is already lost — its head reached the cage before the status
-/// was read — which is why this asserts on the state, not on the response.
+/// given is no longer accepted, so the proxy asks the supervisor to re-resolve and the *next*
+/// request will carry the new value. The refused request itself is already lost — its head reached
+/// the cage before the status was read — which is why this asserts on the state, not on the
+/// response.
 #[test]
 fn a_401_from_an_injection_target_re_resolves_the_credential() {
     let (credentials, calls) = run_with_refresh(

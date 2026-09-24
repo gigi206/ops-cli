@@ -138,10 +138,11 @@ reads the status, so what a refresh buys is the *next* request. In practice the
 agent retries and continues, but the first call after a credential goes stale
 does fail, and that is worth knowing before you read it as a bug.
 
-Three bounds keep a hopeless credential from spinning, since a resolver run can
-mean launching a sandboxed plugin:
+Bounds keep a hopeless credential from spinning, since a resolver run can mean
+launching a sandboxed plugin:
 
-- a refusal within 30 seconds of the last attempt is ignored;
+- a refusal within 30 seconds of the last attempt is ignored, and so is one that
+  arrives while a re-resolution is still running;
 - a resolver that **errors** stops the mechanism for the session, since a broken
   source is not a stale one and retrying only repeats the failure;
 - a resolver that returns **the same value** stops it too: the upstream just

@@ -19,7 +19,7 @@ use crate::sandbox::egress_stats::StatKind;
 
 use super::ca::{Ca, CertResolver, ensure_provider, upstream_config, upstream_config_h2};
 use super::dns::{Resolver, caching_resolver};
-use super::inject::{CredentialRefresh, Credentials};
+use super::inject::Credentials;
 #[cfg(test)]
 use super::inject::{HeaderInjection, SecretNeedle};
 use super::redact_record_in_place;
@@ -97,13 +97,9 @@ pub(crate) struct ProxyCtx {
     pub(super) resolve: Resolver,
     pub(super) timeout: Duration,
     /// The live credential state: the injections to apply and the needles to scan for, as one
-    /// unit. Shared rather than owned because a credential can be re-resolved mid-session, and
-    /// because a capture is masked with the same needles when it is filed — one state, three
-    /// consumers.
+    /// unit. Shared between the connection threads, and replaced whole when the supervisor hands
+    /// back a re-resolved set ([`Self::credential_refused`]).
     pub(super) credentials: Arc<Credentials>,
-    /// How to re-resolve those credentials when an injection target refuses one. `None` for a
-    /// launch with nothing to refresh.
-    pub(super) refresh: Option<Arc<CredentialRefresh>>,
     /// This proxy's end of what the supervisor tells it: the live `--session` rules it folds into
     /// its policy for every decision ([`effective_policy`]), pushed whole and confirmed before the
     /// command that loaded them returns, and the answer to an `ask`-posture request it parks, which
@@ -237,7 +233,6 @@ impl ProxyCtx {
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
                 Vec::new(),
             )),
-            refresh: None,
             link: super::link::Link::detached(),
             notices: false,
             events: None,
@@ -608,34 +603,33 @@ impl ProxyCtx {
         }
     }
 
-    /// Share an already-built credential state, so a consumer outside the proxy (the capture ring's
-    /// masking) scans for exactly what this proxy injects, including after a refresh.
+    /// Hand the proxy its credential state. The launch passes the copy it decoded from the form the
+    /// proxy is handed; a test may keep a clone, to read what the proxy holds after a refresh.
     pub(crate) fn with_shared_credentials(mut self, credentials: Arc<Credentials>) -> Self {
         self.credentials = credentials;
         self
     }
 
-    /// Wire re-resolution, so an upstream that refuses the injected credential can be answered with
-    /// a freshly resolved one on the next request. Absent by default: a launch that never resolved a
-    /// credential has nothing to refresh, and one whose sources are all static gains nothing.
-    pub(crate) fn with_refresh(mut self, refresh: Arc<CredentialRefresh>) -> Self {
-        self.refresh = Some(refresh);
-        self
-    }
-
-    /// Tell the refresher that an injection target refused the credential it was given.
+    /// Ask the supervisor to re-resolve the credentials, since an injection target refused the one
+    /// it was given, and install the set it hands back.
     ///
     /// Called only for a `401` from a host that actually carries an injection: an unrelated refusal
     /// says nothing about our credential, and spending a resolver run on it would let any allowed
-    /// host drive sbx's resolver. The refresher applies its own bounds on top (see
-    /// [`CredentialRefresh::on_refusal`]), so this is safe to call on every such response.
+    /// host drive sbx's resolver. Whether to re-resolve is the supervisor's decision, under bounds
+    /// it holds ([`super::inject::CredentialRefresh::start`]), so this is safe to call on every
+    /// such response;
+    /// nothing comes back when it declines, or when the launch has nothing to refresh.
     ///
     /// The request that met the `401` is already lost: its head has been relayed to the cage by the
     /// time the status is read. What a refresh buys is the *next* one, which is enough for a client
     /// that retries — and every agent CLI observed here does.
     pub(super) fn credential_refused(&self) {
-        if let Some(refresh) = &self.refresh {
-            refresh.on_refusal();
+        if let Some(set) = self
+            .link
+            .refresh()
+            .and_then(|handed| super::inject::CredentialSet::decode(handed).ok())
+        {
+            self.credentials.replace(set);
         }
     }
 
@@ -711,7 +705,14 @@ impl ProxyCtx {
             notices: false,
             ..self.parks(pending)
         };
-        self.link = super::link::serving(parks).0;
+        self.link = super::link::serving(parks, None).0;
+        self
+    }
+
+    /// Serve this proxy's requests to re-resolve its credentials with `refresh`, the supervisor's
+    /// side, as the launch does.
+    pub(super) fn with_refresh(mut self, refresh: Arc<super::inject::CredentialRefresh>) -> Self {
+        self.link = super::link::refreshing(refresh).0;
         self
     }
 

@@ -759,7 +759,7 @@ mod tests {
             Vec::new(),
         ));
         let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8));
-        // The upstream rejected the old value and the proxy re-resolved it, all while the exchange
+        // The upstream rejected the old value and it was re-resolved, all while the exchange
         // below was still in flight — its capture is filed only afterwards.
         credentials.replace(CredentialSet {
             injections: Vec::new(),

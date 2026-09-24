@@ -29,6 +29,7 @@
 //! queue. The reader that takes in parks is the one that takes in confirmations, so it never waits
 //! on anything: a park it could not let in at once would hold every `--session` answer behind it.
 
+use super::inject::{CredentialRefresh, Started, Transfer};
 use crate::allowlist::Rule;
 use crate::sandbox::control::{PendingState, Verdict};
 use crate::sandbox::locks::{locked, read_locked, write_locked};
@@ -81,6 +82,9 @@ enum ToProxy {
     Overlay { version: u64, overlay: Overlay },
     /// The answer to the request the proxy parked as `id`.
     Answer { id: u64, verdict: Verdict },
+    /// The answer to the refresh the proxy asked for as `id`: the re-resolved set, or nothing when
+    /// the supervisor declined or found nothing new.
+    Refreshed { id: u64, set: Option<Transfer> },
 }
 
 /// What the proxy tells the supervisor.
@@ -95,6 +99,15 @@ enum ToSupervisor {
         port: u16,
         path: String,
     },
+    /// An injection target refused the credential it was given: re-resolve, if the supervisor's
+    /// bounds allow. Answered under the same `id`.
+    Refresh { id: u64 },
+}
+
+/// An answer the proxy waits for, handed to the request that asked.
+enum Reply {
+    Verdict(Verdict),
+    Refreshed(Option<Transfer>),
 }
 
 /// The proxy's end: the overlay in force, and the way back to the supervisor.
@@ -110,17 +123,18 @@ struct ProxySide {
     /// The way back, until the proxy lets go of its end ([`Link`]'s `Drop`), which is what tells
     /// the supervisor's reader that nothing more will come.
     up: Mutex<Option<Sender<ToSupervisor>>>,
-    /// The requests this proxy has parked, each waiting for the answer sent under its id.
-    parked: Mutex<Parked>,
+    /// What this proxy has asked and not yet heard back about, each waiting for the answer sent
+    /// under its id.
+    waiting: Mutex<Waiting>,
 }
 
-/// The requests a proxy has parked and not yet heard back about.
+/// The questions a proxy has asked the supervisor and not yet heard back about.
 #[derive(Default)]
-struct Parked {
+struct Waiting {
     /// The id the next one is sent under.
     next: u64,
     /// Where each one's answer is handed over, by id.
-    answers: HashMap<u64, Sender<Verdict>>,
+    replies: HashMap<u64, Sender<Reply>>,
 }
 
 impl Link {
@@ -131,7 +145,7 @@ impl Link {
             side: Arc::new(ProxySide {
                 overlay: RwLock::new((0, Arc::new(Overlay::default()))),
                 up: Mutex::new(None),
-                parked: Mutex::new(Parked::default()),
+                waiting: Mutex::new(Waiting::default()),
             }),
         }
     }
@@ -146,29 +160,46 @@ impl Link {
     /// supervisor lets it wait. A deny when the answer cannot come: an end no supervisor reaches, or
     /// a link that closed while the request waited.
     pub(crate) fn park(&self, host: &str, port: u16, path: &str) -> Verdict {
-        let (id, answer) = {
-            let mut parked = locked(&self.side.parked);
-            parked.next += 1;
-            let id = parked.next;
+        match self.ask(|id| ToSupervisor::Park {
+            id,
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+        }) {
+            Some(Reply::Verdict(verdict)) => verdict,
+            _ => Verdict::Deny,
+        }
+    }
+
+    /// Ask the supervisor to re-resolve the credentials, and wait for the set it hands back: nothing
+    /// when it declined, found nothing new, or cannot answer.
+    pub(crate) fn refresh(&self) -> Option<Transfer> {
+        match self.ask(|id| ToSupervisor::Refresh { id }) {
+            Some(Reply::Refreshed(set)) => set,
+            _ => None,
+        }
+    }
+
+    /// Send the question `message` builds under a fresh id, and wait for its answer. `None` when the
+    /// answer cannot come: an end no supervisor reaches, or a link that closed meanwhile.
+    fn ask(&self, message: impl FnOnce(u64) -> ToSupervisor) -> Option<Reply> {
+        let (id, reply) = {
+            let mut waiting = locked(&self.side.waiting);
+            waiting.next += 1;
+            let id = waiting.next;
             let (tx, rx) = channel();
-            parked.answers.insert(id, tx);
+            waiting.replies.insert(id, tx);
             (id, rx)
         };
         // Registered before it is sent, so an answer arriving at once finds where to go.
-        let sent = locked(&self.side.up).as_ref().is_some_and(|up| {
-            up.send(ToSupervisor::Park {
-                id,
-                host: host.to_string(),
-                port,
-                path: path.to_string(),
-            })
-            .is_ok()
-        });
+        let sent = locked(&self.side.up)
+            .as_ref()
+            .is_some_and(|up| up.send(message(id)).is_ok());
         if !sent {
-            locked(&self.side.parked).answers.remove(&id);
-            return Verdict::Deny;
+            locked(&self.side.waiting).replies.remove(&id);
+            return None;
         }
-        answer.recv().unwrap_or(Verdict::Deny)
+        reply.recv().ok()
     }
 
     /// Keep the reader from installing what it is sent, and so from confirming it, until the guard
@@ -202,8 +233,13 @@ struct SupervisorSide {
     /// How the requests this proxy parks are served, or `None` when nobody answers them: each is
     /// then denied as it arrives.
     parks: Option<Parks>,
+    /// How the proxy's requests to re-resolve its credentials are served, or `None` when the
+    /// launch has nothing to re-resolve: each is then declined as it arrives.
+    refresh: Option<Arc<CredentialRefresh>>,
     /// How a thread of this end is started: [`named_thread`], or in a test one the host refuses.
     threads: fn(&str) -> std::thread::Builder,
+    /// The way to the one thread that runs the admitted refreshes, while it runs.
+    refreshes: Mutex<Option<Sender<(u64, Started)>>>,
 }
 
 /// What the supervisor knows of the proxy's overlay.
@@ -275,15 +311,23 @@ fn gone() -> io::Error {
 /// Join a proxy to the supervisor that serves it, starting the reader on each side, with the
 /// requests the proxy parks served as `parks` says. Both readers end once the proxy lets go of its
 /// [`Link`], and so does every thread waiting on a request it parked.
-pub(crate) fn serving(parks: Parks) -> (Link, Supervisor) {
-    let (link, supervisor, _) = start(Some(parks), named_thread);
+pub(crate) fn serving(parks: Parks, refresh: Option<Arc<CredentialRefresh>>) -> (Link, Supervisor) {
+    let (link, supervisor, _) = start(Some(parks), refresh, named_thread);
     (link, supervisor)
 }
 
-/// [`serving`] with nobody to answer a parked request: all a test of the rules alone needs.
+/// [`serving`] with nobody to answer a parked request or a refresh: all a test of the rules alone
+/// needs.
 #[cfg(test)]
 pub(crate) fn pair() -> (Link, Supervisor) {
-    let (link, supervisor, _) = start(None, named_thread);
+    let (link, supervisor, _) = start(None, None, named_thread);
+    (link, supervisor)
+}
+
+/// [`serving`] with only the refreshes served: all a test of the refresh needs.
+#[cfg(test)]
+pub(crate) fn refreshing(refresh: Arc<CredentialRefresh>) -> (Link, Supervisor) {
+    let (link, supervisor, _) = start(None, Some(refresh), named_thread);
     (link, supervisor)
 }
 
@@ -296,6 +340,7 @@ fn named_thread(name: &str) -> std::thread::Builder {
 /// threads passed in.
 fn start(
     parks: Option<Parks>,
+    refresh: Option<Arc<CredentialRefresh>>,
     threads: fn(&str) -> std::thread::Builder,
 ) -> (Link, Supervisor, [std::thread::JoinHandle<()>; 2]) {
     let (down_tx, down_rx) = channel();
@@ -303,15 +348,31 @@ fn start(
     let proxy = Arc::new(ProxySide {
         overlay: RwLock::new((0, Arc::new(Overlay::default()))),
         up: Mutex::new(Some(up_tx)),
-        parked: Mutex::new(Parked::default()),
+        waiting: Mutex::new(Waiting::default()),
     });
     let supervisor = Arc::new(SupervisorSide {
         down: Mutex::new(Some(down_tx)),
         heard: Mutex::new(Heard::default()),
         changed: Condvar::new(),
         parks,
+        refresh,
         threads,
+        refreshes: Mutex::new(None),
     });
+    // One thread runs every refresh, started here and ended with the link, rather than one per
+    // refresh: a process a refresh starts — a signer handed a new key — is tied to the thread that
+    // started it, since its cage arms the parent-death signal, which follows that thread and not
+    // the process. A thread that ended with its refresh would take the new signer down with it.
+    if let Some(refresh) = supervisor.refresh.clone() {
+        let (jobs, queued) = channel();
+        let side = Arc::clone(&supervisor);
+        if threads("sbx-refresh")
+            .spawn(move || run_refreshes(&side, &refresh, &queued))
+            .is_ok()
+        {
+            *locked(&supervisor.refreshes) = Some(jobs);
+        }
+    }
     let readers = [
         {
             let proxy = Arc::clone(&proxy);
@@ -349,14 +410,18 @@ fn read_supervisor(rx: &Receiver<ToProxy>, side: &ProxySide) {
                     let _ = up.send(ToSupervisor::Installed { version: installed });
                 }
             }
-            ToProxy::Answer { id, verdict } => {
-                if let Some(waiting) = locked(&side.parked).answers.remove(&id) {
-                    let _ = waiting.send(verdict);
-                }
-            }
+            ToProxy::Answer { id, verdict } => hand_over(side, id, Reply::Verdict(verdict)),
+            ToProxy::Refreshed { id, set } => hand_over(side, id, Reply::Refreshed(set)),
         }
     }
-    locked(&side.parked).answers.clear();
+    locked(&side.waiting).replies.clear();
+}
+
+/// Hand the answer sent under `id` to the request waiting for it, if one still is.
+fn hand_over(side: &ProxySide, id: u64, reply: Reply) {
+    if let Some(waiting) = locked(&side.waiting).replies.remove(&id) {
+        let _ = waiting.send(reply);
+    }
 }
 
 /// The supervisor's reader: take in what the proxy confirms, and the requests it parks. Ends when
@@ -376,11 +441,14 @@ fn read_proxy(rx: &Receiver<ToSupervisor>, side: &Arc<SupervisorSide>) {
                 port,
                 path,
             } => serve_park(side, id, &host, port, &path),
+            ToSupervisor::Refresh { id } => serve_refresh(side, id),
         }
     }
     locked(&side.down).take();
     locked(&side.heard).closed = true;
     side.changed.notify_all();
+    // The refresh thread ends once the refresh it may be running does.
+    locked(&side.refreshes).take();
     // Nobody is left to hear these answers, and a thread waiting without a timeout would otherwise
     // outlive the proxy that parked the request.
     if let Some(parks) = &side.parks {
@@ -430,10 +498,50 @@ fn serve_park(side: &Arc<SupervisorSide>, id: u64, host: &str, port: u16, path: 
     }
 }
 
+/// Hand a refresh the proxy asked for to the refresh thread, or decline at once: nothing to
+/// re-resolve, the refresher's bounds refuse it ([`CredentialRefresh::start`]), or no refresh thread
+/// could be started.
+fn serve_refresh(side: &SupervisorSide, id: u64) {
+    let Some(refresh) = &side.refresh else {
+        return send(side, ToProxy::Refreshed { id, set: None });
+    };
+    let Some(started) = refresh.start() else {
+        return send(side, ToProxy::Refreshed { id, set: None });
+    };
+    // A refresh that cannot be handed over drops its admission with it, so the next is admitted.
+    let queued = locked(&side.refreshes)
+        .as_ref()
+        .is_some_and(|jobs| jobs.send((id, started)).is_ok());
+    if !queued {
+        send(side, ToProxy::Refreshed { id, set: None });
+    }
+}
+
+/// The refresh thread: run each admitted refresh in turn and answer it. Ends when the link does.
+fn run_refreshes(
+    side: &SupervisorSide,
+    refresh: &CredentialRefresh,
+    queued: &Receiver<(u64, Started)>,
+) {
+    for (id, started) in queued {
+        // A resolver that panics is answered like one that failed: the proxy waits for this answer,
+        // and nothing else will send it.
+        let set =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| refresh.finish(started)))
+                .unwrap_or(None);
+        send(side, ToProxy::Refreshed { id, set });
+    }
+}
+
 /// Send the answer to the request the proxy parked as `id`, unless the proxy is gone.
 fn answer(side: &SupervisorSide, id: u64, verdict: Verdict) {
+    send(side, ToProxy::Answer { id, verdict });
+}
+
+/// Send `message` to the proxy, unless it is gone.
+fn send(side: &SupervisorSide, message: ToProxy) {
     if let Some(down) = locked(&side.down).as_ref() {
-        let _ = down.send(ToProxy::Answer { id, verdict });
+        let _ = down.send(message);
     }
 }
 
@@ -486,7 +594,7 @@ mod tests {
     /// A proxy that is gone cannot confirm, and the supervisor says so rather than waiting.
     #[test]
     fn a_push_to_a_proxy_that_is_gone_is_an_error() {
-        let (link, supervisor, [proxy_reader, supervisor_reader]) = start(None, named_thread);
+        let (link, supervisor, [proxy_reader, supervisor_reader]) = start(None, None, named_thread);
         drop(link);
         supervisor_reader.join().unwrap();
         proxy_reader.join().unwrap();
@@ -498,7 +606,7 @@ mod tests {
     /// stands up a proxy per app keeps no thread per proxy it is done with.
     #[test]
     fn both_readers_end_once_the_proxy_lets_go() {
-        let (link, supervisor, [proxy_reader, supervisor_reader]) = start(None, named_thread);
+        let (link, supervisor, [proxy_reader, supervisor_reader]) = start(None, None, named_thread);
         supervisor.push(1, overlay("api.test")).unwrap();
         drop(link);
         supervisor_reader.join().unwrap();
@@ -567,7 +675,7 @@ mod tests {
     fn a_parked_request_is_decided_by_the_answer_given_to_the_supervisors_queue() {
         for verdict in [Verdict::Allow, Verdict::Deny] {
             let pending = Arc::new(PendingState::new());
-            let link = Arc::new(serving(parks(&pending, 4, None)).0);
+            let link = Arc::new(serving(parks(&pending, 4, None), None).0);
             let asking = park_on(&link, "api.test");
             let rows = listed(&pending, 1);
             assert_eq!(
@@ -590,7 +698,7 @@ mod tests {
     #[test]
     fn the_supervisor_times_a_parked_request_out() {
         let pending = Arc::new(PendingState::new());
-        let link = Arc::new(serving(parks(&pending, 4, Some(Duration::from_millis(50)))).0);
+        let link = Arc::new(serving(parks(&pending, 4, Some(Duration::from_millis(50))), None).0);
         assert_eq!(
             park_on(&link, "api.test").recv_timeout(ANSWER_WAIT),
             Ok(Verdict::Deny)
@@ -605,7 +713,7 @@ mod tests {
     #[test]
     fn a_request_parked_past_the_cap_is_denied_without_entering_the_queue() {
         let pending = Arc::new(PendingState::new());
-        let link = Arc::new(serving(parks(&pending, 1, None)).0);
+        let link = Arc::new(serving(parks(&pending, 1, None), None).0);
         let first = park_on(&link, "first.test");
         let rows = listed(&pending, 1);
         assert_eq!(
@@ -637,7 +745,7 @@ mod tests {
     fn a_request_parked_by_a_proxy_that_is_gone_leaves_the_queue() {
         let pending = Arc::new(PendingState::new());
         let (link, supervisor, [proxy_reader, supervisor_reader]) =
-            start(Some(parks(&pending, 4, None)), named_thread);
+            start(Some(parks(&pending, 4, None)), None, named_thread);
         // Sent as the proxy sends it, straight on the channel: a request parked with `park` would
         // hold the end this test lets go of.
         locked(&link.side.up)
@@ -669,12 +777,274 @@ mod tests {
     #[test]
     fn a_request_whose_thread_cannot_start_is_denied_and_leaves_the_queue() {
         let pending = Arc::new(PendingState::new());
-        let (link, _supervisor, _) = start(Some(parks(&pending, 4, None)), refused_thread);
+        let (link, _supervisor, _) = start(Some(parks(&pending, 4, None)), None, refused_thread);
         assert_eq!(
             park_on(&Arc::new(link), "api.test").recv_timeout(ANSWER_WAIT),
             Ok(Verdict::Deny)
         );
         assert!(pending.list().is_empty());
+    }
+
+    /// A refresher over `value`, counting its runs; each run resolves `Bearer <value>-<run>`, so no
+    /// two runs return the same value and the unchanged-value stop never answers for the gap.
+    fn counting_refresh(
+        value: &str,
+    ) -> (Arc<CredentialRefresh>, Arc<std::sync::atomic::AtomicUsize>) {
+        use super::super::inject::{Credentials, HeaderInjection};
+        let injection = |v: String| {
+            HeaderInjection::fixed(
+                crate::allowlist::classify("api.test").unwrap(),
+                "authorization".to_string(),
+                v,
+            )
+        };
+        let credentials = Arc::new(Credentials::new(
+            vec![injection(format!("Bearer {value}"))],
+            Vec::new(),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let value = value.to_string();
+        let refresh = CredentialRefresh::new(
+            credentials,
+            Box::new(move |_| {
+                let run = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Ok((vec![injection(format!("Bearer {value}-{run}"))], Vec::new()))
+            }),
+        );
+        (Arc::new(refresh), runs)
+    }
+
+    /// Ask for a refresh through `link` from a thread of its own, and return what it was handed
+    /// back — or fail the test when no answer comes, rather than hang the suite.
+    fn refresh_on(link: &Arc<Link>) -> Option<String> {
+        let (tx, rx) = channel();
+        let link = Arc::clone(link);
+        std::thread::spawn(move || {
+            let _ = tx.send(link.refresh().map(injected));
+        });
+        rx.recv_timeout(ANSWER_WAIT)
+            .expect("the supervisor answers a refresh")
+    }
+
+    /// The value a handed-back set injects.
+    fn injected(set: Transfer) -> String {
+        super::super::inject::CredentialSet::decode(set)
+            .unwrap()
+            .injections[0]
+            .value()
+            .to_string()
+    }
+
+    /// A refresh the proxy asks for is re-resolved by the supervisor and handed back as the new set.
+    #[test]
+    fn a_refresh_the_supervisor_resolves_is_handed_back_to_the_proxy() {
+        let (refresh, runs) = counting_refresh("old");
+        let link = Arc::new(refreshing(refresh).0);
+        assert_eq!(refresh_on(&link).as_deref(), Some("Bearer old-1"));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A proxy asking for refreshes in a loop is held to the supervisor's gap: one re-resolution,
+    /// and every later request declined without reaching the source. Nothing on the proxy's side
+    /// counts or waits.
+    #[test]
+    fn a_proxy_asking_for_refreshes_in_a_loop_is_held_to_the_supervisors_gap() {
+        let (refresh, runs) = counting_refresh("old");
+        let link = Arc::new(refreshing(refresh).0);
+        let answers: Vec<Option<String>> = (0..20).map(|_| refresh_on(&link)).collect();
+        assert_eq!(answers[0].as_deref(), Some("Bearer old-1"));
+        assert!(
+            answers[1..].iter().all(Option::is_none),
+            "every refresh inside the gap is declined: {answers:?}"
+        );
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the source ran once"
+        );
+    }
+
+    /// A refresh asked for while one is under way is declined at once rather than queued behind it,
+    /// even with no gap to hold it: one re-resolution at a time.
+    #[test]
+    fn a_refresh_asked_while_one_runs_is_declined_at_once() {
+        use super::super::inject::{Credentials, HeaderInjection};
+        let injection = |v: &str| {
+            HeaderInjection::fixed(
+                crate::allowlist::classify("api.test").unwrap(),
+                "authorization".to_string(),
+                v.to_string(),
+            )
+        };
+        let (entered, running) = channel();
+        let (release, released) = channel::<()>();
+        let released = Mutex::new(released);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let refresh = CredentialRefresh::new(
+            Arc::new(Credentials::new(
+                vec![injection("Bearer old")],
+                Vec::new(),
+                crate::sandbox::redact::MIN_LEN_DEFAULT,
+                Vec::new(),
+            )),
+            Box::new(move |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = entered.send(());
+                let _ = locked(&released).recv();
+                Ok((vec![injection("Bearer new")], Vec::new()))
+            }),
+        )
+        .with_gap(Duration::ZERO);
+        let link = Arc::new(refreshing(Arc::new(refresh)).0);
+        let first = {
+            let link = Arc::clone(&link);
+            std::thread::spawn(move || link.refresh().map(injected))
+        };
+        running
+            .recv_timeout(ANSWER_WAIT)
+            .expect("the first re-resolution runs");
+        let (tx, second) = channel();
+        {
+            let link = Arc::clone(&link);
+            std::thread::spawn(move || {
+                let _ = tx.send(link.refresh().is_none());
+            });
+        }
+        assert_eq!(
+            second.recv_timeout(ANSWER_WAIT),
+            Ok(true),
+            "declined while the first still runs"
+        );
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap().as_deref(), Some("Bearer new"));
+    }
+
+    /// A refresh nobody serves is declined rather than left waiting.
+    #[test]
+    fn a_refresh_nobody_serves_is_declined() {
+        assert_eq!(refresh_on(&Arc::new(Link::detached())), None);
+        assert_eq!(refresh_on(&Arc::new(pair().0)), None);
+    }
+
+    /// A refresh whose thread cannot be started, or whose source panics, is declined, and does not
+    /// leave the supervisor believing one is still under way: the next is admitted.
+    #[test]
+    fn a_refresh_that_could_not_run_does_not_block_the_next() {
+        let (refresh, _) = counting_refresh("old");
+        let refresh = Arc::new(Arc::into_inner(refresh).unwrap().with_gap(Duration::ZERO));
+        let (link, _supervisor, _) = start(None, Some(Arc::clone(&refresh)), refused_thread);
+        assert_eq!(refresh_on(&Arc::new(link)), None, "no thread, no refresh");
+        assert!(refresh.start().is_some(), "and the next one is admitted");
+
+        let panicking = Arc::new(
+            CredentialRefresh::new(
+                Arc::new(super::super::inject::Credentials::new(
+                    Vec::new(),
+                    Vec::new(),
+                    crate::sandbox::redact::MIN_LEN_DEFAULT,
+                    Vec::new(),
+                )),
+                Box::new(|_| panic!("a resolver that panics")),
+            )
+            .with_gap(Duration::ZERO),
+        );
+        let link = Arc::new(refreshing(Arc::clone(&panicking)).0);
+        let (tx, answer) = channel();
+        {
+            let link = Arc::clone(&link);
+            std::thread::spawn(move || {
+                let _ = tx.send(link.refresh().is_none());
+            });
+        }
+        assert_eq!(
+            answer.recv_timeout(ANSWER_WAIT),
+            Ok(true),
+            "a panicking source is answered, not left waiting"
+        );
+        assert!(panicking.start().is_some(), "and the next one is admitted");
+    }
+
+    /// A process a refresh starts lives as long as the link, not as long as the refresh: a signer
+    /// handed a new key is tied to the thread that started it by the parent-death signal its cage
+    /// arms, so the thread running refreshes must outlive each of them. Once the proxy lets go of
+    /// the link, that thread ends and the process with it.
+    #[test]
+    fn a_process_a_refresh_starts_lives_as_long_as_the_link() {
+        use super::super::inject::{Credentials, HeaderInjection};
+        use std::os::unix::process::CommandExt;
+        let injection = |v: &str| {
+            HeaderInjection::fixed(
+                crate::allowlist::classify("api.test").unwrap(),
+                "authorization".to_string(),
+                v.to_string(),
+            )
+        };
+        let child: Arc<Mutex<Option<std::process::Child>>> = Arc::default();
+        let slot = Arc::clone(&child);
+        let refresh = CredentialRefresh::new(
+            Arc::new(Credentials::new(
+                vec![injection("Bearer old")],
+                Vec::new(),
+                crate::sandbox::redact::MIN_LEN_DEFAULT,
+                Vec::new(),
+            )),
+            Box::new(move |_| {
+                let mut sleep = std::process::Command::new("sleep");
+                sleep.arg("120");
+                // SAFETY: the hook runs between fork and exec and calls `prctl` alone, which is
+                // async-signal-safe. It arms what a plugin cage's `--die-with-parent` arms.
+                unsafe {
+                    sleep.pre_exec(
+                        || match libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) {
+                            0 => Ok(()),
+                            _ => Err(std::io::Error::last_os_error()),
+                        },
+                    );
+                }
+                *locked(&slot) = Some(sleep.spawn()?);
+                Ok((vec![injection("Bearer new")], Vec::new()))
+            }),
+        );
+        let (link, _supervisor, [proxy_reader, supervisor_reader]) =
+            start(None, Some(Arc::new(refresh)), named_thread);
+        let link = Arc::new(link);
+        assert_eq!(refresh_on(&link).as_deref(), Some("Bearer new"));
+        let exited = || {
+            locked(&child)
+                .as_mut()
+                .expect("the refresh started its process")
+                .try_wait()
+                .unwrap()
+                .is_some()
+        };
+        // Answered: a thread that ran this refresh alone would be ending now, its process with it.
+        let window = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < window {
+            assert!(
+                !exited(),
+                "the process a refresh started died with the refresh"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + ANSWER_WAIT;
+        while Arc::strong_count(&link) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(link);
+        supervisor_reader.join().unwrap();
+        proxy_reader.join().unwrap();
+        while !exited() {
+            assert!(
+                Instant::now() < deadline,
+                "the process a refresh started outlived the link"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The notice is composed from what the queue stores, never from what the proxy sent: a host

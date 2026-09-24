@@ -8,6 +8,8 @@ use crate::allowlist::Rule;
 
 mod transfer;
 
+pub(crate) use transfer::Transfer;
+
 /// A resolved credential the proxy injects into requests matching its host/path rule. Injection
 /// happens only after a request is ALLOWED, and only when `rule` matches the verified CONNECT host
 /// and the decrypted path, so the credential reaches exactly one known destination.
@@ -1019,7 +1021,8 @@ fn credential_in(value: &str) -> &str {
 /// How a credential is re-resolved, host-side, when the upstream says the one being injected is no
 /// longer good. A closure rather than a call into the resolver because *what* a credential resolves
 /// from belongs to the launch (sources, project root, the `bwrap` to sandbox a plugin with) and
-/// *when* to ask again belongs to the proxy — this is the seam between the two.
+/// *when* to ask again belongs to [`CredentialRefresh`], on the proxy's report of a refusal — this
+/// is the seam between the two.
 ///
 /// It is handed the state it is replacing, because part of that state is *running*: a signed
 /// injection holds a plugin process, started once at launch and told its credential at a handshake.
@@ -1046,24 +1049,49 @@ const MIN_REFRESH_GAP: std::time::Duration = std::time::Duration::from_secs(30);
 /// accepted. It also covers the cases an expiry cannot — a revoked token, a rotated secret, a
 /// session invalidated elsewhere.
 ///
-/// Three bounds keep a hopeless credential from spinning: no attempt within [`MIN_REFRESH_GAP`] of
-/// the last, a hard stop once an attempt fails outright (the source is broken, not stale), and a
-/// hard stop when a successful re-resolution returns *the same value* — the upstream refused that
-/// value, so re-sending it would only refuse again.
+/// This is the supervisor's side. The proxy only asks, over its link
+/// ([`super::link::Link::refresh`]), and installs the set it is handed back: whether to re-resolve
+/// at all is decided here, so a proxy asking in a loop is held to the same bounds as one asking
+/// once. Three bounds keep a hopeless credential from spinning: no attempt within
+/// [`MIN_REFRESH_GAP`] of the last, a hard stop once an attempt fails outright (the source is
+/// broken, not stale), and a hard stop when a successful re-resolution returns *the same value* —
+/// the upstream refused that value, so re-sending it would only refuse again. And one runs at a
+/// time: a request arriving while one is under way is refused rather than queued behind it.
 pub(crate) struct CredentialRefresh {
     refresher: Refresher,
+    /// The supervisor's copy of the credential state: what a re-resolution is compared against and
+    /// shown, replaced by each one that succeeds. The proxy holds its own copy, which it replaces
+    /// with the set [`Self::finish`] hands it.
     credentials: std::sync::Arc<Credentials>,
-    state: std::sync::Mutex<RefreshState>,
+    state: std::sync::Arc<std::sync::Mutex<RefreshState>>,
     /// The notifier's needle set, when this launch has one. A refresh produces a value the launch
     /// never saw, and an announcement redacts against this set alone: without it the notifier would
     /// mask the credential that has just been superseded and quote the one now in use.
     needles: Option<crate::sandbox::notify_sink::Needles>,
+    /// The least time between two attempts: [`MIN_REFRESH_GAP`], shorter only in a test that needs
+    /// a second attempt.
+    gap: std::time::Duration,
 }
 
 #[derive(Default)]
 struct RefreshState {
     last_attempt: Option<std::time::Instant>,
     stopped: bool,
+    /// A re-resolution is under way.
+    running: bool,
+}
+
+/// A re-resolution [`CredentialRefresh::start`] admitted. Dropping it lets the next one be admitted:
+/// when the re-resolution ends, when it panics, or when it never began because no thread could run
+/// it.
+pub(crate) struct Started(std::sync::Arc<std::sync::Mutex<RefreshState>>);
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.running = false;
+        }
+    }
 }
 
 impl CredentialRefresh {
@@ -1071,8 +1099,9 @@ impl CredentialRefresh {
         Self {
             refresher,
             credentials,
-            state: std::sync::Mutex::new(RefreshState::default()),
+            state: std::sync::Arc::new(std::sync::Mutex::new(RefreshState::default())),
             needles: None,
+            gap: MIN_REFRESH_GAP,
         }
     }
 
@@ -1086,30 +1115,32 @@ impl CredentialRefresh {
         self
     }
 
-    /// Re-resolve after an upstream refusal, and report whether the credential state actually
-    /// changed. `false` covers every no-op: too soon, already given up, the source failed, or the
-    /// value came back identical.
+    /// Admit a re-resolution, or refuse it at once: given up for good, one under way, or the last
+    /// attempt within the gap. Never waits on anything, so the reader that takes in the proxy's
+    /// requests can ask; the re-resolution itself runs in [`Self::finish`].
     ///
-    /// The caller has already established that the refusing host carries an injection, so this does
-    /// not re-check it: an unrelated `401` from some other allowed host must never spend a resolver
-    /// run.
-    pub(crate) fn on_refusal(&self) -> bool {
-        {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(_) => return false,
-            };
-            if state.stopped {
-                return false;
-            }
-            if let Some(last) = state.last_attempt
-                && last.elapsed() < MIN_REFRESH_GAP
-            {
-                return false;
-            }
-            state.last_attempt = Some(std::time::Instant::now());
+    /// The proxy has already established that the refusing host carries an injection, and this
+    /// does not re-check it; the bounds are what hold a proxy that asks without one.
+    pub(crate) fn start(&self) -> Option<Started> {
+        let mut state = self.state.lock().ok()?;
+        if state.stopped || state.running {
+            return None;
         }
+        if let Some(last) = state.last_attempt
+            && last.elapsed() < self.gap
+        {
+            return None;
+        }
+        state.last_attempt = Some(std::time::Instant::now());
+        state.running = true;
+        Some(Started(std::sync::Arc::clone(&self.state)))
+    }
 
+    /// Run the re-resolution `started` admitted, and return the new set in the form the proxy is
+    /// handed it. `None` covers every no-op: the source failed, the value came back identical, or
+    /// the set cannot make the crossing — each of which stops the mechanism for good.
+    pub(crate) fn finish(&self, started: Started) -> Option<Transfer> {
+        let _running = started;
         // Taken before the re-resolution, and handed to it: it is both what the answer is compared
         // against and what the answer may reuse.
         let current = self.credentials.snapshot();
@@ -1117,19 +1148,10 @@ impl CredentialRefresh {
             Ok(resolved) => resolved,
             // A source that errors is broken rather than stale; retrying on a timer would only
             // repeat it. Stop, and let the launch's own error path be what the user sees.
-            Err(_) => {
-                if let Ok(mut state) = self.state.lock() {
-                    state.stopped = true;
-                }
-                return false;
-            }
+            Err(_) => return self.stop(),
         };
-
         if same_values(&current.injections, &injections) {
-            if let Ok(mut state) = self.state.lock() {
-                state.stopped = true;
-            }
-            return false;
+            return self.stop();
         }
         // Published before the set is replaced, so there is no instant in which the value in use is
         // one the notifier cannot mask. The old needle stays in the set: it can no longer appear in
@@ -1138,23 +1160,43 @@ impl CredentialRefresh {
         if let Some(shared) = &self.needles {
             crate::sandbox::notify_sink::publish_needles(shared, &needles);
         }
-        // Installed through the form the proxy will receive it in once it runs apart, as the
-        // launch's own set is. A set that cannot make the crossing is not installed, and the one in
-        // force stays: that is the direction a failing source already takes.
-        let crossed = CredentialSet {
+        // Kept here only once it has made the crossing the proxy's copy makes, so the two copies
+        // cannot part: a set that cannot cross is installed in neither, and the one in force stays,
+        // which is the direction a failing source already takes.
+        let set = CredentialSet {
             injections,
             needles,
-        }
-        .encode()
-        .and_then(CredentialSet::decode);
-        let Ok(set) = crossed else {
-            if let Ok(mut state) = self.state.lock() {
-                state.stopped = true;
-            }
-            return false;
         };
-        self.credentials.replace(set);
-        true
+        let (Ok(handed), Ok(crossed)) =
+            (set.encode(), set.encode().and_then(CredentialSet::decode))
+        else {
+            return self.stop();
+        };
+        self.credentials.replace(crossed);
+        Some(handed)
+    }
+
+    /// Give up for good, as a re-resolution that failed or came back unchanged does.
+    fn stop(&self) -> Option<Transfer> {
+        if let Ok(mut state) = self.state.lock() {
+            state.stopped = true;
+        }
+        None
+    }
+
+    /// [`Self::start`] then [`Self::finish`], reporting whether the supervisor's copy changed: a
+    /// re-resolution as the tests of the bounds drive one.
+    #[cfg(test)]
+    pub(crate) fn on_refusal(&self) -> bool {
+        self.start()
+            .is_some_and(|started| self.finish(started).is_some())
+    }
+
+    /// Shorten the gap between two attempts, so a test can make a second one.
+    #[cfg(test)]
+    pub(crate) fn with_gap(mut self, gap: std::time::Duration) -> Self {
+        self.gap = gap;
+        self
     }
 }
 

@@ -3411,8 +3411,10 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let seen = Arc::clone(&calls);
             let scope = inject_host.to_string();
+            // The supervisor's copy, apart from the proxy's: what the test reads afterwards is what
+            // the proxy installed from the set it was handed back.
             let refresh = Arc::new(CredentialRefresh::new(
-                Arc::clone(&credentials),
+                Arc::new(Credentials::decode(credentials.encode().unwrap()).unwrap()),
                 Box::new(move |_| {
                     seen.fetch_add(1, Ordering::SeqCst);
                     Ok((
