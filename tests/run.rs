@@ -1534,10 +1534,13 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
     // 1. The plugin's headers reach the upstream, and the signature is bound to the request.
     let first = echo("demo-signs", "?a=1");
     let second = echo("demo-signs", "?a=2");
+    // The body is named when the signature is not in it: an answer that reached the echo proves
+    // nothing about what reached the upstream, since a refusal from sbx and an error page from the
+    // echo's own front both name the host too.
     let of = |body: &str| -> String {
-        let at = body
-            .find("DEMO ")
-            .expect("the signature reached the upstream");
+        let Some(at) = body.find("DEMO ") else {
+            panic!("the signature did not reach the upstream; the answer was: {body}");
+        };
         body[at + 5..at + 5 + 64].to_string()
     };
     assert_ne!(
@@ -8658,29 +8661,33 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     }
 
     // Attach a shell under a pty.
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
+    let attach_under_pty = || -> (std::process::Child, libc::c_int) {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed");
+        // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
+        let attach = sbx()
+            .args(["session", "attach", &session_pid.to_string()])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+            .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+            .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+            .spawn()
+            .expect("spawn sbx session attach");
+        unsafe { libc::close(slave) };
+        (attach, master)
     };
-    assert_eq!(rc, 0, "openpty failed");
-    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
-    let mut attach = sbx()
-        .args(["session", "attach", &session_pid.to_string()])
-        .current_dir(project.path())
-        .env("XDG_DATA_HOME", data.path())
-        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .spawn()
-        .expect("spawn sbx session attach");
-    unsafe { libc::close(slave) };
+    let (mut attach, mut master) = attach_under_pty();
 
     // Confirm the attached shell is really live before killing the session — a runtime-assembled
     // sentinel (`ALIVE-42` from shell arithmetic) that can never come from the echoed command text.
@@ -8697,10 +8704,23 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
         };
         if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
             let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
+            if n > 0 {
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+        }
+        // `attach` refuses a session whose agent it cannot enter yet, and the wait above watches the
+        // cage's user namespace, which comes up before the agent inside it does. That refusal is the
+        // "not yet" this loop waits out: attach again. Any other exit is the failure it looks for.
+        if matches!(attach.try_wait(), Ok(Some(_))) {
+            if !String::from_utf8_lossy(&out).contains("has no live process to enter") {
                 break;
             }
-            out.extend_from_slice(&buf[..n as usize]);
+            unsafe { libc::close(master) };
+            std::thread::sleep(Duration::from_millis(250));
+            (attach, master) = attach_under_pty();
+            out.clear();
+            sent = false;
+            continue;
         }
         if !sent && common::shell_prompt_seen(&out) {
             let cmd = b"echo ALIVE-$((6 * 7))\n";
