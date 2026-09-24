@@ -30,7 +30,7 @@
 
 mod wire;
 
-use crate::notify::Block;
+use crate::notify::{Block, NotifyEvent};
 use crate::sandbox::control::{
     CaptureCaps, CaptureRing, FlowRegistry, HttpVer, LogRing, LogVerdict, Masked, Plane, Proto,
     RpcKind, SecretWay,
@@ -63,6 +63,16 @@ const MAX_HOST: usize = 253;
 /// Not [`MAX_HOST`]: a refusal logs the host the cage *asked* for, which need not be a name at all.
 const MAX_FIELD: usize = 64 * 1024;
 
+/// The longest subject or suggested fix a refusal's announcement may carry. Each holds a host the
+/// proxy read, at most [`MAX_FIELD`], with the text the proxy puts around it: the port, a scheme,
+/// the brackets of an address, the `sbx net allow` command, and the app's name, a file name of at
+/// most 255 bytes.
+const MAX_ANNOUNCED: usize = MAX_FIELD + 512;
+
+/// The longest detail a signer's record may carry: the proxy cuts it as the record keeps it
+/// ([`crate::sandbox::lens::sanitize_detail`]), at most that many characters of up to four bytes.
+const MAX_SIGNER_DETAIL: usize = 4 * crate::sandbox::lens::DETAIL_MAX;
+
 /// One thing the proxy did, as the supervisor learns it, with its capture as `C`: the proxy's
 /// [`Masked`], or the form it crosses in ([`wire`]).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -70,11 +80,11 @@ const MAX_FIELD: usize = 64 * 1024;
 pub(crate) enum ProxyEvent<C = Masked> {
     /// A decision, counted for `sbx net stats`.
     Stat { host: String, kind: StatKind },
-    /// A refusal to announce on the desktop.
+    /// A refusal to announce on the desktop, one of the network's.
     Refusal(Block),
     /// A credential a signer formed, or one it would not form. `detail` is already redacted
-    /// against the launch's credential needles: no value a signer was handed leaves the proxy in
-    /// the clear.
+    /// against the launch's credential needles, then cut as the record keeps it: no value a signer
+    /// was handed leaves the proxy in the clear.
     Signer { kind: SignerKind, detail: String },
     /// A decision for `sbx net logs`, under the number the proxy gave it ([`Emitter::log`]).
     Logged { id: u64, entry: LogEntry },
@@ -584,12 +594,16 @@ impl Applier {
                 }
             }
             ProxyEvent::Refusal(block) => {
-                if let Some(notifier) = &sinks.notifier {
+                if let Some(notifier) = &sinks.notifier
+                    && announceable(&block)
+                {
                     notifier.block(block);
                 }
             }
             ProxyEvent::Signer { kind, detail } => {
-                if let Some(ring) = &sinks.signer_log {
+                if let Some(ring) = &sinks.signer_log
+                    && detail.len() <= MAX_SIGNER_DETAIL
+                {
                     ring.push_detail(kind, &detail);
                 }
             }
@@ -684,6 +698,18 @@ impl Applier {
             }
         }
     }
+}
+
+/// Whether `block` is an announcement the proxy can have made: a refusal of the network's (which
+/// lens refused is no more the proxy's to say than the plane its decisions are recorded under), its
+/// subject and fix within [`MAX_ANNOUNCED`], and its reason, the one its decision is logged with, and
+/// its detail within [`MAX_FIELD`].
+fn announceable(block: &Block) -> bool {
+    block.event == NotifyEvent::Network
+        && block.subject.len() <= MAX_ANNOUNCED
+        && block.fix.len() <= MAX_ANNOUNCED
+        && block.reason.len() <= MAX_FIELD
+        && block.detail.len() <= MAX_FIELD
 }
 
 /// A lock that a panicking holder does not take down with it: every value guarded here stays
@@ -1009,6 +1035,152 @@ mod tests {
         let kept = ring.snapshot(None, None, false).events;
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].host.len(), MAX_HOST + 1);
+    }
+
+    /// What a notifier in a test was handed: the summary of each announcement, in order.
+    struct Announced(Arc<Mutex<Vec<String>>>);
+
+    impl crate::sandbox::notify_sink::Sink for Announced {
+        fn deliver(&mut self, summary: &str, _: &str, _: Option<u32>) -> Result<Option<u32>, ()> {
+            lock(&self.0).push(summary.to_string());
+            Ok(None)
+        }
+    }
+
+    /// The summaries of what `blocks` announce, sent as the proxy sends them.
+    fn announced(blocks: Vec<Block>) -> Vec<String> {
+        use crate::notify::{NotifyMode, NotifyPolicy};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let notifier = Arc::new(Notifier::recording(
+            NotifyPolicy::uniform(NotifyMode::Once),
+            Box::new(Announced(Arc::clone(&seen))),
+        ));
+        let (events, applier) = spawn_joinable(Sinks {
+            notifier: Some(Arc::clone(&notifier)),
+            ..Sinks::default()
+        });
+        for block in blocks {
+            events.send(ProxyEvent::Refusal(block));
+        }
+        // Every reporter gone, the applying side ends and lets go of the notifier, whose drop
+        // delivers what it holds.
+        drop(events);
+        applier.join().unwrap();
+        drop(
+            Arc::try_unwrap(notifier)
+                .map_err(|_| "the notifier is still shared")
+                .unwrap(),
+        );
+        lock(&seen).clone()
+    }
+
+    /// A network refusal of `subject`, as the proxy announces one.
+    fn refusal(subject: &str) -> Block {
+        Block {
+            event: NotifyEvent::Network,
+            subject: subject.into(),
+            reason: "denied-default".into(),
+            detail: "no rule in the network policy allows this host".into(),
+            fix: String::new(),
+        }
+    }
+
+    /// An announcement no proxy can have made is dropped on arrival: another lens's refusal, or a
+    /// field longer than any the proxy writes. The longest the proxy writes is still announced.
+    #[test]
+    fn an_announcement_no_proxy_can_have_made_is_dropped() {
+        // `tag`, padded to `len` bytes.
+        let sized = |tag: &str, len: usize| format!("{tag}{}", "x".repeat(len - tag.len()));
+        let host = sized("honest-", MAX_FIELD);
+        let mut blocks = vec![Block {
+            subject: format!("{host}:65535"),
+            fix: format!(
+                "sbx net allow http://[{host}]:65535 --app {}",
+                "a".repeat(255)
+            ),
+            ..refusal("")
+        }];
+        blocks.push(refusal(&sized("subject-at-", MAX_ANNOUNCED)));
+        blocks.push(refusal(&sized("subject-over-", MAX_ANNOUNCED + 1)));
+        for (tag, len, admitted) in [
+            ("fix", MAX_ANNOUNCED, "at"),
+            ("fix", MAX_ANNOUNCED + 1, "over"),
+            ("reason", MAX_FIELD, "at"),
+            ("reason", MAX_FIELD + 1, "over"),
+            ("detail", MAX_FIELD, "at"),
+            ("detail", MAX_FIELD + 1, "over"),
+        ] {
+            let mut block = refusal(&format!("{tag}-{admitted}.example.com:443"));
+            let field = match tag {
+                "fix" => &mut block.fix,
+                "reason" => &mut block.reason,
+                _ => &mut block.detail,
+            };
+            *field = "x".repeat(len);
+            blocks.push(block);
+        }
+        for event in NotifyEvent::ALL
+            .into_iter()
+            .filter(|e| *e != NotifyEvent::Network)
+        {
+            blocks.push(Block {
+                event,
+                ..refusal(&format!("{}.example.com:443", event.as_str()))
+            });
+        }
+
+        let out = announced(blocks);
+        let summaries: Vec<&str> = out
+            .iter()
+            .map(|s| s.strip_prefix("Blocked: ").unwrap_or(s))
+            .collect();
+        let expected = [
+            "honest-",
+            "subject-at-",
+            "fix-at.",
+            "reason-at.",
+            "detail-at.",
+        ];
+        assert_eq!(summaries.len(), expected.len(), "{:?}", summaries);
+        for (summary, expected) in summaries.iter().zip(expected) {
+            assert!(
+                summary.starts_with(expected),
+                "{summary:.40} for {expected}"
+            );
+        }
+    }
+
+    /// A signer's record longer than the proxy cuts one is dropped on arrival; the longest the proxy
+    /// sends is kept.
+    #[test]
+    fn a_signer_detail_longer_than_the_proxy_cuts_one_is_dropped() {
+        let ring = Arc::new(SignerRing::new(SIGNER_RING_CAP));
+        let events = spawn(Sinks {
+            signer_log: Some(Arc::clone(&ring)),
+            ..Sinks::default()
+        })
+        .unwrap();
+        let longest = crate::sandbox::signer_control::signer_detail(
+            "demo",
+            "GET api.example.com/",
+            Some(&"\u{1f980}".repeat(100_000)),
+            &[],
+        );
+        assert!(longest.len() <= MAX_SIGNER_DETAIL, "{}", longest.len());
+        for detail in [
+            longest,
+            "x".repeat(MAX_SIGNER_DETAIL),
+            "y".repeat(MAX_SIGNER_DETAIL + 1),
+        ] {
+            events.send(ProxyEvent::Signer {
+                kind: SignerKind::Sign,
+                detail,
+            });
+        }
+        events.flush();
+        let kept = ring.snapshot(None).events;
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept[1].detail.starts_with('x'));
     }
 
     /// The queue holds a bounded number of bytes: a sender waits while the events already queued own

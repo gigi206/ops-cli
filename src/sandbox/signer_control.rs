@@ -64,8 +64,9 @@ impl SignerKind {
     }
 }
 
-/// One request's credential. `detail` is redacted by [`signer_detail`] and sanitised and capped by
-/// [`SignerRing::push_detail`], so it is safe on the line-based wire and safe to print.
+/// One request's credential. `detail` is redacted and capped by [`signer_detail`], and sanitised
+/// and capped again by [`SignerRing::push_detail`], so it is safe on the line-based wire and safe to
+/// print.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SignerEvent {
     pub(crate) seq: u64,
@@ -128,8 +129,8 @@ impl SignerRing {
     }
 
     /// Append one signature or refusal whose detail [`signer_detail`] composed — already in its
-    /// final order and redacted. The detail is sanitised and capped here, on the side that owns the
-    /// ring, because it arrives from the proxy, which is to run as a process of its own.
+    /// final order, redacted and capped. It is sanitised and capped again here, on the side that owns
+    /// the ring, because it arrives from the proxy, which is to run as a process of its own.
     pub(crate) fn push_detail(&self, kind: SignerKind, detail: &str) -> u64 {
         self.0.push_with(|seq, at_epoch_ms| SignerEvent {
             seq,
@@ -149,11 +150,13 @@ impl SignerRing {
 /// cannot make a refusal *look* like a signature by choosing its words.
 ///
 /// `needles` are the launch's credential needles, and they are applied to the **whole** detail
-/// before [`SignerRing::push_detail`] caps it, in that order and not the other way round. A signer
-/// is the one plugin type that may be handed a credential in plaintext, so a value echoed into a
-/// label is a real path to this record; and a cap applied first would cut a value in half, leaving
-/// the front of it in the line and no needle left to match. Composed on the proxy's side, so no
-/// value a signer was handed leaves the proxy in the clear.
+/// before it is capped, in that order and not the other way round. A signer is the one plugin type
+/// that may be handed a credential in plaintext, so a value echoed into a label is a real path to
+/// this record; and a cap applied first would cut a value in half, leaving the front of it in the
+/// line and no needle left to match. Composed on the proxy's side, so no value a signer was handed
+/// leaves the proxy in the clear; and capped there, as the record keeps it
+/// ([`super::lens::sanitize_detail`]), so what leaves the proxy is no longer than what the ring
+/// holds, and the supervisor can drop anything longer on arrival.
 pub(crate) fn signer_detail(
     signer: &str,
     observed: &str,
@@ -164,12 +167,12 @@ pub(crate) fn signer_detail(
         Some(c) if !c.is_empty() => format!("{signer}: {observed} — {c}"),
         _ => format!("{signer}: {observed}"),
     };
-    crate::sandbox::redact::redact_string(
+    let (redacted, _) = crate::sandbox::redact::redact_string(
         &detail,
         needles,
         &crate::sandbox::redact::Placeholder::Plain,
-    )
-    .0
+    );
+    super::lens::sanitize_detail(&redacted)
 }
 
 // The events are already redacted and capped by `push_detail`, but a `Debug` that dumped a session's
