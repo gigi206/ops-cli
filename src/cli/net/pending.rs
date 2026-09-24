@@ -593,7 +593,7 @@ pub(super) fn net_pending_answer(
             return ExitCode::from(2);
         }
     };
-    print!("{}", render_answer(verdict, &host, count, id, session));
+    crate::cli::print_document(&render_answer(verdict, &host, count, id, session));
 
     // `--save` persists a matching rule (the host) so the same destination is pre-decided next
     // launch: an allow becomes an allow rule, a deny a deny rule. The live answer already stuck, so
