@@ -1076,11 +1076,11 @@ impl Head {
 ///
 /// [`BodyLimits::per_request`] bounds one body; this bounds their sum. The distinction matters because
 /// the proxy is host-side: [`crate::sandbox::cgroup::wrap`] puts *bwrap* in the launch's systemd
-/// scope, so the cage's `MemoryMax` governs the cage and not the supervisor holding these buffers.
+/// scope, so the cage's `MemoryMax` governs the cage and not the process that holds these buffers.
 /// Without a shared ceiling, as many requests as [`ProxyCtx::max_conns`] admits (`[network]
 /// max_connections`, which a launch may raise) each buffering a maximal body would have the host
-/// allocate the product of the two — a denial of service an in-cage agent reaches
-/// with nothing more than an allowed host and concurrency.
+/// allocate the product of the two: a denial of service an in-cage agent reaches with nothing more
+/// than an allowed host and concurrency.
 ///
 /// The ceiling is **derived** from the number below rather than picked as a round figure, because
 /// that number is the one a user meets: a `chunked` request reserves the whole per-request ceiling
@@ -1112,6 +1112,9 @@ pub(crate) const CONCURRENT_CHUNKED_UPLOADS: u64 = 16;
 const BODY_BUDGET_RAM_SHARE: u64 = 16;
 
 /// Total usable RAM in bytes, or `None` when `/proc/meminfo` cannot be read or parsed.
+///
+/// Read by the supervisor, which hands it to the proxy with its start ([`child`]): the proxy's cage
+/// has no `/proc`.
 fn host_ram() -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()?
@@ -1140,13 +1143,17 @@ pub(super) struct BodyLimits {
 }
 
 impl BodyLimits {
+    /// What a launch on this host gets, for a test: the host's RAM read here.
+    #[cfg(test)]
     pub(super) fn new(per_request: u64) -> Self {
         Self::sized(per_request, host_ram())
     }
 
-    /// [`Self::new`] with the host's RAM supplied rather than read, so the arithmetic can be
-    /// exercised for a machine of any size — including the one where the share bites, which is not
-    /// the machine the tests happen to run on.
+    /// The limits for `per_request` on a host with `ram` bytes of memory. The RAM is supplied
+    /// rather than read: the proxy runs in a cage with no `/proc`, so the supervisor reads it
+    /// ([`host_ram`]) and hands it over, and a test can exercise the arithmetic for a machine of any
+    /// size, including the one where the share bites, which is not the machine the tests happen to
+    /// run on.
     ///
     /// A host whose RAM cannot be read gets the multiple alone: that was the whole bound until now,
     /// and failing open here keeps a launch working where `/proc` is not readable rather than

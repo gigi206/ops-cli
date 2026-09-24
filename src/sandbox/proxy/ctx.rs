@@ -184,10 +184,17 @@ impl ProxyCtx {
     /// as its own CONNECT — nothing multiplexes past the filter.
     ///
     /// `link` is the proxy's end of the link to the supervisor, which the launch serves with a judge
-    /// over the same policy bytes this one was decoded from ([`super::child`]). The park notices are
-    /// on unless the policy suppressed them (`[network] ask_notice = false`).
-    pub(crate) fn linked(ca: Arc<Ca>, user_policy: EgressPolicy, link: Link) -> io::Result<Self> {
-        let mut ctx = Self::build(ca, user_policy, link)?;
+    /// over the same policy bytes this one was decoded from ([`super::child`]). `ram` is the host's
+    /// memory as the supervisor read it, which bounds the request bodies held at once: the proxy's
+    /// cage has no `/proc` to read it from. The park notices are on unless the policy suppressed them
+    /// (`[network] ask_notice = false`).
+    pub(crate) fn linked(
+        ca: Arc<Ca>,
+        user_policy: EgressPolicy,
+        link: Link,
+        ram: Option<u64>,
+    ) -> io::Result<Self> {
+        let mut ctx = Self::build(ca, user_policy, link, ram)?;
         ctx.notices = ctx.policy.ask_notice();
         Ok(ctx)
     }
@@ -198,11 +205,17 @@ impl ProxyCtx {
     pub(crate) fn new(ca: Arc<Ca>, user_policy: EgressPolicy) -> io::Result<Self> {
         let judge = Arc::new(super::link::Judge::new(&user_policy.encode()?)?);
         let (link, _) = super::link::joined(judge, None, None);
-        Self::build(ca, user_policy, link)
+        Self::build(ca, user_policy, link, super::host_ram())
     }
 
-    /// The context over `user_policy` and `link`, with the park notices off.
-    fn build(ca: Arc<Ca>, user_policy: EgressPolicy, link: Link) -> io::Result<Self> {
+    /// The context over `user_policy` and `link` on a host with `ram` bytes of memory, with the park
+    /// notices off.
+    fn build(
+        ca: Arc<Ca>,
+        user_policy: EgressPolicy,
+        link: Link,
+        ram: Option<u64>,
+    ) -> io::Result<Self> {
         ensure_provider();
         let server_config = Arc::new(
             ServerConfig::builder()
@@ -229,10 +242,11 @@ impl ProxyCtx {
         let policy_max_conns = policy
             .max_connections()
             .unwrap_or(crate::allowlist::DEFAULT_MAX_CONNECTIONS);
-        let policy_body = super::BodyLimits::new(
+        let policy_body = super::BodyLimits::sized(
             policy
                 .body_max()
                 .unwrap_or(crate::allowlist::DEFAULT_BODY_MAX),
+            ram,
         );
         Ok(ProxyCtx {
             ca,

@@ -10,11 +10,12 @@
 //!
 //! **Starting.** The supervisor binds the cage's socket, starts the proxy holding one descriptor,
 //! its end of the link, and sends it a [`Bootstrap`] first: the policy, as the very bytes the
-//! supervisor's judge decoded, the credentials, and what the launch keeps of the reports; beside the
-//! document, the socket to serve, the proxy's end of the report channel and the signers' sockets.
-//! The supervisor keeps no copy of any of them. The proxy mints its certificate authority itself
-//! and, once it serves, answers [`Ready`] with the certificate, from which the supervisor writes the
-//! cage's trust anchor: the key never exists outside the proxy. A proxy that has not answered within
+//! supervisor's judge decoded, the credentials, what the launch keeps of the reports, and the
+//! host's memory, which the proxy's cage has no `/proc` to read; beside the document, the socket to
+//! serve, the proxy's end of the report channel and the signers' sockets. The supervisor keeps no
+//! copy of any of them. The proxy mints its certificate authority itself and, once it serves,
+//! answers [`Ready`] with the certificate, from which the supervisor writes the cage's trust
+//! anchor: the key never exists outside the proxy. A proxy that has not answered within
 //! [`START_WAIT`] is stopped and the launch fails, so a cage never starts in front of a proxy that
 //! does not serve.
 //!
@@ -69,6 +70,9 @@ struct Bootstrap {
     app: Option<String>,
     /// What the launch keeps of the proxy's reports.
     keeps: super::events::Keeps,
+    /// The host's memory in bytes, as the supervisor read it ([`super::host_ram`]): it bounds the
+    /// request bodies the proxy holds at once, and the proxy's cage has no `/proc` to read it from.
+    ram: Option<u64>,
 }
 
 /// What a proxy says once it serves: the certificate of the authority it mints leaves with, in PEM.
@@ -137,6 +141,7 @@ fn hand_over(down: &wire::Socket, start: Start<'_>, wait: Duration) -> io::Resul
             .map_err(|_| wire::invalid("a credential document that is not text"))?,
         app: start.app.map(str::to_string),
         keeps: start.keeps,
+        ram: super::host_ram(),
     };
     let doc = serde_json::to_vec(&bootstrap)
         .map_err(|_| wire::invalid("a start that does not encode"))?;
@@ -218,6 +223,36 @@ fn run(link: wire::Socket, stop: &Arc<AtomicBool>) -> io::Result<JoinHandle<()>>
     })?;
     let start: Bootstrap =
         serde_json::from_slice(&doc).map_err(|_| wire::invalid("a start that does not parse"))?;
+    let (ctx, listener, reader) = stand_up(start, fds, link)?;
+    let ready = serde_json::to_vec(&Ready {
+        ca: ctx.ca_cert_pem().to_string(),
+    })
+    .map_err(|_| wire::invalid("an answer that does not encode"))?;
+    let serving = {
+        let (ctx, stop) = (Arc::clone(&ctx), Arc::clone(stop));
+        std::thread::Builder::new()
+            .name("sbx-proxy-accept".into())
+            .spawn(move || {
+                // A serve error ends the accepting, and the cage loses egress: fail-closed.
+                let _ = super::serve(listener, ctx, stop);
+            })?
+    };
+    // Last, once everything it serves with stands: the supervisor starts the cage on this.
+    ctx.link.announce(&ready)?;
+    drop(ctx);
+    let _ = reader.join();
+    stop.store(true, Ordering::SeqCst);
+    Ok(serving)
+}
+
+/// What a proxy serves with, from its `start` and the descriptors handed over beside it: the context
+/// over `link` with its certificate authority minted, the socket to serve, and the thread reading
+/// the link, which ends with it.
+fn stand_up(
+    start: Bootstrap,
+    fds: Vec<OwnedFd>,
+    link: wire::Socket,
+) -> io::Result<(Arc<ProxyCtx>, UnixListener, JoinHandle<()>)> {
     let mut fds = fds.into_iter();
     let (Some(listener), Some(reports)) = (fds.next(), fds.next()) else {
         return Err(wire::invalid(
@@ -232,31 +267,12 @@ fn run(link: wire::Socket, stop: &Arc<AtomicBool>) -> io::Result<JoinHandle<()>>
     let events = super::events::emitter(UnixStream::from(reports), start.keeps)?;
     let (link, reader) = super::link::attend(link, Some(events.clone()))?;
     let ctx = Arc::new(
-        ProxyCtx::linked(Arc::new(Ca::ephemeral()?), policy, link)?
+        ProxyCtx::linked(Arc::new(Ca::ephemeral()?), policy, link, start.ram)?
             .with_shared_credentials(Arc::new(credentials))
             .with_app(start.app)
             .with_events(events),
     );
-    let ready = serde_json::to_vec(&Ready {
-        ca: ctx.ca_cert_pem().to_string(),
-    })
-    .map_err(|_| wire::invalid("an answer that does not encode"))?;
-    let serving = {
-        let (ctx, stop) = (Arc::clone(&ctx), Arc::clone(stop));
-        let listener = UnixListener::from(listener);
-        std::thread::Builder::new()
-            .name("sbx-proxy-accept".into())
-            .spawn(move || {
-                // A serve error ends the accepting, and the cage loses egress: fail-closed.
-                let _ = super::serve(listener, ctx, stop);
-            })?
-    };
-    // Last, once everything it serves with stands: the supervisor starts the cage on this.
-    ctx.link.announce(&ready)?;
-    drop(ctx);
-    let _ = reader.join();
-    stop.store(true, Ordering::SeqCst);
-    Ok(serving)
+    Ok((ctx, UnixListener::from(listener), reader))
 }
 
 /// The cage a proxy runs in, and the descriptors bwrap reads, the proxy's end of the link `link`
@@ -531,6 +547,44 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::io::{BufRead, BufReader, Write};
 
+    /// No credential to inject.
+    fn nothing_to_inject() -> Credentials {
+        Credentials::new(
+            Vec::new(),
+            Vec::new(),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        )
+    }
+
+    /// Nothing kept of the proxy's reports.
+    fn nothing_kept() -> super::super::events::Keeps {
+        super::super::events::Keeps {
+            stats: false,
+            refusals: false,
+            signatures: false,
+            log: false,
+            capture: None,
+            flows: false,
+        }
+    }
+
+    /// A start over an empty policy, serving a socket bound in `dir`, with `credentials` and nothing
+    /// kept of the reports: what a test that plays the proxy itself is handed.
+    fn bare_start<'a>(dir: &TmpDir, credentials: &'a Credentials) -> Start<'a> {
+        let listener = UnixListener::bind(dir.join("proxy.sock")).unwrap();
+        let (reports, _) = UnixStream::pair().unwrap();
+        Start {
+            bwrap: Path::new("/nonexistent/bwrap"),
+            policy: b"{}",
+            credentials,
+            app: None,
+            listener,
+            reports,
+            keeps: nothing_kept(),
+        }
+    }
+
     /// A proxy started over the default policy, serving a socket bound in `dir` and reporting into
     /// `log`, with nothing to inject; and the socket's path.
     fn started(dir: &TmpDir, log: &Arc<LogRing>) -> (Launched, std::path::PathBuf) {
@@ -544,12 +598,7 @@ mod tests {
             ..Sinks::default()
         })
         .unwrap();
-        let credentials = Credentials::new(
-            Vec::new(),
-            Vec::new(),
-            crate::sandbox::redact::MIN_LEN_DEFAULT,
-            Vec::new(),
-        );
+        let credentials = nothing_to_inject();
         let launched = launch(
             Start {
                 bwrap: Path::new("/nonexistent/bwrap"),
@@ -644,8 +693,6 @@ mod tests {
             (None, Some(io::ErrorKind::TimedOut)),
         ] {
             let dir = TmpDir::new();
-            let listener = UnixListener::bind(dir.join("proxy.sock")).unwrap();
-            let (reports, _) = UnixStream::pair().unwrap();
             let (down, up) = wire::Socket::pair().unwrap();
             let (release, released) = channel::<()>();
             let peer = std::thread::spawn(move || {
@@ -658,30 +705,10 @@ mod tests {
                 // Holds its end until the test is done with it, so the only answer is the one sent.
                 let _ = released.recv();
             });
-            let credentials = Credentials::new(
-                Vec::new(),
-                Vec::new(),
-                crate::sandbox::redact::MIN_LEN_DEFAULT,
-                Vec::new(),
-            );
+            let credentials = nothing_to_inject();
             let handed = hand_over(
                 &down,
-                Start {
-                    bwrap: Path::new("/nonexistent/bwrap"),
-                    policy: b"{}",
-                    credentials: &credentials,
-                    app: None,
-                    listener,
-                    reports,
-                    keeps: super::super::events::Keeps {
-                        stats: false,
-                        refusals: false,
-                        signatures: false,
-                        log: false,
-                        capture: None,
-                        flows: false,
-                    },
-                },
+                bare_start(&dir, &credentials),
                 Duration::from_millis(300),
             );
             drop(release);
@@ -692,6 +719,49 @@ mod tests {
                 "{handed:?}"
             );
         }
+    }
+
+    /// The start carries the host's memory as the supervisor read it: the proxy's cage has no `/proc`,
+    /// and a test process, where the proxy's body runs on a thread, has one.
+    #[test]
+    fn the_start_carries_the_hosts_memory_which_the_proxys_cage_cannot_read() {
+        let dir = TmpDir::new();
+        let (down, up) = wire::Socket::pair().unwrap();
+        let peer = std::thread::spawn(move || up.recv_down().unwrap().unwrap().0);
+        let credentials = nothing_to_inject();
+        // No answer comes: only what was handed over is looked at.
+        let _ = hand_over(
+            &down,
+            bare_start(&dir, &credentials),
+            Duration::from_millis(50),
+        );
+        let start: Bootstrap = serde_json::from_slice(&peer.join().unwrap()).unwrap();
+        let ram = super::super::host_ram();
+        assert!(ram.is_some(), "this host's memory is readable here");
+        assert_eq!(start.ram, ram);
+    }
+
+    /// A proxy bounds the request bodies it holds at once by the memory its start carries, not by
+    /// what it can read itself.
+    #[test]
+    fn a_proxy_bounds_its_bodies_by_the_memory_its_start_carries() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = TmpDir::new();
+        let listener = UnixListener::bind(dir.join("proxy.sock")).unwrap();
+        let (reports, _channel) = UnixStream::pair().unwrap();
+        let (_down, up) = wire::Socket::pair().unwrap();
+        let (credentials, _) = nothing_to_inject().encode().unwrap().into_parts();
+        let start = Bootstrap {
+            policy: String::from_utf8(EgressPolicy::default().encode().unwrap()).unwrap(),
+            credentials: String::from_utf8(credentials).unwrap(),
+            app: None,
+            keeps: nothing_kept(),
+            ram: Some(1024 * MIB),
+        };
+        let (ctx, _, _) = stand_up(start, vec![listener.into(), reports.into()], up).unwrap();
+        // A sixteenth of 1 GiB is one default body of 64 MiB. Any host that runs this has more, so a
+        // budget read from here would be larger.
+        assert_eq!(ctx.body.total, 64 * MIB);
     }
 
     /// The cage binds the running binary through its descriptor, or copies it when its file is gone,
