@@ -584,25 +584,7 @@ pub(super) fn net_pending_answer(
             return ExitCode::from(2);
         }
     };
-    // `<id>` names one parked request, but identical retries of the same URL collapse to one decision
-    // — so the answer may have woken several. `×N` mirrors the grouped listing.
-    let times = if count > 1 {
-        format!(" (×{count})")
-    } else {
-        String::new()
-    };
-    if count == 0 {
-        // The request was gone while its `--session` rule was being confirmed: the rule is in
-        // force, and only a retry is left for it to decide.
-        println!(
-            "{verb}ed {host} for this session; {id} itself was no longer waiting (it timed out, or \
-             another answer came first)"
-        );
-    } else if session {
-        println!("{verb}ed {host}{times} for {id} (remembered for this session)");
-    } else {
-        println!("{verb}ed {host}{times} for {id}");
-    }
+    print!("{}", render_answer(verdict, &host, count, id, session));
 
     // `--save` persists a matching rule (the host) so the same destination is pre-decided next
     // launch: an allow becomes an allow rule, a deny a deny rule. The live answer already stuck, so
@@ -657,10 +639,7 @@ fn net_pending_answer_all(
     session: bool,
     app: Option<&str>,
 ) -> ExitCode {
-    let past = match verdict {
-        sandbox::control::Verdict::Allow => "allowed",
-        sandbox::control::Verdict::Deny => "denied",
-    };
+    let past = past_tense(verdict);
     let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
         Err(code) => return code,
@@ -694,6 +673,45 @@ fn collapse_hosts(hosts: &[String]) -> Vec<(&str, usize)> {
         }
     }
     order
+}
+
+/// How an answer reports `verdict` done: `allowed`, `denied`.
+fn past_tense(verdict: sandbox::control::Verdict) -> &'static str {
+    match verdict {
+        sandbox::control::Verdict::Allow => "allowed",
+        sandbox::control::Verdict::Deny => "denied",
+    }
+}
+
+/// Render the answer to one request by id: the host it was for, how many parked requests it woke,
+/// and whether it was remembered for the session. A pure presenter.
+fn render_answer(
+    verdict: sandbox::control::Verdict,
+    host: &str,
+    count: usize,
+    id: &str,
+    session: bool,
+) -> String {
+    let past = past_tense(verdict);
+    // `<id>` names one parked request, but identical retries of the same URL collapse to one decision
+    // — so the answer may have woken several. `×N` mirrors the grouped listing.
+    let times = if count > 1 {
+        format!(" (×{count})")
+    } else {
+        String::new()
+    };
+    if count == 0 {
+        // The request was gone while its `--session` rule was being confirmed: the rule is in
+        // force, and only a retry is left for it to decide.
+        format!(
+            "{past} {host} for this session; {id} itself was no longer waiting (it timed out, or \
+             another answer came first)\n"
+        )
+    } else if session {
+        format!("{past} {host}{times} for {id} (remembered for this session)\n")
+    } else {
+        format!("{past} {host}{times} for {id}\n")
+    }
 }
 
 /// Render a bulk `--all` drain: a per-session breakdown of the hosts it answered (so the user sees
@@ -1296,6 +1314,27 @@ mod tests {
             global.contains("\"api.test:8443\""),
             "the saved rule must carry the port the request was answered on, or it cannot match \
              that request next launch:\n{global}"
+        );
+    }
+
+    /// The answer by id reads in the verdict's past tense, a deny's included, and says what it did:
+    /// how many requests it woke, whether it was remembered, and a request gone before its
+    /// `--session` rule was confirmed.
+    #[test]
+    fn render_answer_says_what_the_answer_did() {
+        use sandbox::control::Verdict;
+        assert_eq!(
+            render_answer(Verdict::Deny, "api.test", 1, "7.3@9", false),
+            "denied api.test for 7.3@9\n"
+        );
+        assert_eq!(
+            render_answer(Verdict::Allow, "api.test", 3, "7.3@9", true),
+            "allowed api.test (×3) for 7.3@9 (remembered for this session)\n"
+        );
+        assert_eq!(
+            render_answer(Verdict::Deny, "api.test", 0, "7.3@9", true),
+            "denied api.test for this session; 7.3@9 itself was no longer waiting (it timed out, \
+             or another answer came first)\n"
         );
     }
 
