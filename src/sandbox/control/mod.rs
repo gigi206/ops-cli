@@ -13,13 +13,14 @@
 //! beside `<data>`, which the cage never sees, and answering is inherently a trusted host-side act.
 //!
 //! Discovery is a glob of the egress directory; the socket filename carries the session pid, which
-//! is also the `<pid>.<seq>` id prefix the proxy prints in its notice and the CLI parses to address
-//! one session. The wire protocol is line-based and minimal (one command per connection): `LIST`
-//! returns the pending rows, `ALLOW <seq>` / `DENY <seq>` answer one destination (every identical
-//! retry of it, since a tool re-parks one URL many times), naming the host so a `--save` can persist
-//! it; `RULES` lists the session's live manual `--session` rules; and `ALLOW *` / `DENY *` drain
-//! every parked request at once (one `answered host=…` line each, then `ok` — an older server that
-//! predates this replies `err …`, which the CLI reports as unsupported).
+//! is also the `<pid>.<seq>` id prefix the park notice prints (the supervisor prints it, from the
+//! form the queue stores) and the CLI parses to address one session. The wire protocol is
+//! line-based and minimal (one command per connection): `LIST` returns the pending rows,
+//! `ALLOW <seq>` / `DENY <seq>` answer one destination (every identical retry of it, since a tool
+//! re-parks one URL many times), naming the host so a `--save` can persist it; `RULES` lists the
+//! session's live manual `--session` rules; and `ALLOW *` / `DENY *` drain every parked request at
+//! once (one `answered host=…` line each, then `ok` — an older server that predates this replies
+//! `err …`, which the CLI reports as unsupported).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -50,11 +51,11 @@ pub(crate) enum Verdict {
 }
 
 /// One request parked awaiting a decision: what it is, when it started waiting, and the channel the
-/// control side sends the verdict on to wake the blocked proxy thread.
+/// control side sends the verdict on to wake the thread waiting for it.
 ///
-/// `host` and `path` are held in their sanitised form — see [`PendingState::park`], which is where
-/// they are filtered. Everything that reads this queue reports it to an operator, so the stored form
-/// is the reportable one and no reader has to remember to filter.
+/// `host` and `path` are held in their sanitised form — see [`PendingState::enqueue`], which is
+/// where they are filtered. Everything that reads this queue reports it to an operator, so the
+/// stored form is the reportable one and no reader has to remember to filter.
 struct Entry {
     host: String,
     port: u16,
@@ -73,10 +74,28 @@ pub(crate) struct PendingRow {
     pub(crate) waiting_secs: u64,
 }
 
-/// The shared, lock-guarded queue of parked requests. The proxy [`park`](PendingState::park)s into
-/// it and blocks; the control socket [`list`](PendingState::list)s and
-/// [`answer_like`](PendingState::answer_like)s it. One per launch, shared (via `Arc`) between the
-/// proxy serve threads and the control serve thread.
+/// A request the queue let in: its id and the forms it is listed under, which are what a notice
+/// announcing it may print, and where its answer arrives ([`PendingState::wait`]).
+pub(crate) struct Parked {
+    pub(crate) seq: u64,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path: String,
+    answer: mpsc::Receiver<Verdict>,
+}
+
+/// The most `ask`-posture requests parked at once. A new one beyond this is denied immediately
+/// (fail-closed) rather than enqueued, and each one parked holds a supervisor thread waiting for
+/// its answer ([`crate::sandbox::proxy::link`]), so an in-cage agent cannot pin unbounded host
+/// threads by opening connections that all park — the default ask wait being indefinite. Far above
+/// any realistic interactive backlog.
+pub(crate) const ASK_PENDING_CAP: usize = 256;
+
+/// The shared, lock-guarded queue of parked requests. A request the proxy parks is
+/// [`enqueue`](PendingState::enqueue)d by the supervisor's end of the proxy's link
+/// ([`crate::sandbox::proxy::link`]), which [`wait`](PendingState::wait)s for its answer; the
+/// control socket [`list`](PendingState::list)s and [`answer_like`](PendingState::answer_like)s it.
+/// One per proxy, shared (via `Arc`) between that link and the control serve thread.
 #[derive(Default)]
 pub(crate) struct PendingState {
     inner: Mutex<Inner>,
@@ -95,25 +114,97 @@ impl PendingState {
         Self::default()
     }
 
-    /// Park a request until it is answered or `timeout` elapses (`None` waits indefinitely),
-    /// returning the verdict. A timeout or a dropped channel is a deny — fail-closed. `on_enqueue`
-    /// is called with the assigned sequence id immediately after the request is registered and
-    /// *before* the thread blocks, so the caller can emit its notice with the live id.
+    /// Let a request into the queue, or `None` when `cap` requests are already parked: the caller
+    /// then denies it without waiting on anything. The returned [`Parked`] is how the caller waits
+    /// for its answer ([`Self::wait`]), and names the request in the forms the queue lists it under.
     ///
     /// `host` and `path` are chosen by the cage and stored filtered ([`super::sanitize`]), the one
     /// door into a queue every reader of which reports it to an operator. The verdict is unaffected:
-    /// it is reached on the values the caller holds.
+    /// it is reached on the values the proxy holds.
     ///
-    /// Flood guard: once `cap` requests are already parked, a new one is denied immediately without
-    /// enqueuing, so an in-cage agent cannot pin unbounded host threads by opening connections that
-    /// all park (the default `ask` timeout being indefinite, parked threads would otherwise live
-    /// until answered).
+    /// Flood guard: the `cap` keeps an in-cage agent from pinning unbounded host threads by opening
+    /// connections that all park, the default `ask` wait being indefinite. It is checked under the
+    /// same lock that inserts, so no burst gets past it.
     ///
-    /// Residual (a departed-client ghost): the block is on the channel, not on socket I/O, so a cage
+    /// Residual (a departed-client ghost): the wait is on the answer, not on socket I/O, so a cage
     /// tool that hits its *own* client-side timeout and disconnects mid-park is not noticed — the
     /// entry then sits in the queue (listed, and counting against `cap`) until answered or the
     /// `ask_timeout` elapses. Reaping a departed client denies nothing live, so it is compatible with
     /// the indefinite default; a future increment can poll the socket for a half-close while parked.
+    pub(crate) fn enqueue(&self, host: &str, port: u16, path: &str, cap: usize) -> Option<Parked> {
+        let mut inner = locked(&self.inner);
+        if inner.entries.len() >= cap {
+            return None;
+        }
+        inner.next_seq += 1;
+        let seq = inner.next_seq;
+        let (tx, rx) = mpsc::channel();
+        // The two free-form values are sanitised **here**, on the way in, for the reason
+        // [`LogRing::push`] states at length for the log ring: this is the one door every ask
+        // enters by, and the alternative is a duty spread over every reader of the queue. Both
+        // are chosen by the cage — a `Host` header, an SNI or a CONNECT authority, and the
+        // target of the request being asked about — so they may carry any byte, including an
+        // ESC, which paints over the operator's terminal when `sbx net pending` prints the row
+        // while they are deciding whether to open egress.
+        //
+        // This is not the verdict's view of either: the decision is reached on the raw values
+        // the proxy still holds, and only what is *reported* passes through here. What the
+        // answer reply names, and what `--session` then remembers, is the stored form — so the
+        // rule the operator approves is the one they read. A host that needed filtering
+        // therefore yields a session rule matching nothing, and the next identical request is
+        // asked again rather than granted against a name the operator never saw.
+        //
+        // The stored form is also what [`PendingState::answer_like`] groups a destination by,
+        // and that is a real widening to state: two requests whose raw host or path differ only
+        // in control characters — or past this filter's 512-character cap — collapse into one
+        // `×2` row that a single answer frees. They are one row precisely because they are one
+        // row *to the operator*: nothing on screen could tell them apart, so grouping on the raw
+        // values would show one line and mean two. Keeping both forms is the alternative, and it
+        // puts the unfiltered values back in a struct every reader of this queue reports from,
+        // which is the arrangement this door exists to remove.
+        let (host, path) = (super::sanitize(host), super::sanitize(path));
+        inner.entries.insert(
+            seq,
+            Entry {
+                host: host.clone(),
+                port,
+                path: path.clone(),
+                since: Instant::now(),
+                answer: tx,
+            },
+        );
+        Some(Parked {
+            seq,
+            host,
+            port,
+            path,
+            answer: rx,
+        })
+    }
+
+    /// Wait for the answer to a request [`Self::enqueue`] let in, or until `timeout` elapses
+    /// (`None` waits indefinitely). A timeout, or an answer that can no longer come, is a deny —
+    /// fail-closed.
+    pub(crate) fn wait(&self, parked: Parked, timeout: Option<Duration>) -> Verdict {
+        let verdict = match timeout {
+            Some(t) => parked.answer.recv_timeout(t).unwrap_or(Verdict::Deny),
+            None => parked.answer.recv().unwrap_or(Verdict::Deny),
+        };
+        // On a real answer the control side already removed the entry; on a timeout it is still
+        // present.
+        self.forget(parked.seq);
+        verdict
+    }
+
+    /// Take request `seq` out of the queue without answering it. Idempotent: an answered request
+    /// is already gone.
+    pub(crate) fn forget(&self, seq: u64) {
+        locked(&self.inner).entries.remove(&seq);
+    }
+
+    /// [`Self::enqueue`] then [`Self::wait`], denying at once past `cap`: a request parked as the
+    /// queue's own tests park one. `on_enqueue` runs with the id before the wait.
+    #[cfg(test)]
     pub(crate) fn park(
         &self,
         host: &str,
@@ -123,58 +214,11 @@ impl PendingState {
         cap: usize,
         on_enqueue: impl FnOnce(u64),
     ) -> Verdict {
-        let (seq, rx) = {
-            let mut inner = locked(&self.inner);
-            if inner.entries.len() >= cap {
-                return Verdict::Deny;
-            }
-            inner.next_seq += 1;
-            let seq = inner.next_seq;
-            let (tx, rx) = mpsc::channel();
-            // The two free-form values are sanitised **here**, on the way in, for the reason
-            // [`LogRing::push`] states at length for the log ring: this is the one door every ask
-            // enters by, and the alternative is a duty spread over every reader of the queue. Both
-            // are chosen by the cage — a `Host` header, an SNI or a CONNECT authority, and the
-            // target of the request being asked about — so they may carry any byte, including an
-            // ESC, which paints over the operator's terminal when `sbx net pending` prints the row
-            // while they are deciding whether to open egress.
-            //
-            // This is not the verdict's view of either: the decision is reached on the raw values
-            // the caller still holds, and only what is *reported* passes through here. What the
-            // answer reply names, and what `--session` then remembers, is the stored form — so the
-            // rule the operator approves is the one they read. A host that needed filtering
-            // therefore yields a session rule matching nothing, and the next identical request is
-            // asked again rather than granted against a name the operator never saw.
-            //
-            // The stored form is also what [`PendingState::answer_like`] groups a destination by,
-            // and that is a real widening to state: two requests whose raw host or path differ only
-            // in control characters — or past this filter's 512-character cap — collapse into one
-            // `×2` row that a single answer frees. They are one row precisely because they are one
-            // row *to the operator*: nothing on screen could tell them apart, so grouping on the raw
-            // values would show one line and mean two. Keeping both forms is the alternative, and it
-            // puts the unfiltered values back in a struct every reader of this queue reports from,
-            // which is the arrangement this door exists to remove.
-            inner.entries.insert(
-                seq,
-                Entry {
-                    host: super::sanitize(host),
-                    port,
-                    path: super::sanitize(path),
-                    since: Instant::now(),
-                    answer: tx,
-                },
-            );
-            (seq, rx)
+        let Some(parked) = self.enqueue(host, port, path, cap) else {
+            return Verdict::Deny;
         };
-        on_enqueue(seq);
-        let verdict = match timeout {
-            Some(t) => rx.recv_timeout(t).unwrap_or(Verdict::Deny),
-            None => rx.recv().unwrap_or(Verdict::Deny),
-        };
-        // On a real answer the control side already removed the entry; on a timeout/disconnect it
-        // is still present. Removing is idempotent, so this cleans up either case.
-        locked(&self.inner).entries.remove(&seq);
-        verdict
+        on_enqueue(parked.seq);
+        self.wait(parked, timeout)
     }
 
     /// The currently-parked requests, oldest id first (the `BTreeMap` orders by sequence).
@@ -194,7 +238,7 @@ impl PendingState {
     }
 
     /// Answer every parked request sharing the named request's destination — its `(host, port, path)`
-    /// — with `verdict`, waking each blocked proxy thread, and return `(host, port, count)` where
+    /// — with `verdict`, waking each thread waiting for one, and return `(host, port, count)` where
     /// `count` is how many were answered (the host for a `--save`, the port for a `--session` remember
     /// of the exact request). `None` if `seq` is not parked (already answered, or timed out). A send
     /// failure (a thread that just timed out on its own) is ignored — that entry is gone either way.
@@ -256,18 +300,17 @@ impl PendingState {
         ))
     }
 
-    /// [`answer_all_after`](Self::answer_all_after) with nothing to do first: what the tests of the
-    /// queue itself call.
-    #[cfg(test)]
+    /// [`answer_all_after`](Self::answer_all_after) with nothing to do first: how the requests of a
+    /// proxy that is gone are let go, and what the tests of the queue itself call.
     pub(crate) fn answer_all(&self, verdict: Verdict) -> Vec<(String, u16)> {
         self.answer_all_after(verdict, |_, _| Ok(()))
             .unwrap_or_default()
     }
 
-    /// Answer every request parked when this is called with `verdict`, wake each proxy thread, and
-    /// return the `(host, port)` of each, oldest id first (the `BTreeMap` orders by sequence). A
-    /// point-in-time drain: a request that parks after the call began is not affected, save for the
-    /// one below, and one that timed out meanwhile is not reported.
+    /// Answer every request parked when this is called with `verdict`, wake each thread waiting for
+    /// one, and return the `(host, port)` of each, oldest id first (the `BTreeMap` orders by
+    /// sequence). A point-in-time drain: a request that parks after the call began is not affected,
+    /// save for the one below, and one that timed out meanwhile is not reported.
     ///
     /// `first` is run on every parked destination before any request is woken, with the queue
     /// unlocked, for the reasons [`answer_like_after`](Self::answer_like_after) gives. When `first`
@@ -2384,6 +2427,71 @@ mod tests {
             assert_eq!(left, [other], "only the other destination is still parked");
             assert_eq!(verdicts, [Verdict::Allow, Verdict::Allow, Verdict::Deny]);
         }
+    }
+
+    /// The same, with the requests parked the way the proxy parks them: up its link, whose reader
+    /// on the supervisor's side is also the one that takes in the confirmation the answer waits
+    /// for. A request arriving meanwhile is queued at once, not once the answer has given up: the
+    /// reader queues a park without waiting on it, and the queue is not held across the
+    /// confirmation.
+    #[test]
+    fn a_request_parked_through_the_link_is_queued_while_a_session_answer_waits() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let (link, supervisor) =
+            crate::sandbox::proxy::link::serving(crate::sandbox::proxy::link::Parks {
+                pending: state.clone(),
+                cap: ASK_PENDING_CAP,
+                timeout: None,
+                notices: false,
+            });
+        manual.attach(supervisor).unwrap();
+        let link = Arc::new(link);
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let flows = Arc::new(FlowRegistry::new());
+        let park = |host: &'static str| {
+            let link = link.clone();
+            thread::spawn(move || link.park(host, 443, "/"))
+        };
+        let first = park("api.test");
+        let seq = wait_for_one(&state);
+        let stall = link.stall_installs();
+        let answer = {
+            let (state, manual) = (state.clone(), manual.clone());
+            let (log, flows) = (log.clone(), flows.clone());
+            thread::spawn(move || {
+                let cmd = format!("ALLOW {seq} session");
+                dispatch(&cmd, &state, &manual, &log, &flows, None, None)
+            })
+        };
+        let rule = crate::allowlist::host_port_rule("api.test", 443);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !manual.snapshot().0.contains(&rule) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let elsewhere = park("other.test");
+        // Nothing here is asserted on a duration: held behind the confirmation, the request is
+        // listed only once the answer has given up.
+        let listed = || state.list().iter().any(|row| row.host == "other.test");
+        while !listed() && !answer.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let queued_while_waiting = listed() && !answer.is_finished();
+        drop(stall);
+        let reply = answer.join().unwrap();
+        // Every request is let go however the answer went, so a defect fails the test rather than
+        // hanging it.
+        while !(first.is_finished() && elsewhere.is_finished()) && Instant::now() < deadline {
+            state.answer_all(Verdict::Deny);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let verdicts = [first, elsewhere].map(|h| h.join().unwrap());
+        assert!(
+            queued_while_waiting,
+            "a request parked through the link is queued while the answer waits"
+        );
+        assert_eq!(reply, "ok host=api.test count=1\n");
+        assert_eq!(verdicts, [Verdict::Allow, Verdict::Deny]);
     }
 
     /// A `--session` answer whose request is gone while its rule is being confirmed (here answered

@@ -1337,8 +1337,9 @@ impl EgressPolicy {
         self.default_action
     }
 
-    /// Whether the proxy prints the `ask` park notice to stderr — `true` by default. The proxy
-    /// reads this only under [`DefaultAction::Ask`].
+    /// Whether the `ask` park notice is printed to stderr — `true` by default. The supervisor
+    /// serving the proxy's parked requests prints it, and the proxy reads it to leave the refusal of
+    /// an answered ask unannounced; it matters only under [`DefaultAction::Ask`].
     pub(crate) fn ask_notice(&self) -> bool {
         !self.suppress_ask_notice
     }

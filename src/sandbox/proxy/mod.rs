@@ -376,12 +376,6 @@ const CONTROL_BYTE_DETAIL: &str = "a request line or header carries a control by
      character); another parser could read it as a line break, so it is refused rather than \
      forwarded";
 
-/// The most `ask`-posture requests parked at once. A new one beyond this is denied immediately
-/// (fail-closed) rather than enqueued, so an in-cage agent cannot pin unbounded host threads by
-/// opening connections that all park — the default ask wait being indefinite. Far above any
-/// realistic interactive backlog.
-const ASK_PENDING_CAP: usize = 256;
-
 /// Handle one client connection: parse the CONNECT, man-in-the-middle the tunnel, and serve the
 /// requests the client sends through it — each one a full turn through [`serve_tunneled_request`],
 /// which is where the policy decision and every check around it live. A connection that is not a
@@ -769,37 +763,15 @@ fn decide_https(
         }
         Decision::Ask => {
             // Masked before it is parked, for the reason the logging branch masks before pushing: a
-            // parked request is printed by `sbx net pending` (and by the notice below), so a token
+            // parked request is printed by `sbx net pending` (and by the park notice), so a token
             // riding in a query would reach the operator's terminal — and a `--json` capture — in
             // the clear from a path that is careful about it everywhere else. The outbound
             // tripwire is not a backstop here: `carries_secret` skips a needle whose destination is
             // the host it was learned on, which is exactly the request that parks instead of being
-            // refused.
+            // refused. Masked here because the needles live here: the supervisor that queues and
+            // announces the request never sees the ones the proxy learned.
             let path = &ctx.redact_query(host, path);
-            let verdict = ctx.pending.park(
-                host,
-                port,
-                path,
-                policy.ask_timeout(),
-                ASK_PENDING_CAP,
-                |seq| {
-                    if ctx.notices {
-                        let id = super::control::format_id(
-                            std::process::id(),
-                            seq,
-                            super::control::incarnation(),
-                        );
-                        print_egress_notice(
-                            &format!("egress decision needed [{id}] {host}:{port}{path}"),
-                            &[
-                                ("allow", &format!("sbx net pending allow {id}")),
-                                ("deny", &format!("sbx net pending deny {id}")),
-                            ],
-                        );
-                    }
-                },
-            );
-            match verdict {
+            match ctx.link.park(host, port, path) {
                 super::control::Verdict::Allow => Ok(Some(allowlist::host_port_rule(host, port))),
                 super::control::Verdict::Deny => refuse(PolicyRefusal::AskedDenied),
             }

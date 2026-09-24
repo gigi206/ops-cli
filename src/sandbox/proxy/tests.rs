@@ -5152,7 +5152,8 @@ fn a_logged_path_has_its_secret_query_redacted_at_push() {
 }
 
 /// `with_control` turns the stderr park notices on, but honors a policy that silenced them
-/// (`[network] ask_notice = false`) — and the union with the built-in set must preserve that.
+/// (`[network] ask_notice = false`) — and the union with the built-in set must preserve that. The
+/// supervisor, which prints the notice, reads the same setting the proxy does.
 #[test]
 fn with_control_honors_the_policy_ask_notice() {
     let pending = Arc::new(crate::sandbox::control::PendingState::new());
@@ -5160,8 +5161,12 @@ fn with_control_honors_the_policy_ask_notice() {
     // Default policy → the notice is on under `with_control`.
     let on = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), EgressPolicy::default())
         .unwrap()
-        .with_control(pending.clone(), super::link::Link::detached());
+        .with_control(super::link::Link::detached());
     assert!(on.notices, "the park notice is on by default");
+    assert!(
+        on.parks(pending.clone()).notices,
+        "the supervisor prints the notice the proxy counts on"
+    );
 
     // A policy that silenced the notice → off, surviving the built-in union in `new`.
     let off = ProxyCtx::new(
@@ -5169,10 +5174,14 @@ fn with_control_honors_the_policy_ask_notice() {
         EgressPolicy::default().with_ask_notice(false),
     )
     .unwrap()
-    .with_control(pending, super::link::Link::detached());
+    .with_control(super::link::Link::detached());
     assert!(
         !off.notices,
         "ask_notice = false suppresses the park notice"
+    );
+    assert!(
+        !off.parks(pending).notices,
+        "and the supervisor prints none"
     );
 }
 
@@ -6861,9 +6870,10 @@ fn an_asked_request_is_refused_when_denied() {
 }
 
 /// A live manual rule (from a prior `--session` answer) short-circuits the ask: a remembered
-/// allow lets the request proceed to the upstream **without parking** (no answerer thread — the
-/// default ask wait is indefinite, so if the overlay did not decide, this would hang forever and
-/// the test would time out), and a remembered deny refuses it. The 4b verdict path, cage-free.
+/// allow lets the request proceed to the upstream **without parking** (nobody answers a park on
+/// this proxy's link, so if the overlay did not decide, the request would be refused
+/// `asked-denied` rather than reach the upstream), and a remembered deny refuses it. The 4b
+/// verdict path, cage-free.
 #[test]
 fn a_manual_rule_decides_an_ask_without_parking() {
     use crate::sandbox::control::{ManualRules, Verdict};
@@ -7069,9 +7079,9 @@ fn a_broad_session_overlay_allow_does_not_unlock_a_private_ip() {
 
 /// The full proactive-`--session` wire path, cage-free: `inject_rule` (the client `sbx net allow
 /// --session` drives) loads a rule over a real control `serve` into the overlay the proxy shares,
-/// so an otherwise-undecided ask request proceeds to the upstream **without parking**. There is no
-/// answerer thread and the default ask wait is indefinite, so a request that (wrongly) parked would
-/// hang and time the test out — the 200 is the proof the injected rule decided it.
+/// so an otherwise-undecided ask request proceeds to the upstream **without parking**. Nobody
+/// answers a park on this proxy's link, so a request that (wrongly) parked would be refused
+/// `asked-denied` — the 200 is the proof the injected rule decided it.
 #[test]
 fn a_session_injected_allow_makes_a_request_proceed_without_parking() {
     use crate::sandbox::control::{
@@ -8078,9 +8088,9 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
     }
 
     // asked-denied (an `ask` park that times out with no answer) → deny. A short timeout and no
-    // answerer thread makes the park deny by timeout — the still-reachable `asked-denied` path (a
-    // remembered/`--session` deny now folds into the effective policy and surfaces as
-    // `denied-by-rule`, tested above).
+    // answerer thread makes the park deny by timeout, which the supervisor serving the queue
+    // applies — the still-reachable `asked-denied` path (a remembered/`--session` deny now folds
+    // into the effective policy and surfaces as `denied-by-rule`, tested above).
     {
         let s = fresh();
         let ca = Arc::new(Ca::ephemeral().unwrap());
@@ -8099,7 +8109,8 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
             ))
             .with_resolver(Box::new(|_| {
                 panic!("resolve must not run for a timed-out ask")
-            })),
+            }))
+            .with_pending_silent(Arc::new(crate::sandbox::control::PendingState::new())),
         );
         let resp = through_proxy(
             ctx,

@@ -104,19 +104,17 @@ pub(crate) struct ProxyCtx {
     /// How to re-resolve those credentials when an injection target refuses one. `None` for a
     /// launch with nothing to refresh.
     pub(super) refresh: Option<Arc<CredentialRefresh>>,
-    /// The shared queue of parked `ask`-posture requests. Under `DefaultAction::Ask` an undecided
-    /// request enqueues here and blocks; the control socket ([`crate::sandbox::control`]) answers it. A
-    /// throwaway internal queue by default (so a non-ask launch never touches it); the launch
-    /// injects the one the control thread also holds via [`Self::with_control`].
-    pub(super) pending: Arc<crate::sandbox::control::PendingState>,
     /// This proxy's end of what the supervisor tells it: the live `--session` rules it folds into
     /// its policy for every decision ([`effective_policy`]), pushed whole and confirmed before the
-    /// command that loaded them returns. Detached, with no rule, by default; the launch joins it to
-    /// the control plane's rules via [`Self::with_control`].
+    /// command that loaded them returns, and the answer to an `ask`-posture request it parks, which
+    /// the supervisor queues for the control socket ([`crate::sandbox::control`]) and holds to its
+    /// own cap and timeout. Detached by default, with no rule and nobody to answer a park, which is
+    /// then denied; the launch joins it to the control plane via [`Self::with_control`].
     pub(super) link: super::link::Link,
-    /// Whether to print a one-line stderr notice when a request parks, so an interactive user sees
-    /// the pending id without polling. Off by default (tests, non-ask launches); the launch turns
-    /// it on when it wires the control socket.
+    /// Whether the launch announces a parked request on stderr (`[network] ask_notice`), which the
+    /// supervisor does. Read here for what follows a denied ask: the person was already shown that
+    /// request, so its refusal is not announced a second time ([`refusal_block`]). Off by default
+    /// (tests, non-ask launches); the launch turns it on when it wires the control socket.
     pub(super) notices: bool,
     /// Where this proxy reports what it did — the decisions it counts for `sbx net stats` and logs
     /// for `sbx net logs`, what completes a logged decision (its status, its capture, a secret seen
@@ -240,7 +238,6 @@ impl ProxyCtx {
                 Vec::new(),
             )),
             refresh: None,
-            pending: Arc::new(crate::sandbox::control::PendingState::new()),
             link: super::link::Link::detached(),
             notices: false,
             events: None,
@@ -583,22 +580,32 @@ impl ProxyCtx {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// Wire the proxy to the launch's shared pending queue and to its end of the link the
-    /// supervisor pushes the `--session` rules down, and turn on the park notices unless the policy
-    /// suppressed them (`[network] ask_notice = false`). The launch
-    /// ([`crate::sandbox::egress::start`]) passes the same [`crate::sandbox::control::PendingState`]
-    /// it serves on the control socket, and attaches the other end of `link` to the
-    /// [`crate::sandbox::control::ManualRules`] it serves there, so a request parked here is
-    /// answerable by `sbx net pending` and a `--session` rule loaded there decides requests here.
-    pub(crate) fn with_control(
-        mut self,
-        pending: Arc<crate::sandbox::control::PendingState>,
-        link: super::link::Link,
-    ) -> Self {
-        self.pending = pending;
+    /// Wire the proxy to its end of the link to the supervisor, and turn on the park notices unless
+    /// the policy suppressed them (`[network] ask_notice = false`). The launch
+    /// ([`crate::sandbox::egress::start`]) serves the other end with the
+    /// [`crate::sandbox::control::PendingState`] and the [`crate::sandbox::control::ManualRules`] it
+    /// serves on the control socket, so a request parked here is answerable by `sbx net pending`
+    /// and a `--session` rule loaded there decides requests here.
+    pub(crate) fn with_control(mut self, link: super::link::Link) -> Self {
         self.link = link;
         self.notices = self.policy.ask_notice();
         self
+    }
+
+    /// How the supervisor is to serve the requests this proxy parks into `pending`: the cap, and the
+    /// timeout and notice this proxy's policy sets. Read from the policy the proxy decides with, so
+    /// the notice the supervisor prints and the refusal the proxy then leaves unannounced follow
+    /// one setting.
+    pub(crate) fn parks(
+        &self,
+        pending: Arc<crate::sandbox::control::PendingState>,
+    ) -> super::link::Parks {
+        super::link::Parks {
+            pending,
+            cap: crate::sandbox::control::ASK_PENDING_CAP,
+            timeout: self.policy.ask_timeout(),
+            notices: self.policy.ask_notice(),
+        }
     }
 
     /// Share an already-built credential state, so a consumer outside the proxy (the capture ring's
@@ -692,20 +699,26 @@ impl ProxyCtx {
         self
     }
 
-    /// Wire the shared pending queue without turning on the stderr park notices, so a test can
-    /// answer a parked request out of band while keeping the test output clean (unlike
-    /// [`with_control`](ProxyCtx::with_control), which the launch uses and which prints notices).
+    /// Serve the requests this proxy parks into `pending`, as the launch does but without the
+    /// stderr park notices, so a test can answer a parked request out of band while keeping the
+    /// test output clean (unlike [`with_control`](ProxyCtx::with_control), which the launch uses
+    /// and which prints notices).
     pub(super) fn with_pending_silent(
         mut self,
         pending: Arc<crate::sandbox::control::PendingState>,
     ) -> Self {
-        self.pending = pending;
+        let parks = super::link::Parks {
+            notices: false,
+            ..self.parks(pending)
+        };
+        self.link = super::link::serving(parks).0;
         self
     }
 
     /// Join the proxy to `manual` alone (notices off), so a test can load a rule, before or after,
-    /// and assert the proxy honors it without ever parking. The rules reach the proxy the way the
-    /// launch's do: pushed down a link and confirmed.
+    /// and assert the proxy honors it without ever parking: nobody answers a park on this link, so
+    /// a request that parks anyway is denied. The rules reach the proxy the way the launch's do:
+    /// pushed down a link and confirmed.
     pub(super) fn with_manual(mut self, manual: Arc<crate::sandbox::control::ManualRules>) -> Self {
         let (link, supervisor) = super::link::pair();
         manual
