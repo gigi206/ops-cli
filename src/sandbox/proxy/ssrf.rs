@@ -4,9 +4,12 @@
 //!
 //! The proxy runs on the host with full network reach, so an allowlisted *hostname* (or a rebound
 //! DNS answer for it) resolving to an internal address would be an SSRF vector; the guard below is
-//! applied before every upstream connection. It is reached only through [`resolve_checked`] /
-//! [`checked_address`], which record the refusal as they make it -- so a connect path cannot turn a
-//! request down here without the counter, the log and the notification saying so.
+//! applied before every upstream connection. The supervisor applies it ([`permitted`]) to every
+//! connection it opens on the proxy's behalf, and the proxy records what it was refused in one place
+//! ([`ProxyCtx::check`](super::ProxyCtx::check), [`ProxyCtx::connect`](super::ProxyCtx::connect)),
+//! so a connect path cannot be turned down without the counter, the log and the notification saying
+//! so. The HTTP/2 plane still resolves and dials for itself, through [`resolve_checked`] /
+//! [`checked_address`], which record the refusal as they make it.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -215,10 +218,13 @@ fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
     ip_refusal(ip, host, deciding).is_none()
 }
 
-/// Why a connect path may not reach a host the policy allowed: the name did not resolve, or every
-/// address it resolved to is one the guard refuses. Both are answered to the client, so each knows
-/// the status to answer with, the stable `x-sbx-egress-reason` token, and the sentence the refusal
-/// body repeats — the four connect paths differ in how they write a refusal, not in what it says.
+/// Why a connect path may not reach a host its policy allowed: the name did not resolve, every
+/// address it resolved to is one the guard refuses, none of them answered, or the supervisor, asked
+/// for the connection, turned it down. Each is answered to the client, so each knows the status to
+/// answer with, the stable `x-sbx-egress-reason` token, and the sentence the refusal body repeats:
+/// the connect paths differ in how they write a refusal, not in what it says. It crosses the link
+/// as the supervisor's answer, so it is the supervisor's word for what went wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum ConnectRefusal {
     /// The name did not resolve. An *error*, not a refusal: the policy said yes, so it is logged as
     /// one and moves no counter — the whole point of the distinction is that this reads differently
@@ -227,22 +233,34 @@ pub(super) enum ConnectRefusal {
     /// Every resolved address was private or never-reachable, and the deciding rule names no exact
     /// host. A security guard firing, so it is counted and announced like the others.
     Ssrf,
+    /// No permitted address accepted a connection. An error like [`Self::Dns`]: the policy said
+    /// yes and the host did not answer.
+    Unreachable,
+    /// The supervisor's own copy of the policy refused a connection the proxy had admitted. An
+    /// honest proxy meets it only when the two copies differ for a moment (a `--session` rule the
+    /// supervisor has sent and the proxy not yet installed), and it refuses in the safe direction.
+    Supervisor,
+    /// The supervisor was already answering as many of the proxy's questions as it answers at once,
+    /// or could not start the thread to answer this one.
+    Busy,
 }
 
 impl ConnectRefusal {
     /// The status line the HTTP/1.1 paths write.
     pub(super) fn status_line(&self) -> &'static str {
         match self {
-            Self::Dns => "502 Bad Gateway",
-            Self::Ssrf => "403 Forbidden",
+            Self::Dns | Self::Unreachable => "502 Bad Gateway",
+            Self::Ssrf | Self::Supervisor => "403 Forbidden",
+            Self::Busy => "503 Service Unavailable",
         }
     }
 
     /// The same status for the HTTP/2 path, which frames it rather than writing it.
     pub(super) fn status(&self) -> http::StatusCode {
         match self {
-            Self::Dns => http::StatusCode::BAD_GATEWAY,
-            Self::Ssrf => http::StatusCode::FORBIDDEN,
+            Self::Dns | Self::Unreachable => http::StatusCode::BAD_GATEWAY,
+            Self::Ssrf | Self::Supervisor => http::StatusCode::FORBIDDEN,
+            Self::Busy => http::StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -251,16 +269,29 @@ impl ConnectRefusal {
         match self {
             Self::Dns => "dns-failure",
             Self::Ssrf => "ssrf-blocked",
+            Self::Unreachable => "upstream-unreachable",
+            Self::Supervisor => "supervisor-denied",
+            Self::Busy => "supervisor-busy",
         }
     }
 
-    /// The sentence the refusal body carries, naming the host the client asked for.
-    pub(super) fn message(&self, host: &str) -> String {
+    /// The sentence the refusal body carries, naming the host and port the client asked for.
+    pub(super) fn message(&self, host: &str, port: u16) -> String {
         match self {
             Self::Dns => format!("DNS resolution failed for `{host}`"),
             Self::Ssrf => format!(
                 "`{host}` resolved only to disallowed addresses (a private or metadata range)"
             ),
+            Self::Unreachable => format!("`{host}:{port}` is allowed but could not be reached"),
+            Self::Supervisor => format!(
+                "the supervisor's copy of the network policy refused `{host}:{port}` (a session \
+                 rule changed while the request was decided)"
+            ),
+            Self::Busy => {
+                "the supervisor is already opening as many connections as it opens at once (retry \
+                 when one completes)"
+                    .to_string()
+            }
         }
     }
 }
@@ -270,8 +301,8 @@ impl ConnectRefusal {
 /// allowed host is an error the client is told about (a clean `502`), not a dropped connection.
 ///
 /// A list rather than one address, because one was a bug: a host whose first record is out of
-/// service was answered `502` where any ordinary client would have tried the next. Dial them with
-/// [`first_reachable`], which is where the order is honoured.
+/// service was answered `502` where any ordinary client would have tried the next. Dial them in
+/// order, as the supervisor does for the planes that ask it for their connections.
 pub(super) fn resolve_checked(
     ctx: &ProxyCtx,
     proto: Proto,
@@ -310,16 +341,7 @@ pub(super) fn checked_address(
     deciding: Option<&Rule>,
     ips: Vec<IpAddr>,
 ) -> Result<Vec<IpAddr>, ConnectRefusal> {
-    // *Every* permitted address, in resolution order — not the first one. The guard is applied to
-    // each, so nothing here widens what may be dialled; what changes is that a caller can move on
-    // from an address that will not connect. Keeping only the first meant a multi-homed host whose
-    // first A record was out of service answered `502 upstream-unreachable`, where an ordinary
-    // client — which walks the list — would have reached the second.
-    let permitted: Vec<IpAddr> = ips
-        .into_iter()
-        .filter(|ip| ip_permitted(*ip, host, deciding))
-        .collect();
-    if permitted.is_empty() {
+    permitted(&ips, host, deciding).inspect_err(|refusal| {
         ctx.outcome(
             proto,
             host,
@@ -327,8 +349,31 @@ pub(super) fn checked_address(
             method,
             path,
             StatKind::Blocked,
-            ConnectRefusal::Ssrf.tag(),
+            refusal.tag(),
         );
+    })
+}
+
+/// The addresses among `ips` the guard lets a request to `host`, permitted by `deciding`, reach, in
+/// resolution order; or [`ConnectRefusal::Ssrf`] when it lets none. The guard alone, recording
+/// nothing: the supervisor applies it to every connection it opens for the proxy, and the proxy
+/// records what it is told.
+pub(super) fn permitted(
+    ips: &[IpAddr],
+    host: &str,
+    deciding: Option<&Rule>,
+) -> Result<Vec<IpAddr>, ConnectRefusal> {
+    // *Every* permitted address, in resolution order — not the first one. The guard is applied to
+    // each, so nothing here widens what may be dialled; what changes is that a caller can move on
+    // from an address that will not connect. Keeping only the first meant a multi-homed host whose
+    // first A record was out of service answered `502 upstream-unreachable`, where an ordinary
+    // client — which walks the list — would have reached the second.
+    let permitted: Vec<IpAddr> = ips
+        .iter()
+        .copied()
+        .filter(|ip| ip_permitted(*ip, host, deciding))
+        .collect();
+    if permitted.is_empty() {
         return Err(ConnectRefusal::Ssrf);
     }
     Ok(permitted)
@@ -354,34 +399,6 @@ pub(super) fn dial_bounded(
     timeout: std::time::Duration,
 ) -> std::io::Result<std::net::TcpStream> {
     std::net::TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), timeout)
-}
-
-/// Dial the permitted addresses in order, answering with the first that connects.
-///
-/// The list comes from [`checked_address`], so the SSRF guard has already passed on **each** of
-/// them — walking it cannot reach an address the guard refused, which is the property that makes
-/// the walk safe rather than a second chance at the same question. The last error is the one
-/// reported: a caller that could reach none of them is told about the last thing it tried, and the
-/// refusal it renders is the same one a single-address failure produced.
-pub(super) fn first_reachable<T, E>(
-    ips: &[IpAddr],
-    mut dial: impl FnMut(IpAddr) -> Result<T, E>,
-) -> Result<T, E> {
-    let mut last = None;
-    for ip in ips {
-        match dial(*ip) {
-            Ok(v) => return Ok(v),
-            Err(e) => last = Some(e),
-        }
-    }
-    // `checked_address` never returns an empty list (it refuses instead), and it is the only
-    // producer, so the `expect` is unreachable rather than a case left unhandled.
-    #[expect(
-        clippy::expect_used,
-        reason = "`checked_address` refuses rather than returning an empty list, and it is the \
-                  only producer, so the loop above ran at least once and set `last`"
-    )]
-    Err(last.expect("the permitted-address list is never empty"))
 }
 
 /// Whether `deciding` is an explicit, exact-host rule for `host` (not a wildcard/regex). With no

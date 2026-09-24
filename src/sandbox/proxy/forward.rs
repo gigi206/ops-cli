@@ -140,24 +140,18 @@ pub(super) fn handle_https_forward(
         return Ok(());
     }
 
-    // 6. Resolve host-side, then the SSRF guard against the deciding rule. A resolution failure for an
-    //    allowed host is a clean 502, distinct from a refusal.
-    let ips = match resolve_checked(
-        ctx,
-        crate::sandbox::control::Proto::Https,
-        &host,
-        port,
-        Some(verb),
-        Some(&path),
-        deciding.as_ref(),
-    ) {
-        Ok(ips) => ips,
+    // 6. The supervisor's check, as on the tunneled plane: the verdict again from its own copy, the
+    //    resolution and the SSRF guard against its deciding rule, the refusal recorded where the
+    //    answer comes in. A resolution failure for an allowed host is a clean 502, distinct from a
+    //    refusal.
+    let checked = match ctx.check(&super::link::Asked::inspected(&host, port, verb, &path)) {
+        Ok(checked) => checked,
         Err(refusal) => {
             return write_refusal(
                 &mut client,
                 refusal.status_line(),
                 refusal.tag(),
-                &refusal.message(&host),
+                &refusal.message(&host, port),
             );
         }
     };
@@ -326,18 +320,16 @@ pub(super) fn handle_https_forward(
         keep_alive.then(|| PoolKey::new(&host, port, &injected_ids, ctx.credentials.generation()));
     let replayable = chunked || body_len == 0 || held.is_some();
 
-    // 7b. Take the upstream connection: a parked one, or a new validated TLS connection to the
-    //     checked address (not a re-resolve, which would reopen the rebinding window). A
-    //     forged/self-signed upstream is refused, never downgraded.
-    let (mut upstream, mut from_pool) = match super::ssrf::first_reachable(&ips, |ip| {
-        acquire_upstream(
-            ctx,
-            pool_key.as_ref().filter(|_| replayable),
-            ip,
-            port,
-            &host,
-        )
-    }) {
+    // 7b. Take the upstream connection: a parked one whose address this request's guard passes, or a
+    //     new validated TLS connection the supervisor opens to an address its check kept (not a
+    //     re-resolve, which would reopen the rebinding window). A forged/self-signed upstream is
+    //     refused, never downgraded.
+    let (mut upstream, mut from_pool) = match acquire_upstream(
+        ctx,
+        pool_key.as_ref().filter(|_| replayable),
+        &checked,
+        deciding.as_ref(),
+    ) {
         Ok(pair) => pair,
         Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, &e),
     };
@@ -503,9 +495,7 @@ pub(super) fn handle_https_forward(
                     ),
                 );
             }
-            let (fresh, _) = match super::ssrf::first_reachable(&ips, |ip| {
-                acquire_upstream(ctx, None, ip, port, &host)
-            }) {
+            let (fresh, _) = match acquire_upstream(ctx, None, &checked, deciding.as_ref()) {
                 Ok(pair) => pair,
                 Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, &e),
             };

@@ -297,26 +297,25 @@ pub(super) fn serve_tunneled_request(
         return Ok(Turn::Close);
     }
 
-    // 6. Resolve host-side, then the SSRF guard — one call, which records the refusal whichever way
-    //    it goes. A resolution failure for an allowed host is a clean 502 (not a dropped
+    // 6. The supervisor's check: it decides the request again from its own copy of the policy,
+    //    resolves the host and applies the SSRF guard, and the refusal is recorded where its answer
+    //    comes in, whichever way it goes. Asked here, before anything below the request is not yet
+    //    cleared for. A resolution failure for an allowed host is a clean 502 (not a dropped
     //    connection), so the agent sees "the name did not resolve" rather than an ambiguous
     //    transport error.
-    let ips = match resolve_checked(
-        ctx,
-        crate::sandbox::control::Proto::Https,
+    let checked = match ctx.check(&super::link::Asked::inspected(
         connect_host,
         port,
-        Some(&imethod),
-        Some(&itarget),
-        deciding.as_ref(),
-    ) {
-        Ok(ips) => ips,
+        &imethod,
+        &itarget,
+    )) {
+        Ok(checked) => checked,
         Err(refusal) => {
             return respond_refusal_tls(
                 &mut br,
                 refusal.status_line(),
                 refusal.tag(),
-                &refusal.message(connect_host),
+                &refusal.message(connect_host, port),
             );
         }
     };
@@ -519,18 +518,16 @@ pub(super) fn serve_tunneled_request(
     // one.
     let replayable = chunked || body_len == 0 || held.is_some();
 
-    // 7b. Take the upstream connection: a parked one, or a new one to the address just checked (not
-    //     a re-resolve, which would reopen the rebinding window) with its certificate validated up
-    //     front — a forged or self-signed upstream is refused, never passed through.
-    let (mut upstream, mut from_pool) = match super::ssrf::first_reachable(&ips, |ip| {
-        acquire_upstream(
-            ctx,
-            pool_key.as_ref().filter(|_| replayable),
-            ip,
-            port,
-            connect_host,
-        )
-    }) {
+    // 7b. Take the upstream connection: a parked one whose address this request's guard passes, or a
+    //     new one the supervisor opens to an address its check kept (not a re-resolve, which would
+    //     reopen the rebinding window) with its certificate validated up front: a forged or
+    //     self-signed upstream is refused, never passed through.
+    let (mut upstream, mut from_pool) = match acquire_upstream(
+        ctx,
+        pool_key.as_ref().filter(|_| replayable),
+        &checked,
+        deciding.as_ref(),
+    ) {
         Ok(pair) => pair,
         Err(e) => {
             return Turn::closing(refuse_upstream(
@@ -798,9 +795,7 @@ pub(super) fn serve_tunneled_request(
                     ),
                 );
             }
-            let (fresh, _) = match super::ssrf::first_reachable(&ips, |ip| {
-                acquire_upstream(ctx, None, ip, port, connect_host)
-            }) {
+            let (fresh, _) = match acquire_upstream(ctx, None, &checked, deciding.as_ref()) {
                 Ok(pair) => pair,
                 Err(e) => {
                     return Turn::closing(refuse_upstream(

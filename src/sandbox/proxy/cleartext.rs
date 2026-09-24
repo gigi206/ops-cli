@@ -71,9 +71,11 @@ pub(super) fn handle_cleartext(
     //    (a bare `sbx net allow host` would add an https/443 rule that does not open the clear, and
     //    a scheme with no port would open 80 rather than the port that was refused) — spelled by the
     //    one shared [`rule_destination`], which the notification for this same refusal also reads.
+    //    The deciding rule itself is the supervisor's to find again: it applies the SSRF guard with
+    //    its own, below.
     let policy = effective_policy(ctx);
-    let deciding: Rule = match policy.explain_clear(&host, port, &path, method) {
-        Decision::AllowedBy(rule) => rule.clone(),
+    match policy.explain_clear(&host, port, &path, method) {
+        Decision::AllowedBy(_) => {}
         Decision::DeniedBy(_) => {
             ctx.outcome(
                 crate::sandbox::control::Proto::Http,
@@ -135,27 +137,20 @@ pub(super) fn handle_cleartext(
                 ),
             );
         }
-    };
+    }
 
-    // 6. Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata address
-    //    is refused unless the `http://` rule names this exact host). A resolution failure for an
-    //    allowed host is a clean 502, distinct from a refusal.
-    let ips = match resolve_checked(
-        ctx,
-        crate::sandbox::control::Proto::Http,
-        &host,
-        port,
-        Some(method),
-        Some(&path),
-        Some(&deciding),
-    ) {
-        Ok(ips) => ips,
+    // 6. The supervisor's check: the verdict again from its own copy, then the resolution and the
+    //    SSRF guard against its deciding rule (a private/metadata address is refused unless the
+    //    `http://` rule names this exact host), the refusal recorded where the answer comes in. A
+    //    resolution failure for an allowed host is a clean 502, distinct from a refusal.
+    let checked = match ctx.check(&super::link::Asked::clear(&host, port, method, &path)) {
+        Ok(checked) => checked,
         Err(refusal) => {
             return write_refusal(
                 &mut client,
                 refusal.status_line(),
                 refusal.tag(),
-                &refusal.message(&host),
+                &refusal.message(&host, port),
             );
         }
     };
@@ -174,28 +169,17 @@ pub(super) fn handle_cleartext(
     //     scopes it to the destination it was acquired on.
     ctx.credentials.observe_head(&head.headers, &[], &host);
 
-    // 7. Open the plaintext upstream to the checked address (no TLS, no certificate — an `http://`
-    //    connection is cleartext by definition; the empty netns + the allowlist are the boundary).
-    let mut upstream = match super::ssrf::first_reachable(&ips, |ip| {
-        super::ssrf::dial_bounded(ip, port, ctx.timeout)
-    }) {
-        Ok(s) => {
-            let _ = s.set_read_timeout(Some(ctx.timeout));
-            let _ = s.set_write_timeout(Some(ctx.timeout));
-            // Nagle off, for the reason `connect_upstream` states: this path writes a head and
-            // then streams a body, and the second write would wait on a delayed ACK.
-            let _ = s.set_nodelay(true);
-            s
-        }
-        Err(_) => {
-            return refuse_unreachable(
+    // 7. The plaintext upstream, which the supervisor opens to an address its check kept. No TLS and
+    //    no certificate: an `http://` connection is cleartext by definition, and the empty netns +
+    //    the allowlist are the boundary.
+    let mut upstream = match ctx.connect(&checked.asked, Some(checked.id), 0) {
+        Ok((stream, _, _)) => stream,
+        Err(refusal) => {
+            return write_refusal(
                 &mut client,
-                ctx,
-                crate::sandbox::control::Proto::Http,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(&host, port),
             );
         }
     };

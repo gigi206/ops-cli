@@ -3715,6 +3715,279 @@ fn a_host_whose_first_address_refuses_is_reached_at_its_second() {
     );
 }
 
+/// A listener on `ip:port` that accepts TCP and then answers with bytes no TLS client accepts, so a
+/// handshake with it fails after the connection succeeded. Counts what it accepted.
+fn refuse_tls_at(ip: [u8; 4], port: u16) -> Arc<AtomicUsize> {
+    let listener = TcpListener::bind((IpAddr::from(ip), port)).unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    thread::spawn(move || {
+        while let Ok((mut sock, _)) = listener.accept() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = sock.write_all(b"HTTP/1.1 400 Not TLS\r\n\r\n");
+        }
+    });
+    accepted
+}
+
+/// [`reuse_ctx`] resolving `upstream.test` to `ips`, in that order.
+fn ctx_resolving_to(
+    upstream_ca: CertificateDer<'static>,
+    ips: Vec<IpAddr>,
+) -> (Arc<ProxyCtx>, CertificateDer<'static>) {
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, false, vec![]);
+    let ctx = Arc::try_unwrap(ctx)
+        .unwrap_or_else(|_| panic!("the context is not shared yet"))
+        .with_resolver(Box::new(move |_| Ok(ips.clone())));
+    (Arc::new(ctx), proxy_ca_der)
+}
+
+/// A host whose first address takes the connection and then fails the TLS handshake is reached at
+/// its second, as a first address that refuses the connection is: the supervisor opens connections
+/// and the proxy completes the handshake, so a failed handshake asks the supervisor again from the
+/// next address rather than ending the request.
+#[test]
+fn a_host_whose_first_address_fails_its_handshake_is_reached_at_its_second() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let failing = refuse_tls_at([127, 0, 0, 2], addr.port());
+    let (ctx, proxy_ca_der) = ctx_resolving_to(
+        upstream_ca,
+        vec![IpAddr::from([127, 0, 0, 2]), IpAddr::from([127, 0, 0, 1])],
+    );
+    let got = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        "upstream.test",
+        addr.port(),
+        b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        got.ends_with("hello"),
+        "the second address answers where the first failed its handshake: {got:?}"
+    );
+    assert_eq!(
+        failing.load(Ordering::SeqCst),
+        1,
+        "the first address took the connection"
+    );
+    assert_eq!(upstream.connections(), 1);
+}
+
+/// The same under `ask`, where the request reaches its host only on an operator's allow: the allow
+/// is the request's, not its first connection's, so the connection asked for again after a failed
+/// handshake is admitted like the first.
+#[test]
+fn a_request_an_operator_allowed_is_reached_at_its_second_address_too() {
+    use crate::allowlist::DefaultAction;
+    use crate::sandbox::control::{PendingState, Verdict};
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let failing = refuse_tls_at([127, 0, 0, 2], addr.port());
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let state = Arc::new(PendingState::new());
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            proxy_ca,
+            EgressPolicy::default().with_default(DefaultAction::Ask),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_resolver(Box::new(|_| {
+            Ok(vec![
+                IpAddr::from([127, 0, 0, 2]),
+                IpAddr::from([127, 0, 0, 1]),
+            ])
+        }))
+        .with_pending_silent(state.clone()),
+    );
+    let answerer = {
+        let state = state.clone();
+        thread::spawn(move || answer_when_parked(&state, Verdict::Allow))
+    };
+    let got = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        "upstream.test",
+        addr.port(),
+        b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(answerer.join().unwrap().as_deref(), Some("upstream.test"));
+    assert!(got.ends_with("hello"), "{got:?}");
+    assert_eq!(failing.load(Ordering::SeqCst), 1);
+    assert_eq!(upstream.connections(), 1);
+}
+
+/// A request none of whose addresses can be had leaves one line, naming the last failure, as when
+/// the proxy dialled every address itself: a handshake that failed before it is not a line of its
+/// own.
+#[test]
+fn a_request_no_address_serves_leaves_one_line_naming_the_last_failure() {
+    use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
+    let (addr, upstream_ca, _upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let port = addr.port();
+    let _failing = refuse_tls_at([127, 0, 0, 2], port);
+    // 127.0.0.3 is loopback with nothing listening on this port: its dial is refused at once.
+    for (ips, reason) in [
+        ([[127, 0, 0, 2], [127, 0, 0, 3]], "upstream-unreachable"),
+        ([[127, 0, 0, 3], [127, 0, 0, 2]], "upstream-cert-rejected"),
+    ] {
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let (ctx, proxy_ca_der) =
+            ctx_resolving_to(upstream_ca.clone(), ips.map(IpAddr::from).to_vec());
+        let ctx = Arc::new(
+            Arc::try_unwrap(ctx)
+                .unwrap_or_else(|_| panic!("the context is not shared yet"))
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    Arc::clone(&log),
+                    None,
+                )),
+        );
+        let got = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            port,
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        )
+        .unwrap();
+        assert!(got.contains(" 502 ") && got.contains(reason), "{got:?}");
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.verdict, e.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(LogVerdict::Error, reason)],
+            "{ips:?}"
+        );
+    }
+}
+
+/// A parked connection is reused only for a request whose own connection could reach the address
+/// it is connected to. Here the first request is admitted by a rule naming the host, which opens a
+/// private address, and leaves its connection to one behind; the second is admitted by a wildcard,
+/// which does not, while the host now resolves to a public address. The second request passes the
+/// supervisor's check, and must not ride the connection the first left.
+#[test]
+fn a_parked_connection_to_an_address_the_request_may_not_reach_is_not_reused() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx_allowing(
+        upstream_ca,
+        true,
+        vec![],
+        &["{GET} upstream.test:*", "*.test:*"],
+    );
+    let resolved = Arc::new(AtomicUsize::new(0));
+    let ctx = Arc::new(
+        Arc::try_unwrap(ctx)
+            .unwrap_or_else(|_| panic!("the context is not shared yet"))
+            // The public address is never answered here: the dial gives up on this bound.
+            .with_timeout(Duration::from_millis(300))
+            .with_resolver(Box::new(move |_| {
+                Ok(vec![if resolved.fetch_add(1, Ordering::SeqCst) == 0 {
+                    IpAddr::from([127, 0, 0, 1])
+                } else {
+                    IpAddr::from([1, 2, 3, 4])
+                }])
+            })),
+    );
+    let got = through_proxy_repeatedly(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"POST /two HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 0\r\n\r\n",
+        ],
+    )
+    .unwrap();
+    assert!(got[0].ends_with("hello"), "{:?}", got[0]);
+    assert!(got[1].contains(" 502 "), "{:?}", got[1]);
+    assert_eq!(
+        upstream.heads.lock().unwrap().len(),
+        1,
+        "the second request never reached the connection the first left"
+    );
+}
+
+/// The supervisor's copy of the policy is the last word on a connection: one that is ahead of the
+/// proxy's (a `--session` deny sent and not yet installed) refuses a request the proxy admitted,
+/// under its own reason, counted as a denial, and the upstream is never reached.
+#[test]
+fn a_request_the_supervisors_copy_refuses_is_refused_under_its_own_reason() {
+    use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
+    use crate::sandbox::egress_stats::{Counts, EgressStats};
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let dir = TmpDir::new();
+    let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
+    let log = Arc::new(LogRing::new(LOG_RING_CAP));
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, false, vec![]);
+    let ctx = Arc::try_unwrap(ctx)
+        .unwrap_or_else(|_| panic!("the context is not shared yet"))
+        .with_events(crate::sandbox::proxy::events::for_log(
+            Arc::clone(&log),
+            Some(Arc::clone(&stats)),
+        ));
+    ctx.link.judge().unwrap().sent(
+        1,
+        &super::link::Overlay {
+            deny: vec![classify("upstream.test:*").unwrap()],
+            ..super::link::Overlay::default()
+        },
+    );
+    let got = through_proxy(
+        Arc::new(ctx),
+        proxy_ca_der,
+        "upstream.test",
+        "upstream.test",
+        addr.port(),
+        b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        got.contains(" 403 ") && got.contains("supervisor-denied"),
+        "{got:?}"
+    );
+    assert_eq!(
+        stats
+            .snapshot()
+            .get("upstream.test")
+            .copied()
+            .unwrap_or_default(),
+        Counts {
+            deny: 1,
+            ..Default::default()
+        }
+    );
+    let events = log.snapshot(None, None, false).events;
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| (e.verdict, e.reason.as_str()))
+            .collect::<Vec<_>>(),
+        [(LogVerdict::Deny, "supervisor-denied")]
+    );
+    assert_eq!(upstream.connections(), 0);
+}
+
 /// The whole point of the increment: two requests to the same host, one TLS handshake. Nothing
 /// else in this file could show it — every other upstream helper serves one request and closes,
 /// so reuse would look identical to no reuse.

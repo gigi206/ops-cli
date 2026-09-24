@@ -105,11 +105,13 @@
 //! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `sbx net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
 //! | `403` | `http2-ask-unsupported`  | an `ask`-undecided host designated `[network] http2`. Every stream of one HTTP/2 connection is multiplexed onto a single runtime, so parking one to wait for `sbx net pending` would stall its siblings; the stream fails closed under its own reason instead of being parked (see [`AskPosture`]) |
 //! | `403` | `ssrf-blocked`           | the host resolved only to private / metadata addresses |
+//! | `403` | `supervisor-denied`      | the supervisor's own copy of the policy refused a connection the proxy had admitted. The proxy asks the supervisor for every upstream connection ([`link::Judge`]), and the two copies differ only while a `--session` rule the supervisor has sent is not yet in force in the proxy: refused in the safe direction, and counted as a denial |
 //! | `403` | `ip-literal`             | the CONNECT target was an IP literal on the inspected path (allow it raw with a `tcp://` rule) |
 //! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
 //! | `403` | `signer-refused`         | a signer plugin would not form this request's credential; the body carries the plugin's own reason, scrubbed of every declared credential |
 //! | `413` | `signer-body-too-large`  | a signer asked to be told a digest over the request body, and the request declares a `Content-Length` above what the proxy holds. No plugin refused: sbx did, from the head, before the body was invited. An over-cap `chunked` body declares no length and is discovered while being read, so it keeps the `bad-request:chunked` above |
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
+//! | `503` | `supervisor-busy`        | the supervisor was already opening as many connections for this proxy as it opens at once (the policy's `[network] max_connections`), or could not start the thread to open this one (retry when one completes) |
 //! | `503` | `connection-cap`         | the proxy is already serving as many client connections as it will serve at once (`[network] max_connections`). Answered on the accept loop, before anything is read, so the caller's own request is still unread when the connection closes and the refusal arrives followed by a reset |
 //! | `503` | `body-buffer-cap`        | the proxy is already holding as much request-body data as it will hold at one time (retry when one in flight completes). Nothing is wrong with the request: it is a shared ceiling on host memory, since the proxy buffers host-side and the cage's own `MemoryMax` does not reach it |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
@@ -231,8 +233,8 @@ pub(crate) use inject::{
 use inject::{SignRefusal, pairs_for as injection_values};
 use pool::{PoolKey, UpstreamTls};
 use splice::splice_l4;
+use ssrf::resolve_checked;
 pub(crate) use ssrf::{AddrRefusal, ip_refusal, names_exact_host};
-use ssrf::{checked_address, resolve_checked};
 use tunnel::{Turn, serve_tunneled_request};
 use websocket::*;
 use wire::*;
@@ -475,8 +477,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     is fine for it). Anything else (the common case) falls through to the inspected L7 path.
     {
         let policy = effective_policy(ctx);
-        if let L4Decision::Splice(rule) = policy.l4_decision(&connect_host, port) {
-            return splice_l4(client, &connect_host, port, rule, ctx);
+        if let L4Decision::Splice(_) = policy.l4_decision(&connect_host, port) {
+            return splice_l4(client, &connect_host, port, ctx);
         }
     }
 
@@ -780,45 +782,49 @@ fn decide_https(
     }
 }
 
-/// Why a connection to the validated upstream could not be opened, so the refusal can name a
-/// distinct motif: the TCP connection failed (the host is down/filtered), or the TLS handshake /
+/// Why a request's validated upstream could not be had, so the refusal names a distinct motif: the
+/// supervisor gave no connection (it refused one, or reached no address), or the TLS handshake /
 /// certificate validation failed (a forged or otherwise untrusted upstream — never downgraded).
 enum UpstreamError {
-    /// The TCP connection to the checked address could not be established.
-    Unreachable,
+    /// The supervisor gave no connection, and why. Already recorded where the answer came in
+    /// ([`ProxyCtx::connect`]).
+    Refused(ssrf::ConnectRefusal),
     /// The TLS handshake or certificate validation against the upstream failed.
     CertRejected,
 }
 
-/// Open a validated TLS connection to a checked upstream address. The TCP target is the
-/// already-guarded IP; the certificate is validated against `host` (the name), so the connection
-/// goes to the exact address the SSRF guard approved while still authenticating the real server.
-/// The handshake is completed here so a validation failure surfaces now (a 502), distinct from a
-/// plain unreachable host (also a 502, but a different reason).
-fn connect_upstream(
-    ip: IpAddr,
-    port: u16,
-    host: &str,
-    ctx: &ProxyCtx,
-) -> Result<StreamOwned<ClientConnection, TcpStream>, UpstreamError> {
-    let sock = ssrf::dial_bounded(ip, port, ctx.timeout).map_err(|_| UpstreamError::Unreachable)?;
-    sock.set_read_timeout(Some(ctx.timeout))
-        .map_err(|_| UpstreamError::Unreachable)?;
-    sock.set_write_timeout(Some(ctx.timeout))
-        .map_err(|_| UpstreamError::Unreachable)?;
-    // Nagle off. Every relay here writes a head and then a body, and on a connection that stays
-    // open the second write waits for the delayed ACK of the first — tens of milliseconds of
-    // latency the proxy adds to every request that carries one. Latency over segment count is the
-    // trade a proxy in a request's path wants, and it is what the broker's socket already takes.
-    let _ = sock.set_nodelay(true);
-    let name = upstream_server_name(host).map_err(|_| UpstreamError::CertRejected)?;
-    let mut conn = ClientConnection::new(ctx.upstream.clone(), name)
-        .map_err(|_| UpstreamError::CertRejected)?;
-    let mut sock = sock;
+/// Open a validated TLS connection for the request `checked` cleared. The TCP connection is the
+/// supervisor's, to an address its SSRF guard approved; the certificate is validated here against
+/// the host's name, so the connection goes to an approved address while still authenticating the
+/// real server. The handshake is completed here so a validation failure surfaces now (a 502),
+/// distinct from a host that cannot be reached (also a 502, but a different reason).
+///
+/// A handshake that fails moves on to the host's next address, as a dial that fails does: the
+/// supervisor says at which of how many addresses it connected, and is asked again from the one
+/// after. The failure reported is the last one, as when this proxy dialled every address itself,
+/// and a handshake that fails before the last address records nothing.
+fn connect_upstream(ctx: &ProxyCtx, checked: &link::Checked) -> Result<UpstreamTls, UpstreamError> {
+    let mut from = 0;
+    loop {
+        let (sock, at, of) = ctx
+            .connect(&checked.asked, Some(checked.id), from)
+            .map_err(UpstreamError::Refused)?;
+        match handshake(sock, &checked.asked.host, ctx) {
+            Some(stream) => return Ok(stream),
+            None if at + 1 < of => from = at + 1,
+            None => return Err(UpstreamError::CertRejected),
+        }
+    }
+}
+
+/// The TLS session to `host` over `sock`, its handshake driven and the certificate validated now,
+/// or `None` when either fails.
+fn handshake(mut sock: TcpStream, host: &str, ctx: &ProxyCtx) -> Option<UpstreamTls> {
+    let name = upstream_server_name(host).ok()?;
+    let mut conn = ClientConnection::new(ctx.upstream.clone(), name).ok()?;
     // drives + validates the TLS handshake now; a forged/self-signed upstream fails here
-    conn.complete_io(&mut sock)
-        .map_err(|_| UpstreamError::CertRejected)?;
-    Ok(StreamOwned::new(conn, sock))
+    conn.complete_io(&mut sock).ok()?;
+    Some(StreamOwned::new(conn, sock))
 }
 
 /// The upstream connection this request will ride: one an earlier request to the same host left
@@ -826,67 +832,42 @@ fn connect_upstream(
 /// and validated one. The flag says which, so a connection that dies between the pool's probe and
 /// the request write can be named for what it is rather than surfacing as an empty response.
 ///
-/// Reuse deliberately sits **after** the verdict, the name resolution and the address guard, not
-/// instead of them: a parked connection shortens the handshake, never the checks. It also cannot
-/// outlive what authorized it — the certificate was validated against `host`, which is part of the
-/// key, so a reused connection goes to a server that was authenticated for exactly this name.
+/// Reuse deliberately sits **after** the verdict and the supervisor's check, not instead of them: a
+/// parked connection shortens the handshake, never the checks. It also cannot outlive what
+/// authorized it. The certificate was validated against `host`, which is part of the key, so a
+/// reused connection goes to a server that was authenticated for exactly this name; and the address
+/// it is connected to must pass the guard this request's own connection would, against this
+/// request's deciding rule ([`reusable`]), so a connection opened under a rule that named the host
+/// exactly does not carry a request a wildcard admitted to a private address.
 fn acquire_upstream(
     ctx: &ProxyCtx,
     key: Option<&PoolKey>,
-    ip: IpAddr,
-    port: u16,
-    host: &str,
+    checked: &link::Checked,
+    deciding: Option<&Rule>,
 ) -> Result<(UpstreamTls, bool), UpstreamError> {
     if let (Some(pool), Some(key)) = (ctx.pool.as_ref(), key)
         && let Some(stream) = pool.checkout(key)
+        && reusable(&stream, &checked.asked.host, deciding)
     {
         return Ok((stream, true));
     }
-    connect_upstream(ip, port, host, ctx).map(|stream| (stream, false))
+    connect_upstream(ctx, checked).map(|stream| (stream, false))
 }
 
-/// Refuse a request because the upstream the policy allowed could not be reached at all: an `error`
-/// line naming the host, and a `502` telling the agent that the refusal is a transport failure and
-/// not a verdict.
-///
-/// Every transport that opens an upstream of its own ends here — the two inspected-TLS planes
-/// through [`refuse_upstream`], [`handle_cleartext`] and [`splice_l4`] directly — because the reason
-/// token and the sentence beside it state one fact that does not depend on what carried the request.
-/// What genuinely differs is passed in: the `proto` the attempt is recorded under, and the request
-/// it belongs to, which a raw splice does not have (it refuses before any HTTP is spoken).
-///
-/// The HTTP/2 plane keeps its own refusal. It answers a stream with a header-only `502` carrying the
-/// reason and no body, so there is no sentence for it to share.
-fn refuse_unreachable<W: Write>(
-    w: &mut W,
-    ctx: &ProxyCtx,
-    proto: super::control::Proto,
-    host: &str,
-    port: u16,
-    method: Option<&str>,
-    target: Option<&str>,
-) -> io::Result<()> {
-    ctx.push_log(
-        proto,
-        host,
-        port,
-        method,
-        target,
-        super::control::LogVerdict::Error,
-        "upstream-unreachable",
-    );
-    write_refusal(
-        w,
-        "502 Bad Gateway",
-        "upstream-unreachable",
-        &format!("`{host}:{port}` is allowed but could not be reached"),
-    )
+/// Whether a parked connection may carry a request to `host` that its policy permitted by
+/// `deciding`: the address it is connected to passes the SSRF guard for that request. A connection
+/// whose address cannot be read is not reused.
+fn reusable(stream: &UpstreamTls, host: &str, deciding: Option<&Rule>) -> bool {
+    stream
+        .sock
+        .peer_addr()
+        .is_ok_and(|peer| ssrf::ip_refusal(peer.ip(), host, deciding).is_none())
 }
 
-/// Refuse a request because its validated upstream could not be opened. Both shapes are a `502`,
-/// with distinct reasons so "the host is down" reads differently from "its certificate was
-/// rejected". Written straight to whichever client leg asked — the decrypted tunnel on the
-/// inspected-TLS path, the plaintext socket on the absolute-form one.
+/// Refuse a request because its validated upstream could not be had. Every shape is a `502` but the
+/// supervisor's own refusals, with distinct reasons so "the host is down" reads differently from
+/// "its certificate was rejected". Written straight to whichever client leg asked: the decrypted
+/// tunnel on the inspected-TLS path, the plaintext socket on the absolute-form one.
 fn refuse_upstream<W: Write>(
     w: &mut W,
     ctx: &ProxyCtx,
@@ -896,37 +877,36 @@ fn refuse_upstream<W: Write>(
     target: &str,
     err: &UpstreamError,
 ) -> io::Result<()> {
-    let (reason, detail) = match err {
-        // The shape every plane can produce, answered in the one place that spells it.
-        UpstreamError::Unreachable => {
-            return refuse_unreachable(
-                w,
-                ctx,
+    match err {
+        // Recorded where the supervisor's answer came in; only the answer is written here.
+        UpstreamError::Refused(refusal) => write_refusal(
+            w,
+            refusal.status_line(),
+            refusal.tag(),
+            &refusal.message(host, port),
+        ),
+        UpstreamError::CertRejected => {
+            let reason = "upstream-cert-rejected";
+            ctx.push_log(
                 super::control::Proto::Https,
                 host,
                 port,
                 Some(method),
                 Some(target),
+                super::control::LogVerdict::Error,
+                reason,
             );
+            write_refusal(
+                w,
+                "502 Bad Gateway",
+                reason,
+                &format!(
+                    "the TLS handshake with `{host}` failed (upstream certificate validation is the \
+                     usual cause)"
+                ),
+            )
         }
-        UpstreamError::CertRejected => (
-            "upstream-cert-rejected",
-            format!(
-                "the TLS handshake with `{host}` failed (upstream certificate validation is the \
-                 usual cause)"
-            ),
-        ),
-    };
-    ctx.push_log(
-        super::control::Proto::Https,
-        host,
-        port,
-        Some(method),
-        Some(target),
-        super::control::LogVerdict::Error,
-        reason,
-    );
-    write_refusal(w, "502 Bad Gateway", reason, &detail)
+    }
 }
 
 /// Whether a method may be sent a second time after a parked connection turns out to be dead.

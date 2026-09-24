@@ -40,9 +40,11 @@ impl Drop for SpliceGuard<'_> {
 }
 
 /// Handle a raw L4 (`tcp://`) splice: a `tcp://` allow rule opted this host:port into an uninspected
-/// tunnel ([`EgressPolicy::l4_decision`](crate::allowlist::EgressPolicy::l4_decision)). The connection keeps the controls a raw stream can carry —
-/// the host:port allowlist (already matched), host-side DNS, the open-splice cap, and the SSRF guard
-/// — but **loses** TLS termination, path/method matching, Host/SNI anti-fronting, and secret
+/// tunnel ([`EgressPolicy::l4_decision`](crate::allowlist::EgressPolicy::l4_decision)). The
+/// connection keeps the controls a raw stream can carry: the host:port allowlist (already matched,
+/// and matched again by the supervisor before it opens the connection), host-side DNS, the
+/// open-splice cap, and the SSRF guard. It **loses** TLS termination, path/method matching,
+/// Host/SNI anti-fronting, and secret
 /// redaction (there is no HTTP head to inspect). Failures before the tunnel is accepted are reported
 /// as plain-HTTP refusals (the client is still speaking the CONNECT protocol); once `200` is sent the
 /// bytes are raw and a mid-stream error simply tears the tunnel down.
@@ -50,7 +52,6 @@ pub(super) fn splice_l4(
     mut client: UnixStream,
     connect_host: &str,
     port: u16,
-    deciding: &Rule,
     ctx: &ProxyCtx,
 ) -> io::Result<()> {
     // Reserve a splice slot up front; the guard releases it on every return below.
@@ -74,65 +75,22 @@ pub(super) fn splice_l4(
         );
     }
 
-    // Resolve host-side. An IP-literal CONNECT target is allowed for a splice (it needs no SNI), so
-    // it is used directly; a hostname is resolved, and a failure is a clean 502 (not a dropped
-    // connection). Then the SSRF guard against the deciding rule — a private/metadata address is
-    // refused unless the rule names this exact host.
-    let checked = match connect_host.parse::<IpAddr>() {
-        // An IP-literal target: this path is the only one that accepts one, and there is nothing to
-        // resolve — the guard still decides.
-        Ok(ip) => checked_address(
-            ctx,
-            crate::sandbox::control::Proto::Tcp,
-            connect_host,
-            port,
-            None,
-            None,
-            Some(deciding),
-            vec![ip],
-        ),
-        Err(_) => resolve_checked(
-            ctx,
-            crate::sandbox::control::Proto::Tcp,
-            connect_host,
-            port,
-            None,
-            None,
-            Some(deciding),
-        ),
-    };
-    let ips = match checked {
-        Ok(ips) => ips,
+    // The raw upstream, which the supervisor opens: it decides the splice again from its own copy of
+    // the policy, resolves a hostname (an IP-literal target, which a splice alone accepts since it
+    // needs no SNI, is used as it is), applies the SSRF guard against its deciding rule (a
+    // private/metadata address is refused unless the rule names this exact host), and dials. No
+    // check comes first: nothing happens between the two on this path. No TLS and no certificate
+    // validation either: a raw splice is uninspected by design, and the empty netns + the allowlist
+    // are the boundary. A refusal is recorded where the answer comes in, and is a clean refusal here
+    // rather than a dropped connection.
+    let upstream = match ctx.connect(&super::link::Asked::splice(connect_host, port), None, 0) {
+        Ok((stream, _, _)) => stream,
         Err(refusal) => {
             return write_refusal(
                 &mut client,
                 refusal.status_line(),
                 refusal.tag(),
-                &refusal.message(connect_host),
-            );
-        }
-    };
-
-    // Open the raw upstream to the checked address (no TLS, no certificate validation — a raw splice
-    // is uninspected by design; the empty netns + the allowlist are the boundary).
-    let upstream = match super::ssrf::first_reachable(&ips, |ip| {
-        super::ssrf::dial_bounded(ip, port, ctx.timeout)
-    }) {
-        Ok(s) => {
-            // Nagle off. A raw splice carries whatever protocol the cage speaks, including
-            // interactive ones whose small writes are exactly what Nagle holds back.
-            let _ = s.set_nodelay(true);
-            s
-        }
-        Err(_) => {
-            return refuse_unreachable(
-                &mut client,
-                ctx,
-                crate::sandbox::control::Proto::Tcp,
-                connect_host,
-                port,
-                None,
-                None,
+                &refusal.message(connect_host, port),
             );
         }
     };

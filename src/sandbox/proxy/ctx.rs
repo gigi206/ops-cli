@@ -4,7 +4,8 @@
 //! built-in-augmented) egress policy, the name resolver, the per-socket timeout, the host-side
 //! credential injections and redaction needles, and the live control/stats/log/flow handles a
 //! launch attaches. [`union_with_builtin`] augments a user policy with the always-on self-equip
-//! allow-set, and [`effective_policy`] folds a live `--session` overlay onto the config policy.
+//! allow-set, and [`effective_policy`] folds a live `--session` overlay onto the config policy, by
+//! [`folded`], which the supervisor's [`Judge`](super::link::Judge) folds its own copies with.
 
 use std::io;
 use std::sync::Arc;
@@ -18,11 +19,17 @@ use crate::sandbox::control::SecretWay;
 use crate::sandbox::egress_stats::StatKind;
 
 use super::ca::{Ca, CertResolver, ensure_provider, upstream_config, upstream_config_h2};
-use super::dns::{Resolver, caching_resolver};
+use super::dns::{SharedResolver, caching_resolver};
 use super::inject::Credentials;
 #[cfg(test)]
 use super::inject::{HeaderInjection, SecretNeedle};
+use super::link::{Asked, Checked, Link};
 use super::redact_record_in_place;
+use super::ssrf::ConnectRefusal;
+
+/// How long a socket to an upstream waits: for the handshake that opens it, and for each read and
+/// write after. The supervisor dials with it, and the proxy reads and writes with it.
+pub(super) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The hosts of the built-in self-equip allow-set, in allowlist-entry syntax. Sourced once so
 /// the policy (`builtin_allow_rules`) and the `sbx config` display can never drift.
@@ -94,7 +101,9 @@ pub(crate) struct ProxyCtx {
     /// so the proxy negotiates HTTP/2 with the real gRPC server (validated against the same roots).
     pub(super) upstream_h2: Arc<ClientConfig>,
     pub(super) policy: EgressPolicy,
-    pub(super) resolve: Resolver,
+    /// The name resolver of the one plane that still resolves for itself, HTTP/2. Every other
+    /// plane's connections are the supervisor's, which resolves with its own.
+    pub(super) resolve: SharedResolver,
     pub(super) timeout: Duration,
     /// The live credential state: the injections to apply and the needles to scan for, as one
     /// unit. Shared between the connection threads, and replaced whole when the supervisor hands
@@ -104,8 +113,9 @@ pub(crate) struct ProxyCtx {
     /// its policy for every decision ([`effective_policy`]), pushed whole and confirmed before the
     /// command that loaded them returns, and the answer to an `ask`-posture request it parks, which
     /// the supervisor queues for the control socket ([`crate::sandbox::control`]) and holds to its
-    /// own cap and timeout. Detached by default, with no rule and nobody to answer a park, which is
-    /// then denied; the launch joins it to the control plane via [`Self::with_control`].
+    /// own cap and timeout; and every upstream connection, which the supervisor checks and opens
+    /// ([`super::link::Link::check`], [`super::link::Link::connect`]). The launch builds the proxy
+    /// on its end ([`Self::linked`]) and serves the other.
     pub(super) link: super::link::Link,
     /// Whether the launch announces a parked request on stderr (`[network] ask_notice`), which the
     /// supervisor does. Read here for what follows a denied ask: the person was already shown that
@@ -175,7 +185,27 @@ impl ProxyCtx {
     /// is augmented with the built-in self-equip allow-set (regardless of trust). The server
     /// config advertises no ALPN, so the client speaks HTTP/1.1 and every request is re-checked
     /// as its own CONNECT — nothing multiplexes past the filter.
+    ///
+    /// `link` is the proxy's end of the link to the supervisor, which the launch serves
+    /// ([`super::link::serving`]) with a judge over the same policy bytes this one was decoded from.
+    /// The park notices are on unless the policy suppressed them (`[network] ask_notice = false`).
+    pub(crate) fn linked(ca: Arc<Ca>, user_policy: EgressPolicy, link: Link) -> io::Result<Self> {
+        let mut ctx = Self::build(ca, user_policy, link)?;
+        ctx.notices = ctx.policy.ask_notice();
+        Ok(ctx)
+    }
+
+    /// A context for a test: its link served by a judge over the same policy, with nobody to answer a
+    /// parked request or a refresh, and the park notices off.
+    #[cfg(test)]
     pub(crate) fn new(ca: Arc<Ca>, user_policy: EgressPolicy) -> io::Result<Self> {
+        let judge = Arc::new(super::link::Judge::new(&user_policy.encode()?)?);
+        let (link, _) = super::link::joined(judge, None, None);
+        Self::build(ca, user_policy, link)
+    }
+
+    /// The context over `user_policy` and `link`, with the park notices off.
+    fn build(ca: Arc<Ca>, user_policy: EgressPolicy, link: Link) -> io::Result<Self> {
         ensure_provider();
         let server_config = Arc::new(
             ServerConfig::builder()
@@ -194,11 +224,11 @@ impl ProxyCtx {
         // re-hit the resolver each time (and any hiccup fails a fetch). A short-TTL cache resolves
         // each host once and reuses it — tunable via `[network] dns_cache_ttl`, where `0` disables
         // the cache and an unset field takes the named default.
-        let resolve = caching_resolver(
+        let resolve: SharedResolver = Arc::from(caching_resolver(
             policy
                 .dns_cache_ttl()
                 .unwrap_or(crate::allowlist::DEFAULT_DNS_CACHE_TTL),
-        );
+        ));
         // Built only when the launch asks for reuse, so a launch that does not is byte-for-byte the
         // connection-per-request path and cannot inherit any of reuse's failure modes.
         // Both resolved once, here, so every place that asks reads the same answer.
@@ -224,7 +254,7 @@ impl ProxyCtx {
             upstream_h2: upstream_config_h2(),
             policy,
             resolve,
-            timeout: Duration::from_secs(30),
+            timeout: UPSTREAM_TIMEOUT,
             // Empty, and on the built-in floor: a launch with credentials replaces this wholesale
             // with the set it resolved (and that set's own floor) through `with_shared_credentials`.
             credentials: Arc::new(Credentials::new(
@@ -233,7 +263,7 @@ impl ProxyCtx {
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
                 Vec::new(),
             )),
-            link: super::link::Link::detached(),
+            link,
             notices: false,
             events: None,
             flows: None,
@@ -575,31 +605,74 @@ impl ProxyCtx {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// Wire the proxy to its end of the link to the supervisor, and turn on the park notices unless
-    /// the policy suppressed them (`[network] ask_notice = false`). The launch
-    /// ([`crate::sandbox::egress::start`]) serves the other end with the
-    /// [`crate::sandbox::control::PendingState`] and the [`crate::sandbox::control::ManualRules`] it
-    /// serves on the control socket, so a request parked here is answerable by `sbx net pending`
-    /// and a `--session` rule loaded there decides requests here.
-    pub(crate) fn with_control(mut self, link: super::link::Link) -> Self {
-        self.link = link;
-        self.notices = self.policy.ask_notice();
-        self
+    /// Ask the supervisor whether the request `asked` may connect, before the proxy does anything
+    /// the request is not yet cleared for (read its body, ask a signer, learn what it carries). A
+    /// refusal is recorded here, once, the way the proxy's own resolution and address guard recorded
+    /// it: the plane only answers it.
+    pub(super) fn check(&self, asked: &Asked) -> Result<Checked, ConnectRefusal> {
+        self.link
+            .check(asked)
+            .inspect_err(|refusal| self.refused(asked, *refusal))
     }
 
-    /// How the supervisor is to serve the requests this proxy parks into `pending`: the cap, and the
-    /// timeout and notice this proxy's policy sets. Read from the policy the proxy decides with, so
-    /// the notice the supervisor prints and the refusal the proxy then leaves unannounced follow
-    /// one setting.
-    pub(crate) fn parks(
+    /// Ask the supervisor for a connection for the request `asked`, cleared by the check named
+    /// `check`, at the first of its host's addresses from the `from`th that answers: the connection,
+    /// with this proxy's bound on reads and writes, the position it was reached at and how many
+    /// addresses there are. A refusal is recorded here, once, as [`Self::check`] records one.
+    pub(super) fn connect(
         &self,
-        pending: Arc<crate::sandbox::control::PendingState>,
-    ) -> super::link::Parks {
-        super::link::Parks {
-            pending,
-            cap: crate::sandbox::control::ASK_PENDING_CAP,
-            timeout: self.policy.ask_timeout(),
-            notices: self.policy.ask_notice(),
+        asked: &Asked,
+        check: Option<u64>,
+        from: usize,
+    ) -> Result<(std::net::TcpStream, usize, usize), ConnectRefusal> {
+        let (stream, at, of) = self
+            .link
+            .connect(asked, check, from)
+            .inspect_err(|refusal| self.refused(asked, *refusal))?;
+        let _ = stream.set_read_timeout(Some(self.timeout));
+        let _ = stream.set_write_timeout(Some(self.timeout));
+        // Nagle off. Every relay here writes a head and then a body, and on a connection that stays
+        // open the second write would wait for the delayed ACK of the first.
+        let _ = stream.set_nodelay(true);
+        Ok((stream, at, of))
+    }
+
+    /// Record the refusal the supervisor gave the request `asked`: an error when the policy said yes
+    /// and the host could not be resolved or reached, a counted outcome when a guard or the
+    /// supervisor's own copy of the policy refused it.
+    fn refused(&self, asked: &Asked, refusal: ConnectRefusal) {
+        let (proto, method, path) = match &asked.plane {
+            super::link::Plane::Inspected { method, path } => (
+                crate::sandbox::control::Proto::Https,
+                Some(method.as_str()),
+                Some(path.as_str()),
+            ),
+            super::link::Plane::Clear { method, path } => (
+                crate::sandbox::control::Proto::Http,
+                Some(method.as_str()),
+                Some(path.as_str()),
+            ),
+            super::link::Plane::Splice => (crate::sandbox::control::Proto::Tcp, None, None),
+        };
+        let (host, port, tag) = (asked.host.as_str(), asked.port, refusal.tag());
+        match refusal {
+            ConnectRefusal::Dns | ConnectRefusal::Unreachable => {
+                self.push_log(
+                    proto,
+                    host,
+                    port,
+                    method,
+                    path,
+                    crate::sandbox::control::LogVerdict::Error,
+                    tag,
+                );
+            }
+            ConnectRefusal::Ssrf | ConnectRefusal::Busy => {
+                self.outcome(proto, host, port, method, path, StatKind::Blocked, tag);
+            }
+            ConnectRefusal::Supervisor => {
+                self.outcome(proto, host, port, method, path, StatKind::Deny, tag);
+            }
         }
     }
 
@@ -675,17 +748,51 @@ impl ProxyCtx {
 
 #[cfg(test)]
 impl ProxyCtx {
-    /// Replace the name resolver, so a test can map a host to a fixed address deterministically.
-    pub(super) fn with_resolver(mut self, resolve: Resolver) -> Self {
+    /// Replace the name resolver, so a test can map a host to a fixed address deterministically:
+    /// the supervisor's, which resolves for every connection it opens, and this proxy's own, which
+    /// the HTTP/2 plane still resolves with.
+    pub(super) fn with_resolver(mut self, resolve: super::dns::Resolver) -> Self {
+        let resolve: SharedResolver = Arc::from(resolve);
+        if let Some(judge) = self.link.judge() {
+            judge.set_resolver(Arc::clone(&resolve));
+        }
         self.resolve = resolve;
         self
     }
 
     /// Shrink the per-socket timeout, so a test can provoke an idle-timeout window in milliseconds
-    /// instead of the production 30 s.
+    /// instead of the production 30 s: this proxy's reads and writes, and the supervisor's dials.
     pub(super) fn with_timeout(mut self, timeout: Duration) -> Self {
+        if let Some(judge) = self.link.judge() {
+            judge.set_timeout(timeout);
+        }
         self.timeout = timeout;
         self
+    }
+
+    /// Wire the proxy to `link` in place of the one it was built with, and turn on the park notices
+    /// unless the policy suppressed them (`[network] ask_notice = false`), as the launch's
+    /// [`ProxyCtx::linked`] does.
+    pub(crate) fn with_control(mut self, link: Link) -> Self {
+        self.link = link;
+        self.notices = self.policy.ask_notice();
+        self
+    }
+
+    /// How the supervisor is to serve the requests this proxy parks into `pending`, read from the
+    /// policy this proxy decides with: what the launch reads from the supervisor's own copy.
+    pub(crate) fn parks(
+        &self,
+        pending: Arc<crate::sandbox::control::PendingState>,
+    ) -> super::link::Parks {
+        super::link::Parks::for_policy(&self.policy, pending)
+    }
+
+    /// The judge the supervisor's end of this proxy's link answers with.
+    fn judge(&self) -> Arc<super::link::Judge> {
+        self.link
+            .judge()
+            .expect("a test context's link is served by a judge")
     }
 
     /// Replace the upstream-validation config, so a test can trust a loopback upstream's own CA.
@@ -696,8 +803,8 @@ impl ProxyCtx {
 
     /// Serve the requests this proxy parks into `pending`, as the launch does but without the
     /// stderr park notices, so a test can answer a parked request out of band while keeping the
-    /// test output clean (unlike [`with_control`](ProxyCtx::with_control), which the launch uses
-    /// and which prints notices).
+    /// test output clean (unlike [`ProxyCtx::linked`], which the launch builds its proxy with and
+    /// which prints notices).
     pub(super) fn with_pending_silent(
         mut self,
         pending: Arc<crate::sandbox::control::PendingState>,
@@ -706,16 +813,14 @@ impl ProxyCtx {
             notices: false,
             ..self.parks(pending)
         };
-        self.link = super::link::serving(parks, None, None)
-            .expect("a link starts")
-            .0;
+        self.link = super::link::joined(self.judge(), Some(parks), None).0;
         self
     }
 
     /// Serve this proxy's requests to re-resolve its credentials with `refresh`, the supervisor's
     /// side, as the launch does.
     pub(super) fn with_refresh(mut self, refresh: Arc<super::inject::CredentialRefresh>) -> Self {
-        self.link = super::link::refreshing(refresh).0;
+        self.link = super::link::joined(self.judge(), None, Some(refresh)).0;
         self
     }
 
@@ -724,7 +829,7 @@ impl ProxyCtx {
     /// a request that parks anyway is denied. The rules reach the proxy the way the launch's do:
     /// pushed down a link and confirmed.
     pub(super) fn with_manual(mut self, manual: Arc<crate::sandbox::control::ManualRules>) -> Self {
-        let (link, supervisor) = super::link::pair();
+        let (link, supervisor) = super::link::joined(self.judge(), None, None);
         manual
             .attach(supervisor)
             .expect("a proxy just joined confirms the rules already held");
@@ -788,6 +893,10 @@ fn refusal_detail(reason: &str) -> &'static str {
         "splice-cap" => "too many raw tunnels are already open for this session",
         "ws-injection-refused" => "a credential cannot be injected into a WebSocket upgrade",
         "http2-ask-unsupported" => "an HTTP/2 host cannot be decided interactively",
+        "supervisor-denied" => {
+            "the supervisor's copy of the network policy refused it while a session rule changed"
+        }
+        "supervisor-busy" => "the supervisor was already opening as many connections as it opens",
         _ => "the network policy refused it",
     }
 }
@@ -817,23 +926,32 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
 /// borrows the config policy with no allocation.
 pub(super) fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPolicy> {
     // One overlay for the whole decision: a push landing midway is the next decision's.
-    let overlay = ctx.link.overlay();
+    folded(&ctx.policy, &ctx.link.overlay())
+}
+
+/// `policy` with the `--session` `overlay` folded in: what [`effective_policy`] decides with, and
+/// what the supervisor's judge decides with from its own copies of the two. One function, so the
+/// two cannot fold differently.
+pub(super) fn folded<'a>(
+    policy: &'a EgressPolicy,
+    overlay: &super::link::Overlay,
+) -> std::borrow::Cow<'a, EgressPolicy> {
     if overlay.is_empty() {
-        return std::borrow::Cow::Borrowed(&ctx.policy);
+        return std::borrow::Cow::Borrowed(policy);
     }
-    let mut allow = ctx.policy.allow_rules().to_vec();
+    let mut allow = policy.allow_rules().to_vec();
     allow.extend(overlay.allow.iter().cloned());
-    let mut deny = ctx.policy.deny_rules().to_vec();
+    let mut deny = policy.deny_rules().to_vec();
     deny.extend(overlay.deny.iter().cloned());
     // The mute (`dontaudit`) overlay — a live `sbx net mute --session` — folds onto the config
     // mutes, so a suppressed refusal is honored identically whether it came from config or the
     // session. Carried through this rebuild (like default_action/ask), or it would be dropped.
-    let mut mute = ctx.policy.mute_rules().to_vec();
+    let mut mute = policy.mute_rules().to_vec();
     mute.extend(overlay.mute.iter().cloned());
     // Amended, not rebuilt, for the reason [`union_with_builtin`] gives: a merge that names the
     // settings it carries loses the ones it does not, and a `--session` overlay must change what is
     // allowed and nothing else.
-    std::borrow::Cow::Owned(ctx.policy.clone().with_rules(allow, deny).with_mute(mute))
+    std::borrow::Cow::Owned(policy.clone().with_rules(allow, deny).with_mute(mute))
 }
 
 #[cfg(test)]
@@ -939,6 +1057,8 @@ mod notify_tests {
             "splice-cap",
             "ws-injection-refused",
             "http2-ask-unsupported",
+            "supervisor-denied",
+            "supervisor-busy",
         ] {
             assert_ne!(
                 refusal_detail(reason),

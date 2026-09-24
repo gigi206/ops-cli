@@ -368,7 +368,10 @@ off.
 
 Reuse never touches the verdict. Every request is checked in full, exactly as it is
 without it: the allowlist, the `Host`/SNI agreement, the address guard, the secret
-tripwires. What is reused is the handshake.
+tripwires. What is reused is the handshake. The address guard also holds for the
+connection itself: a parked connection is handed only to a request whose own connection
+could reach the address it is connected to, so a connection opened under a rule naming
+the host exactly is not reused by a request a wildcard admitted.
 
 **The two legs are independent, and that is the load-bearing part.** Whether the
 connection to the real server is held for another request, and whether the cage's tunnel
@@ -507,7 +510,18 @@ documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), the
 benchmarking range `198.18.0.0/15`, the reserved `240.0.0.0/4`, ULA `fc00::/7` and
 documentation `2001:db8::/32`; link-local, multicast, unspecified and broadcast are
 blocked outright and never reachable. A dial is bounded by the socket timeout, trying
-the permitted addresses in order and reporting the last error.
+the permitted addresses in order and reporting the last error; a connection whose TLS
+handshake fails moves on to the next address the same way.
+
+The resolution, this guard and the dial are done by sbx's supervisor, not by the part of
+the proxy that serves the cage's connections (an
+[`http2`](../configuration/network#http2-and-grpc) host excepted: its plane still
+resolves and dials in the proxy). That part asks the supervisor for every other upstream
+connection, and the supervisor decides the request again from its own copy of the policy
+before it resolves or dials anything. The two copies agree, since they are
+read from the same bytes; they can differ only for the moment a `--session` rule has
+been sent and is not yet in force, and a connection refused then carries
+`supervisor-denied`.
 
 Every v6 spelling that carries a v4 inside it is unwrapped first and classified by the
 address it embeds, so the guard cannot be dodged by an alternate encoding: v4-mapped
@@ -550,11 +564,15 @@ not allowed, whether by an explicit deny, the timeout, or the pending-queue cap)
 because nothing can redact the frames past the `101`), `http2-ask-unsupported` (an
 `ask`-undecided host designated [`http2`](../configuration/network#http2-and-grpc),
 failed closed rather than parked, because parking one stream of a multiplexed connection
-would stall its siblings), `ssrf-blocked`, `host-mismatch`, `ip-literal`,
+would stall its siblings), `ssrf-blocked`, `supervisor-denied` (the supervisor's own
+copy of the policy refused a connection the proxy had admitted, described under
+[the SSRF guard](#the-ssrf-guard)), `host-mismatch`, `ip-literal`,
 `method-not-allowed` (a request naming no destination the proxy can route),
 `bad-request` (including `bad-request:head`, a head that never arrived whole),
 `outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
-`connection-cap`, `splice-cap` (the concurrent raw `tcp://` tunnel ceiling),
+`connection-cap`, `supervisor-busy` (the supervisor was already opening as many
+connections as it opens at once, `[network] max_connections`), `splice-cap` (the
+concurrent raw `tcp://` tunnel ceiling),
 `injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
 `upstream-cert-rejected`, `upstream-http2-unsupported`, `upstream-closed`,
 `interim-head-cap`, and `upstream-head-too-large`. A genuine upstream status (a real
@@ -566,9 +584,10 @@ when a client connects to an address no name was handed out for. It carries no h
 no status, because that connection is closed before the proxy is dialed.
 
 The statuses behind them: policy and guard refusals are `403` (`denied-*`,
-`outbound-secret`, `ssrf-blocked`, `ip-literal`, `ws-injection-refused`,
-`signer-refused`), a too-large signer body is `413`, the shared ceilings are `503`
-(`splice-cap`, `connection-cap`, `body-buffer-cap`), a fronting mismatch is `421`,
+`outbound-secret`, `ssrf-blocked`, `supervisor-denied`, `ip-literal`,
+`ws-injection-refused`, `signer-refused`), a too-large signer body is `413`, the shared
+ceilings are `503` (`splice-cap`, `connection-cap`, `supervisor-busy`,
+`body-buffer-cap`), a fronting mismatch is `421`,
 a malformed request is `400`, a destination-less one `405`, and transport failures are
 `502`. `bad-request` is sub-categorized (`:transfer-encoding`, `:dup-content-length`,
 `:dup-host`, `:dup-transfer-encoding`, `:invalid-content-length`, `:control-char`,

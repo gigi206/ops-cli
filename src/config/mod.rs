@@ -5027,4 +5027,4 @@ mod tests;
 /// The shipped catalogue under `examples/`, checked against the schema that accepts it — kept
 /// apart from the engine's own suite because it shares none of its fixtures and calls no resolver.
 #[cfg(test)]
-mod catalogue_tests;
+pub(crate) mod catalogue_tests;

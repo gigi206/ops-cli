@@ -1860,17 +1860,9 @@ fn no_shipped_package_is_frozen_at_the_version_it_names() {
     );
 }
 
-/// Every shipped app's egress policy reaches the proxy intact through the form it is handed
-/// ([`crate::allowlist::EgressPolicy::encode`]), with the built-in self-equip rules the proxy
-/// unions in, and the rules the shipped groups contribute.
-///
-/// `==` on a rule ignores `group` and `builtin`, and the SSRF guard reads `builtin`, so equality of
-/// the decoded policy proves nothing about them: each rule's two flags are compared on their own,
-/// and the bytes are compared after a second encoding. The counts at the end are what keep this
-/// from passing on a corpus that never carried the fields it is meant to watch.
-#[test]
-fn every_shipped_egress_policy_survives_the_transfer_to_the_proxy() {
-    use crate::allowlist::{EgressPolicy, Rule};
+/// Every shipped app's egress policy, by app name, as the loader resolves it with the shipped groups
+/// declared: what a launch of that app hands its proxy before the built-in rules are unioned in.
+pub(crate) fn shipped_egress_policies() -> Vec<(String, crate::allowlist::EgressPolicy)> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let toml_files = |dir: &str| -> Vec<(String, Vec<u8>)> {
         let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(root.join(dir))
@@ -1901,19 +1893,38 @@ fn every_shipped_egress_policy_survives_the_transfer_to_the_proxy() {
         global.app.insert(name, app);
     }
     let resolved = super::resolve(global, None, &super::PluginRegistry::default());
+    resolved
+        .apps
+        .iter()
+        .filter_map(|(name, app)| match &app.network {
+            Some(super::NetworkPolicy::Allowlist(policy)) => {
+                Some((name.clone(), (**policy).clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
 
+/// Every shipped app's egress policy reaches the proxy intact through the form it is handed
+/// ([`crate::allowlist::EgressPolicy::encode`]), with the built-in self-equip rules the proxy
+/// unions in, and the rules the shipped groups contribute.
+///
+/// `==` on a rule ignores `group` and `builtin`, and the SSRF guard reads `builtin`, so equality of
+/// the decoded policy proves nothing about them: each rule's two flags are compared on their own,
+/// and the bytes are compared after a second encoding. The counts at the end are what keep this
+/// from passing on a corpus that never carried the fields it is meant to watch.
+#[test]
+fn every_shipped_egress_policy_survives_the_transfer_to_the_proxy() {
+    use crate::allowlist::{EgressPolicy, Rule};
     let flags = |rules: &[Rule]| -> Vec<(Option<String>, bool)> {
         rules.iter().map(|r| (r.group.clone(), r.builtin)).collect()
     };
     let (mut policies, mut grouped, mut builtin) = (0usize, 0usize, 0usize);
-    for (name, app) in &resolved.apps {
-        let Some(super::NetworkPolicy::Allowlist(policy)) = &app.network else {
-            continue;
-        };
+    for (name, policy) in &shipped_egress_policies() {
         // What the proxy works from: the built-ins are unioned in when its context is built.
         let mut allow = policy.allow_rules().to_vec();
         allow.extend(crate::sandbox::builtin_allow_rules());
-        let policy = (**policy)
+        let policy = policy
             .clone()
             .with_rules(allow, policy.deny_rules().to_vec());
 

@@ -12,8 +12,10 @@
 //! passes [`AskPosture::RefuseUnsupported`](super::AskPosture), which is the single way it diverges —
 //! see the call site for why it cannot park. The `:authority`
 //! is re-verified against the CONNECT host **per stream** (h2 lets a client vary it), the SSRF guard
-//! resolves and validates the address exactly as [`connect_upstream`](super::connect_upstream) does (connect the checked IP,
-//! no re-resolve, validate the upstream cert), and gRPC is HTTP/2 end-to-end (no downgrade). The
+//! resolves and validates the address as the supervisor does for the other planes (connect the
+//! checked IP, no re-resolve; this plane still resolves and dials for itself), the upstream cert is
+//! validated as [`connect_upstream`](super::connect_upstream) validates it, and gRPC is HTTP/2
+//! end-to-end (no downgrade). The
 //! secret machinery is replicated too: the outbound tripwire ([`carries_secret`]) refuses a request
 //! whose head carries a configured secret verbatim, matching host-scoped credentials are injected
 //! (strip-and-replace) onto the upstream request, and a reflected secret is masked out of the
@@ -577,7 +579,7 @@ async fn relay(
     // of them refuses never reaches this line. What is reused is the handshake.
     // Walked in order, like the HTTP/1.1 planes: `checked_address` passed the guard on every one
     // of these, so moving on from an address that will not connect cannot reach one it refused.
-    // Written as a loop rather than through `first_reachable` because each attempt is awaited.
+    // Written as a loop of its own because each attempt is awaited.
     let mut attempt = Err("no permitted address for this host");
     for ip in ips {
         attempt = ready_upstream(pool, &injected_ids, *ip, port, host, ctx).await;

@@ -13,6 +13,10 @@ use std::time::Duration;
 /// A host name resolver, injectable so tests can map a name to a fixed address deterministically.
 pub(super) type Resolver = Box<dyn Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync>;
 
+/// A [`Resolver`] held where more than one side resolves with it: the one a test injects reaches the
+/// supervisor, which resolves for every connection it opens, and the proxy's HTTP/2 plane.
+pub(super) type SharedResolver = Arc<dyn Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync>;
+
 fn default_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     use std::net::ToSocketAddrs;
     // the port is immaterial to name resolution; 443 is a placeholder so `to_socket_addrs` runs

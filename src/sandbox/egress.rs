@@ -986,15 +986,11 @@ pub(crate) fn start(
     // own, not as the value built above: everything the launch did to the policy is done by now,
     // and a field the encoding drops is then dropped on every launch rather than on the day the
     // proxy moves. See [`crate::allowlist::EgressPolicy::encode`].
-    let policy = EgressPolicy::decode(&policy.encode()?)?;
-    // The proxy's copy of the credentials is handed over the same way: as the form it will receive
-    // once it runs apart, so a field that form drops is dropped on every launch that injects a
-    // credential. See [`super::proxy::Credentials::encode`].
-    let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
-        .with_shared_credentials(std::sync::Arc::new(super::proxy::Credentials::decode(
-            credentials.encode()?,
-        )?))
-        .with_app(app.map(str::to_string));
+    let bytes = policy.encode()?;
+    // The supervisor answers every connection the proxy asks for from its own copy of the policy,
+    // decoded from these same bytes: the two copies cannot differ by anything the launch did to the
+    // policy, and a copy taken earlier would miss what it did last (a destination withdrawn above).
+    let judge = Arc::new(super::proxy::link::Judge::new(&bytes)?);
     // Stand up the control socket the host-side `sbx net pending`/`sbx net log`/`sbx net allow
     // --session` reach. It lives under the `0700` egress dir beside `<data>` and is **never** bound
     // into the cage (only the proxy socket and the CA cross in) — in Mode B the in-cage agent must not
@@ -1039,8 +1035,7 @@ pub(crate) fn start(
     // Before the control plane, which the link below joins to it: a failure here has nothing yet to
     // unwind.
     let events = super::proxy::events::spawn(sinks)?;
-    ctx = ctx.with_events(events.clone());
-    let (control_uds, supervisor) = {
+    let (control_uds, supervisor, ctx) = {
         let control_uds = dir.join(format!("control-{pid}{instance}.sock"));
         let _ = std::fs::remove_file(&control_uds);
         let pending = Arc::new(super::control::PendingState::new());
@@ -1049,10 +1044,25 @@ pub(crate) fn start(
         // before the command that made it returns; the requests the proxy parks come up the same
         // link into the queue served here, held to the cap and timeout this end sets, and so do its
         // requests to re-resolve the credentials, held to the bounds the refresher sets.
+        // The requests the proxy parks are held to the cap, timeout and notice of the supervisor's
+        // own copy of the policy, the one the proxy's copy was decoded beside.
+        let parks = super::proxy::link::Parks::for_policy(judge.policy(), pending.clone());
         let (link, supervisor) =
-            super::proxy::link::serving(ctx.parks(pending.clone()), refresh, Some(events))?;
+            super::proxy::link::serving(judge, parks, refresh, Some(events.clone()))?;
         manual.attach(supervisor.clone())?;
-        ctx = ctx.with_control(link);
+        // The proxy's copy of the credentials is handed over as the policy is: as the form it will
+        // receive once it runs apart, so a field that form drops is dropped on every launch that
+        // injects a credential. See [`super::proxy::Credentials::encode`].
+        let ctx = ProxyCtx::linked(
+            Arc::new(Ca::ephemeral()?),
+            EgressPolicy::decode(&bytes)?,
+            link,
+        )?
+        .with_shared_credentials(std::sync::Arc::new(super::proxy::Credentials::decode(
+            credentials.encode()?,
+        )?))
+        .with_app(app.map(str::to_string))
+        .with_events(events);
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.
         let control_listener = UnixListener::bind(&control_uds)?;
@@ -1074,7 +1084,7 @@ pub(crate) fn start(
                 control_stop,
             );
         });
-        (Some(control_uds), supervisor)
+        (Some(control_uds), supervisor, ctx)
     };
     if let Some(stats) = &stats {
         // The trailing write, so the debounce below only bounds how *often* the file is rewritten
@@ -3437,6 +3447,56 @@ mod tests {
             ),
         ];
         (guards, secrets)
+    }
+
+    /// The supervisor judges the proxy's connections with the policy the proxy was handed, including
+    /// what the launch did to it last: a destination withdrawn because its credential could not be
+    /// resolved is refused by the supervisor's copy as well, while the others stay admitted. A copy
+    /// taken before the withdrawal would admit it.
+    #[test]
+    fn the_supervisor_judges_with_the_destinations_the_launch_withdrew() {
+        let _lock = env_lock();
+        let (_guards, secrets) = a_set_with_one_unreadable_credential();
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let policy = EgressPolicy::new(
+            ["first.test", "absent.test", "last.test"]
+                .into_iter()
+                .map(|e| crate::allowlist::classify(e).unwrap())
+                .collect(),
+            vec![],
+        );
+        let (guard, _wiring) = start(
+            &layout,
+            policy,
+            &secrets,
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            false,
+            None,
+            "-9",
+            None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            None,
+            Plane::Agent,
+            None,
+            Unresolved::DenyDestination,
+            None,
+        )
+        .expect("start the egress proxy");
+        let judge = guard.supervisor.judge();
+        let asked = |host: &str| super::super::proxy::link::Asked::inspected(host, 443, "GET", "/");
+        assert!(
+            !judge.admits(&asked("absent.test")),
+            "the withdrawn destination is refused by the supervisor too"
+        );
+        assert!(
+            judge.admits(&asked("first.test")) && judge.admits(&asked("last.test")),
+            "and the destinations whose credentials resolved are not"
+        );
     }
 
     /// Both answers to an unresolvable credential name the same declaration.

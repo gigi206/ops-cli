@@ -27,9 +27,13 @@ use std::time::Duration;
 /// than one written by hand.
 pub(super) const INLINE_MAX: usize = 64 * 1024;
 
-/// The largest message the proxy sends. What it says fits in far less: a version, an id, and a host
-/// and a path cut to what the supervisor's queue shows of them.
-pub(super) const MAX_UP: usize = 16 * 1024;
+/// The largest message the proxy sends. Its longest is a question about a connection, which carries
+/// the request's method and path whole: on HTTP/1.1 they fit the request's head, at most 16 KiB; on
+/// HTTP/2 they fit the header list the proxy accepts, at most 64 KiB, of printable ASCII the URI
+/// parser admits. Written as JSON, a byte of it takes at most two (`\\` and `\"`), and the host
+/// comes from a 16 KiB head as well; this leaves room above that, and stays under the largest
+/// datagram a socket's default send buffer holds.
+pub(super) const MAX_UP: usize = 192 * 1024;
 
 /// The most descriptors the kernel passes in one message (`SCM_MAX_FD`), and so the room the proxy
 /// keeps for them.
@@ -179,8 +183,18 @@ impl Socket {
     }
 
     /// The next message from the proxy, or `None` where the link ends.
+    #[cfg(test)]
     pub(super) fn recv_up(&self) -> io::Result<Option<Vec<u8>>> {
         let mut buf = vec![0u8; MAX_UP];
+        Ok(self.recv_up_into(&mut buf)?.map(|n| {
+            buf.truncate(n);
+            buf
+        }))
+    }
+
+    /// Read the next message from the proxy into `buf`, which holds [`MAX_UP`] bytes: its length,
+    /// or `None` where the link ends.
+    pub(super) fn recv_up_into(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
@@ -198,11 +212,7 @@ impl Socket {
         if msg.msg_flags & libc::MSG_TRUNC != 0 {
             return Err(invalid("a message larger than the link carries"));
         }
-        let Some(n) = received_len else {
-            return Ok(None);
-        };
-        buf.truncate(n);
-        Ok(Some(buf))
+        Ok(received_len)
     }
 
     /// Stop sending: the other end reads the end of the link once it has read what came before.

@@ -2465,6 +2465,7 @@ mod tests {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let (link, supervisor) = crate::sandbox::proxy::link::serving(
+            crate::sandbox::proxy::link::default_judge(),
             crate::sandbox::proxy::link::Parks {
                 pending: state.clone(),
                 cap: ASK_PENDING_CAP,

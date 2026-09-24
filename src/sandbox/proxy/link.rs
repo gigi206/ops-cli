@@ -33,17 +33,29 @@
 //! behind it. What it answers on the spot, a deny or a declined refresh, waits at most
 //! [`SEND_WAIT`] for room on the socket; a proxy that leaves no room for that long has stopped
 //! reading, and the link ends.
+//!
+//! **Every upstream connection is the supervisor's.** Before it would resolve a name the proxy asks
+//! whether the request may connect ([`Link::check`]), and where it would dial it asks for the
+//! connection ([`Link::connect`]), which crosses as a descriptor. The supervisor answers both from
+//! its own copy of what the decision reads ([`Judge`]), each on a thread of its own and no more of
+//! them at once than the policy's connection bound: the reader never waits on a name or a dial.
 
+mod judge;
 mod wire;
+
+pub(crate) use judge::{Asked, Judge, Plane};
 
 use super::events::Emitter;
 use super::inject::{CredentialRefresh, Started, Transfer};
-use crate::allowlist::Rule;
+use super::ssrf::ConnectRefusal;
+use crate::allowlist::{EgressPolicy, Rule};
 use crate::sandbox::control::{PendingState, Verdict};
 use crate::sandbox::locks::{locked, read_locked, write_locked};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
+use std::net::TcpStream;
 use std::os::fd::OwnedFd;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
@@ -94,11 +106,26 @@ pub(crate) struct Parks {
     pub(crate) notices: bool,
 }
 
-/// What the supervisor tells the proxy, with a re-resolved credential set as `S`: the [`Transfer`]
-/// handed over, or, in the document that crosses, that transfer's own document as text, its
-/// descriptors beside the message.
+impl Parks {
+    /// How the requests a proxy deciding with `policy` parks are served from `pending`: the cap,
+    /// and the timeout and notice that policy sets. Read by the supervisor from its own copy, so the
+    /// notice it prints and the refusal the proxy then leaves unannounced follow one setting.
+    pub(crate) fn for_policy(policy: &EgressPolicy, pending: Arc<PendingState>) -> Self {
+        Parks {
+            pending,
+            cap: crate::sandbox::control::ASK_PENDING_CAP,
+            timeout: policy.ask_timeout(),
+            notices: policy.ask_notice(),
+        }
+    }
+}
+
+/// What the supervisor tells the proxy, with a re-resolved credential set as `S` and a connection as
+/// `C`: the [`Transfer`] and the descriptor handed over, or, in the document that crosses, the
+/// transfer's own document as text and nothing for the connection, the descriptors beside the
+/// message.
 #[derive(Serialize, Deserialize)]
-enum ToProxy<S = Transfer> {
+enum ToProxy<S = Transfer, C = OwnedFd> {
     /// The whole overlay, as of `version`.
     Overlay { version: u64, overlay: Overlay },
     /// The answer to the request the proxy parked as `id`.
@@ -108,19 +135,49 @@ enum ToProxy<S = Transfer> {
     Refreshed { id: u64, set: Option<S> },
     /// Apply everything reported so far, then say so under the same `id`.
     Flush { id: u64 },
+    /// The request checked as `id` may connect.
+    Checked { id: u64 },
+    /// The connection asked for as `id`, reached at the `at`th of the `of` addresses its host may
+    /// be reached at.
+    Connected {
+        id: u64,
+        at: usize,
+        of: usize,
+        stream: C,
+    },
+    /// The check or the connection asked for as `id` is refused, and why.
+    Refused { id: u64, refusal: ConnectRefusal },
 }
 
-impl<S> ToProxy<S> {
-    /// This message with the set it carries, if any, made into what `f` makes of it.
-    fn try_map_set<T, E>(self, f: impl FnOnce(S) -> Result<T, E>) -> Result<ToProxy<T>, E> {
+impl<S, C> ToProxy<S, C> {
+    /// This message with the set it carries, if any, made into what `set` makes of it, and the
+    /// connection it hands over, if any, into what `stream` makes of it.
+    fn try_map<T, D, E>(
+        self,
+        set: impl FnOnce(S) -> Result<T, E>,
+        stream: impl FnOnce(C) -> Result<D, E>,
+    ) -> Result<ToProxy<T, D>, E> {
         Ok(match self {
             ToProxy::Overlay { version, overlay } => ToProxy::Overlay { version, overlay },
             ToProxy::Answer { id, verdict } => ToProxy::Answer { id, verdict },
-            ToProxy::Refreshed { id, set } => ToProxy::Refreshed {
+            ToProxy::Refreshed { id, set: s } => ToProxy::Refreshed {
                 id,
-                set: set.map(f).transpose()?,
+                set: s.map(set).transpose()?,
             },
             ToProxy::Flush { id } => ToProxy::Flush { id },
+            ToProxy::Checked { id } => ToProxy::Checked { id },
+            ToProxy::Connected {
+                id,
+                at,
+                of,
+                stream: s,
+            } => ToProxy::Connected {
+                id,
+                at,
+                of,
+                stream: stream(s)?,
+            },
+            ToProxy::Refused { id, refusal } => ToProxy::Refused { id, refusal },
         })
     }
 }
@@ -128,30 +185,45 @@ impl<S> ToProxy<S> {
 impl ToProxy {
     /// This message as it crosses: its document, and the descriptors it hands over beside it.
     fn encode(self) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
-        let mut handed = Vec::new();
-        let doc = self.try_map_set(|set| {
-            let (bytes, fds) = set.into_parts();
-            handed = fds;
-            String::from_utf8(bytes)
-                .map_err(|_| wire::invalid("a credential document that is not text"))
-        })?;
+        let handed = RefCell::new(Vec::new());
+        let doc = self.try_map(
+            |set| {
+                let (bytes, fds) = set.into_parts();
+                *handed.borrow_mut() = fds;
+                String::from_utf8(bytes)
+                    .map_err(|_| wire::invalid("a credential document that is not text"))
+            },
+            |stream| {
+                handed.borrow_mut().push(stream);
+                Ok(())
+            },
+        )?;
         let doc = serde_json::to_vec(&doc)
             .map_err(|_| wire::invalid("a message that does not encode"))?;
-        Ok((doc, handed))
+        Ok((doc, handed.into_inner()))
     }
 
     /// The message `doc` holds, with the descriptors `fds` handed over beside it. Those of a message
-    /// that hands over none are closed.
+    /// that hands over none are closed; a connection handed over without its descriptor does not
+    /// read.
     fn decode(doc: &[u8], fds: Vec<OwnedFd>) -> io::Result<Self> {
-        let doc: ToProxy<String> = serde_json::from_slice(doc)
+        let doc: ToProxy<String, ()> = serde_json::from_slice(doc)
             .map_err(|_| wire::invalid("a message that does not parse"))?;
-        let mut fds = Some(fds);
-        doc.try_map_set(|text| {
-            Ok(Transfer::from_parts(
-                text.into_bytes(),
-                fds.take().unwrap_or_default(),
-            ))
-        })
+        let fds = RefCell::new(Some(fds));
+        doc.try_map(
+            |text| {
+                Ok(Transfer::from_parts(
+                    text.into_bytes(),
+                    fds.borrow_mut().take().unwrap_or_default(),
+                ))
+            },
+            |()| {
+                fds.borrow_mut()
+                    .take()
+                    .and_then(|fds| fds.into_iter().next())
+                    .ok_or_else(|| wire::invalid("a connection handed over without its descriptor"))
+            },
+        )
     }
 }
 
@@ -173,17 +245,42 @@ enum ToSupervisor {
     Refresh { id: u64 },
     /// Everything the proxy reported before the flush the supervisor asked for as `id` is applied.
     Flushed { id: u64 },
+    /// May the request `asked` connect? Answered under the same `id`, which the connections that
+    /// follow name as `check`.
+    Check { id: u64, asked: Asked },
+    /// A connection for the request `asked`, which the check named `check` cleared, at the first of
+    /// its host's addresses from the `from`th that answers. Answered under the same `id`.
+    Connect {
+        id: u64,
+        asked: Asked,
+        check: Option<u64>,
+        from: usize,
+    },
 }
 
 /// An answer the proxy waits for, handed to the request that asked.
 enum Reply {
     Verdict(Verdict),
     Refreshed(Option<Transfer>),
+    Checked,
+    Connected(TcpStream, usize, usize),
+    Refused(ConnectRefusal),
+}
+
+/// A request the supervisor cleared to connect: what was asked, and the check that cleared it, for
+/// the connections that follow to name.
+pub(crate) struct Checked {
+    pub(crate) id: u64,
+    pub(crate) asked: Asked,
 }
 
 /// The proxy's end: the overlay in force, and the way back to the supervisor.
 pub(crate) struct Link {
     side: Arc<ProxySide>,
+    /// The judge the supervisor's end answers with, while both ends are in one process: how a test
+    /// reaches the supervisor's resolver and dial bound through the proxy it builds.
+    #[cfg(test)]
+    judge: Option<Arc<Judge>>,
 }
 
 /// What the proxy's end shares with its reader.
@@ -230,11 +327,14 @@ impl ProxySide {
 }
 
 impl Link {
-    /// An end no supervisor reaches: its overlay is empty for good. What a proxy is built with
-    /// before a launch wires it, and all a test that loads no rule needs.
+    /// An end no supervisor reaches: its overlay is empty for good, a park is denied and a check or
+    /// a connection is refused. All a test of the proxy's end alone needs.
+    #[cfg(test)]
     pub(crate) fn detached() -> Self {
         Link {
             side: Arc::new(ProxySide::on(None)),
+            #[cfg(test)]
+            judge: None,
         }
     }
 
@@ -270,6 +370,55 @@ impl Link {
             Some(Reply::Refreshed(set)) => set,
             _ => None,
         }
+    }
+
+    /// Ask the supervisor whether the request `asked` may connect, and wait for the answer: the
+    /// check that cleared it, or why it may not. [`ConnectRefusal::Unreachable`] when no answer can
+    /// come.
+    pub(super) fn check(&self, asked: &Asked) -> Result<Checked, ConnectRefusal> {
+        let mut sent = 0;
+        match self.ask(|id| {
+            sent = id;
+            ToSupervisor::Check {
+                id,
+                asked: asked.clone(),
+            }
+        }) {
+            Some(Reply::Checked) => Ok(Checked {
+                id: sent,
+                asked: asked.clone(),
+            }),
+            Some(Reply::Refused(refusal)) => Err(refusal),
+            _ => Err(ConnectRefusal::Unreachable),
+        }
+    }
+
+    /// Ask the supervisor for a connection for the request `asked`, cleared by the check named
+    /// `check`, at the first of its host's addresses from the `from`th that answers; and wait for
+    /// it: the connection, the position it was reached at and how many addresses there are, or why
+    /// there is none. [`ConnectRefusal::Unreachable`] when no answer can come.
+    pub(super) fn connect(
+        &self,
+        asked: &Asked,
+        check: Option<u64>,
+        from: usize,
+    ) -> Result<(TcpStream, usize, usize), ConnectRefusal> {
+        match self.ask(|id| ToSupervisor::Connect {
+            id,
+            asked: asked.clone(),
+            check,
+            from,
+        }) {
+            Some(Reply::Connected(stream, at, of)) => Ok((stream, at, of)),
+            Some(Reply::Refused(refusal)) => Err(refusal),
+            _ => Err(ConnectRefusal::Unreachable),
+        }
+    }
+
+    /// The judge the supervisor's end of this link answers with, when both ends are in this process.
+    #[cfg(test)]
+    pub(crate) fn judge(&self) -> Option<Arc<Judge>> {
+        self.judge.clone()
     }
 
     /// Send the question `message` builds under a fresh id, and wait for its answer. `None` when the
@@ -337,6 +486,8 @@ struct SupervisorSide {
     /// How the proxy's requests to re-resolve its credentials are served, or `None` when the
     /// launch has nothing to re-resolve: each is then declined as it arrives.
     refresh: Option<Arc<CredentialRefresh>>,
+    /// How the proxy's checks and connections are answered.
+    judge: Arc<Judge>,
     /// How a thread of this end is started: [`named_thread`], or in a test one the host refuses.
     threads: fn(&str) -> std::thread::Builder,
     /// The way to the one thread that runs the admitted refreshes, while it runs.
@@ -359,6 +510,12 @@ struct Heard {
 }
 
 impl Supervisor {
+    /// The judge this end answers the proxy's checks and connections with.
+    #[cfg(test)]
+    pub(crate) fn judge(&self) -> Arc<Judge> {
+        Arc::clone(&self.side.judge)
+    }
+
     /// The version the proxy last confirmed, so an overlay it already holds is not sent again.
     pub(crate) fn installed(&self) -> u64 {
         locked(&self.side.heard).installed
@@ -376,6 +533,9 @@ impl Supervisor {
             let mut heard = locked(&self.side.heard);
             heard.sent = heard.sent.max(version);
         }
+        // Noted before it is sent, so a connection the proxy asks for under this overlay is judged
+        // under it too: the supervisor's copy may be ahead of the proxy's, never behind it.
+        self.side.judge.sent(version, &overlay);
         send(&self.side, ToProxy::Overlay { version, overlay }).map_err(|_| gone())?;
         let heard = self.until(deadline, |heard| heard.installed >= version);
         if heard.installed >= version {
@@ -439,28 +599,48 @@ fn gone() -> io::Error {
 /// what it reported through `events`. Both readers end once the proxy lets go of its [`Link`], and
 /// so does every thread waiting on a request it parked.
 pub(crate) fn serving(
+    judge: Arc<Judge>,
     parks: Parks,
     refresh: Option<Arc<CredentialRefresh>>,
     events: Option<Emitter>,
 ) -> io::Result<(Link, Supervisor)> {
-    let (link, supervisor, _) = start(Some(parks), refresh, events, named_thread)?;
+    let (link, supervisor, _) = start(judge, Some(parks), refresh, events, named_thread)?;
     Ok((link, supervisor))
+}
+
+/// A judge over the default policy: all a test that makes no connection needs.
+#[cfg(test)]
+pub(crate) fn default_judge() -> Arc<Judge> {
+    let bytes = EgressPolicy::default()
+        .encode()
+        .expect("the default policy encodes");
+    Arc::new(Judge::new(&bytes).expect("a judge over the default policy"))
+}
+
+/// [`serving`] with `judge`, and the requests the proxy parks and its refreshes served only as the
+/// test says: how a test builds the link a proxy decides through.
+#[cfg(test)]
+pub(crate) fn joined(
+    judge: Arc<Judge>,
+    parks: Option<Parks>,
+    refresh: Option<Arc<CredentialRefresh>>,
+) -> (Link, Supervisor) {
+    let (link, supervisor, _) =
+        start(judge, parks, refresh, None, named_thread).expect("a link starts");
+    (link, supervisor)
 }
 
 /// [`serving`] with nobody to answer a parked request or a refresh: all a test of the rules alone
 /// needs.
 #[cfg(test)]
 pub(crate) fn pair() -> (Link, Supervisor) {
-    let (link, supervisor, _) = start(None, None, None, named_thread).expect("a link starts");
-    (link, supervisor)
+    joined(default_judge(), None, None)
 }
 
 /// [`serving`] with only the refreshes served: all a test of the refresh needs.
 #[cfg(test)]
 pub(crate) fn refreshing(refresh: Arc<CredentialRefresh>) -> (Link, Supervisor) {
-    let (link, supervisor, _) =
-        start(None, Some(refresh), None, named_thread).expect("a link starts");
-    (link, supervisor)
+    joined(default_judge(), None, Some(refresh))
 }
 
 /// A thread of the supervisor's end, named for what it waits on.
@@ -475,14 +655,23 @@ type Readers = (JoinHandle<()>, JoinHandle<io::Result<()>>);
 /// [`serving`], keeping the two readers' handles, with the way the supervisor's end starts its
 /// threads passed in.
 fn start(
+    judge: Arc<Judge>,
     parks: Option<Parks>,
     refresh: Option<Arc<CredentialRefresh>>,
     events: Option<Emitter>,
     threads: fn(&str) -> std::thread::Builder,
 ) -> io::Result<(Link, Supervisor, Readers)> {
     let (down, up) = wire::Socket::pair()?;
-    let (supervisor, supervisor_reader) = supervise(down, parks, refresh, threads)?;
+    #[cfg(test)]
+    let held = Arc::clone(&judge);
+    let (supervisor, supervisor_reader) = supervise(down, judge, parks, refresh, threads)?;
     let (link, proxy_reader) = attend(up, events)?;
+    #[cfg(test)]
+    let link = {
+        let mut link = link;
+        link.judge = Some(held);
+        link
+    };
     Ok((link, supervisor, (proxy_reader, supervisor_reader)))
 }
 
@@ -501,7 +690,14 @@ fn attend(socket: wire::Socket, events: Option<Emitter>) -> io::Result<(Link, Jo
         let side = Arc::clone(&side);
         named_thread("sbx-link-proxy").spawn(move || read_supervisor(&side, &flushes))?
     };
-    Ok((Link { side }, reader))
+    Ok((
+        Link {
+            side,
+            #[cfg(test)]
+            judge: None,
+        },
+        reader,
+    ))
 }
 
 /// The supervisor's half of a link, on its end `socket`: the reader that takes in what the proxy
@@ -509,6 +705,7 @@ fn attend(socket: wire::Socket, events: Option<Emitter>) -> io::Result<(Link, Jo
 /// thread that runs the refreshes.
 fn supervise(
     socket: wire::Socket,
+    judge: Arc<Judge>,
     parks: Option<Parks>,
     refresh: Option<Arc<CredentialRefresh>>,
     threads: fn(&str) -> std::thread::Builder,
@@ -521,6 +718,7 @@ fn supervise(
         changed: Condvar::new(),
         parks,
         refresh,
+        judge,
         threads,
         refreshes: Mutex::new(None),
     });
@@ -575,6 +773,11 @@ fn read_supervisor(side: &ProxySide, flushes: &Sender<u64>) {
             }
             ToProxy::Answer { id, verdict } => hand_over(side, id, Reply::Verdict(verdict)),
             ToProxy::Refreshed { id, set } => hand_over(side, id, Reply::Refreshed(set)),
+            ToProxy::Checked { id } => hand_over(side, id, Reply::Checked),
+            ToProxy::Connected { id, at, of, stream } => {
+                hand_over(side, id, Reply::Connected(TcpStream::from(stream), at, of));
+            }
+            ToProxy::Refused { id, refusal } => hand_over(side, id, Reply::Refused(refusal)),
             // Not flushed here: the reader would stop reading for as long as the flush takes.
             ToProxy::Flush { id } => {
                 let _ = flushes.send(id);
@@ -611,13 +814,16 @@ fn run_flushes(side: &ProxySide, events: Option<&Emitter>, asked: &Receiver<u64>
 /// Either way it then ends the link, which ends the proxy's reader, and lets go of the requests the
 /// proxy had parked, which ends the threads waiting on them.
 fn read_proxy(side: &Arc<SupervisorSide>, socket: &wire::Socket) -> io::Result<()> {
+    // One buffer for every message: a message may be as long as a request path, and a buffer that
+    // large allocated per message is a mapping made and unmade per request.
+    let mut buf = vec![0u8; wire::MAX_UP];
     let ended = loop {
-        let doc = match socket.recv_up() {
-            Ok(Some(doc)) => doc,
+        let doc = match socket.recv_up_into(&mut buf) {
+            Ok(Some(n)) => &buf[..n],
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
         };
-        let Ok(message) = serde_json::from_slice(&doc) else {
+        let Ok(message) = serde_json::from_slice(doc) else {
             break Err(wire::invalid("a message that does not parse"));
         };
         match message {
@@ -638,6 +844,13 @@ fn read_proxy(side: &Arc<SupervisorSide>, socket: &wire::Socket) -> io::Result<(
                 heard.flushed = heard.flushed.max(id.min(heard.flushes));
                 side.changed.notify_all();
             }
+            ToSupervisor::Check { id, asked } => serve_question(side, id, Question::Check(asked)),
+            ToSupervisor::Connect {
+                id,
+                asked,
+                check,
+                from,
+            } => serve_question(side, id, Question::Connect { asked, check, from }),
         }
     };
     locked(&side.down).take();
@@ -666,6 +879,7 @@ fn serve_park(side: &Arc<SupervisorSide>, id: u64, host: &str, port: u16, path: 
     };
     let (pending, timeout, notices) = (Arc::clone(&parks.pending), parks.timeout, parks.notices);
     let waiter = Arc::clone(side);
+    let destination = (host.to_string(), port);
     // Handed over once the thread exists: a thread that cannot be started leaves the request here,
     // with the answer an operator may already have given it.
     let (hand, handed) = channel::<crate::sandbox::control::Parked>();
@@ -686,14 +900,75 @@ fn serve_park(side: &Arc<SupervisorSide>, id: u64, host: &str, port: u16, path: 
             super::print_egress_notice(&head, &[("allow", &allow), ("deny", &deny)]);
         }
         let verdict = pending.wait(parked, timeout);
-        answer(&waiter, id, verdict);
+        answer_park(&waiter, id, &destination.0, destination.1, verdict);
     });
     match started {
         Ok(_) => {
             let _ = hand.send(parked);
         }
-        Err(_) => answer(side, id, parks.pending.withdraw(parked)),
+        Err(_) => answer_park(side, id, host, port, parks.pending.withdraw(parked)),
     }
+}
+
+/// Answer the request the proxy parked for `host:port` as `id` with `verdict`. An allow is noted
+/// first, for the check that request makes next: an operator's one-shot allow is a connection the
+/// supervisor's own copy of the policy would refuse.
+fn answer_park(side: &SupervisorSide, id: u64, host: &str, port: u16, verdict: Verdict) {
+    if verdict == Verdict::Allow {
+        side.judge.grant(host, port);
+    }
+    answer(side, id, verdict);
+}
+
+/// A question about an upstream connection, as the proxy asked it.
+enum Question {
+    Check(Asked),
+    Connect {
+        asked: Asked,
+        check: Option<u64>,
+        from: usize,
+    },
+}
+
+/// Answer a question about an upstream connection on a thread of its own, since the answer may wait
+/// on a name or a dial; or refuse it at once when the judge is already answering as many as it
+/// answers at once, or no thread can be started. The proxy's request waits for an answer either
+/// way.
+fn serve_question(side: &Arc<SupervisorSide>, id: u64, question: Question) {
+    let Some(serving) = side.judge.enter() else {
+        return refuse(side, id, ConnectRefusal::Busy);
+    };
+    let answering = Arc::clone(side);
+    let started = (side.threads)("sbx-link-connect").spawn(move || {
+        let _serving = serving;
+        let judge = &answering.judge;
+        // A resolver that panics is answered like a host that cannot be reached: the proxy waits
+        // for this answer, and nothing else will send it.
+        let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match question {
+            Question::Check(asked) => judge.check(id, &asked).map(|()| ToProxy::Checked { id }),
+            Question::Connect { asked, check, from } => {
+                judge
+                    .connect(&asked, check, from)
+                    .map(|(stream, at, of)| ToProxy::Connected {
+                        id,
+                        at,
+                        of,
+                        stream: stream.into(),
+                    })
+            }
+        }))
+        .unwrap_or(Err(ConnectRefusal::Unreachable))
+        .unwrap_or_else(|refusal| ToProxy::Refused { id, refusal });
+        let _ = send(&answering, answer);
+    });
+    if started.is_err() {
+        refuse(side, id, ConnectRefusal::Busy);
+    }
+}
+
+/// Refuse the check or the connection the proxy asked for as `id`, unless the link has ended.
+fn refuse(side: &SupervisorSide, id: u64, refusal: ConnectRefusal) {
+    let _ = send(side, ToProxy::Refused { id, refusal });
 }
 
 /// Hand a refresh the proxy asked for to the refresh thread, or decline at once: nothing to
@@ -812,7 +1087,7 @@ mod tests {
     #[test]
     fn a_push_to_a_proxy_that_is_gone_is_an_error() {
         let (link, supervisor, (proxy_reader, supervisor_reader)) =
-            start(None, None, None, named_thread).unwrap();
+            start(default_judge(), None, None, None, named_thread).unwrap();
         drop(link);
         supervisor_reader.join().unwrap().unwrap();
         proxy_reader.join().unwrap();
@@ -825,7 +1100,7 @@ mod tests {
     #[test]
     fn both_readers_end_once_the_proxy_lets_go() {
         let (link, supervisor, (proxy_reader, supervisor_reader)) =
-            start(None, None, None, named_thread).unwrap();
+            start(default_judge(), None, None, None, named_thread).unwrap();
         supervisor.push(1, overlay("api.test")).unwrap();
         drop(link);
         supervisor_reader.join().unwrap().unwrap();
@@ -893,7 +1168,11 @@ mod tests {
     fn a_parked_request_is_decided_by_the_answer_given_to_the_supervisors_queue() {
         for verdict in [Verdict::Allow, Verdict::Deny] {
             let pending = Arc::new(PendingState::new());
-            let link = Arc::new(serving(parks(&pending, 4, None), None, None).unwrap().0);
+            let link = Arc::new(
+                serving(default_judge(), parks(&pending, 4, None), None, None)
+                    .unwrap()
+                    .0,
+            );
             let asking = park_on(&link, "api.test");
             let rows = listed(&pending, 1);
             assert_eq!(
@@ -918,6 +1197,7 @@ mod tests {
         let pending = Arc::new(PendingState::new());
         let link = Arc::new(
             serving(
+                default_judge(),
                 parks(&pending, 4, Some(Duration::from_millis(50))),
                 None,
                 None,
@@ -939,7 +1219,11 @@ mod tests {
     #[test]
     fn a_request_parked_past_the_cap_is_denied_without_entering_the_queue() {
         let pending = Arc::new(PendingState::new());
-        let link = Arc::new(serving(parks(&pending, 1, None), None, None).unwrap().0);
+        let link = Arc::new(
+            serving(default_judge(), parks(&pending, 1, None), None, None)
+                .unwrap()
+                .0,
+        );
         let first = park_on(&link, "first.test");
         let rows = listed(&pending, 1);
         assert_eq!(
@@ -970,8 +1254,14 @@ mod tests {
     #[test]
     fn a_request_parked_by_a_proxy_that_is_gone_leaves_the_queue() {
         let pending = Arc::new(PendingState::new());
-        let (link, supervisor, (proxy_reader, supervisor_reader)) =
-            start(Some(parks(&pending, 4, None)), None, None, named_thread).unwrap();
+        let (link, supervisor, (proxy_reader, supervisor_reader)) = start(
+            default_judge(),
+            Some(parks(&pending, 4, None)),
+            None,
+            None,
+            named_thread,
+        )
+        .unwrap();
         // Sent as the proxy sends it, straight on the socket: a request parked with `park` would
         // hold the end this test lets go of.
         link.side
@@ -1001,8 +1291,14 @@ mod tests {
     #[test]
     fn a_request_whose_thread_cannot_start_is_denied_and_leaves_the_queue() {
         let pending = Arc::new(PendingState::new());
-        let (link, _supervisor, _) =
-            start(Some(parks(&pending, 4, None)), None, None, refused_thread).unwrap();
+        let (link, _supervisor, _) = start(
+            default_judge(),
+            Some(parks(&pending, 4, None)),
+            None,
+            None,
+            refused_thread,
+        )
+        .unwrap();
         assert_eq!(
             park_on(&Arc::new(link), "api.test").recv_timeout(ANSWER_WAIT),
             Ok(Verdict::Deny)
@@ -1162,8 +1458,14 @@ mod tests {
     fn a_refresh_that_could_not_run_does_not_block_the_next() {
         let (refresh, _) = counting_refresh("old");
         let refresh = Arc::new(Arc::into_inner(refresh).unwrap().with_gap(Duration::ZERO));
-        let (link, _supervisor, _) =
-            start(None, Some(Arc::clone(&refresh)), None, refused_thread).unwrap();
+        let (link, _supervisor, _) = start(
+            default_judge(),
+            None,
+            Some(Arc::clone(&refresh)),
+            None,
+            refused_thread,
+        )
+        .unwrap();
         assert_eq!(refresh_on(&Arc::new(link)), None, "no thread, no refresh");
         assert!(refresh.start().is_some(), "and the next one is admitted");
 
@@ -1236,8 +1538,14 @@ mod tests {
                 Ok((vec![injection("Bearer new")], Vec::new()))
             }),
         );
-        let (link, _supervisor, (proxy_reader, supervisor_reader)) =
-            start(None, Some(Arc::new(refresh)), None, named_thread).unwrap();
+        let (link, _supervisor, (proxy_reader, supervisor_reader)) = start(
+            default_judge(),
+            None,
+            Some(Arc::new(refresh)),
+            None,
+            named_thread,
+        )
+        .unwrap();
         let link = Arc::new(link);
         assert_eq!(refresh_on(&link).as_deref(), Some("Bearer new"));
         let exited = || {
@@ -1303,7 +1611,8 @@ mod tests {
     /// to play the proxy with, keeping to the link's rules or not.
     fn supervised() -> (Supervisor, JoinHandle<io::Result<()>>, Arc<wire::Socket>) {
         let (down, up) = wire::Socket::pair().unwrap();
-        let (supervisor, reader) = supervise(down, None, None, named_thread).unwrap();
+        let (supervisor, reader) =
+            supervise(down, default_judge(), None, None, named_thread).unwrap();
         (supervisor, reader, Arc::new(up))
     }
 
@@ -1494,7 +1803,14 @@ mod tests {
             applied,
         )
         .unwrap();
-        let (_link, supervisor, _) = start(None, None, Some(events.clone()), named_thread).unwrap();
+        let (_link, supervisor, _) = start(
+            default_judge(),
+            None,
+            None,
+            Some(events.clone()),
+            named_thread,
+        )
+        .unwrap();
         for _ in 0..50 {
             events.send(ProxyEvent::Stat {
                 host: "api.example.com".into(),
@@ -1581,7 +1897,11 @@ mod tests {
             (controls.clone(), controls),
         ] {
             let pending = Arc::new(PendingState::new());
-            let link = Arc::new(serving(parks(&pending, 4, None), None, None).unwrap().0);
+            let link = Arc::new(
+                serving(default_judge(), parks(&pending, 4, None), None, None)
+                    .unwrap()
+                    .0,
+            );
             let (tx, answered) = channel();
             {
                 let (link, host, path) = (Arc::clone(&link), host.clone(), path.clone());
@@ -1604,5 +1924,169 @@ mod tests {
             pending.answer_like(rows[0].seq, Verdict::Allow);
             assert_eq!(answered.recv_timeout(ANSWER_WAIT), Ok(Verdict::Allow));
         }
+    }
+
+    /// A judge over a policy allowing `api.test` on any port, resolving it to loopback, and the
+    /// listener it reaches there with the port it took.
+    fn judge_reaching_a_listener() -> (Arc<Judge>, std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let policy = EgressPolicy::new(
+            vec![crate::allowlist::classify("api.test:*").unwrap()],
+            vec![],
+        );
+        let judge = Judge::new(&policy.encode().unwrap()).unwrap();
+        judge.set_resolver(Arc::new(|_| {
+            Ok(vec![std::net::IpAddr::from([127, 0, 0, 1])])
+        }));
+        (Arc::new(judge), listener, port)
+    }
+
+    /// A connection the proxy asks for crosses as a descriptor: the socket it holds is the one the
+    /// supervisor dialled, whose far end the listener accepted.
+    #[test]
+    fn a_connection_the_proxy_asks_for_crosses_as_its_descriptor() {
+        let (judge, listener, port) = judge_reaching_a_listener();
+        let (link, _supervisor) = joined(judge, None, None);
+        let checked = link
+            .check(&Asked::inspected("api.test", port, "GET", "/"))
+            .unwrap();
+        let (stream, at, of) = link.connect(&checked.asked, Some(checked.id), 0).unwrap();
+        assert_eq!((at, of), (0, 1));
+        let (accepted, _) = listener.accept().unwrap();
+        assert_eq!(
+            accepted.peer_addr().unwrap(),
+            stream.local_addr().unwrap(),
+            "the proxy holds the connection the supervisor opened"
+        );
+    }
+
+    /// A connection handed over without its descriptor is a message the proxy cannot read: the link
+    /// ends, and the request that asked for it is told there is none.
+    #[test]
+    fn a_connection_handed_over_without_its_descriptor_ends_the_link() {
+        let (link, supervisor) = attended(None);
+        let asking = {
+            let link = Arc::clone(&link);
+            let (tx, rx) = channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    link.connect(&Asked::splice("api.test", 22), None, 0)
+                        .map(|_| ()),
+                );
+            });
+            rx
+        };
+        let asked = supervisor.recv_up().unwrap().unwrap();
+        let ToSupervisor::Connect { id, .. } = serde_json::from_slice(&asked).unwrap() else {
+            panic!("the proxy asked for a connection");
+        };
+        let mut message = vec![0u8];
+        message.extend_from_slice(
+            format!("{{\"Connected\":{{\"id\":{id},\"at\":0,\"of\":1,\"stream\":null}}}}")
+                .as_bytes(),
+        );
+        supervisor.send_raw(&message, &[]).unwrap();
+        assert_eq!(
+            asking.recv_timeout(ANSWER_WAIT).unwrap(),
+            Err(ConnectRefusal::Unreachable)
+        );
+        assert!(
+            supervisor.recv_up().unwrap().is_none(),
+            "the proxy ended the link"
+        );
+    }
+
+    /// A question the supervisor cannot answer now is refused rather than left waiting: past the
+    /// judge's cap, and when no thread can be started to answer it.
+    #[test]
+    fn a_question_the_supervisor_cannot_take_now_is_refused_busy() {
+        let asked = Asked::inspected("api.test", 443, "GET", "/");
+        let (judge, _listener, _) = judge_reaching_a_listener();
+        let capped = Arc::new(Arc::into_inner(judge).unwrap().with_cap(0));
+        let (link, _supervisor) = joined(capped, None, None);
+        assert_eq!(link.check(&asked).map(|_| ()), Err(ConnectRefusal::Busy));
+
+        let (judge, _listener, _) = judge_reaching_a_listener();
+        let (link, _supervisor, _) = start(judge, None, None, None, refused_thread).unwrap();
+        assert_eq!(link.check(&asked).map(|_| ()), Err(ConnectRefusal::Busy));
+        assert_eq!(
+            link.connect(&asked, None, 0).map(|_| ()),
+            Err(ConnectRefusal::Busy)
+        );
+    }
+
+    /// An operator's allow for a parked request is the supervisor's to honour when that request
+    /// asks for its connection; a deny leaves the request nothing to connect with.
+    #[test]
+    fn an_operators_answer_to_a_parked_request_decides_its_connection() {
+        for (verdict, cleared) in [(Verdict::Allow, true), (Verdict::Deny, false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let policy = EgressPolicy::default().with_default(crate::allowlist::DefaultAction::Ask);
+            let judge = Judge::new(&policy.encode().unwrap()).unwrap();
+            judge.set_resolver(Arc::new(|_| {
+                Ok(vec![std::net::IpAddr::from([127, 0, 0, 1])])
+            }));
+            let pending = Arc::new(PendingState::new());
+            let link = Arc::new(joined(Arc::new(judge), Some(parks(&pending, 4, None)), None).0);
+            let asking = {
+                let link = Arc::clone(&link);
+                let (tx, rx) = channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(link.park("api.test", port, "/v1"));
+                });
+                rx
+            };
+            let rows = listed(&pending, 1);
+            pending.answer_like(rows[0].seq, verdict);
+            assert_eq!(asking.recv_timeout(ANSWER_WAIT), Ok(verdict));
+            let checked = link.check(&Asked::inspected("api.test", port, "GET", "/v1"));
+            assert_eq!(checked.is_ok(), cleared, "{verdict:?}");
+            if let Ok(checked) = checked {
+                assert!(link.connect(&checked.asked, Some(checked.id), 0).is_ok());
+            }
+        }
+    }
+
+    /// An overlay the supervisor pushes is the judge's before the proxy confirms it: a connection
+    /// the proxy asks for under it is judged under it.
+    #[test]
+    fn a_pushed_overlay_decides_the_supervisors_judgement() {
+        let (judge, _listener, port) = judge_reaching_a_listener();
+        let (link, supervisor) = joined(Arc::clone(&judge), None, None);
+        let asked = Asked::inspected("api.test", port, "GET", "/");
+        assert!(judge.admits(&asked));
+        supervisor
+            .push(
+                1,
+                Overlay {
+                    deny: vec![crate::allowlist::classify("api.test:*").unwrap()],
+                    ..Overlay::default()
+                },
+            )
+            .unwrap();
+        assert!(!judge.admits(&asked));
+        assert_eq!(
+            link.check(&asked).map(|_| ()),
+            Err(ConnectRefusal::Supervisor)
+        );
+    }
+
+    /// The longest question a proxy asks crosses the link: a path as long as an HTTP/2 header list
+    /// holds, of the character that costs most once written as JSON, under a host as long as an
+    /// HTTP/1.1 head holds.
+    #[test]
+    fn a_question_carrying_the_longest_request_crosses() {
+        let (judge, _listener, port) = judge_reaching_a_listener();
+        let (link, _supervisor) = joined(judge, None, None);
+        let path = format!("/{}", "\"".repeat(64 * 1024 - 1));
+        let host = format!("{}.test", "a".repeat(16 * 1024 - 5));
+        assert_eq!(
+            link.check(&Asked::inspected(&host, port, "GET", &path))
+                .map(|_| ()),
+            Err(ConnectRefusal::Supervisor),
+            "answered by the judge, which admits no such host, rather than lost on the way"
+        );
     }
 }
