@@ -202,6 +202,8 @@ struct SupervisorSide {
     /// How the requests this proxy parks are served, or `None` when nobody answers them: each is
     /// then denied as it arrives.
     parks: Option<Parks>,
+    /// How a thread of this end is started: [`named_thread`], or in a test one the host refuses.
+    threads: fn(&str) -> std::thread::Builder,
 }
 
 /// What the supervisor knows of the proxy's overlay.
@@ -274,19 +276,28 @@ fn gone() -> io::Error {
 /// requests the proxy parks served as `parks` says. Both readers end once the proxy lets go of its
 /// [`Link`], and so does every thread waiting on a request it parked.
 pub(crate) fn serving(parks: Parks) -> (Link, Supervisor) {
-    let (link, supervisor, _) = start(Some(parks));
+    let (link, supervisor, _) = start(Some(parks), named_thread);
     (link, supervisor)
 }
 
 /// [`serving`] with nobody to answer a parked request: all a test of the rules alone needs.
 #[cfg(test)]
 pub(crate) fn pair() -> (Link, Supervisor) {
-    let (link, supervisor, _) = start(None);
+    let (link, supervisor, _) = start(None, named_thread);
     (link, supervisor)
 }
 
-/// [`serving`], keeping the two readers' handles.
-fn start(parks: Option<Parks>) -> (Link, Supervisor, [std::thread::JoinHandle<()>; 2]) {
+/// A thread of the supervisor's end, named for what it waits on.
+fn named_thread(name: &str) -> std::thread::Builder {
+    std::thread::Builder::new().name(name.to_string())
+}
+
+/// [`serving`], keeping the two readers' handles, with the way the supervisor's end starts its
+/// threads passed in.
+fn start(
+    parks: Option<Parks>,
+    threads: fn(&str) -> std::thread::Builder,
+) -> (Link, Supervisor, [std::thread::JoinHandle<()>; 2]) {
     let (down_tx, down_rx) = channel();
     let (up_tx, up_rx) = channel();
     let proxy = Arc::new(ProxySide {
@@ -299,6 +310,7 @@ fn start(parks: Option<Parks>) -> (Link, Supervisor, [std::thread::JoinHandle<()
         heard: Mutex::new(Heard::default()),
         changed: Condvar::new(),
         parks,
+        threads,
     });
     let readers = [
         {
@@ -377,7 +389,8 @@ fn read_proxy(rx: &Receiver<ToSupervisor>, side: &Arc<SupervisorSide>) {
 }
 
 /// Let a request the proxy parked into the queue and wait for its answer on a thread of its own, or
-/// deny it at once: nobody serves parks, the queue is full, or no thread could be started.
+/// deny it at once: nobody serves parks, or the queue is full. When no thread can be started, the
+/// request leaves the queue with whatever answer it was given in between.
 fn serve_park(side: &Arc<SupervisorSide>, id: u64, host: &str, port: u16, path: &str) {
     let Some(parks) = &side.parks else {
         return answer(side, id, Verdict::Deny);
@@ -385,30 +398,35 @@ fn serve_park(side: &Arc<SupervisorSide>, id: u64, host: &str, port: u16, path: 
     let Some(parked) = parks.pending.enqueue(host, port, path, parks.cap) else {
         return answer(side, id, Verdict::Deny);
     };
-    let seq = parked.seq;
     let (pending, timeout, notices) = (Arc::clone(&parks.pending), parks.timeout, parks.notices);
     let waiter = Arc::clone(side);
-    let started = std::thread::Builder::new()
-        .name("sbx-park-wait".to_string())
-        .spawn(move || {
-            // Printed here rather than by the reader, which must not wait on a stderr that blocks.
-            if notices {
-                let (head, allow, deny) = park_notice(
-                    &crate::sandbox::control::format_id(
-                        std::process::id(),
-                        parked.seq,
-                        crate::sandbox::control::incarnation(),
-                    ),
-                    &parked,
-                );
-                super::print_egress_notice(&head, &[("allow", &allow), ("deny", &deny)]);
-            }
-            let verdict = pending.wait(parked, timeout);
-            answer(&waiter, id, verdict);
-        });
-    if started.is_err() {
-        parks.pending.forget(seq);
-        answer(side, id, Verdict::Deny);
+    // Handed over once the thread exists: a thread that cannot be started leaves the request here,
+    // with the answer an operator may already have given it.
+    let (hand, handed) = channel::<crate::sandbox::control::Parked>();
+    let started = (side.threads)("sbx-park-wait").spawn(move || {
+        let Ok(parked) = handed.recv() else {
+            return;
+        };
+        // Printed here rather than by the reader, which must not wait on a stderr that blocks.
+        if notices {
+            let (head, allow, deny) = park_notice(
+                &crate::sandbox::control::format_id(
+                    std::process::id(),
+                    parked.seq,
+                    crate::sandbox::control::incarnation(),
+                ),
+                &parked,
+            );
+            super::print_egress_notice(&head, &[("allow", &allow), ("deny", &deny)]);
+        }
+        let verdict = pending.wait(parked, timeout);
+        answer(&waiter, id, verdict);
+    });
+    match started {
+        Ok(_) => {
+            let _ = hand.send(parked);
+        }
+        Err(_) => answer(side, id, parks.pending.withdraw(parked)),
     }
 }
 
@@ -468,7 +486,7 @@ mod tests {
     /// A proxy that is gone cannot confirm, and the supervisor says so rather than waiting.
     #[test]
     fn a_push_to_a_proxy_that_is_gone_is_an_error() {
-        let (link, supervisor, [proxy_reader, supervisor_reader]) = start(None);
+        let (link, supervisor, [proxy_reader, supervisor_reader]) = start(None, named_thread);
         drop(link);
         supervisor_reader.join().unwrap();
         proxy_reader.join().unwrap();
@@ -480,7 +498,7 @@ mod tests {
     /// stands up a proxy per app keeps no thread per proxy it is done with.
     #[test]
     fn both_readers_end_once_the_proxy_lets_go() {
-        let (link, supervisor, [proxy_reader, supervisor_reader]) = start(None);
+        let (link, supervisor, [proxy_reader, supervisor_reader]) = start(None, named_thread);
         supervisor.push(1, overlay("api.test")).unwrap();
         drop(link);
         supervisor_reader.join().unwrap();
@@ -619,7 +637,7 @@ mod tests {
     fn a_request_parked_by_a_proxy_that_is_gone_leaves_the_queue() {
         let pending = Arc::new(PendingState::new());
         let (link, supervisor, [proxy_reader, supervisor_reader]) =
-            start(Some(parks(&pending, 4, None)));
+            start(Some(parks(&pending, 4, None)), named_thread);
         // Sent as the proxy sends it, straight on the channel: a request parked with `park` would
         // hold the end this test lets go of.
         locked(&link.side.up)
@@ -638,6 +656,25 @@ mod tests {
         proxy_reader.join().unwrap();
         assert!(pending.list().is_empty());
         drop(supervisor);
+    }
+
+    /// A thread the host is certain to refuse: a stack larger than any address space, still small
+    /// enough for the C library to accept as a size, so it is the mapping that fails.
+    fn refused_thread(_: &str) -> std::thread::Builder {
+        std::thread::Builder::new().stack_size(usize::MAX / 8)
+    }
+
+    /// A request whose waiting thread cannot be started is answered at once, a deny since nobody
+    /// answered it meanwhile, and does not stay listed as a request nobody will hear back on.
+    #[test]
+    fn a_request_whose_thread_cannot_start_is_denied_and_leaves_the_queue() {
+        let pending = Arc::new(PendingState::new());
+        let (link, _supervisor, _) = start(Some(parks(&pending, 4, None)), refused_thread);
+        assert_eq!(
+            park_on(&Arc::new(link), "api.test").recv_timeout(ANSWER_WAIT),
+            Ok(Verdict::Deny)
+        );
+        assert!(pending.list().is_empty());
     }
 
     /// The notice is composed from what the queue stores, never from what the proxy sent: a host

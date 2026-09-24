@@ -202,6 +202,15 @@ impl PendingState {
         locked(&self.inner).entries.remove(&seq);
     }
 
+    /// Take a request [`Self::enqueue`] let in back out of the queue when nobody will wait for its
+    /// answer, and return the answer it was given before it left, or a deny. Out of the queue
+    /// first: after that, the only answer that can still come is one already on its way, which is
+    /// waited for, so an operator told the request was allowed is not contradicted.
+    pub(crate) fn withdraw(&self, parked: Parked) -> Verdict {
+        self.forget(parked.seq);
+        parked.answer.recv().unwrap_or(Verdict::Deny)
+    }
+
     /// [`Self::enqueue`] then [`Self::wait`], denying at once past `cap`: a request parked as the
     /// queue's own tests park one. `on_enqueue` runs with the id before the wait.
     #[cfg(test)]
@@ -2208,6 +2217,23 @@ mod tests {
         );
         assert_eq!(verdict, Verdict::Deny);
         assert!(state.list().is_empty(), "a timed-out entry is removed");
+    }
+
+    /// A request taken back out of the queue keeps the answer an operator gave it before it left,
+    /// by id or by the drain, and is denied when none was given: what a request whose waiting
+    /// thread could not be started is decided with.
+    #[test]
+    fn a_withdrawn_request_keeps_the_answer_it_was_given() {
+        let state = PendingState::new();
+        let parked = state.enqueue("api.test", 443, "/", 4).unwrap();
+        state.answer_like(parked.seq, Verdict::Allow);
+        assert_eq!(state.withdraw(parked), Verdict::Allow);
+        let parked = state.enqueue("api.test", 443, "/", 4).unwrap();
+        state.answer_all(Verdict::Allow);
+        assert_eq!(state.withdraw(parked), Verdict::Allow);
+        let parked = state.enqueue("api.test", 443, "/", 4).unwrap();
+        assert_eq!(state.withdraw(parked), Verdict::Deny);
+        assert!(state.list().is_empty());
     }
 
     #[test]

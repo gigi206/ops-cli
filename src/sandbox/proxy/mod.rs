@@ -2090,9 +2090,16 @@ fn egress_notice_line(p: &crate::style::Palette, head: &str, actions: &[(&str, &
 /// Print one egress notice line to stderr. Colour auto-detects on stderr — a terminal with
 /// `NO_COLOR` unset and `TERM` not `dumb` — via the shared [`crate::style::Palette`], so a pipe or
 /// a captured run prints plain text.
+///
+/// A notice that cannot be written is dropped rather than panicking, as `eprintln!` would: the
+/// thread printing it is the one that owes the proxy the answer to the request it announces.
 fn print_egress_notice(head: &str, actions: &[(&str, &str)]) {
     let p = crate::style::Palette::for_stream(std::io::IsTerminal::is_terminal(&std::io::stderr()));
-    eprintln!("{}", egress_notice_line(&p, head, actions));
+    let _ = writeln!(
+        std::io::stderr(),
+        "{}",
+        egress_notice_line(&p, head, actions)
+    );
 }
 
 /// The body of a written refusal, in one place because two planes write it.
