@@ -24,6 +24,7 @@ pub(super) struct LiveFlows {
     inner: Mutex<Inner>,
 }
 
+/// What [`LiveFlows`] guards: the numbering of its flows, and the ones open.
 struct Inner {
     /// The number the next flow is given; the supervisor's view is keyed by it.
     next_id: u64,

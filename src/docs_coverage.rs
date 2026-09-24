@@ -1264,8 +1264,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("sandbox/argv.rs", "path"),
     ("sandbox/broker.rs", "hex_digit"),
     ("sandbox/control/capture.rs", "CaptureInner"),
-    ("sandbox/control/mod.rs", "FlowEntry"),
-    ("sandbox/control/mod.rs", "FlowInner"),
     ("sandbox/control/mod.rs", "Inner"),
     ("sandbox/control/mod.rs", "LogInner"),
     ("sandbox/control/mod.rs", "ManualInner"),

@@ -91,6 +91,7 @@ impl Credentials {
     }
 }
 
+/// [`Credentials`] as it crosses: its live set, and what a needle it learns later is built with.
 #[derive(Serialize, Deserialize)]
 struct CredentialsWire {
     set: SetWire,
@@ -98,12 +99,14 @@ struct CredentialsWire {
     shared_credential: Vec<Vec<String>>,
 }
 
+/// [`CredentialSet`] as it crosses.
 #[derive(Serialize, Deserialize)]
 struct SetWire {
     injections: Vec<InjectionWire>,
     needles: Vec<NeedleWire>,
 }
 
+/// [`HeaderInjection`] as it crosses.
 #[derive(Serialize, Deserialize)]
 struct InjectionWire {
     rule: Rule,
@@ -128,6 +131,7 @@ enum FormWire {
     },
 }
 
+/// A signer's [`SecretMarker`] as it crosses: its three fields.
 #[derive(Serialize, Deserialize)]
 struct MarkerWire {
     marker: Vec<u8>,
@@ -317,10 +321,12 @@ impl NeedleWire {
     }
 }
 
+/// The document `wire` is written as.
 fn to_bytes(wire: &impl Serialize) -> io::Result<Vec<u8>> {
     serde_json::to_vec(wire).map_err(|e| io::Error::other(format!("credentials: {}", position(&e))))
 }
 
+/// The value a document holds, a malformed one reported by its position alone.
 fn from_bytes<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> io::Result<T> {
     serde_json::from_slice(bytes).map_err(|e| {
         io::Error::new(
