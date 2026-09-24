@@ -80,7 +80,7 @@ sum past total RAM); the task cap is the clean host-wide anti-DoS guarantee.
 ## What the agent is told
 
 The ceilings a launch really carries are written into the generated contract the cage reads at
-`/opt/sbx/egress-contract.md`, named by `SBX_EGRESS_CONTRACT`.
+`/opt/sbx/contract.md`, named by `SBX_CONTRACT`.
 
 They are there because a cage cannot find them out for itself. It reads a fresh `procfs` rather
 than a cgroup-aware one, and no `/sys/fs/cgroup` is mounted, so `free` and `/proc/meminfo` answer

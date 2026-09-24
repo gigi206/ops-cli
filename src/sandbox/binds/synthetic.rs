@@ -25,7 +25,7 @@ pub(crate) struct Identity {
 }
 
 /// The synthetic interactive-shell rc: set a default prompt that names the cage, show the
-/// egress contract once (to stderr, so a captured stdout stays clean), source the home's own
+/// in-cage contract once (to stderr, so a captured stdout stays clean), source the home's own
 /// `.bashrc` if the agent has written one, then activate mise so its activated tools manage
 /// PATH/env. Static (no per-project data, so the same bytes back every cage), bound read-only
 /// from outside every writable mount, so the agent cannot rewrite what its own shell sources.
@@ -36,7 +36,7 @@ pub(crate) struct Identity {
 /// variable being set and readable, so it is a no-op where the handle is absent.
 pub(super) const SHELL_RC_CONTENTS: &str = "\
 PS1='(\\h) \\w\\$ '\n\
-[ -r \"$SBX_EGRESS_CONTRACT\" ] && cat \"$SBX_EGRESS_CONTRACT\" >&2\n\
+[ -r \"$SBX_CONTRACT\" ] && cat \"$SBX_CONTRACT\" >&2\n\
 [ -r \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n\
 command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 

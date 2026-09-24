@@ -731,7 +731,7 @@ fn the_zone_the_session_resolves_is_the_zone_a_task_resolves() {
     let env = task_env(&[
         ("TZ".to_string(), "Europe/Paris".to_string()),
         ("TZDIR".to_string(), "/usr/share/zoneinfo".to_string()),
-        ("SBX_EGRESS_CONTRACT".to_string(), "/opt/x".to_string()),
+        ("SBX_CONTRACT".to_string(), "/opt/x".to_string()),
     ]);
     assert_eq!(
         env,

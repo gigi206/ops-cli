@@ -92,7 +92,7 @@ Cautions are informational: the token is still applied.
 
 ## What the agent is told
 
-The generated contract the cage reads at `/opt/sbx/egress-contract.md` names the **families** of
+The generated contract the cage reads at `/opt/sbx/contract.md` names the **families** of
 call the filter still refuses: reading or patching another process, loading kernel modules,
 mounting and creating namespaces, and so on. It says that the refusal is the sandbox's and
 that it does not depend on how a program is invoked.

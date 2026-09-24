@@ -85,7 +85,7 @@ use crate::sandbox::locks::locked;
 pub(crate) const CAGE_TASK_UDS: &str = "/tmp/sbx-task.sock";
 
 /// The environment variable that tells an in-cage tool the task plane is available, and where. The
-/// discovery handle, like `SBX_EGRESS_CONTRACT` for the egress contract.
+/// discovery handle, like `SBX_CONTRACT` for the in-cage contract.
 pub(crate) const TASK_SOCKET_ENV: &str = "SBX_TASK_SOCKET";
 
 /// Where the task client is bound read-only inside the cage. Under `/opt/sbx`, beside the egress

@@ -31,7 +31,7 @@ a key finds none, and concludes it is unauthenticated while its plain requests a
 carrying a credential. What follows is the familiar shape. It asks the user for a token that
 already exists, writes one into a configuration file, or gives up on a destination it can reach.
 
-So the generated contract the cage reads at `/opt/sbx/egress-contract.md` names the
+So the generated contract the cage reads at `/opt/sbx/contract.md` names the
 **destinations** a credential is attached to, and states that the value is not in here and is not
 to be looked for. Destinations only: never a credential's name, its header, or the source it was
 read from. What a caller can act on is which destinations it is authenticated to, and none of

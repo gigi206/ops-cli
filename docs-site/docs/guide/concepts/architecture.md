@@ -119,7 +119,7 @@ absent. What a launch assembles on that empty base:
 | `$HOME` | the project's runtime home, or an [app's isolated home](../apps/home) | yes |
 | a synthetic `/etc` | hosts, passwd, machine-id, locale, time zone, CA bundle | no |
 | `/dev` | a minimal device tree, never the host's, plus any [granted device](../configuration/devices) | mixed |
-| the sbx furniture | what the postures call for: the session CA, the [egress contract](../reference/environment-variables), the task client, the exec shim | no |
+| the sbx furniture | what the postures call for: the session CA, the [in-cage contract](../reference/environment-variables), the task client, the exec shim | no |
 
 Nothing else of the host is there unless a trusted [`binds`](../configuration/binds) entry
 put it there, and the [`[fs]`](../configuration/fs) table can subtract from the project

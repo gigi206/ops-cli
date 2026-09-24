@@ -201,7 +201,7 @@ including:
 | Variable | Meaning |
 |---|---|
 | `SBX_SANDBOX=1` | a marker that the process is running inside an `sbx` cage |
-| `SBX_EGRESS_CONTRACT` | the in-cage path to the generated contract (`/opt/sbx/egress-contract.md`): what the cage can reach, which destinations a [credential](../configuration/secret#what-the-agent-is-told) is attached to, which paths an [`[fs]`](../configuration/fs) mask or a read-only [bind](../configuration/binds) covers, how execution is mediated, which [system calls](../configuration/seccomp#what-the-agent-is-told) are refused, the [resource ceilings](../configuration/limits#what-the-agent-is-told) the launch carries, and the [declared operations](../cli/task#how-an-agent-finds-them) it may invoke |
+| `SBX_CONTRACT` | the in-cage path to the generated contract (`/opt/sbx/contract.md`): what the cage can reach, which destinations a [credential](../configuration/secret#what-the-agent-is-told) is attached to, which paths an [`[fs]`](../configuration/fs) mask or a read-only [bind](../configuration/binds) covers, how execution is mediated, which [system calls](../configuration/seccomp#what-the-agent-is-told) are refused, the [resource ceilings](../configuration/limits#what-the-agent-is-told) the launch carries, and the [declared operations](../cli/task#how-an-agent-finds-them) it may invoke |
 | `no_proxy`/`NO_PROXY` | set to `localhost,127.0.0.1,::1` so in-cage loopback does not route through the egress proxy |
 | `HOME`, `PATH`, `TERM`, `LANG` | the synthetic identity's home, the tool paths, and the two passthrough values |
 

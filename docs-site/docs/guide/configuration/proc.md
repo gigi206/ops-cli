@@ -204,7 +204,7 @@ occupy the socket for the second the shim spends retrying can still cost itself 
 
 ### What the agent is told
 
-The cage's generated contract (`/opt/sbx/egress-contract.md`, named by `SBX_EGRESS_CONTRACT`)
+The cage's generated contract (`/opt/sbx/contract.md`, named by `SBX_CONTRACT`)
 carries a section for this lens, and it states the **posture only**: that execution is mediated,
 under which mode, and, under `ask`, that a program no rule settles is parked for a person to allow
 or refuse. It names **no program**, in any mode.

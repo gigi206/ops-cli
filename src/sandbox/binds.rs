@@ -625,7 +625,7 @@ struct SandboxPaths<'a> {
     mise_plugin_src: &'a Path,
     /// Synthetic interactive-shell rc; bound read-only at [`SHELL_RC_INCAGE`].
     shell_rc_src: &'a Path,
-    /// Generated egress contract; bound read-only at [`super::contract::EGRESS_CONTRACT_INCAGE`].
+    /// Generated in-cage contract; bound read-only at [`super::contract::CONTRACT_INCAGE`].
     contract_src: &'a Path,
     /// Synthetic `xdg-open` script; bound read-only at [`XDG_OPEN_INCAGE`]. It is the single file
     /// inside [`Self::open_router_src`], so both in-cage names serve one staged source.
@@ -858,14 +858,14 @@ fn cage_mounts(
             src: paths.shell_rc_src.to_path_buf(),
             dest: PathBuf::from(SHELL_RC_INCAGE),
         },
-        // Zone 1 — the generated egress contract, read-only: a description of what the
-        // cage's network posture permits (reachable hosts, why a direct connection or
-        // `ping` fails). Informational only — it enforces nothing; the empty netns and the
-        // host proxy are the boundary. Bound from outside every writable mount so the agent
-        // cannot rewrite the contract it is told to read.
+        // Zone 1 — the generated in-cage contract, read-only: a description of what the
+        // cage permits (reachable hosts, why a direct connection or `ping` fails, what is
+        // masked, refused or capped). Informational only — it enforces nothing; the empty
+        // netns, the host proxy and the other layers are the boundary. Bound from outside
+        // every writable mount so the agent cannot rewrite the contract it is told to read.
         Mount::RoBind {
             src: paths.contract_src.to_path_buf(),
-            dest: PathBuf::from(super::contract::EGRESS_CONTRACT_INCAGE),
+            dest: PathBuf::from(super::contract::CONTRACT_INCAGE),
         },
         // Zone 1 — synthetic identity (no host accounts leaked).
         Mount::RoBind {
@@ -1230,16 +1230,16 @@ fn cage_env(
             join_paths(&userland.foreign_lib_paths),
         ),
         // The sandbox-awareness handle: `SBX_SANDBOX=1` lets a process tell it is running
-        // inside an sbx cage, and `SBX_EGRESS_CONTRACT` points it at the read-only contract
-        // describing the cage's network posture. Both are structural (lowest precedence): a
+        // inside an sbx cage, and `SBX_CONTRACT` points it at the read-only contract
+        // describing what the cage permits. Both are structural (lowest precedence): a
         // trusted `[env]` could override them, but that only mispoints the project's own
         // tools at its own value — self-sabotage of an informational handle, not an escape
         // (the same class as `FONTCONFIG_FILE`/`WAYLAND_DISPLAY`) — so neither needs a
         // denylist entry.
         ("SBX_SANDBOX".to_string(), "1".to_string()),
         (
-            "SBX_EGRESS_CONTRACT".to_string(),
-            super::contract::EGRESS_CONTRACT_INCAGE.to_string(),
+            "SBX_CONTRACT".to_string(),
+            super::contract::CONTRACT_INCAGE.to_string(),
         ),
         // Locale. `LOCALE_ARCHIVE` names sbx's own UTF-8 locale archive so the cage's glibc
         // can load a UTF-8 `LANG` — a hermetic cage has no host `/usr/lib/locale`, so without
@@ -1363,7 +1363,7 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     super::miseplugin::INCAGE_DIR,
     MISE_PROJECT_INCAGE,
     MISE_SHARED_INCAGE,
-    super::contract::EGRESS_CONTRACT_INCAGE,
+    super::contract::CONTRACT_INCAGE,
 ];
 
 /// The entries of [`STRUCTURAL_DESTS`] that [`assemble`] lays down as a symlink rather than a mount.
@@ -1709,7 +1709,7 @@ pub(crate) fn build_spec(
     overlay: &Overlay,
     extra_binds: &[ExtraBind],
     net: NetPolicy,
-    egress_contract: &str,
+    contract_text: &str,
     tcp: &super::egress::TcpPlan,
     seccomp: super::seccomp::SeccompPolicy,
     devices: &[PathBuf],
@@ -1759,13 +1759,13 @@ pub(crate) fn build_spec(
     let shell_rc = rt.etc_dir.join("bashrc");
     super::atomicfile::write_atomic(&shell_rc, SHELL_RC_CONTENTS.as_bytes())?;
 
-    // Materialize the generated egress contract beside the rc (same outside-every-writable-
+    // Materialize the generated in-cage contract beside the rc (same outside-every-writable-
     // mount placement, for the same reason: the agent must not be able to rewrite the
     // contract it is told to read). Regenerated each launch, so it never goes stale. Written
     // atomically (temp + rename) because this directory is shared by concurrent cages of the
     // same project — an in-place write could show a running cage a torn, half-written file.
-    let contract = rt.etc_dir.join("egress-contract.md");
-    super::atomicfile::write_atomic(&contract, egress_contract.as_bytes())?;
+    let contract = rt.etc_dir.join("contract.md");
+    super::atomicfile::write_atomic(&contract, contract_text.as_bytes())?;
 
     // Materialize the URL router beside the other synthetic files (outside every writable mount, so
     // it has no writable alias the agent could rewrite), then make it executable so a tool calling

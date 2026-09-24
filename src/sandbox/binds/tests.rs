@@ -82,7 +82,7 @@ fn base_paths() -> SandboxPaths<'static> {
         shell_rc_src: Path::new("/store/bashrc"),
         xdg_open_src: Path::new("/data/sbx/projects/abc/etc/open/xdg-open"),
         open_router_src: Path::new("/data/sbx/projects/abc/etc/open"),
-        contract_src: Path::new("/store/egress-contract.md"),
+        contract_src: Path::new("/store/contract.md"),
         hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
         ssh_config_src: None,
         machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
@@ -968,39 +968,32 @@ fn assemble_builds_a_hermetic_environment() {
     // the passthrough variable survived
     assert!(joined.iter().any(|s| s == "TERM"));
     // the sandbox-awareness handles are present: a process can tell it is caged, and
-    // find the egress contract describing its network posture
+    // find the in-cage contract describing its posture
     let sandbox_i = joined.iter().position(|s| s == "SBX_SANDBOX").unwrap();
     assert_eq!(joined[sandbox_i + 1], "1");
-    let contract_i = joined
-        .iter()
-        .position(|s| s == "SBX_EGRESS_CONTRACT")
-        .unwrap();
+    let contract_i = joined.iter().position(|s| s == "SBX_CONTRACT").unwrap();
     assert_eq!(
         joined[contract_i + 1],
-        super::super::contract::EGRESS_CONTRACT_INCAGE
+        super::super::contract::CONTRACT_INCAGE
     );
 }
 
 #[test]
-fn the_egress_contract_is_bound_read_only() {
+fn the_contract_is_bound_read_only() {
     // The contract describes what the cage's network permits; it must be a read-only
     // bind from the synthetic source, so the agent cannot rewrite the contract it is
     // told to read.
     // Key off the bind *source* — unique in the argv — since the in-cage destination
-    // path is also the value of the `SBX_EGRESS_CONTRACT` environment variable.
+    // path is also the value of the `SBX_CONTRACT` environment variable.
     let argv = argv_strings(&assembled());
     let src = argv
         .iter()
-        .position(|s| s == "/store/egress-contract.md")
-        .expect("the egress contract is bound");
-    assert_eq!(
-        argv[src - 1],
-        "--ro-bind",
-        "the egress contract must be read-only"
-    );
+        .position(|s| s == "/store/contract.md")
+        .expect("the contract is bound");
+    assert_eq!(argv[src - 1], "--ro-bind", "the contract must be read-only");
     assert_eq!(
         argv[src + 1],
-        super::super::contract::EGRESS_CONTRACT_INCAGE,
+        super::super::contract::CONTRACT_INCAGE,
         "contract bound at the in-cage contract path"
     );
 }
@@ -1747,7 +1740,7 @@ fn an_empty_config_adds_nothing() {
             "NIX_LD",
             "NIX_LD_LIBRARY_PATH",
             "SBX_SANDBOX",
-            "SBX_EGRESS_CONTRACT",
+            "SBX_CONTRACT",
             "LOCALE_ARCHIVE",
             "LANG",
             "TZDIR",
@@ -2193,7 +2186,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
         group_src: Path::new("/data/sbx/apps/demo-app/etc/group"),
         mise_plugin_src: Path::new("/store/mise-plugin"),
         shell_rc_src: Path::new("/store/bashrc"),
-        contract_src: Path::new("/store/egress-contract.md"),
+        contract_src: Path::new("/store/contract.md"),
         xdg_open_src: Path::new("/data/sbx/apps/demo-app/etc/open/xdg-open"),
         open_router_src: Path::new("/data/sbx/apps/demo-app/etc/open"),
         hosts_src: Path::new("/data/sbx/apps/demo-app/etc/hosts"),

@@ -8,7 +8,7 @@
 //! A leaf on purpose. Every file sbx stages this way answers the same three questions — where the
 //! temp goes, what happens to it on failure, and whether an unchanged file is rewritten — and the
 //! answers were once given eight times over, at which point they had already diverged. The callers
-//! are the cage's synthetic identity and egress contract ([`super::binds`]), the per-project pin
+//! are the cage's synthetic identity and in-cage contract ([`super::binds`]), the per-project pin
 //! locks ([`super::flake`], [`super::nixhub`], [`super::prebuilt`]), the staged audio shim
 //! ([`super::audio`]), the desktop mark ([`super::notify_sink`]), the snapshot an overwrite keeps
 //! ([`crate::cli::keep_replaced_file`]), the profile an import writes ([`crate::cli::app`]) and the

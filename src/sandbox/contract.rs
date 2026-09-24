@@ -1,17 +1,16 @@
 //! The in-cage contract: a human- and agent-readable description of what the sandbox
 //! permits, generated from the resolved config and bound read-only into the cage at
-//! [`EGRESS_CONTRACT_INCAGE`].
+//! [`CONTRACT_INCAGE`].
 //!
-//! Seven planes are described, and the file keeps its name from the first: the egress posture, the
-//! destinations a credential is attached to, the paths a mask or a read-only bind covers, how
-//! execution is mediated, the system calls refused, the resource ceilings the launch carries, and
-//! the declared operations.
+//! Seven planes are described: the egress posture, the destinations a credential is attached to,
+//! the paths a mask or a read-only bind covers, how execution is mediated, the system calls
+//! refused, the resource ceilings the launch carries, and the declared operations.
 //!
 //! It is purely informational — it enforces nothing (the empty network namespace plus
 //! the host filtering proxy are the boundary). Its job is to let a process inside the
 //! cage understand *why* a direct connection or a `ping` fails and *which* hosts it can
 //! actually reach, without running the host-side `sbx net` tools (which it cannot, from
-//! inside the cage). The companion `SBX_SANDBOX=1` / `SBX_EGRESS_CONTRACT` environment
+//! inside the cage). The companion `SBX_SANDBOX=1` / `SBX_CONTRACT` environment
 //! variables (set by the assembler) are the discovery handle: a tool reads the file the
 //! second variable points at.
 //!
@@ -48,11 +47,11 @@ use crate::proc_policy::{ProcMode, ProcPolicy};
 use crate::sandbox::fsmask::Expanded;
 
 /// Where the generated contract is bound read-only inside the cage. Also the value of
-/// the `SBX_EGRESS_CONTRACT` environment variable, so a tool need not hard-code the path.
+/// the `SBX_CONTRACT` environment variable, so a tool need not hard-code the path.
 ///
 /// Under `/opt/sbx`, beside the mise plugin and the shell rc, colliding with no
 /// structural mount.
-pub(crate) const EGRESS_CONTRACT_INCAGE: &str = "/opt/sbx/egress-contract.md";
+pub(crate) const CONTRACT_INCAGE: &str = "/opt/sbx/contract.md";
 
 /// Render the egress contract for a resolved network posture. Pure: the text derives only
 /// from the policy and the destinations this run withdrew.
@@ -83,7 +82,7 @@ fn egress_contract(policy: &NetworkPolicy, withdrawn: &[String]) -> String {
 /// kernel will refuse it, what it may spend, and last what it may invoke instead.
 ///
 /// One file rather than seven, and the one a process already knows to read
-/// (`$SBX_EGRESS_CONTRACT`). A second file would reintroduce the very problem this section exists
+/// (`$SBX_CONTRACT`). A second file would reintroduce the very problem this section exists
 /// to solve — something the cage can only use if it already knows to look for it. Each section
 /// omits itself entirely when the posture it describes is absent, so the document stays the length
 /// of what was actually configured.
@@ -518,8 +517,7 @@ operation carries. A value outside its declared bound is refused and nothing run
 itself is fixed by the declaration — only the parameters above are yours to set.\n";
 
 /// The document's title, over every section. It names the whole contract rather than its first
-/// plane: the file keeps the egress name its path and `SBX_EGRESS_CONTRACT` carry, while the
-/// heading a reader sees says what the document covers.
+/// plane, as its path and `SBX_CONTRACT` do.
 const CONTRACT_TITLE: &str = "# sbx sandbox — contract\n\n";
 
 /// The shared head of every empty-netns contract: the cage has no route of its own, so a

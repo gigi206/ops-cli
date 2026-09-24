@@ -36,7 +36,7 @@ invocations nobody owns.
 ## How an agent finds them
 
 A declared operation the agent never learns about is worth exactly as much as one you never
-declared. So when a session offers any, they are written into the contract the cage already reads, `/opt/sbx/egress-contract.md`, named by `$SBX_EGRESS_CONTRACT`: beside the network posture:
+declared. So when a session offers any, they are written into the contract the cage already reads, `/opt/sbx/contract.md`, named by `$SBX_CONTRACT`: beside the network posture:
 
 ```markdown
 ## Declared operations

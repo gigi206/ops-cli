@@ -525,8 +525,8 @@ yet under a denied directory. See [`sbx test`](../cli/test#sbx-test-fs).
 
 ### What the agent is told
 
-The cage carries a generated contract at `/opt/sbx/egress-contract.md`, named by
-`SBX_EGRESS_CONTRACT`, and the masks have a section in it. This is not a second enforcement point:
+The cage carries a generated contract at `/opt/sbx/contract.md`, named by
+`SBX_CONTRACT`, and the masks have a section in it. This is not a second enforcement point:
 it exists because one of the three shapes is invisible from inside. A denied **file** keeps its
 name and answers `EACCES`, so a process discovers it by trying; a **read-only** path refuses the
 write, so a process discovers that too, though only after producing the bytes. A denied

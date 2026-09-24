@@ -47,7 +47,7 @@ uid, so it can *read* whatever is bound. To keep a secret out of the cage, do no
 bind it at all; bind read-only only what the tool may read but must not modify.
 
 A read-only bind is named in the generated contract the cage reads at
-`/opt/sbx/egress-contract.md`, alongside the paths a [`[fs]`](fs) mask closes, under the
+`/opt/sbx/contract.md`, alongside the paths a [`[fs]`](fs) mask closes, under the
 heading that lists what refuses a write. The two mechanisms differ on the host and not from
 inside: either way the contents are the real ones and the write comes back refused, after the
 work that produced the bytes. A writable bind is named nowhere, being no restriction to
