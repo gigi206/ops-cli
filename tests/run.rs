@@ -5468,14 +5468,18 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
     );
 
     // untrusted project, plain `sbx run` — the tool must still equip and run (open posture).
-    let out = run_in(project.path(), data.path(), &["rg", "--version"]);
+    let out = run_in(
+        project.path(),
+        data.path(),
+        &["sh", "-c", "command -v rg; rg --version"],
+    );
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ripgrep"),
+        out.status.success() && runs_the_equipped_rg(&String::from_utf8_lossy(&out.stdout)),
         "an auto-equipped aqua: tool must run on a plain `sbx run` of an untrusted project: {log}"
     );
 }
@@ -5533,7 +5537,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
         project.path(),
         data.path(),
         state.path(),
-        &["run", "--", "rg", "--version"],
+        &["run", "--", "sh", "-c", "command -v rg; rg --version"],
     );
     let log = format!(
         "{}{}",
@@ -5541,10 +5545,21 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ripgrep"),
+        out.status.success() && runs_the_equipped_rg(&String::from_utf8_lossy(&out.stdout)),
         "an aqua: tool must auto-equip through the MITM proxy under a trusted allowlist — mise's \
          reqwest must trust the proxy's per-session CA on a direct download: {log}"
     );
+}
+
+/// Whether a `command -v rg; rg --version` run printed the `rg` mise equipped — one of its shims —
+/// rather than any `rg` answering. The base userland carries one of its own, so a version alone is
+/// what a launch whose install failed prints too.
+fn runs_the_equipped_rg(stdout: &str) -> bool {
+    stdout.contains("ripgrep")
+        && stdout
+            .lines()
+            .next()
+            .is_some_and(|rg| rg.contains("mise") && rg.ends_with("/shims/rg"))
 }
 
 #[test]
@@ -5825,7 +5840,7 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
     // declared in the project's mise.toml (Lane 2 — the open self-equip toolchain), not `[packages]`.
     std::fs::write(
         project.path().join(".sbx.toml"),
-        "[app.ag]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n",
+        "[app.ag]\ncmd = [\"sh\", \"-c\", \"command -v rg; rg --version\"]\n",
     )
     .unwrap();
     std::fs::write(
@@ -5855,8 +5870,11 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
+    // What ran has to be the per-project pool's shim, not the base userland's `rg`.
     assert!(
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ripgrep"),
+        out.status.success()
+            && runs_the_equipped_rg(&String::from_utf8_lossy(&out.stdout))
+            && String::from_utf8_lossy(&out.stdout).starts_with("/opt/sbx/mise-project/"),
         "the global app must auto-equip the project's mise.toml tool and run it: {log}"
     );
 
@@ -5865,7 +5883,7 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
     assert_eq!(
         per_project.len(),
         1,
-        "the project's Lane-2 tool must create exactly one per-project pool: {per_project:?}"
+        "the project's Lane-2 tool must create exactly one per-project pool: {per_project:?}\n{log}"
     );
     let (installs, entries) = &per_project[0];
     assert!(
