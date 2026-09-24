@@ -380,6 +380,15 @@ impl Drain {
     fn left_parked(&self) -> bool {
         !self.unsupported.is_empty() || !self.unconfirmed.is_empty()
     }
+
+    /// 2 when a session's proxy did not confirm the `--session` rules, so a script does not go on
+    /// as if they decided its requests there; success otherwise.
+    fn exit_code(&self) -> ExitCode {
+        match self.unconfirmed.is_empty() {
+            true => ExitCode::SUCCESS,
+            false => ExitCode::from(2),
+        }
+    }
 }
 
 /// Answer every parked request in each session `keep` accepts, and report what happened. A dead or
@@ -656,7 +665,7 @@ fn net_pending_answer_all(
         "{}",
         render_drain(past, session, app, &drain, &context, &pal)
     );
-    ExitCode::SUCCESS
+    drain.exit_code()
 }
 
 /// Collapse a session's answered-host list — one entry per parked request, so a host repeats once per
@@ -962,7 +971,7 @@ fn net_pending_drain_and_save(
         }
         write_left_parked_notes(&mut out, &drain, &pal);
         print!("{out}");
-        return ExitCode::SUCCESS;
+        return drain.exit_code();
     }
 
     // Persist a rule per *unique* answered host, preserving first-seen order. The base of a
@@ -1027,7 +1036,7 @@ fn net_pending_drain_and_save(
                     pal.dim, pal.reset
                 );
             }
-            ExitCode::SUCCESS
+            drain.exit_code()
         }
         Some((code, msg)) => {
             // The persister's own code, for the reason the by-id save states.
@@ -1315,6 +1324,49 @@ mod tests {
             "the saved rule must carry the port the request was answered on, or it cannot match \
              that request next launch:\n{global}"
         );
+    }
+
+    /// A drain that a session's proxy did not confirm exits 2, so a script does not go on as if the
+    /// `--session` rules decided its requests there.
+    #[test]
+    fn a_drain_whose_session_did_not_confirm_its_rules_exits_2() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+        let pid = 424_243u32;
+        let egress = data.path().join("egress");
+        std::fs::create_dir_all(&egress).expect("create the control directory");
+        let socket = egress.join(format!("control-{pid}.sock"));
+        let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
+        let session = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept the drain");
+            let mut cmd = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut cmd)
+                .expect("read the command");
+            let reply = format!("{}\n", sandbox::control::UNCONFIRMED);
+            (&stream)
+                .write_all(reply.as_bytes())
+                .expect("write the reply");
+            cmd.trim_end().to_string()
+        });
+
+        let code = net_pending_answer(
+            sandbox::control::Verdict::Deny,
+            &[OsString::from("--all"), OsString::from("--session")],
+        );
+        // Unblock a stand-in still waiting on `accept` (the drain never reached it), so a failure
+        // reports itself instead of hanging the suite.
+        if let Ok(poke) = std::os::unix::net::UnixStream::connect(&socket) {
+            let _ = (&poke).write_all(b"QUIT\n");
+        }
+        let drained = session.join().expect("the stand-in session thread");
+        assert_eq!(drained, "DENY * session");
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
     }
 
     /// The answer by id reads in the verdict's past tense, a deny's included, and says what it did:

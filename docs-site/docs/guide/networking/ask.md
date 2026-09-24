@@ -157,7 +157,9 @@ sbx net pending allow --all --session            # …and remember each for its 
 ```
 
 `--all` is a **point-in-time** bulk answer: a request that parks *after* the drain
-still waits. It reports per session, so a cross-agent grant is visible.
+still waits. It reports per session, so a cross-agent grant is visible. With
+`--session`, a session whose proxy does not confirm the rules is named, nothing is
+answered there, and the command exits with code 2.
 
 `--all` composes with `--save`, with a deliberate safety rule about scope:
 

@@ -569,7 +569,12 @@ fn net_inject_session(
             &pal
         )
     );
-    ExitCode::SUCCESS
+    // A rule a session's proxy did not confirm may not be deciding its requests: a script must not
+    // go on as if it were.
+    match unconfirmed.is_empty() {
+        true => ExitCode::SUCCESS,
+        false => ExitCode::from(2),
+    }
 }
 
 /// Render a `--session` rule load: which live sessions took the rule (with their agent/project
@@ -711,6 +716,52 @@ fn persist_egress_removal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `--session` rule that a session's proxy did not confirm exits 2, so a script does not go
+    /// on as if the rule decided its requests there.
+    #[test]
+    fn a_session_rule_the_proxy_did_not_confirm_exits_2() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+        let pid = 424_244u32;
+        let egress = data.path().join("egress");
+        std::fs::create_dir_all(&egress).expect("create the control directory");
+        let socket = egress.join(format!("control-{pid}.sock"));
+        let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
+        let session = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept the rule load");
+            let mut cmd = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut cmd)
+                .expect("read the command");
+            let reply = format!("{}\n", sandbox::control::UNCONFIRMED);
+            (&stream)
+                .write_all(reply.as_bytes())
+                .expect("write the reply");
+            cmd.trim_end().to_string()
+        });
+
+        let code = net_inject_session(
+            config::manage::EgressList::Deny,
+            "api.test",
+            true,
+            None,
+            data.path(),
+        );
+        // Unblock a stand-in still waiting on `accept` (the load never reached it), so a failure
+        // reports itself instead of hanging the suite.
+        if let Ok(poke) = std::os::unix::net::UnixStream::connect(&socket) {
+            let _ = (&poke).write_all(b"QUIT\n");
+        }
+        let loaded = session.join().expect("the stand-in session thread");
+        assert_eq!(loaded, "REMEMBER DENY api.test");
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+    }
 
     #[test]
     fn net_rules_render_tags_each_rule_by_source_and_kind() {
