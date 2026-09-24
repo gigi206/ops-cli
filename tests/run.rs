@@ -8237,9 +8237,25 @@ fn cage_userns_ready(session_pid: u32) -> bool {
 /// about to assert. Returning the pid is what makes that wait possible.
 fn cage_inside_pid(session_pid: u32) -> Option<u32> {
     let host = std::fs::read_link("/proc/self/ns/user").ok();
+    let children = proc_children();
+    let mut queue = children.get(&session_pid).cloned().unwrap_or_default();
+    while let Some(pid) = queue.pop() {
+        let ns = std::fs::read_link(format!("/proc/{pid}/ns/user")).ok();
+        if ns.is_some() && ns != host {
+            return Some(pid);
+        }
+        if let Some(kids) = children.get(&pid) {
+            queue.extend(kids);
+        }
+    }
+    None
+}
+
+/// Every live process's children, by parent pid, read from `/proc`.
+fn proc_children() -> std::collections::BTreeMap<u32, Vec<u32>> {
     let mut children: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return None;
+        return children;
     };
     for e in entries.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
@@ -8254,17 +8270,42 @@ fn cage_inside_pid(session_pid: u32) -> Option<u32> {
             }
         }
     }
-    let mut queue = children.get(&session_pid).cloned().unwrap_or_default();
-    while let Some(pid) = queue.pop() {
-        let ns = std::fs::read_link(format!("/proc/{pid}/ns/user")).ok();
-        if ns.is_some() && ns != host {
-            return Some(pid);
-        }
-        if let Some(kids) = children.get(&pid) {
-            queue.extend(kids);
+    children
+}
+
+/// `root` and every live descendant of it, one line each: pid, command name, state, and the pid
+/// namespace it runs in. What a teardown test prints when something outlived the teardown, so the
+/// failure says where the survivor lived rather than only that it survived.
+fn process_tree_report(root: u32) -> String {
+    let children = proc_children();
+    let mut out = String::new();
+    let mut stack = vec![(root, 0usize)];
+    while let Some((pid, depth)) = stack.pop() {
+        let indent = "  ".repeat(depth);
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            out.push_str(&format!("{indent}{pid} gone\n"));
+            continue;
+        };
+        let comm = stat
+            .find('(')
+            .zip(stat.rfind(')'))
+            .map_or("?", |(open, close)| &stat[open + 1..close]);
+        let state = stat
+            .rfind(')')
+            .and_then(|close| stat[close + 1..].split_whitespace().next())
+            .unwrap_or("?");
+        let pidns = std::fs::read_link(format!("/proc/{pid}/ns/pid")).map_or_else(
+            |e| format!("unreadable ({e})"),
+            |ns| ns.display().to_string(),
+        );
+        out.push_str(&format!(
+            "{indent}{pid} {comm} state={state} pidns={pidns}\n"
+        ));
+        for &kid in children.get(&pid).into_iter().flatten() {
+            stack.push((kid, depth + 1));
         }
     }
-    None
+    out
 }
 
 /// `sbx session attach <id>` joins a **running** cage and opens a shell *inside* it — the real thing, not a
@@ -8680,6 +8721,15 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
         );
     }
 
+    // Where everything stood while it was all live: the attached shell's pid namespace has to be the
+    // cage's for the teardown below to reach it, and a failure is read against this.
+    let before_stop = format!(
+        "session {session_pid}:\n{}attach {}:\n{}",
+        process_tree_report(session_pid),
+        attach.id(),
+        process_tree_report(attach.id())
+    );
+
     // End the session. The attached shell is in its pid namespace, so it must die with it.
     let stop = sbx_in(
         project.path(),
@@ -8713,6 +8763,16 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
             break;
         }
     }
+    // What was left, read before anything below reaps or kills it.
+    let after_stop = (!attach_exited).then(|| {
+        format!(
+            "session {session_pid} ({:?}):\n{}attach {}:\n{}",
+            agent.try_wait(),
+            process_tree_report(session_pid),
+            attach.id(),
+            process_tree_report(attach.id())
+        )
+    });
     unsafe { libc::close(master) };
     // Reap both children on every path (a survivor is force-killed first), so the test leaves no
     // process behind whether it passes or fails.
@@ -8724,7 +8784,13 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     assert!(
         attach_exited,
         "`sbx session attach` outlived the session it joined — the attached shell escaped the cage's pid \
-         namespace instead of being killed with it"
+         namespace instead of being killed with it\n\
+         before `session stop`:\n{before_stop}\n\
+         `session stop` said: {}{}\n\
+         15 s after it:\n{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+        after_stop.unwrap_or_default()
     );
 }
 
