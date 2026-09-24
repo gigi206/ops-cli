@@ -194,8 +194,9 @@ later, because a decision without a trigger cannot be revisited except by argume
 
 ### One process, no daemon
 
-`sbx` is one process per invocation. The supervisor, the egress proxy and the control planes
-all live in the process you launched, and they end when it does.
+`sbx` is one process per invocation. The supervisor and the control planes live in the process
+you launched; the egress proxy runs as a child of it, in a cage of its own, and all of them end
+when it does.
 
 **What it buys** is the property the whole [architecture](architecture) rests on: the cage
 cannot reach what judges it, because what judges it is not a service with an address, a

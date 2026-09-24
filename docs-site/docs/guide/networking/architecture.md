@@ -52,6 +52,14 @@ listens on `127.0.0.1:18043` and forwards to that socket, so tools set the stand
 the host side of the socket sits the `sbx`-owned MITM CONNECT proxy that does all the
 real work.
 
+That proxy is a process of its own, which sbx starts in a cage for every proxy a launch
+stands up: an empty network namespace, and nothing of the host's filesystem but the
+read-only userland its binary may need to load. It holds the policy, the credentials it
+injects and the per-session CA, whose key it mints itself and never hands out. It cannot
+open a connection, so it asks sbx's supervisor for every upstream one
+([the SSRF guard](#the-ssrf-guard) says what the supervisor checks), and it stops when
+the launch that started it ends.
+
 ---
 
 ## Why empty netns (fail-closed by construction)
@@ -500,9 +508,9 @@ and be fronted to `b.example.com`.
 
 ### The SSRF guard
 
-The proxy runs on the host with full network reach, so an allowlisted *hostname* (or a
-rebound DNS answer for it) resolving to an **internal** address would be a
-server-side-request-forgery vector. After resolving, the proxy classifies the target
+Upstream connections are opened on the host, with full network reach, so an allowlisted
+*hostname* (or a rebound DNS answer for it) resolving to an **internal** address would be a
+server-side-request-forgery vector. After resolving, sbx classifies the target
 IP: a public address is reachable subject to policy; a **private/loopback/CGNAT**
 address is refused **unless** the deciding rule names that *exact* host (an explicit
 IP-literal or exact-host allow: a deliberate internal target). A `*.domain` or regex
@@ -521,10 +529,10 @@ blocked outright and never reachable. A dial is bounded by the socket timeout, t
 the permitted addresses in order and reporting the last error; a connection whose TLS
 handshake fails moves on to the next address the same way.
 
-The resolution, this guard and the dial are done by sbx's supervisor, not by the part of
-the proxy that serves the cage's connections. That part asks the supervisor for every
-upstream connection, and the supervisor decides the request again from its own copy of
-the policy before it resolves or dials anything. The two copies agree, since they are
+The resolution, this guard and the dial are done by sbx's supervisor, not by the proxy,
+which has no network of its own. The proxy asks the supervisor for every upstream
+connection, and the supervisor decides the request again from its own copy of the policy
+before it resolves or dials anything. The two copies agree, since they are
 read from the same bytes; they can differ only for the moment a `--session` rule has
 been sent and is not yet in force, and a connection refused then carries
 `supervisor-denied`.

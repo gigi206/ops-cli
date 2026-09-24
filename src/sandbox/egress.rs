@@ -21,7 +21,7 @@
 //! boundary is the empty namespace plus the host proxy, not socat.
 
 use super::binds::ExtraBind;
-use super::proxy::{Ca, HeaderInjection, ProxyCtx, SecretNeedle};
+use super::proxy::{HeaderInjection, SecretNeedle};
 use crate::allowlist::EgressPolicy;
 use crate::config::{HeaderSecret, SecretSource};
 use crate::store::Layout;
@@ -72,26 +72,28 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
 ];
 
 /// A running egress session's host-side resources: the bound proxy socket, the CA file, and the
-/// control socket a host-side `sbx net pending`/`sbx net log` reaches. This guard owns the on-disk
-/// artifacts only, unlinking them when the launch ends. The control socket is deliberately not among
-/// the cage's binds (see [`start`]).
+/// control socket a host-side `sbx net pending`/`sbx net log` reaches, with the proxy's process and
+/// what serves it. This guard stops the proxy and unlinks the artifacts when the launch ends. The
+/// control socket is deliberately not among the cage's binds (see [`start`]).
 ///
-/// # Stopping the accept threads
+/// # Stopping
 ///
-/// The two threads [`start`] spawns are detached and hold the listening fds, and neither
-/// [`super::proxy::serve`] nor [`super::control::serve`] returns on its own —
-/// `UnixListener::incoming()` yields forever, and both loops deliberately treat every `accept(2)`
-/// error as transient (log, sleep 20 ms, continue) so host fd exhaustion cannot take a session's
-/// egress down.
+/// The proxy runs in a process of its own ([`super::proxy::child`]) and stops when its link ends, so
+/// [`Drop`] closes the link and gives the process a moment before it kills it.
+///
+/// The control thread [`start`] spawns is detached and holds its listening fd, and
+/// [`super::control::serve`] does not return on its own: `UnixListener::incoming()` yields forever,
+/// and the loop deliberately treats every `accept(2)` error as transient (log, sleep 20 ms,
+/// continue) so host fd exhaustion cannot take a session's control plane down.
 ///
 /// While the only `Egress` was the session's, that cost nothing: "until sbx exits" and "until the
 /// launch ends" named the same instant. They are not the same instant for the per-invocation proxy
 /// a task invocation stands up ([`start`] with an `instance`, from `sandbox::task`), whose guard is
-/// dropped when the invocation finishes — so a session running N task invocations accumulated 2N
-/// parked threads and 2N listening sockets nothing would ever connect to again.
+/// dropped when the invocation finishes, so a session running N task invocations would accumulate
+/// N parked threads and N listening sockets nothing would ever connect to again.
 ///
-/// So the guard carries a stop flag both loops read, and [`Drop`] sets it and then connects once to
-/// each socket to unpark the `accept`. It has to be a flag plus a poke: a `shutdown(2)` on the
+/// So the guard carries a stop flag the loop reads, and [`Drop`] sets it and then connects once to
+/// the socket to unpark the `accept`. It has to be a flag plus a poke: a `shutdown(2)` on the
 /// listener would be read as one more transient accept error and turn the parked thread into a
 /// 50 Hz error-logging spin, and `close(2)` is worse still — an `EBADF` spin, plus an fd-reuse
 /// hazard against the thread's own eventual close.
@@ -110,12 +112,18 @@ pub(crate) struct Egress {
     /// `sbx app <name> --net-learn` synthesizes rules from. The proxy appends to it; this is a
     /// read handle.
     log: Arc<super::control::LogRing>,
-    /// The stop signal both serve loops read, set by [`Drop`] — see the header above for why the
-    /// threads cannot be ended any other way.
+    /// The stop signal the control loop reads, set by [`Drop`]: the header above says why the
+    /// thread cannot be ended any other way.
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// The supervisor's end of the link to the proxy, held so [`Drop`] and
-    /// [`Self::observed_events`] can ask the proxy to wait until what it reported is applied.
+    /// [`Self::observed_events`] can ask the proxy to wait until what it reported is applied, and so
+    /// [`Drop`] can end it.
     supervisor: super::proxy::link::Supervisor,
+    /// The proxy's process, stopped by [`Drop`] once its link is closed.
+    proxy: super::proxy::child::Proxy,
+    /// The thread applying what the proxy reports, which ends once the proxy's end of the channel
+    /// has closed and what it wrote is applied; `None` once [`Drop`] has waited for it.
+    applier: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Egress {
@@ -161,18 +169,30 @@ impl Egress {
 impl Drop for Egress {
     fn drop(&mut self) {
         // What the proxy reported and the applying side has not reached yet, applied before the
-        // counters are written for the last time. Asked first, while the serve thread still holds
-        // the proxy and so its end of the link: once it stops, the last hold on that end may go
-        // with it, and a flush asked through a link that has ended returns without waiting.
+        // counters are written for the last time. Asked first, while the proxy still serves its
+        // link: once the link is closed, a flush has nobody to answer it.
         self.supervisor.flush();
-        // Stop the two serve threads before the paths go, and in this order: the flag first, then
-        // one throwaway connection per socket to unpark the `accept` they are blocked in. The loops
-        // read the flag the moment `accept` returns — with the connection or with an error, either
-        // ends them — so the poke has to happen while the path still resolves, which is why the
-        // unlinks below come after. A refused or failed connect costs nothing: the thread is then
-        // already gone, or the process is exiting anyway.
+        // The proxy stops when its link ends, closed from this side: the control plane holds a clone
+        // of this end for as long as it serves, so the last one going is not an event to wait for.
+        self.supervisor.close();
+        self.proxy.stop(super::proxy::child::STOP_WAIT);
+        // Whatever it wrote before it went, applied: its end of the report channel went with it.
+        if let Some(applier) = self.applier.take() {
+            let deadline = std::time::Instant::now() + super::proxy::child::STOP_WAIT;
+            while !applier.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if applier.is_finished() {
+                let _ = applier.join();
+            }
+        }
+        // Stop the control thread before the paths go, and in this order: the flag first, then one
+        // throwaway connection to unpark the `accept` it is blocked in. The loop reads the flag the
+        // moment `accept` returns (with the connection or with an error, either ends it), so the
+        // poke has to happen while the path still resolves, which is why the unlinks below come
+        // after. A refused or failed connect costs nothing: the thread is then already gone, or the
+        // process is exiting anyway.
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = std::os::unix::net::UnixStream::connect(&self.host_uds);
         if let Some(control) = &self.control_uds {
             let _ = std::os::unix::net::UnixStream::connect(control);
         }
@@ -1029,43 +1049,56 @@ pub(crate) fn start(
         flows: Some(Arc::clone(&flows)),
         plane,
     };
-    // One stop signal for both serve threads. Set by the guard's `Drop`, which then connects to each
-    // socket once to unpark the `accept` that would otherwise block forever — see `Egress`.
+    // The stop signal of the control thread. Set by the guard's `Drop`, which then connects to the
+    // socket once to unpark the `accept` that would otherwise block forever: see `Egress`.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Before the control plane, which the link below joins to it: a failure here has nothing yet to
-    // unwind.
-    let events = super::proxy::events::spawn(sinks)?;
-    let (control_uds, supervisor, ctx) = {
-        let control_uds = dir.join(format!("control-{pid}{instance}.sock"));
-        let _ = std::fs::remove_file(&control_uds);
-        let pending = Arc::new(super::control::PendingState::new());
-        let manual = Arc::new(super::control::ManualRules::new());
-        // The rules the control plane keeps reach the proxy down a link, which confirms each change
-        // before the command that made it returns; the requests the proxy parks come up the same
-        // link into the queue served here, held to the cap and timeout this end sets, and so do its
-        // requests to re-resolve the credentials, held to the bounds the refresher sets.
-        // The requests the proxy parks are held to the cap, timeout and notice of the supervisor's
-        // own copy of the policy, the one the proxy's copy was decoded beside.
-        let parks = super::proxy::link::Parks::for_policy(judge.policy(), pending.clone());
-        let (link, supervisor) =
-            super::proxy::link::serving(judge, parks, refresh, Some(events.clone()))?;
-        manual.attach(supervisor.clone())?;
-        // The proxy's copy of the credentials is handed over as the policy is: as the form it will
-        // receive once it runs apart, so a field that form drops is dropped on every launch that
-        // injects a credential. See [`super::proxy::Credentials::encode`].
-        let ctx = ProxyCtx::linked(
-            Arc::new(Ca::ephemeral()?),
-            EgressPolicy::decode(&bytes)?,
-            link,
-        )?
-        .with_shared_credentials(std::sync::Arc::new(super::proxy::Credentials::decode(
-            credentials.encode()?,
-        )?))
-        .with_app(app.map(str::to_string))
-        .with_events(events);
-        // Bind+listen here, before the serving thread, so the control plane is reachable the moment
-        // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.
-        let control_listener = UnixListener::bind(&control_uds)?;
+    // Before the proxy, which is handed its end: a failure here has nothing yet to unwind.
+    let (reports, keeps, applier) = super::proxy::events::applied(sinks)?;
+    // Bound before the proxy starts, and handed to it: connections queue from the moment the cage
+    // can reach the socket, so the first is never refused, and nothing here keeps a copy that would
+    // leave the cage queueing in front of a proxy that has gone.
+    let listener = UnixListener::bind(&host_uds)?;
+    // Until the guard is built, a failure leaves no socket behind: nothing else unlinks it.
+    let unlink_socket = |e: io::Error| -> io::Error {
+        let _ = std::fs::remove_file(&host_uds);
+        e
+    };
+    let control_uds = dir.join(format!("control-{pid}{instance}.sock"));
+    let _ = std::fs::remove_file(&control_uds);
+    let pending = Arc::new(super::control::PendingState::new());
+    let manual = Arc::new(super::control::ManualRules::new());
+    // The rules the control plane keeps reach the proxy down a link, which confirms each change
+    // before the command that made it returns; the requests the proxy parks come up the same link
+    // into the queue served here, held to the cap and timeout this end sets, and so do its requests
+    // to re-resolve the credentials, held to the bounds the refresher sets. The requests the proxy
+    // parks are held to the cap, timeout and notice of the supervisor's own copy of the policy, the
+    // one the proxy's copy is decoded beside.
+    let parks = super::proxy::link::Parks::for_policy(judge.policy(), pending.clone());
+    // The proxy's copy of the policy and of the credentials cross in the form they are encoded to,
+    // so a field that form drops is dropped on every launch. See [`EgressPolicy::encode`] and
+    // [`super::proxy::Credentials::encode`].
+    let launched = super::proxy::child::launch(
+        super::proxy::child::Start {
+            bwrap,
+            policy: &bytes,
+            credentials: &credentials,
+            app,
+            listener,
+            reports,
+            keeps,
+        },
+        judge,
+        parks,
+        refresh,
+    )
+    .map_err(&unlink_socket)?;
+    manual
+        .attach(launched.supervisor.clone())
+        .map_err(&unlink_socket)?;
+    // Bind+listen here, before the serving thread, so the control plane is reachable the moment the
+    // launch is up: never a race with the first `sbx net pending`/`sbx net log`.
+    let control_listener = UnixListener::bind(&control_uds).map_err(&unlink_socket)?;
+    {
         let control_log = log.clone();
         let control_capture = capture;
         let control_stats = stats.clone();
@@ -1084,8 +1117,8 @@ pub(crate) fn start(
                 control_stop,
             );
         });
-        (Some(control_uds), supervisor, ctx)
-    };
+    }
+    let control_uds = Some(control_uds);
     if let Some(stats) = &stats {
         // The trailing write, so the debounce below only bounds how *often* the file is rewritten
         // and never how much of the session it reflects once the traffic stops.
@@ -1097,21 +1130,22 @@ pub(crate) fn start(
     // until its last statement. A failure below therefore performs that teardown itself before it
     // propagates, in `Drop`'s order and for `Drop`'s reasons: the flag first, then one throwaway
     // connection to unpark the `accept` the thread is blocked in, then the path. Without it a
-    // process that keeps going after a failed `start` — a batch `sbx upgrade` moving to the next
-    // app — accumulates one parked thread and one dead socket per failure.
+    // process that keeps going after a failed `start` (a batch `sbx upgrade` moving to the next
+    // app) accumulates one parked thread and one dead socket per failure. The proxy goes with
+    // `launched`, which stops it when it is dropped.
     let unwind_control = |e: io::Error| -> io::Error {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(control) = &control_uds {
             let _ = std::os::unix::net::UnixStream::connect(control);
             let _ = std::fs::remove_file(control);
         }
-        e
+        unlink_socket(e)
     };
-    let ctx = Arc::new(ctx);
 
     // Write the CA bundle owner-only, outside every writable mount, then bind it read-only — the
     // agent gets a trust anchor it cannot rewrite. It always opens with the per-session MITM CA,
-    // which is what verifies every inspected byte the cage receives.
+    // which is what verifies every inspected byte the cage receives: the certificate the proxy
+    // answered with once it served, whose key never left it.
     //
     // The public roots follow it by default, for either of two independent reasons.
     //
@@ -1139,7 +1173,7 @@ pub(crate) fn start(
             .truncate(true)
             .mode(0o600)
             .open(&ca_file)?;
-        f.write_all(ctx.ca_cert_pem().as_bytes())?;
+        f.write_all(launched.ca.as_bytes())?;
         if let Some(bundle) = ca_bundle.filter(|_| roots_needed)
             && let Ok(roots) = std::fs::read(bundle)
         {
@@ -1149,16 +1183,6 @@ pub(crate) fn start(
         Ok(())
     };
     write_ca().map_err(&unwind_control)?;
-
-    // Bind+listen happens here on the main thread, before the thread accepts, so connections
-    // queue from the moment the cage can reach the socket — no first-request race.
-    let listener = UnixListener::bind(&host_uds).map_err(&unwind_control)?;
-    let serve_ctx = ctx;
-    let proxy_stop = stop.clone();
-    std::thread::spawn(move || {
-        // A serve error ends the proxy thread; the cage then loses egress (fail-closed).
-        let _ = super::proxy::serve(listener, serve_ctx, proxy_stop);
-    });
 
     let proxy_url = format!("http://127.0.0.1:{CAGE_PROXY_PORT}");
     // Exempt loopback from the proxy: an agent's own in-cage service (a dev server, a test
@@ -1214,7 +1238,9 @@ pub(crate) fn start(
             stats,
             log,
             stop,
-            supervisor,
+            supervisor: launched.supervisor,
+            proxy: launched.proxy,
+            applier: Some(applier),
         },
         Wiring {
             binds,
@@ -2111,6 +2137,43 @@ mod tests {
         );
     }
 
+    /// Dropping the guard stops its proxy well within the bounds it waits on: the proxy stops on the
+    /// end of its link rather than when the wait for it runs out, and the report channel ends with it,
+    /// since nothing on this side kept a copy of the proxy's end.
+    #[test]
+    fn dropping_the_guard_stops_its_proxy_well_within_its_bounds() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let (guard, _wiring) = start(
+            &layout,
+            EgressPolicy::default(),
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            false,
+            None,
+            "-5",
+            None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            None,
+            Plane::Agent,
+            None,
+            Unresolved::Abort,
+            None,
+        )
+        .expect("start the egress proxy");
+        let begun = std::time::Instant::now();
+        drop(guard);
+        let took = begun.elapsed();
+        assert!(
+            took < super::super::proxy::child::STOP_WAIT,
+            "the guard waited out a bound: {took:?}"
+        );
+    }
+
     /// Every path this guard owns goes when the launch ends. A path it holds but does not unlink is
     /// a file per session left behind for good: nothing else writes these names, and the runtime
     /// sweep is a backstop for the sessions that end on a signal, not a substitute for the guard.
@@ -2135,6 +2198,8 @@ mod tests {
                 super::super::control::LOG_RING_CAP,
             )),
             supervisor: super::super::proxy::link::pair().1,
+            proxy: super::super::proxy::child::Proxy::none(),
+            applier: None,
         });
         for path in &paths {
             assert!(!path.exists(), "left behind: {}", path.display());

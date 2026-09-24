@@ -345,6 +345,13 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
                 a.push(lit("--tmpfs"));
                 a.push(path(dest));
             }
+            Mount::Copy { fd, dest } => {
+                a.push(lit("--perms"));
+                a.push(lit("0555"));
+                a.push(lit("--file"));
+                a.push(OsString::from(fd.to_string()));
+                a.push(path(dest));
+            }
         }
     }
 
@@ -1106,9 +1113,12 @@ mod tests {
         // Spawns bubblewrap itself rather than through the launch command, and the list it hands it
         // is the composed one. `doctor`'s probe is sbx's own, fixed, and reports on the host rather
         // than running anything for a project, so it owes no scope; the session launcher and the
-        // task pool each run a project's own code and take the scope with the composed list.
+        // task pool each run a project's own code and take the scope with the composed list. The
+        // egress proxy runs sbx's own binary, which bounds its own memory (`[network] body_max_mb`,
+        // `max_connections`), and takes no scope.
         const SPAWNS_THE_COMPOSED_LIST: &[&str] = &[
             "src/sandbox/launch/cage.rs",
+            "src/sandbox/proxy/child.rs",
             "src/sandbox/smoke.rs",
             "src/sandbox/taskpool.rs",
         ];

@@ -201,6 +201,7 @@ use super::egress_stats::StatKind;
 mod bench;
 pub(super) mod ca;
 mod capture;
+pub(crate) mod child;
 mod cleartext;
 mod ctx;
 mod dns;

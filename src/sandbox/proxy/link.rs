@@ -3,10 +3,10 @@
 //! [`super::events`] carries the proxy's account of its own work, one way. This carries the other
 //! direction: state the supervisor owns and the proxy decides with — the rules an operator loads
 //! into a running session (`sbx net allow|deny|mute --session`, or an `ask` answered with
-//! `--session`), and the answer to a request the proxy parks under `ask`. The proxy is to run in a
-//! process of its own, so neither side holds the other's structures: each end reads its own end of
-//! a socket ([`wire`]) on a thread of its own. Until the proxy moves the two ends are a pair within
-//! one process, so every message already crosses as the bytes it will cross in then.
+//! `--session`), and the answer to a request the proxy parks under `ask`. The proxy runs in a
+//! process of its own ([`super::child`]), so neither side holds the other's structures: each end
+//! reads its own end of a socket ([`wire`]) on a thread of its own. A test joins the two ends within
+//! one process, and every message crosses as the same bytes.
 //!
 //! **A rule is in force when the supervisor hears that it is.** The supervisor sends the whole
 //! overlay under a version ([`Supervisor::push`]); the proxy's reader installs it and then says which
@@ -42,7 +42,7 @@
 //! time, an HTTP/2 tunnel two): the reader never waits on a name or a dial.
 
 mod judge;
-mod wire;
+pub(super) mod wire;
 
 pub(crate) use judge::{Asked, Judge, Plane};
 
@@ -416,6 +416,17 @@ impl Link {
         }
     }
 
+    /// Send `doc` to the supervisor outside the link's own messages: a proxy that runs apart says
+    /// once, first, that it serves ([`super::child`]), and the supervisor reads that before it starts
+    /// the reader that takes in the rest.
+    pub(super) fn announce(&self, doc: &[u8]) -> io::Result<()> {
+        self.side
+            .socket
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
+            .send_up(doc)
+    }
+
     /// The judge the supervisor's end of this link answers with, when both ends are in this process.
     #[cfg(test)]
     pub(crate) fn judge(&self) -> Option<Arc<Judge>> {
@@ -566,6 +577,16 @@ impl Supervisor {
         }
     }
 
+    /// End the link from this side: the reader reads its end and lets go of what the proxy parked,
+    /// and the proxy reads the end of its link, which is how a proxy that runs apart is told to
+    /// stop. Every clone of this end is ended with it; the control plane keeps one for as long as it
+    /// serves, so the launch's own end cannot wait for the last to drop.
+    pub(crate) fn close(&self) {
+        if let Some(socket) = locked(&self.side.down).clone() {
+            socket.shutdown();
+        }
+    }
+
     /// What this end has heard, once `reached` holds of it, the link has ended, or `deadline` has
     /// passed.
     fn until(&self, deadline: Instant, reached: impl Fn(&Heard) -> bool) -> MutexGuard<'_, Heard> {
@@ -595,18 +616,17 @@ fn gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "the proxy is gone")
 }
 
-/// Join a proxy to the supervisor that serves it, starting the reader on each side, with the
-/// requests the proxy parks served as `parks` says, its refreshes by `refresh`, and its flushes of
-/// what it reported through `events`. Both readers end once the proxy lets go of its [`Link`], and
-/// so does every thread waiting on a request it parked.
-pub(crate) fn serving(
+/// Serve the proxy at the other end of `socket`, which runs apart ([`super::child`]), with the
+/// requests it parks served as `parks` says and its refreshes by `refresh`. The reader ends when the
+/// proxy's end closes, or when [`Supervisor::close`] ends the link from this side, and so does every
+/// thread waiting on a request it parked.
+pub(super) fn supervising(
+    socket: wire::Socket,
     judge: Arc<Judge>,
     parks: Parks,
     refresh: Option<Arc<CredentialRefresh>>,
-    events: Option<Emitter>,
-) -> io::Result<(Link, Supervisor)> {
-    let (link, supervisor, _) = start(judge, Some(parks), refresh, events, named_thread)?;
-    Ok((link, supervisor))
+) -> io::Result<Supervisor> {
+    Ok(supervise(socket, judge, Some(parks), refresh, named_thread)?.0)
 }
 
 /// A judge over the default policy: all a test that makes no connection needs.
@@ -618,8 +638,9 @@ pub(crate) fn default_judge() -> Arc<Judge> {
     Arc::new(Judge::new(&bytes).expect("a judge over the default policy"))
 }
 
-/// [`serving`] with `judge`, and the requests the proxy parks and its refreshes served only as the
-/// test says: how a test builds the link a proxy decides through.
+/// Both ends of a link in this process, the supervisor's judging with `judge`, and the requests the
+/// proxy parks and its refreshes served only as the test says: how a test builds the link a proxy
+/// decides through.
 #[cfg(test)]
 pub(crate) fn joined(
     judge: Arc<Judge>,
@@ -631,14 +652,14 @@ pub(crate) fn joined(
     (link, supervisor)
 }
 
-/// [`serving`] with nobody to answer a parked request or a refresh: all a test of the rules alone
+/// [`joined`] with nobody to answer a parked request or a refresh: all a test of the rules alone
 /// needs.
 #[cfg(test)]
 pub(crate) fn pair() -> (Link, Supervisor) {
     joined(default_judge(), None, None)
 }
 
-/// [`serving`] with only the refreshes served: all a test of the refresh needs.
+/// [`joined`] with only the refreshes served: all a test of the refresh needs.
 #[cfg(test)]
 pub(crate) fn refreshing(refresh: Arc<CredentialRefresh>) -> (Link, Supervisor) {
     joined(default_judge(), None, Some(refresh))
@@ -651,10 +672,12 @@ fn named_thread(name: &str) -> std::thread::Builder {
 
 /// The two readers of a link: the proxy's, and the supervisor's, which returns why the link ended
 /// when the proxy's end is not what ended it.
+#[cfg(test)]
 type Readers = (JoinHandle<()>, JoinHandle<io::Result<()>>);
 
-/// [`serving`], keeping the two readers' handles, with the way the supervisor's end starts its
-/// threads passed in.
+/// Both ends of a link in this process, keeping the two readers' handles, with the way the
+/// supervisor's end starts its threads passed in.
+#[cfg(test)]
 fn start(
     judge: Arc<Judge>,
     parks: Option<Parks>,
@@ -679,7 +702,10 @@ fn start(
 /// The proxy's half of a link, on its end `socket`: the reader that installs and hands over what
 /// the supervisor sends, and the thread that answers the supervisor's flushes of what `events`
 /// reported. Both end with the link.
-fn attend(socket: wire::Socket, events: Option<Emitter>) -> io::Result<(Link, JoinHandle<()>)> {
+pub(super) fn attend(
+    socket: wire::Socket,
+    events: Option<Emitter>,
+) -> io::Result<(Link, JoinHandle<()>)> {
     let side = Arc::new(ProxySide::on(Some(socket)));
     let (flushes, asked) = channel();
     {
@@ -1169,11 +1195,7 @@ mod tests {
     fn a_parked_request_is_decided_by_the_answer_given_to_the_supervisors_queue() {
         for verdict in [Verdict::Allow, Verdict::Deny] {
             let pending = Arc::new(PendingState::new());
-            let link = Arc::new(
-                serving(default_judge(), parks(&pending, 4, None), None, None)
-                    .unwrap()
-                    .0,
-            );
+            let link = Arc::new(joined(default_judge(), Some(parks(&pending, 4, None)), None).0);
             let asking = park_on(&link, "api.test");
             let rows = listed(&pending, 1);
             assert_eq!(
@@ -1197,13 +1219,11 @@ mod tests {
     fn the_supervisor_times_a_parked_request_out() {
         let pending = Arc::new(PendingState::new());
         let link = Arc::new(
-            serving(
+            joined(
                 default_judge(),
-                parks(&pending, 4, Some(Duration::from_millis(50))),
-                None,
+                Some(parks(&pending, 4, Some(Duration::from_millis(50)))),
                 None,
             )
-            .unwrap()
             .0,
         );
         assert_eq!(
@@ -1220,11 +1240,7 @@ mod tests {
     #[test]
     fn a_request_parked_past_the_cap_is_denied_without_entering_the_queue() {
         let pending = Arc::new(PendingState::new());
-        let link = Arc::new(
-            serving(default_judge(), parks(&pending, 1, None), None, None)
-                .unwrap()
-                .0,
-        );
+        let link = Arc::new(joined(default_judge(), Some(parks(&pending, 1, None)), None).0);
         let first = park_on(&link, "first.test");
         let rows = listed(&pending, 1);
         assert_eq!(
@@ -1898,11 +1914,7 @@ mod tests {
             (controls.clone(), controls),
         ] {
             let pending = Arc::new(PendingState::new());
-            let link = Arc::new(
-                serving(default_judge(), parks(&pending, 4, None), None, None)
-                    .unwrap()
-                    .0,
-            );
+            let link = Arc::new(joined(default_judge(), Some(parks(&pending, 4, None)), None).0);
             let (tx, answered) = channel();
             {
                 let (link, host, path) = (Arc::clone(&link), host.clone(), path.clone());

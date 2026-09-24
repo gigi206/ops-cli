@@ -15,7 +15,10 @@ See also: [What sbx is](./) · [Security model](security-model) ·
 `sbx` is a single binary, and nothing of it runs between launches. Everything that
 *decides* lives on the **host side**, inside the process you invoked: it reads the
 configuration, applies the trust gate, resolves the secrets, builds the description of the
-sandbox, launches it, and supervises what it launched.
+sandbox, launches it, and supervises what it launched. The one part that runs apart is the
+egress proxy, which reads what the cage sends: a child process in a cage of its own, with no
+network, that asks the supervisor for every connection it opens
+([networking architecture](../networking/architecture#the-ssrf-guard)).
 
 The cage holds no policy of its own. It receives a filesystem, an environment, and a small
 number of sockets, and every one of those was placed there by a decision taken before it

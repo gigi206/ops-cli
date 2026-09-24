@@ -183,9 +183,9 @@ impl ProxyCtx {
     /// config advertises no ALPN, so the client speaks HTTP/1.1 and every request is re-checked
     /// as its own CONNECT — nothing multiplexes past the filter.
     ///
-    /// `link` is the proxy's end of the link to the supervisor, which the launch serves
-    /// ([`super::link::serving`]) with a judge over the same policy bytes this one was decoded from.
-    /// The park notices are on unless the policy suppressed them (`[network] ask_notice = false`).
+    /// `link` is the proxy's end of the link to the supervisor, which the launch serves with a judge
+    /// over the same policy bytes this one was decoded from ([`super::child`]). The park notices are
+    /// on unless the policy suppressed them (`[network] ask_notice = false`).
     pub(crate) fn linked(ca: Arc<Ca>, user_policy: EgressPolicy, link: Link) -> io::Result<Self> {
         let mut ctx = Self::build(ca, user_policy, link)?;
         ctx.notices = ctx.policy.ask_notice();

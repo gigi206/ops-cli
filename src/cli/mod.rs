@@ -742,6 +742,11 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // invoked by a user directly, so it carries no page of its own. `rest` is
         // `[<egress socket path>]`; it never returns.
         "__net-tap" => crate::sandbox::run_tap(&rest),
+        // Internal: the egress proxy. Started by a launch inside a cage of its own (no network, no
+        // host filesystem but the read-only userland), it serves the cage's egress socket and asks
+        // the launch for every upstream connection over the link it is handed. Never invoked by a
+        // user directly, so it carries no page of its own. `rest` is `[<link descriptor>]`.
+        "__proxy" => crate::sandbox::run_proxy(&rest),
         // Internal: `doctor`'s transparent-capture probe. Creates a throwaway user+network
         // namespace and tries to install the redirect rules in it, so the answer is a measurement
         // rather than an inference about the kernel. A subcommand because `doctor` cannot unshare

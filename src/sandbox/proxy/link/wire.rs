@@ -33,7 +33,7 @@ pub(super) const INLINE_MAX: usize = 64 * 1024;
 /// parser admits. Written as JSON, a byte of it takes at most two (`\\` and `\"`), and the host
 /// comes from a 16 KiB head as well; this leaves room above that, and stays under the largest
 /// datagram a socket's default send buffer holds.
-pub(super) const MAX_UP: usize = 192 * 1024;
+pub(in crate::sandbox::proxy) const MAX_UP: usize = 192 * 1024;
 
 /// The most descriptors the kernel passes in one message (`SCM_MAX_FD`), and so the room the proxy
 /// keeps for them.
@@ -46,7 +46,7 @@ const INLINE: u8 = 0;
 const IN_FILE: u8 = 1;
 
 /// One end of the link's socket.
-pub(super) struct Socket(OwnedFd);
+pub(in crate::sandbox::proxy) struct Socket(OwnedFd);
 
 impl AsFd for Socket {
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -54,9 +54,16 @@ impl AsFd for Socket {
     }
 }
 
+/// The descriptor itself, for the end a process is started holding.
+impl From<Socket> for OwnedFd {
+    fn from(socket: Socket) -> OwnedFd {
+        socket.0
+    }
+}
+
 impl Socket {
     /// A connected pair, both ends close-on-exec.
-    pub(super) fn pair() -> io::Result<(Socket, Socket)> {
+    pub(in crate::sandbox::proxy) fn pair() -> io::Result<(Socket, Socket)> {
         let mut fds: [RawFd; 2] = [-1; 2];
         // SAFETY: `socketpair` writes two descriptors into the two-element array on success, and
         // touches nothing else.
@@ -74,6 +81,66 @@ impl Socket {
         // SAFETY: both are descriptors `socketpair` just opened for this process, each wrapped once.
         let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         Ok((Socket(pair.0), Socket(pair.1)))
+    }
+
+    /// The end of a link this process was started holding as descriptor `fd`, which it now owns:
+    /// refused unless `fd` is a socket of the kind [`Self::pair`] makes, so a number that names
+    /// anything else (closed, a file, another socket) is never read as a link. Made close-on-exec,
+    /// as every end is.
+    pub(in crate::sandbox::proxy) fn adopt(fd: RawFd) -> io::Result<Socket> {
+        let mut kind: libc::c_int = 0;
+        let mut len = size_of_val(&kind) as libc::socklen_t;
+        // SAFETY: `SO_TYPE` writes one `c_int` into what is passed, with its size; a number that is
+        // no open descriptor fails with `EBADF` and writes nothing.
+        let read = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                std::ptr::from_mut(&mut kind).cast(),
+                &mut len,
+            )
+        };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if kind != libc::SOCK_SEQPACKET {
+            return Err(invalid("a descriptor that is not the end of a link"));
+        }
+        // SAFETY: `fd` is an open socket this process was started with and nothing else owns;
+        // `F_SETFD` changes only its close-on-exec flag.
+        unsafe {
+            if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Socket(OwnedFd::from_raw_fd(fd)))
+        }
+    }
+
+    /// Wait at most `wait` for a message, or the end of the link, to be there to read. `false` when
+    /// the wait ran out first.
+    pub(in crate::sandbox::proxy) fn readable_within(&self, wait: Duration) -> io::Result<bool> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut ready = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+            // SAFETY: one `pollfd` on an open descriptor, with its count.
+            match unsafe { libc::poll(&mut ready, 1, millis) } {
+                0 => return Ok(false),
+                n if n > 0 => return Ok(true),
+                _ => {
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::Interrupted {
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 
     /// Wait at most `wait` for room to send a message, then fail the send with
@@ -104,7 +171,11 @@ impl Socket {
 
     /// Send `doc` to the proxy, handing over `fds` with it: in the message itself when it fits, in a
     /// file otherwise.
-    pub(super) fn send_down(&self, doc: &[u8], fds: &[OwnedFd]) -> io::Result<()> {
+    pub(in crate::sandbox::proxy) fn send_down(
+        &self,
+        doc: &[u8],
+        fds: &[OwnedFd],
+    ) -> io::Result<()> {
         let handed: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
         if doc.len() <= INLINE_MAX {
             match self.send(&[&[INLINE], doc], &handed) {
@@ -124,7 +195,9 @@ impl Socket {
 
     /// The next message from the supervisor and the descriptors it handed over, or `None` where the
     /// link ends.
-    pub(super) fn recv_down(&self) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+    pub(in crate::sandbox::proxy) fn recv_down(
+        &self,
+    ) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
         let mut buf = vec![0u8; 1 + INLINE_MAX];
         let (mut control, space) = control_room(MAX_FDS);
         let mut iov = libc::iovec {
@@ -194,7 +267,10 @@ impl Socket {
 
     /// Read the next message from the proxy into `buf`, which holds [`MAX_UP`] bytes: its length,
     /// or `None` where the link ends.
-    pub(super) fn recv_up_into(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+    pub(in crate::sandbox::proxy) fn recv_up_into(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<Option<usize>> {
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
@@ -354,7 +430,7 @@ fn fds_len(count: usize) -> libc::c_uint {
 
 /// A message this end refuses, saying `what` is wrong with it. A fixed text: a message may hold a
 /// credential set, and a parser's own message can quote the value it stopped at.
-pub(super) fn invalid(what: &str) -> io::Error {
+pub(in crate::sandbox::proxy) fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("link: {what}"))
 }
 

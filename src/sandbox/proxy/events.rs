@@ -1,12 +1,11 @@
 //! What the proxy reports about its own work, as messages to the process that supervises it.
 //!
-//! The proxy is to run in a process of its own, holding none of the session's shared state. What it
-//! reports — a decision counted, a refusal to announce, a credential a signer formed, a decision
-//! logged and what later completes it — therefore leaves it as owned values on a bounded queue
-//! ([`Emitter`]), written to a socket, and one thread on the supervisor's side ([`applying`]) reads
-//! them and applies them to the structures a reader consults. The socket is already the one the
-//! report crosses: until the proxy moves, both ends are a pair within one process ([`spawn`]), so
-//! this is the one path, and every test that reads a count reads it through the bytes.
+//! The proxy runs in a process of its own ([`super::child`]), holding none of the session's shared
+//! state. What it reports (a decision counted, a refusal to announce, a credential a signer
+//! formed, a decision logged and what later completes it) therefore leaves it as owned values on a
+//! bounded queue ([`Emitter`]), written to a socket, and one thread on the supervisor's side
+//! ([`applying`]) reads them and applies them to the structures a reader consults. A test joins both
+//! ends within one process, and every test that reads a count reads it through the bytes.
 //!
 //! **Delivery is asynchronous, and backpressure blocks.** A full queue makes the sender wait rather
 //! than lose an event: the proxy's memory stays bounded, only the proxy slows down, and the
@@ -308,7 +307,7 @@ pub(crate) struct Emitter {
 }
 
 /// Which kinds of event a launch keeps a structure for.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Keeps {
     pub(crate) stats: bool,
     pub(crate) refusals: bool,
@@ -410,17 +409,29 @@ impl Emitter {
 /// Start the applying side for one proxy, returning the proxy's end of its queue. The two ends are a
 /// socket pair within this process; the applying thread ends once every clone of the returned
 /// [`Emitter`] is dropped, after applying what they queued.
+#[cfg(test)]
 pub(crate) fn spawn(sinks: Sinks) -> io::Result<Emitter> {
     Ok(start(sinks)?.0)
 }
 
 /// [`spawn`], keeping the applying thread's handle: a caller that joins it knows the structures it
 /// was handed are no longer held.
+#[cfg(test)]
 fn start(sinks: Sinks) -> io::Result<(Emitter, std::thread::JoinHandle<()>)> {
+    let (proxy, keeps, applier) = applied(sinks)?;
+    Ok((emitter(proxy, keeps)?, applier))
+}
+
+/// Start the applying side for one proxy that runs apart: the proxy's end of the channel, to hand
+/// over with what the launch keeps, and the applying thread, which ends once the proxy has let go
+/// of its end, after applying what it wrote.
+pub(crate) fn applied(
+    sinks: Sinks,
+) -> io::Result<(UnixStream, Keeps, std::thread::JoinHandle<()>)> {
     let keeps = Keeps::of(&sinks);
     let (proxy, supervisor) = UnixStream::pair()?;
     let applier = applying(sinks, supervisor)?;
-    Ok((emitter(proxy, keeps)?, applier))
+    Ok((proxy, keeps, applier))
 }
 
 /// The proxy's end of a report written to `channel`, for a launch that keeps what `keeps` says.

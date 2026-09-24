@@ -44,6 +44,14 @@ pub(crate) enum Mount {
     DevBind { src: PathBuf, dest: PathBuf },
     /// A fresh, private tmpfs at `dest`.
     Tmpfs { dest: PathBuf },
+    /// A copy of the file open as descriptor `fd` in the launcher, readable and executable at
+    /// `dest`: what runs a program no path names any more (its file deleted since it was opened).
+    /// The descriptor must reach bwrap: the exec is prepared with
+    /// [`super::memfd::inherit_across_exec`].
+    Copy {
+        fd: std::os::fd::RawFd,
+        dest: PathBuf,
+    },
 }
 
 impl Mount {
@@ -61,7 +69,8 @@ impl Mount {
             | Mount::Proc { dest }
             | Mount::Dev { dest }
             | Mount::DevBind { dest, .. }
-            | Mount::Tmpfs { dest } => dest,
+            | Mount::Tmpfs { dest }
+            | Mount::Copy { dest, .. } => dest,
         }
     }
 }

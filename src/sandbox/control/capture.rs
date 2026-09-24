@@ -112,7 +112,7 @@ pub(crate) const CAPTURE_RING_CAP: usize = 200;
 pub(crate) const CAPTURE_TOTAL_BUDGET: usize = 16 * 1024 * 1024;
 
 /// The per-part byte caps a launch captures with, derived once from the policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CaptureCaps {
     /// The most head bytes kept per direction.
     pub(crate) head: usize,
