@@ -623,12 +623,13 @@ impl ProxyCtx {
     /// The request that met the `401` is already lost: its head has been relayed to the cage by the
     /// time the status is read. What a refresh buys is the *next* one, which is enough for a client
     /// that retries — and every agent CLI observed here does.
+    ///
+    /// A signer the new set keeps is asked through the conversation already open with it
+    /// ([`super::inject::CredentialSet::decode_over`]).
     pub(super) fn credential_refused(&self) {
-        if let Some(set) = self
-            .link
-            .refresh()
-            .and_then(|handed| super::inject::CredentialSet::decode(handed).ok())
-        {
+        if let Some(set) = self.link.refresh().and_then(|handed| {
+            super::inject::CredentialSet::decode_over(handed, &self.credentials.snapshot()).ok()
+        }) {
             self.credentials.replace(set);
         }
     }
@@ -1094,5 +1095,83 @@ mod wiring_tests {
                 "a {proto:?} refusal on :{port} must offer `{expected}`, got {body:?}"
             );
         }
+    }
+
+    /// The conversation the injection at `at` holds in the proxy's copy.
+    fn conversation(
+        set: &super::super::inject::CredentialSet,
+        at: usize,
+    ) -> Arc<Mutex<dyn crate::sandbox::signer::Signing>> {
+        match &set.injections[at].form {
+            super::super::inject::Form::Signed(super::super::inject::Signed {
+                signer: super::super::inject::Signer::Asking { channel, .. },
+                ..
+            }) => Arc::clone(channel),
+            _ => panic!("injection {at} holds no conversation"),
+        }
+    }
+
+    /// A signer the supervisor's re-resolution kept is asked, once the proxy installs the new set,
+    /// through the conversation the proxy already had with it. A second one over the same plugin's
+    /// socket would read the first's answers the moment two requests ask at once.
+    #[test]
+    fn a_kept_signer_is_asked_through_the_conversation_already_open() {
+        use super::super::inject::{CredentialRefresh, Form, HeaderInjection, Signed, Signer};
+        let rule = |host: &str| crate::allowlist::classify(host).unwrap();
+        let (process, _plugin) =
+            crate::sandbox::signer::SignerProcess::stand_in(&["Authorization"]);
+        let signed = HeaderInjection {
+            rule: rule("signed.test"),
+            form: Form::Signed(Signed {
+                name: "demo-sig".to_string(),
+                sets: vec!["Authorization".to_string()],
+                sees: Vec::new(),
+                key: "the-key".to_string(),
+                marker: None,
+                signer: Signer::Running(Arc::new(process)),
+                body_digest: None,
+            }),
+        };
+        let supervisors = Arc::new(Credentials::new(
+            vec![
+                HeaderInjection::fixed(rule("fixed.test"), "Authorization", "Bearer old"),
+                signed,
+            ],
+            Vec::new(),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        let proxys = Arc::new(Credentials::decode(supervisors.encode().unwrap()).unwrap());
+        let before = conversation(&proxys.snapshot(), 1);
+        let refresh = Arc::new(CredentialRefresh::new(
+            supervisors,
+            Box::new(move |standing| {
+                Ok((
+                    vec![
+                        HeaderInjection::fixed(rule("fixed.test"), "Authorization", "Bearer new"),
+                        standing[1].clone(),
+                    ],
+                    Vec::new(),
+                ))
+            }),
+        ));
+        let ctx = ProxyCtx::new(
+            Arc::new(crate::sandbox::proxy::ca::Ca::ephemeral().unwrap()),
+            EgressPolicy::default(),
+        )
+        .unwrap()
+        .with_shared_credentials(Arc::clone(&proxys))
+        .with_refresh(refresh);
+        ctx.credential_refused();
+        let after = proxys.snapshot();
+        assert_eq!(
+            after.injections[0].value(),
+            "Bearer new",
+            "the proxy installed the set it was handed"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &conversation(&after, 1)),
+            "the kept signer is asked through the conversation already open"
+        );
     }
 }

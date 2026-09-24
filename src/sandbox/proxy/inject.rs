@@ -57,13 +57,43 @@ pub(crate) struct Signed {
     /// sbx substitutes it into the plugin's own headers on their way to the wire, so the plugin can
     /// place a credential it never learns.
     pub(crate) marker: Option<std::sync::Arc<super::super::broker::SecretMarker>>,
-    /// The running plugin, serialized: it is one process answering one question at a time, and a
-    /// launch may have many requests in flight.
-    pub(crate) process: std::sync::Arc<std::sync::Mutex<dyn crate::sandbox::signer::Signing>>,
+    /// The plugin that forms the headers, as this copy of the credentials holds it.
+    pub(crate) signer: Signer,
     /// The digest this plugin's manifest asked for over the request body, if any. Read *before* the
     /// plugin runs, because it decides whether the caller holds the body at all — which is a choice
     /// about how the request is forwarded, not about how it is signed.
     pub(crate) body_digest: Option<crate::plugins::signer::BodyDigest>,
+}
+
+/// A signer plugin as one side holds it.
+///
+/// The supervisor starts the plugin and hands it its credential; the proxy asks it one question per
+/// request. The two copies of a credential set therefore hold different things, and a copy holds one
+/// kind only: the supervisor's is built by the launch's resolution, the proxy's is decoded from what
+/// the supervisor hands over ([`Transfer`]).
+#[derive(Clone)]
+pub(crate) enum Signer {
+    /// The supervisor's: the running plugin, kept alive by this copy, kept by a re-resolution that
+    /// finds it unchanged, and handed over as a descriptor. It signs nothing.
+    Running(std::sync::Arc<crate::sandbox::signer::SignerProcess>),
+    /// The proxy's: the conversation with plugin `id`, serialized, since it answers one question at
+    /// a time and a launch may have many requests in flight.
+    Asking {
+        id: u64,
+        channel: std::sync::Arc<std::sync::Mutex<dyn crate::sandbox::signer::Signing>>,
+    },
+}
+
+impl Signer {
+    /// A conversation with `signing` standing in for a plugin, for the tests of what the proxy does
+    /// with an answer.
+    #[cfg(test)]
+    pub(crate) fn asking(signing: impl crate::sandbox::signer::Signing + 'static) -> Self {
+        Signer::Asking {
+            id: 0,
+            channel: std::sync::Arc::new(std::sync::Mutex::new(signing)),
+        }
+    }
 }
 
 impl HeaderInjection {
@@ -286,9 +316,16 @@ pub(crate) fn pairs_for(
                 };
                 // A poisoned lock is a panic in another thread's `sign`, which is not a state to
                 // sign in: refuse like any other failure rather than reach past it.
-                let signed_headers = match signed.process.lock() {
-                    Ok(mut process) => process.sign(&ask),
-                    Err(_) => Err("the signer plugin is in an unusable state".to_string()),
+                let signed_headers = match &signed.signer {
+                    Signer::Asking { channel, .. } => match channel.lock() {
+                        Ok(mut channel) => channel.sign(&ask),
+                        Err(_) => Err("the signer plugin is in an unusable state".to_string()),
+                    },
+                    // The supervisor's copy, which signs nothing: a proxy holding one was handed
+                    // no conversation.
+                    Signer::Running(_) => Err("the proxy holds no conversation with this signer \
+                                               plugin"
+                        .to_string()),
                 };
                 // What sbx observed of this request, which leads every line on the feed. The values
                 // are never in it — the header *names* are what a reader needs, and they are the
@@ -1071,7 +1108,19 @@ pub(crate) struct CredentialRefresh {
     /// The least time between two attempts: [`MIN_REFRESH_GAP`], shorter only in a test that needs
     /// a second attempt.
     gap: std::time::Duration,
+    /// How long a signer plugin a re-resolution replaced is kept: [`RETIRE_AFTER`], shorter only in
+    /// a test that waits for one to go.
+    retire_after: std::time::Duration,
 }
+
+/// How long a signer plugin a re-resolution replaced is kept alive after it.
+///
+/// The proxy may be asking it at that moment, through the conversation the set it just replaced
+/// held, and the supervisor cannot see that from where it stands. A question and its answer are
+/// each bounded by [`crate::sandbox::signer::SIGN_DEADLINE`], so twice that lets one asked just
+/// before the replacement be answered. A request that holds the old set longer than that before it
+/// asks is refused rather than signed with the key that was just replaced.
+const RETIRE_AFTER: std::time::Duration = crate::sandbox::signer::SIGN_DEADLINE.saturating_mul(2);
 
 #[derive(Default)]
 struct RefreshState {
@@ -1102,6 +1151,7 @@ impl CredentialRefresh {
             state: std::sync::Arc::new(std::sync::Mutex::new(RefreshState::default())),
             needles: None,
             gap: MIN_REFRESH_GAP,
+            retire_after: RETIRE_AFTER,
         }
     }
 
@@ -1160,19 +1210,22 @@ impl CredentialRefresh {
         if let Some(shared) = &self.needles {
             crate::sandbox::notify_sink::publish_needles(shared, &needles);
         }
-        // Kept here only once it has made the crossing the proxy's copy makes, so the two copies
-        // cannot part: a set that cannot cross is installed in neither, and the one in force stays,
-        // which is the direction a failing source already takes.
+        // Installed only once it is known to make the crossing the proxy's copy makes: a set that
+        // cannot cross is installed in neither copy, and the one in force stays, which is the
+        // direction a failing source already takes. The supervisor keeps the set itself, not the
+        // crossed one: its signers are the running plugins, and the crossed set holds conversations
+        // with them, which would leave nothing keeping a plugin alive.
         let set = CredentialSet {
             injections,
             needles,
         };
-        let (Ok(handed), Ok(crossed)) =
-            (set.encode(), set.encode().and_then(CredentialSet::decode))
+        let (Ok(handed), Ok(_)) = (set.encode(), set.encode().and_then(CredentialSet::decode))
         else {
             return self.stop();
         };
-        self.credentials.replace(crossed);
+        let replaced = replaced_plugins(&current, &set);
+        self.credentials.replace(set);
+        retire(replaced, self.retire_after);
         Some(handed)
     }
 
@@ -1198,6 +1251,60 @@ impl CredentialRefresh {
         self.gap = gap;
         self
     }
+
+    /// Shorten how long a replaced signer plugin is kept, so a test can see it go.
+    #[cfg(test)]
+    pub(crate) fn with_retire_after(mut self, after: std::time::Duration) -> Self {
+        self.retire_after = after;
+        self
+    }
+}
+
+/// The running signer plugins `old` holds and `new` does not: the ones a re-resolution replaced.
+fn replaced_plugins(
+    old: &CredentialSet,
+    new: &CredentialSet,
+) -> Vec<std::sync::Arc<crate::sandbox::signer::SignerProcess>> {
+    let running =
+        |set: &CredentialSet| -> Vec<std::sync::Arc<crate::sandbox::signer::SignerProcess>> {
+            set.injections
+                .iter()
+                .filter_map(|injection| match &injection.form {
+                    Form::Signed(Signed {
+                        signer: Signer::Running(plugin),
+                        ..
+                    }) => Some(std::sync::Arc::clone(plugin)),
+                    _ => None,
+                })
+                .collect()
+        };
+    let kept = running(new);
+    let mut replaced: Vec<std::sync::Arc<crate::sandbox::signer::SignerProcess>> = Vec::new();
+    for plugin in running(old) {
+        if !kept.iter().any(|k| std::sync::Arc::ptr_eq(k, &plugin))
+            && !replaced.iter().any(|r| std::sync::Arc::ptr_eq(r, &plugin))
+        {
+            replaced.push(plugin);
+        }
+    }
+    replaced
+}
+
+/// Keep `plugins` alive for `after`, then let them go, which kills them. A thread that cannot be
+/// started lets them go at once: the replacement is the set in force either way.
+fn retire(
+    plugins: Vec<std::sync::Arc<crate::sandbox::signer::SignerProcess>>,
+    after: std::time::Duration,
+) {
+    if plugins.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("sbx-signer-retire".into())
+        .spawn(move || {
+            std::thread::sleep(after);
+            drop(plugins);
+        });
 }
 
 /// Whether two injection sets carry the same **resolve-time material** for the same headers — the
@@ -2166,7 +2273,7 @@ mod tests {
                 sees: vec!["Content-Type".to_string()],
                 key: "the-key".to_string(),
                 marker,
-                process: std::sync::Arc::new(std::sync::Mutex::new(FakeSigner(answer))),
+                signer: Signer::asking(FakeSigner(answer)),
                 body_digest: None,
             }),
         }
@@ -2311,7 +2418,7 @@ mod tests {
                 sees: Vec::new(),
                 key: "the-key".to_string(),
                 marker: None,
-                process: std::sync::Arc::new(std::sync::Mutex::new(RecordingSigner(seen.clone()))),
+                signer: Signer::asking(RecordingSigner(seen.clone())),
                 body_digest: Some(crate::plugins::signer::BodyDigest::Sha256),
             }),
         }
@@ -2528,6 +2635,105 @@ mod tests {
         assert!(
             !same_values(&same(), &[other]),
             "a rotated key is a new credential"
+        );
+    }
+
+    /// A signed injection served by `process`, whose credential is `key`.
+    fn signed_by(
+        process: &Arc<crate::sandbox::signer::SignerProcess>,
+        key: &str,
+    ) -> HeaderInjection {
+        HeaderInjection {
+            rule: crate::allowlist::classify("signed.test").unwrap(),
+            form: Form::Signed(Signed {
+                name: "demo-sig".to_string(),
+                sets: vec!["Authorization".to_string()],
+                sees: Vec::new(),
+                key: key.to_string(),
+                marker: None,
+                signer: Signer::Running(Arc::clone(process)),
+                body_digest: None,
+            }),
+        }
+    }
+
+    /// A running signer with no plugin behind it, and the plugin's end of its conversation.
+    fn stand_in() -> (
+        Arc<crate::sandbox::signer::SignerProcess>,
+        std::os::unix::net::UnixStream,
+    ) {
+        let (process, plugin) = crate::sandbox::signer::SignerProcess::stand_in(&["Authorization"]);
+        (Arc::new(process), plugin)
+    }
+
+    /// A re-resolution that rotates one credential and keeps a signer keeps the signer's running
+    /// plugin in the supervisor's copy. The copy the proxy is handed holds conversations, not
+    /// plugins: kept in its place, it would leave nothing keeping the plugin alive while the proxy
+    /// goes on asking it.
+    #[test]
+    fn a_re_resolution_that_keeps_a_signer_keeps_its_running_plugin() {
+        let (process, _plugin) = stand_in();
+        let creds = Arc::new(default_creds(
+            vec![injection("Bearer old"), signed_by(&process, "the-key")],
+            Vec::new(),
+        ));
+        let refresh = CredentialRefresh::new(
+            creds.clone(),
+            // The fixed credential rotated; the signer's came back unchanged, and is kept.
+            Box::new(|standing| {
+                Ok((
+                    vec![injection("Bearer new"), standing[1].clone()],
+                    Vec::new(),
+                ))
+            }),
+        );
+        assert!(refresh.on_refusal(), "the fixed credential changed");
+        match &creds.snapshot().injections[1].form {
+            Form::Signed(Signed {
+                signer: Signer::Running(kept),
+                ..
+            }) => assert!(
+                Arc::ptr_eq(kept, &process),
+                "the very plugin, still running"
+            ),
+            _ => panic!("the supervisor's copy lost its running plugin"),
+        }
+    }
+
+    /// A plugin a re-resolution replaced is not killed the moment it is replaced: the proxy may be
+    /// asking it through the set it held until then. It goes once its time is up.
+    #[test]
+    fn a_replaced_signer_is_kept_for_a_while_then_let_go() {
+        let (old, old_plugin) = stand_in();
+        let creds = Arc::new(default_creds(vec![signed_by(&old, "key-one")], Vec::new()));
+        drop(old);
+        let (new, _new_plugin) = stand_in();
+        let refresh = CredentialRefresh::new(
+            creds.clone(),
+            Box::new(move |_| Ok((vec![signed_by(&new, "key-two")], Vec::new()))),
+        )
+        .with_retire_after(std::time::Duration::from_millis(400));
+        assert!(refresh.on_refusal(), "the signer's key changed");
+
+        let mut byte = [0u8; 1];
+        old_plugin
+            .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .unwrap();
+        match std::io::Read::read(&mut &old_plugin, &mut byte) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            other => panic!("the replaced plugin went at once: {other:?}"),
+        }
+        old_plugin
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        assert_eq!(
+            std::io::Read::read(&mut &old_plugin, &mut byte).unwrap(),
+            0,
+            "and goes once its time is up"
         );
     }
 }

@@ -157,7 +157,10 @@ with, so a `401` from its destination says nothing a re-resolution could fix. It
 also survives a re-resolution triggered by some *other* declaration's `401`: the
 plugin already running keeps running, as long as the key behind it resolves to
 the same value. A rotated key does start a new one, because a plugin is told its
-credential once, at its handshake, and cannot be told again.
+credential once, at its handshake, and cannot be told again. The plugin it
+replaces is kept for twenty seconds, so a request that was already asking it
+gets its answer; one that asks it after that is refused rather than signed with
+the key that was replaced.
 
 ## Worked example
 

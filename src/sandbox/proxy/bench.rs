@@ -543,7 +543,7 @@ fn signing_injection(digest: bool) -> HeaderInjection {
             sees: Vec::new(),
             key: "the-key".to_string(),
             marker: None,
-            process: Arc::new(std::sync::Mutex::new(NullSigner)),
+            signer: crate::sandbox::proxy::Signer::asking(NullSigner),
             body_digest: digest.then_some(crate::plugins::signer::BodyDigest::Sha256),
         }),
     }

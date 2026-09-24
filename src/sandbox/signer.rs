@@ -34,7 +34,7 @@ pub(crate) const PROTOCOL_VERSION: u32 = 1;
 /// A signature is a computation, not a conversation with a human, and it sits in the path of a
 /// request the cage is waiting on. The wait must be bounded at all, because a silent plugin
 /// otherwise holds the request thread for as long as the session lives.
-const SIGN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const SIGN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The longest header value a plugin may hand back.
 ///
@@ -288,7 +288,7 @@ pub(crate) struct Signature {
 /// answer is about this exchange, and the next one starts clean. An answer carrying another
 /// request's `seq` is not: it says the plugin is reading one question behind, and the channel is a
 /// sequence of question-and-answer lines, so it stays behind for every request after this one. That
-/// is the same condition [`SignerProcess::sign`] already buries a plugin for when the channel itself
+/// is the same condition [`SignerChannel::sign`] already buries a plugin for when the channel itself
 /// fails, arrived at by a different route, and a plugin that has lost its place should say so once
 /// rather than refuse every request under a sentence about this one.
 pub(crate) struct AnswerRefused {
@@ -425,31 +425,36 @@ fn check_value(name: &str, value: &str) -> Result<(), String> {
 }
 
 /// What a caller needs of a signer, so the callers are testable without a sandbox and a real
-/// plugin. [`SignerProcess`] is the one implementation that runs code.
+/// plugin. [`SignerChannel`] is the one implementation that talks to a running plugin.
 pub(crate) trait Signing: Send {
     /// Sign one request, or say why it cannot be. An `Err` refuses the request.
     fn sign(&mut self, req: &SignRequest<'_>) -> Result<Signature, String>;
 }
 
-/// A signer plugin running in its own host-side cage, spoken to over a socket pair.
+/// Numbers every signer this process starts, so the proxy can tell a plugin it already talks to
+/// from a new one when a re-resolution hands it a set again.
+static NEXT_SIGNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A signer plugin running in its own host-side cage, as the supervisor holds it.
+///
+/// The supervisor starts it and hands it its credential at the handshake, which is the one
+/// exchange that carries the credential; after that it keeps the plugin alive and hands the
+/// conversation to the proxy ([`Self::handoff`]), which asks it one question per request through a
+/// [`SignerChannel`]. It never asks one itself: two parties writing questions into one stream would
+/// each read the other's answers.
 ///
 /// A socket rather than a pipe for the reason a broker's is: a socket takes a read deadline and a
 /// pipe does not, and that deadline is the only thing between a wedged plugin and a wedged request.
 pub(crate) struct SignerProcess {
-    child: std::process::Child,
-    reader: io::BufReader<std::os::unix::net::UnixStream>,
-    writer: std::os::unix::net::UnixStream,
-    /// The headers this plugin's manifest declared, kept here so every answer is bounded by the
-    /// manifest rather than by what the caller happens to pass.
+    /// Which plugin this is, across every set it is handed over in.
+    id: u64,
+    /// The bwrap child, killed and reaped when this is dropped. `None` only for a stand-in a test
+    /// builds on a bare socket pair.
+    child: Option<std::process::Child>,
+    /// The supervisor's end of the conversation, past the handshake.
+    channel: std::os::unix::net::UnixStream,
+    /// The headers this plugin's manifest declared, which bound every answer it gives.
     sets: Vec<String>,
-    /// The next request's sequence number. It exists so an answer can be matched to its question:
-    /// a plugin one answer behind would otherwise sign every request with the previous one's
-    /// signature.
-    seq: u64,
-    /// Once a plugin has failed, it stays failed. A broken signer refusing one request per request
-    /// is a bounded cost; one restarted per request is a sandbox spawn per request, and one whose
-    /// stream desynchronized would answer the wrong question.
-    dead: Option<String>,
     /// The descriptor the cage's environment was read from, held open for the child's whole life:
     /// bwrap reads it at startup, and dropping it earlier would race that read.
     _env: Vec<std::fs::File>,
@@ -494,16 +499,15 @@ impl SignerProcess {
             &super::resolver::plugin_cage_limits(),
         )?;
 
+        // Held by `me` before anything can fail, so its `Drop` kills and reaps the child.
         let mut me = Self {
-            child,
-            reader: io::BufReader::new(reader_side),
-            writer,
+            id: NEXT_SIGNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            child: Some(child),
+            channel: writer,
             sets: plugin.signer.sets_headers.clone(),
-            seq: 0,
-            dead: None,
             _env: env,
         };
-        me.handshake(plugin, host, credential)?;
+        me.handshake(plugin, host, credential, reader_side)?;
         Ok(me)
     }
 
@@ -512,6 +516,7 @@ impl SignerProcess {
         plugin: &SignerPlugin,
         host: &str,
         credential: Credential,
+        reader_side: std::os::unix::net::UnixStream,
     ) -> io::Result<()> {
         let hello = Hello {
             signer: &plugin.name,
@@ -520,15 +525,103 @@ impl SignerProcess {
             sees: &plugin.signer.sees_headers,
             credential,
         };
-        self.writer.write_all(hello.line().as_bytes())?;
-        self.writer.flush()?;
-        let line = self.read_line()?;
-        parse_hello_reply(&line).map_err(|why| {
+        self.channel.write_all(hello.line().as_bytes())?;
+        self.channel.flush()?;
+        let mut reader = io::BufReader::new(reader_side);
+        let line = super::broker::read_bounded_line(&mut reader, MAX_LINE_BYTES)?;
+        let cannot = |why: &str| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the `{}` signer plugin cannot sign: {why}", plugin.name),
             )
-        })
+        };
+        parse_hello_reply(&line).map_err(|why| cannot(&why))?;
+        // The conversation is handed over as a descriptor, and bytes this reader already took off it
+        // would not go with it: the proxy's first answer would be one the plugin gave to no
+        // question it asked. A plugin speaks after its acceptance only when asked.
+        if !reader.buffer().is_empty() {
+            return Err(cannot(
+                "it said more than its acceptance before being asked anything",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Which plugin this is. Two sets naming the same number name the same running plugin.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The headers its manifest declared.
+    pub(crate) fn sets(&self) -> &[String] {
+        &self.sets
+    }
+
+    /// A descriptor of the conversation, for the proxy's [`SignerChannel`].
+    pub(crate) fn handoff(&self) -> io::Result<std::os::fd::OwnedFd> {
+        self.channel.try_clone().map(std::os::fd::OwnedFd::from)
+    }
+
+    /// A stand-in on a bare socket pair, with no plugin behind it, and the plugin's end of the pair:
+    /// what a test serves, or drops, in the plugin's place.
+    #[cfg(test)]
+    pub(crate) fn stand_in(sets: &[&str]) -> (Self, std::os::unix::net::UnixStream) {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(SIGN_DEADLINE)).unwrap();
+        ours.set_write_timeout(Some(SIGN_DEADLINE)).unwrap();
+        let me = Self {
+            id: NEXT_SIGNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            child: None,
+            channel: ours,
+            sets: sets.iter().map(ToString::to_string).collect(),
+            _env: Vec::new(),
+        };
+        (me, theirs)
+    }
+}
+
+impl Drop for SignerProcess {
+    fn drop(&mut self) {
+        // The child dies with sbx by construction, but a signer belongs to a launch: it is killed
+        // here rather than left holding a slot, and reaped in the same breath so a long session
+        // does not accumulate zombies.
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The proxy's end of a conversation with a running signer plugin: one question per request, one
+/// answer to each.
+///
+/// Built on the descriptor [`SignerProcess::handoff`] gives, which carries the deadlines the plugin
+/// was started with: they are the socket's, not this end's. One stream serves both directions, read
+/// through its buffer and written through the same descriptor, so building one duplicates nothing.
+pub(crate) struct SignerChannel {
+    reader: io::BufReader<std::os::unix::net::UnixStream>,
+    /// The headers this plugin's manifest declared, kept here so every answer is bounded by the
+    /// manifest rather than by what the caller happens to pass.
+    sets: Vec<String>,
+    /// The next request's sequence number. It exists so an answer can be matched to its question:
+    /// a plugin one answer behind would otherwise sign every request with the previous one's
+    /// signature.
+    seq: u64,
+    /// Once a plugin has failed, it stays failed. A broken signer refusing one request per request
+    /// is a bounded cost; one restarted per request is a sandbox spawn per request, and one whose
+    /// stream desynchronized would answer the wrong question.
+    dead: Option<String>,
+}
+
+impl SignerChannel {
+    /// The conversation on `channel`, bounded by the headers in `sets`.
+    pub(crate) fn new(channel: std::os::fd::OwnedFd, sets: Vec<String>) -> Self {
+        Self {
+            reader: io::BufReader::new(std::os::unix::net::UnixStream::from(channel)),
+            sets,
+            seq: 0,
+            dead: None,
+        }
     }
 
     /// One line from the plugin, or an error when it says nothing in time, closes, or says more than
@@ -538,7 +631,7 @@ impl SignerProcess {
     }
 }
 
-impl Signing for SignerProcess {
+impl Signing for SignerChannel {
     fn sign(&mut self, req: &SignRequest<'_>) -> Result<Signature, String> {
         if let Some(why) = &self.dead {
             return Err(why.clone());
@@ -552,10 +645,10 @@ impl Signing for SignerProcess {
         };
         let seq = self.seq;
         self.seq += 1;
-        if let Err(e) = self
-            .writer
+        let mut writer = self.reader.get_ref();
+        if let Err(e) = writer
             .write_all(req.line(seq).as_bytes())
-            .and_then(|()| self.writer.flush())
+            .and_then(|()| writer.flush())
         {
             return Err(bury(self, format!("cannot reach the plugin: {e}")));
         }
@@ -575,16 +668,6 @@ impl Signing for SignerProcess {
                 refused.why
             }
         })
-    }
-}
-
-impl Drop for SignerProcess {
-    fn drop(&mut self) {
-        // The child dies with sbx by construction, but a signer belongs to a launch: it is killed
-        // here rather than left holding a slot, and reaped in the same breath so a long session
-        // does not accumulate zombies.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -939,5 +1022,59 @@ mod tests {
             !shown.contains("AKIA-secret") && !shown.contains("marker"),
             "{shown}"
         );
+    }
+
+    fn demo_plugin() -> SignerPlugin {
+        SignerPlugin {
+            name: "demo-sig".to_string(),
+            dir: std::path::PathBuf::from("/data/plugins/demo-sig"),
+            exec: std::path::PathBuf::from("/data/plugins/demo-sig/sign"),
+            sandbox: Default::default(),
+            signer: crate::plugins::signer::SignerSpec {
+                sets_headers: vec!["Authorization".to_string()],
+                sees_headers: Vec::new(),
+                reads_secret: true,
+                body_digest: None,
+            },
+            version: None,
+            description: None,
+            host: Default::default(),
+        }
+    }
+
+    /// The handshake takes the plugin's acceptance and nothing after it. The conversation is then
+    /// handed to the proxy as a descriptor, and an answer this side had already read off it would
+    /// stay behind with the reader: the proxy's first question would get the answer after it.
+    #[test]
+    fn a_plugin_that_speaks_past_its_acceptance_is_refused_at_the_handshake() {
+        for (said, accepted) in [
+            ("{\"ok\":true}\n", true),
+            (
+                "{\"ok\":true}\n{\"seq\":0,\"headers\":{\"Authorization\":\"x\"}}\n",
+                false,
+            ),
+        ] {
+            let (mut process, plugin) = SignerProcess::stand_in(&["Authorization"]);
+            let reader_side = process.channel.try_clone().unwrap();
+            let answering = std::thread::spawn(move || {
+                let mut hello = String::new();
+                io::BufRead::read_line(
+                    &mut io::BufReader::new(plugin.try_clone().unwrap()),
+                    &mut hello,
+                )
+                .unwrap();
+                // One write, so both lines are there to be read together.
+                (&plugin).write_all(said.as_bytes()).unwrap();
+                plugin
+            });
+            let got = process.handshake(
+                &demo_plugin(),
+                "api.example.com",
+                Credential::Plaintext("the-key".to_string()),
+                reader_side,
+            );
+            let _plugin = answering.join().unwrap();
+            assert_eq!(got.is_ok(), accepted, "{said:?}: {got:?}");
+        }
     }
 }

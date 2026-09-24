@@ -226,6 +226,7 @@ use forward::handle_https_forward;
 pub(crate) use inject::NEEDLE_HISTORY_MAX;
 pub(crate) use inject::{
     CredentialRefresh, CredentialSet, Credentials, Form, HeaderInjection, SecretNeedle, Signed,
+    Signer,
 };
 use inject::{SignRefusal, pairs_for as injection_values};
 use pool::{PoolKey, UpstreamTls};

@@ -5832,7 +5832,7 @@ fn digesting_injection_for(to: &str) -> HeaderInjection {
             sees: Vec::new(),
             key: "the-key".to_string(),
             marker: None,
-            process: Arc::new(std::sync::Mutex::new(DigestEcho)),
+            signer: crate::sandbox::proxy::Signer::asking(DigestEcho),
             body_digest: Some(crate::plugins::signer::BodyDigest::Sha256),
         }),
     }

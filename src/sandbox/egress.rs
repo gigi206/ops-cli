@@ -1478,7 +1478,7 @@ fn resolve_one(
             secret.name
         ))
     })?;
-    let (marker, process) = match reusable_signer(standing, &plugin.name, trimmed) {
+    let (marker, signer) = match reusable_signer(standing, &plugin.name, trimmed) {
         Some(kept) => kept,
         None => {
             // The wider grant is the plaintext, and only a manifest that declared `reads_secret`
@@ -1496,8 +1496,7 @@ fn resolve_one(
             let process = super::signer::SignerProcess::start(bwrap, plugin, host, credential)?;
             (
                 marker,
-                std::sync::Arc::new(std::sync::Mutex::new(process))
-                    as std::sync::Arc<std::sync::Mutex<dyn super::signer::Signing>>,
+                crate::sandbox::proxy::Signer::Running(std::sync::Arc::new(process)),
             )
         }
     };
@@ -1510,7 +1509,7 @@ fn resolve_one(
                 sees: plugin.signer.sees_headers.clone(),
                 key: trimmed.to_string(),
                 marker,
-                process,
+                signer,
                 body_digest: plugin.signer.body_digest,
             }),
         },
@@ -1524,7 +1523,7 @@ fn resolve_one(
 /// longer substitutes.
 type RunningSigner = (
     Option<std::sync::Arc<super::broker::SecretMarker>>,
-    std::sync::Arc<std::sync::Mutex<dyn super::signer::Signing>>,
+    crate::sandbox::proxy::Signer,
 );
 
 /// The running signer a re-resolution may keep instead of starting a new one.
@@ -1548,9 +1547,11 @@ fn reusable_signer(
 ) -> Option<RunningSigner> {
     match standing.map(|i| &i.form) {
         Some(crate::sandbox::proxy::Form::Signed(prev))
-            if prev.name == plugin && prev.key == key =>
+            if prev.name == plugin
+                && prev.key == key
+                && matches!(prev.signer, crate::sandbox::proxy::Signer::Running(_)) =>
         {
-            Some((prev.marker.clone(), prev.process.clone()))
+            Some((prev.marker.clone(), prev.signer.clone()))
         }
         _ => None,
     }
@@ -2815,19 +2816,6 @@ mod tests {
     /// resolver runner — the only consumer of bwrap — never fires.
     const UNUSED_BWRAP: &str = "/nonexistent/bwrap";
 
-    /// A signer that answers nothing, standing in for a running plugin process. What these tests
-    /// ask of it is only that it is *the same one*, which `Arc::ptr_eq` decides.
-    struct InertSigner;
-
-    impl super::super::signer::Signing for InertSigner {
-        fn sign(
-            &mut self,
-            _req: &super::super::signer::SignRequest<'_>,
-        ) -> Result<super::super::signer::Signature, String> {
-            Err("this signer is a stand-in".to_string())
-        }
-    }
-
     /// A signed injection standing for `plugin` with `key` behind it, as a launch left it.
     fn standing_signer(plugin: &str, key: &str) -> HeaderInjection {
         standing_signer_for("api.example.com", plugin, key)
@@ -2846,7 +2834,11 @@ mod tests {
                 marker: Some(std::sync::Arc::new(
                     super::super::broker::SecretMarker::new(key, 8).expect("marker"),
                 )),
-                process: std::sync::Arc::new(std::sync::Mutex::new(InertSigner)),
+                // A running signer with no plugin behind it: what these tests ask of it is only
+                // that it is *the same one*, which `Arc::ptr_eq` decides.
+                signer: crate::sandbox::proxy::Signer::Running(std::sync::Arc::new(
+                    super::super::signer::SignerProcess::stand_in(&["Authorization"]).0,
+                )),
                 body_digest: None,
             }),
         }
@@ -2854,10 +2846,20 @@ mod tests {
 
     fn process_of(
         injection: &HeaderInjection,
-    ) -> std::sync::Arc<std::sync::Mutex<dyn super::super::signer::Signing>> {
+    ) -> std::sync::Arc<super::super::signer::SignerProcess> {
         match &injection.form {
-            crate::sandbox::proxy::Form::Signed(signed) => signed.process.clone(),
+            crate::sandbox::proxy::Form::Signed(signed) => running(&signed.signer),
             _ => panic!("not a signed injection"),
+        }
+    }
+
+    /// The plugin a supervisor's signer holds.
+    fn running(
+        signer: &crate::sandbox::proxy::Signer,
+    ) -> std::sync::Arc<super::super::signer::SignerProcess> {
+        match signer {
+            crate::sandbox::proxy::Signer::Running(process) => std::sync::Arc::clone(process),
+            crate::sandbox::proxy::Signer::Asking { .. } => panic!("the proxy's copy of a signer"),
         }
     }
 
@@ -2870,7 +2872,7 @@ mod tests {
         let (marker, process) =
             reusable_signer(Some(&standing), "demo-sigv4", "the-key").expect("kept");
         assert!(
-            std::sync::Arc::ptr_eq(&process, &process_of(&standing)),
+            std::sync::Arc::ptr_eq(&running(&process), &process_of(&standing)),
             "the very process, not an equal one"
         );
         // The plugin learned this token at its handshake and cannot be told another: a re-drawn
@@ -2934,7 +2936,7 @@ mod tests {
             let (_marker, kept) =
                 reusable_signer(Some(standing), "demo-sigv4", "the-key").expect("kept");
             assert!(
-                std::sync::Arc::ptr_eq(&kept, &process_of(standing)),
+                std::sync::Arc::ptr_eq(&running(&kept), &process_of(standing)),
                 "the entry handed in is the one whose process comes back, whatever it is scoped to"
             );
         }
