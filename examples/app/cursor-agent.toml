@@ -78,16 +78,25 @@
 # STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly (covered by the shipped-profiles
 # test). PROVEN LIVE: the `tarball:` resolve, pin and build, and `cursor-agent --version` answering
 # from the built store path; before the move to that backend, the bootstrap download and the CLI
-# routing through sbx's proxy, with the api5 agent hosts + repo42 reaching their transport. Still to
-# be proven with a real Cursor account: the AUTH
-# (`CURSOR_API_KEY` via `--env`, or `cursor-agent login`) and a full prompt round-trip. Treat it as
-# a grounded starting point to validate, not a turnkey profile. If a request is blocked, the proxy
-# names the host it refused — add it to `allow` (or check ahead with `sbx test net <url>`).
+# routing through sbx's proxy, with the api5 agent hosts + repo42 reaching their transport; with a
+# real Cursor account signed in from the app home, a full `-p` prompt round-trip
+# under `mode = "deny"`, which needs the bundle's `shared_credential` group. Not proven: the
+# `CURSOR_API_KEY` path and the interactive TUI. If a request is blocked, the proxy names the host it
+# refused — add it to `allow` (or check ahead with `sbx test net <url>`).
 # The bundle's `[packages]` key, which is what the generated wrapper is installed as and what the
 # launch puts on PATH. `sbx app run cursor-agent -- <args>` appends its arguments to this command,
 # and they reach the agent verbatim — no shell wrapper, since nothing has to be put on PATH by hand
 # any more.
 cmd = "cursor-agent"
+
+# No `contract`: cursor-agent offers no way to hand it the cage's summary from outside the project.
+# It reads rules only from the workspace (`AGENTS.md`, `.cursor/rules/`), and sbx does not write into
+# your project; a rule shipped in a `--plugin-dir` plugin, the files of an `--add-dir` root and the
+# hidden `--system-prompt` (which replaces Cursor's own prompt) either never reach the model or are
+# not usable. Point the agent at the summary yourself: add a User Rule to your Cursor account
+# (Settings → Rules) such as "When the environment variable SBX_SANDBOX is 1, read the file named by
+# SBX_CONTRACT_SUMMARY before anything else", or say it in your first prompt. The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch, so the rule never needs editing.
 
 # --- The agent's requirements come from its bundle ------------------------------------------------
 # `use` pulls in the `cursor-agent` BUNDLE — the agent itself, the hosts the CLI reaches and the
@@ -127,6 +136,7 @@ allow = [
 # designating them sent `PRI *` → `bad-request`). The Cursor desktop profile inverts this — a
 # different client, do not copy one to the other.
 http2 = [
+    "api3.cursor.sh",     # the CLI's metrics calls (MetricsService) — sent as HTTP/2
     "*.api5.cursor.sh",   # agent hosts (agentn.global.api5, agent.api5, …) — the CLI speaks gRPC/h2 here
     # repo42.cursor.sh is HTTP/1.1 from the CLI client — left OFF; designating it h2 blocks it.
     #"api2.cursor.sh",

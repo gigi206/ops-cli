@@ -45,6 +45,13 @@ allow = [
     "{*} https://mcp.notion.com",
 ]
 
+# The CLI signs in once and spends that one bearer token on several of Cursor's names: the dashboard
+# calls on `api2.cursor.sh`, the agent run itself on `agentn.global.api5.cursor.sh`. sbx learns the
+# token on the first name it sees it sent to, so without this group the agent run reads as that
+# token leaving for another host and is refused `outbound-secret` (the CLI reports
+# `[permission_denied] HTTP 403`). The group names Cursor's API domain and nothing wider.
+shared_credential = [["*.cursor.sh"]]
+
 [packages]
 # The agent itself, pinned on first use and rolled by `sbx upgrade`.
 cursor-agent = "tarball:resolve"
