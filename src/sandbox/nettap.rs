@@ -189,11 +189,13 @@ pub(crate) fn resolv_conf() -> String {
 /// answered `ENETUNREACH` on the first packet. Its order is load-bearing too, and it runs at
 /// `filter` priority, after the `nat` chain has already rewritten what it captures:
 ///
-/// 1. loopback, which carries the egress forwarder and any intra-cage service — and, by the time
-///    this chain sees them, every packet the `nat` chain bent to the tap;
-/// 2. the DNS transports the tap answers;
-/// 3. TCP, whose non-loopback destinations the `nat` chain has already redirected;
-/// 4. everything else, rejected with the same `net-unreachable` the route lookup used to raise.
+/// 1. every packet of a flow the `nat` chain bent to the tap, its answers included. The tap answers
+///    a UDP query at the address and port it came from, `dummy0`'s address when the resolver is
+///    off loopback, which none of the rules below would let through;
+/// 2. loopback, which carries the egress forwarder and any intra-cage service;
+/// 3. the DNS transports the tap answers;
+/// 4. TCP, whose non-loopback destinations the `nat` chain has already redirected;
+/// 5. everything else, rejected with the same `net-unreachable` the route lookup used to raise.
 ///
 /// `reject` belongs here rather than in the `nat` chain, which nftables does not allow it in.
 pub(crate) fn redirect_ruleset() -> String {
@@ -207,6 +209,7 @@ pub(crate) fn redirect_ruleset() -> String {
          }}\n  \
          chain refuse {{\n    \
          type filter hook output priority filter; policy accept;\n    \
+         ct status dnat accept\n    \
          ip daddr 127.0.0.0/8 accept\n    \
          udp dport 53 accept\n    \
          meta l4proto tcp accept\n    \

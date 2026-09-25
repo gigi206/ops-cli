@@ -9,6 +9,7 @@
 #[macro_use]
 mod common;
 
+use common::fixture::TmpDir;
 use std::process::Command;
 
 /// Run the holder with a shell checker that dumps the two per-netns proc files, returning
@@ -89,5 +90,86 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
     assert!(
         !default_route,
         "a default route exists — the dummy must never open an egress path:\n{route}"
+    );
+}
+
+/// The first `nft` on `PATH`, as the launcher finds it, or `None` on a host without nftables.
+fn nft() -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join("nft"))
+        .find(|p| p.is_file())
+}
+
+/// A query to the cage's resolver is answered through the capture tap, over UDP.
+///
+/// The cage's resolver is off loopback (`nettap::CAGE_RESOLVER`), so a query leaves with `dummy0`'s
+/// address as its source, the `nat` chain bends it to the tap, and the tap answers at that address.
+/// A refusal chain that let through only what leaves for loopback, DNS or TCP rejected that answer,
+/// and every client resolving over UDP waited out its timeout. The query is written by hand rather
+/// than asked of `getent`, which would ask the host's resolver: that one is on loopback, and its
+/// answer never met the refusal.
+#[test]
+fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
+    let python = std::path::Path::new("/usr/bin/python3");
+    if !python.exists() {
+        skip_incapable!("skipping tap DNS e2e: no /usr/bin/python3 to ask the query");
+        return;
+    }
+    let Some(nft) = nft() else {
+        skip_incapable!("skipping tap DNS e2e: no nft on PATH to install the redirect");
+        return;
+    };
+    // The egress socket a captured connection would be handed to. A query is answered by the tap
+    // alone, but the socket is real so the tap starts as a launch starts it.
+    let dir = TmpDir::new("tapdns");
+    let egress = dir.join("egress.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&egress).expect("bind egress socket");
+    let query = r#"
+import socket, struct
+q = struct.pack(">HHHHHH", 0x5b5b, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+try:
+    s.sendto(q, ("198.19.255.254", 53))
+    r = s.recv(512)
+except OSError as e:
+    print("error", e.errno, e)
+else:
+    count = struct.unpack(">H", r[6:8])[0]
+    print("answer", count, socket.inet_ntoa(r[-4:]) if count else "-")
+"#;
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["__netns-holder", "--tap"])
+        .arg(&egress)
+        .arg("--nft")
+        .arg(&nft)
+        .arg("--")
+        .arg(python)
+        .args(["-c", query])
+        .output()
+        .expect("spawn sbx __netns-holder");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || stderr.contains("transparent capture unavailable") {
+        skip_incapable!(
+            "skipping tap DNS e2e: the holder or its tap did not stand up ({})",
+            stderr.trim()
+        );
+        return;
+    }
+    if stdout.starts_with(&format!("error {} ", libc::ENETUNREACH)) {
+        skip_incapable!(
+            "skipping tap DNS e2e: no route to the resolver (dummy module unavailable?)"
+        );
+        return;
+    }
+    // One address, out of the tap's own range (`198.18.0.0/15`).
+    let answered = match stdout.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["answer", "1", addr] => addr.starts_with("198.18.") || addr.starts_with("198.19."),
+        _ => false,
+    };
+    assert!(
+        answered,
+        "the tap's answer did not come back: {stdout}{stderr}"
     );
 }

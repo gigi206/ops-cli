@@ -615,7 +615,7 @@ fn the_ruleset_keeps_what_nftables_and_the_egress_forwarder_require() {
 /// go, but only TCP and DNS are captured. Without the closing `reject` the rest would reach the
 /// dummy device and be dropped there, so a `sendto` would succeed into a black hole instead of
 /// failing at once. The order is what makes the refusal narrow: the accepts that precede it are the
-/// traffic the tap and the egress forwarder own.
+/// traffic the tap and the egress forwarder own, the tap's answers to the cage among them.
 #[test]
 fn the_ruleset_refuses_what_it_does_not_capture() {
     let rules = redirect_ruleset();
@@ -631,6 +631,7 @@ fn the_ruleset_refuses_what_it_does_not_capture() {
     );
     let reject = offset("reject with icmp type net-unreachable");
     for accept in [
+        "ct status dnat accept",
         "ip daddr 127.0.0.0/8 accept",
         "udp dport 53 accept",
         "meta l4proto tcp accept",
