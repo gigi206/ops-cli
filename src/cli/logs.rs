@@ -725,7 +725,7 @@ fn read_net_rows(
     // Muted refusals and captured traffic stay out: this view is the shape of a session's activity,
     // and `sbx net logs --all --with-body` is where one request is opened up. Asking for neither
     // keeps the read cheap and the column honest about what the default egress view shows.
-    let snap = crate::sandbox::control::read_log(socket, after, None, false, false)?;
+    let snap = crate::sandbox::control::read_log(socket, after, None, false, false, None)?;
     let rows = snap.events.into_iter().map(net_row).collect();
     Ok((rows, Some(snap.head), snap.dropped))
 }

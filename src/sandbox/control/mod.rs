@@ -27,7 +27,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::allowlist::Rule;
@@ -539,6 +539,18 @@ impl ManualRules {
 /// The default number of recent egress events a session retains for the live log.
 pub(crate) const LOG_RING_CAP: usize = 1000;
 
+/// The most `--follow` readers one ring keeps track of for [`LogRing::linger`]. Past it, the reader
+/// heard from longest ago is forgotten.
+const FOLLOWERS_MAX: usize = 16;
+
+/// How long after its announced interval a `--follow` reader's next read may come and still be
+/// waited for. A follow reads every session in turn once its interval has passed, so its read of
+/// any one session lands a little after it.
+const FOLLOW_SLACK: Duration = Duration::from_millis(500);
+
+/// The longest a session that ends waits for its `--follow` readers ([`LogRing::linger`]).
+pub(crate) const LINGER_MAX: Duration = Duration::from_secs(2);
+
 /// The verdict class of a logged egress decision. A superset of the `sbx net stats` taxonomy
 /// (allow/deny/blocked): the log is a diagnostic record, not a counter, so it also carries `error` —
 /// a request the policy permitted but that could not complete (DNS failed, the host was unreachable,
@@ -1005,6 +1017,25 @@ pub(crate) struct LogRing {
     /// Where every decision is also written, when the launch asked for a session record. `None` is
     /// the default and the shape this ring always had. See [`LogRing::with_record`].
     record: Option<super::lens::Recorder>,
+    /// The `--follow` readers of this ring, each as its last read left it
+    /// ([`LogRing::followed`]), for [`LogRing::linger`] to wait on.
+    followers: Mutex<Vec<FollowRead>>,
+    /// Signalled on every follow read, so a [`LogRing::linger`] ends at the read it waits for.
+    follow_read: Condvar,
+}
+
+/// One `--follow` reader of a [`LogRing`], as its last read left it.
+struct FollowRead {
+    /// The reader, by the process id it announced.
+    reader: u32,
+    /// When it last read.
+    at: Instant,
+    /// How often it reads, as it announced.
+    interval: Duration,
+    /// The newest event sequence that read covered.
+    head: u64,
+    /// The newest amendment sequence that read covered, for a reader that asks for amendments.
+    amend: Option<u64>,
 }
 
 // The same choice [`crate::sandbox::signer_control::SignerRing`] makes, for the same reason: a
@@ -1054,6 +1085,8 @@ impl LogRing {
             }),
             cap: cap.max(1),
             record: None,
+            followers: Mutex::new(Vec::new()),
+            follow_read: Condvar::new(),
         }
     }
 
@@ -1395,6 +1428,76 @@ impl LogRing {
             capture_evicted: 0,
         }
     }
+
+    /// Note a `--follow` read: `reader` announced itself with the `interval` it polls at, and was
+    /// handed `snapshot`. `amendments` says whether the read asked for amendments, so that a status
+    /// or a capture the reader never shows is no reason to wait for it.
+    pub(crate) fn followed(
+        &self,
+        reader: u32,
+        interval: Duration,
+        snapshot: &LogSnapshot,
+        amendments: bool,
+    ) {
+        let read = FollowRead {
+            reader,
+            at: Instant::now(),
+            interval,
+            head: snapshot.head,
+            amend: amendments.then_some(snapshot.amend_head),
+        };
+        let mut followers = locked(&self.followers);
+        match followers.iter_mut().find(|f| f.reader == reader) {
+            Some(known) => *known = read,
+            None => {
+                if followers.len() >= FOLLOWERS_MAX
+                    && let Some(oldest) = (0..followers.len()).min_by_key(|&i| followers[i].at)
+                {
+                    followers.swap_remove(oldest);
+                }
+                followers.push(read);
+            }
+        }
+        drop(followers);
+        self.follow_read.notify_all();
+    }
+
+    /// Wait until every `--follow` reader of this ring has read it since its last change, for at
+    /// most `max`.
+    ///
+    /// A session calls this as it ends, once the last of what its proxy reported is in the ring
+    /// and before its control socket goes. A follow reads on an interval, so what arrived after
+    /// its last read (the status and the traffic of an exchange that ended with the session)
+    /// would otherwise go with the socket, unread. The wait is for the follow's next read, and it
+    /// ends at that read.
+    ///
+    /// Only a reader that is still polling is waited for: one whose next read is overdue by more
+    /// than [`FOLLOW_SLACK`] has stopped, and one whose next read falls past `max` is not waited
+    /// for at all. A session no follow has read, or whose follows have read everything, does not
+    /// wait.
+    pub(crate) fn linger(&self, max: Duration) {
+        let end = Instant::now() + max;
+        let (head, amend_head) = {
+            let g = locked(&self.inner);
+            (g.next_seq - 1, g.next_amend - 1)
+        };
+        let mut followers = locked(&self.followers);
+        loop {
+            let now = Instant::now();
+            let due = followers
+                .iter()
+                .filter(|f| f.head < head || f.amend.is_some_and(|a| a < amend_head))
+                .map(|f| f.at + f.interval + FOLLOW_SLACK)
+                .filter(|&due| due > now && due <= end)
+                .max();
+            let Some(due) = due else { return };
+            followers = self
+                .follow_read
+                .wait_timeout(followers, due - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
 }
 
 // ── The live active-flow registry ─────────────────────────────────────────────────────────────
@@ -1674,8 +1777,10 @@ fn handle(stream: UnixStream, dispatch: &dyn Fn(&str) -> String) -> io::Result<(
 /// session's manual rules (`manual allow|deny <rule>` lines) then `ok`. `LOG` returns the recent
 /// egress events (a `dropped=` line when a `--follow` cursor fell behind the ring, a `head=`
 /// cursor, then one `event …` line each) then `ok`; `LOG after=<seq>` returns only events past that
-/// cursor. `path` is emitted last on a `pending`/`event` line so a query string's `=` cannot be
-/// mistaken for a field separator (the reader splits each token on its first `=`).
+/// cursor, and a `follow=<pid>:<ms>` token names a `--follow` reader and its poll interval
+/// ([`LogRing::followed`]). `path` is emitted last on a `pending`/`event` line so a query
+/// string's `=` cannot be mistaken for a field separator (the reader splits each token on its
+/// first `=`).
 ///
 /// The transparent-capture tap's reports are not verbs of this socket: they arrive on the tap's own
 /// ([`report`]), and here they are a bad request like any other unknown word.
@@ -1842,11 +1947,18 @@ fn dispatch(
             let mut after_amend = None;
             let mut include_muted = false;
             let mut want_capture = false;
+            let mut follow = None;
             for token in parts {
                 if let Some(v) = token.strip_prefix("after=") {
                     after = v.parse().ok();
                 } else if let Some(v) = token.strip_prefix("amended=") {
                     after_amend = v.parse().ok();
+                } else if let Some(v) = token.strip_prefix("follow=") {
+                    // `sbx net logs --follow` — the reader's process id and poll interval in
+                    // milliseconds, so the session can wait for its next read as it ends.
+                    follow = v.split_once(':').and_then(|(reader, ms)| {
+                        Some((reader.parse::<u32>().ok()?, ms.parse::<u64>().ok()?))
+                    });
                 } else if token == "all" {
                     // `sbx net log --all` — fold the muted (`dontaudit`) ring into the view.
                     include_muted = true;
@@ -1857,6 +1969,10 @@ fn dispatch(
                 }
             }
             let snapshot = log.snapshot(after, after_amend, include_muted);
+            if let Some((reader, ms)) = follow {
+                let interval = Duration::from_millis(ms);
+                log.followed(reader, interval, &snapshot, after_amend.is_some());
+            }
             let mut out = String::new();
             if snapshot.dropped > 0 {
                 out.push_str(&format!("dropped={}\n", snapshot.dropped));
@@ -4207,6 +4323,170 @@ mod tests {
         );
     }
 
+    /// A session that ends waits for a `--follow` reader that has not read its last change, and the
+    /// wait ends at that reader's next read, not when a timer runs out.
+    #[test]
+    fn linger_ends_at_the_read_of_a_follower_behind_the_ring() {
+        let ring = Arc::new(LogRing::new(LOG_RING_CAP));
+        let interval = Duration::from_millis(900);
+        let first = ring.snapshot(None, None, false);
+        ring.followed(7, interval, &first, false);
+        push_event(&ring, "last.test", LogVerdict::Allow, "allowed");
+        let cursor = first.head;
+        let reader = {
+            let ring = Arc::clone(&ring);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                let next = ring.snapshot(Some(cursor), None, false);
+                ring.followed(7, interval, &next, false);
+                next.events.len()
+            })
+        };
+        let begun = Instant::now();
+        ring.linger(LINGER_MAX);
+        let took = begun.elapsed();
+        assert_eq!(
+            reader.join().unwrap(),
+            1,
+            "the read the session waited for carries its last event"
+        );
+        assert!(
+            took >= Duration::from_millis(100) && took < interval,
+            "the wait ends at the read: {took:?}"
+        );
+    }
+
+    /// A follower that shows amendments is waited for when only an amendment arrived after its last
+    /// read, and a follower that does not read again is waited for until its read was due, and no
+    /// longer.
+    #[test]
+    fn linger_waits_for_an_amendment_the_follower_shows_until_its_read_was_due() {
+        let ring = LogRing::new(LOG_RING_CAP);
+        push_event(&ring, "a.test", LogVerdict::Allow, "allowed");
+        let snap = ring.snapshot(None, None, false);
+        let interval = Duration::from_millis(100);
+        ring.followed(1, interval, &snap, true);
+        ring.set_status(snap.head, 200);
+        let begun = Instant::now();
+        ring.linger(LINGER_MAX);
+        let took = begun.elapsed();
+        assert!(
+            took + Duration::from_millis(50) >= interval + FOLLOW_SLACK && took < LINGER_MAX,
+            "the wait runs to the read that was due: {took:?}"
+        );
+    }
+
+    /// A session does not wait when no follower has anything left to read: with no follower, with
+    /// one that has read everything, for an amendment a follower does not show, for one whose next
+    /// read falls past the bound, and for one that has stopped reading.
+    #[test]
+    fn linger_does_not_wait_when_no_follower_has_anything_left_to_read() {
+        let quick = |ring: &LogRing| {
+            let begun = Instant::now();
+            ring.linger(LINGER_MAX);
+            begun.elapsed() < Duration::from_millis(50)
+        };
+
+        let ring = LogRing::new(LOG_RING_CAP);
+        push_event(&ring, "a.test", LogVerdict::Allow, "allowed");
+        assert!(quick(&ring), "no follower");
+        let snap = ring.snapshot(None, None, false);
+        ring.followed(1, Duration::from_secs(1), &snap, true);
+        assert!(quick(&ring), "a follower that has read everything");
+
+        let ring = LogRing::new(LOG_RING_CAP);
+        push_event(&ring, "a.test", LogVerdict::Allow, "allowed");
+        let snap = ring.snapshot(None, None, false);
+        ring.followed(1, Duration::from_secs(1), &snap, false);
+        ring.set_status(snap.head, 200);
+        assert!(quick(&ring), "a status the follower does not show");
+
+        let ring = LogRing::new(LOG_RING_CAP);
+        let snap = ring.snapshot(None, None, false);
+        ring.followed(1, LINGER_MAX * 2, &snap, false);
+        push_event(&ring, "a.test", LogVerdict::Allow, "allowed");
+        assert!(quick(&ring), "a follower whose next read is past the bound");
+
+        let ring = LogRing::new(LOG_RING_CAP);
+        let snap = ring.snapshot(None, None, false);
+        ring.followed(1, Duration::from_millis(1), &snap, false);
+        thread::sleep(FOLLOW_SLACK + Duration::from_millis(50));
+        push_event(&ring, "a.test", LogVerdict::Allow, "allowed");
+        assert!(quick(&ring), "a follower whose read is overdue has stopped");
+    }
+
+    /// A ring keeps one entry per follower and a bounded number of them: past the bound, the
+    /// follower heard from longest ago is the one forgotten.
+    #[test]
+    fn a_ring_keeps_one_entry_per_follower_and_a_bounded_number() {
+        let ring = LogRing::new(LOG_RING_CAP);
+        let snap = ring.snapshot(None, None, false);
+        let readers = FOLLOWERS_MAX as u32 + 3;
+        for reader in 0..readers {
+            ring.followed(reader, Duration::from_secs(1), &snap, false);
+            thread::sleep(Duration::from_millis(1));
+        }
+        ring.followed(readers - 1, Duration::from_secs(1), &snap, false);
+        let followers = locked(&ring.followers);
+        assert_eq!(followers.len(), FOLLOWERS_MAX);
+        assert_eq!(
+            followers.iter().filter(|f| f.reader == readers - 1).count(),
+            1,
+            "a follower that reads again is the same entry"
+        );
+        assert!(
+            (0..3).all(|gone| followers.iter().all(|f| f.reader != gone)),
+            "the followers heard from longest ago are the ones forgotten"
+        );
+    }
+
+    /// `LOG … follow=<pid>:<ms>` names a follow reader, and the session records the reader, its
+    /// interval, how far the read went, and whether it asked for amendments. A malformed token
+    /// names nobody.
+    #[test]
+    fn a_log_read_that_names_a_follower_is_recorded() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
+        push_event(&log, "a.test", LogVerdict::Allow, "allowed");
+        log.set_status(1, 200);
+
+        for bad in [
+            "follow=",
+            "follow=12",
+            "follow=x:1000",
+            "follow=12:y",
+            "follow=-1:1000",
+        ] {
+            dispatch(&format!("LOG {bad}"), &state, &manual, &log, &flows, None);
+        }
+        assert!(
+            locked(&log.followers).is_empty(),
+            "a malformed token names nobody"
+        );
+
+        let out = dispatch(
+            "LOG after=0 amended=0 follow=4242:1000",
+            &state,
+            &manual,
+            &log,
+            &flows,
+            None,
+        );
+        assert!(out.contains("event seq=1"), "{out}");
+        dispatch("LOG follow=77:250", &state, &manual, &log, &flows, None);
+        let followers = locked(&log.followers);
+        let shown = |reader: u32| {
+            followers
+                .iter()
+                .find(|f| f.reader == reader)
+                .map(|f| (f.interval, f.head, f.amend))
+        };
+        assert_eq!(shown(4242), Some((Duration::from_secs(1), 1, Some(1))));
+        assert_eq!(shown(77), Some((Duration::from_millis(250), 1, None)));
+    }
+
     #[test]
     fn rpc_kind_classifies_by_content_type_family_never_the_path() {
         use RpcKind::*;
@@ -4298,7 +4578,7 @@ mod tests {
         }
 
         // A tail read over the socket returns both events, newest last, with the fields intact.
-        let snap = read_log(&socket, None, None, false, false).unwrap();
+        let snap = read_log(&socket, None, None, false, false, None).unwrap();
         assert_eq!(snap.events.len(), 2);
         assert_eq!(snap.head, 2);
         assert_eq!(snap.events[0].host, "a.test");
@@ -4308,13 +4588,13 @@ mod tests {
         assert_eq!(snap.events[1].path.as_deref(), Some("/two?t=1"));
 
         // A follow read past the first event returns only the second, no gap.
-        let after = read_log(&socket, Some(1), None, false, false).unwrap();
+        let after = read_log(&socket, Some(1), None, false, false, None).unwrap();
         assert_eq!(after.events.len(), 1);
         assert_eq!(after.events[0].seq, 2);
         assert_eq!(after.dropped, 0);
 
         // Discovery: `log_all` globs the egress dir and finds this session by its socket pid.
-        let sessions = log_all(data.path(), false, false);
+        let sessions = log_all(data.path(), false, false, None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, pid);
         assert_eq!(sessions[0].snapshot.events.len(), 2);

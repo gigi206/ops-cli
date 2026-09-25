@@ -176,15 +176,29 @@ pub(crate) struct SessionLog {
     pub(crate) snapshot: LogSnapshot,
 }
 
+/// How a `--follow` reader names itself on each read of a session's log, so that the session can
+/// wait for its next read as it ends ([`LogRing::linger`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Follow {
+    /// The reader's process id, which tells one follow's reads from another's.
+    pub(crate) reader: u32,
+    /// How often it reads each session.
+    pub(crate) interval: Duration,
+    /// Whether it shows amendments (a status, a capture), and so asks for them from its first read
+    /// of a session on.
+    pub(crate) amendments: bool,
+}
+
 /// Query one session's control socket for its recent egress events (`LOG`, or `LOG after=<seq>` for a
 /// follow read past a cursor). A session whose socket is gone (a dead/stale launch) fails the connect
-/// and the caller skips it.
+/// and the caller skips it. `follow` names a `--follow` reader to the session.
 pub(crate) fn read_log(
     socket: &Path,
     after: Option<u64>,
     after_amend: Option<u64>,
     include_muted: bool,
     with_capture: bool,
+    follow: Option<Follow>,
 ) -> io::Result<LogSnapshot> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -206,6 +220,10 @@ pub(crate) fn read_log(
     // simply sends no `cap` lines, so the request is always safe to make.
     if with_capture {
         cmd.push_str(" capture");
+    }
+    // An older session ignores the token and ends without waiting for the reader.
+    if let Some(f) = follow {
+        cmd.push_str(&format!(" follow={}:{}", f.reader, f.interval.as_millis()));
     }
     cmd.push('\n');
     (&stream).write_all(cmd.as_bytes())?;
@@ -294,15 +312,26 @@ fn parse_capture_line(line: &str) -> Option<(u64, CapturePart, CaptureBytes)> {
 /// filename's pid, and query it (with an optional per-nothing tail read — a shared cursor makes no
 /// sense across sessions, whose sequence spaces are independent). A dead/stale socket is skipped.
 /// Sessions are returned ordered by pid for stable output.
-pub(crate) fn log_all(data_dir: &Path, include_muted: bool, with_capture: bool) -> Vec<SessionLog> {
+///
+/// `follow` names the `--follow` reader this listing seeds. One that shows amendments asks for them
+/// from this first read on (`amended=0`, which re-sends nothing, since no event is at or behind a
+/// cursor of 0), so a session that ends before the follow reads it again still waits for it.
+pub(crate) fn log_all(
+    data_dir: &Path,
+    include_muted: bool,
+    with_capture: bool,
+    follow: Option<Follow>,
+) -> Vec<SessionLog> {
     let mut sessions = Vec::new();
+    let after_amend = follow.filter(|f| f.amendments).map(|_| 0);
     for pid in session_pids(data_dir) {
         if let Ok(snapshot) = read_log(
             &control_socket(data_dir, pid),
             None,
-            None,
+            after_amend,
             include_muted,
             with_capture,
+            follow,
         ) {
             sessions.push(SessionLog { pid, snapshot });
         }

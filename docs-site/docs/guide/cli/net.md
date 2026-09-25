@@ -233,7 +233,7 @@ proxy made. **Live-only**: the log lives in the running session's memory and is
 | `--with-status` | add the upstream HTTP status the server answered, for a completed inspected-`https` request only: an L4 (`tcp://`) splice, a refusal or an `error` shows `-`, having no HTTP response to read. Distinct from the verdict: an allowed request can still get a 404. Under `--follow`, an event whose response has not returned yet prints once without a status and again carrying it, tagged `update`, since a live tail cannot un-print a line |
 | `--with-headers` | the request and response heads that actually crossed (needs `capture`) |
 | `--with-body` | the leading bytes of each body as well (needs `capture = "bodies"`) |
-| `-f`, `--follow` | tail the log instead of printing a snapshot |
+| `-f`, `--follow` | tail the log instead of printing a snapshot. A session that ends waits for the follow's next read, at most two seconds, so what arrived since the last read still reaches it |
 | `-i <secs>` | the poll interval under `--follow` |
 | `--json` | one JSON object per event (NDJSON), for a pipe. Each carries `seq`, the event's number in its session; under `--follow`, each also carries `update`, `true` when it shows an event again |
 

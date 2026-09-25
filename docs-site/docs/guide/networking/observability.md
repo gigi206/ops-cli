@@ -527,6 +527,15 @@ and not as a second request. Under `--json`, every object of the stream carries
 with `pid` pairs an update with the event's first line. Leaving the updates out
 counts each request once.
 
+A session that ends while a follow reads it waits for that follow's next read before
+its log goes, so what arrived since the last read is shown rather than lost with the
+session: often the status and the traffic of its last exchange. The wait ends at that
+read and lasts at most two seconds. A session no follow has read, or whose follows
+have read everything, ends at once. Two cases stay out of reach: a session that
+starts and ends between two polls is never read at all, and a follow whose next read
+would come more than two seconds after the session ends (a longer `--interval`) is
+not waited for.
+
 The one exception is a **WebSocket**, which is genuinely several events rather than one:
 it appears when the tunnel opens (with its handshake), then as each direction's transcript
 fills, then once more at close if that changed anything. **Four lines of traffic** over the

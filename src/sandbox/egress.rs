@@ -79,7 +79,9 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
 /// # Stopping
 ///
 /// The proxy runs in a process of its own ([`super::proxy::child`]) and stops when its link ends, so
-/// [`Drop`] closes the link and gives the process a moment before it kills it.
+/// [`Drop`] closes the link and gives the process a moment before it kills it. Once what the proxy
+/// reported is applied, and before the control socket goes, the guard that owns its ring waits for
+/// the `--follow` readers that have not read its last change ([`super::control::LogRing::linger`]).
 ///
 /// The control and report threads [`start`] spawns are detached and each holds its listening fd,
 /// and neither [`super::control::serve`] nor [`super::control::serve_reports`] returns on its own:
@@ -116,6 +118,10 @@ pub(crate) struct Egress {
     /// `sbx app <name> --net-learn` synthesizes rules from. The proxy appends to it; this is a
     /// read handle.
     log: Arc<super::control::LogRing>,
+    /// Whether that ring is this proxy's own rather than one handed in by the session
+    /// ([`Self::event_log`]). Only the owner's end is the end of what a `--follow` reads, so only
+    /// the owner waits for it ([`super::control::LogRing::linger`]).
+    owns_log: bool,
     /// The stop signal the control and report loops read, set by [`Drop`]: the header above says
     /// why the threads cannot be ended any other way.
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -189,6 +195,12 @@ impl Drop for Egress {
             if applier.is_finished() {
                 let _ = applier.join();
             }
+        }
+        // The ring is final from here. A `--follow` that read this session is given its next read
+        // of it before the socket goes, so the status and the traffic of the last exchange reach
+        // it.
+        if self.owns_log {
+            self.log.linger(super::control::LINGER_MAX);
         }
         // Stop the control thread before the paths go, and in this order: the flag first, then one
         // throwaway connection to unpark the `accept` it is blocked in. The loop reads the flag the
@@ -1031,6 +1043,7 @@ pub(crate) fn start(
     // The event ring is created here, before the control block, so a clone can be kept on the guard
     // for `--net-learn` to snapshot after the run — the control thread and the proxy get their own
     // clones of the same `Arc`.
+    let owns_log = event_log.is_none();
     let log = event_log.unwrap_or_else(|| {
         Arc::new(
             super::control::LogRing::new(super::control::LOG_RING_CAP)
@@ -1264,6 +1277,7 @@ pub(crate) fn start(
             report_uds: report_uds.clone(),
             stats,
             log,
+            owns_log,
             stop,
             supervisor: launched.supervisor,
             proxy: launched.proxy,
@@ -2341,6 +2355,124 @@ mod tests {
         );
     }
 
+    /// A session that ends gives a `--follow` that read it its next read before the control socket
+    /// goes, so the event that arrived since that follow's last read reaches it.
+    #[test]
+    fn dropping_the_guard_gives_a_follow_its_next_read() {
+        use crate::sandbox::control::{Follow, HttpVer, LogVerdict, Proto, RpcKind, read_log};
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let (guard, _wiring) = start(
+            &layout,
+            EgressPolicy::default(),
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            false,
+            None,
+            "-4",
+            None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            None,
+            Plane::Agent,
+            None,
+            Unresolved::Abort,
+            None,
+        )
+        .expect("start the egress proxy");
+        let socket = guard.control_uds.clone().expect("a control socket");
+        let follow = Follow {
+            reader: 4242,
+            interval: std::time::Duration::from_millis(300),
+            amendments: false,
+        };
+        let first = read_log(&socket, None, None, false, false, Some(follow)).expect("first read");
+        guard.event_log().push(
+            false,
+            "last.test",
+            443,
+            Some("GET"),
+            Some("/x"),
+            LogVerdict::Allow,
+            "allowed",
+            Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
+            Plane::Agent,
+        );
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(follow.interval);
+            read_log(&socket, Some(first.head), None, false, false, Some(follow))
+                .map(|next| next.events.len())
+        });
+        let begun = std::time::Instant::now();
+        drop(guard);
+        let took = begun.elapsed();
+        assert_eq!(
+            reader.join().unwrap().ok(),
+            Some(1),
+            "the follow's next read reaches the session and carries its last event"
+        );
+        assert!(
+            took < crate::sandbox::control::LINGER_MAX,
+            "the wait ended at the read: {took:?}"
+        );
+    }
+
+    /// A per-invocation proxy handed the session's ring does not wait for the session's follows as
+    /// it stops: the ring outlives it, and so does the socket they read it through.
+    #[test]
+    fn a_guard_handed_the_sessions_ring_does_not_wait_for_its_follows() {
+        use crate::sandbox::control::{HttpVer, LOG_RING_CAP, LogRing, LogVerdict, Proto, RpcKind};
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let shared = std::sync::Arc::new(LogRing::new(LOG_RING_CAP));
+        let (guard, _w) = start(
+            &layout,
+            EgressPolicy::default(),
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            false,
+            None,
+            "-3",
+            None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            Some(shared.clone()),
+            Plane::Task,
+            None,
+            Unresolved::Abort,
+            None,
+        )
+        .expect("start with the session's ring");
+        let interval = std::time::Duration::from_millis(900);
+        let snap = shared.snapshot(None, None, false);
+        shared.followed(4242, interval, &snap, false);
+        shared.push(
+            false,
+            "task.test",
+            443,
+            Some("GET"),
+            Some("/x"),
+            LogVerdict::Allow,
+            "allowed",
+            Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
+            Plane::Task,
+        );
+        let begun = std::time::Instant::now();
+        drop(guard);
+        let took = begun.elapsed();
+        assert!(took < interval, "the guard waited for a follow: {took:?}");
+    }
+
     /// Every path this guard owns goes when the launch ends. A path it holds but does not unlink is
     /// a file per session left behind for good: nothing else writes these names, and the runtime
     /// sweep is a backstop for the sessions that end on a signal, not a substitute for the guard.
@@ -2365,6 +2497,7 @@ mod tests {
             log: Arc::new(super::super::control::LogRing::new(
                 super::super::control::LOG_RING_CAP,
             )),
+            owns_log: true,
             supervisor: super::super::proxy::link::pair().1,
             proxy: super::super::proxy::child::Proxy::none(),
             applier: None,

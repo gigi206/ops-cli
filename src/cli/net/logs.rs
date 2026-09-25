@@ -52,6 +52,13 @@ impl LogView {
     fn wants_capture(&self) -> bool {
         self.with_headers || self.with_body
     }
+
+    /// Whether this view shows what arrives after an event: its status under `--with-status`, or
+    /// its traffic under `--with-headers`/`--with-body`. Only such a follow asks a session to send
+    /// an event again once it is amended.
+    fn shows_amendments(&self) -> bool {
+        self.with_status || self.wants_capture()
+    }
 }
 
 /// The `--verdict` values, as the flag's own messages spell them. Derived from the verdict set so
@@ -137,15 +144,18 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
 /// the retained window's first sequence number as the count of what fell off. Asking for the merged
 /// view is what makes that sequence contiguous again. What the reader sees is decided in
 /// [`filtered_log_events`], which drops the muted events unless `--all` asked for them.
+///
+/// `follow` names the `--follow` reader this listing seeds, `None` for the one-shot listing.
 fn collect_logs(
     data_dir: &Path,
     app: Option<&str>,
     with_capture: bool,
+    follow: Option<sandbox::control::Follow>,
 ) -> (
     Vec<sandbox::control::SessionLog>,
     Vec<(u32, PathBuf, String)>,
 ) {
-    let mut sessions = sandbox::control::log_all(data_dir, true, with_capture);
+    let mut sessions = sandbox::control::log_all(data_dir, true, with_capture, follow);
     if let Some(name) = app {
         let pids = session_pids_for_app(data_dir, name);
         sessions.retain(|s| pids.contains(&s.pid));
@@ -231,7 +241,8 @@ pub(super) fn net_logs(args: &[OsString]) -> ExitCode {
         return net_logs_follow(&data_dir, &view, &pal);
     }
 
-    let (sessions, context) = collect_logs(&data_dir, view.app.as_deref(), view.wants_capture());
+    let (sessions, context) =
+        collect_logs(&data_dir, view.app.as_deref(), view.wants_capture(), None);
 
     if view.json {
         let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
@@ -284,6 +295,13 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     use std::fmt::Write as _;
 
     let interval = std::time::Duration::from_secs(view.interval_secs.max(1));
+    // How this follow names itself on every read, so a session that ends waits for its next read
+    // rather than taking with it what arrived since the last one.
+    let follow = sandbox::control::Follow {
+        reader: std::process::id(),
+        interval,
+        amendments: view.shows_amendments(),
+    };
     // A per-session cursor: the last seq already shown, plus the amendment cursor (for retroactive
     // status). Seeded from the initial listing so the follow only ever appends genuinely new events.
     let mut cursor: HashMap<u32, (u64, u64)> = HashMap::new();
@@ -297,7 +315,12 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     // Seed: the current listing (human render, or NDJSON of the retained events), respecting `-n`.
     // Only actual events are written — the one-shot's "nothing to show" line is skipped, so a follow
     // that pipes to `head` on an idle session emits no spurious line then spins.
-    let (sessions, context) = collect_logs(data_dir, view.app.as_deref(), view.wants_capture());
+    let (sessions, context) = collect_logs(
+        data_dir,
+        view.app.as_deref(),
+        view.wants_capture(),
+        Some(follow),
+    );
     let has_events = sessions
         .iter()
         .any(|s| !filtered_log_events(&s.snapshot.events, view).is_empty());
@@ -370,17 +393,18 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
             // status under `--with-status`, or the traffic under `--with-headers`/`--with-body`.
             // Otherwise the completion is invisible and re-showing the line would be pure
             // duplication. Both arrive as ONE amendment per exchange, so an event is re-shown once.
-            let after_amend = if view.with_status || view.wants_capture() {
-                entry.map(|(_, amend)| amend)
-            } else {
-                None
-            };
+            // A session read for the first time is asked from amendment 0, which re-sends nothing
+            // and tells it this follow shows amendments.
+            let after_amend = view
+                .shows_amendments()
+                .then(|| entry.map_or(0, |(_, amend)| amend));
             let Ok(snap) = sandbox::control::read_log(
                 &sandbox::control::control_socket(data_dir, pid),
                 after,
                 after_amend,
                 view.all,
                 view.wants_capture(),
+                Some(follow),
             ) else {
                 continue; // a session that vanished mid-read is handled next tick
             };

@@ -3171,7 +3171,11 @@ pub(super) const PAGES: &[Page] = &[
             LIVE-ONLY: the log lives in the running session's memory and is NEVER written to disk;\n\
             once the session exits, nothing remains. It shows a session while it runs (watch it\n\
             from another terminal), not after. Only a filtering posture (`deny`/`allow`/`ask`) has a\n\
-            proxy, so only those sessions have a log.\n\
+            proxy, so only those sessions have a log. Under `--follow`, a session that ends\n\
+            waits for the follow's next read, at most two seconds, before its log goes, so what\n\
+            arrived since the last read (often the status and traffic of the last exchange) is\n\
+            shown. A session that starts and ends between two polls is never read, and a follow\n\
+            whose next read would come later than that is not waited for.\n\
             \n\
             Verdicts are a superset of `sbx net stats`: allow, deny, blocked (a security/protocol\n\
             guard), and `error` — a request that was allowed but did not complete (DNS failure, an\n\

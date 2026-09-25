@@ -960,7 +960,7 @@ fn the_log_reader_asks_each_session_for_its_muted_ring_so_a_hole_is_not_an_evict
         cmd.trim_end().to_string()
     });
 
-    let (sessions, context) = collect_logs(data.path(), None, false);
+    let (sessions, context) = collect_logs(data.path(), None, false, None);
     let asked = session.join().expect("the stand-in session thread");
     assert_eq!(sessions.len(), 1, "the stand-in session must be reachable");
     assert_eq!(

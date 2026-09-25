@@ -3068,3 +3068,100 @@ fn a_followed_event_sent_again_with_its_status_is_marked_as_an_update() {
         }
     }
 }
+
+/// `sbx net logs --follow` names itself on every read of a session, from the first one on, so a
+/// session that ends can wait for its next read: whether the listing that starts the follow found
+/// the session, or a later poll did. A follow that shows amendments also asks for them from that
+/// first read on (`amended=0`), and one that does not never asks.
+#[test]
+fn a_follow_names_itself_on_every_read_of_a_session() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    type Asked = Arc<Mutex<Vec<String>>>;
+    // A session that answers `reads` reads with nothing new, then ends.
+    let stand_in = |egress: &std::path::Path, pid: u32, reads: usize| {
+        let socket = egress.join(format!("control-{pid}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let asked: Asked = Arc::default();
+        let seen = Arc::clone(&asked);
+        let server = std::thread::spawn(move || {
+            for _ in 0..reads {
+                let (stream, _) = listener.accept().unwrap();
+                let mut cmd = String::new();
+                BufReader::new(&stream).read_line(&mut cmd).unwrap();
+                seen.lock().unwrap().push(cmd.trim_end().to_string());
+                (&stream).write_all(b"head=0\namended=0\nok\n").unwrap();
+            }
+            std::fs::remove_file(&socket).unwrap();
+        });
+        (server, asked)
+    };
+    let until = |what: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !what() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    for with_status in [true, false] {
+        let fx = Project::new("net");
+        let egress = fx.data_home.path().join("sbx").join("egress");
+        std::fs::create_dir_all(&egress).unwrap();
+        // Found by the listing that starts the follow, then read once more by a poll.
+        let (seeded, seeded_asked) = stand_in(&egress, 55563, 2);
+
+        let mut args = vec!["net", "logs", "--follow"];
+        if with_status {
+            args.push("--with-status");
+        }
+        let mut follower = fx
+            .cmd(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sbx net logs --follow");
+        let started = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&started);
+        let stderr = follower.stderr.take().expect("piped stderr");
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if line.contains("following egress") {
+                    *flag.lock().unwrap() = true;
+                }
+            }
+        });
+        until(&|| *started.lock().unwrap());
+        // Found by a poll, once the follow has started.
+        let (polled, polled_asked) = stand_in(&egress, 55564, 1);
+        until(&|| seeded.is_finished() && polled.is_finished());
+        let reader = follower.id();
+        let _ = follower.kill();
+        let _ = follower.wait();
+
+        let seeded_asked = seeded_asked.lock().unwrap().clone();
+        let polled_asked = polled_asked.lock().unwrap().clone();
+        assert_eq!(seeded_asked.len(), 2, "{seeded_asked:?}");
+        assert_eq!(polled_asked.len(), 1, "{polled_asked:?}");
+        let name = format!("follow={reader}:1000");
+        for cmd in seeded_asked.iter().chain(&polled_asked) {
+            assert!(cmd.split(' ').any(|t| t == name), "`{name}` in {cmd:?}");
+            assert_eq!(
+                cmd.contains("amended="),
+                with_status,
+                "amendments asked for exactly when shown: {cmd:?}"
+            );
+        }
+        for first in [&seeded_asked[0], &polled_asked[0]] {
+            assert!(!first.contains("after="), "a first read: {first:?}");
+            if with_status {
+                assert!(first.contains("amended=0"), "{first:?}");
+            }
+        }
+        assert!(seeded_asked[1].contains("after=0"), "{seeded_asked:?}");
+    }
+}
