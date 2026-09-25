@@ -27,6 +27,14 @@
 # `sbx test net <url>`).
 cmd = "pi"
 
+# No `contract`: the channel Pi offers, `--append-system-prompt`, costs you your own addition. Given
+# on the command line it makes Pi skip its `APPEND_SYSTEM.md` (the project's `.pi/` one and the one
+# in `~/.pi/agent/`) without a word; `AGENTS.md` still loads. Hand Pi the summary
+# (/opt/sbx/contract-summary.md, rewritten at every launch) yourself, and pass your own file with it
+# when you have one, since the option may be repeated:
+#     sbx app run pi -- --append-system-prompt /home/sandbox/.pi/agent/APPEND_SYSTEM.md \
+#                       --append-system-prompt /opt/sbx/contract-summary.md
+
 # Your host Pi config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
 # `pi` read and write these host files (auth, API keys, sessions). Uncomment to share your host Pi

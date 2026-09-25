@@ -119,6 +119,14 @@ exec prime-agent "$@"
     "prime-agent",
 ]
 
+# No `contract`: the channel Prime Agent offers, `--append-system-prompt`, costs you your own
+# addition. Given on the command line it makes the agent skip its `APPEND_SYSTEM.md` (the
+# project's `.prime/agent/` one and the one in `~/.prime/agent/`) without a word; `AGENTS.md`
+# still loads. Hand it the summary (/opt/sbx/contract-summary.md, rewritten at every launch)
+# yourself, and pass your own file with it when you have one, since the option may be repeated:
+#     sbx app run prime-agent -- --append-system-prompt /home/sandbox/.prime/agent/APPEND_SYSTEM.md \
+#                                --append-system-prompt /opt/sbx/contract-summary.md
+
 # Your host Prime Agent setup, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
 # caged agent read and write these host files (auth, sessions, harness state). Uncomment to share

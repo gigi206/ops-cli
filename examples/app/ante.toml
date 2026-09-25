@@ -118,6 +118,15 @@
 # proprietary license.
 cmd = "ante"
 
+# No `contract`: the channel Ante offers, `--append-system-prompt`, takes text
+# and costs you your own addition. Given on the command line it replaces the
+# `append_system_prompt` of your `~/.ante/settings.json` without a word;
+# `AGENTS.md` still loads. Point Ante at the cage's summary yourself instead,
+# for instance with a line in that `append_system_prompt` such as "When the
+# environment variable SBX_SANDBOX is 1, read the file named by
+# SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Ante config/models, mounted read-write at their real absolute
 # paths. `binds` is a security field, honored only because this profile lives
 # in your trusted config dir; `mode = "rw"` lets the caged `ante` read and
