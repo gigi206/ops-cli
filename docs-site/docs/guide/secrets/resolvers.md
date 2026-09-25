@@ -59,12 +59,31 @@ type   = "bearer"
 ```
 
 `sops://<file>#<key>` decrypts an encrypted file host-side and extracts one key.
-The decryption uses the host-side age/KMS key material: which stays on the host,
+The decryption uses the host-side age/KMS key material, which stays on the host,
 outside the cage. This is the clean demonstration that the SOURCE layer is
 distinct from the SINK: the same first-party HTTP-header broker consumes a value
-that a completely different mechanism produced. The encrypted file the agent
-*could* read (if it were bound, which it is not) would be useless ciphertext
-anyway, because no decryption key is in the cage.
+that a completely different mechanism produced.
+
+A relative `<file>` resolves against the project root, and the project tree is
+writable from the cage. The ciphertext is useless there, since no decryption key
+is in the cage, but the file's `sops` metadata is not inert: it tells the host's
+`sops` where to fetch the key, and `sops` goes there with the credentials of your
+environment. So a file **in the project** is decrypted only as the bytes
+[`sbx trust`](../concepts/trust#sops-files-the-config-names) approved:
+
+- the project's `.sbx.toml` must name the file (in a `sops://` reference or as the
+  `file` of `[secret.defaults.sops]`) and be trusted, which folds the file's bytes
+  into the trust hash;
+- each resolution (the launch, every task run, every credential refresh) re-reads
+  the file and hands `sops` a private copy of those bytes, outside the cage's view,
+  never the path in the project;
+- a file the trust does not cover, or one rewritten since `sbx trust`, is refused
+  before `sops` runs, and the error names it.
+
+A file outside the project, named by an absolute path, is decrypted where it is.
+A relative sops file named only by the global config or an app profile is in the
+project too, and is refused until the project's `.sbx.toml` names it and is
+trusted; give such a file an absolute path outside the project instead.
 
 ## Two ways to name a source
 

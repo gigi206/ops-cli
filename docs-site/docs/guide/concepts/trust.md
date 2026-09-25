@@ -81,7 +81,7 @@ compares:
 flowchart TB
     LOAD["<b>a launch loads .sbx.toml</b>"] --> GATE{"<b>safety gate</b><br/><i>plain · owner-owned · not world-writable</i>"}
     GATE -- "fails" --> CLOSED["<b>fail-closed</b><br/><i>unverifiable, reported</i>"]
-    GATE -- "passes" --> HASH["<b>SHA-256 of the whole file</b><br/><i>with the mise files, if any</i>"]
+    GATE -- "passes" --> HASH["<b>SHA-256 of the whole file</b><br/><i>with the mise and sops files, if any</i>"]
     HASH --> REC{"<b>a trust record?</b>"}
     REC -- "no" --> UNTRUSTED["<b>untrusted</b><br/><i>security fields dropped</i>"]
     REC -- "yes, bytes differ" --> CHANGED["<b>changed</b><br/><i>dropped, with its own warning</i>"]
@@ -108,7 +108,8 @@ applying until you run `sbx trust` again.
 ## What a re-approval shows
 
 The hash says *whether* the file changed, not *what* changed. So beside each trust record
-sits a copy of the bytes it approved, the `.sbx.toml` and every mise file, and
+sits a copy of the bytes it approved, the `.sbx.toml`, every mise file and every sops file
+it names, and
 `sbx trust` compares the current contents against that copy before recording anything.
 It prints the lines that differ, per file, and asks for confirmation; with no copy on
 record (a first approval) every line is shown, since all of it is being granted.
@@ -147,6 +148,25 @@ on your behalf. Create the config yourself (`touch .sbx.toml` is enough), review
 mise file, run `sbx trust .sbx.toml`, and the command proceeds. A project with no mise
 file bootstraps in one step as before, and so does one whose config you already trust:
 there the mise bytes are the ones your existing marker already covers.
+
+## Sops files the config names
+
+A [`sops://`](../secrets/resolvers#sops-a-sops-encrypted-store) source decrypts a file
+host-side, and the file's metadata decides where the host's `sops` fetches the key,
+with the credentials of your environment. A file in the project is one the cage can
+rewrite, so every sops file the `.sbx.toml` names in the project (the file of a
+`sops://` reference anywhere in it, and the `file` of a `[secret.defaults.sops]`
+table) is hashed **together** with it, like the mise files. A sops file named by an
+absolute path outside the project is not.
+
+`sbx trust` shows such a file under `sops:<path>`, ciphertext and metadata, so a
+change to the metadata is on screen before it is granted. Re-encrypting or rotating
+the file (`sops edit`, `sops updatekeys`) re-arms the gate like any other edit.
+
+At each resolution (the launch, a task run, a credential refresh), sbx re-reads the
+file, checks that the project is trusted over those very bytes, and hands `sops` a
+private copy of them rather than the path. A file the trust does not cover, or one
+rewritten since, is refused before `sops` runs.
 
 ## Why the whole file
 

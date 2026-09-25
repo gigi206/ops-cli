@@ -710,6 +710,19 @@ fn sops_source(locator: &str) -> Result<SecretSource, String> {
     })
 }
 
+/// The file a `sops://` reference names, split exactly as [`sops_source`] splits it; `None` for a
+/// reference of any other scheme or one that would not parse as a sops source.
+///
+/// The trust gate reads a config's sops references through this, so the file it hashes is the file
+/// a resolution later opens: a second spelling of the `#` split could hash one path and decrypt
+/// another.
+pub(crate) fn sops_ref_file(reff: &str) -> Option<PathBuf> {
+    match sops_source(reff.strip_prefix("sops://")?) {
+        Ok(SecretSource::Sops { file, .. }) => Some(file),
+        _ => None,
+    }
+}
+
 /// Validate a sops `--extract` key path: dot-separated segments, each non-empty and made of
 /// letters, digits, `_`, or `-`. Rejects an empty key (a trailing `#`), an empty segment
 /// (`a..b`, `.a`, `a.`), and any character that could break the bracketed extract expression.

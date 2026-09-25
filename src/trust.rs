@@ -22,8 +22,14 @@
 //! the gate. The mise file is anchored on the `.sbx.toml`: it is hashed (and
 //! later honored) only beside one, keyed by the `.sbx.toml` path.
 //!
-//! Beside each marker sits the record of what it approved: the bytes of the `.sbx.toml` and of
-//! every mise file, as they were hashed ([`approved`]). The hash alone answers *whether* the
+//! A project may name a SOPS-encrypted file as a secret's source, and its metadata decides where
+//! the host's `sops` goes for the key, with the user's credentials. A file in the project is one
+//! the cage can rewrite, so the hash folds in every such file the `.sbx.toml` names
+//! ([`sops_inputs_for`]), and a resolution hands `sops` only bytes that hash still covers
+//! ([`covered_sops_bytes`]).
+//!
+//! Beside each marker sits the record of what it approved: the bytes of the `.sbx.toml`, of every
+//! mise file and of every sops file it names, as they were hashed ([`approved`]). The hash alone answers *whether* the
 //! project changed; `sbx trust` needs *what* changed, so that re-approving shows the reader the
 //! contents they are about to grant instead of asking them to vouch for bytes they never saw.
 
@@ -37,6 +43,11 @@ use std::path::{Path, PathBuf};
 /// precedence order. The trust hash folds these in, and the launcher maps them — so
 /// the same type carries the bytes from the safety gate to both consumers.
 pub(crate) type MiseInputs = Vec<(String, Vec<u8>)>;
+
+/// Every file the trust hash covers beside the `.sbx.toml`, as `(tag, bytes)`: the mise files
+/// ([`MiseInputs`]) then the sops files the config names, the latter tagged under
+/// [`SOPS_TAG_PREFIX`]. The launcher maps only the mise half; the gate hashes and records both.
+pub(crate) type TrustInputs = Vec<(String, Vec<u8>)>;
 
 /// Lowercase hex SHA-256 of a buffer. The single hasher for both the marker key
 /// (a path string) and the content hash, so the two can never diverge.
@@ -119,12 +130,157 @@ pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
     Ok(out)
 }
 
+/// What a sops file's part of the hash is tagged with, before the file as the config spells it. No
+/// entry of [`MISE_CONFIG_NAMES`] begins so, which keeps every tag of one hash distinct.
+const SOPS_TAG_PREFIX: &str = "sops:";
+
+/// The directory a project's relative paths resolve against, resolved as far as it exists, so the
+/// same project yields the same sops parts whichever spelling of its config path was given.
+fn project_root_of(config_path: &Path) -> PathBuf {
+    canonicalize_existing_prefix(config_path.parent().unwrap_or(Path::new("")))
+}
+
+/// Whether `path` is in the project under `root`, the tree the cage is given to write: under it as
+/// spelled, or once the part of it that exists is resolved. Either answer counts, so a path that
+/// only reaches the project through a link is treated as the project's.
+fn in_project(root: &Path, path: &Path) -> bool {
+    path.starts_with(root) || canonicalize_existing_prefix(path).starts_with(root)
+}
+
+/// Every sops file a config names: the file of each `sops://` reference, wherever it appears
+/// (`from`, a task's variable, a broker's secret), and each `file` of a `[… .sops]` defaults table,
+/// which a terse `key` expands through. Read from the raw TOML rather than from the resolved
+/// config, so the set does not depend on which fields the schema honours. A name missed here is
+/// never covered, and [`covered_sops_bytes`] refuses it: an omission fails closed.
+fn sops_files_named(sbx_bytes: &[u8]) -> std::collections::BTreeSet<PathBuf> {
+    fn walk(value: &toml::Value, out: &mut std::collections::BTreeSet<PathBuf>) {
+        match value {
+            toml::Value::String(s) => out.extend(crate::config::sops_ref_file(s)),
+            toml::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+            toml::Value::Table(table) => {
+                for (key, v) in table {
+                    if key == "sops"
+                        && let Some(file) = v.get("file").and_then(toml::Value::as_str)
+                    {
+                        out.insert(PathBuf::from(file));
+                    }
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    if let Some(table) = std::str::from_utf8(sbx_bytes)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+    {
+        walk(&toml::Value::Table(table), &mut out);
+    }
+    out
+}
+
+/// Read every sops file the `.sbx.toml` bytes name that lies in the project, through the safety
+/// gate the config uses, as `(tag, bytes)` for folding into the trust hash. A file outside the
+/// project is left out (the cage is not given it to write), as is one that does not exist: a file
+/// that appears later changes the hash a resolution recomputes, so it is refused, not admitted.
+/// `Err` when one is present but unsafe or unreadable, for the reason [`mise_inputs_for`] gives.
+pub(crate) fn sops_inputs_for(config_path: &Path, sbx_bytes: &[u8]) -> io::Result<TrustInputs> {
+    let root = project_root_of(config_path);
+    let mut out = Vec::new();
+    for file in sops_files_named(sbx_bytes) {
+        let path = crate::sandbox::egress::sops_path(&file, &root);
+        if !in_project(&root, &path) {
+            continue;
+        }
+        match crate::config::safety::read_safe_bytes(&path) {
+            Ok(bytes) => out.push((format!("{SOPS_TAG_PREFIX}{}", file.display()), bytes)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// Every file the trust of `config_path` covers beside it: the mise files, then the sops files
+/// `sbx_bytes` names. What the gate hashes and records, and what [`trust_written`] compares.
+pub(crate) fn trust_inputs_for(config_path: &Path, sbx_bytes: &[u8]) -> io::Result<TrustInputs> {
+    let mut inputs = mise_inputs_for(config_path)?;
+    inputs.extend(sops_inputs_for(config_path, sbx_bytes)?);
+    Ok(inputs)
+}
+
+/// The bytes `sops` may be handed for `file`, a sops source resolved against `project_root`.
+///
+/// `Ok(None)` when the file is outside the project: the cage is not given it to write, and it is
+/// decrypted where it is. A file in the project is one the cage can rewrite, and its metadata
+/// decides where `sops` fetches the key, with the user's credentials. So it is decrypted only as
+/// the bytes the project's trust covers: `Ok(Some(bytes))` when the `.sbx.toml` names it and the
+/// project reads `Trusted` over those very bytes, which are the ones returned, so nothing written
+/// after the check reaches `sops`. `Err` otherwise, naming the file and why it is not covered.
+pub(crate) fn covered_sops_bytes(
+    store_dir: Option<&Path>,
+    project_root: &Path,
+    file: &Path,
+) -> io::Result<Option<Vec<u8>>> {
+    let root = canonicalize_existing_prefix(project_root);
+    let path = crate::sandbox::egress::sops_path(file, &root);
+    if !in_project(&root, &path) {
+        return Ok(None);
+    }
+    let config = root.join(crate::config::PROJECT_CONFIG);
+    let refuse = |why: &str| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is in the project, which the cage can write, and {why}: name it in {} and run \
+                 `sbx trust`, or keep it outside the project",
+                path.display(),
+                crate::config::PROJECT_CONFIG
+            ),
+        )
+    };
+    let Some(store) = store_dir else {
+        return Err(refuse(
+            "no trust store can be located to confirm it was approved",
+        ));
+    };
+    let sbx_bytes = crate::config::safety::read_safe_bytes(&config).map_err(|e| {
+        refuse(&match e.kind() {
+            io::ErrorKind::NotFound => format!("no {} covers it", crate::config::PROJECT_CONFIG),
+            _ => format!("its approval cannot be confirmed ({e})"),
+        })
+    })?;
+    let inputs = trust_inputs_for(&config, &sbx_bytes)
+        .map_err(|e| refuse(&format!("its approval cannot be confirmed ({e})")))?;
+    match verdict_for_hash(store, &config, &content_hash(&sbx_bytes, &inputs)) {
+        TrustState::Trusted => {}
+        TrustState::Untrusted => return Err(refuse("the project is not trusted")),
+        TrustState::Changed => {
+            return Err(refuse(
+                "the project, or a file its trust covers, changed since it was trusted",
+            ));
+        }
+    }
+    inputs
+        .into_iter()
+        .find_map(|(tag, bytes)| {
+            let named = tag.strip_prefix(SOPS_TAG_PREFIX)?;
+            (crate::sandbox::egress::sops_path(Path::new(named), &root) == path).then_some(bytes)
+        })
+        .map(Some)
+        .ok_or_else(|| {
+            refuse("the trusted config does not name it, so its trust does not cover it")
+        })
+}
+
 /// The trust content hash for a project: the `.sbx.toml` bytes alone when the
-/// project has no mise file — so a project that never had one keeps a marker
-/// byte-identical to hashing the single file — or an unambiguous framing of the
-/// `.sbx.toml` and *every* mise file when it has some. Each part is domain-tagged
-/// (the mise parts by filename) and length-prefixed, never a bare concatenation, so
-/// among *has-mise* inputs no two distinct sets share an encoding: a change to any
+/// project has no mise file and names no sops file in it — so a project that never had
+/// one keeps a marker byte-identical to hashing the single file — or an unambiguous
+/// framing of the `.sbx.toml` and *every* covered file ([`trust_inputs_for`]) when it
+/// has some. Each part is domain-tagged (the mise parts by path, the sops parts under
+/// [`SOPS_TAG_PREFIX`]) and length-prefixed, never a bare concatenation, so among
+/// *has-companion* inputs no two distinct sets share an encoding: a change to any
 /// file — or moving an entry between files — always changes the hash.
 ///
 /// The no-mise fast path is an intentional exception (it hashes the raw file, for the
@@ -132,14 +288,14 @@ pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
 /// as a has-mise one — would require the trusted `.sbx.toml` bytes to *begin with the internal
 /// framing header* (`sbx.toml\0` + a length), which a real, user-reviewed TOML config never does
 /// (it embeds a NUL), so the "any change re-arms trust" guarantee holds for every real input.
-pub(crate) fn content_hash(sbx_bytes: &[u8], mise_inputs: &[(String, Vec<u8>)]) -> String {
-    if mise_inputs.is_empty() {
+pub(crate) fn content_hash(sbx_bytes: &[u8], inputs: &[(String, Vec<u8>)]) -> String {
+    if inputs.is_empty() {
         return hash_bytes(sbx_bytes);
     }
-    let extra: usize = mise_inputs.iter().map(|(n, b)| n.len() + b.len()).sum();
+    let extra: usize = inputs.iter().map(|(n, b)| n.len() + b.len()).sum();
     let mut buf = Vec::with_capacity(sbx_bytes.len() + extra + 32);
     frame(&mut buf, b"sbx.toml", sbx_bytes);
-    for (name, bytes) in mise_inputs {
+    for (name, bytes) in inputs {
         frame(&mut buf, name.as_bytes(), bytes);
     }
     hash_bytes(&buf)
@@ -172,7 +328,8 @@ fn unframe(mut buf: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
 }
 
 /// The tag the `.sbx.toml` part of an approved record is written under. A mise part is tagged by
-/// its path relative to the project, which never has this spelling.
+/// its path relative to the project and a sops part under [`SOPS_TAG_PREFIX`], neither of which
+/// has this spelling.
 const APPROVED_SBX_TAG: &str = "sbx.toml";
 
 /// Where the approved contents of `config_path` are kept: beside its marker, under the marker's
@@ -183,14 +340,14 @@ fn approved_path(store_dir: &Path, config_path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(name))
 }
 
-/// The contents a recorded trust approved: the `.sbx.toml` bytes and the mise files beside it, as
-/// they were hashed. `None` when nothing is recorded — never trusted, trusted by a version of sbx
+/// The contents a recorded trust approved: the `.sbx.toml` bytes and the files its trust covers
+/// ([`TrustInputs`]), as they were hashed. `None` when nothing is recorded — never trusted, trusted by a version of sbx
 /// that kept only the hash, or a record that cannot be read back whole.
 ///
 /// This is a display input, never a verdict: whether the project is trusted is the marker's hash
 /// alone ([`verdict_for_hash`]), so a record that was tampered with can mislead a diff but cannot
 /// make anything trusted.
-pub(crate) fn approved(store_dir: &Path, config_path: &Path) -> Option<(Vec<u8>, MiseInputs)> {
+pub(crate) fn approved(store_dir: &Path, config_path: &Path) -> Option<(Vec<u8>, TrustInputs)> {
     let bytes = std::fs::read(approved_path(store_dir, config_path)?).ok()?;
     let mut parts = unframe(&bytes)?.into_iter();
     let (tag, sbx) = parts.next()?;
@@ -370,43 +527,40 @@ pub(crate) fn verdict_for_hash(
 /// safety gate the loader uses, so a file the loader would reject (world-writable,
 /// foreign-owned) or cannot read is reported `Untrusted`, never `Trusted` — the
 /// displayed verdict matches what a launch would actually act on. A sibling mise
-/// file that is present but unsafe is also reported `Untrusted`: the trusted
-/// content folds in that file, and an unverifiable one cannot yield `Trusted`.
+/// file, or a sops file the config names, that is present but unsafe is also reported
+/// `Untrusted`: the trusted content folds in that file, and an unverifiable one cannot
+/// yield `Trusted`.
 pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
     state_with_inputs(store_dir, config_path).0
 }
 
-/// [`state`], handing back the sibling mise files the verdict was computed over.
+/// [`state`], handing back the covered files ([`TrustInputs`]) the verdict was computed over.
 ///
 /// A caller that gates a write on the verdict and then blesses what it wrote needs both: the
 /// verdict to admit the write, and those very bytes to hand to [`trust_written`], which attests to
-/// nothing else. Reading the mise files again at bless time would answer the same question twice,
-/// and the project tree is bound read-write into the cage — so the two answers can differ by an
-/// in-cage write, and the second one was admitted by nobody. An unreadable or unsafe file yields
+/// nothing else. Reading the covered files again at bless time would answer the same question
+/// twice, and the project tree is bound read-write into the cage — so the two answers can differ by
+/// an in-cage write, and the second one was admitted by nobody. An unreadable or unsafe file yields
 /// `(Untrusted, empty)`: the verdict the fail-closed arms of this function already give, paired
-/// with the expectation only a project with no mise file at all can meet.
-pub(crate) fn state_with_inputs(store_dir: &Path, config_path: &Path) -> (TrustState, MiseInputs) {
+/// with the expectation only a project with no covered file at all can meet.
+pub(crate) fn state_with_inputs(store_dir: &Path, config_path: &Path) -> (TrustState, TrustInputs) {
     let sbx_bytes = match crate::config::safety::read_safe_bytes(config_path) {
         Ok(b) => b,
         Err(_) => return (TrustState::Untrusted, Vec::new()),
     };
-    let mise_inputs = match mise_inputs_for(config_path) {
+    let inputs = match trust_inputs_for(config_path, &sbx_bytes) {
         Ok(m) => m,
         Err(_) => return (TrustState::Untrusted, Vec::new()),
     };
-    let verdict = verdict_for_hash(
-        store_dir,
-        config_path,
-        &content_hash(&sbx_bytes, &mise_inputs),
-    );
-    (verdict, mise_inputs)
+    let verdict = verdict_for_hash(store_dir, config_path, &content_hash(&sbx_bytes, &inputs));
+    (verdict, inputs)
 }
 
 /// Record trust for `config_path`: hash the file's current contents — and those of
-/// a sibling mise file, when present — and write the marker. Every byte is read
-/// through the safety gate, so a world-writable or foreign-owned `.sbx.toml` *or*
-/// mise file is refused rather than blessed, and the hash covers exactly the gated
-/// bytes of both.
+/// every file its trust covers ([`trust_inputs_for`]) — and write the marker. Every byte
+/// is read through the safety gate, so a world-writable or foreign-owned `.sbx.toml`,
+/// mise file or sops file is refused rather than blessed, and the hash covers exactly
+/// the gated bytes of all of them.
 pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
     trust_inner(store_dir, config_path, None)
 }
@@ -421,27 +575,28 @@ pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
 /// marker, and the next launch drops it: the fail-safe answer, and the one the caller's own gate
 /// already assumes it gets.
 ///
-/// The sibling mise files are still read here, because the caller did not write those — attesting
-/// to bytes it never composed would be inventing them. `expected_mise` is what the caller's *gate*
-/// read of them ([`state_with_inputs`]), and the read here must still match it: the marker covers
-/// the mise files too, and a `nix:` tool in one is provisioned host-side the moment the project
-/// reads `Trusted`. A mise file that changed, appeared or vanished in between is content no gate
-/// admitted, so it is refused rather than blessed.
+/// The covered files — the sibling mise files and the sops files the config names — are still read
+/// here, because the caller did not write those — attesting to bytes it never composed would be
+/// inventing them. `expected` is what the caller's *gate* read of them ([`state_with_inputs`]), and
+/// the read here must still match it: the marker covers them too, a `nix:` tool in a mise file is
+/// provisioned host-side the moment the project reads `Trusted`, and a sops file's metadata is what
+/// the host's `sops` acts on. A file that changed, appeared or vanished in between is content no
+/// gate admitted, so it is refused rather than blessed.
 pub(crate) fn trust_written(
     store_dir: &Path,
     config_path: &Path,
     sbx_bytes: &[u8],
-    expected_mise: &MiseInputs,
+    expected: &TrustInputs,
 ) -> io::Result<()> {
-    trust_inner(store_dir, config_path, Some((sbx_bytes, expected_mise)))
+    trust_inner(store_dir, config_path, Some((sbx_bytes, expected)))
 }
 
 /// The body of both: `written` is the config's bytes as the caller composed them, paired with the
-/// sibling mise files its gate admitted; `None` to read both back from `config_path`.
+/// covered files its gate admitted; `None` to read both back from `config_path`.
 fn trust_inner(
     store_dir: &Path,
     config_path: &Path,
-    written: Option<(&[u8], &MiseInputs)>,
+    written: Option<(&[u8], &TrustInputs)>,
 ) -> io::Result<()> {
     // Every error out of this function opens with the file it is about, so a caller can name the
     // action alone (`could not re-trust {e}`) instead of prefixing a path the message already
@@ -464,26 +619,28 @@ fn trust_inner(
     // what the caller holds. Only the *hashed* bytes come from the caller.
     let read_back = crate::config::safety::read_safe_bytes(config_path)?;
     let sbx_bytes = written.map(|(b, _)| b.to_vec()).unwrap_or(read_back);
-    let mise_inputs = mise_inputs_for(config_path)?;
-    // The mise half of the hash has no composed bytes to stand in for it, so it is read from disk
+    let inputs = trust_inputs_for(config_path, &sbx_bytes)?;
+    // The covered files have no composed bytes to stand in for them, so they are read from disk
     // here — a second read of files the caller's gate already judged. Anything that changed between
     // the two reads was admitted by nobody, and pinning it would hand the marker to an in-cage
-    // writer: the marker is what releases a mise file's `nix:` provisioning on the host. Refusing
-    // instead leaves the project `Changed` and the verb reporting that it wrote but could not
-    // re-trust — the fail-safe the `.sbx.toml` half already gets from hashing the composed bytes.
+    // writer: the marker is what releases a mise file's `nix:` provisioning on the host, and a sops
+    // file's metadata to the host's `sops`. Refusing instead leaves the project `Changed` and the
+    // verb reporting that it wrote but could not re-trust — the fail-safe the `.sbx.toml` half
+    // already gets from hashing the composed bytes. A sops file the composed config names and the
+    // gate's did not is refused the same way: nobody reviewed it.
     if let Some((_, expected)) = written
-        && mise_inputs != *expected
+        && inputs != *expected
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{}: a mise file beside it changed while sbx was writing, so the trust marker \
-                 would cover content that was never reviewed",
+                "{}: a mise or sops file its trust covers is not the one sbx read before writing, \
+                 so the trust marker would cover content that was never reviewed",
                 config_path.display()
             ),
         ));
     }
-    let hash = content_hash(&sbx_bytes, &mise_inputs);
+    let hash = content_hash(&sbx_bytes, &inputs);
 
     // Create the store owner-only from the start, so a loose umask never leaves a
     // world-readable window between creation and tightening, and tighten a dir
@@ -533,7 +690,7 @@ fn trust_inner(
     // record that fails is not this function's error.
     let mut record = Vec::new();
     frame(&mut record, APPROVED_SBX_TAG.as_bytes(), &sbx_bytes);
-    for (name, bytes) in &mise_inputs {
+    for (name, bytes) in &inputs {
         frame(&mut record, name.as_bytes(), bytes);
     }
     if let Some(at) = approved_path(store_dir, config_path)
@@ -873,6 +1030,136 @@ mod tests {
         // re-trusting the new contents clears it again
         trust(store.path(), &cfg).unwrap();
         assert_eq!(state(store.path(), &cfg), TrustState::Trusted);
+    }
+
+    /// A sops file the config names in the project is part of what `sbx trust` approves: a rewrite
+    /// of it re-arms the gate. One outside the project, or one the config does not name, is not.
+    #[test]
+    fn a_sops_file_the_config_names_in_the_project_is_covered_by_the_hash() {
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let outside = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        std::fs::create_dir(proj.join("secrets")).unwrap();
+        std::fs::write(proj.join("secrets/prod.enc.yaml"), b"sops:\n  kms: a\n").unwrap();
+        std::fs::write(proj.join("stray.enc.yaml"), b"sops: {}\n").unwrap();
+        std::fs::write(outside.join("far.enc.yaml"), b"sops: {}\n").unwrap();
+        std::fs::write(
+            &cfg,
+            format!(
+                "[secret.\"api.example.com\"]\nfrom = \"sops://secrets/prod.enc.yaml#tok\"\n\
+                 [task.t]\ncmd = [\"true\"]\n[task.t.secret]\nX = \"sops://{}#k\"\n",
+                outside.join("far.enc.yaml").display()
+            ),
+        )
+        .unwrap();
+
+        let (_, inputs) = state_with_inputs(store.path(), &cfg);
+        let tags: Vec<&str> = inputs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            tags,
+            ["sops:secrets/prod.enc.yaml"],
+            "only the named, in-project file"
+        );
+
+        trust(store.path(), &cfg).unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Trusted);
+
+        std::fs::write(proj.join("stray.enc.yaml"), b"sops: {changed: 1}\n").unwrap();
+        std::fs::write(outside.join("far.enc.yaml"), b"sops: {changed: 1}\n").unwrap();
+        assert_eq!(
+            state(store.path(), &cfg),
+            TrustState::Trusted,
+            "an unnamed or outside file does not re-arm the gate"
+        );
+
+        std::fs::write(proj.join("secrets/prod.enc.yaml"), b"sops:\n  kms: b\n").unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Changed);
+    }
+
+    /// A terse `key` names its sops file through a `[… .sops] file` defaults table; that file is
+    /// covered too, and a config naming no sops file keeps the hash of its bytes alone.
+    #[test]
+    fn a_sops_defaults_file_is_covered_and_a_config_without_one_hashes_alone() {
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        std::fs::write(proj.join("prod.yaml"), b"sops: {}\n").unwrap();
+        let text = b"[secret.defaults]\norder = [\"sops\"]\n[secret.defaults.sops]\nfile = \"prod.yaml\"\n";
+        let inputs = sops_inputs_for(&cfg, text).unwrap();
+        assert_eq!(
+            inputs,
+            [("sops:prod.yaml".to_string(), b"sops: {}\n".to_vec())]
+        );
+
+        let plain = b"network = \"isolated\"\n";
+        assert!(sops_inputs_for(&cfg, plain).unwrap().is_empty());
+        assert_eq!(content_hash(plain, &[]), hash_bytes(plain));
+    }
+
+    /// The bytes a resolution may hand `sops`: `None` outside the project, the approved bytes for a
+    /// covered file, and a refusal for every way a file in the project is not covered.
+    #[test]
+    fn covered_sops_bytes_answers_each_case() {
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let outside = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        let far = outside.join("far.enc.yaml");
+        std::fs::write(&far, b"x").unwrap();
+        assert_eq!(
+            covered_sops_bytes(Some(store.path()), proj.path(), &far).unwrap(),
+            None,
+            "a file outside the project is decrypted where it is"
+        );
+
+        let file = Path::new("prod.enc.yaml");
+        std::fs::write(proj.path().join(file), b"approved\n").unwrap();
+        let refused = |why: &str| {
+            let err = covered_sops_bytes(Some(store.path()), proj.path(), file).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            assert!(err.to_string().contains(why), "{why}: {err}");
+        };
+        refused("no .sbx.toml covers it");
+
+        std::fs::write(&cfg, b"network = \"isolated\"\n").unwrap();
+        trust(store.path(), &cfg).unwrap();
+        refused("does not name it");
+
+        std::fs::write(&cfg, b"x = \"sops://prod.enc.yaml#k\"\n").unwrap();
+        refused("changed since it was trusted");
+        trust(store.path(), &cfg).unwrap();
+        assert_eq!(
+            covered_sops_bytes(Some(store.path()), proj.path(), file).unwrap(),
+            Some(b"approved\n".to_vec())
+        );
+        // The same file named absolutely is the same file.
+        assert_eq!(
+            covered_sops_bytes(Some(store.path()), proj.path(), &proj.path().join(file)).unwrap(),
+            Some(b"approved\n".to_vec())
+        );
+
+        std::fs::write(proj.path().join(file), b"rewritten by the cage\n").unwrap();
+        refused("changed since it was trusted");
+
+        untrust(store.path(), &cfg).unwrap();
+        refused("not trusted");
+        let err = covered_sops_bytes(None, proj.path(), file).unwrap_err();
+        assert!(err.to_string().contains("no trust store"), "{err}");
+    }
+
+    /// A link the cage plants in the project cannot carry a file out of the gate's reach: a path
+    /// that reaches the project only through a link is still the project's.
+    #[test]
+    fn a_path_reaching_the_project_through_a_link_is_the_projects() {
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let elsewhere = TmpDir::new();
+        std::fs::write(proj.join("prod.enc.yaml"), b"x").unwrap();
+        let link = elsewhere.join("into-project");
+        std::os::unix::fs::symlink(proj.path(), &link).unwrap();
+        let err = covered_sops_bytes(Some(store.path()), proj.path(), &link.join("prod.enc.yaml"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
     }
 
     #[test]

@@ -144,8 +144,10 @@ fn record_trust(path: &Path, yes: bool) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let read = crate::config::safety::read_safe_bytes(path)
-        .and_then(|sbx| Ok((sbx, trust::mise_inputs_for(path)?)));
+    let read = crate::config::safety::read_safe_bytes(path).and_then(|sbx| {
+        let covered = trust::trust_inputs_for(path, &sbx)?;
+        Ok((sbx, covered))
+    });
     let (sbx_bytes, mise) = match read {
         Ok(read) => read,
         Err(e) => {
@@ -185,9 +187,11 @@ fn record_trust(path: &Path, yes: bool) -> ExitCode {
 type Shown = (String, String);
 
 /// The files a trust covers, named for display: the config as it was given, then each mise file
-/// by its path relative to the project. Bytes that are not UTF-8 are shown lossily — the review is
+/// by its path relative to the project, then each sops file the config names, under `sops:`. A
+/// sops file is shown as it is on disk, ciphertext and metadata: the metadata is what decides where
+/// the host's `sops` fetches its key, so a change to it is what the review must show. Bytes that are not UTF-8 are shown lossily — the review is
 /// for a reader, and the hash is over the bytes whatever is displayed.
-fn contents_of(path: &Path, sbx: &[u8], mise: &trust::MiseInputs) -> Vec<Shown> {
+fn contents_of(path: &Path, sbx: &[u8], mise: &trust::TrustInputs) -> Vec<Shown> {
     let mut out = vec![(
         path.display().to_string(),
         String::from_utf8_lossy(sbx).into_owned(),

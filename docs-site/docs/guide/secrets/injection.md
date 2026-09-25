@@ -174,8 +174,10 @@ The declaration above (`sops://` source, `bearer` header) plays out like this:
 3. **Agent runs:** `curl https://api.github.com/user` (no token anywhere) →
    in-cage forwarder → host MITM proxy → the header is injected → forwarded → the
    `200` is relayed back. The agent never saw the token; the `secrets.enc.yaml`
-   it could read (if it were bound) is useless ciphertext with no key in the
-   cage.
+   it can read in the project is useless ciphertext with no key in the cage, and
+   rewriting it does not steer the host's `sops`: a file in the project is
+   decrypted only as the bytes `sbx trust` approved (see
+   [Resolvers](resolvers#sops-a-sops-encrypted-store)).
 4. **Teardown:** `sbx` discards the plaintext; the proxy, CA, and socket are torn
    down with the cage.
 

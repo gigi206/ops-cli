@@ -141,14 +141,14 @@ fn scope_is_gated(scope: &config::manage::Scope) -> bool {
 }
 
 /// What a `--trust` on a key-writing verb blesses: the text the verb composed for the config, and
-/// the sibling mise files [`admit_config_write`] judged before the write. The two travel together
+/// the covered files (mise, sops) [`admit_config_write`] judged before the write. The two travel together
 /// because the trust marker covers both, and both have to be bytes that were admitted rather than a
 /// later read of the path — see [`crate::trust::trust_written`].
 struct Attested<'a> {
     /// The config text the verb composed and wrote.
     text: &'a str,
-    /// The mise files beside it as the gate read them.
-    mise: &'a trust::MiseInputs,
+    /// The files its trust covers, as the gate read them.
+    mise: &'a trust::TrustInputs,
 }
 
 /// Read the trust verdict for a write, **before** the write happens, and refuse the one write that
@@ -158,7 +158,7 @@ struct Attested<'a> {
 ///
 /// - The returned `was_trusted` is what [`report_write_trust`] needs to say whether this edit
 ///   re-armed a gate. It has to be read first: the write changes the file, and so its verdict.
-/// - The returned mise files are the ones this verdict covers, and [`report_write_trust`] hands
+/// - The returned covered files (mise, sops) are the ones this verdict covers, and [`report_write_trust`] hands
 ///   them to [`crate::trust::trust_written`] so the marker attests to what was judged here. A
 ///   second read at bless time would be a second answer, and the project tree is bound read-write
 ///   into the cage — so an in-cage write landing in between would be blessed unreviewed.
@@ -180,14 +180,14 @@ fn admit_config_write(
     gated: bool,
     trust_flag: bool,
     store_dir: Option<&Path>,
-) -> Result<(bool, trust::MiseInputs), ExitCode> {
+) -> Result<(bool, trust::TrustInputs), ExitCode> {
     if !gated {
-        return Ok((false, trust::MiseInputs::new()));
+        return Ok((false, trust::TrustInputs::new()));
     }
     // No store means no marker can be read and none can be written: `--trust` cannot bless anything,
     // which `report_write_trust` says in its own words. Nothing to admit.
     let Some(dir) = store_dir else {
-        return Ok((false, trust::MiseInputs::new()));
+        return Ok((false, trust::TrustInputs::new()));
     };
     let (state, mise) = trust::state_with_inputs(dir, path);
     let has_mise = !trust::mise_files_for(path).is_empty();
@@ -1101,7 +1101,7 @@ mod tests {
             true,
             &Attested {
                 text: &written.text,
-                mise: &trust::MiseInputs::new(),
+                mise: &trust::TrustInputs::new(),
             },
         );
 

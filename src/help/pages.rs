@@ -1466,11 +1466,14 @@ pub(super) const PAGES: &[Page] = &[
             close project paths off inside the cage, so it applies whether or not the file is\n\
             trusted, except its two keys that widen instead (`scan_max_kb`, `git_writable`).\n\
             \n\
-            Before recording, it prints what the trust grants: the lines of the config and of its\n\
-            mise files that changed since they were last approved, or every line when nothing was\n\
-            approved before. It then asks a terminal to confirm; without one it refuses unless\n\
-            --yes is given. A config that already matches its approval is recorded without a\n\
-            question, since it grants nothing new.",
+            The trust also covers the mise files beside the config and every sops file it names\n\
+            in the project: a `sops://` source there is decrypted only as the bytes approved here.\n\
+            \n\
+            Before recording, it prints what the trust grants: the lines of the config, of its\n\
+            mise files and of its sops files that changed since they were last approved, or every\n\
+            line when nothing was approved before. It then asks a terminal to confirm; without\n\
+            one it refuses unless --yes is given. A config that already matches its approval is\n\
+            recorded without a question, since it grants nothing new.",
     },
     Page {
         path: &["untrust"],

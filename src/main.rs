@@ -1067,19 +1067,19 @@ struct RuleWrite<'a> {
     app_key: Option<&'a str>,
     /// How to name the destination to the user; already carries the app, if any.
     target: String,
-    /// The trust store and the sibling mise files the gate read, and by its presence the gate
-    /// itself: `Some` for a `--local` project write (which must be re-trusted after the edit),
+    /// The trust store and the covered files (mise, sops) the gate read, and by its presence the
+    /// gate itself: `Some` for a `--local` project write (which must be re-trusted after the edit),
     /// `None` for a global config or an app profile, both trusted by location.
     ///
-    /// The mise files travel with the store because the re-trust must attest to the ones the gate
-    /// judged: [`trust::trust_written`] refuses a marker over any other, so an in-cage payload
+    /// The covered files travel with the store because the re-trust must attest to the ones the
+    /// gate judged: [`trust::trust_written`] refuses a marker over any other, so an in-cage payload
     /// rewriting one between the gate and the re-trust cannot have it blessed.
     ///
     /// The re-trust stays with each caller rather than riding along here: the two add paths always
     /// owe one, the removal path owes one only when it actually changed the file (re-trusting a
     /// path that no removal created would fail and turn a no-op into an error), and all three word
     /// a failure differently.
-    store: Option<(PathBuf, trust::MiseInputs)>,
+    store: Option<(PathBuf, trust::TrustInputs)>,
 }
 
 /// Admit a rule write to the scoped config file, refusing everything that must be refused before

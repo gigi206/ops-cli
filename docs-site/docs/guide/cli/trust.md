@@ -23,7 +23,8 @@ See also: [The trust gate](../concepts/trust) · [`sbx untrust`](untrust) · [Co
 
 ## Behavior
 
-`sbx trust` records a **SHA-256 of the whole file** (plus any sibling mise files),
+`sbx trust` records a **SHA-256 of the whole file** (plus any sibling mise files, and
+every [sops file it names in the project](../concepts/trust#sops-files-the-config-names)),
 keyed by the config's canonical path. A launch then compares the hash of the exact
 bytes it parses:
 
@@ -32,8 +33,8 @@ bytes it parses:
   (distinct from untrusted).
 - **Untrusted**: no record; security fields are dropped.
 
-Before recording, `sbx trust` prints what the trust grants: the lines of the config and
-of its mise files that changed since they were last approved, as a diff, or every line
+Before recording, `sbx trust` prints what the trust grants: the lines of the config,
+of its mise files and of its sops files (shown as `sops:<path>`) that changed since they were last approved, as a diff, or every line
 when nothing was approved before. It then asks for confirmation on a terminal. Without a
 terminal it refuses unless `--yes` is given, so a script that trusts a config has to say
 so. A config that already matches its approval is recorded without a question, since it

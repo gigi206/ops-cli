@@ -678,23 +678,28 @@ fn read_project(
         }
     };
 
-    // Fold a sibling mise file into the verdict — trust covers both declarative
-    // inputs. A present-but-unsafe mise file is unverifiable, so it forces the
-    // project untrusted: its `.sbx.toml` still parses (its free `env` applies under
-    // untrusted rules), but its security fields drop. Verdict over the exact bytes
-    // that will be parsed (closes the trust→parse window): hash these bytes —
-    // framed with the mise bytes — and compare to the marker, never re-reading.
-    let (state, mise_inputs) = match trust::mise_inputs_for(&path) {
+    // Fold the sibling mise files and the sops files the config names into the verdict —
+    // trust covers every one of them. A present-but-unsafe one is unverifiable, so it forces
+    // the project untrusted: its `.sbx.toml` still parses (its free `env` applies under
+    // untrusted rules), but its security fields drop. Verdict over the exact bytes that will
+    // be parsed (closes the trust→parse window): hash these bytes — framed with the covered
+    // files — and compare to the marker, never re-reading. Only the mise half travels on to
+    // the launcher; the sops half is read again, and checked again, at each resolution.
+    let covered = trust::mise_inputs_for(&path).and_then(|mise| {
+        let sops = trust::sops_inputs_for(&path, &bytes)?;
+        Ok((mise, sops))
+    });
+    let (state, mise_inputs) = match covered {
         Err(e) => {
             warnings.push(format!("treating {} as untrusted: {e}", path.display()));
             (TrustState::Untrusted, Vec::new())
         }
-        Ok(mise_inputs) => {
+        Ok((mise_inputs, sops_inputs)) => {
             let state = match trust::default_store_dir() {
                 Some(store) => trust::verdict_for_hash(
                     &store,
                     &path,
-                    &trust::content_hash(&bytes, &mise_inputs),
+                    &trust::content_hash(&bytes, &[mise_inputs.as_slice(), &sops_inputs].concat()),
                 ),
                 None => {
                     warnings.push(format!(

@@ -1658,43 +1658,22 @@ fn read_source(
                 path.display()
             ))),
         },
-        SecretSource::Sops { file, key } => {
-            let path = sops_path(file, project_root);
-            // A confirmed-missing encrypted file is a clean absent (fall through), like `file://`;
-            // an existing one goes to sops. A path whose existence cannot be determined — an
-            // unreadable parent directory — is a hard error, never silently treated as absent
-            // (which would let a permission problem downgrade to a weaker fallback source).
-            match path.try_exists() {
-                Ok(false) => Ok(None),
-                // Located through the one `PATH` search, which reads absolute entries only. An
-                // empty element means the current directory to `execvp`, and the current directory
-                // here is the project tree: without this, a repository could ship the `sops` that
-                // is handed its own encrypted file to decrypt. The trusted form applies the second
-                // half of the same rule — the binary must also be a regular file owned by us or
-                // root and not world-writable — because this is the one host tool a launch hands a
-                // key to, and a loosely-permissioned directory on `PATH` would otherwise choose it.
-                Ok(true) => match crate::store::find_trusted_on_path("sops") {
-                    Some(sops) => run_sops(
-                        &sops,
-                        &path,
-                        key.as_deref(),
-                        header,
-                        super::resolver::HOST_RESOLUTION_DEADLINE,
-                    ),
-                    // Three causes now, not two: the trusted lookup also declines a match it
-                    // found. That one is already named on stderr with its reason, so this says
-                    // there is one rather than repeating it.
-                    None => Err(io::Error::other(format!(
-                        "the secret for `{header}` needs sops, which is not installed, not on \
-                         PATH, or was refused for its ownership or mode (named above)"
-                    ))),
-                },
-                Err(e) => Err(io::Error::other(format!(
-                    "the secret for `{header}` cannot stat {}: {e}",
-                    path.display()
-                ))),
-            }
-        }
+        // Located through the one `PATH` search, which reads absolute entries only. An empty
+        // element means the current directory to `execvp`, and the current directory here is the
+        // project tree: without this, a repository could ship the `sops` that is handed its own
+        // encrypted file to decrypt. The trusted form applies the second half of the same rule —
+        // the binary must also be a regular file owned by us or root and not world-writable —
+        // because this is the one host tool a launch hands a key to, and a loosely-permissioned
+        // directory on `PATH` would otherwise choose it.
+        SecretSource::Sops { file, key } => read_sops(
+            file,
+            key.as_deref(),
+            header,
+            project_root,
+            crate::trust::default_store_dir().as_deref(),
+            || crate::store::find_trusted_on_path("sops"),
+            super::resolver::HOST_RESOLUTION_DEADLINE,
+        ),
         // A resolver plugin is run host-side in its own least-privilege bwrap cage, never inside
         // the agent's cage. The full ref (`scheme://locator`) reconstructs exactly — `parse_secret_ref`
         // split it on the first `://` — and goes to the plugin as `argv[1]`. Its stdout flows
@@ -1709,9 +1688,117 @@ fn read_source(
     }
 }
 
+/// Read a `sops://` source: `file` resolved against `project_root`, decrypted by the `sops` that
+/// `locate` finds, within `deadline`. The trust store and the lookup are parameters so a test runs
+/// the whole path against a store and a fake `sops` of its own, without touching the environment.
+///
+/// A confirmed-missing encrypted file is a clean absent (fall through), like `file://`. A path
+/// whose existence cannot be determined — an unreadable parent directory — is a hard error, never
+/// silently treated as absent (which would let a permission problem downgrade to a weaker fallback
+/// source).
+///
+/// An existing file in the project is one the cage can rewrite, and the metadata of a sops file
+/// decides where `sops` fetches its key, with the credentials of the user's environment. So it is
+/// decrypted only when the project's trust covers it, and `sops` is handed a private copy of the
+/// bytes that trust covers rather than the path ([`crate::trust::covered_sops_bytes`]): a rewrite
+/// after the check reaches nothing. An uncovered file is refused before `sops` is looked up, so no
+/// part of it is ever read by a host program. A file outside the project is decrypted where it is.
+fn read_sops(
+    file: &Path,
+    key: Option<&str>,
+    header: &str,
+    project_root: &Path,
+    store_dir: Option<&Path>,
+    locate: impl FnOnce() -> Option<PathBuf>,
+    deadline: std::time::Duration,
+) -> io::Result<Option<String>> {
+    let path = sops_path(file, project_root);
+    match path.try_exists() {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "the secret for `{header}` cannot stat {}: {e}",
+                path.display()
+            )));
+        }
+    }
+    let covered = crate::trust::covered_sops_bytes(store_dir, project_root, file).map_err(|e| {
+        io::Error::other(format!("the secret for `{header}` is not decrypted: {e}"))
+    })?;
+    // Three causes, not two: the trusted lookup also declines a match it found. That one is
+    // already named on stderr with its reason, so this says there is one rather than repeating it.
+    let Some(sops) = locate() else {
+        return Err(io::Error::other(format!(
+            "the secret for `{header}` needs sops, which is not installed, not on PATH, or was \
+             refused for its ownership or mode (named above)"
+        )));
+    };
+    match covered {
+        None => run_sops(&sops, &path, key, header, deadline),
+        Some(bytes) => {
+            let copy = PrivateCopy::new(&path, &bytes).map_err(|e| {
+                io::Error::other(format!(
+                    "the secret for `{header}` cannot stage {} for sops: {e}",
+                    path.display()
+                ))
+            })?;
+            run_sops_as(&sops, &copy.file, &path, key, header, deadline)
+        }
+    }
+}
+
+/// A private copy of a sops file's approved bytes, for `sops` to read in place of the project's
+/// file, removed with its directory when dropped.
+///
+/// The copy keeps the file's name, because `sops` infers the format from its extension. It lives in
+/// a directory created for it alone, owner-only, under the host's `/tmp`, which the cage never
+/// sees: it is given a tmpfs of its own there, mounted after every configured bind, so no bind can
+/// reach through it. `TMPDIR` is not read, because it may name a directory a read-write bind
+/// hands the cage, or a relative one that resolves in the project tree.
+struct PrivateCopy {
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+impl PrivateCopy {
+    fn new(original: &Path, bytes: &[u8]) -> io::Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        let dir = Path::new("/tmp").join(format!(
+            "sbx-sops-{}-{}",
+            std::process::id(),
+            super::atomicfile::unique()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let copy = Self {
+            file: dir.join(
+                original
+                    .file_name()
+                    .unwrap_or(std::ffi::OsStr::new("secrets")),
+            ),
+            dir,
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&copy.file)?
+            .write_all(bytes)?;
+        Ok(copy)
+    }
+}
+
+impl Drop for PrivateCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Resolve a sops file path: a relative one against the project root (the `.sbx.toml`'s directory),
-/// an absolute one as-is.
-fn sops_path(file: &Path, project_root: &Path) -> PathBuf {
+/// an absolute one as-is. The trust gate resolves the files it hashes through this too, so the file
+/// it covers is the file a resolution decrypts.
+pub(crate) fn sops_path(file: &Path, project_root: &Path) -> PathBuf {
     if file.is_absolute() {
         file.to_path_buf()
     } else {
@@ -1744,12 +1831,31 @@ fn run_sops(
     header: &str,
     deadline: std::time::Duration,
 ) -> io::Result<Option<String>> {
+    run_sops_as(sops_bin, file, file, key, header, deadline)
+}
+
+/// [`run_sops`] on `file`, every message naming `shown` instead: the project's file when `sops` is
+/// handed a private copy of it, which is the name the reader knows.
+///
+/// `sops` runs from `/`. On a decryption it reads a `.sops.yaml` in its current directory and in
+/// every directory above it, and sbx's current directory is the project tree, which the cage
+/// writes: from `/` the only candidate is root's own. The file is made absolute first, so a
+/// relative one still names what it named from here.
+fn run_sops_as(
+    sops_bin: &Path,
+    file: &Path,
+    shown: &Path,
+    key: Option<&str>,
+    header: &str,
+    deadline: std::time::Duration,
+) -> io::Result<Option<String>> {
     let mut cmd = Command::new(sops_bin);
-    cmd.arg("--decrypt");
+    cmd.current_dir("/").arg("--decrypt");
     if let Some(k) = key {
         cmd.arg("--extract").arg(sops_extract_expr(k));
     }
-    cmd.arg(file);
+    cmd.arg(std::path::absolute(file)?);
+    let file = shown;
     let what = format!("sops decrypting {}", file.display());
     let output = match super::resolver::output_within(&mut cmd, deadline, &what) {
         Ok(out) => out,
@@ -3205,6 +3311,152 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
+    /// A fake `sops` that records the file it was handed, that file's contents and its own working
+    /// directory under `dir`, then prints `value`. What it records is how a test tells which bytes
+    /// reached `sops`, from where, and whether it ran at all.
+    fn recording_sops(dir: &TmpDir) -> PathBuf {
+        let (arg, seen, cwd) = (dir.join("arg"), dir.join("seen"), dir.join("cwd"));
+        fake_sops(
+            dir,
+            &format!(
+                "for a; do last=$a; done\nprintf %s \"$last\" > '{}'\ncat \"$last\" > '{}'\n\
+                 pwd > '{}'\necho value",
+                arg.display(),
+                seen.display(),
+                cwd.display()
+            ),
+        )
+    }
+
+    /// [`read_sops`] with a fake `sops`, retried on a transient spawn failure for the reason
+    /// [`run_sops_retrying_spawn`] documents.
+    fn read_sops_with(
+        sops: &Path,
+        file: &Path,
+        project: &Path,
+        store: &Path,
+    ) -> io::Result<Option<String>> {
+        let read = || {
+            read_sops(
+                file,
+                Some("k"),
+                "Authorization",
+                project,
+                Some(store),
+                || Some(sops.to_path_buf()),
+                std::time::Duration::from_secs(60),
+            )
+        };
+        let mut attempt = read();
+        for _ in 0..100 {
+            match &attempt {
+                Err(e) if e.to_string().contains("could not run sops") => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    attempt = read();
+                }
+                _ => break,
+            }
+        }
+        attempt
+    }
+
+    /// A sops file in the project that its trust does not cover never reaches `sops`: the refusal
+    /// comes before the lookup, and the recording fake shows it never ran.
+    #[test]
+    fn an_uncovered_sops_file_in_the_project_is_refused_before_sops_runs() {
+        let (bin, store, project) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+        let sops = recording_sops(&bin);
+        std::fs::write(project.join("prod.enc.yaml"), "sops: {}\n").unwrap();
+        std::fs::write(
+            project.join(".sbx.toml"),
+            "x = \"sops://prod.enc.yaml#k\"\n",
+        )
+        .unwrap();
+
+        let err = read_sops_with(
+            &sops,
+            Path::new("prod.enc.yaml"),
+            project.path(),
+            store.path(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not trusted"), "{err}");
+        assert!(!bin.join("arg").exists(), "sops must not have run");
+    }
+
+    /// A covered file is decrypted from a private copy of the approved bytes, never from the path
+    /// in the project; a rewrite after `sbx trust` is refused, again before `sops` runs; and the
+    /// copy is gone once the call returns.
+    #[test]
+    fn a_covered_sops_file_reaches_sops_as_its_approved_bytes_only() {
+        let (bin, store, project) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+        let sops = recording_sops(&bin);
+        let file = project.join("prod.enc.yaml");
+        std::fs::write(&file, "sops: {kms: approved}\n").unwrap();
+        let cfg = project.join(".sbx.toml");
+        std::fs::write(&cfg, "x = \"sops://prod.enc.yaml#k\"\n").unwrap();
+        crate::trust::trust(store.path(), &cfg).unwrap();
+
+        let value = read_sops_with(
+            &sops,
+            Path::new("prod.enc.yaml"),
+            project.path(),
+            store.path(),
+        );
+        assert_eq!(value.unwrap().as_deref(), Some("value"));
+        let handed = PathBuf::from(std::fs::read_to_string(bin.join("arg")).unwrap());
+        assert_ne!(
+            handed, file,
+            "sops is handed a copy, not the project's file"
+        );
+        assert_eq!(
+            handed.file_name(),
+            file.file_name(),
+            "the copy keeps the name"
+        );
+        assert!(!handed.exists(), "the copy is removed after the call");
+        assert_eq!(
+            std::fs::read_to_string(bin.join("seen")).unwrap(),
+            "sops: {kms: approved}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bin.join("cwd")).unwrap(),
+            "/\n",
+            "sops runs from `/`, above no `.sops.yaml` the cage can write"
+        );
+
+        std::fs::remove_file(bin.join("arg")).unwrap();
+        std::fs::write(&file, "sops: {kms: planted}\n").unwrap();
+        let err = read_sops_with(
+            &sops,
+            Path::new("prod.enc.yaml"),
+            project.path(),
+            store.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("changed since it was trusted"),
+            "{err}"
+        );
+        assert!(!bin.join("arg").exists(), "sops must not have run");
+    }
+
+    /// A sops file outside the project is decrypted where it is, whatever the project's trust.
+    #[test]
+    fn a_sops_file_outside_the_project_is_decrypted_in_place() {
+        let (bin, store, project, outside) =
+            (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+        let sops = recording_sops(&bin);
+        let file = outside.join("prod.enc.yaml");
+        std::fs::write(&file, "sops: {}\n").unwrap();
+        let value = read_sops_with(&sops, &file, project.path(), store.path());
+        assert_eq!(value.unwrap().as_deref(), Some("value"));
+        assert_eq!(
+            PathBuf::from(std::fs::read_to_string(bin.join("arg")).unwrap()),
+            file
+        );
+    }
+
     #[test]
     fn a_missing_sops_file_is_absent_and_falls_through() {
         // a sops source whose file does not exist is a clean absent: the chain falls through to a
@@ -3281,6 +3533,9 @@ mod tests {
     fn the_sops_that_decrypts_comes_from_an_absolute_path_entry() {
         let _lock = env_lock();
         let dir = TmpDir::new();
+        // The encrypted file sits outside the project, so this is about the lookup alone: one in
+        // the project is refused before any lookup unless its trust covers it.
+        let project = TmpDir::new();
         fake_sops(&dir, "echo decrypted-by-the-planted-binary");
         let file = dir.join("prod.enc.yaml");
         std::fs::write(&file, "a: b\n").unwrap();
@@ -3289,7 +3544,7 @@ mod tests {
             read_source(
                 &source,
                 "Authorization",
-                dir.path(),
+                project.path(),
                 Path::new(UNUSED_BWRAP),
                 &[],
             )
