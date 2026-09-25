@@ -3165,3 +3165,91 @@ fn a_follow_names_itself_on_every_read_of_a_session() {
         assert!(seeded_asked[1].contains("after=0"), "{seeded_asked:?}");
     }
 }
+
+/// Under `--follow -n`, an event the opening listing left out is not printed later as an update
+/// when the session sends it again: the stream never showed it, so there is nothing for an update
+/// to complete. An event it did show is still completed.
+#[test]
+fn an_update_of_an_event_the_follow_never_printed_is_not_printed() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let event = |seq: u32, status: &str, path: &str| {
+        format!(
+            "event seq={seq} at=1700000000000 port=443 verdict=allow proto=https reason=allowed\
+             {status} method=GET host=api.test path={path}\n"
+        )
+    };
+    let fx = Project::new("net");
+    let egress = fx.data_home.path().join("sbx").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let socket = egress.join("control-55565.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let replies = [
+        format!(
+            "head=2\namended=0\n{}{}ok\n",
+            event(1, "", "/old"),
+            event(2, "", "/new")
+        ),
+        format!(
+            "head=2\namended=2\n{}{}ok\n",
+            event(1, " status=200", "/old"),
+            event(2, " status=200", "/new")
+        ),
+    ];
+    let server = std::thread::spawn(move || {
+        for reply in replies {
+            let (stream, _) = listener.accept().unwrap();
+            let mut cmd = String::new();
+            BufReader::new(&stream).read_line(&mut cmd).unwrap();
+            (&stream).write_all(reply.as_bytes()).unwrap();
+        }
+        std::fs::remove_file(&socket).unwrap();
+    });
+
+    let mut follower = fx
+        .cmd(&[
+            "net",
+            "logs",
+            "--follow",
+            "-n",
+            "1",
+            "--with-status",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sbx net logs --follow");
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&lines);
+    let stdout = follower.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            sink.lock().unwrap().push(line);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !server.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The poll after the last reply finds the socket gone: by then the reply is written out.
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = follower.kill();
+    let _ = follower.wait();
+    server.join().unwrap();
+
+    let lines = lines.lock().unwrap().clone();
+    let shape: Vec<(u64, bool)> = lines
+        .iter()
+        .map(|l| {
+            let o: serde_json::Value = serde_json::from_str(l).expect("one object per line");
+            (o["seq"].as_u64().unwrap(), o["update"].as_bool().unwrap())
+        })
+        .collect();
+    assert_eq!(shape, [(2, false), (2, true)], "{}", lines.join("\n"));
+}

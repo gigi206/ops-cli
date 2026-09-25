@@ -525,7 +525,8 @@ A line that shows an event again is tagged `update`, so it reads as the same exc
 and not as a second request. Under `--json`, every object of the stream carries
 `update` (`true` on such a line) and `seq`, the event's number in its session, which
 with `pid` pairs an update with the event's first line. Leaving the updates out
-counts each request once.
+counts each request once. An event the opening listing left out (under `-n`) is not
+shown later as an update either.
 
 A session that ends while a follow reads it waits for that follow's next read before
 its log goes, so what arrived since the last read is shown rather than lost with the

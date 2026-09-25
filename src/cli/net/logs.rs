@@ -305,6 +305,9 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     // A per-session cursor: the last seq already shown, plus the amendment cursor (for retroactive
     // status). Seeded from the initial listing so the follow only ever appends genuinely new events.
     let mut cursor: HashMap<u32, (u64, u64)> = HashMap::new();
+    // Per session the listing started, the oldest event it printed: `-n` keeps older ones out of
+    // it, and an update of an event this stream never printed is not printed either.
+    let mut printed_from: HashMap<u32, u64> = HashMap::new();
     let (dim, r) = (pal.dim, pal.reset);
     let ctx_of = |ctx: &[(u32, PathBuf, String)], pid: u32| {
         ctx.iter()
@@ -347,6 +350,10 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     }
     for s in &sessions {
         cursor.insert(s.pid, (s.snapshot.head, s.snapshot.amend_head));
+        let oldest = filtered_log_events(&s.snapshot.events, view)
+            .first()
+            .map_or(s.snapshot.head + 1, |e| e.seq);
+        printed_from.insert(s.pid, oldest);
     }
     // A closed downstream pipe (`… | head`) ends the follow cleanly — Rust ignores SIGPIPE, so a
     // write to a gone reader returns an error we must act on rather than spin forever.
@@ -378,6 +385,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
             .collect();
         for pid in ended {
             cursor.remove(&pid);
+            printed_from.remove(&pid);
             if !view.json {
                 let _ = writeln!(tick, "  {dim}session {pid} ended{r}");
                 if last_pid == Some(pid) {
@@ -424,10 +432,12 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                     );
                 }
             }
+            let oldest = printed_from.get(&pid).copied().unwrap_or(0);
             let new: Vec<&sandbox::control::LogEvent> = snap
                 .events
                 .iter()
                 .filter(|e| event_passes_filters(e, view))
+                .filter(|e| !(is_update(e, after) && e.seq < oldest))
                 .collect();
             if !new.is_empty() {
                 let c = ctx_of(&context, pid);
