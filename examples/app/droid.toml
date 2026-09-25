@@ -45,6 +45,18 @@
 # ahead with `sbx test net <url>`).
 cmd = "droid"
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects, which
+# operations it offers) appended to Droid's system prompt, so a refused host or a read-only file reads
+# as the sandbox rather than as a fault to work around. sbx places the option right after `cmd`,
+# which Droid honors for its interactive session. `droid exec` ignores an option given before the
+# subcommand without a word, so a headless run carries the summary only when you pass it again after
+# `exec`:
+#     sbx app run droid -- exec --append-system-prompt-file /opt/sbx/contract-summary.md "your task"
+# Both the interactive and that `exec` form were checked in the request Droid sends to its model;
+# whether the model then acts on it was not measured. Bound to this `cmd`: a project that sets its
+# own `cmd` for this app writes its own `contract`, or has none.
+contract = { arg = "--append-system-prompt-file" }
+
 # Your host Droid config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
 # the caged `droid` read and write these host files (Factory login, settings.json). Uncomment to

@@ -36,6 +36,13 @@ mute = [
     "@npm-jsr",
 ]
 
+# Droid signs in once and sends that token to more than one Factory name: its API calls go to
+# `api.factory.ai`, its telemetry to `telemetry.factory.ai`. sbx learns the token on the first, so
+# without this group the telemetry reads as the token leaving for another host and is blocked
+# `outbound-secret`, a refusal no `mute` can silence. Grouped, the telemetry reaches its own verdict
+# instead: denied, since no rule allows it, and muted above.
+shared_credential = [["*.factory.ai"]]
+
 [packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
 droid = "mise:npm:droid"

@@ -171,8 +171,11 @@ claude --append-system-prompt-file /opt/sbx/contract-summary.md <your arguments>
 ```
 
 So the program must accept the option ahead of a subcommand: `sbx app run claude-code -- mcp list`
-runs `claude --append-system-prompt-file … mcp list`, which Claude Code accepts. An agent with no
-such option gets no `contract`, and the summary stays in the cage for it to find.
+runs `claude --append-system-prompt-file … mcp list`, which Claude Code accepts. Accepting the
+option is not always applying it: Droid takes it ahead of `exec` without an error but applies it
+only to its interactive session, so its profile shows how a headless run passes it again after
+`exec`. An agent with no such option gets no `contract`, and the summary stays in the cage for it
+to find.
 
 **The text instead of the path.** Some agents take their instructions as a config value, not as a
 file. `toml_key` names the config key the summary's text is assigned to, and `arg` then takes
