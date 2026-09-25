@@ -165,7 +165,30 @@ dsh_dir="$dsh_root/node_modules/@deepseek-ai/dsh"
 # `--expose-internals` instead of a bare `dsh`: the loader reaches Node's internal module loader
 # either through that flag or through a native addon, and the addon refuses this cage's node build
 # (see the header). Without it the boot dies applying the reload plugin.
-exec node --expose-internals "$dsh_dir/lib/bin.js" web --port 3080 "$@"
+#
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers), handed to the agent as instructions through a patch overlay that
+# inserts a second `dsh-agent-instructions` row. That row reads only the `AGENTS.md` of a home
+# directory staged under the cage's own `/etc`, a tmpfs, so both files live for this launch only and
+# never reach the host. It adds to the instructions: your `~/.dsh/AGENTS.md` and the project's
+# files still load through the stock row. The persona options (`personaSuffix` and the like) are
+# left alone, because a patch replaces a row's whole config and the bundles already set them.
+patch=()
+if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/deepseek-harness/home 2>/dev/null; then
+  cp /opt/sbx/contract-summary.md /etc/deepseek-harness/home/AGENTS.md
+  cat > /etc/deepseek-harness/contract.patch.yml <<'PATCH'
+- insert:
+    - id: sbx-contract
+      name: '@deepseek-ai/dsh-agent-instructions'
+      config:
+        maxBytes: 65536
+        dshHome: /etc/deepseek-harness/home
+        instructionFileCandidates: []
+        localInstructionFileCandidates: []
+PATCH
+  patch=(--patch /etc/deepseek-harness/contract.patch.yml)
+fi
+exec node --expose-internals "$dsh_dir/lib/bin.js" web "${patch[@]}" --port 3080 "$@"
 """,
     "deepseek-harness",
 ]
