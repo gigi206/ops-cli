@@ -136,6 +136,14 @@ allow = [
 # github allow-set and harmless: the pinned build in the store is read-only, so an update it found
 # could not apply; sbx manages upgrades via `sbx upgrade --app goose-desktop`.)
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers), read by Goose's built-in "Top Of Mind" extension and added to every
+# turn, so a refused host or a read-only file reads as the sandbox rather than as a fault to work
+# around. The app hands its environment to the `goose serve` engine it starts, the same engine as
+# the `goose` CLI, which adds it next to the project's `.goosehints`/`AGENTS.md` and next to a
+# `GOOSE_MOIM_MESSAGE_TEXT` of yours, never in place of them.
+GOOSE_MOIM_MESSAGE_FILE = "/opt/sbx/contract-summary.md"
+
 # --- Provider example (commented) — uncomment ONE block to inject a key host-side instead of
 # entering it in the GUI. ---
 # OpenRouter (one key, hundreds of models, OpenAI-compatible bearer auth):
