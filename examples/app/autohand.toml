@@ -84,6 +84,14 @@
 # (read out of the `dev` script), and the Apache-2.0 license.
 cmd = "autohand"
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) appended to Autohand's system
+# prompt, so a refused host or a read-only file reads as the sandbox rather than
+# as a fault to work around. The option reaches both the interactive session and
+# `-p`. Bound to this `cmd`: a project that sets its own `cmd` for this app
+# writes its own `contract`, or has none.
+contract = { arg = "--append-system-prompt-file" }
+
 # Your host Autohand config/auth, mounted read-write at its real absolute paths.
 # `binds` is a security field, honored only because this profile lives in your
 # trusted config dir; `mode = "rw"` lets the caged `autohand` read and write
