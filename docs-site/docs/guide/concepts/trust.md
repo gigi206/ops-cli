@@ -157,7 +157,9 @@ with the credentials of your environment. A file in the project is one the cage 
 rewrite, so every sops file the `.sbx.toml` names in the project (the file of a
 `sops://` reference anywhere in it, and the `file` of a `[secret.defaults.sops]`
 table) is hashed **together** with it, like the mise files. A sops file named by an
-absolute path outside the project is not.
+absolute path outside the project is not. A path counts as the project's when
+resolving it passes through the project at any step, as a link into it does, even
+where a link left there leads out again: the cage can point that one anywhere.
 
 `sbx trust` shows such a file under `sops:<path>`, ciphertext and metadata, so a
 change to the metadata is on screen before it is granted. Re-encrypting or rotating

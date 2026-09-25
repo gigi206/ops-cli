@@ -141,10 +141,73 @@ fn project_root_of(config_path: &Path) -> PathBuf {
 }
 
 /// Whether `path` is in the project under `root`, the tree the cage is given to write: under it as
-/// spelled, or once the part of it that exists is resolved. Either answer counts, so a path that
-/// only reaches the project through a link is treated as the project's.
+/// spelled, once the part of it that exists is resolved, or at any step of resolving it
+/// ([`resolution_visits`]). Any answer counts, so a path that only reaches the project through a
+/// link is treated as the project's, even where a link the cage left there leads out again.
 fn in_project(root: &Path, path: &Path) -> bool {
-    path.starts_with(root) || canonicalize_existing_prefix(path).starts_with(root)
+    path.starts_with(root)
+        || canonicalize_existing_prefix(path).starts_with(root)
+        || resolution_visits(root, path)
+}
+
+/// Whether resolving the absolute `path` passes through `root` at any step, reading each link it
+/// meets and resolving the rest from where the link leads, as the kernel does. Where the path ends
+/// is not enough: a link in `root` that leads out of it is one the cage can point anywhere, and
+/// resolving from outside through it lands wherever the cage chose. Past as many links as the
+/// kernel follows, the answer is that it does. A relative `path` answers no: the callers' paths are
+/// absolute, and the spelled and resolved checks of [`in_project`] still apply to one.
+fn resolution_visits(root: &Path, path: &Path) -> bool {
+    use std::path::Component;
+    /// The links the kernel follows in one resolution before it answers `ELOOP`.
+    const MAX_LINKS: usize = 40;
+    // Last component first, so the next step to take is the one `pop` returns.
+    fn steps(path: &Path) -> Vec<Component<'_>> {
+        let mut steps: Vec<_> = path
+            .components()
+            .filter(|c| !matches!(c, Component::CurDir | Component::Prefix(_)))
+            .collect();
+        steps.reverse();
+        steps
+    }
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut links = 0;
+    let mut pending: Vec<std::ffi::OsString> = steps(path)
+        .into_iter()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut at = PathBuf::from("/");
+    while let Some(step) = pending.pop() {
+        match Path::new(&step).components().next() {
+            Some(Component::RootDir) => at = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                at.pop();
+            }
+            Some(Component::Normal(name)) => {
+                at.push(name);
+                if at.starts_with(root) {
+                    return true;
+                }
+                if let Ok(target) = std::fs::read_link(&at) {
+                    if links == MAX_LINKS {
+                        return true;
+                    }
+                    links += 1;
+                    at.pop();
+                    pending.extend(steps(&target).into_iter().map(|c| c.as_os_str().to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `path` is in the project at `project_root`, as [`in_project`] answers once the root is
+/// resolved as far as it exists: the form a caller holding the launch's root, spelled any way, asks.
+pub(crate) fn lies_in_project(project_root: &Path, path: &Path) -> bool {
+    in_project(&canonicalize_existing_prefix(project_root), path)
 }
 
 /// Every sops file a config names: the file of each `sops://` reference, wherever it appears
@@ -1192,6 +1255,42 @@ mod tests {
         let err = covered_sops_bytes(Some(store.path()), proj.path(), &link.join("prod.enc.yaml"))
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// A path named outside the project, whose link leads into it where the cage has left a link
+    /// leading out again, is still the project's: it ends outside only because of a link the cage
+    /// chose, and the cage can point that one at any file of the host's.
+    #[test]
+    fn a_path_through_a_link_the_cage_points_out_again_is_the_projects() {
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let host = TmpDir::new();
+        let elsewhere = TmpDir::new();
+        let key = host.join("prod.enc.yaml");
+        std::fs::write(&key, b"x").unwrap();
+        let planted = proj.join("prod.enc.yaml");
+        std::os::unix::fs::symlink(&key, &planted).unwrap();
+        let named = elsewhere.join("prod.enc.yaml");
+        std::os::unix::fs::symlink(&planted, &named).unwrap();
+
+        assert!(lies_in_project(proj.path(), &named));
+        assert!(
+            !lies_in_project(proj.path(), &key),
+            "the file the link leads to is outside the project"
+        );
+        let err = covered_sops_bytes(Some(store.path()), proj.path(), &named).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// A resolution that loops is answered as reaching the project, never as leaving it.
+    #[test]
+    fn a_path_whose_links_loop_is_the_projects() {
+        let proj = TmpDir::new();
+        let elsewhere = TmpDir::new();
+        let (a, b) = (elsewhere.join("a"), elsewhere.join("b"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(lies_in_project(proj.path(), &a));
     }
 
     #[test]

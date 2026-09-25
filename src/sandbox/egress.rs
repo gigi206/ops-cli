@@ -1677,6 +1677,22 @@ fn read_source(
                 "the secret for `{header}` reads ${var}, which is not valid Unicode"
             ))),
         },
+        // The project is bound into the cage read-write, so a file there is no secret from the
+        // agent, and the agent can put a link at it, or at a directory on its way, to any file of
+        // yours, which this read would follow and put on the wire. Refused before anything is
+        // looked at, present or not, so removing the file cannot choose which source of a chain
+        // answers either.
+        SecretSource::File(path) if crate::trust::lies_in_project(project_root, path) => {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the secret for `{header}` reads {}, which is in the project: the cage reads \
+                     and writes the project, so a file there is neither hidden from it nor fixed; \
+                     keep the file outside the project",
+                    path.display()
+                ),
+            ))
+        }
         SecretSource::File(path) => match std::fs::read_to_string(path) {
             Ok(value) => classify_value(&value, header, &path.display().to_string()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -3240,14 +3256,19 @@ mod tests {
         }
     }
 
-    /// Resolve with a throwaway project root — the env/file tests never read it (only a relative
-    /// `sops` source would); the sops tests below pass their own root explicitly.
+    /// A project root no test fixture lies under. A file source in the project is refused, so the
+    /// tests that read one need a root that is not an ancestor of their temporary files.
+    const THROWAWAY_ROOT: &str = "/nonexistent/sbx-throwaway-project";
+
+    /// Resolve at [`THROWAWAY_ROOT`]: a file source is checked against it and found outside, and
+    /// only a relative `sops` source would read it; the sops tests below pass their own root
+    /// explicitly.
     fn resolve_injections_at_root(
         secrets: &[HeaderSecret],
     ) -> io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)> {
         resolve_injections(
             secrets,
-            Path::new("/"),
+            Path::new(THROWAWAY_ROOT),
             Path::new(UNUSED_BWRAP),
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
@@ -3764,7 +3785,7 @@ mod tests {
     fn resolve_or_deny_at_root(secrets: &[HeaderSecret]) -> Kept {
         resolve_or_deny(
             secrets,
-            Path::new("/"),
+            Path::new(THROWAWAY_ROOT),
             Path::new(UNUSED_BWRAP),
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
@@ -3778,7 +3799,7 @@ mod tests {
     fn resolve_aborting_at_root(secrets: &[HeaderSecret]) -> io::Result<Kept> {
         resolve_or_deny(
             secrets,
-            Path::new("/"),
+            Path::new(THROWAWAY_ROOT),
             Path::new(UNUSED_BWRAP),
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
@@ -4187,6 +4208,101 @@ mod tests {
         assert!(
             err.contains("newline or NUL"),
             "an embedded newline must fail closed (header-splitting): {err}"
+        );
+    }
+
+    /// Read `path` as a file source of the project at `project`.
+    fn read_file_source(path: PathBuf, project: &Path) -> io::Result<Option<String>> {
+        read_source(
+            &SecretSource::File(path),
+            "Authorization",
+            project,
+            Path::new(UNUSED_BWRAP),
+            &[],
+        )
+    }
+
+    /// A file source in the project is refused, and its bytes never come back: the project is the
+    /// cage's to read and write.
+    #[test]
+    fn a_file_secret_in_the_project_is_refused() {
+        let project = TmpDir::new();
+        let file = project.join("token");
+        std::fs::write(&file, "tok3n-in-the-project\n").unwrap();
+        let err = read_file_source(file.clone(), project.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains(&file.display().to_string()) && message.contains("in the project"),
+            "the refusal names the file and why: {message}"
+        );
+        assert!(
+            !message.contains("tok3n-in-the-project"),
+            "the refusal never carries the value: {message}"
+        );
+    }
+
+    /// A link the cage leaves in the project does not lead a file source to a file of the host's:
+    /// not at the file's own name, not at a directory on its way, and not when the path named is
+    /// outside the project and only reaches it through a link.
+    #[test]
+    fn a_link_in_the_project_does_not_lead_a_file_secret_out_of_it() {
+        let project = TmpDir::new();
+        let host = TmpDir::new();
+        let target = host.join("key");
+        std::fs::write(&target, "a-host-file-the-cage-cannot-see\n").unwrap();
+
+        let at_the_name = project.join("token");
+        std::os::unix::fs::symlink(&target, &at_the_name).unwrap();
+        let on_the_way = project.join("secrets");
+        std::os::unix::fs::symlink(host.path(), &on_the_way).unwrap();
+        let elsewhere = TmpDir::new();
+        let into_the_project = elsewhere.join("token");
+        std::os::unix::fs::symlink(&at_the_name, &into_the_project).unwrap();
+
+        for path in [at_the_name, on_the_way.join("key"), into_the_project] {
+            let got = read_file_source(path.clone(), project.path());
+            assert!(
+                matches!(&got, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+                "{} is refused, not followed: {got:?}",
+                path.display()
+            );
+        }
+    }
+
+    /// A file source in the project is refused even where no file is there yet, so a cage that
+    /// removes the file cannot hand the chain to its next source.
+    #[test]
+    fn a_missing_file_secret_in_the_project_does_not_fall_through() {
+        let _lock = env_lock();
+        let _var = EnvVar::set("SBX_TEST_EGRESS_PROJECT_FILE", "would-resolve-if-consulted");
+        let project = TmpDir::new();
+        let got = resolve_chain(
+            &[
+                SecretSource::File(project.join("absent")),
+                SecretSource::Env("SBX_TEST_EGRESS_PROJECT_FILE".into()),
+            ],
+            "Authorization",
+            project.path(),
+            Path::new(UNUSED_BWRAP),
+            &[],
+        );
+        assert!(
+            matches!(&got, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+            "the chain stops at the refused source: {got:?}"
+        );
+    }
+
+    /// A file source outside the project resolves as it always has, beside a real project.
+    #[test]
+    fn a_file_secret_outside_the_project_still_resolves() {
+        let project = TmpDir::new();
+        let host = TmpDir::new();
+        let file = host.join("token");
+        std::fs::write(&file, "tok3n-outside\n").unwrap();
+        assert_eq!(
+            read_file_source(file, project.path()).unwrap().as_deref(),
+            Some("tok3n-outside")
         );
     }
 

@@ -487,7 +487,7 @@ It comes in two tiers, and the difference between them is what a flaw would reac
 | `src/sandbox/sshagent.rs` | ssh-agent requests | the agent | `[ssh_agent] allow` |
 | `src/sandbox/task_control.rs` | an invocation: the task's name, its parameters, the variables passed | the agent | a `[task.<name>]` is declared |
 | `src/sandbox/task.rs` | a task's output, and the tree of its output directory | the task's cage, run with the agent's parameters | the same |
-| `src/sandbox/egress.rs`, `src/trust.rs` | a secret source, again at each task invocation and each credential refresh | the agent, where the source lies in the project | a secret names a source in the project |
+| `src/sandbox/egress.rs`, `src/trust.rs` | a `sops` file in the project, at launch and again at each task invocation and each credential refresh | the agent | a secret names a `sops` file in the project |
 | `src/sandbox/proc_enforce/`, `src/proc_policy.rs`, `src/open_policy.rs` | the descriptor the shim hands over, then each notified `execve` or open: the path and arguments in the caller's memory, the head of the file it runs, the bytes of a file it opens | the agent | `[proc]` in `enforce` or `ask`, an `[fs] scan` list, `--proc-learn` |
 | `src/sandbox/notify_relay.rs` | the notifications sent on the cage's private bus | the agent | `dbus = true` with `gui = "wayland"` |
 | `src/sandbox/theme_relay.rs` | nothing of the cage's, but it writes into the app's home, whose names are the cage's | the agent, names only | the same |
@@ -495,7 +495,8 @@ It comes in two tiers, and the difference between them is what a flaw would reac
 | `src/sandbox/fs_watch.rs` | the names of what the agent writes in the project | the agent | `--observe` |
 | `src/sandbox/forward.rs` | the name of the socket a forward dials; the bytes are relayed, never read | the agent, names only | `forward = [...]` |
 
-Of the secret sources, only a `sops` file is held to the bytes [`sbx trust`](trust) approved.
+Of the secret sources in the project, a `sops` file is decrypted only as the bytes
+[`sbx trust`](trust) approved, and a `file` one is refused.
 
 ### In the commands you run against a session
 

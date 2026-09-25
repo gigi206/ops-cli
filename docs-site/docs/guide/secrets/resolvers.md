@@ -43,11 +43,21 @@ header = "Authorization"
 type   = "bearer"
 ```
 
-`file:///absolute/path` reads the file's contents **host-side** at launch. The
-path is **never bound into the cage**: only the resolved value reaches the
+`file:///absolute/path` reads the file's contents **host-side** at launch. sbx
+**never binds the path into the cage**: only the resolved value reaches the
 broker, on the host. This matters: the cage cannot read the file, so even a
 compromised agent cannot exfiltrate it directly; it can only ask the proxy to use
 the resulting capability toward the one allowed host.
+
+That holds only while the file is outside everything the cage is given. A path
+**in the project** is refused: the project is bound into the cage read-write, so a
+file there is neither hidden from the agent nor fixed, and a link the agent puts in
+its place would lead the read to any other file of yours. A path counts as the
+project's when resolving it passes through the project at any step, as a link into
+it does. It is refused whether or not the file exists, so removing the file cannot
+hand a [fallback chain](#fallback-chains) to its next source. A file under a
+read-write [`binds`](../configuration/binds) you granted is in the cage as well, and
+sbx does not look for that case: keep a secret file out of both.
 
 ### `sops://`: a SOPS-encrypted store
 
@@ -80,7 +90,9 @@ environment. So a file **in the project** is decrypted only as the bytes
 - a file the trust does not cover, or one rewritten since `sbx trust`, is refused
   before `sops` runs, and the error names it.
 
-A file outside the project, named by an absolute path, is decrypted where it is.
+A file outside the project, named by an absolute path, is decrypted where it is,
+unless resolving that path passes through the project, as a link into it does:
+such a file is the project's.
 A relative sops file named only by the global config or an app profile is in the
 project too, and is refused until the project's `.sbx.toml` names it and is
 trusted; give such a file an absolute path outside the project instead.
