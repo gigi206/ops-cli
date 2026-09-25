@@ -501,7 +501,7 @@ fn git_file_target_refusal(root: &Path, git_writable: bool) -> Option<String> {
     if let Err(e) =
         std::fs::File::open(&file).and_then(|f| f.take(GITFILE_MAX).read_to_end(&mut head))
     {
-        return Some(visible(&unreadable_refusal("read", &file, &e)));
+        return Some(visible(&git_unreadable("read", &file, &e)));
     }
     if head.len() as u64 == GITFILE_MAX {
         return None;
@@ -523,8 +523,8 @@ fn git_file_target_refusal(root: &Path, git_writable: bool) -> Option<String> {
         visible(&format!(
             "`{}` names a repository inside the project (`{}`): sbx protects the files git reads \
              in a `.git` directory, and a repository elsewhere in the tree would be left open to \
-             the cage. Move the repository into `.git` in place of the file, or set `[fs] \
-             git_writable = true` from a trusted layer, then launch again",
+             the cage. Move the repository into `.git` in place of the file, then launch again. \
+             {GIT_WRITABLE_HINT}",
             file.display(),
             canon.display()
         ))
@@ -623,7 +623,10 @@ fn git_hook_dirs(
             }
             Err(e) => {
                 refused.get_or_insert_with(|| {
-                    format!("{pattern}: {}", unreadable_refusal("look at", &path, &e))
+                    visible(&format!(
+                        "{pattern}: {}",
+                        git_unreadable("look at", &path, &e)
+                    ))
                 });
                 continue;
             }
@@ -633,7 +636,10 @@ fn git_hook_dirs(
                 Ok(_) => continue,
                 Err(e) => {
                     refused.get_or_insert_with(|| {
-                        format!("{pattern}: {}", unreadable_refusal("resolve", &path, &e))
+                        visible(&format!(
+                            "{pattern}: {}",
+                            git_unreadable("resolve", &path, &e)
+                        ))
                     });
                     continue;
                 }
@@ -771,20 +777,23 @@ fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<Strin
                 let canon = crate::trust::canonicalize_existing_prefix(&path);
                 if canon.starts_with(root) {
                     refused.get_or_insert_with(|| {
-                        format!(
+                        visible(&format!(
                             "git includes `{}` as configuration ({pattern}), and it does not \
                              exist: the cage could create it and your git would read it. Create \
-                             it (empty is enough), remove the include, or set `[fs] git_writable \
-                             = true` from a trusted layer, then launch again",
+                             it (empty is enough) or remove the include, then launch again. \
+                             {GIT_WRITABLE_HINT}",
                             canon.display()
-                        )
+                        ))
                     });
                 }
                 continue;
             }
             Err(e) => {
                 refused.get_or_insert_with(|| {
-                    format!("{pattern}: {}", unreadable_refusal("look at", &path, &e))
+                    visible(&format!(
+                        "{pattern}: {}",
+                        git_unreadable("look at", &path, &e)
+                    ))
                 });
                 continue;
             }
@@ -792,7 +801,10 @@ fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<Strin
                 Ok(c) => c,
                 Err(e) => {
                     refused.get_or_insert_with(|| {
-                        format!("{pattern}: {}", unreadable_refusal("resolve", &path, &e))
+                        visible(&format!(
+                            "{pattern}: {}",
+                            git_unreadable("resolve", &path, &e)
+                        ))
                     });
                     continue;
                 }
@@ -838,13 +850,13 @@ fn git_commondir_refusal(root: &Path, git_writable: bool) -> Option<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(format!(
             "`.git/commondir`: {}",
-            visible(&unreadable_refusal("look at", &path, &e))
+            visible(&git_unreadable("look at", &path, &e))
         )),
         Ok(_) => Some(format!(
             "`{}` is present: git writes this file only for a linked worktree, and in the \
              project's own `.git` it makes your git read its configuration from the directory it \
              names instead of `.git/config`, which sbx protects. Check what it names and remove \
-             it, or set `[fs] git_writable = true` from a trusted layer, then launch again",
+             it, then launch again. {GIT_WRITABLE_HINT}",
             path.display()
         )),
     }
@@ -902,7 +914,7 @@ fn git_worktree_files(
     let listing = match std::fs::symlink_metadata(&worktrees) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
         Err(e) => {
-            refused.get_or_insert_with(|| visible(&unreadable_refusal("look at", &worktrees, &e)));
+            refused.get_or_insert_with(|| visible(&git_unreadable("look at", &worktrees, &e)));
             return out;
         }
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -920,15 +932,15 @@ fn git_worktree_files(
             refused.get_or_insert_with(|| {
             visible(&format!(
                 "`{}` holds more than {MASK_MAX} entries, more linked worktrees than a launch can \
-                 protect: remove the ones you no longer use (`git worktree prune`), or set `[fs] \
-                 git_writable = true` from a trusted layer, then launch again",
+                 protect: remove the ones you no longer use (`git worktree prune`), then launch \
+                 again. {GIT_WRITABLE_HINT}",
                     worktrees.display()
                 ))
             });
             return out;
         }
         Err(e) => {
-            refused.get_or_insert_with(|| visible(&unreadable_refusal("list", &worktrees, &e)));
+            refused.get_or_insert_with(|| visible(&git_unreadable("list", &worktrees, &e)));
             return out;
         }
     };
@@ -953,7 +965,7 @@ fn git_worktree_files(
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                refused.get_or_insert_with(|| visible(&unreadable_refusal("look at", &dir, &e)));
+                refused.get_or_insert_with(|| visible(&git_unreadable("look at", &dir, &e)));
             }
         }
     }
@@ -1120,15 +1132,15 @@ fn worktree_file(
                     visible(&format!(
                         "git reads `{}` as configuration (`extensions.worktreeConfig` is on in \
                          `.git/config`), and it does not exist: the cage could create it and your \
-                         git would read it. Create it (empty is enough), or set `[fs] \
-                         git_writable = true` from a trusted layer, then launch again",
+                         git would read it. Create it (empty is enough), then launch again. \
+                         {GIT_WRITABLE_HINT}",
                         path.display()
                     ))
                 });
             }
         }
         Err(e) => {
-            refused.get_or_insert_with(|| visible(&unreadable_refusal("look at", path, &e)));
+            refused.get_or_insert_with(|| visible(&git_unreadable("look at", path, &e)));
         }
         Ok(meta) if meta.file_type().is_symlink() => {
             refused
@@ -1163,8 +1175,8 @@ fn git_link_on_the_way(root: &Path, path: &Path, what: &str, instead: &str) -> O
         ResolutionStop::At(link) => Some(git_link_refusal(&link, what, instead)),
         ResolutionStop::TooManyLinks(link) => Some(visible(&format!(
             "`{}`: resolving the path to {what} meets more symbolic links than the kernel follows \
-             in one resolution. Name it by a path with fewer links, or set `[fs] git_writable = \
-             true` from a trusted layer, then launch again",
+             in one resolution. Name it by a path with fewer links, then launch again. \
+             {GIT_WRITABLE_HINT}",
             link.display()
         ))),
     }
@@ -1177,8 +1189,7 @@ fn git_link_refusal(link: &Path, what: &str, instead: &str) -> String {
     visible(&format!(
         "`{}` is a symbolic link on the way to {what}, and the cage could point it elsewhere \
          during the session: your git would then read what it names rather than what sbx \
-         protects. {instead}, or set `[fs] git_writable = true` from a trusted layer, then launch \
-         again",
+         protects. {instead}, then launch again. {GIT_WRITABLE_HINT}",
         link.display()
     ))
 }
@@ -1247,6 +1258,18 @@ fn unreadable_refusal(verb: &str, path: &Path, e: &std::io::Error) -> String {
          mask are the same answer from here",
         path.display()
     )
+}
+
+/// The way out every refusal about git's files ends with: `git_writable`, the one opening in
+/// `[fs]`, with the command that records it and the approval a project's own copy needs.
+const GIT_WRITABLE_HINT: &str = "Or, to let the cage write git's files in this project, run `sbx \
+    config set fs.git_writable true` here and approve it with `sbx trust` (`--global` sets it for \
+    every project)";
+
+/// [`unreadable_refusal`] for one of the files the host's git reads, ending with the way out
+/// [`GIT_WRITABLE_HINT`] names.
+fn git_unreadable(verb: &str, path: &Path, e: &std::io::Error) -> String {
+    format!("{}. {GIT_WRITABLE_HINT}", unreadable_refusal(verb, path, e))
 }
 
 /// Why a candidate yielded no mask. The two are not interchangeable: one is a line the author can
@@ -2713,6 +2736,58 @@ mod tests {
         std::fs::rename(root.join(".git"), root.join("realgit")).unwrap();
         std::os::unix::fs::symlink("realgit", root.join(".git")).unwrap();
         refused(".git", "the directory it names");
+    }
+
+    /// Every refusal about git's files ends with the command that lifts the protection, an
+    /// unreadable one included, so a project that needs git's files writable is told how.
+    #[test]
+    fn a_refusal_about_gits_files_names_the_command_that_lifts_it() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+        let root = root.canonicalize().unwrap();
+        let refused = || {
+            let why = expand(&root, &FsPolicy::default())
+                .refused
+                .expect("refused");
+            assert!(
+                why.contains("`sbx config set fs.git_writable true`"),
+                "{why}"
+            );
+        };
+
+        std::os::unix::fs::symlink("elsewhere", root.join(".git/hooks")).unwrap();
+        refused();
+        std::fs::remove_file(root.join(".git/hooks")).unwrap();
+
+        std::fs::write(root.join(".git/commondir"), "../x\n").unwrap();
+        refused();
+        std::fs::remove_file(root.join(".git/commondir")).unwrap();
+
+        // root traverses whatever it likes, so an unreadable directory is no premise there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let worktrees = root.join(".git/worktrees");
+        std::fs::create_dir_all(&worktrees).unwrap();
+        std::fs::set_permissions(
+            &worktrees,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+        let why = expand(&root, &FsPolicy::default()).refused;
+        // Restore before asserting, so a failure does not leave the fixture undeletable.
+        std::fs::set_permissions(
+            &worktrees,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let why = why.expect("an unreadable worktrees directory refuses");
+        assert!(
+            why.contains("cannot list") && why.contains("`sbx config set fs.git_writable true`"),
+            "{why}"
+        );
     }
 
     /// A link above the directory `core.hooksPath` names, or on the way to a file git includes,

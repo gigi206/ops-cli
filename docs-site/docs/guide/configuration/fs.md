@@ -213,6 +213,10 @@ A project that needs those opens them from a trusted layer:
 git_writable = true
 ```
 
+`sbx config set fs.git_writable true`, run in the project, writes that line into its
+`.sbx.toml`, and `--global` writes it into the global config instead. Each refusal about git's
+files ends by naming that command.
+
 It is the one key in `[fs]` that opens rather than closes, so it is honored only from a
 trusted project (where it appears in the diff [`sbx trust`](../cli/trust) shows), from the
 global config, or from an app profile; from an untrusted project it is dropped with a warning.
