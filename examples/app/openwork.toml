@@ -229,6 +229,16 @@ mute = [
 #     "@github",                 # sbx net groups import examples/net-groups/github.toml
 # Add them to `allow` above, not here.
 
+[env]
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers), added to the instructions of the OpenCode engine the app starts, so a
+# refused host or a read-only file reads as the sandbox rather than as a fault to work around. The
+# app hands its environment to that engine, and OpenCode merges this variable over the config the
+# app writes for it (`OPENCODE_CONFIG`) rather than replacing it. The opt-in engine-v2 preview
+# starts its engine with a fixed list of variables instead (read out of `app.asar`), and does not
+# carry it.
+OPENCODE_CONFIG_CONTENT = '{"instructions":["/opt/sbx/contract-summary.md"]}'
+
 # CREDENTIAL POSTURE — the engine's own credentials, held in the app's isolated home.
 # OpenWork drives its embedded OpenCode engine, and that engine authenticates the way it does
 # everywhere else: a provider key you enter in the app, or a provider login it performs itself. Both
@@ -239,7 +249,7 @@ mute = [
 # If you would rather keep the key OUT of the cage entirely, the injected path works here as it does
 # in `examples/app/opencode.toml`: put a placeholder in [env], name the provider host in a [secret]
 # block, and the egress proxy substitutes the real value on the wire — the cage never holds it.
-#[env]
+# Add the placeholder to the [env] table above (a second `[env]` header is invalid TOML):
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 #
 #[secret."openrouter.ai"]
