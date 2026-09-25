@@ -279,12 +279,15 @@ linked worktree's `config.worktree` and `commondir`), and a `.git/commondir` in 
 own repository, which would have git read its configuration from elsewhere, refuses the
 launch. Such a file cannot be held before it exists, so sbx names any that appeared once the
 cage has exited. A `.git` that is a file, the pointer a linked worktree keeps to its
-repository, is read-only as well. Committing,
+repository, is read-only as well, and so are the repositories of the submodules the index
+names, which a `git status` in the superproject reads too. Committing,
 switching branches, fetching and pushing still work; what is refused is writing the config
 (`remote add`, the upstream `push -u` records), installing a hook, and moving a repository into
 `.git` (`submodule absorbgitdirs`): `.git` itself is held in place, and a symbolic link on the
 way to any of these paths refuses the launch, since the cage could point it elsewhere, so the
-paths your git reads after the session are the protected ones. A project that needs
+paths your git reads after the session are the protected ones. The exception is a repository
+that appears during the session, in a submodule's directory or added to the index, which no
+mount can hold. A project that needs
 those sets `[fs] git_writable = true` from a trusted layer, the one key of `[fs]` that opens
 rather than closes and therefore the one the trust gate decides.
 

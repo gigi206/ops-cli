@@ -927,6 +927,94 @@ fn a_linked_worktrees_git_file_is_read_only_and_keeps_its_path() {
     assert_eq!(std::fs::read(wt.join(".git")).unwrap(), before);
 }
 
+/// A superproject's submodule keeps its repository's configuration and hooks read-only inside a
+/// real cage, and the `.git` file that points at it in place, while the submodule's own commits
+/// still work; the host's copies are left as they were.
+#[test]
+fn a_submodules_repository_is_read_only_in_a_superprojects_cage() {
+    let (project, source, data) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "a submodule's repository in a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    let git = |dir: &Path, args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+    };
+    let Ok(init) = git(source.path(), &["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    for (dir, args) in [
+        (
+            source.path(),
+            &["commit", "-q", "--allow-empty", "-m", "s"][..],
+        ),
+        (root, &["init", "-q"]),
+        (
+            root,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                source.path().to_str().unwrap(),
+                "sub",
+            ],
+        ),
+        (root, &["commit", "-q", "--no-verify", "-m", "sub"]),
+    ] {
+        assert!(git(dir, args).unwrap().status.success(), "git {args:?}");
+    }
+    let files = [".git/modules/sub/config", "sub/.git"];
+    let before: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(root.join(f)).unwrap())
+        .collect();
+
+    let script = "for f in .git/modules/sub/config sub/.git; do \
+          (echo x >> $f) 2>/dev/null && echo WROTE-$f || echo REFUSED-$f; \
+        done; \
+        (: > .git/modules/sub/hooks/pre-commit) 2>/dev/null && echo WROTE-hook || echo REFUSED-hook; \
+        if mv sub/.git sub/moved 2>/dev/null; then echo MOVED; mv sub/moved sub/.git; \
+        else echo HELD; fi; \
+        git -c user.name=t -c user.email=t@t -C sub commit -q --allow-empty -m in-cage \
+          && echo COMMITTED";
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(root)
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run sbx");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for word in [
+        "REFUSED-.git/modules/sub/config",
+        "REFUSED-sub/.git",
+        "REFUSED-hook",
+        "HELD",
+        "COMMITTED",
+    ] {
+        assert!(
+            stdout.contains(word),
+            "{word}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    for (f, was) in files.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read(root.join(f)).unwrap(),
+            was,
+            "{f} on the host"
+        );
+    }
+    assert!(!root.join(".git/modules/sub/hooks/pre-commit").exists());
+}
+
 /// What no mount can hold in the project's git is named once the cage has exited: a
 /// `.git/commondir` and a `config.worktree` that appeared during the session, and the next launch
 /// refuses on the first. Run under a network posture with no proxy, where a launch with nothing to

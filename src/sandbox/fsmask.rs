@@ -260,24 +260,33 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     let layout = git_dir_link_refusal(&root, policy.git_writable())
         .or_else(|| git_file_target_refusal(&root, policy.git_writable()))
         .or_else(|| protected.then(|| git_repo_refusal(&root, &main)).flatten());
-    let (hooks, includes, worktree) = match layout {
+    let mut carrier: Vec<Masked> = Vec::new();
+    let mut submodules = 0;
+    match layout {
         Some(reason) => {
             out.refused.get_or_insert(reason);
-            (Vec::new(), Vec::new(), Vec::new())
         }
-        None if !protected => (Vec::new(), Vec::new(), Vec::new()),
-        None => (
-            git_hook_dirs(&root, &main, &mut out.warnings, &mut out.refused),
-            git_include_files(&root, &main, &mut out.refused),
-            git_worktree_files(&root, &main, &mut out.refused),
-        ),
-    };
-    for mut m in builtin
-        .into_iter()
-        .chain(hooks)
-        .chain(includes)
-        .chain(worktree)
-    {
+        None if !protected => {}
+        None => {
+            carrier.extend(git_hook_dirs(
+                &root,
+                &main,
+                &mut out.warnings,
+                &mut out.refused,
+            ));
+            carrier.extend(git_include_files(&root, &main, &mut out.refused));
+            carrier.extend(git_worktree_files(&root, &main, &mut out.refused));
+            submodules = submodule_carrier(
+                &root,
+                &main,
+                0,
+                &mut carrier,
+                &mut out.warnings,
+                &mut out.refused,
+            );
+        }
+    }
+    for mut m in builtin.into_iter().chain(carrier) {
         m.builtin = true;
         let covered = out
             .denied
@@ -337,18 +346,35 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     guard_git_tracked(&root, &out.denied, &mut out.warnings);
 
     let count = out.count();
+    // A submodule's files are git's: sbx lays them itself, and naming a directory does not apply.
+    let among = if submodules > 0 {
+        format!(
+            " The git files of {submodules} submodule repositories, which sbx protects by itself, \
+             are among them."
+        )
+    } else {
+        String::new()
+    };
     if count > MASK_MAX {
+        let advice = if submodules > 0 {
+            format!(
+                " An `[fs]` entry costs less naming a directory than its files. {GIT_WRITABLE_HINT}"
+            )
+        } else {
+            " Name a directory instead of its files: one entry closes it, at constant cost, and it \
+             stays closed for anything created inside it later"
+                .to_string()
+        };
         out.refused = Some(format!(
             "`[fs]` needs {count} mounts, its masks and the directories that hold them in place, \
-             and {MASK_MAX} is the ceiling: a launch pays for mounts faster than one-for-one. Name \
-             a directory instead of its files: one entry closes it, at constant cost, and it stays \
-             closed for anything created inside it later"
+             and {MASK_MAX} is the ceiling: a launch pays for mounts faster than one-for-one.\
+             {among}{advice}"
         ));
     } else if count > MASK_WARN {
         out.warnings.push(format!(
             "`[fs]` needs {count} mounts, its masks and the directories that hold them in place: \
-             past about {MASK_WARN} the launch slows down noticeably. Naming a directory closes it \
-             in one entry, at constant cost"
+             past about {MASK_WARN} the launch slows down noticeably.{among} Naming a directory \
+             closes an `[fs]` entry in one mount, at constant cost"
         ));
     }
     out
@@ -427,7 +453,8 @@ const BUILTIN_READONLY: &str = "readonly (built-in)";
 /// why it is honored only from a trusted layer. A `.git` that is a file (a linked worktree, a
 /// submodule) is read-only itself ([`git_file_protected`]): it names the repository git reads,
 /// outside the project where the cage does not reach, and one that names a repository inside the
-/// project refuses the launch ([`git_file_target_refusal`]).
+/// project refuses the launch ([`git_file_target_refusal`]). The repositories of the submodules
+/// the index names get the same carrier as the project's own ([`submodule_carrier`]).
 ///
 /// Returned as `[fs]` entries relative to the project, for [`resolve_list`], which is what refuses
 /// one that cannot be looked at: an absent file is left out here, every other answer goes through.
@@ -508,36 +535,15 @@ fn git_file_protected(root: &Path, git_writable: bool) -> bool {
 /// whose configuration and hooks nothing protects, since the carrier is looked for in a `.git`
 /// directory, so it refuses the launch, and so does a link inside the project on the way to it
 /// ([`git_link_on_the_way`]).
-///
-/// The file is read the way git reads it: everything after `gitdir: `, less the line ends that close
-/// it, is the path. The read stops past the longest path the kernel resolves, since a file longer
-/// than that names a path git cannot open.
 fn git_file_target_refusal(root: &Path, git_writable: bool) -> Option<String> {
-    use std::io::Read;
-    use std::os::unix::ffi::OsStrExt;
-    /// Past the kernel's `PATH_MAX`, with room for the `gitdir: ` prefix.
-    const GITFILE_MAX: u64 = 8192;
     if !git_file_protected(root, git_writable) {
         return None;
     }
     let file = root.join(".git");
-    let mut head = Vec::new();
-    if let Err(e) =
-        std::fs::File::open(&file).and_then(|f| f.take(GITFILE_MAX).read_to_end(&mut head))
-    {
-        return Some(visible(&git_unreadable("read", &file, &e)));
-    }
-    if head.len() as u64 == GITFILE_MAX {
-        return None;
-    }
-    let mut named = head.strip_prefix(b"gitdir: ")?;
-    while let Some(rest) = named
-        .strip_suffix(b"\n")
-        .or_else(|| named.strip_suffix(b"\r"))
-    {
-        named = rest;
-    }
-    let target = root.join(std::ffi::OsStr::from_bytes(named));
+    let target = match gitfile_target(&file) {
+        Ok(target) => target?,
+        Err(e) => return Some(visible(&git_unreadable("read", &file, &e))),
+    };
     let what = "the repository your git reads";
     if let Some(reason) = git_link_on_the_way(root, &target, what, GIT_LINK_INSTEAD) {
         return Some(reason);
@@ -553,6 +559,158 @@ fn git_file_target_refusal(root: &Path, git_writable: bool) -> Option<String> {
             canon.display()
         ))
     })
+}
+
+/// How deep submodules of submodules are followed; one nested deeper refuses the launch.
+const SUBMODULE_DEPTH: usize = 8;
+
+/// The repositories of `repo`'s submodules that the host's git reads, and theirs below them, each
+/// with the carrier its own repository has, as read-only masks added to `masks`; the number of
+/// repositories found is returned.
+///
+/// The host's git reads a submodule's configuration whenever a gitlink of the index has a
+/// repository in its directory, whether or not `.gitmodules` names it: a `git status` in the
+/// superproject reads it, and a submodule's own submodules the same way. So the submodules are
+/// found in the index ([`gitlinks`]), and for each the `.git` in its directory decides: a file is
+/// held read-only and the repository it names is protected when it lies in the project, a
+/// directory is the repository, a link refuses the launch, and none means there is no repository
+/// for git to read yet. Each repository found gets what the project's own does: its `config`, its
+/// hooks, the files it includes and the files beside its configuration, and a link or a `commondir`
+/// in it refuses the launch ([`git_repo_refusal`]).
+///
+/// An index this cannot read refuses the launch when the repository shows submodules (a
+/// `.gitmodules`, or a `modules` directory in its git directory), since their repositories could not
+/// be found; otherwise there is nothing to look for.
+fn submodule_carrier(
+    root: &Path,
+    repo: &GitRepo,
+    depth: usize,
+    masks: &mut Vec<Masked>,
+    warnings: &mut Vec<String>,
+    refused: &mut Option<String>,
+) -> usize {
+    let links = match gitlinks(repo) {
+        Ok(links) => links,
+        Err(reason) => {
+            let shows =
+                repo.work_tree.join(".gitmodules").exists() || repo.dir.join("modules").exists();
+            if shows {
+                refused.get_or_insert_with(|| visible(&reason));
+            }
+            return 0;
+        }
+    };
+    let mut found = 0;
+    for dir in links {
+        let dot_git = dir.join(".git");
+        let what = "a submodule's repository";
+        if let Some(reason) = git_link_on_the_way(root, &dot_git, what, GIT_LINK_INSTEAD) {
+            refused.get_or_insert(reason);
+            continue;
+        }
+        let git_dir = match std::fs::symlink_metadata(&dot_git) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                refused.get_or_insert_with(|| visible(&git_unreadable("look at", &dot_git, &e)));
+                continue;
+            }
+            Ok(meta) if meta.is_dir() => dot_git,
+            Ok(meta) if meta.is_file() => {
+                git_file(root, &dot_git, None, refused, masks);
+                let target = match gitfile_target(&dot_git) {
+                    Ok(Some(target)) => target,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        refused
+                            .get_or_insert_with(|| visible(&git_unreadable("read", &dot_git, &e)));
+                        continue;
+                    }
+                };
+                if let Some(reason) = git_link_on_the_way(root, &target, what, GIT_LINK_INSTEAD) {
+                    refused.get_or_insert(reason);
+                    continue;
+                }
+                let canon = crate::trust::canonicalize_existing_prefix(&target);
+                // Outside the project the cage does not reach it; the file naming it is held.
+                if !canon.starts_with(root) {
+                    continue;
+                }
+                if !canon.is_dir() {
+                    refused.get_or_insert_with(|| {
+                        visible(&format!(
+                            "`{}` names a submodule's repository at `{}`, which does not exist: the \
+                             cage could create it and your git would read it. Check the file, \
+                             then launch again. {GIT_WRITABLE_HINT}",
+                            dot_git.display(),
+                            canon.display()
+                        ))
+                    });
+                    continue;
+                }
+                canon
+            }
+            Ok(_) => continue,
+        };
+        let sub = GitRepo {
+            dir: git_dir,
+            work_tree: dir,
+        };
+        if let Some(reason) = git_repo_refusal(root, &sub) {
+            refused.get_or_insert(reason);
+            continue;
+        }
+        found += 1;
+        git_file(root, &sub.dir.join("config"), None, refused, masks);
+        masks.extend(git_hook_dirs(root, &sub, warnings, refused));
+        masks.extend(git_include_files(root, &sub, refused));
+        masks.extend(git_worktree_files(root, &sub, refused));
+        if depth + 1 == SUBMODULE_DEPTH {
+            refused.get_or_insert_with(|| {
+                visible(&format!(
+                    "`{}` is a submodule nested {SUBMODULE_DEPTH} deep, deeper than sbx follows \
+                     submodules to protect their repositories. {GIT_WRITABLE_HINT}",
+                    sub.work_tree.display()
+                ))
+            });
+            continue;
+        }
+        found += submodule_carrier(root, &sub, depth + 1, masks, warnings, refused);
+        if found > MASK_MAX {
+            break;
+        }
+    }
+    found
+}
+
+/// The repository a `.git` file names, or `None` when git would not read the file as a pointer.
+///
+/// The file is read the way git reads it: everything after `gitdir: `, less the line ends that close
+/// it, is the path, relative to the file's directory when it is not absolute. The read stops past
+/// the longest path the kernel resolves, since a file longer than that names a path git cannot
+/// open.
+fn gitfile_target(file: &Path) -> io::Result<Option<PathBuf>> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    /// Past the kernel's `PATH_MAX`, with room for the `gitdir: ` prefix.
+    const GITFILE_MAX: u64 = 8192;
+    let mut head = Vec::new();
+    std::fs::File::open(file)?
+        .take(GITFILE_MAX)
+        .read_to_end(&mut head)?;
+    if head.len() as u64 == GITFILE_MAX {
+        return Ok(None);
+    }
+    let Some(mut named) = head.strip_prefix(b"gitdir: ") else {
+        return Ok(None);
+    };
+    while let Some(rest) = named
+        .strip_suffix(b"\n")
+        .or_else(|| named.strip_suffix(b"\r"))
+    {
+        named = rest;
+    }
+    let base = file.parent().unwrap_or(Path::new("/"));
+    Ok(Some(base.join(std::ffi::OsStr::from_bytes(named))))
 }
 
 /// Whether the project's `.git` is a symbolic link while no trusted layer set `git_writable`, which
@@ -914,10 +1072,12 @@ fn git_worktree_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>)
     .is_some_and(|out| out.trim_ascii() == b"true");
     let mut out: Vec<Masked> = Vec::new();
     let git = &repo.dir;
-    worktree_file(
+    let config = repo.shown(root, "config");
+    let required = extension.then_some(config.as_str());
+    git_file(
         root,
         &git.join("config.worktree"),
-        extension,
+        required,
         refused,
         &mut out,
     );
@@ -964,14 +1124,14 @@ fn git_worktree_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>)
                 });
             }
             Ok(meta) if meta.is_dir() => {
-                worktree_file(
+                git_file(
                     root,
                     &dir.join("config.worktree"),
-                    extension,
+                    required,
                     refused,
                     &mut out,
                 );
-                worktree_file(root, &dir.join("commondir"), false, refused, &mut out);
+                git_file(root, &dir.join("commondir"), None, refused, &mut out);
             }
             // Not a worktree: git reads nothing from a file here.
             Ok(_) => {}
@@ -1120,13 +1280,14 @@ impl WorktreeScan {
     }
 }
 
-/// Protect one of the files [`git_worktree_files`] names, adding it to `out` when it is there. The
-/// flag `required` is whether git reads it as configuration when present, which makes an absent one
-/// a refusal: the cage could create it and git would read it.
-fn worktree_file(
+/// Protect one of the files the host's git reads, adding it to `out` when it is there. `required`
+/// names the configuration that turns `extensions.worktreeConfig` on when git reads the file as
+/// configuration, which makes an absent one a refusal: the cage could create it and git would read
+/// it.
+fn git_file(
     root: &Path,
     path: &Path,
-    required: bool,
+    required: Option<&str>,
     refused: &mut Option<String>,
     out: &mut Vec<Masked>,
 ) {
@@ -1139,11 +1300,11 @@ fn worktree_file(
     );
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if required {
+            if let Some(config) = required {
                 refused.get_or_insert_with(|| {
                     visible(&format!(
                         "git reads `{}` as configuration (`extensions.worktreeConfig` is on in \
-                         `.git/config`), and it does not exist: the cage could create it and your \
+                         `{config}`), and it does not exist: the cage could create it and your \
                          git would read it. Create it (empty is enough), then launch again. \
                          {GIT_WRITABLE_HINT}",
                         path.display()
@@ -1606,29 +1767,65 @@ fn git_tracked_paths(git_dir: &Path) -> Option<BTreeSet<String>> {
 /// mask no longer breaks commits. Reporting the path anyway would leave the warning standing after
 /// the user did exactly what it asked, which is the fastest way to teach someone to ignore it.
 fn parse_git_index(data: &[u8]) -> Option<BTreeSet<String>> {
+    Some(
+        parse_git_index_entries(data, SHA1_LEN)?
+            .into_iter()
+            .filter(|entry| !entry.skip_worktree)
+            .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+            .collect(),
+    )
+}
+
+/// The length of an object name in a repository that keeps SHA-1 names, git's default.
+const SHA1_LEN: usize = 20;
+
+/// The length of an object name in a repository whose `extensions.objectFormat` is `sha256`.
+const SHA256_LEN: usize = 32;
+
+/// The mode git records for a gitlink: a submodule's commit, whose directory holds a repository.
+const GITLINK_MODE: u32 = 0o160000;
+
+/// One entry of a git index, as far as the checks here read it.
+struct IndexEntry {
+    path: Vec<u8>,
+    mode: u32,
+    skip_worktree: bool,
+}
+
+/// The entries of a git index blob whose object names are `hash_len` bytes long, or `None` when the
+/// blob is not an index this reads in full.
+///
+/// Versions 2 and 3 pad each entry to a multiple of 8 bytes; version 4, which git writes when a
+/// repository asks for it and which `git update-index --index-version 4` switches any index to,
+/// writes each path as the length it strips from the previous one and the rest. A split index keeps
+/// most of its entries in a shared file of its own, so an index that carries one is not read in
+/// full here and answers `None`.
+fn parse_git_index_entries(data: &[u8], hash_len: usize) -> Option<Vec<IndexEntry>> {
     if data.len() < 12 || &data[0..4] != b"DIRC" {
         return None;
     }
     let version = u32::from_be_bytes(data[4..8].try_into().ok()?);
-    if !matches!(version, 2 | 3) {
+    if !matches!(version, 2..=4) {
         return None;
     }
     let count = u32::from_be_bytes(data[8..12].try_into().ok()?) as usize;
-    let mut out = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut previous: Vec<u8> = Vec::new();
     let mut pos = 12;
     for _ in 0..count {
         let start: usize = pos;
-        // 62 bytes of fixed metadata, the last two being the flags whose top bit says a second
-        // pair follows (version 3's extended flags).
-        let flags_at = start.checked_add(60)?;
+        // Ten 4-byte fields, the fifth being the mode, then the object name, then the flags whose
+        // bit 0x4000 says a second pair follows (version 3's extended flags).
+        let mode_at = start.checked_add(24)?;
+        let flags_at = start.checked_add(40)?.checked_add(hash_len)?;
         if flags_at + 2 > data.len() {
             return None;
         }
+        let mode = u32::from_be_bytes(data[mode_at..mode_at + 4].try_into().ok()?);
         let flags = u16::from_be_bytes(data[flags_at..flags_at + 2].try_into().ok()?);
-        let mut name_at = start + 62;
-        // Bit 0x4000 of the base flags says a second pair follows (version 3's extended flags);
-        // bit 0x4000 *of those* is `skip-worktree`, which git sets on `update-index
-        // --skip-worktree` and which switches the index to version 3 to carry it.
+        let mut name_at = flags_at + 2;
+        // Bit 0x4000 of the extended flags is `skip-worktree`, which git sets on `update-index
+        // --skip-worktree`.
         let mut skip_worktree = false;
         if flags & 0x4000 != 0 {
             if name_at + 2 > data.len() {
@@ -1638,23 +1835,108 @@ fn parse_git_index(data: &[u8]) -> Option<BTreeSet<String>> {
             skip_worktree = extended & 0x4000 != 0;
             name_at += 2;
         }
-        if name_at > data.len() {
-            return None;
-        }
-        // The 12-bit length in the flags saturates at 0xFFF, so the NUL is the authority either way.
-        let end = name_at + data[name_at..].iter().position(|&b| b == 0)?;
-        if !skip_worktree {
-            out.insert(String::from_utf8_lossy(&data[name_at..end]).into_owned());
-        }
-        // Entries are padded with NULs to a multiple of 8 from the entry's own start, with at least
-        // one NUL of terminator.
-        let unpadded = end + 1 - start;
-        pos = start + unpadded.div_ceil(8) * 8;
+        let path = if version == 4 {
+            let (strip, used) = index_varint(data.get(name_at..)?)?;
+            name_at += used;
+            let end = name_at + data.get(name_at..)?.iter().position(|&b| b == 0)?;
+            let mut path = previous[..previous.len().checked_sub(strip)?].to_vec();
+            path.extend_from_slice(&data[name_at..end]);
+            pos = end + 1;
+            path
+        } else {
+            // The 12-bit length in the flags saturates at 0xFFF, so the NUL is the authority
+            // either way; entries are padded with NULs to a multiple of 8 from their own start.
+            let end = name_at + data.get(name_at..)?.iter().position(|&b| b == 0)?;
+            pos = start + (end + 1 - start).div_ceil(8) * 8;
+            data[name_at..end].to_vec()
+        };
         if pos > data.len() {
             return None;
         }
+        previous.clone_from(&path);
+        out.push(IndexEntry {
+            path,
+            mode,
+            skip_worktree,
+        });
+    }
+    // The extensions run from the last entry to the checksum: four bytes of signature and four of
+    // length each.
+    let body_end = data.len().saturating_sub(hash_len);
+    while pos + 8 <= body_end {
+        let size = u32::from_be_bytes(data[pos + 4..pos + 8].try_into().ok()?) as usize;
+        if &data[pos..pos + 4] == b"link" {
+            return None;
+        }
+        pos = pos.checked_add(8)?.checked_add(size)?;
     }
     Some(out)
+}
+
+/// git's offset varint, which index version 4 writes the stripped length in, and how many bytes
+/// it took.
+fn index_varint(data: &[u8]) -> Option<(usize, usize)> {
+    let mut used = 0;
+    let mut byte = *data.get(used)?;
+    used += 1;
+    let mut value = usize::from(byte & 0x7f);
+    while byte & 0x80 != 0 {
+        byte = *data.get(used)?;
+        used += 1;
+        value = value
+            .checked_add(1)?
+            .checked_mul(0x80)?
+            .checked_add(usize::from(byte & 0x7f))?;
+    }
+    Some((value, used))
+}
+
+/// The gitlinks of `repo`'s index, as directories of its work tree: where the host's git looks for a
+/// submodule's repository, whether or not `.gitmodules` names it. `Ok` and empty when there is no
+/// index; `Err` with the reason when there is one this cannot read in full, so the caller decides
+/// whether that stops the launch.
+///
+/// Read rather than asked, for the reason [`git_tracked_paths`] gives: listing the index through
+/// git runs what its configuration names. A path that is not plain names below the work tree is
+/// not one git writes, and is left out.
+fn gitlinks(repo: &GitRepo) -> Result<Vec<PathBuf>, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let index = repo.dir.join("index");
+    let meta = match std::fs::metadata(&index) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(git_unreadable("look at", &index, &e)),
+        Ok(meta) => meta,
+    };
+    let unread = || {
+        format!(
+            "`{}` is not an index sbx reads in full (larger than {} MiB, split, or of another \
+             format), so the submodules whose repositories git reads cannot be found. {GIT_WRITABLE_HINT}",
+            index.display(),
+            INDEX_MAX / (1024 * 1024)
+        )
+    };
+    if !meta.is_file() || meta.len() > INDEX_MAX {
+        return Err(unread());
+    }
+    let data = std::fs::read(&index).map_err(|e| git_unreadable("read", &index, &e))?;
+    let hash_len = if host_git_config(repo, &["--get", "extensions.objectFormat"])
+        .is_some_and(|out| out.trim_ascii() == b"sha256")
+    {
+        SHA256_LEN
+    } else {
+        SHA1_LEN
+    };
+    let entries = parse_git_index_entries(&data, hash_len).ok_or_else(unread)?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.mode == GITLINK_MODE)
+        .map(|entry| PathBuf::from(std::ffi::OsStr::from_bytes(&entry.path)))
+        .filter(|rel| {
+            rel.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        })
+        .map(|rel| repo.work_tree.join(rel))
+        .collect())
 }
 
 /// The binds that realise this expansion in the agent's cage.
@@ -2893,6 +3175,196 @@ mod tests {
         assert!(e.refused.is_none(), "{:?}", e.refused);
     }
 
+    /// A repository at `dir` with one empty commit, made by the host's git; `false` when git is
+    /// not there to make it.
+    fn git_repo_at(dir: &Path, args: &[&str]) -> bool {
+        let git = |extra: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(extra)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let dir = dir.to_str().unwrap();
+        git(&[&["init", "-q"], args, &[dir]].concat())
+            && git(&[
+                "-C",
+                dir,
+                "commit",
+                "-q",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "i",
+            ])
+    }
+
+    /// A submodule the index names is protected like the project's own repository: its
+    /// configuration and hooks, and the `.git` file in its directory, and so is a submodule of
+    /// that submodule and a repository embedded in the tree. `git_writable` lifts all of it.
+    #[test]
+    fn a_submodules_repository_is_read_only_like_the_projects_own() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping submodule protection: no git on this host");
+            return;
+        };
+        let (inner, mid) = (tmp.path().join("inner"), tmp.path().join("mid"));
+        assert!(git_repo_at(&inner, &[]) && git_repo_at(&mid, &[]));
+        let file = ["-c", "protocol.file.allow=always"];
+        let in_mid = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+                .arg(&mid)
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let add_inner = [
+            &file[..],
+            &["submodule", "add", "-q", inner.to_str().unwrap(), "in"],
+        ];
+        assert!(in_mid(&add_inner.concat()) && in_mid(&["commit", "-q", "-m", "in"]));
+        let add_mid = [
+            &file[..],
+            &["submodule", "add", "-q", mid.to_str().unwrap(), "sub"],
+        ];
+        assert!(git(&add_mid.concat()));
+        let update = [
+            &file[..],
+            &["submodule", "update", "-q", "--init", "--recursive"],
+        ];
+        assert!(git(&update.concat()));
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+
+        let e = expand(&root, &FsPolicy::default());
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        for held in [
+            ".git/modules/sub/config",
+            ".git/modules/sub/hooks",
+            "sub/.git",
+            ".git/modules/sub/modules/in/config",
+            ".git/modules/sub/modules/in/hooks",
+            "sub/in/.git",
+            "emb/.git/config",
+            "emb/.git/hooks",
+        ] {
+            assert!(
+                e.readonly
+                    .iter()
+                    .any(|m| m.path == root.join(held) && m.builtin),
+                "{held}: {:?}",
+                e.readonly
+            );
+        }
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        assert!(expand(&root, &lifted).is_empty(), "git_writable lifts it");
+    }
+
+    /// Where a submodule's `.git` cannot be held to the repository git reads, the launch refuses:
+    /// a link there, or a `.git` file naming a repository inside the project that does not exist.
+    /// One naming a repository outside the project holds the file alone.
+    #[test]
+    fn a_submodules_git_that_cannot_be_held_refuses_the_launch() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping submodule refusals: no git on this host");
+            return;
+        };
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap();
+        let gitlink = |path: &str| {
+            let info = format!("160000,{},{path}", head.trim());
+            assert!(git(&["update-index", "--add", "--cacheinfo", &info]));
+            std::fs::create_dir_all(root.join(path)).unwrap();
+        };
+        let refused = || {
+            expand(&root, &FsPolicy::default())
+                .refused
+                .expect("refused")
+        };
+
+        gitlink("lnk");
+        std::os::unix::fs::symlink(tmp.path(), root.join("lnk/.git")).unwrap();
+        assert!(refused().contains("lnk/.git` is a symbolic link"));
+        std::fs::remove_file(root.join("lnk/.git")).unwrap();
+
+        gitlink("gone");
+        std::fs::write(root.join("gone/.git"), "gitdir: ../.git/modules/gone\n").unwrap();
+        assert!(refused().contains("which does not exist"));
+        std::fs::remove_file(root.join("gone/.git")).unwrap();
+
+        let outside = tmp.path().join("outside-repo");
+        assert!(git_repo_at(&outside, &[]));
+        gitlink("out");
+        let pointer = format!("gitdir: {}/.git\n", outside.display());
+        std::fs::write(root.join("out/.git"), pointer).unwrap();
+        let e = expand(&root, &FsPolicy::default());
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert!(e.readonly.iter().any(|m| m.path == root.join("out/.git")));
+        assert!(
+            !e.readonly.iter().any(|m| m.path.starts_with(&outside)),
+            "nothing outside the project"
+        );
+    }
+
+    /// The index is read in the formats git writes it in: version 4, and the longer object names of
+    /// a SHA-256 repository. A split index, whose entries this does not read in full, refuses the
+    /// launch where the repository shows submodules.
+    #[test]
+    fn the_index_is_read_in_the_formats_git_writes() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping index formats: no git on this host");
+            return;
+        };
+        let source = tmp.path().join("source");
+        assert!(git_repo_at(&source, &[]));
+        let add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
+        assert!(git(&[&add[..], &[source.to_str().unwrap(), "sub"]].concat()));
+        let held = |root: &Path| {
+            let e = expand(root, &FsPolicy::default());
+            e.refused.is_none()
+                && e.readonly
+                    .iter()
+                    .any(|m| m.path == root.join(".git/modules/sub/config"))
+        };
+        assert!(git(&["update-index", "--index-version", "4"]));
+        assert!(held(&root), "version 4");
+        assert!(git(&["update-index", "--split-index"]));
+        let why = expand(&root, &FsPolicy::default())
+            .refused
+            .expect("a split index refuses");
+        assert!(why.contains("not an index sbx reads in full"), "{why}");
+
+        let sha = tmp.path().join("sha");
+        if !git_repo_at(&sha, &["--object-format=sha256"]) {
+            skip_incapable!("skipping a SHA-256 index: this git does not make one");
+            return;
+        }
+        let sha = sha.canonicalize().unwrap();
+        assert!(git_repo_at(&sha.join("emb"), &["--object-format=sha256"]));
+        let add = std::process::Command::new("git")
+            .args(["-C", sha.to_str().unwrap(), "add", "emb"])
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        let e = expand(&sha, &FsPolicy::default());
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert!(
+            e.readonly
+                .iter()
+                .any(|m| m.path == sha.join("emb/.git/config"))
+        );
+    }
+
     /// The end of a session names what appeared in the project's git that no mount could hold: a
     /// `.git/commondir`, a `config.worktree` absent at launch, and a link where the launch refuses
     /// one. A file present at launch is not reported, and every name is escaped.
@@ -3409,13 +3881,54 @@ mod tests {
             "an ordinary v3 entry stays"
         );
 
-        // What must yield `None` rather than a wrong answer: not an index, a version whose paths
-        // are compressed, a truncated one.
+        // What must yield `None` rather than a wrong answer: not an index, a version-2 layout
+        // labelled version 4, whose paths it does not compress, a truncated one.
         assert!(parse_git_index(b"not an index at all").is_none());
         let mut v4 = data.clone();
         v4[4..8].copy_from_slice(&4u32.to_be_bytes());
-        assert!(parse_git_index(&v4).is_none(), "version 4 compresses paths");
+        assert!(parse_git_index(&v4).is_none(), "not version 4's layout");
         assert!(parse_git_index(&data[..20]).is_none(), "truncated");
+    }
+
+    /// A version-4 index writes each path as the length it strips from the previous one and the
+    /// rest, unpadded, and the mode tells a gitlink from a file.
+    #[test]
+    fn the_git_index_parse_reads_version_4_and_the_mode() {
+        fn entry(strip: u8, suffix: &str, mode: u32) -> Vec<u8> {
+            let mut e = vec![0u8; 60];
+            e[24..28].copy_from_slice(&mode.to_be_bytes());
+            e.extend_from_slice(&(suffix.len() as u16).to_be_bytes());
+            e.push(strip);
+            e.extend_from_slice(suffix.as_bytes());
+            e.push(0);
+            e
+        }
+        let mut v4 = b"DIRC".to_vec();
+        v4.extend_from_slice(&4u32.to_be_bytes());
+        v4.extend_from_slice(&3u32.to_be_bytes());
+        v4.extend(entry(0, "sub/a.txt", 0o100644));
+        v4.extend(entry(5, "b.txt", 0o100644));
+        v4.extend(entry(9, "vendor/lib", GITLINK_MODE));
+        let entries =
+            parse_git_index_entries(&v4, SHA1_LEN).expect("a well-formed v4 index parses");
+        let read: Vec<(String, u32)> = entries
+            .iter()
+            .map(|e| (String::from_utf8_lossy(&e.path).into_owned(), e.mode))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("sub/a.txt".to_string(), 0o100644),
+                ("sub/b.txt".to_string(), 0o100644),
+                ("vendor/lib".to_string(), GITLINK_MODE),
+            ]
+        );
+
+        // A strip longer than the previous path is not an index git wrote.
+        let mut bad = v4[..12].to_vec();
+        bad[8..12].copy_from_slice(&1u32.to_be_bytes());
+        bad.extend(entry(3, "x", 0o100644));
+        assert!(parse_git_index_entries(&bad, SHA1_LEN).is_none());
     }
 
     #[test]

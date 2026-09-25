@@ -171,6 +171,26 @@ in the tree, remove the `.git/hooks` link and point `core.hooksPath` at the dire
 repository a `.git/config` of its own that includes it (`git config include.path
 ../repo.gitconfig`). `git_writable` lifts this along with the rest.
 
+A **submodule** is a repository of its own that your git reads too: a `git status` in the
+superproject reads the configuration of every submodule the index names, whether or not
+`.gitmodules` lists it, and of that submodule's own submodules. So each one is protected the way
+the project's repository is, its configuration, its hooks directory and the files that
+configuration includes, and the `.git` file in its directory that points at it is read-only
+as well. That covers a submodule's repository under `.git/modules/`, and a repository embedded in
+the tree and added to the index. The submodules are found in the index, which sbx reads itself;
+an index it cannot read in full (a split index, or one past its size bound) refuses the launch
+in a repository that has submodules, and so does a link where a submodule's `.git` is looked
+for. Holding a submodule's configuration costs what holding `.git/config` costs:
+`git submodule update` rewrites the submodule's configuration every time it runs and is
+refused, as are `git submodule sync`, `git config` and `git remote add` inside a submodule, and
+`git mv` or `git rm` of a submodule's directory, which is held in place. The commits, branches
+and checkouts inside a submodule work, and `git submodule foreach -q 'git checkout -q $sha1'`
+puts each submodule on the commit the superproject records, which is what `update` does. Each
+submodule adds a few mounts to the ceiling `[fs]` counts, so a superproject with many of them
+can reach it; the refusal says so. What no mount can hold is a repository that appears during
+the session: one the cage creates in a gitlink's directory, or adds to the index, is read by
+your next `git status` in the superproject.
+
 **What this does not close: the hooks a project already has run its code.** The protection
 closes the hooks git would run without a trace: an untracked script in the hooks directory, a
 configuration key that names a program. It cannot close the hooks a project already uses,
