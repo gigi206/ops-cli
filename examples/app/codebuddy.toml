@@ -44,7 +44,26 @@
 # traffic through sbx's MITM. Grounded here: the packaging (Tencent's own npm scope, no
 # postinstall), the endpoints and auth headers (read out of the package's `product.json`), and the
 # environment keys (read out of the shipped bundle).
-cmd = "codebuddy"
+#
+# The command hands CodeBuddy the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) through `--append-system-prompt`, which adds
+# to the system prompt: the instructions in `~/.codebuddy/CODEBUDDY.md` still apply.
+# `--append-system-prompt` takes text rather than a path, so the file is read here and passed as one
+# argument, never evaluated; a summary too large for one argument is left out rather than stopping
+# the launch. `--system-prompt` and `--system-prompt-file` would replace the system prompt instead.
+# Arguments after `sbx app run codebuddy --` reach CodeBuddy verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+if [ -r "$SBX_CONTRACT_SUMMARY" ] && [ "$(wc -c < "$SBX_CONTRACT_SUMMARY")" -lt 100000 ]; then
+  exec codebuddy --append-system-prompt "$(cat "$SBX_CONTRACT_SUMMARY")" "$@"
+fi
+exec codebuddy "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "codebuddy",
+]
 
 # Your host CodeBuddy config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
