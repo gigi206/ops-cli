@@ -22,8 +22,9 @@
 //! it, and the launch warns rather than passing over it in silence); and a path nobody listed is
 //! simply open. What the cage cannot do is defeat a mask from inside: `umount2`, `mount`, `unshare`
 //! and the rest of that family are refused by the mandatory seccomp filter, and it holds no
-//! capability in its user namespace. Nor can it move one: every directory between the project root
-//! and a mask is held in place for the session ([`holding_dirs`]), so the path a mask was placed on
+//! capability in its user namespace. Nor can it move one: every directory between the project root,
+//! or the read-write bind a mask lies in, and the mask is held in place for the session
+//! ([`holding_dirs`]), so the path a mask was placed on
 //! still names the file it protects when the host's git reads it after the session and when the
 //! next launch resolves `[fs]` again.
 //!
@@ -79,7 +80,8 @@ const INDEX_MAX: u64 = 64 * 1024 * 1024;
 /// One project path a mask covers, and the entry that named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Masked {
-    /// The absolute host path, canonical and verified to be inside the project.
+    /// The absolute host path, canonical and verified to be inside the project, or for a file the
+    /// host's git reads, where the cage writes ([`Reach`]).
     pub(crate) path: PathBuf,
     /// Whether it is a directory, which decides which decoy covers it.
     pub(crate) is_dir: bool,
@@ -97,8 +99,9 @@ pub(crate) struct Expanded {
     pub(crate) denied: Vec<Masked>,
     /// Paths the cage may read but not write.
     pub(crate) readonly: Vec<Masked>,
-    /// The directories between the project root and a mask, shallow to deep, that the agent's cage
-    /// holds in place so each mask keeps naming the file it protects. See [`holding_dirs`].
+    /// The directories between a mask and the directory the cage writes it through, shallow to
+    /// deep, that the agent's cage holds in place so each mask keeps naming the file it protects.
+    /// See [`holding_dirs`].
     pub(crate) pins: Vec<PathBuf>,
     /// What the expansion found worth saying: an entry that matched nothing, a file reachable by a
     /// second name, a path git tracks. Surfaced by the launch, never fatal on its own.
@@ -111,22 +114,98 @@ pub(crate) struct Expanded {
     pub(crate) reach: Reach,
 }
 
-/// The host directories the cage writes at their own path, canonical: the project root.
+/// Where the cage writes host paths, canonical: at their own name in the project and in the
+/// read-write config binds, and under other names in sbx's data directory.
 ///
-/// A file the host's git reads that lies under it is one the cage could rewrite before that git
-/// reads it, so it is held; a link under it is a name the cage could point elsewhere. A path under
-/// none of these directories is not the cage's to write.
+/// A file the host's git reads that lies at its own name in the project or in a read-write bind is
+/// one the cage could rewrite before that git reads it, so it is held; a link there is a name the
+/// cage could point elsewhere. sbx's data directory holds the cage's home, its store and the
+/// install pools, which the cage writes at `/home/sandbox`, `/nix` and the pool paths: a mask at
+/// the host name would hold nothing there, so a file git reads in it refuses the launch. A path
+/// under none of these directories is not the cage's to write.
+///
+/// A read-write bind that holds the global configuration the host's git reads is the exception:
+/// the cage can name a program there that git runs in every repository, so holding git's other
+/// files in that bind protects nothing, and nothing in it is held. The launch says so instead
+/// ([`Reach::unheld`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Reach {
     /// The canonical project root.
     project: PathBuf,
+    /// The config binds the cage finds at their own path, in the order they are mounted.
+    binds: Vec<BindReach>,
+    /// sbx's data directory, canonical, or `None` when it did not resolve.
+    data: Option<PathBuf>,
+}
+
+/// One config bind as the reach sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindReach {
+    /// The canonical bind path.
+    path: PathBuf,
+    /// Whether the cage writes through it.
+    writable: bool,
+    /// The global git configuration file a read-write bind holds, which leaves nothing in it held.
+    git_global: Option<PathBuf>,
 }
 
 impl Reach {
-    /// The reach of a launch in the project at canonical `root`.
-    fn of(root: &Path) -> Self {
+    /// The reach of a launch in the project at canonical `root`, with the config's canonical
+    /// `binds` and sbx's data directory, against the global git configuration the environment
+    /// names ([`git_global_configs`]).
+    pub(crate) fn of(root: &Path, binds: &[crate::config::Bind], data: Option<&Path>) -> Self {
+        Reach::with_git_global(root, binds, data, &git_global_configs())
+    }
+
+    /// [`Reach::of`] against the global git configuration files `git_global`, as the host names
+    /// them.
+    ///
+    /// A bind a later mount covers is left out ([`super::binds::bind_reaches_the_cage`]): inside
+    /// the project, the project's own mount is what the cage writes through. A read-write bind
+    /// holds a global configuration file when it contains the file's name, which the cage can
+    /// replace, or what a link there resolves to, which the cage can rewrite.
+    fn with_git_global(
+        root: &Path,
+        binds: &[crate::config::Bind],
+        data: Option<&Path>,
+        git_global: &[PathBuf],
+    ) -> Self {
+        let named: Vec<(PathBuf, PathBuf)> = git_global
+            .iter()
+            .flat_map(|file| {
+                let parent = file.parent().unwrap_or(Path::new("/"));
+                let name = file.file_name().map(PathBuf::from).unwrap_or_default();
+                [
+                    crate::trust::canonicalize_existing_prefix(parent).join(name),
+                    crate::trust::canonicalize_existing_prefix(file),
+                ]
+                .map(|at| (at, file.clone()))
+            })
+            .collect();
+        // The file named is one that is there when any is, so the warning points at what to read.
+        let held_in = |bind: &Path| {
+            let held: Vec<&PathBuf> = named
+                .iter()
+                .filter(|(at, _)| at.starts_with(bind))
+                .map(|(_, file)| file)
+                .collect();
+            held.iter()
+                .find(|file| std::fs::symlink_metadata(file).is_ok())
+                .or(held.first())
+                .map(|file| (*file).clone())
+        };
         Reach {
             project: root.to_path_buf(),
+            binds: binds
+                .iter()
+                .filter(|b| super::binds::bind_reaches_the_cage(&b.path, Some(root)))
+                .map(|b| BindReach {
+                    path: b.path.clone(),
+                    writable: b.writable,
+                    git_global: b.writable.then(|| held_in(&b.path)).flatten(),
+                })
+                .collect(),
+            data: data.map(crate::trust::canonicalize_existing_prefix),
         }
     }
 
@@ -135,16 +214,78 @@ impl Reach {
         &self.project
     }
 
-    /// The directory `path` lies at or under, or `None` when the cage does not write it.
-    fn root_of(&self, path: &Path) -> Option<&Path> {
-        let known = !self.project.as_os_str().is_empty();
-        (known && path.starts_with(&self.project)).then_some(self.project.as_path())
+    /// Whether `path` lies at or under the project root.
+    fn in_project(&self, path: &Path) -> bool {
+        !self.project.as_os_str().is_empty() && path.starts_with(&self.project)
     }
 
-    /// Whether `path` lies at or under a directory the cage writes.
+    /// The bind the cage finds at `path`, when the project does not answer for it.
+    ///
+    /// The project's mount comes after the config binds, so it answers first. Among the binds, a
+    /// later mount at a directory above a path covers an earlier one, and one below it lands
+    /// inside it: the last bind that contains the path is the one the cage finds there.
+    fn bind_at(&self, path: &Path) -> Option<&BindReach> {
+        if self.in_project(path) {
+            return None;
+        }
+        self.binds.iter().rev().find(|b| path.starts_with(&b.path))
+    }
+
+    /// The directory through which the cage writes `path` at its own name and sbx holds what git
+    /// reads there, the project root or a read-write bind, or `None`.
+    fn root_of(&self, path: &Path) -> Option<&Path> {
+        if self.in_project(path) {
+            return Some(self.project.as_path());
+        }
+        self.bind_at(path)
+            .filter(|b| b.writable && b.git_global.is_none())
+            .map(|b| b.path.as_path())
+    }
+
+    /// Whether the cage writes `path` at its own name and sbx holds the files git reads there.
     fn holds(&self, path: &Path) -> bool {
         self.root_of(path).is_some()
     }
+
+    /// Whether the cage writes `path` at its own name, in the project or a read-write bind.
+    pub(crate) fn writes(&self, path: &Path) -> bool {
+        self.in_project(path) || self.bind_at(path).is_some_and(|b| b.writable)
+    }
+
+    /// The read-write binds that hold the global git configuration, each with the file it holds:
+    /// the cage writes them, and nothing in them is held.
+    fn unheld(&self) -> impl Iterator<Item = (&Path, &Path)> {
+        self.binds
+            .iter()
+            .filter_map(|b| Some((b.path.as_path(), b.git_global.as_deref()?)))
+    }
+
+    /// Whether the cage writes `path` under another name: it lies in sbx's data directory, outside
+    /// the project.
+    fn written_elsewhere(&self, path: &Path) -> bool {
+        !self.in_project(path) && self.data.as_ref().is_some_and(|d| path.starts_with(d))
+    }
+}
+
+/// The files the host's git reads as its global configuration, as git finds them:
+/// `$GIT_CONFIG_GLOBAL` alone when it is set, otherwise `$XDG_CONFIG_HOME/git/config` (with
+/// `~/.config` in its place when that is unset) and `~/.gitconfig`. Absent ones are listed too,
+/// since the cage could create one.
+fn git_global_configs() -> Vec<PathBuf> {
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    if let Some(file) = var("GIT_CONFIG_GLOBAL") {
+        return vec![file];
+    }
+    let home = var("HOME");
+    let xdg = var("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config")));
+    xdg.map(|x| x.join("git/config"))
+        .into_iter()
+        .chain(home.map(|h| h.join(".gitconfig")))
+        .collect()
 }
 
 /// What an expansion does to one project path: the two answers a bind produces, and the entry
@@ -243,7 +384,16 @@ pub(crate) fn stage_decoys(dir: &Path) -> io::Result<Decoys> {
 /// candidate, and one read of `.git/index` for the tracked-path guard. Nothing recursive — the
 /// grammar guarantees every component above the last is a literal name, which is what keeps this
 /// bounded on a repository with millions of files.
-pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
+///
+/// `binds` are the config's canonical binds and `data` sbx's data directory: with the project,
+/// they are where the cage writes ([`Reach`]), which decides which of the files the host's git
+/// reads are held.
+pub(crate) fn expand(
+    project: &Path,
+    policy: &FsPolicy,
+    binds: &[crate::config::Bind],
+    data: Option<&Path>,
+) -> Expanded {
     let mut out = Expanded::default();
     if policy.is_empty()
         && builtin_readonly_names(project, policy.git_writable()).is_empty()
@@ -293,9 +443,23 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     // Every question below is asked of the host's git, and a `.git` or a `.git/config` reached
     // through a link, or a `.git/commondir`, would have it answer from elsewhere: refused first,
     // and nothing is asked.
-    let reach = Reach::of(&root);
+    let reach = Reach::of(&root, binds, data);
     let main = GitRepo::main(&root);
     let protected = git_protected(&root, policy.git_writable());
+    // A read-write bind holding the global git configuration leaves the carrier open whatever is
+    // held, and nothing in it is held: said rather than refused, since the bind is a trusted grant.
+    if protected || git_file_protected(&root, policy.git_writable()) {
+        for (bind, file) in reach.unheld() {
+            out.warnings.push(format!(
+                "the read-write bind `{}` holds `{}`, the global configuration your git reads in \
+                 every repository: the cage can name a program there that your git runs in this \
+                 project too, so sbx holds none of git's files inside that bind. Bind a narrower \
+                 directory, or this one read-only, to keep them held",
+                bind.display(),
+                file.display()
+            ));
+        }
+    }
     let layout = git_dir_link_refusal(&root, policy.git_writable())
         .or_else(|| git_file_target_refusal(&reach, policy.git_writable()))
         .or_else(|| protected.then(|| git_repo_refusal(&reach, &main)).flatten());
@@ -421,14 +585,15 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
 }
 
 /// The directories the agent's cage holds in place so that each mask keeps naming the file it
-/// protects: every directory strictly between the project root and a masked path, shallow to deep.
+/// protects: every directory strictly between a masked path and the directory the cage writes it
+/// through, the project root or a read-write bind ([`Reach`]), shallow to deep.
 ///
 /// A mask is a mount point, which the cage can neither rename nor remove; the directories above it
 /// are ordinary ones in a writable tree. The path a mask was placed on names the protected file
 /// only while none of them can be renamed, and that path is what the host's git reads after the
 /// session and what the next launch resolves `[fs]` against. So each of them is bound over itself
-/// read-write: its contents stay writable, and it becomes a mount point too. The project root needs
-/// no pin, being the project's own mount.
+/// read-write: its contents stay writable, and it becomes a mount point too. The project root or
+/// the bind needs no pin, being a mount of its own.
 ///
 /// None is laid at or under a read-only directory mask. Nothing inside a read-only mount can be
 /// renamed already, and a read-write bind there would reopen that directory to writes.
@@ -569,7 +734,7 @@ fn git_file_protected(root: &Path, git_writable: bool) -> bool {
 }
 
 /// The refusal the repository a `.git` file names earns, or `None` when it lies outside the project
-/// or the file is not one git reads as a pointer.
+/// and sbx's data directory, or the file is not one git reads as a pointer.
 ///
 /// git reads `gitdir: <path>` there, relative to the project root when it is not absolute, and uses
 /// the directory it names as the repository: its configuration and its hooks. A linked worktree's
@@ -577,7 +742,8 @@ fn git_file_protected(root: &Path, git_writable: bool) -> bool {
 /// read-only in the cage ([`git_file_protected`]). One inside the project would be a repository
 /// whose configuration and hooks nothing protects, since the carrier is looked for in a `.git`
 /// directory, so it refuses the launch, and so does a link inside the project on the way to it
-/// ([`git_link_on_the_way`]).
+/// ([`git_link_on_the_way`]). One in sbx's data directory refuses the launch too, since the cage
+/// writes there under other names ([`Reach::written_elsewhere`]).
 fn git_file_target_refusal(reach: &Reach, git_writable: bool) -> Option<String> {
     let root = reach.project();
     if !git_file_protected(root, git_writable) {
@@ -593,6 +759,9 @@ fn git_file_target_refusal(reach: &Reach, git_writable: bool) -> Option<String> 
         return Some(reason);
     }
     let canon = crate::trust::canonicalize_existing_prefix(&target);
+    if reach.written_elsewhere(&canon) {
+        return Some(git_data_refusal(what, &canon));
+    }
     canon.starts_with(root).then(|| {
         visible(&format!(
             "`{}` names a repository inside the project (`{}`): sbx protects the files git reads \
@@ -616,11 +785,12 @@ const SUBMODULE_DEPTH: usize = 8;
 /// repository in its directory, whether or not `.gitmodules` names it: a `git status` in the
 /// superproject reads it, and a submodule's own submodules the same way. So the submodules are
 /// found in the index ([`gitlinks`]), and for each the `.git` in its directory decides: a file is
-/// held read-only and the repository it names is protected when it lies in the project, a
-/// directory is the repository, a link refuses the launch, and none means there is no repository
-/// for git to read yet. Each repository found gets what the project's own does: its `config`, its
-/// hooks, the files it includes and the files beside its configuration, and a link or a `commondir`
-/// in it refuses the launch ([`git_repo_refusal`]).
+/// held read-only and the repository it names is protected when the cage writes it ([`Reach`]) and
+/// refuses the launch when it lies in sbx's data directory, a directory is the repository, a link
+/// refuses the launch, and none means there is no repository for git to read yet. Each repository
+/// found gets what the project's own does: its `config`, its hooks, the files it includes and the
+/// files beside its configuration, and a link or a `commondir` in it refuses the launch
+/// ([`git_repo_refusal`]).
 ///
 /// An index this cannot read refuses the launch when the repository shows submodules (a
 /// `.gitmodules`, or a `modules` directory in its git directory), since their repositories could not
@@ -675,6 +845,10 @@ fn submodule_carrier(
                     continue;
                 }
                 let canon = crate::trust::canonicalize_existing_prefix(&target);
+                if reach.written_elsewhere(&canon) {
+                    refused.get_or_insert_with(|| git_data_refusal(what, &canon));
+                    continue;
+                }
                 // Where the cage does not write, it does not reach it; the file naming it is held.
                 if !reach.holds(&canon) {
                     continue;
@@ -797,7 +971,7 @@ fn git_repo_refusal(reach: &Reach, repo: &GitRepo) -> Option<String> {
 }
 
 /// The directories git runs hooks from, as read-only masks: `.git/hooks`, and the directory
-/// `core.hooksPath` names when it is inside the project.
+/// `core.hooksPath` names when the cage writes it ([`Reach`]).
 ///
 /// **Absent ones included.** A mount needs something to land on, and the cage can create a
 /// directory it does not find: a repository initialised without the template's `hooks/`, or a
@@ -811,8 +985,9 @@ fn git_repo_refusal(reach: &Reach, repo: &GitRepo) -> Option<String> {
 /// because the value that matters is the one the host's git will act on, include files and the
 /// global config among what decides it. husky points it at `.husky/_`, inside the working tree and
 /// ignored by git: a hook rewritten there does not even show in `git status`. With no git on the
-/// host, no hook can run on it, and there is nothing to ask. A value outside the project is left
-/// alone, since the cage does not hold it.
+/// host, no hook can run on it, and there is nothing to ask. A value the cage does not write is
+/// left alone, and one in sbx's data directory, which the cage writes under other names, refuses
+/// the launch.
 ///
 /// **A link on the way refuses the launch**, whether it is `.git/hooks` itself or a directory above
 /// the one `core.hooksPath` names, and wherever it leads ([`git_link_on_the_way`]). The refusal
@@ -872,13 +1047,27 @@ fn git_hook_dirs(
                 }
             },
         };
+        if reach.written_elsewhere(&canon) {
+            refused.get_or_insert_with(|| git_data_refusal(&what, &canon));
+            continue;
+        }
         let Some(root) = reach.root_of(&canon) else {
             continue;
         };
         if canon == root {
+            let whole = if root == reach.project() {
+                "the project root itself: its hooks cannot be protected without making the whole \
+                 project read-only"
+                    .to_string()
+            } else {
+                format!(
+                    "the read-write bind `{}` itself: its hooks cannot be protected without \
+                     making the whole bind read-only",
+                    root.display()
+                )
+            };
             warnings.push(format!(
-                "`{pattern}` names the project root itself: its hooks cannot be protected without \
-                 making the whole project read-only, so they stay writable to the cage"
+                "`{pattern}` names {whole}, so they stay writable to the cage"
             ));
             continue;
         }
@@ -943,22 +1132,23 @@ fn git_hooks_path(repo: &GitRepo) -> Option<PathBuf> {
     git_config_path(value, Some(&repo.work_tree))
 }
 
-/// The files inside the project that an `include.path` or `includeIf.<condition>.path` makes part
-/// of the configuration the host's git reads, as read-only masks.
+/// The files the cage writes ([`Reach`]) that an `include.path` or `includeIf.<condition>.path`
+/// makes part of the configuration the host's git reads, as read-only masks.
 ///
 /// `.git/config` being read-only is worth nothing if a file it includes is writable: git reads the
 /// included file as configuration, `core.hooksPath` and `core.fsmonitor` included. So every include
 /// the host's git reports is followed, from whichever file declares it (the global config among
-/// them, and an included file's own includes, each listed with its origin), and one that lands in
-/// the project is protected. A conditional include is protected whether or not its condition holds
-/// today: the condition is a property of where the repository is, which the cage does not decide
-/// but a later move could change.
+/// them, and an included file's own includes, each listed with its origin), and one that lands
+/// where the cage writes is protected. A conditional include is protected whether or not its
+/// condition holds today: the condition is a property of where the repository is, which the cage
+/// does not decide but a later move could change.
 ///
-/// An include naming a file inside the project that does not exist refuses the launch rather than
-/// being created: the cage could create it and git would read it, and a configuration file is not
-/// sbx's to write into the user's tree the way an empty hooks directory is. The refusal names the
-/// file and the way out. An include reached through a symbolic link inside the project refuses
-/// the launch as well, wherever the link leads ([`git_link_on_the_way`]).
+/// An include naming a file where the cage writes that does not exist refuses the launch rather
+/// than being created: the cage could create it and git would read it, and a configuration file is
+/// not sbx's to write into the user's tree the way an empty hooks directory is. The refusal names
+/// the file and the way out. An include reached through a symbolic link where the cage writes
+/// refuses the launch as well, wherever the link leads ([`git_link_on_the_way`]), and so does an
+/// include in sbx's data directory, present or not, which the cage writes under other names.
 fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
     let Some(out) = host_git_config(
         repo,
@@ -999,7 +1189,9 @@ fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>
         let canon = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let canon = crate::trust::canonicalize_existing_prefix(&path);
-                if reach.holds(&canon) {
+                if reach.written_elsewhere(&canon) {
+                    refused.get_or_insert_with(|| git_data_refusal(&what, &canon));
+                } else if reach.holds(&canon) {
                     refused.get_or_insert_with(|| {
                         visible(&format!(
                             "git includes `{}` as configuration ({pattern}), and it does not \
@@ -1034,8 +1226,12 @@ fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>
                 }
             },
         };
-        // A directory is not a configuration file git can read; outside the project, the cage
-        // does not hold it.
+        if reach.written_elsewhere(&canon) {
+            refused.get_or_insert_with(|| git_data_refusal(&what, &canon));
+            continue;
+        }
+        // A directory is not a configuration file git can read; where the cage does not write,
+        // there is nothing to hold.
         if !reach.holds(&canon) || canon.is_dir() {
             continue;
         }
@@ -1224,22 +1420,31 @@ fn worktree_entries(worktrees: &Path) -> io::Result<(Vec<PathBuf>, bool)> {
 /// and protects every `config.worktree` present, covers both.
 pub(crate) struct GitWatch {
     root: PathBuf,
+    reach: Reach,
     configs: BTreeSet<PathBuf>,
     submodules: GitlinkScan,
 }
 
 impl GitWatch {
     /// The watch for a launch in `project`, or `None` when the launch does not protect the git
-    /// carrier, where there is nothing for it to look at.
-    pub(crate) fn start(project: &Path, git_writable: bool) -> Option<Self> {
+    /// carrier, where there is nothing for it to look at. `binds` and `data` are what [`expand`]
+    /// is given, so the watch follows a submodule's repository where the launch held one.
+    pub(crate) fn start(
+        project: &Path,
+        git_writable: bool,
+        binds: &[crate::config::Bind],
+        data: Option<&Path>,
+    ) -> Option<Self> {
         let root = project.canonicalize().ok()?;
         if !git_protected(&root, git_writable) {
             return None;
         }
+        let reach = Reach::of(&root, binds, data);
         let configs = WorktreeScan::of(&root).configs;
-        let submodules = GitlinkScan::of(&Reach::of(&root));
+        let submodules = GitlinkScan::of(&reach);
         Some(GitWatch {
             root,
+            reach,
             configs,
             submodules,
         })
@@ -1283,7 +1488,7 @@ impl GitWatch {
                 self.root.join(".git/worktrees").display()
             ));
         }
-        let now = GitlinkScan::of(&Reach::of(&self.root));
+        let now = GitlinkScan::of(&self.reach);
         for dot_git in now.repos.difference(&self.submodules.repos) {
             out.push(format!(
                 "`{}` is a submodule's repository that sbx did not protect at launch: a `git \
@@ -1364,11 +1569,11 @@ impl WorktreeScan {
 }
 
 /// The `.git` in each gitlink's directory that holds one, from the project's index and, below it,
-/// from the index of each submodule's repository in the project, with the indexes that could not
+/// from the index of each submodule's repository the cage writes, with the indexes that could not
 /// be read in full and whether the walk stopped at its bound.
 ///
 /// Found by file type, as [`submodule_carrier`] finds them, and followed through a `.git` file only
-/// to a repository inside the project, the one kind the cage can have written.
+/// to a repository the cage writes ([`Reach`]), the one kind it can have added a gitlink to.
 #[derive(Default)]
 struct GitlinkScan {
     repos: BTreeSet<PathBuf>,
@@ -1473,15 +1678,15 @@ fn git_file(
     }
 }
 
-/// The refusal a symbolic link inside the project on the way to what the host's git reads earns,
-/// or `None` when resolving `path` meets none.
+/// The refusal a symbolic link where the cage writes, on the way to what the host's git reads,
+/// earns, or `None` when resolving `path` meets none.
 ///
-/// A mask holds what a path resolved to at launch. A link is a name, and one inside the project is
-/// a name the cage could point elsewhere during the session, after which the host's git would read
-/// what the link names instead of what the mask holds. So each link the resolution meets is looked
-/// at, in the order the kernel meets them ([`crate::trust::resolution_stop`]): one outside the
-/// project, which the cage does not hold, is followed, and a link inside the project that it leads
-/// through still counts. `what` says what git reads there, and `instead` the form sbx holds in
+/// A mask holds what a path resolved to at launch. A link is a name, and one where the cage writes
+/// ([`Reach`]) is a name the cage could point elsewhere during the session, after which the host's
+/// git would read what the link names instead of what the mask holds. So each link the resolution
+/// meets is looked at, in the order the kernel meets them ([`crate::trust::resolution_stop`]): one
+/// the cage does not write is followed, and a link it writes that the resolution leads through
+/// still counts. `what` says what git reads there, and `instead` the form sbx holds in
 /// place.
 fn git_link_on_the_way(reach: &Reach, path: &Path, what: &str, instead: &str) -> Option<String> {
     use crate::trust::ResolutionStop;
@@ -1505,6 +1710,19 @@ fn git_link_refusal(link: &Path, what: &str, instead: &str) -> String {
          during the session: your git would then read what it names rather than what sbx \
          protects. {instead}, then launch again. {GIT_WRITABLE_HINT}",
         link.display()
+    ))
+}
+
+/// The refusal a path the host's git reads earns when it lies in sbx's data directory
+/// ([`Reach::written_elsewhere`]), with the path escaped for the terminal. `what` names what git
+/// reads there.
+fn git_data_refusal(what: &str, path: &Path) -> String {
+    visible(&format!(
+        "{what} is `{}`, in sbx's data directory: the cage writes there under other names (its \
+         home, its store, the install pools), where no mask at this name holds it, and your git \
+         would read what the cage put there. Point git at a path outside it, then launch again. \
+         {GIT_WRITABLE_HINT}",
+        path.display()
     ))
 }
 
@@ -2091,8 +2309,9 @@ fn gitlinks(repo: &GitRepo) -> Result<Vec<PathBuf>, String> {
 /// anything today.
 ///
 /// `project_writable` is whether the project itself is mounted read-write. The directories that
-/// hold the masks in place ([`holding_dirs`]) are bound only then: in a read-only project nothing
-/// can be renamed, and a read-write bind of one of its directories would reopen it to writes.
+/// hold the masks in place ([`holding_dirs`]) inside the project are bound only then: in a
+/// read-only project nothing can be renamed, and a read-write bind of one of its directories would
+/// reopen it to writes. Those in a read-write bind are bound either way, since the bind is.
 pub(crate) fn agent_binds(
     expanded: &Expanded,
     decoys: &Decoys,
@@ -2101,13 +2320,17 @@ pub(crate) fn agent_binds(
     let mut out = Vec::with_capacity(expanded.count());
     // The held directories first, shallow to deep, so every mask lands inside the directories
     // already held above it rather than being covered by one laid after it.
-    if project_writable {
-        out.extend(expanded.pins.iter().map(|dir| ExtraBind {
-            src: dir.clone(),
-            dest: dir.clone(),
-            writable: true,
-        }));
-    }
+    out.extend(
+        expanded
+            .pins
+            .iter()
+            .filter(|dir| project_writable || !expanded.reach.in_project(dir))
+            .map(|dir| ExtraBind {
+                src: dir.clone(),
+                dest: dir.clone(),
+                writable: true,
+            }),
+    );
     // Then `readonly`, then `deny`. The two can legitimately nest the one way round that is left
     // after the expansion drops the other (`readonly = [".git/"]` with `deny = [".git/config"]`),
     // and the later mount is the one that wins — so the closed path has to be applied over the
@@ -2263,7 +2486,7 @@ mod tests {
     fn covering_answers_for_a_path_under_a_denied_directory() {
         let tmp = TmpDir::new();
         let root = project(&tmp);
-        let out = expand(&root, &policy(&["secrets/"], &[]));
+        let out = expand(&root, &policy(&["secrets/"], &[]), &[], None);
         assert!(out.refused.is_none(), "{:?}", out.refused);
 
         let listed = out.covering(&root.join("secrets"));
@@ -2286,7 +2509,12 @@ mod tests {
     fn covering_lets_deny_win_inside_a_readonly_directory() {
         let tmp = TmpDir::new();
         let root = project(&tmp);
-        let out = expand(&root, &policy(&["certs/server.pem"], &["certs/"]));
+        let out = expand(
+            &root,
+            &policy(&["certs/server.pem"], &["certs/"]),
+            &[],
+            None,
+        );
         assert!(out.refused.is_none(), "{:?}", out.refused);
 
         let denied = out.covering(&root.join("certs/server.pem"));
@@ -2300,7 +2528,7 @@ mod tests {
     fn covering_names_the_entry_that_decides() {
         let tmp = TmpDir::new();
         let root = project(&tmp);
-        let out = expand(&root, &policy(&["*.key"], &[]));
+        let out = expand(&root, &policy(&["*.key"], &[]), &[], None);
         assert!(out.refused.is_none(), "{:?}", out.refused);
 
         match out.covering(&root.join("prod.key")) {
@@ -2320,7 +2548,7 @@ mod tests {
         let tmp = TmpDir::new();
         let absent = tmp.path().join("gone");
 
-        let e = expand(&absent, &policy(&["prod.key"], &[]));
+        let e = expand(&absent, &policy(&["prod.key"], &[]), &[], None);
         let refusal = e
             .refused
             .expect("an unresolvable root must refuse the launch");
@@ -2335,7 +2563,7 @@ mod tests {
 
         // The control arm: a policy that asks for nothing is not a policy that failed, and the same
         // unresolvable path must stay silent for it — the early return above it sees to that.
-        let empty = expand(&absent, &policy(&[], &[]));
+        let empty = expand(&absent, &policy(&[], &[]), &[], None);
         assert!(
             empty.refused.is_none(),
             "a launch declaring no `[fs]` masks has nothing to place and nothing to refuse"
@@ -2349,6 +2577,8 @@ mod tests {
         let e = expand(
             &root,
             &policy(&["prod.key", "certs/*.pem", "secrets/"], &[]),
+            &[],
+            None,
         );
         let paths: Vec<&Path> = e.denied.iter().map(|m| m.path.as_path()).collect();
         assert_eq!(
@@ -2379,7 +2609,12 @@ mod tests {
     fn an_entry_matching_nothing_warns_and_closes_nothing() {
         let tmp = TmpDir::new();
         let root = project(&tmp);
-        let e = expand(&root, &policy(&["absent.key", "certs/*.crt"], &[]));
+        let e = expand(
+            &root,
+            &policy(&["absent.key", "certs/*.crt"], &[]),
+            &[],
+            None,
+        );
         assert!(e.denied.is_empty());
         assert_eq!(e.warnings.len(), 2, "{:?}", e.warnings);
         assert!(e.warnings.iter().all(|w| w.contains("matches nothing")));
@@ -2407,14 +2642,14 @@ mod tests {
         std::fs::write(sub.join("secrets.env"), b"SECRET").unwrap();
 
         // Sanity: the entry is honoured while the parent can be traversed.
-        let ok = expand(&root, &policy(&["sub/secrets.env"], &[]));
+        let ok = expand(&root, &policy(&["sub/secrets.env"], &[]), &[], None);
         assert_eq!(ok.denied.len(), 1);
         assert!(ok.refused.is_none());
 
         // The cage makes its own directory untraversable, as it may.
         std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .unwrap();
-        let hidden = expand(&root, &policy(&["sub/secrets.env"], &[]));
+        let hidden = expand(&root, &policy(&["sub/secrets.env"], &[]), &[], None);
         // Restore before asserting, so a failure does not leave the fixture undeletable.
         std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
@@ -2448,13 +2683,13 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("a.env"), b"SECRET").unwrap();
 
-        let ok = expand(&root, &policy(&["sub/*.env"], &[]));
+        let ok = expand(&root, &policy(&["sub/*.env"], &[]), &[], None);
         assert_eq!(ok.denied.len(), 1, "honoured while the parent is readable");
         assert!(ok.refused.is_none());
 
         std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .unwrap();
-        let hidden = expand(&root, &policy(&["sub/*.env"], &[]));
+        let hidden = expand(&root, &policy(&["sub/*.env"], &[]), &[], None);
         std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
 
@@ -2487,13 +2722,13 @@ mod tests {
         std::fs::write(sub.join("secrets.env"), b"SECRET").unwrap();
         std::os::unix::fs::symlink(sub.join("secrets.env"), root.join("link.env")).unwrap();
 
-        let ok = expand(&root, &policy(&["link.env"], &[]));
+        let ok = expand(&root, &policy(&["link.env"], &[]), &[], None);
         assert_eq!(ok.denied.len(), 1, "honoured while the target is reachable");
         assert!(ok.refused.is_none());
 
         std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .unwrap();
-        let hidden = expand(&root, &policy(&["link.env"], &[]));
+        let hidden = expand(&root, &policy(&["link.env"], &[]), &[], None);
         std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
 
@@ -2514,7 +2749,7 @@ mod tests {
         std::fs::write(root.join("notadir"), b"x").unwrap();
 
         for entry in ["nothere/*.env", "notadir/*.env"] {
-            let out = expand(&root, &policy(&[entry], &[]));
+            let out = expand(&root, &policy(&[entry], &[]), &[], None);
             assert!(
                 out.refused.is_none(),
                 "`{entry}` must not refuse the launch: {:?}",
@@ -2542,7 +2777,7 @@ mod tests {
         let odd = std::ffi::OsStr::from_bytes(b"priv\xe9.pem");
         std::fs::write(root.join("certs").join(odd), b"KEY").unwrap();
 
-        let e = expand(&root, &policy(&["certs/*.pem"], &[]));
+        let e = expand(&root, &policy(&["certs/*.pem"], &[]), &[], None);
         let paths: Vec<&Path> = e.denied.iter().map(|m| m.path.as_path()).collect();
         assert_eq!(
             paths,
@@ -2574,7 +2809,7 @@ mod tests {
         let outside = tmp.path().join("outside.txt");
         std::fs::write(&outside, b"HOST").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link.key")).unwrap();
-        let e = expand(&root, &policy(&["link.key"], &[]));
+        let e = expand(&root, &policy(&["link.key"], &[]), &[], None);
         assert!(
             e.denied.is_empty(),
             "nothing outside the project is mounted over"
@@ -2597,7 +2832,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".config/mise")).unwrap();
         std::fs::write(root.join(".config/mise/config.toml"), b"[tools]\n").unwrap();
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         let ro: Vec<&Path> = e.readonly.iter().map(|m| m.path.as_path()).collect();
         assert_eq!(
             ro,
@@ -2630,7 +2865,7 @@ mod tests {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         std::fs::write(root.join("mise.toml"), b"[tools]\n").unwrap();
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.is_empty(), "{:?}", e.readonly);
     }
 
@@ -2646,7 +2881,7 @@ mod tests {
         std::fs::write(root.join(".mise/config.toml"), b"").unwrap();
         std::fs::write(root.join(".tool-versions"), b"").unwrap();
 
-        let e = expand(&root, &policy(&[".tool-versions"], &[".mise/"]));
+        let e = expand(&root, &policy(&[".tool-versions"], &[".mise/"]), &[], None);
         let ro: Vec<&Path> = e.readonly.iter().map(|m| m.path.as_path()).collect();
         assert_eq!(
             ro,
@@ -2671,7 +2906,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
         std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         let ro: Vec<(&Path, bool)> = e
             .readonly
             .iter()
@@ -2691,7 +2926,7 @@ mod tests {
             ..FsPolicy::default()
         };
         assert!(
-            expand(&root, &lifted).is_empty(),
+            expand(&root, &lifted, &[], None).is_empty(),
             "the one opening in the table"
         );
     }
@@ -2706,7 +2941,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         let hooks = root.join(".git/hooks");
         assert!(
             e.readonly
@@ -2734,7 +2969,7 @@ mod tests {
                 pattern: String::new(),
                 builtin: true,
             }],
-            reach: Reach::of(&root),
+            reach: Reach::of(&root, &[], None),
             ..Expanded::default()
         };
         assert!(create_absent_dirs(&planted).is_err());
@@ -2769,7 +3004,7 @@ mod tests {
                 .success()
         );
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(
             e.readonly
                 .iter()
@@ -2782,7 +3017,7 @@ mod tests {
             ..FsPolicy::default()
         };
         assert!(
-            expand(&root, &lifted).readonly.is_empty(),
+            expand(&root, &lifted, &[], None).readonly.is_empty(),
             "git_writable lifts it too"
         );
 
@@ -2795,7 +3030,7 @@ mod tests {
                 .status
                 .success()
         );
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(!e.readonly.iter().any(|m| m.path.starts_with(&outside)));
     }
 
@@ -2840,7 +3075,7 @@ mod tests {
                 .success()
         );
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         let files: Vec<&Path> = e
             .readonly
@@ -2869,7 +3104,7 @@ mod tests {
                 .status
                 .success()
         );
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         let why = e
             .refused
             .expect("an absent included file refuses the launch");
@@ -2884,7 +3119,7 @@ mod tests {
             ..FsPolicy::default()
         };
         assert!(
-            expand(&root, &lifted).refused.is_none(),
+            expand(&root, &lifted, &[], None).refused.is_none(),
             "git_writable lifts it"
         );
     }
@@ -2940,7 +3175,7 @@ mod tests {
         std::fs::create_dir_all(root.join("named-hooks")).unwrap();
         std::fs::write(root.join(".git/commondir"), "../other.git\n").unwrap();
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         let why = e.refused.as_deref().expect("a main commondir refuses");
         assert!(
             why.contains(".git/commondir") && why.contains("git_writable"),
@@ -2957,14 +3192,18 @@ mod tests {
         // Whatever its shape.
         std::fs::remove_file(root.join(".git/commondir")).unwrap();
         std::fs::create_dir(root.join(".git/commondir")).unwrap();
-        assert!(expand(&root, &FsPolicy::default()).refused.is_some());
+        assert!(
+            expand(&root, &FsPolicy::default(), &[], None)
+                .refused
+                .is_some()
+        );
 
         let lifted = FsPolicy {
             git_writable: Some(true),
             ..FsPolicy::default()
         };
         assert!(
-            expand(&root, &lifted).refused.is_none(),
+            expand(&root, &lifted, &[], None).refused.is_none(),
             "git_writable lifts it"
         );
     }
@@ -2982,12 +3221,12 @@ mod tests {
         let worktree_config = root.join(".git/config.worktree");
         let protected = |e: &Expanded| e.readonly.iter().any(|m| m.path == worktree_config);
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         assert!(!protected(&e), "absent and not read: nothing to hold");
 
         std::fs::write(&worktree_config, "").unwrap();
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(protected(&e), "present: read-only whatever the setting");
 
         std::fs::remove_file(&worktree_config).unwrap();
@@ -2998,12 +3237,14 @@ mod tests {
         .unwrap();
         assert!(git(&["config", "include.path", "../inc.cfg"]));
         assert!(
-            expand(&root, &FsPolicy::default()).refused.is_none(),
+            expand(&root, &FsPolicy::default(), &[], None)
+                .refused
+                .is_none(),
             "git honors the setting from `.git/config` only"
         );
 
         assert!(git(&["config", "extensions.worktreeConfig", "true"]));
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         let why = e.refused.as_deref().expect("read by git and absent");
         assert!(
             why.contains("config.worktree") && why.contains("git_writable"),
@@ -3037,7 +3278,7 @@ mod tests {
         std::fs::write(odd.join("commondir"), "../..\n").unwrap();
         std::fs::write(odd.join("config.worktree"), "").unwrap();
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         let files: Vec<&Path> = e
             .readonly
@@ -3073,7 +3314,7 @@ mod tests {
         };
         std::fs::write(root.join("real.cfg"), "").unwrap();
         std::os::unix::fs::symlink("../real.cfg", root.join(".git/config.worktree")).unwrap();
-        let why = expand(&root, &FsPolicy::default())
+        let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
             .expect("a link refuses");
         assert!(why.contains("symbolic link"), "{why}");
@@ -3082,7 +3323,7 @@ mod tests {
         let named = root.join(".git/worktrees/a\u{1b}[2Jb");
         std::fs::create_dir_all(&named).unwrap();
         std::os::unix::fs::symlink("/elsewhere", named.join("commondir")).unwrap();
-        let why = expand(&root, &FsPolicy::default())
+        let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
             .expect("a link refuses");
         assert!(
@@ -3092,7 +3333,7 @@ mod tests {
         std::fs::remove_dir_all(root.join(".git/worktrees")).unwrap();
 
         std::os::unix::fs::symlink(tmp.path(), root.join(".git/worktrees")).unwrap();
-        let why = expand(&root, &FsPolicy::default())
+        let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
             .expect("a linked worktrees directory refuses");
         assert!(why.contains("symbolic link"), "{why}");
@@ -3109,7 +3350,7 @@ mod tests {
         for i in 0..=MASK_MAX {
             std::fs::create_dir_all(root.join(format!(".git/worktrees/w{i}"))).unwrap();
         }
-        let why = expand(&root, &FsPolicy::default())
+        let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
             .expect("past the ceiling");
         assert!(why.contains("more than"), "{why}");
@@ -3135,7 +3376,7 @@ mod tests {
             ..FsPolicy::default()
         };
         let refused = |link: &str, instead: &str| {
-            let e = expand(&root, &FsPolicy::default());
+            let e = expand(&root, &FsPolicy::default(), &[], None);
             let why = e.refused.expect("a link refuses");
             assert!(
                 why.contains(&format!(
@@ -3150,7 +3391,7 @@ mod tests {
                 e.warnings
             );
             assert!(
-                expand(&root, &lifted).refused.is_none(),
+                expand(&root, &lifted, &[], None).refused.is_none(),
                 "git_writable lifts it"
             );
         };
@@ -3187,7 +3428,7 @@ mod tests {
         std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
         let root = root.canonicalize().unwrap();
         let refused = || {
-            let why = expand(&root, &FsPolicy::default())
+            let why = expand(&root, &FsPolicy::default(), &[], None)
                 .refused
                 .expect("refused");
             assert!(
@@ -3215,7 +3456,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o000),
         )
         .unwrap();
-        let why = expand(&root, &FsPolicy::default()).refused;
+        let why = expand(&root, &FsPolicy::default(), &[], None).refused;
         // Restore before asserting, so a failure does not leave the fixture undeletable.
         std::fs::set_permissions(
             &worktrees,
@@ -3241,7 +3482,7 @@ mod tests {
             return;
         };
         let refused_at = |link: &Path| {
-            let why = expand(&root, &FsPolicy::default())
+            let why = expand(&root, &FsPolicy::default(), &[], None)
                 .refused
                 .expect("a link refuses");
             assert!(
@@ -3276,7 +3517,7 @@ mod tests {
         std::os::unix::fs::symlink("loop-a", outside.join("loop-b")).unwrap();
         let looped = outside.join("loop-a");
         assert!(git(&["config", "core.hooksPath", looped.to_str().unwrap()]));
-        let why = expand(&root, &FsPolicy::default())
+        let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
             .expect("a loop refuses");
         assert!(why.contains("more symbolic links"), "{why}");
@@ -3296,7 +3537,7 @@ mod tests {
         std::fs::write(root.join("repo.gitconfig"), "").unwrap();
         assert!(git(&["config", "core.hooksPath", ".githooks"]));
         assert!(git(&["config", "include.path", "../repo.gitconfig"]));
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         for held in [".githooks", ".git/hooks", ".git/config", "repo.gitconfig"] {
             assert!(
@@ -3316,8 +3557,325 @@ mod tests {
         ]));
         let inc = outside.join("inc.cfg");
         assert!(git(&["config", "include.path", inc.to_str().unwrap()]));
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
+    }
+
+    /// The reach answers where the cage writes at a host path's own name: the project first, then
+    /// the last bind mounted over the path, which holds it only when it is read-write. sbx's data
+    /// directory is written under other names, outside the project.
+    #[test]
+    fn the_reach_of_a_path_is_the_last_mount_over_it() {
+        let root = PathBuf::from("/w/proj");
+        let bind = |path: &str, writable| crate::config::Bind {
+            path: PathBuf::from(path),
+            writable,
+        };
+        let binds = [
+            bind("/w", true),
+            bind("/w/main/ro", false),
+            bind("/w/proj/inner", false),
+            bind("/w/main/ro/again", true),
+        ];
+        let reach = Reach::of(&root, &binds, Some(Path::new("/d/sbx")));
+        // The bind inside the project is covered by the project's own mount.
+        assert_eq!(
+            reach.root_of(Path::new("/w/proj/inner/x")),
+            Some(root.as_path())
+        );
+        assert_eq!(reach.root_of(Path::new("/w/main/x")), Some(Path::new("/w")));
+        assert!(!reach.holds(Path::new("/w/main/ro/x")), "read-only there");
+        assert_eq!(
+            reach.root_of(Path::new("/w/main/ro/again/x")),
+            Some(Path::new("/w/main/ro/again"))
+        );
+        assert!(!reach.holds(Path::new("/elsewhere")));
+        assert!(reach.written_elsewhere(Path::new("/d/sbx/projects/h/home/hooks")));
+        assert!(!reach.written_elsewhere(Path::new("/d/sbx-other")));
+        // A project inside the data directory is answered for as the project.
+        let inside = Reach::of(Path::new("/d/sbx/p"), &[], Some(Path::new("/d/sbx")));
+        assert!(!inside.written_elsewhere(Path::new("/d/sbx/p/.git/hooks")));
+        assert!(inside.written_elsewhere(Path::new("/d/sbx/other")));
+    }
+
+    /// A read-write bind that holds the global git configuration, by its name or through a link
+    /// that resolves into it, is written by the cage and holds nothing: the warning names the file
+    /// that is there. A read-write bind mounted after it inside it, or elsewhere, still holds, and
+    /// a read-only bind holding the configuration is not written at all.
+    #[test]
+    fn a_read_write_bind_holding_the_global_git_configuration_holds_nothing() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().canonicalize().unwrap();
+        let (home, dots, other) = (base.join("home"), base.join("dots"), base.join("other"));
+        if !crate::sandbox::binds::bind_reaches_the_cage(&home, Some(&base.join("proj"))) {
+            skip_incapable!(
+                "skipping the global git configuration: the fixture root is a cage mount"
+            );
+            return;
+        }
+        for dir in [&home.join("src"), &dots, &other, &base.join("home2")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(home.join(".gitconfig"), "").unwrap();
+        std::fs::write(dots.join("gitconfig"), "").unwrap();
+        std::os::unix::fs::symlink(dots.join("gitconfig"), base.join("home2/.gitconfig")).unwrap();
+        let read_only = crate::config::Bind {
+            path: base.join("home2"),
+            writable: false,
+        };
+        let binds = [
+            rw_bind(&home),
+            rw_bind(&home.join("src")),
+            rw_bind(&dots),
+            rw_bind(&other),
+            read_only,
+        ];
+        let global = [
+            home.join(".config/git/config"),
+            home.join(".gitconfig"),
+            base.join("home2/.gitconfig"),
+        ];
+        let reach = Reach::with_git_global(&base.join("proj"), &binds, None, &global);
+
+        assert!(!reach.holds(&home.join("x")) && reach.writes(&home.join("x")));
+        assert!(!reach.holds(&dots.join("x")), "through the link");
+        assert!(reach.holds(&home.join("src/x")) && reach.holds(&other.join("x")));
+        assert!(!reach.writes(&base.join("home2/x")));
+        let unheld: Vec<(&Path, &Path)> = reach.unheld().collect();
+        assert_eq!(
+            unheld,
+            vec![
+                (home.as_path(), home.join(".gitconfig").as_path()),
+                (dots.as_path(), base.join("home2/.gitconfig").as_path()),
+            ],
+            "the file that is there is the one named"
+        );
+    }
+
+    /// A read-write bind at `path`, as the config's canonical binds carry it.
+    fn rw_bind(path: &Path) -> crate::config::Bind {
+        crate::config::Bind {
+            path: path.to_path_buf(),
+            writable: true,
+        }
+    }
+
+    /// A read-write bind is written by the cage at its own name like the project: the directory
+    /// `core.hooksPath` names there and a file git includes from there are held, with the
+    /// directories above them, in a read-only project too. In a read-only bind, or under a
+    /// read-only bind mounted after the read-write one, nothing is added.
+    #[test]
+    fn what_git_reads_in_a_read_write_bind_is_held_and_nothing_in_a_read_only_one() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping git's files in a bind: no git on this host");
+            return;
+        };
+        let shared = tmp.path().canonicalize().unwrap().join("shared");
+        if !crate::sandbox::binds::bind_reaches_the_cage(&shared, Some(&root)) {
+            skip_incapable!("skipping git's files in a bind: the fixture root is a cage mount");
+            return;
+        }
+        std::fs::create_dir_all(shared.join("tools")).unwrap();
+        let (hooks, inc) = (
+            shared.join("tools/hooks"),
+            shared.join("tools/team.gitconfig"),
+        );
+        std::fs::write(&inc, "").unwrap();
+        assert!(git(&["config", "core.hooksPath", hooks.to_str().unwrap()]));
+        assert!(git(&["config", "include.path", inc.to_str().unwrap()]));
+
+        let e = expand(&root, &FsPolicy::default(), &[rw_bind(&shared)], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        for (held, is_dir) in [(&hooks, true), (&inc, false)] {
+            assert!(
+                e.readonly
+                    .iter()
+                    .any(|m| m.path == *held && m.is_dir == is_dir && m.builtin),
+                "{}: {:?}",
+                held.display(),
+                e.readonly
+            );
+        }
+        assert!(e.pins.contains(&shared.join("tools")), "{:?}", e.pins);
+        // Absent at launch, so made empty in the bind before it is bound.
+        create_absent_dirs(&e).unwrap();
+        assert!(hooks.is_dir());
+        let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
+        let binds = agent_binds(&e, &decoys, false);
+        assert!(
+            binds
+                .iter()
+                .any(|b| b.writable && b.dest == shared.join("tools")),
+            "held in the bind whatever the project's mode: {binds:?}"
+        );
+        assert!(
+            !binds
+                .iter()
+                .any(|b| b.writable && b.dest.starts_with(&root)),
+            "{binds:?}"
+        );
+
+        let read_only = |path: &Path| crate::config::Bind {
+            path: path.to_path_buf(),
+            writable: false,
+        };
+        for binds in [
+            vec![read_only(&shared)],
+            vec![rw_bind(&shared), read_only(&shared.join("tools"))],
+        ] {
+            let e = expand(&root, &FsPolicy::default(), &binds, None);
+            assert!(e.refused.is_none(), "{:?}", e.refused);
+            assert!(
+                !e.readonly.iter().any(|m| m.path.starts_with(&shared)),
+                "{binds:?}: {:?}",
+                e.readonly
+            );
+        }
+    }
+
+    /// A link inside a read-write bind, on the way to the directory `core.hooksPath` names, is a
+    /// name the cage could point elsewhere, and refuses the launch as one inside the project does.
+    #[test]
+    fn a_link_in_a_read_write_bind_on_the_way_to_the_hooks_path_refuses_the_launch() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a link in a bind: no git on this host");
+            return;
+        };
+        let shared = tmp.path().canonicalize().unwrap().join("shared");
+        if !crate::sandbox::binds::bind_reaches_the_cage(&shared, Some(&root)) {
+            skip_incapable!("skipping a link in a bind: the fixture root is a cage mount");
+            return;
+        }
+        std::fs::create_dir_all(shared.join("real/hooks")).unwrap();
+        std::os::unix::fs::symlink("real", shared.join("tools")).unwrap();
+        let named = shared.join("tools/hooks");
+        assert!(git(&["config", "core.hooksPath", named.to_str().unwrap()]));
+        let why = expand(&root, &FsPolicy::default(), &[rw_bind(&shared)], None)
+            .refused
+            .expect("a link in the bind refuses");
+        let link = shared.join("tools");
+        assert!(
+            why.contains(&format!("{}` is a symbolic link", link.display())),
+            "{why}"
+        );
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "outside the reach: {:?}", e.refused);
+    }
+
+    /// A file git reads in sbx's data directory refuses the launch, since the cage writes there
+    /// under other names and a mask at the host name would hold nothing: the directory
+    /// `core.hooksPath` names, a file git includes, absent or present, and the repository a `.git`
+    /// file names, a submodule's or the project's own.
+    #[test]
+    fn a_file_git_reads_in_sbxs_data_directory_refuses_the_launch() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping git's files in the data directory: no git on this host");
+            return;
+        };
+        let data = tmp.path().canonicalize().unwrap().join("data");
+        let home = data.join("projects/h/home");
+        std::fs::create_dir_all(home.join("hooks")).unwrap();
+        let refused_at = |path: &Path| {
+            let why = expand(&root, &FsPolicy::default(), &[], Some(&data))
+                .refused
+                .expect("a file git reads in the data directory refuses");
+            assert!(
+                why.contains("sbx's data directory")
+                    && why.contains(&path.display().to_string())
+                    && why.contains("git_writable"),
+                "{why}"
+            );
+        };
+        let hooks = home.join("hooks");
+        assert!(git(&["config", "core.hooksPath", hooks.to_str().unwrap()]));
+        refused_at(&hooks);
+        assert!(git(&["config", "--unset", "core.hooksPath"]));
+
+        let inc = home.join("team.gitconfig");
+        assert!(git(&["config", "include.path", inc.to_str().unwrap()]));
+        refused_at(&inc);
+        std::fs::write(&inc, "").unwrap();
+        refused_at(&inc);
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert!(git(&["config", "--unset", "include.path"]));
+
+        std::fs::create_dir_all(data.join("modules")).unwrap();
+        let repo = data.join("modules/sub");
+        let separate = ["--separate-git-dir", repo.to_str().unwrap()];
+        assert!(git_repo_at(&root.join("sub"), &separate) && git(&["add", "sub"]));
+        refused_at(&repo);
+
+        let worktree = tmp.path().join("linked");
+        let repo = data.join("linked.git");
+        let separate = ["--separate-git-dir", repo.to_str().unwrap()];
+        assert!(git_repo_at(&worktree, &separate));
+        let why = expand(&worktree, &FsPolicy::default(), &[], Some(&data))
+            .refused
+            .expect("a `.git` file naming the data directory refuses");
+        assert!(
+            why.contains("sbx's data directory") && why.contains(&repo.display().to_string()),
+            "{why}"
+        );
+    }
+
+    /// A submodule whose `.git` file names a repository in a read-write bind has that repository
+    /// held like one in the project, and the end of the session follows it there: a gitlink added
+    /// inside it during the session is named.
+    #[test]
+    fn a_submodules_repository_in_a_read_write_bind_is_held_and_watched() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a submodule's repository in a bind: no git on this host");
+            return;
+        };
+        let shared = tmp.path().canonicalize().unwrap().join("shared");
+        if !crate::sandbox::binds::bind_reaches_the_cage(&shared, Some(&root)) {
+            skip_incapable!(
+                "skipping a submodule's repository in a bind: the fixture root is a \
+                 cage mount"
+            );
+            return;
+        }
+        let repo = shared.join("modules/sub");
+        std::fs::create_dir_all(shared.join("modules")).unwrap();
+        let separate = ["--separate-git-dir", repo.to_str().unwrap()];
+        assert!(git_repo_at(&root.join("sub"), &separate) && git(&["add", "sub"]));
+        let binds = [rw_bind(&shared)];
+
+        let e = expand(&root, &FsPolicy::default(), &binds, None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        for held in [repo.join("config"), repo.join("hooks")] {
+            assert!(
+                e.readonly.iter().any(|m| m.path == held && m.builtin),
+                "{}: {:?}",
+                held.display(),
+                e.readonly
+            );
+        }
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(!e.readonly.iter().any(|m| m.path.starts_with(&shared)));
+
+        let watch = GitWatch::start(&root, false, &binds, None).expect("a protected `.git`");
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+        let in_sub = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", root.join("sub").to_str().unwrap()])
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        assert!(git_repo_at(&root.join("sub/inner"), &[]) && in_sub(&["add", "inner"]));
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("sub/inner/.git` is a submodule's repository")),
+            "{found:#?}"
+        );
     }
 
     /// A repository at `dir` with one empty commit, made by the host's git; `false` when git is
@@ -3382,7 +3940,7 @@ mod tests {
         assert!(git(&update.concat()));
         assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
 
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         for held in [
             ".git/modules/sub/config",
@@ -3406,7 +3964,10 @@ mod tests {
             git_writable: Some(true),
             ..FsPolicy::default()
         };
-        assert!(expand(&root, &lifted).is_empty(), "git_writable lifts it");
+        assert!(
+            expand(&root, &lifted, &[], None).is_empty(),
+            "git_writable lifts it"
+        );
     }
 
     /// Where a submodule's `.git` cannot be held to the repository git reads, the launch refuses:
@@ -3431,7 +3992,7 @@ mod tests {
             std::fs::create_dir_all(root.join(path)).unwrap();
         };
         let refused = || {
-            expand(&root, &FsPolicy::default())
+            expand(&root, &FsPolicy::default(), &[], None)
                 .refused
                 .expect("refused")
         };
@@ -3451,7 +4012,7 @@ mod tests {
         gitlink("out");
         let pointer = format!("gitdir: {}/.git\n", outside.display());
         std::fs::write(root.join("out/.git"), pointer).unwrap();
-        let e = expand(&root, &FsPolicy::default());
+        let e = expand(&root, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         assert!(e.readonly.iter().any(|m| m.path == root.join("out/.git")));
         assert!(
@@ -3475,7 +4036,7 @@ mod tests {
         let add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
         assert!(git(&[&add[..], &[source.to_str().unwrap(), "sub"]].concat()));
         let held = |root: &Path| {
-            let e = expand(root, &FsPolicy::default());
+            let e = expand(root, &FsPolicy::default(), &[], None);
             e.refused.is_none()
                 && e.readonly
                     .iter()
@@ -3484,7 +4045,7 @@ mod tests {
         assert!(git(&["update-index", "--index-version", "4"]));
         assert!(held(&root), "version 4");
         assert!(git(&["update-index", "--split-index"]));
-        let why = expand(&root, &FsPolicy::default())
+        let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
             .expect("a split index refuses");
         assert!(why.contains("not an index sbx reads in full"), "{why}");
@@ -3501,7 +4062,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(add.status.success());
-        let e = expand(&sha, &FsPolicy::default());
+        let e = expand(&sha, &FsPolicy::default(), &[], None);
         assert!(e.refused.is_none(), "{:?}", e.refused);
         assert!(
             e.readonly
@@ -3521,7 +4082,8 @@ mod tests {
             return;
         };
         assert!(git_repo_at(&root.join("kept"), &[]) && git(&["add", "kept"]));
-        let watch = GitWatch::start(&root, false).expect("a protected `.git` is watched");
+        let watch =
+            GitWatch::start(&root, false, &[], None).expect("a protected `.git` is watched");
         assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
 
         assert!(git(&["update-index", "--index-version", "4"]));
@@ -3577,10 +4139,11 @@ mod tests {
         std::fs::write(root.join(".git/worktrees/kept/config.worktree"), "").unwrap();
         let root = root.canonicalize().unwrap();
 
-        let watch = GitWatch::start(&root, false).expect("a protected `.git` is watched");
+        let watch =
+            GitWatch::start(&root, false, &[], None).expect("a protected `.git` is watched");
         assert!(watch.findings().is_empty(), "nothing appeared yet");
         assert!(
-            GitWatch::start(&root, true).is_none(),
+            GitWatch::start(&root, true, &[], None).is_none(),
             "git_writable: nothing to watch"
         );
 
@@ -3645,39 +4208,47 @@ mod tests {
             "gitdir: ../main/.git/worktrees/w\r\n".to_string(),
         ] {
             std::fs::write(&git, pointer).unwrap();
-            held_alone(&expand(&root, &FsPolicy::default()));
-            assert!(expand(&root, &lifted).is_empty(), "git_writable lifts it");
+            held_alone(&expand(&root, &FsPolicy::default(), &[], None));
+            assert!(
+                expand(&root, &lifted, &[], None).is_empty(),
+                "git_writable lifts it"
+            );
         }
 
         std::fs::create_dir_all(root.join("repo")).unwrap();
         for pointer in ["gitdir: repo\n", "gitdir: not-there-yet"] {
             std::fs::write(&git, pointer).unwrap();
-            let why = expand(&root, &FsPolicy::default())
+            let why = expand(&root, &FsPolicy::default(), &[], None)
                 .refused
                 .expect("a repository inside the project refuses");
             assert!(
                 why.contains("names a repository inside the project"),
                 "{why}"
             );
-            assert!(expand(&root, &lifted).refused.is_none());
+            assert!(expand(&root, &lifted, &[], None).refused.is_none());
         }
 
         std::os::unix::fs::symlink(&outside, root.join("via")).unwrap();
         std::fs::write(&git, "gitdir: via\n").unwrap();
-        let why = expand(&root, &FsPolicy::default())
+        let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
             .expect("a link on the way refuses");
         assert!(why.contains("via` is a symbolic link"), "{why}");
 
         std::fs::write(&git, "not a pointer\n").unwrap();
-        held_alone(&expand(&root, &FsPolicy::default()));
+        held_alone(&expand(&root, &FsPolicy::default(), &[], None));
     }
 
     #[test]
     fn deny_wins_over_readonly_where_they_meet() {
         let tmp = TmpDir::new();
         let root = project(&tmp);
-        let e = expand(&root, &policy(&["secrets/"], &["secrets/token", "main.rs"]));
+        let e = expand(
+            &root,
+            &policy(&["secrets/"], &["secrets/token", "main.rs"]),
+            &[],
+            None,
+        );
         let ro: Vec<&Path> = e.readonly.iter().map(|m| m.path.as_path()).collect();
         assert_eq!(
             ro,
@@ -3703,6 +4274,8 @@ mod tests {
         let e = expand(
             &root,
             &policy(&["secrets/", "secrets/token"], &["secrets/token"]),
+            &[],
+            None,
         );
         assert_eq!(
             e.denied
@@ -3733,7 +4306,7 @@ mod tests {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
-        let e = expand(&root, &policy(&["secrets/token"], &["secrets/"]));
+        let e = expand(&root, &policy(&["secrets/token"], &["secrets/"]), &[], None);
         assert_eq!(
             e.denied.len(),
             1,
@@ -3769,7 +4342,7 @@ mod tests {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         std::fs::hard_link(root.join("prod.key"), root.join("copy.key")).unwrap();
-        let e = expand(&root, &policy(&["prod.key"], &[]));
+        let e = expand(&root, &policy(&["prod.key"], &[]), &[], None);
         assert_eq!(e.denied.len(), 1);
         assert!(
             e.warnings.iter().any(|w| w.contains("hard links")),
@@ -3786,7 +4359,12 @@ mod tests {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         std::fs::hard_link(root.join("certs/server.pem"), root.join("certs/alias.pem")).unwrap();
-        let e = expand(&root, &policy(&[], &["certs/server.pem", "main.rs"]));
+        let e = expand(
+            &root,
+            &policy(&[], &["certs/server.pem", "main.rs"]),
+            &[],
+            None,
+        );
         let hits: Vec<&String> = e
             .warnings
             .iter()
@@ -3821,7 +4399,7 @@ mod tests {
         for i in 0..MASK_MAX + 5 {
             std::fs::write(dir.join(format!("f{i}.key")), b"x").unwrap();
         }
-        let e = expand(&root, &policy(&["many/*.key"], &[]));
+        let e = expand(&root, &policy(&["many/*.key"], &[]), &[], None);
         assert!(
             e.refused.as_ref().is_some_and(|r| r.contains("ceiling")),
             "a policy past the ceiling fails closed rather than dropping the tail: {:?}",
@@ -3855,7 +4433,12 @@ mod tests {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
-        let e = expand(&root, &policy(&["prod.key", "secrets/"], &["main.rs"]));
+        let e = expand(
+            &root,
+            &policy(&["prod.key", "secrets/"], &["main.rs"]),
+            &[],
+            None,
+        );
         let binds = agent_binds(&e, &decoys, true);
         assert_eq!(binds.len(), 3);
         // `readonly` is emitted first, so a `deny` nested inside one lands over it rather than
@@ -3887,7 +4470,12 @@ mod tests {
         std::fs::write(root.join("config/sub/prod.key"), b"KEY").unwrap();
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
 
-        let e = expand(&root, &policy(&["config/sub/prod.key", "prod.key"], &[]));
+        let e = expand(
+            &root,
+            &policy(&["config/sub/prod.key", "prod.key"], &[]),
+            &[],
+            None,
+        );
         assert!(e.refused.is_none(), "{:?}", e.refused);
         assert_eq!(
             e.pins,
@@ -3925,6 +4513,8 @@ mod tests {
         let e = expand(
             &root,
             &policy(&["config/sub/prod.key", "certs/server.pem"], &["config/"]),
+            &[],
+            None,
         );
         assert!(e.refused.is_none(), "{:?}", e.refused);
         assert_eq!(e.denied.len(), 2, "both files are closed");
@@ -3943,7 +4533,7 @@ mod tests {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
-        let e = expand(&root, &policy(&["certs/server.pem"], &[]));
+        let e = expand(&root, &policy(&["certs/server.pem"], &[]), &[], None);
         assert_eq!(e.pins, vec![root.join("certs")]);
 
         let binds = agent_binds(&e, &decoys, false);
@@ -3966,7 +4556,7 @@ mod tests {
             })
             .collect();
         let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
-        let e = expand(&root, &policy(&entries, &[]));
+        let e = expand(&root, &policy(&entries, &[]), &[], None);
         assert!(e.denied.len() < MASK_MAX, "the masks alone fit");
         assert!(
             e.refused.as_ref().is_some_and(|r| r.contains("ceiling")),
@@ -3981,7 +4571,12 @@ mod tests {
         let root = project(&tmp);
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
         // `readonly` is not carried into a task cage: the project is bound read-only there already.
-        let e = expand(&root, &policy(&["prod.key", "certs/*.pem"], &["main.rs"]));
+        let e = expand(
+            &root,
+            &policy(&["prod.key", "certs/*.pem"], &["main.rs"]),
+            &[],
+            None,
+        );
 
         let (none, unused) = task_mounts(&e, &decoys, &root, &[]);
         assert_eq!(
@@ -4011,7 +4606,7 @@ mod tests {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
-        let e = expand(&root, &policy(&["prod.key"], &[]));
+        let e = expand(&root, &policy(&["prod.key"], &[]), &[], None);
         // `main.rs` is a real file that no mask covers: lifting it would be a bind, not an unmask.
         let (mounts, unused) = task_mounts(&e, &decoys, &root, &["main.rs".to_string()]);
         assert_eq!(mounts.len(), 1, "the real mask is untouched");
@@ -4024,7 +4619,7 @@ mod tests {
         let tmp = TmpDir::new();
         let root = project(&tmp);
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
-        let e = expand(&root, &policy(&["secrets/"], &[]));
+        let e = expand(&root, &policy(&["secrets/"], &[]), &[], None);
         let (mounts, unused) = task_mounts(&e, &decoys, &root, &["secrets/".to_string()]);
         assert!(mounts.is_empty(), "the directory is open to this task");
         assert!(unused.is_empty());
@@ -4150,7 +4745,7 @@ mod tests {
         data.extend(e);
         std::fs::write(git.join("index"), &data).unwrap();
 
-        let warned = expand(&root, &policy(&["prod.key"], &[])).warnings;
+        let warned = expand(&root, &policy(&["prod.key"], &[]), &[], None).warnings;
         assert!(
             warned
                 .iter()
@@ -4158,7 +4753,7 @@ mod tests {
             "the warning has to carry the cure, not just the problem: {warned:?}"
         );
         // An untracked mask in the same repository says nothing.
-        let quiet = expand(&root, &policy(&["secrets/"], &[])).warnings;
+        let quiet = expand(&root, &policy(&["secrets/"], &[]), &[], None).warnings;
         assert!(
             !quiet.iter().any(|w| w.contains("update-index")),
             "{quiet:?}"

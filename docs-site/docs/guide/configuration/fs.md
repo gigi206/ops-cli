@@ -120,22 +120,23 @@ protection stops](../concepts/security-model#where-the-protection-stops). The ho
 *directory* is protected, so a hook created halfway through the session is refused too.
 
 The hooks directory is the one git will run hooks from: `.git/hooks`, and also the directory
-`core.hooksPath` names when it is inside the project. husky, for one, points it at `.husky/_`,
-a directory git ignores, where a rewritten hook would not even show in `git status`. The value
+`core.hooksPath` names when the cage writes it, in the project or in a read-write bind ([where
+the cage writes](#where-the-cage-writes)). husky, for one, points it at `.husky/_`, a
+directory git ignores, where a rewritten hook would not even show in `git status`. The value
 is read from your host's own `git` at launch, so an include file or your global config counts;
-a directory outside the project is left alone, since the cage does not hold it, and with no
-`git` on the host there is nothing to ask and no hook to run. A hooks directory that does not
-exist yet is **created empty at launch** and then protected, which is what `git init` makes:
-otherwise the cage could create it and fill it. It is made one component at a time, and a
-symbolic link found on the way refuses the launch rather than being followed.
+a directory the cage does not write is left alone, and with no `git` on the host there is
+nothing to ask and no hook to run. A hooks directory that does not exist yet is **created
+empty at launch** and then protected, which is what `git init` makes: otherwise the cage could
+create it and fill it. It is made one component at a time, and a symbolic link found on the
+way refuses the launch rather than being followed.
 
 A file the configuration **includes** is configuration too: an `include.path` or
-`includeIf.<condition>.path` that names a file inside the project (from `.git/config`, from
-your global config, or from an included file) makes that file read-only as well, whether or
-not the condition holds today. The list is the one your host's `git` reports. An include that
-names a project file that does not exist **refuses the launch**, naming the file: the cage
-could create it and git would read it, and sbx does not write a configuration file into your
-tree. Create it (empty is enough), remove the include, or set `git_writable`.
+`includeIf.<condition>.path` that names a file the cage writes (from `.git/config`, from your
+global config, or from an included file) makes that file read-only as well, whether or not the
+condition holds today. The list is the one your host's `git` reports. An include that names
+such a file that does not exist **refuses the launch**, naming the file: the cage could create
+it and git would read it, and sbx does not write a configuration file into your tree. Create
+it (empty is enough), remove the include, or set `git_writable`.
 
 The files git reads **beside** `.git/config` are configuration as well.
 `.git/config.worktree` is read-only whenever it is there. git reads it when `.git/config`
@@ -164,21 +165,23 @@ catches a `.git/commondir`.
 A **symbolic link** on the way to any of these refuses the launch, naming the link, wherever it
 leads: `.git` itself, `.git/hooks`, `.git/config`, a directory above the one `core.hooksPath`
 names, or a directory on the way to a file git includes. sbx protects each of these paths by
-laying a read-only mount on what it resolves to at launch, and a link inside the project is a
-name the cage could point elsewhere during the session, after which your git would read what
-the link names instead. The refusal names a form sbx holds in place. For a hooks directory kept
-in the tree, remove the `.git/hooks` link and point `core.hooksPath` at the directory
-(`git config core.hooksPath .githooks`). For a configuration file kept in the tree, give the
-repository a `.git/config` of its own that includes it (`git config include.path
-../repo.gitconfig`). `git_writable` lifts this along with the rest.
+laying a read-only mount on what it resolves to at launch, and a link where the cage writes, in
+the project or in a read-write bind, is a name the cage could point elsewhere during the
+session, after which your git would read what the link names instead. The refusal names a form
+sbx holds in place. For a hooks directory kept in the tree, remove the `.git/hooks` link and
+point `core.hooksPath` at the directory (`git config core.hooksPath .githooks`). For a
+configuration file kept in the tree, give the repository a `.git/config` of its own that
+includes it (`git config include.path ../repo.gitconfig`). `git_writable` lifts this along
+with the rest.
 
 A **submodule** is a repository of its own that your git reads too: a `git status` in the
 superproject reads the configuration of every submodule the index names, whether or not
 `.gitmodules` lists it, and of that submodule's own submodules. So each one is protected the way
 the project's repository is, its configuration, its hooks directory and the files that
 configuration includes, and the `.git` file in its directory that points at it is read-only
-as well. That covers a submodule's repository under `.git/modules/`, and a repository embedded in
-the tree and added to the index. The submodules are found in the index, which sbx reads itself;
+as well. That covers a submodule's repository under `.git/modules/`, one in a read-write bind,
+and a repository embedded in the tree and added to the index. The submodules are found in the
+index, which sbx reads itself;
 an index it cannot read in full (a split index, or one past its size bound) refuses the launch
 in a repository that has submodules, and so does a link where a submodule's `.git` is looked
 for. Holding a submodule's configuration costs what holding `.git/config` costs:
@@ -254,6 +257,33 @@ repository's configuration and hooks: move the repository into `.git` in place o
 [`sbx test fs`](#seeing-what-is-closed) reports all of these as `READ-ONLY`, protected by sbx
 itself, and [`sbx config show`](../cli/config) prints `fs git: writable` when a layer lifted
 the git pair.
+
+### Where the cage writes
+
+The cage writes more than the project. Each read-write [bind](binds) is written at its own
+path, so what your git reads there is held as it is in the project: the directory
+`core.hooksPath` names in a bind, a file git includes from one, and a submodule's repository
+there are read-only in the cage, and a symbolic link in the bind on the way to one refuses the
+launch. The directories between the bind and each of them are held in place, so the cage can no
+longer rename or remove them (`EBUSY`). The rest of a read-write bind stays writable, since that
+is what the bind grants, another repository in it included. A read-only bind is not written,
+nor is a read-only bind of a directory inside a read-write one listed after it, and nothing is
+added there.
+
+A read-write bind that holds your **global git configuration** (`~/.gitconfig`,
+`~/.config/git/config`, or the file `GIT_CONFIG_GLOBAL` names), such as a bind of your whole
+home, is the exception. The cage can name a program there that your git runs in every
+repository, this project included, so holding git's other files in that bind would protect
+nothing: none is held there, nothing it names refuses the launch, and the launch warns, naming
+the bind and the file. Bind a narrower directory, or that one read-only, to keep them held.
+
+sbx's own data directory is written too, under other names: the cage's home at
+`/home/sandbox`, its store at `/nix` and the install pools all live in it. A read-only mount at
+the host path would hold nothing there, so a hooks directory, an included file or a repository
+your git reads in it refuses the launch, naming it.
+
+[`sbx test fs`](#seeing-what-is-closed) answers for a path in a read-write bind as it does for
+one in the project.
 
 ## The grammar
 

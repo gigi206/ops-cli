@@ -1489,7 +1489,7 @@ fn the_directories_above_a_mask_keep_their_path_inside_the_cage() {
         deny: vec!["config/sub/prod.key".to_string()],
         ..Default::default()
     };
-    let expanded = crate::sandbox::fsmask::expand(&root, &policy);
+    let expanded = crate::sandbox::fsmask::expand(&root, &policy, &[], None);
     assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
     let decoys = crate::sandbox::fsmask::stage_decoys(&scratch.path().join("mask")).unwrap();
     let mut mounts = vec![

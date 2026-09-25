@@ -1196,7 +1196,7 @@ mod tests {
             readonly: readonly.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         };
-        let expanded = crate::sandbox::fsmask::expand(&root, &policy);
+        let expanded = crate::sandbox::fsmask::expand(&root, &policy, &[], None);
         assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
         (tmp, expanded)
     }
@@ -1959,7 +1959,7 @@ mod tests {
             deny: vec!["notes/*".to_string()],
             ..Default::default()
         };
-        let expanded = crate::sandbox::fsmask::expand(&root, &policy);
+        let expanded = crate::sandbox::fsmask::expand(&root, &policy, &[], None);
         assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
         let root = root.canonicalize().unwrap();
         (tmp, root, expanded)
@@ -2057,8 +2057,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
         let root = root.canonicalize().unwrap();
-        let masks =
-            crate::sandbox::fsmask::expand(&root, &crate::config::fspolicy::FsPolicy::default());
+        let masks = crate::sandbox::fsmask::expand(
+            &root,
+            &crate::config::fspolicy::FsPolicy::default(),
+            &[],
+            None,
+        );
         let summary = summary_paths(&masks, &[], Some(&root));
         assert!(
             summary.contains("relative to the project root: `.git`\n"),

@@ -415,7 +415,12 @@ fn launch_foreground(
     // missed by the other.
     let (exec_poll, fs) = observation_flags(&prep.cfg.proc, observe);
     // Taken now, before the cage runs: what the end of the session compares against.
-    let git_watch = crate::sandbox::fsmask::GitWatch::start(&prep.cwd, prep.cfg.fs.git_writable());
+    let git_watch = crate::sandbox::fsmask::GitWatch::start(
+        &prep.cwd,
+        prep.cfg.fs.git_writable(),
+        &prep.cfg.binds,
+        Some(prep.layout.data_dir()),
+    );
 
     match guard {
         // The postures with no guard and nothing to do after the cage: exec-replace, so the

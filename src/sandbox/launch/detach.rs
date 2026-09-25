@@ -174,7 +174,12 @@ fn detached_child(
     });
 
     // Taken now, before the cage runs; what it finds goes to the session log.
-    let git_watch = crate::sandbox::fsmask::GitWatch::start(&prep.cwd, prep.cfg.fs.git_writable());
+    let git_watch = crate::sandbox::fsmask::GitWatch::start(
+        &prep.cwd,
+        prep.cfg.fs.git_writable(),
+        &prep.cfg.binds,
+        Some(prep.layout.data_dir()),
+    );
 
     match guard {
         None if may_exec_replace(&prep.cfg.proc, observe, git_watch.is_some()) => {

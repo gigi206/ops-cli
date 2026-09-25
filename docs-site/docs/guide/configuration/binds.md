@@ -59,6 +59,15 @@ finds that mount at the path instead. Inside the project that means the project'
 mount: listing the bind as read-only would tell a process that a path refuses a write when it
 takes one.
 
+A read-write bind is written the way the project is, so what your git reads there is held the
+same way: the directory `core.hooksPath` names in the bind, a file git includes from it, and a
+submodule's repository in it are read-only in the cage, and a symbolic link in the bind on the
+way to one refuses the launch ([where the cage writes](fs#where-the-cage-writes)). The
+directories between the bind and each of them can no longer be renamed or removed from the cage.
+The rest of the bind stays writable: another repository in it is what the bind grants. A bind
+that holds your global git configuration (a bind of your whole home, for one) holds none of
+this, since the cage could name a program there that git runs anyway, and the launch warns.
+
 ## Path rules
 
 - A bind path must be **absolute**. It is canonicalized (resolving symlinks) at

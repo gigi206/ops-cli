@@ -1009,7 +1009,11 @@ fn fs_test(args: &[OsString]) -> ExitCode {
     };
 
     let policy = &resolved.fs;
-    let expanded = crate::sandbox::fsmask::expand(&cwd, policy);
+    // Where the cage writes decides which of git's files are held, so the tester reads it the way
+    // the launch does: the resolved binds and sbx's data directory.
+    let layout = crate::store::Layout::from_env();
+    let data = layout.as_ref().map(|l| l.data_dir());
+    let expanded = crate::sandbox::fsmask::expand(&cwd, policy, &resolved.binds, data);
     // The launch treats this as fatal, so the tester does too: a refusal means the masks the config
     // names cannot be placed, and an answer computed from the paths that survived would describe a
     // cage no launch will build.
@@ -1058,11 +1062,15 @@ fn fs_test(args: &[OsString]) -> ExitCode {
     let shown = |p: &Path| crate::sandbox::sanitize(&p.display().to_string());
 
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
-    if !path.starts_with(&root) {
+    // A read-write bind is answered too: the files the project's git reads there are held like
+    // the project's own, and nothing else in it is.
+    let in_bind = !path.starts_with(&root)
+        && crate::sandbox::fsmask::Reach::of(&root, &resolved.binds, data).writes(&path);
+    if !path.starts_with(&root) && !in_bind {
         println!("  {dim}{}{r}", shown(&path), dim = pal.dim);
         diag::error(
-            "sbx: test fs: that path is outside the project — `[fs]` closes paths of the project \
-             it is declared in, and nothing else",
+            "sbx: test fs: that path is outside the project and its read-write binds: `[fs]` \
+             closes paths of the project it is declared in, and nothing else",
         );
         return ExitCode::from(2);
     }
@@ -1079,9 +1087,9 @@ fn fs_test(args: &[OsString]) -> ExitCode {
         // An entry sbx added itself is named as such: pointing at a `[fs]` line would send the
         // reader to look for, or remove, a line that is in no config.
         Some((_, m)) if m.builtin => println!(
-            "  {dim}by sbx itself: the project config, its mise files, and what git reads in the \
-             project (its hooks, its configuration, a `.git` file) are read-only in the cage by \
-             default{r}",
+            "  {dim}by sbx itself: the project config, its mise files, and what the project's git \
+             reads where the cage writes (its hooks, its configuration, a `.git` file) are \
+             read-only in the cage by default{r}",
             dim = pal.dim
         ),
         Some((field, m)) if m.path == path => {
@@ -1108,6 +1116,10 @@ fn fs_test(args: &[OsString]) -> ExitCode {
                 dim = pal.dim
             )
         }
+        None if in_bind => println!(
+            "  {dim}in a read-write bind, which `[fs]` entries do not name: the cage writes it{r}",
+            dim = pal.dim
+        ),
         None => println!("  {dim}no `[fs]` entry names it{r}", dim = pal.dim),
     }
 

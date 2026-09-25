@@ -348,7 +348,7 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place_inside_the_cage() {
         ],
         ..Default::default()
     };
-    let expanded = crate::sandbox::fsmask::expand(&home, &policy);
+    let expanded = crate::sandbox::fsmask::expand(&home, &policy, &[], None);
     assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
     let decoys = crate::sandbox::fsmask::stage_decoys(&scratch.path().join("mask")).unwrap();
     let fs_binds = crate::sandbox::fsmask::agent_binds(&expanded, &decoys, true);

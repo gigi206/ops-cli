@@ -723,6 +723,98 @@ fn a_hook_cannot_be_planted_through_an_absent_hooks_dir_or_core_hooks_path() {
     );
 }
 
+/// A read-write bind is written by the cage at its own path, so what the project's git reads there
+/// is held as it is in the project: inside a real cage, the directory `core.hooksPath` names in
+/// the bind and a file git includes from it refuse a write, and the directory above them keeps its
+/// path, while the rest of the bind takes a write.
+#[test]
+fn what_the_projects_git_reads_in_a_read_write_bind_is_read_only_in_a_real_cage() {
+    let (project, data, state, bound) = (
+        TmpDir::new("f"),
+        TmpDir::new("f"),
+        TmpDir::new("f"),
+        TmpDir::new("f"),
+    );
+    probe_or_skip!(
+        "git's files in a read-write bind, in a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    let git = |args: &[&str]| Command::new("git").args(args).current_dir(root).output();
+    let Ok(init) = git(&["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    let shared = bound.path().canonicalize().unwrap();
+    if shared.starts_with("/tmp") {
+        // The cage mounts its own `/tmp` after the config binds, so a bind there is not written.
+        skip_incapable!("the fixture root is under /tmp, which a bind cannot reach in the cage");
+        return;
+    }
+    std::fs::create_dir_all(shared.join("tools")).unwrap();
+    let (tools, hooks, inc) = (
+        shared.join("tools"),
+        shared.join("tools/hooks"),
+        shared.join("tools/team.gitconfig"),
+    );
+    std::fs::write(&inc, "").unwrap();
+    for (key, value) in [("core.hooksPath", &hooks), ("include.path", &inc)] {
+        let set = git(&["config", key, value.to_str().unwrap()]).unwrap();
+        assert!(set.status.success(), "{set:?}");
+    }
+    std::fs::write(
+        root.join(".sbx.toml"),
+        format!(
+            "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
+            shared.display()
+        ),
+    )
+    .unwrap();
+    let trusted = sbx_isolated()
+        .args(["trust", "--yes"])
+        .current_dir(root)
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("trust");
+    assert!(trusted.status.success(), "{trusted:?}");
+
+    let script = format!(
+        "(mkdir -p {hooks} && printf x > {hooks}/pre-commit) 2>/dev/null \
+           && echo WROTE-HOOK || echo REFUSED-HOOK; \
+         (printf '[core]\\n\\tfsmonitor = x\\n' >> {inc}) 2>/dev/null \
+           && echo WROTE-INCLUDE || echo REFUSED-INCLUDE; \
+         (printf x > {shared}/notes) 2>/dev/null && echo WROTE-OTHER || echo REFUSED-OTHER; \
+         (mv {tools} {tools}.moved) 2>/dev/null && echo MOVED || echo HELD",
+        hooks = hooks.display(),
+        inc = inc.display(),
+        shared = shared.display(),
+        tools = tools.display(),
+    );
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", &script])
+        .current_dir(root)
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for word in ["REFUSED-HOOK", "REFUSED-INCLUDE", "WROTE-OTHER", "HELD"] {
+        assert!(
+            stdout.contains(word),
+            "expected {word}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assert!(hooks.is_dir(), "the launch made the directory it binds");
+    assert!(!hooks.join("pre-commit").exists(), "no hook on the host");
+    assert!(std::fs::read(&inc).unwrap().is_empty());
+    assert!(
+        shared.join("notes").exists(),
+        "the rest of the bind is written"
+    );
+}
+
 /// The files git reads as configuration beside `.git/config` are read-only inside a real cage: the
 /// main `config.worktree`, and a linked worktree's `config.worktree` and `commondir`, whose
 /// directory also keeps its path. A `.git/commondir` in the project's own repository refuses the
@@ -1458,6 +1550,120 @@ fn test_fs_refuses_a_path_outside_the_project() {
     assert_eq!(out.status.code(), Some(2), "{:?}", out.status);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("outside the project"), "{err}");
+}
+
+/// A read-write bind is answered too: the directory the project's git runs hooks from there is
+/// read-only by sbx itself, the rest of the bind is open and said to be a bind, and a path in
+/// neither the project nor a read-write bind is still refused.
+#[test]
+fn test_fs_answers_for_what_git_reads_in_a_read_write_bind() {
+    let p = Project::new("tfs");
+    let root = p.proj.path();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !git(&["init", "-q"]) {
+        skip_incapable!("git is not installed on this host");
+        return;
+    }
+    let shared = p.scratch().canonicalize().unwrap().join("shared");
+    if shared.starts_with("/tmp") {
+        // The cage mounts its own `/tmp` after the config binds, so a bind there is not written.
+        skip_incapable!("the fixture root is under /tmp, which a bind cannot reach in the cage");
+        return;
+    }
+    std::fs::create_dir_all(shared.join("hooks")).unwrap();
+    let hooks = shared.join("hooks");
+    assert!(git(&["config", "core.hooksPath", hooks.to_str().unwrap()]));
+    p.write_project(&format!(
+        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
+        shared.display()
+    ));
+    assert!(
+        p.run(&["trust", "--yes"]).status.success(),
+        "trust the fixture"
+    );
+    let verdict = |path: &Path| -> String {
+        let out = p.run(&["test", "fs", path.to_str().unwrap()]);
+        assert!(
+            out.status.success(),
+            "test fs {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let hook = verdict(&hooks.join("pre-commit"));
+    assert!(
+        hook.contains("READ-ONLY") && hook.contains("by sbx itself"),
+        "{hook}"
+    );
+    let other = verdict(&shared.join("notes.txt"));
+    assert!(
+        other.contains("OPEN") && other.contains("read-write bind"),
+        "{other}"
+    );
+    let out = p.run(&["test", "fs", "/etc/hostname"]);
+    assert_eq!(out.status.code(), Some(2), "{:?}", out.status);
+}
+
+/// A read-write bind that holds the global git configuration holds nothing: the cage can name a
+/// program there that git runs anyway. An absent include and a hooks directory the global
+/// configuration names in it neither refuse nor are held, and the tester says why.
+#[test]
+fn test_fs_holds_nothing_in_a_bind_that_holds_the_global_git_configuration() {
+    let p = Project::new("tfs");
+    let root = p.proj.path();
+    let home = p.scratch().canonicalize().unwrap().join("home");
+    if home.starts_with("/tmp") {
+        // The cage mounts its own `/tmp` after the config binds, so a bind there is not written.
+        skip_incapable!("the fixture root is under /tmp, which a bind cannot reach in the cage");
+        return;
+    }
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join(".gitconfig"),
+        "[include]\n\tpath = ~/.gitconfig.local\n[core]\n\thooksPath = ~/.githooks\n",
+    )
+    .unwrap();
+    let in_home = |args: &[&str]| {
+        let mut cmd = p.cmd(args);
+        cmd.env("HOME", &home).env_remove("GIT_CONFIG_GLOBAL");
+        cmd.output().expect("spawn sbx")
+    };
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .env("HOME", &home)
+        .output();
+    if !git.is_ok_and(|o| o.status.success()) {
+        skip_incapable!("git is not installed on this host");
+        return;
+    }
+    p.write_project(&format!(
+        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
+        home.display()
+    ));
+    assert!(in_home(&["trust", "--yes"]).status.success(), "trust");
+
+    let out = in_home(&[
+        "test",
+        "fs",
+        home.join(".githooks/pre-commit").to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "no refusal\n{stdout}\n{stderr}");
+    assert!(stdout.contains("OPEN"), "nothing held there\n{stdout}");
+    assert!(
+        stderr.contains("holds") && stderr.contains(".gitconfig"),
+        "the warning names the bind and the file\n{stderr}"
+    );
 }
 
 /// A path the **project** chose reaches this terminal through the verdict, and it must arrive as

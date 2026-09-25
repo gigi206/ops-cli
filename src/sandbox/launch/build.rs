@@ -2147,7 +2147,12 @@ fn stage_fs_masks(
     // be covered by it, which is exactly why a `binds` entry aimed inside the project masks nothing
     // today. Unlike the rest of this block their destinations *are* project paths, which is the
     // point: they are the only binds here meant to land on one.
-    let fs_masks = crate::sandbox::fsmask::expand(&prep.cwd, &prep.cfg.fs);
+    let fs_masks = crate::sandbox::fsmask::expand(
+        &prep.cwd,
+        &prep.cfg.fs,
+        &prep.cfg.binds,
+        Some(prep.layout.data_dir()),
+    );
     for warning in &fs_masks.warnings {
         crate::diag::warn_config(warning);
     }

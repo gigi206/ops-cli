@@ -2490,7 +2490,7 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<path>",
-                "the project path to ask about, absolute or relative to the project. It need not exist: a denied directory closes the names that appear inside it later, and that is the answer this reports",
+                "the project path to ask about, absolute or relative to the project. It need not exist: a denied directory closes the names that appear inside it later, and that is the answer this reports. A path in a read-write bind is answered too, for the files the project's git reads there",
             ),
             (
                 "-a, --app <name>",

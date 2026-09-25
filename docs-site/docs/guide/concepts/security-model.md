@@ -269,18 +269,23 @@ lean on it:
 **The git carrier is closed by default.** A git hook is the one entry in the table above
 that no legitimate agent task needs to write, and the feed does not show it. So
 `.git/hooks/` and `.git/config` are [read-only in every cage](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)
-without any entry, as is the directory `core.hooksPath` names inside the project (husky's
-`.husky/_`): the directory, so a hook created halfway through the session is refused as
-well as one that was already there (and made empty at launch when it is absent, so the cage
-cannot create it), and the config, because `core.hooksPath`,
-`core.fsmonitor`, a filter or an alias names a program as surely as a hook does. The files
+without any entry, as is the directory `core.hooksPath` names where the cage writes, in the
+project (husky's `.husky/_`) or in a read-write bind: the directory, so a hook created halfway
+through the session is refused as well as one that was already there (and made empty at
+launch when it is absent, so the cage cannot create it), and the config, because
+`core.hooksPath`, `core.fsmonitor`, a filter or an alias names a program as surely as a hook
+does. The files
 git reads as configuration beside it are held the same way (`.git/config.worktree`, and a
 linked worktree's `config.worktree` and `commondir`), and a `.git/commondir` in the project's
 own repository, which would have git read its configuration from elsewhere, refuses the
 launch. Such a file cannot be held before it exists, so sbx names any that appeared once the
 cage has exited. A `.git` that is a file, the pointer a linked worktree keeps to its
 repository, is read-only as well, and so are the repositories of the submodules the index
-names, which a `git status` in the superproject reads too. Committing,
+names, which a `git status` in the superproject reads too. What your git reads in a read-write
+bind is held as in the project, unless the bind holds your global git configuration, which the
+cage could then rewrite (the launch warns), and a file it reads in sbx's data directory, which
+the cage writes under other names, refuses the launch ([where the cage
+writes](../configuration/fs#where-the-cage-writes)). Committing,
 switching branches, fetching and pushing still work; what is refused is writing the config
 (`remote add`, the upstream `push -u` records), installing a hook, and moving a repository into
 `.git` (`submodule absorbgitdirs`): `.git` itself is held in place, and a symbolic link on the

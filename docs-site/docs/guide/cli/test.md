@@ -49,7 +49,7 @@ the covering path is named too, because the pattern alone does not say why that 
 
 | Option | Meaning |
 |---|---|
-| `<path>` | the project path to ask about, absolute or relative to the project |
+| `<path>` | the project path to ask about, absolute or relative to the project; a path in a read-write bind is answered too, for the files the project's git reads there ([where the cage writes](../configuration/fs#where-the-cage-writes)) |
 | `-a, --app <name>` | test against that app's effective policy (baseline + overlay) |
 
 ```sh
