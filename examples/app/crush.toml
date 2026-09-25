@@ -110,7 +110,29 @@
 # (read out of the README's API Keys table), and the FSL-1.1-MIT license
 # (Functional Source License 1.1, with a future-MIT grant — read out of the
 # GitHub `LICENSE.md`).
-cmd = "crush"
+#
+# The command hands Crush the cage's summary (/opt/sbx/contract-summary.md: what
+# it may reach, which files it protects, which operations it offers) as a
+# context file, through the system-wide `/etc/crush/crush.json` Crush loads
+# beneath the user's config. `/etc` is the cage's own tmpfs, so the file lives
+# for this launch only and never reaches the host. `context_paths` lists from
+# the two files are joined: the user's `~/.config/crush/CRUSH.md` and their own
+# `context_paths` still apply. The key is `context_paths`, never
+# `global_context_paths`, whose defaults (`CRUSH.md`, `AGENTS.md`) Crush drops
+# as soon as any file sets it. Arguments after `sbx app run crush --` reach
+# Crush verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/crush 2>/dev/null; then
+  printf '%s\n' '{"options":{"context_paths":["/opt/sbx/contract-summary.md"]}}' > /etc/crush/crush.json
+fi
+exec crush "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "crush",
+]
 
 # Your host Crush config/auth, mounted read-write at their real absolute paths.
 # `binds` is a security field, honored only because this profile lives in your
