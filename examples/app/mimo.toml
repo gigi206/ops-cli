@@ -84,12 +84,19 @@ allow = [
 #mute = [
 #]
 
+[env]
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers) added to MiMo Code's instructions, so a refused host or a read-only
+# file reads as the sandbox rather than as a fault to work around. MiMo Code reads it as one more
+# config and adds its `instructions` to what it already loads, so the summary comes next to your
+# `AGENTS.md`, never in place of it.
+MIMOCODE_CONFIG_CONTENT = '{"instructions":["/opt/sbx/contract-summary.md"]}'
+
 # BYOK path (alternate providers): the real key is read on the HOST and injected by the egress
 # proxy — never in the cage. Provide it on the host as $OPENROUTER_API_KEY (or point `from` at
 # a resolver, e.g. sops://secrets.yaml#openrouter), uncomment the host in [network] allow
 # above and this block, and add the placeholder below. The in-cage placeholder lets the CLI
 # start and issue the request; the proxy strips it and substitutes the real key on the wire.
-#[env]
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
