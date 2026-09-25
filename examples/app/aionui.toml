@@ -10,6 +10,7 @@
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/chromium-background.toml
 #
 # AionUi is a free, open-source Electron + React desktop app: ONE interface over 20+ AI agents. It
 # ships a built-in agent and auto-detects CLI agents installed on the machine (Claude Code, Codex,
@@ -252,7 +253,7 @@ allow = [
     # cross-domain flow (accounts.google.com auth → accounts.google.<cctld>/SetSID on your country
     # domain), works in any locale, and is anchored so a look-alike (accounts.google.com.evil.com) is
     # refused — the same pattern claude-desktop / hermes-desktop / vibe use — plus Google's asset/avatar
-    # hosts. (accounts.youtube.com's CheckConnection is non-essential; add it to `mute` if it is noisy.)
+    # hosts. (accounts.youtube.com's CheckConnection is non-essential; `@chromium-background` mutes it.)
     #'{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
     #"{*} https://oauth2.googleapis.com",
     #"{*} https://apis.google.com",
@@ -275,6 +276,16 @@ allow = [
 mute = [
     "*.sentry.io",        # crash/usage telemetry
     "static.aionui.com",  # AionUi's own auto-update feed — the .deb is managed by `sbx upgrade`, not in-cage
+    # The analytics of the www.aionui.com account page, which the sign-in loads: Google Analytics and
+    # Tag Manager, and the Firebase installation and config lookups of AionUi's own Firebase project.
+    "www.google-analytics.com",
+    "www.googletagmanager.com",
+    "firebase.googleapis.com",
+    "firebaseinstallations.googleapis.com",
+    # The embedded Chromium's own background services (the leak check, the sign-in signalling, the
+    # Play logging endpoint), described once in the shared group, plus its translate language list.
+    "@chromium-background",
+    "translate.googleapis.com",
 ]
 
 # AUTHENTICATION — no [secret] block. AionUi stores each provider's API key locally (entered
