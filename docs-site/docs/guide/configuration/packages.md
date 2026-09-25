@@ -218,6 +218,10 @@ no second pool: it neither offers a pool nor reads one.
 neighbour reading one of them loses what it was reading. It installs its own copy at the next
 launch, which is what it would have done had the app never run there.
 
+A pool is shared only while it has the shape a launch left: each directory down to its `installs`
+is a real directory. A pool where one of them has been replaced by a link is left off the list,
+and the app reading it installs its own copy instead.
+
 This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only), and unlike the
 others it cannot be set in the global config at all. The grant is about *these* apps in *this*
 project, and a machine-wide default would open the pools of projects that never asked for it.

@@ -1018,6 +1018,13 @@ fn cage_mounts(
     // spawn removes a directory this cage was about to bind, and a hard mount would fail the
     // launch of an app that merely had a neighbour tidied. Skipped, the app installs its own copy,
     // which is what it would have done had the neighbour never run.
+    //
+    // Each source sits below the neighbour's `mise` directory, whose contents that neighbour's
+    // cage writes, and the host resolves it for this one. So the list holds only pools that were
+    // real directories down to `installs` when the launch was planned
+    // ([`super::inspect::project_mise_pools`]), and a pool a cage left as a link is never bound.
+    // That check and bwrap's mount are two resolutions of the same path: a neighbour's cage
+    // running between them can still change what the path names.
     for (app, installs) in paths.mise_shared_installs {
         mounts.push(Mount::RoBindTry {
             src: installs.clone(),

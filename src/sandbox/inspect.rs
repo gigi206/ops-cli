@@ -329,15 +329,44 @@ pub(crate) fn app_per_project_mise_pools(data_dir: &Path, name: &str) -> Vec<App
 /// This is the set `apps_share_install_pools` grants a read of. It is discovered on disk rather
 /// than declared, so the grant covers exactly the apps that have run in this project, and it is
 /// symmetric by construction: each app sees the others, none sees itself twice.
+///
+/// Each path becomes the source of a bind the host resolves for the asking app's cage, and
+/// everything below a neighbour's `mise` directory is written by the neighbour's own cage, which
+/// has it as its mount point. So a pool is kept only where `<app>/mise/installs` opens as a real
+/// directory at every component, walked from the project's `apps` directory without following a
+/// link ([`super::gc::open_beneath`]). A pool that is not what a launch left is not shared, and
+/// the asking app installs its own copy, as it would with no neighbour at all.
 pub(crate) fn project_mise_pools(
     data_dir: &Path,
     project_id: &str,
     except: &str,
 ) -> Vec<(String, PathBuf)> {
-    let mut pools = Vec::new();
+    let apps = data_dir.join("projects").join(project_id).join("apps");
+    project_mise_neighbours(data_dir, project_id, except)
+        .into_iter()
+        .filter_map(|name| {
+            let rel = Path::new(&name).join("mise").join("installs");
+            super::gc::open_beneath(&apps, &rel).ok()?;
+            Some((name, apps.join(rel)))
+        })
+        .collect()
+}
+
+/// The other apps of `project_id` whose mise pool holds an `installs` entry, of whatever kind,
+/// sorted by name: the apps [`project_mise_pools`] considers before it checks what each entry is.
+///
+/// `sbx app prune` asks this rather than the checked list, because it reads a neighbour's
+/// activations and never its pool: a neighbour whose pool is refused as a bind source still
+/// resolves out of the pool being swept, so what it asks for is still kept.
+pub(crate) fn project_mise_neighbours(
+    data_dir: &Path,
+    project_id: &str,
+    except: &str,
+) -> Vec<String> {
+    let mut names = Vec::new();
     let apps = data_dir.join("projects").join(project_id).join("apps");
     let Ok(entries) = std::fs::read_dir(&apps) else {
-        return pools;
+        return names;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -347,13 +376,12 @@ pub(crate) fn project_mise_pools(
         if name == except || !crate::config::is_valid_app_name(&name) {
             continue;
         }
-        let installs = entry.path().join("mise").join("installs");
-        if installs.is_dir() {
-            pools.push((name, installs));
+        if std::fs::symlink_metadata(entry.path().join("mise").join("installs")).is_ok() {
+            names.push(name);
         }
     }
-    pools.sort_by(|a, b| a.0.cmp(&b.0));
-    pools
+    names.sort();
+    names
 }
 
 /// Which project trees pin `locator` in `lockfile` — the realized-where signal for a `deb:`,
@@ -1070,6 +1098,35 @@ mod tests {
 
         // and an app alone in its project has nobody to read
         assert!(project_mise_pools(data, "p2", "other").is_empty());
+    }
+
+    #[test]
+    fn a_neighbour_pool_that_is_not_a_real_directory_is_not_shared() {
+        // Everything below a neighbour's `mise` directory is written by that neighbour's cage, and
+        // the list this returns becomes bind sources the host resolves for another cage. So a pool
+        // is shared only where each component down to `installs` is a real directory: one that is a
+        // symlink is left out, wherever it points, and a real one beside it is still shared.
+        let scratch = crate::testutil::TmpDir::new();
+        let data = scratch.path();
+        let apps = data.join("projects/p1/apps");
+        std::fs::create_dir_all(apps.join("real/mise/installs/nix-jq/1.8.1")).unwrap();
+        let elsewhere = scratch.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("nix-jq/1.8.1")).unwrap();
+        std::fs::create_dir_all(apps.join("linked/mise")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, apps.join("linked/mise/installs")).unwrap();
+        std::fs::create_dir_all(apps.join("relinked")).unwrap();
+        std::os::unix::fs::symlink(apps.join("real/mise"), apps.join("relinked/mise")).unwrap();
+
+        let pools = project_mise_pools(data, "p1", "asker");
+        let names: Vec<&str> = pools.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["real"], "only a real pool is shared: {pools:?}");
+
+        // while the sweep, which reads each neighbour's activations and never its pool, still
+        // counts every one of them: a pool refused here is not a neighbour that stopped resolving
+        assert_eq!(
+            project_mise_neighbours(data, "p1", "asker"),
+            ["linked", "real", "relinked"]
+        );
     }
 
     #[test]

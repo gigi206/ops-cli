@@ -986,11 +986,12 @@ fn open_dir_nofollow(parent: Option<&OwnedFd>, name: &std::ffi::CStr) -> io::Res
 /// following nothing.
 ///
 /// The anchor is `home` itself: sbx's own directory under the data dir, and the cage's mount point,
-/// so it is the one component of the path the cage cannot have swapped. Each component below it is
-/// opened `O_DIRECTORY|O_NOFOLLOW` from the descriptor for the one above, so a link the cage planted
-/// is refused at the step that meets it rather than traversed. A descriptor obtained this way keeps
-/// naming the directory it was opened on however the names above it change afterwards, which is what
-/// [`contained_in`] cannot offer.
+/// so it is the one component of the path the cage cannot have swapped. The other caller,
+/// [`super::inspect::project_mise_pools`], anchors on a project's `apps` directory, which sbx owns
+/// and no cage mounts. Each component below it is opened `O_DIRECTORY|O_NOFOLLOW` from the
+/// descriptor for the one above, so a link the cage planted is refused at the step that meets it
+/// rather than traversed. A descriptor obtained this way keeps naming the directory it was opened on
+/// however the names above it change afterwards, which is what [`contained_in`] cannot offer.
 ///
 /// `..` is **not** a symlink, and `O_NOFOLLOW` does not stop it: a walk that accepted it would climb
 /// straight out of the home into the data dir. So a `rel` carrying `..`, or a leading `/`, is refused
@@ -998,8 +999,9 @@ fn open_dir_nofollow(parent: Option<&OwnedFd>, name: &std::ffi::CStr) -> io::Res
 /// so it cannot reach anywhere, and `./.npm` is a name a user writes. An empty `rel` names `home`.
 ///
 /// A link that stays *inside* the home is refused too, where `contained_in` follows it. That is a
-/// narrowing, and the fail-closed side of one: the caller is a verb whose only action is to delete.
-fn open_beneath(home: &Path, rel: &Path) -> io::Result<OwnedFd> {
+/// narrowing, and the fail-closed side of one: the sweeps here are verbs whose only action is to
+/// delete, and a pool left out of the shared list is one the app installs for itself.
+pub(super) fn open_beneath(home: &Path, rel: &Path) -> io::Result<OwnedFd> {
     use std::os::unix::ffi::OsStrExt;
 
     let anchor = std::ffi::CString::new(home.as_os_str().as_bytes()).map_err(io::Error::other)?;
