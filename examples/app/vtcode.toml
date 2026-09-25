@@ -42,7 +42,28 @@
 # UNVERIFIED (like every profile until run with a real key): the live authentication and the model
 # traffic through sbx's MITM. Grounded here: the packaging (upstream's own GitHub release), the
 # default provider and model, and the provider env-var names (upstream's provider guide).
-cmd = "vtcode"
+#
+# The command hands VT Code the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as an instruction file, through the
+# system-wide `/etc/vtcode/vtcode.toml`, the lowest of VT Code's config layers. `/etc` is the cage's
+# own tmpfs, so the file lives for this launch only and never reaches the host. VT Code replaces an
+# array from a higher layer rather than joining it: if your own config sets `agent.instruction_files`,
+# yours applies and the summary is left out, so add `"/opt/sbx/contract-summary.md"` to your list to
+# keep both. The same rule is why the summary is not passed as `-c agent.instruction_files=…`: that
+# runtime layer sits above yours and would drop your list.
+# Arguments after `sbx app run vtcode --` reach VT Code verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/vtcode 2>/dev/null; then
+  printf '%s\n' '[agent]' 'instruction_files = ["/opt/sbx/contract-summary.md"]' > /etc/vtcode/vtcode.toml
+fi
+exec vtcode "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "vtcode",
+]
 
 # Your host VT Code config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
