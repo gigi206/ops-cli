@@ -157,6 +157,13 @@ exec cursor --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
 ''',
 ]
 
+# No `contract`: Cursor's agent takes its rules from the workspace (`AGENTS.md`, `.cursor/rules/`)
+# and from the User Rules of your account, and sbx writes into neither; the channels measured on the
+# CLI are listed in the `cursor-agent` profile. Point the agent at the summary yourself: add a User
+# Rule (Settings → Rules) such as "When the environment variable SBX_SANDBOX is 1, read the file
+# named by SBX_CONTRACT_SUMMARY before anything else", or say it in your first prompt. The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch, so the rule never needs editing.
+
 gui = "wayland"
 gpu = true
 audio = true
