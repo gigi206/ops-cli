@@ -695,6 +695,18 @@ mod tests {
         assert_eq!(seen, [".one", ".two"]);
     }
 
+    /// `sbx app show` prints these names, and the cage chose them: a name carrying a character that
+    /// acts on the terminal is shown filtered, at its own level and in the prefix of the level
+    /// opened under it.
+    #[test]
+    fn a_home_entry_the_cage_named_is_shown_filtered_at_every_level() {
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.join("home");
+        file_of(&home, "w\x1b[2Kx/in\ry/f", 64 * 1024);
+        let got: Vec<String> = home_composition(&home).into_iter().map(|e| e.rel).collect();
+        assert_eq!(got, ["w [2Kx", "w [2Kx/in y", "w [2Kx/in y/f"]);
+    }
+
     #[test]
     fn a_link_is_never_opened() {
         // Opening it would report a tree that is not under this home, named as if it were: the
@@ -1327,7 +1339,8 @@ const MAX_DESCENT: usize = 3;
 /// One line of a home's composition.
 #[derive(serde::Serialize)]
 pub(crate) struct HomeEntry {
-    /// The entry's path relative to the home.
+    /// The entry's path relative to the home, each name run through [`crate::sandbox::sanitize`]:
+    /// the cage names what its home holds, and `sbx app show` prints this, as text or as JSON.
     pub(crate) rel: String,
     /// On-disk size of the data the entry holds.
     pub(crate) bytes: u64,
@@ -1388,7 +1401,10 @@ pub(crate) fn home_composition(home: &Path) -> Vec<HomeEntry> {
             level
                 .into_iter()
                 .map(|(name, bytes)| HomeEntry {
-                    rel: format!("{prefix}{}", name.to_string_lossy()),
+                    rel: format!(
+                        "{prefix}{}",
+                        crate::sandbox::sanitize(&name.to_string_lossy())
+                    ),
                     bytes,
                     depth,
                 })
@@ -1401,7 +1417,10 @@ pub(crate) fn home_composition(home: &Path) -> Vec<HomeEntry> {
         if !descends_into(&next) {
             break;
         }
-        prefix = format!("{prefix}{}/", leader.to_string_lossy());
+        prefix = format!(
+            "{prefix}{}/",
+            crate::sandbox::sanitize(&leader.to_string_lossy())
+        );
         dir = next;
     }
     // A level opens the entry above it, so it is spliced in directly after that entry rather than

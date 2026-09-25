@@ -1407,7 +1407,8 @@ pub(crate) fn reset_home(home: &Path, apply: bool) -> Vec<DroppedEntry> {
             continue;
         };
         named.push(Named {
-            rel: name.to_string_lossy().into_owned(),
+            // The cage chose this name, and the report prints it; the removal goes by `name`.
+            rel: crate::sandbox::sanitize(&name.to_string_lossy()),
             path: real_home.join(&name),
             dir,
             name,
@@ -1418,7 +1419,8 @@ pub(crate) fn reset_home(home: &Path, apply: bool) -> Vec<DroppedEntry> {
 
 /// One entry a removal was asked for, resolved both ways it has to be.
 struct Named {
-    /// The name to report it under, as the caller wrote it.
+    /// The name to report it under: as the caller wrote it for `--drop`, filtered for display for
+    /// `--reset`, whose names the cage wrote.
     rel: String,
     /// Where its size is read from. Sizing removes nothing, so it stays a path: a component swapped
     /// under it costs a miscounted byte, never a deletion somewhere else.
@@ -2898,6 +2900,27 @@ mod tests {
         assert!(
             home.join(".config/f").exists(),
             "a preview emptied the home"
+        );
+    }
+
+    /// A reset reports every entry of a home by name, and the cage names them: the report carries
+    /// the filtered form a terminal may see, while the entry itself goes by the name it has.
+    #[test]
+    fn a_reset_reports_a_cage_chosen_name_filtered_and_still_removes_it() {
+        let tmp = TmpDir::new();
+        let raw = "r\x1b[31mx";
+        let home = home_with(tmp.path(), &[(raw, 128)]);
+
+        let taken = reset_home(&home, true);
+
+        assert_eq!(
+            taken.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(),
+            vec![crate::sandbox::sanitize(raw)]
+        );
+        assert!(!taken[0].rel.contains('\x1b'));
+        assert!(
+            std::fs::symlink_metadata(home.join(raw)).is_err(),
+            "the entry reported must be the one that went"
         );
     }
 
