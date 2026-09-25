@@ -170,6 +170,14 @@ mute = [
 # read on the HOST, on the wire, for the pilot `opencode` agent.
 [env]
 ORCA_TELEMETRY_DISABLED = "1"
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers) added to the pilot `opencode` agent's instructions, so a refused host
+# or a read-only file reads as the sandbox rather than as a fault to work around. Orca hands its
+# environment to the agents it starts, and the config directory it sets for opencode does not stop
+# this one being read. opencode merges this inline config over the others and concatenates
+# `instructions`, so the summary comes next to your `AGENTS.md` and the `instructions` of your
+# `opencode.json`, never in place of them.
+OPENCODE_CONFIG_CONTENT = '{"instructions":["/opt/sbx/contract-summary.md"]}'
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
