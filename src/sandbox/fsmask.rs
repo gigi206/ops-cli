@@ -255,23 +255,21 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     // Every question below is asked of the host's git, and a `.git` or a `.git/config` reached
     // through a link, or a `.git/commondir`, would have it answer from elsewhere: refused first,
     // and nothing is asked.
+    let main = GitRepo::main(&root);
+    let protected = git_protected(&root, policy.git_writable());
     let layout = git_dir_link_refusal(&root, policy.git_writable())
         .or_else(|| git_file_target_refusal(&root, policy.git_writable()))
-        .or_else(|| git_commondir_refusal(&root, policy.git_writable()));
+        .or_else(|| protected.then(|| git_repo_refusal(&root, &main)).flatten());
     let (hooks, includes, worktree) = match layout {
         Some(reason) => {
             out.refused.get_or_insert(reason);
             (Vec::new(), Vec::new(), Vec::new())
         }
+        None if !protected => (Vec::new(), Vec::new(), Vec::new()),
         None => (
-            git_hook_dirs(
-                &root,
-                policy.git_writable(),
-                &mut out.warnings,
-                &mut out.refused,
-            ),
-            git_include_files(&root, policy.git_writable(), &mut out.refused),
-            git_worktree_files(&root, policy.git_writable(), &mut out.refused),
+            git_hook_dirs(&root, &main, &mut out.warnings, &mut out.refused),
+            git_include_files(&root, &main, &mut out.refused),
+            git_worktree_files(&root, &main, &mut out.refused),
         ),
     };
     for mut m in builtin
@@ -468,6 +466,32 @@ fn git_protected(root: &Path, git_writable: bool) -> bool {
     !git_writable && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir())
 }
 
+/// A repository whose files the host's git reads: its git directory, and the top of the work tree
+/// a relative `core.hooksPath` resolves against.
+struct GitRepo {
+    dir: PathBuf,
+    work_tree: PathBuf,
+}
+
+impl GitRepo {
+    /// The project's own repository: `<root>/.git`, with the project as its work tree.
+    fn main(root: &Path) -> Self {
+        GitRepo {
+            dir: root.join(".git"),
+            work_tree: root.to_path_buf(),
+        }
+    }
+
+    /// `name` inside the git directory, as the project spells it, for a pattern or a message.
+    fn shown(&self, root: &Path, name: &str) -> String {
+        let path = self.dir.join(name);
+        path.strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+    }
+}
+
 /// Whether the project's `.git` is a file while no trusted layer set `git_writable`: the pointer a
 /// linked worktree or a submodule keeps to its repository, which is read-only in the cage.
 fn git_file_protected(root: &Path, git_writable: bool) -> bool {
@@ -538,32 +562,36 @@ fn git_linked(root: &Path, git_writable: bool) -> bool {
         && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.file_type().is_symlink())
 }
 
-/// The refusal a `.git` or a `.git/config` that is a symbolic link earns, or `None`.
+/// The refusal a `.git` that is a symbolic link earns, or `None`.
 ///
 /// The launch holds `.git` in place and lays its masks on the paths inside it, which protects what
-/// git reads there only while those paths are the ones git reads. A link at either is a name the
-/// cage could point elsewhere during the session ([`git_link_on_the_way`]), and a `.git` that is a
-/// link would leave nothing protected at all, since the carrier is looked for in a directory. Both
-/// are checked before any question is asked of the host's git, which would read through them.
+/// git reads there only while those paths are the ones git reads. A `.git` that is a link is a name
+/// the cage could point elsewhere during the session ([`git_link_on_the_way`]), and it would leave
+/// nothing protected at all, since the carrier is looked for in a directory. It is checked before
+/// any question is asked of the host's git, which would read through it.
 fn git_dir_link_refusal(root: &Path, git_writable: bool) -> Option<String> {
-    let git = root.join(".git");
-    if git_linked(root, git_writable) {
-        return Some(git_link_refusal(
-            &git,
+    git_linked(root, git_writable).then(|| {
+        git_link_refusal(
+            &root.join(".git"),
             "the repository your git reads",
             "Replace it with the directory it names",
-        ));
-    }
-    if !git_protected(root, git_writable) {
-        return None;
-    }
+        )
+    })
+}
+
+/// The refusal a repository's own layout earns, or `None`: a `config` that is a symbolic link, the
+/// same name the cage could point elsewhere as a `.git` link ([`git_link_on_the_way`]), or a
+/// `commondir` ([`git_commondir_refusal`]). Both are checked before any question is asked of the
+/// host's git, which would read through them.
+fn git_repo_refusal(root: &Path, repo: &GitRepo) -> Option<String> {
     git_link_on_the_way(
         root,
-        &git.join("config"),
+        &repo.dir.join("config"),
         "the configuration your git reads",
         "Replace it with the file it names, or keep that file in the project and include it from a \
          `.git/config` of its own (`git config include.path <file>`), which sbx protects in place",
     )
+    .or_else(|| git_commondir_refusal(root, repo))
 }
 
 /// The directories git runs hooks from, as read-only masks: `.git/hooks`, and the directory
@@ -577,7 +605,7 @@ fn git_dir_link_refusal(root: &Path, git_writable: bool) -> Option<String> {
 /// which is what `git init` makes. `sbx test fs` and the in-cage contract read this same list, so
 /// they describe the directory the launch will protect, not the absence it found.
 ///
-/// **`core.hooksPath` is asked of the host's own git** (`git --git-dir <project>/.git config --get`),
+/// **`core.hooksPath` is asked of the host's own git** (`git --git-dir <git dir> config --get`),
 /// because the value that matters is the one the host's git will act on, include files and the
 /// global config among what decides it. husky points it at `.husky/_`, inside the working tree and
 /// ignored by git: a hook rewritten there does not even show in `git status`. With no git on the
@@ -589,20 +617,17 @@ fn git_dir_link_refusal(root: &Path, git_writable: bool) -> Option<String> {
 /// names the form sbx holds in place: `core.hooksPath` pointed at the directory itself.
 fn git_hook_dirs(
     root: &Path,
-    git_writable: bool,
+    repo: &GitRepo,
     warnings: &mut Vec<String>,
     refused: &mut Option<String>,
 ) -> Vec<Masked> {
-    if !git_protected(root, git_writable) {
-        return Vec::new();
-    }
     let mut dirs = vec![(
-        root.join(".git/hooks"),
-        ".git/hooks/".to_string(),
+        repo.dir.join("hooks"),
+        format!("{}/", repo.shown(root, "hooks")),
         "Replace it with the directory it names, or remove it and point `core.hooksPath` at that \
          directory (`git config core.hooksPath <dir>`), which sbx protects in place",
     )];
-    if let Some(named) = git_hooks_path(root) {
+    if let Some(named) = git_hooks_path(repo) {
         let shown = format!("core.hooksPath = {}", named.display());
         dirs.push((
             named,
@@ -667,19 +692,19 @@ fn git_hook_dirs(
     out
 }
 
-/// Ask the host's own git a `config` question about the repository at `<root>/.git`, returning
-/// its standard output, or `None` when there is no trusted git on the host, when git does not read
-/// `<root>/.git` as a repository, or when nothing matches (git's exit status 1).
+/// Ask the host's own git a `config` question about `repo`, returning its standard output, or
+/// `None` when there is no trusted git on the host, when git does not read the repository's git
+/// directory as one, or when nothing matches (git's exit status 1).
 ///
 /// `--git-dir` rather than `-C`, so a `.git` git does not recognise is not answered by a repository
 /// discovered above it. The answer is the one the host's git acts on — the global and system files
 /// and every include count — which is the point of asking git rather than reading the file. And
 /// `git config` reads configuration and runs nothing it names: no hook, no fsmonitor, no pager.
-fn host_git_config(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+fn host_git_config(repo: &GitRepo, args: &[&str]) -> Option<Vec<u8>> {
     let git = crate::store::resolve_git()?;
     let out = std::process::Command::new(git)
         .arg("--git-dir")
-        .arg(root.join(".git"))
+        .arg(&repo.dir)
         .arg("config")
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -703,17 +728,17 @@ fn git_config_path(value: &str, base: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-/// The host git's `core.hooksPath` for the repository at `<root>/.git`, resolved the way git
-/// resolves it for a working tree (a relative value against the top of the tree), or `None` when it
-/// is unset or cannot be asked ([`host_git_config`]).
-fn git_hooks_path(root: &Path) -> Option<PathBuf> {
-    let out = host_git_config(root, &["--get", "core.hooksPath"])?;
+/// The host git's `core.hooksPath` for `repo`, resolved the way git resolves it for a working tree
+/// (a relative value against the top of the tree), or `None` when it is unset or cannot be asked
+/// ([`host_git_config`]).
+fn git_hooks_path(repo: &GitRepo) -> Option<PathBuf> {
+    let out = host_git_config(repo, &["--get", "core.hooksPath"])?;
     let value = String::from_utf8(out).ok()?;
     let value = value.trim_end_matches('\n');
     if value.is_empty() {
         return None;
     }
-    git_config_path(value, Some(root))
+    git_config_path(value, Some(&repo.work_tree))
 }
 
 /// The files inside the project that an `include.path` or `includeIf.<condition>.path` makes part
@@ -732,12 +757,9 @@ fn git_hooks_path(root: &Path) -> Option<PathBuf> {
 /// sbx's to write into the user's tree the way an empty hooks directory is. The refusal names the
 /// file and the way out. An include reached through a symbolic link inside the project refuses
 /// the launch as well, wherever the link leads ([`git_link_on_the_way`]).
-fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<String>) -> Vec<Masked> {
-    if !git_protected(root, git_writable) {
-        return Vec::new();
-    }
+fn git_include_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
     let Some(out) = host_git_config(
-        root,
+        repo,
         &[
             "-z",
             "--show-origin",
@@ -827,8 +849,7 @@ fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<Strin
     masks
 }
 
-/// The refusal a `.git/commondir` in the project's own repository earns, or `None` when there is
-/// none or the git carrier is not protected.
+/// The refusal a `commondir` in `repo`'s own git directory earns, or `None` when there is none.
 ///
 /// git writes `commondir` only in a linked worktree's directory under `.git/worktrees/`, never in a
 /// main repository's `.git`. Where one is present, the configuration the host's git reads comes
@@ -841,15 +862,13 @@ fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<Strin
 /// stand in its place, since git refuses to run on an empty file or a directory there. The cage can
 /// therefore create one during a session: the end of that session names it ([`GitWatch`]), and the
 /// next launch refuses on it.
-fn git_commondir_refusal(root: &Path, git_writable: bool) -> Option<String> {
-    if !git_protected(root, git_writable) {
-        return None;
-    }
-    let path = root.join(".git/commondir");
+fn git_commondir_refusal(root: &Path, repo: &GitRepo) -> Option<String> {
+    let path = repo.dir.join("commondir");
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(format!(
-            "`.git/commondir`: {}",
+            "`{}`: {}",
+            repo.shown(root, "commondir"),
             visible(&git_unreadable("look at", &path, &e))
         )),
         Ok(_) => Some(format!(
@@ -882,16 +901,9 @@ fn git_commondir_refusal(root: &Path, git_writable: bool) -> Option<String> {
 /// [`MASK_MAX`]: more worktrees than masks can hold refuses the launch rather than reading on. What
 /// holding these costs is `git worktree remove` and `prune` of a worktree that existed at launch,
 /// which cannot delete its directory from the cage.
-fn git_worktree_files(
-    root: &Path,
-    git_writable: bool,
-    refused: &mut Option<String>,
-) -> Vec<Masked> {
-    if !git_protected(root, git_writable) {
-        return Vec::new();
-    }
+fn git_worktree_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
     let extension = host_git_config(
-        root,
+        repo,
         &[
             "--local",
             "--type=bool",
@@ -901,7 +913,7 @@ fn git_worktree_files(
     )
     .is_some_and(|out| out.trim_ascii() == b"true");
     let mut out: Vec<Masked> = Vec::new();
-    let git = root.join(".git");
+    let git = &repo.dir;
     worktree_file(
         root,
         &git.join("config.worktree"),
