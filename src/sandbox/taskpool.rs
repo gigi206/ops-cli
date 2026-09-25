@@ -88,7 +88,7 @@ fn installs_dir(pool: &Path) -> PathBuf {
 /// mise's separator is `@`, which also opens an npm scope (`npm:@example/tool`), so the split is
 /// looked for only in the token's **last path segment** and only past its first character:
 /// `npm:@example/tool` has no version, `npm:@example/tool@1.2` has `1.2`, `node@22` has `22`.
-fn split_version(token: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_version(token: &str) -> (&str, Option<&str>) {
     let segment_start = token.rfind('/').map(|i| i + 1).unwrap_or(0);
     let segment = &token[segment_start..];
     match segment.char_indices().skip(1).find(|(_, c)| *c == '@') {

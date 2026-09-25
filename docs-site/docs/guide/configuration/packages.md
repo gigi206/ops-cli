@@ -145,6 +145,16 @@ lists it) or rebuild the home from scratch with [`sbx app rm --purge`](../cli/ap
 Note: an `npm:` tool needs `/usr/bin/env` (the cage provides a synthetic one) and, if
 it is pure JS, a node runtime: declare `nodejs = "nix:nodejs"` alongside it.
 
+A `pipx:` tool is installed into a virtualenv built on the Python the profile declares
+(`python = "nix:python312"`), and that virtualenv links to the interpreter's store path. When
+the home's [nixpkgs pin](nixpkgs) moves, the old interpreter leaves the cage, but mise still
+counts the tool as installed, and a roll finds nothing to do when upstream has not released
+since. So each launch checks the `pipx:` tools it equips: one whose interpreter is gone is
+reinstalled at the same version before the app starts, and the launch says so
+(`sbx: <tool>: the Python its environment was built on is no longer in the cage; reinstalling
+it`). The reinstall fetches from PyPI, so under an allowlist it needs the same hosts as the
+first install.
+
 **`mise:` is the one backend equipped inside the cage**: every other backend is
 provisioned host-side, before the cage, so only `mise:` is governed by the cage's
 [`network`](network) posture. In practice: under an allowlist the backend's

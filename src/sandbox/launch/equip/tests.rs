@@ -312,6 +312,90 @@ fn running_the_equip_script_gives_mise_the_pinned_dir_and_the_command_the_ambien
     }
 }
 
+/// A stand-in `mise` that appends its whole argv, one line per call, to `$SBX_TEST_RECORD`.
+fn argv_recording_stub(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        "#!/bin/sh\necho \"mise $*\" >> \"$SBX_TEST_RECORD\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
+    // A pipx virtualenv links `bin/python` to the store path of the interpreter it was built on,
+    // and mise keeps counting it as installed after that path leaves the cage. Run the script
+    // against a real tree, so the test sees which installs the checks pick and not only the text.
+    let bash = std::path::PathBuf::from("/bin/bash");
+    if !bash.is_file() {
+        skip_incapable!("skipping equip-script run: no /bin/bash on this host");
+        return;
+    }
+    let dir = crate::testutil::TmpDir::new();
+    let mise = dir.path().join("mise");
+    argv_recording_stub(&mise);
+    let pool = dir.path().join("pool");
+    let installs = pool.join("installs");
+    let venv = |tool: &str, version: &str, python: &std::path::Path| {
+        let bin = installs.join(tool).join(version).join("env").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(python, bin.join("python")).unwrap();
+    };
+    let gone =
+        std::path::Path::new("/nix/store/00000000000000000000000000000000-python3/bin/python");
+    let present = dir.path().join("python");
+    std::fs::write(&present, "").unwrap();
+    // Broken: its interpreter is gone. mise's alias link to it must not trigger a second repair.
+    venv("pipx-broken-tool", "1.2.0", gone);
+    std::os::unix::fs::symlink("./1.2.0", installs.join("pipx-broken-tool").join("latest"))
+        .unwrap();
+    // Healthy: its interpreter is present.
+    venv("pipx-healthy-tool", "3.0", &present);
+    // Not a pipx token, even though its install looks like a broken virtualenv.
+    venv("aqua-example-demo-tool", "0.1", gone);
+    // `pipx:absent-tool` has no install at all.
+    let tokens = vec![
+        "pipx:broken-tool".to_string(),
+        "pipx:healthy-tool@3.0".to_string(),
+        "pipx:absent-tool".to_string(),
+        "aqua:example/demo-tool".to_string(),
+    ];
+
+    for pin in [Some(pool.to_str().unwrap()), None] {
+        let record = dir.path().join("record");
+        let _ = std::fs::remove_file(&record);
+        let argv = wrap_mise_equip(
+            &mise,
+            &bash,
+            "use -g --pin",
+            &tokens,
+            pin,
+            vec![OsString::from("true")],
+        );
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("SBX_TEST_RECORD", &record)
+            .env("MISE_DATA_DIR", &pool)
+            .output()
+            .expect("run the generated equip script");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the equip script failed: {stderr}");
+        let calls = std::fs::read_to_string(&record).expect("the stub recorded its calls");
+        assert_eq!(
+            calls,
+            "mise install --force pipx:broken-tool@1.2.0\n\
+             mise use -g --pin pipx:broken-tool pipx:healthy-tool@3.0 pipx:absent-tool \
+             aqua:example/demo-tool\n",
+            "exactly the broken pipx install is repaired, then the equip runs (pin {pin:?})"
+        );
+        assert!(
+            stderr.contains("sbx: pipx:broken-tool: the Python its environment was built on"),
+            "the repair is announced: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
     // `sbx upgrade mise` rolls `[packages] mise:` tools, which for a global app live in the

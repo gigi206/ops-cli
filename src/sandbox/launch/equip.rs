@@ -148,6 +148,17 @@ pub(super) fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
 /// value is an sbx-owned fixed cage path ([`binds::mise_app_global_data_dir`]) and it is quoted
 /// through [`shell_quote`] rather than wrapped in a pair of literal quotes, so the assignment holds
 /// whatever the path turns out to contain instead of holding because of what it contains today.
+///
+/// A `pipx:` token is also **repaired** before the equip, when its install no longer runs. mise's
+/// pipx backend builds a virtualenv whose `bin/python` links to the absolute store path of the
+/// interpreter it was built on. When the home's nixpkgs pin moves, that interpreter leaves the cage
+/// and the link dangles, while mise still counts the version as installed: the equip does nothing,
+/// a roll with no newer upstream release does nothing, and the app no longer starts. So each
+/// installed version whose `bin/python` link dangles is reinstalled with `mise install --force` at
+/// the same version, in the same data dir the equip uses, with a notice naming the tool. Only the
+/// tokens handed in here are repaired, never a directory the cage created on its own; the version
+/// alias links mise keeps beside the real directories are skipped; and the check is bash tests and
+/// globs only, so a launch where nothing is broken runs no extra process.
 pub(super) fn wrap_mise_equip(
     mise: &Path,
     bash: &Path,
@@ -161,18 +172,63 @@ pub(super) fn wrap_mise_equip(
         Some(dir) => format!("MISE_DATA_DIR={} ", shell_quote(dir)),
         None => String::new(),
     };
+    let mise = shell_quote(&mise.to_string_lossy());
+    // `(locator, install directory, display name)` per `pipx:` token. The directory name is
+    // derived from the token here, never read back from the cage, and all three ride `"$@"`.
+    let repairs: Vec<[String; 3]> = tokens
+        .iter()
+        .filter_map(|token| {
+            let (locator, _) = crate::sandbox::taskpool::split_version(token);
+            locator.starts_with("pipx:").then(|| {
+                [
+                    locator.to_string(),
+                    crate::sandbox::inspect::mise_munge(locator),
+                    crate::sandbox::sanitize(locator),
+                ]
+            })
+        })
+        .collect();
+    let m = repairs.len();
+    let repair = if m == 0 {
+        String::new()
+    } else {
+        let data_dir = match mise_data_dir {
+            Some(dir) => shell_quote(dir),
+            None => "\"${MISE_DATA_DIR:-$HOME/.local/share/mise}\"".to_string(),
+        };
+        format!(
+            "d={data_dir}\n\
+             a=$(({n} + 1)); k={m}\n\
+             while [ \"$k\" -gt 0 ]; do\n\
+             loc=\"${{!a}}\"; b=$((a + 1)); dir=\"${{!b}}\"; c=$((a + 2)); shown=\"${{!c}}\"\n\
+             for v in \"$d/installs/$dir\"/*; do\n\
+             [ -d \"$v\" ] && [ ! -L \"$v\" ] || continue\n\
+             for py in \"$v\"/*/bin/python; do\n\
+             if [ -L \"$py\" ] && [ ! -e \"$py\" ]; then\n\
+             echo \"sbx: $shown: the Python its environment was built on is no longer in the cage; reinstalling it\" 1>&2\n\
+             {data_dir_prefix}{mise} install --force \"$loc@${{v##*/}}\" 1>&2\n\
+             break\n\
+             fi\n\
+             done\n\
+             done\n\
+             a=$((a + 3)); k=$((k - 1))\n\
+             done\n"
+        )
+    };
     let script = format!(
-        "{data_dir_prefix}{mise} {verb} \"${{@:1:{n}}}\" 1>&2; shift {n}; exec \"$@\"",
-        mise = shell_quote(&mise.to_string_lossy()),
+        "{repair}{data_dir_prefix}{mise} {verb} \"${{@:1:{n}}}\" 1>&2; shift {shifted}; exec \"$@\"",
+        shifted = n + 3 * m,
     );
     let mut out = vec![
         bash.as_os_str().to_os_string(),
         OsString::from("-c"),
         OsString::from(script),
-        // `$0` — a label; the tokens are `$1..$n`, the command is what remains after `shift`.
+        // `$0` — a label; the tokens are `$1..$n`, then one `(locator, directory, display name)`
+        // triple per repaired `pipx:` token; the command is what remains after `shift`.
         OsString::from("sbx-mise-equip"),
     ];
     out.extend(tokens.iter().map(OsString::from));
+    out.extend(repairs.into_iter().flatten().map(OsString::from));
     out.extend(cmd);
     out
 }
