@@ -987,6 +987,91 @@ fn every_refusal_category_the_proxy_documents_is_named_in_the_guide() {
     );
 }
 
+/// Every source path the trusted-computing-base section of the architecture page cites exists.
+///
+/// That section names, module by module, the code that reads what a cage chose, so that "one binary
+/// makes the trusted computing base something you can point at" can be checked against the source
+/// rather than taken on trust. The check is only as good as the names: a module renamed, split or
+/// moved leaves a row pointing at nothing, and a reader auditing the list meets a gap where the
+/// code went while nothing has failed.
+///
+/// A cell may write a later path relative to the directory of the `src/` path before it on its line
+/// (`link/judge.rs` after `src/sandbox/proxy/link.rs`), and it is resolved that way. Only a `src/`
+/// path sets that directory, so two relative paths in a row resolve against the same one, and a
+/// relative path with no `src/` path before it on its line has nothing to resolve against and
+/// fails. A path written with a trailing `/` names a directory, any other a file.
+///
+/// It checks presence only: a module that reads what a cage chose and is missing from the tables is
+/// not something a scrape of the tables can see.
+#[test]
+fn every_source_path_the_trusted_computing_base_cites_exists() {
+    let page = std::fs::read_to_string(guide().join("concepts/architecture.md"))
+        .expect("docs-site/docs/guide/concepts/architecture.md must exist");
+    let section = page
+        .split_once("\n## The trusted computing base\n")
+        .expect("the page must keep a `## The trusted computing base` section")
+        .1;
+    // The section runs to the next heading of its own level; its `### ` tables stay inside it.
+    let section = section
+        .split_once("\n## ")
+        .map_or(section, |(inside, _)| inside);
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (mut cited, mut missing, mut unanchored) = (0, Vec::new(), Vec::new());
+    for line in section.lines() {
+        let mut base: Option<&str> = None;
+        // Every other piece of a line split on backticks is the inside of a code span.
+        for span in line.split('`').skip(1).step_by(2) {
+            let path = if span.starts_with("src/") {
+                base = Some(span);
+                PathBuf::from(span)
+            } else if span.ends_with(".rs") {
+                let Some(base) = base else {
+                    unanchored.push(span.to_string());
+                    continue;
+                };
+                let dir = if base.ends_with('/') {
+                    Path::new(base)
+                } else {
+                    Path::new(base).parent().unwrap_or(Path::new(base))
+                };
+                dir.join(span)
+            } else {
+                continue;
+            };
+            cited += 1;
+            let target = root.join(&path);
+            let found = if span.ends_with('/') {
+                target.is_dir()
+            } else {
+                target.is_file()
+            };
+            if !found {
+                missing.push(if path == Path::new(span) {
+                    span.to_string()
+                } else {
+                    format!("{span} (resolved as {})", path.display())
+                });
+            }
+        }
+    }
+    assert!(
+        cited > 30,
+        "the trusted-computing-base section of docs-site/docs/guide/concepts/architecture.md no \
+         longer reads as a list of modules: {cited} source paths found"
+    );
+    assert!(
+        unanchored.is_empty(),
+        "these relative source paths in the trusted-computing-base section have no `src/` path \
+         before them on their line to resolve against: {unanchored:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "the trusted-computing-base section of docs-site/docs/guide/concepts/architecture.md \
+         cites source paths that do not exist: {missing:?}"
+    );
+}
+
 /// How wide a slice around an em dash must be found under `src/` for the dash to count as a
 /// quotation rather than prose.
 ///
