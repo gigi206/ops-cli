@@ -132,11 +132,16 @@ jobs:
         # `head` together -- only `socat` is absent from a runner image). Read from that run's own
         # skip report, not guessed: the report exists so a number like that is visible instead of
         # being carried in someone's head.
+        #
+        # `nftables` brings `nft`, which installs the capture tap's redirect. Without it a launch
+        # wires no tap and says nothing, and the tap's two tests (in `netns`, and the tap e2e in
+        # `run`) return without running. Added on 2026-09-25 ahead of any skip report: whether the
+        # image already carries `nft` could not be read, and the package costs nothing if it does.
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            bubblewrap zsh weston pulseaudio dbus-user-session socat
+            bubblewrap zsh weston pulseaudio dbus-user-session socat nftables
 
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which refuses the
