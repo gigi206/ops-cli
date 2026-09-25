@@ -448,19 +448,38 @@ fn listed_rules(policy: &EgressPolicy, withdrawn: &[String]) -> Vec<Rule> {
         .collect()
 }
 
-/// What a host no rule lists meets, worded by the default action. Shared by both documents, so the
-/// summary cannot promise a posture the contract describes otherwise.
+/// What an HTTPS request no rule admits meets, worded by the default action. Shared by both
+/// documents, so the summary cannot promise a posture the contract describes otherwise.
+///
+/// Worded by request, not by host, because that is how the proxy decides: a rule admits a method
+/// only if its set names it, so a `POST` to a host listed `{GET,HEAD}` matches no rule and falls to
+/// this default like an unlisted host does. Said per host, a listing's method set reads as a limit
+/// the proxy enforces whatever the posture, and under `allow` or `ask` it is not one.
+///
+/// Scoped to HTTPS, because only the inspected plane consults the default: cleartext HTTP and the
+/// raw TCP splice open only on a rule that names them, and a WebSocket only on a rule that names
+/// `WS`. The two postures that would otherwise suggest those are admitted too say that they are
+/// not.
 fn default_line(policy: &EgressPolicy) -> &'static str {
     match policy.default_action() {
-        DefaultAction::Deny => "Any host not listed above is refused (HTTP 403 at the proxy).",
+        DefaultAction::Deny => {
+            "Any HTTPS request no rule above admits — to a host not listed, or with a method a \
+             listed host's rule does not name — is refused (HTTP 403 at the proxy)."
+        }
         DefaultAction::Ask => {
-            "A host not listed above triggers a host-side approval prompt; it is reached \
-             only if a human approves it (and denied if not)."
+            "Any HTTPS request no rule above admits — to a host not listed, or with a method a \
+             listed host's rule does not name — triggers a host-side approval prompt; it goes \
+             through only if a human approves it (and is denied if not). Nothing else is asked \
+             for: a WebSocket needs a rule that names `WS`, and cleartext HTTP or raw TCP a rule \
+             listed for it."
         }
         DefaultAction::Allow => {
-            "Egress is open by default (a denylist posture): any other host is also \
-             reachable, except ones the policy explicitly denies. The proxy still inspects \
-             traffic, so deny carve-outs and credential redaction remain in force."
+            "Egress is open by default (a denylist posture): any HTTPS request no rule above \
+             admits — to a host not listed, or with a method a listed host's rule does not name \
+             — is also allowed, except ones the policy explicitly denies. Nothing else is open by \
+             default: a WebSocket needs a rule that names `WS`, and cleartext HTTP or raw TCP a \
+             rule listed for it. The proxy still inspects traffic, so deny carve-outs and \
+             credential redaction remain in force."
         }
     }
 }
@@ -2031,6 +2050,34 @@ mod tests {
             assert!(text.contains(expected), "{action:?}: {text}");
             assert!(text.contains("`ping` always fails"), "{action:?}: {text}");
             assert!(text.contains(DENY_CAVEAT), "{action:?}: {text}");
+        }
+    }
+
+    // A method set is a limit only under `deny`: under the other two an HTTPS request with a method
+    // no rule names falls to the default like an unlisted host. And only HTTPS does: a WebSocket,
+    // cleartext HTTP and raw TCP open on a rule of their own whatever the posture. Each closing line
+    // says so, so neither a listing's `{GET,HEAD}` nor an open posture is read as more than it is.
+    #[test]
+    fn the_default_line_covers_a_method_no_rule_names() {
+        for action in [
+            DefaultAction::Deny,
+            DefaultAction::Ask,
+            DefaultAction::Allow,
+        ] {
+            let policy = policy_from(&["https://api.demo.test"], &[]).with_default(action);
+            let line = default_line(&policy);
+            assert!(
+                line.contains("with a method a listed host's rule does not name"),
+                "{action:?}: {line}"
+            );
+            assert!(line.starts_with("Any HTTPS request") || line.contains("any HTTPS request"));
+            for other_plane in ["needs a rule that names `WS`", "cleartext HTTP or raw TCP"] {
+                assert_eq!(
+                    line.contains(other_plane),
+                    action != DefaultAction::Deny,
+                    "{action:?}: {line}"
+                );
+            }
         }
     }
 
