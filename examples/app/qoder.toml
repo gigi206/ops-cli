@@ -47,6 +47,15 @@
 # the two auth paths (the package's own documentation).
 cmd = "qodercli"
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects, which
+# operations it offers) appended to Qoder's system prompt through `--append-system-prompt-file`,
+# which the CLI reads at startup and joins to its own prompt rather than replacing it (read out of
+# the shipped bundle). A text value wins over the file: a `QODER_APPEND_SYSTEM_PROMPT` in the
+# environment, or an `--append-system-prompt` passed after `sbx app run qoder --`, silently drops
+# the summary. Not measured: Qoder needs a Qoder account before it starts a turn. Bound to this
+# `cmd`: a project that sets its own `cmd` for this app writes its own `contract`, or has none.
+contract = { arg = "--append-system-prompt-file" }
+
 # Your host Qoder config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
 # CLI read and write these host files (login, settings). Uncomment to share your host Qoder setup
