@@ -73,7 +73,9 @@ the file it protects for the whole session, for your own tools afterwards, and a
 launch, which resolves `[fs]` again by that path. The directories stay writable inside;
 renaming or removing one of them fails with `EBUSY`, and a `rename` across one's boundary fails
 with `EXDEV`, which `mv` answers by copying instead. Each held directory is a mount, and counts
-toward the same ceiling as the masks.
+toward the same ceiling as the masks. This holds when you launch from your home as well, where
+`sbx` [pins its own directories](../concepts/security-model#the-control-plane-is-pinned) under
+`.config` and `.local`: those pins are laid around the masks, never over them.
 
 ### Entries that overlap
 

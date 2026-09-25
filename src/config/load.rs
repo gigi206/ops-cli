@@ -430,7 +430,10 @@ fn root_at_or_above<'a>(canon: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBu
 /// does append binds after them (the task control socket and its generated client), and those are
 /// safe not because they come first — they do not — but because their destinations are sbx's own
 /// constants: nothing a project configures chooses them. **A bind appended after the pins whose
-/// destination is derived from the configuration would break the protection.**
+/// destination is derived from the configuration would break the protection.** The one exception
+/// is a bind that can only close: the launcher lays the `[fs]` masks that fall inside a pin again
+/// after the pins, each read-only and bound from the path itself or from sbx's own decoy, so none
+/// can substitute what a pin holds.
 ///
 /// Iterates the same root set as [`control_plane_mode`], so a root added there is pinned here
 /// automatically.

@@ -818,6 +818,81 @@ echo "F:$(touch /nix/.sbx-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
 }
 
 #[test]
+fn an_fs_mask_under_a_pinned_directory_stays_closed_when_launched_from_home() {
+    // A launch from the directory that holds sbx's own roots (`cd ~ && sbx run`) pins those roots
+    // after the `[fs]` binds, and the pin chain runs above a mask under the config home or inside
+    // the data dir. Both masks must stay closed, the directory held above the first must keep its
+    // path, sbx's data dir must stay read-only, and the rest of the config home writable. Only a
+    // real launch lays the two emitters in their real order. Skips (never fails) where the host
+    // cannot sandbox.
+    let home = TmpDir::prefixed("r", "cpm");
+    // Single-letter roots, for the socket-path budget the test above explains.
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let data = h.join("d");
+    let state = h.join("s");
+    let config = h.join("c");
+    let data_dir = data.join("sbx");
+    assert!(
+        data_dir.as_os_str().len() <= 74,
+        "this fixture's data directory is {} bytes ({}) and a launch accepts at most 74. Point \
+         SBX_TEST_TMPDIR at a shorter fixture root (e.g. /tmp/sbx-t) and rerun.",
+        data_dir.as_os_str().len(),
+        data_dir.display()
+    );
+    std::fs::create_dir_all(config.join("gh")).unwrap();
+    std::fs::write(config.join("gh/hosts.yml"), b"HOSTS\n").unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join("witness"), b"WITNESS\n").unwrap();
+    std::fs::write(
+        h.join(".sbx.toml"),
+        "[fs]\ndeny = [\"c/gh/hosts.yml\", \"d/sbx/witness\"]\n",
+    )
+    .unwrap();
+
+    let run = |script: &str| {
+        sbx()
+            .arg("run")
+            .arg("--")
+            .arg("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&h)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", &config)
+            .output()
+            .expect("spawn sbx run")
+    };
+    probe_or_skip!("home-launch fs-mask e2e", run("true"));
+
+    let out = run(
+        r#"echo "M1:$(cat c/gh/hosts.yml 2>/dev/null || echo CLOSED)"
+echo "M2:$(cat d/sbx/witness 2>/dev/null || echo CLOSED)"
+if mv c/gh c/gh.moved 2>/dev/null; then echo "H:MOVED"; mv c/gh.moved c/gh; else echo "H:HELD"; fi
+echo "R:$(touch d/sbx/probe 2>/dev/null && echo WRITABLE || echo RO)"
+echo "W:$(touch c/new 2>/dev/null && echo OK || echo FAIL)"
+"#,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the launch failed: {stderr}\nstdout: {stdout}"
+    );
+    for line in ["M1:CLOSED", "M2:CLOSED", "H:HELD", "R:RO", "W:OK"] {
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "expected `{line}`: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(config.join("gh/hosts.yml")).unwrap(),
+        b"HOSTS\n",
+        "the host file is untouched"
+    );
+}
+
+#[test]
 fn sbx_app_launches_the_apps_command_with_its_overlay() {
     let project = TmpDir::prefixed("r", "appproj");
     let data = TmpDir::prefixed("r", "appdata");

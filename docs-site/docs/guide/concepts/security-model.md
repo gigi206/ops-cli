@@ -134,6 +134,11 @@ handled fail-closed and warned about; see [`binds`](../configuration/binds).)
   `sbx`'s own directories is the same request as a read-write bind over it. It is
   mounted **read-only**, with a warning naming the directory. Launch from somewhere
   else if you need to write there.
+- An [`[fs]`](../configuration/fs) mask keeps its effect where the pins run above it,
+  as they do under `.config` and `.local` when you launch from your home. The pins are
+  laid around the masks and the directories holding them, never over them, and a mask
+  inside one of `sbx`'s own directories is applied again after the pin that keeps that
+  directory read-only.
 
 This closes an escalation where a writable parent directory would let the agent
 substitute a forged control-plane directory. See [`binds`](../configuration/binds)

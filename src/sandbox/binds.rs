@@ -533,7 +533,7 @@ pub(crate) struct ExtraBind {
 
 impl ExtraBind {
     /// The mount this bind is emitted as.
-    fn mount(&self) -> Mount {
+    pub(in crate::sandbox) fn mount(&self) -> Mount {
         if self.writable {
             Mount::Bind {
                 src: self.src.clone(),

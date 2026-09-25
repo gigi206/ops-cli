@@ -206,7 +206,7 @@ fn a_control_plane_pin_that_lands_on_an_fs_mask_is_dropped() {
         ..Default::default()
     };
     assert!(
-        pins_clear_of_masks(pins.clone(), &masks).is_empty(),
+        pins_clear_of_masks(pins.clone(), &masks, &[]).is_empty(),
         "a pin over a denied directory hands the cage back the real one, read-write"
     );
 
@@ -215,7 +215,7 @@ fn a_control_plane_pin_that_lands_on_an_fs_mask_is_dropped() {
         readonly: vec![masked(home.join(".config"))],
         ..Default::default()
     };
-    assert!(pins_clear_of_masks(pins.clone(), &masks).is_empty());
+    assert!(pins_clear_of_masks(pins.clone(), &masks, &[]).is_empty());
 
     // A mask elsewhere in the project does not cost the control plane its pins.
     masks = crate::sandbox::fsmask::Expanded {
@@ -223,15 +223,221 @@ fn a_control_plane_pin_that_lands_on_an_fs_mask_is_dropped() {
         ..Default::default()
     };
     assert_eq!(
-        pins_clear_of_masks(pins.clone(), &masks).len(),
+        pins_clear_of_masks(pins.clone(), &masks, &[]).len(),
         2,
         "only a mask the pin sits under may drop it"
     );
     // And neither does no mask at all, which is every launch without an `[fs]` section.
     assert_eq!(
-        pins_clear_of_masks(pins, &crate::sandbox::fsmask::Expanded::default()).len(),
+        pins_clear_of_masks(pins, &crate::sandbox::fsmask::Expanded::default(), &[]).len(),
         2
     );
+}
+
+/// What the cage finds at `path` once `binds` are laid in order: the last one bound at the path or
+/// at a directory above it. That is the rule measured with bubblewrap, which binds the host's view
+/// of a directory and so covers every mount the cage had below it.
+fn found_at<'b>(binds: &'b [binds::ExtraBind], path: &Path) -> Option<&'b binds::ExtraBind> {
+    binds.iter().rev().find(|b| path.starts_with(&b.dest))
+}
+
+/// A control-plane pin laid above an `[fs]` bind must not cover it, and the control plane must stay
+/// read-only around a mask laid inside it, directories held there included.
+///
+/// The chains are the ones `cd ~ && sbx run` produces, and the `[fs]` binds are what a mask under
+/// `.config` and a mask inside the data dir emit: the directories held above them, then the masks.
+/// This is the arrangement itself. The cage below cannot tell the second rule apart, since without
+/// it the third lays the masks again and a covered mount point still refuses a rename.
+#[test]
+fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
+    let home = PathBuf::from("/home/agent");
+    let bind = |path: &str, writable: bool| binds::ExtraBind {
+        src: home.join(path),
+        dest: home.join(path),
+        writable,
+    };
+    let mask = |path: &str| binds::ExtraBind {
+        src: PathBuf::from("/data/fs/mask-1/file"),
+        dest: home.join(path),
+        writable: false,
+    };
+    let pins = vec![
+        bind(".config", true),
+        bind(".config/sbx", false),
+        bind(".local", true),
+        bind(".local/share", true),
+        bind(".local/share/sbx", false),
+    ];
+    let fs_binds = vec![
+        bind(".config", true),
+        bind(".config/gh", true),
+        bind(".local", true),
+        bind(".local/share", true),
+        bind(".local/share/sbx", true),
+        bind(".local/share/sbx/sub", true),
+        mask(".config/gh/hosts.yml"),
+        mask(".local/share/sbx/sub/secret"),
+    ];
+    let laid: Vec<binds::ExtraBind> = fs_binds
+        .iter()
+        .cloned()
+        .chain(pins_clear_of_masks(
+            pins,
+            &crate::sandbox::fsmask::Expanded::default(),
+            &fs_binds,
+        ))
+        .collect();
+
+    for path in [".config/gh/hosts.yml", ".local/share/sbx/sub/secret"] {
+        assert_eq!(
+            found_at(&laid, &home.join(path)),
+            Some(&mask(path)),
+            "`{path}` must stay masked: {laid:#?}"
+        );
+    }
+    assert_eq!(
+        found_at(&laid, &home.join(".config/gh")),
+        Some(&bind(".config/gh", true)),
+        "the directory held above a mask must stay held: {laid:#?}"
+    );
+    for (path, root) in [
+        (".config/sbx", ".config/sbx"),
+        (".local/share/sbx", ".local/share/sbx"),
+        (".local/share/sbx/sub", ".local/share/sbx"),
+    ] {
+        assert_eq!(
+            found_at(&laid, &home.join(path)),
+            Some(&bind(root, false)),
+            "`{path}` must stay under sbx's read-only root: {laid:#?}"
+        );
+    }
+    assert_eq!(
+        found_at(&laid, &home.join(".local/state")),
+        Some(&bind(".local", true)),
+        "a directory outside both keeps its read-write mount point: {laid:#?}"
+    );
+}
+
+/// The same arrangement, laid by bubblewrap: a mask under `.config` and one inside sbx's data dir
+/// stay closed, the directory held above the first cannot be renamed, and sbx's roots stay
+/// read-only, a directory held inside one included. bwrap and a user namespace are enough; no
+/// userland is built.
+#[test]
+fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place_inside_the_cage() {
+    let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
+        skip_incapable!("skipping control-plane arrangement smoke: need bwrap");
+        return;
+    };
+    if !matches!(crate::probe_userns(), crate::Userns::Ok) {
+        skip_incapable!("skipping control-plane arrangement smoke: need a user namespace");
+        return;
+    }
+    let scratch = TmpDir::new();
+    let home = scratch.path().join("home");
+    for dir in [".config/gh", ".config/sbx", ".local/share/sbx/sub"] {
+        std::fs::create_dir_all(home.join(dir)).unwrap();
+    }
+    std::fs::write(home.join(".config/gh/hosts.yml"), b"HOSTS").unwrap();
+    std::fs::write(home.join(".local/share/sbx/sub/secret"), b"SECRET").unwrap();
+    let home = home.canonicalize().unwrap();
+
+    let policy = crate::config::fspolicy::FsPolicy {
+        deny: vec![
+            ".config/gh/hosts.yml".to_string(),
+            ".local/share/sbx/sub/secret".to_string(),
+        ],
+        ..Default::default()
+    };
+    let expanded = crate::sandbox::fsmask::expand(&home, &policy);
+    assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
+    let decoys = crate::sandbox::fsmask::stage_decoys(&scratch.path().join("mask")).unwrap();
+    let fs_binds = crate::sandbox::fsmask::agent_binds(&expanded, &decoys, true);
+    let pin = |path: &str, writable: bool| binds::ExtraBind {
+        src: home.join(path),
+        dest: home.join(path),
+        writable,
+    };
+    let pins = vec![
+        pin(".config", true),
+        pin(".config/sbx", false),
+        pin(".local", true),
+        pin(".local/share", true),
+        pin(".local/share/sbx", false),
+    ];
+    let mut mounts = vec![
+        crate::sandbox::spec::Mount::RoBind {
+            src: "/usr".into(),
+            dest: "/usr".into(),
+        },
+        crate::sandbox::spec::Mount::Symlink {
+            target: "usr/lib".into(),
+            dest: "/lib".into(),
+        },
+        crate::sandbox::spec::Mount::Symlink {
+            target: "usr/lib64".into(),
+            dest: "/lib64".into(),
+        },
+        crate::sandbox::spec::Mount::RoBindTry {
+            src: "/etc/ld.so.cache".into(),
+            dest: "/etc/ld.so.cache".into(),
+        },
+        crate::sandbox::spec::Mount::Bind {
+            src: home.clone(),
+            dest: home.clone(),
+        },
+    ];
+    mounts.extend(fs_binds.iter().map(binds::ExtraBind::mount));
+    mounts.extend(
+        pins_clear_of_masks(pins, &expanded, &fs_binds)
+            .iter()
+            .map(binds::ExtraBind::mount),
+    );
+
+    let script = r#"cd "$1" || exit 9
+for f in .config/gh/hosts.yml .local/share/sbx/sub/secret; do
+  if cat "$f" >&2; then echo "$f open"; else echo "$f closed"; fi
+done
+if mv .config/gh .config/gh.moved 2>&1; then echo ".config/gh moved"; mv .config/gh.moved .config/gh; else echo ".config/gh held"; fi
+for d in .config/sbx .local/share/sbx .local/share/sbx/sub; do
+  if touch "$d/written" 2>&1; then echo "$d writable"; rm -f "$d/written"; else echo "$d read-only"; fi
+done
+touch .config/new && echo ".config writable"
+echo end"#;
+    let spec = crate::sandbox::spec::SandboxSpec::new(
+        "/".into(),
+        mounts,
+        Vec::new(),
+        crate::sandbox::spec::NetPolicy::Shared,
+        vec![
+            std::ffi::OsString::from("/usr/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from(script),
+            std::ffi::OsString::from("sh"),
+            home.clone().into_os_string(),
+        ],
+    )
+    .expect("a spec");
+    let out = crate::sandbox::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.lines().any(|l| l == "end"),
+        "the cage did not run to its end:\n{stdout}\n{stderr}"
+    );
+    for line in [
+        ".config/gh/hosts.yml closed",
+        ".local/share/sbx/sub/secret closed",
+        ".config/gh held",
+        ".config/sbx read-only",
+        ".local/share/sbx read-only",
+        ".local/share/sbx/sub read-only",
+        ".config writable",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "expected `{line}`:\n{stdout}\n{stderr}"
+        );
+    }
 }
 
 #[test]

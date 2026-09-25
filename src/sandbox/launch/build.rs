@@ -101,30 +101,52 @@ fn pin_sources(binds: &[crate::config::Bind], project: &Path) -> Vec<crate::conf
     sources
 }
 
-/// Drop the control-plane pins an `[fs]` mask already covers.
+/// The control-plane pins to emit after the `[fs]` binds, arranged so that none of them covers one.
 ///
 /// Both emitters land on host paths, and `cage_mounts` appends `extra_binds` verbatim and in list
-/// order, so the *later* bind at a destination is the one the cage sees. The masks are staged
-/// first and the pins after them, so a pin at — or under — a mask destination would undo the mask:
-/// a `deny`'s decoy would be replaced by the real directory, and a `readonly`'s self re-bind by a
-/// read-write one. The shape is not exotic: launching from `$HOME` puts `$HOME/.config` and
-/// `$HOME/.local` on the pin chain, which is exactly what an `[fs]` entry there names.
+/// order. A later bind at a destination is the one the cage sees there, and a later bind at a
+/// directory *above* a destination covers it too: bubblewrap binds the host's view of that
+/// directory, which carries none of the cage's own mounts below it. The `[fs]` binds come first,
+/// so three rules keep every one of them in place. The shape is not exotic: launching from `$HOME`
+/// puts `$HOME/.config` and `$HOME/.local` on the pin chain, which is exactly where an `[fs]` entry
+/// there, or the built-in protection of a mise file under `.config`, lands.
 ///
-/// The mask is the one that wins, because it costs the control plane nothing. A mask is itself a
-/// mount at that path — a decoy for `deny`, the path over itself for `readonly`, both read-only —
-/// so the component stays a mountpoint the kernel refuses to rename (`EBUSY`) and stays unwritable
-/// through, which is the whole of what the pin was there to provide. And `[fs]` only ever removes
-/// access, so deferring to it can never widen what the cage reaches.
+/// - **A pin at or under a mask is dropped.** A mask is itself a read-only mount at that path (a
+///   decoy for `deny`, the path over itself for `readonly`), so the component stays a mountpoint
+///   the kernel refuses to rename (`EBUSY`) and stays unwritable through, which is the whole of
+///   what the pin was there to provide. Containment is asked of the expansion rather than restated
+///   here, so "this path is closed" keeps a single definition.
+/// - **A read-write pin `[fs]` already holds is dropped.** A directory held above a mask is bound
+///   over itself read-write, which is the very bind the pin would lay, already in place and before
+///   any root below it. Laying it again would cover the masks beneath, for the third rule to lay a
+///   second time.
+/// - **Every read-only `[fs]` bind strictly under a pin that stays is emitted again after the
+///   pins**, such as a mask inside one of sbx's own roots. Each of those binds can
+///   only close: its source is the path itself or sbx's own decoy, so landing last never widens
+///   what the cage reaches, and the root stays read-only around it.
 ///
-/// Containment is asked of the expansion rather than restated here, so "this path is closed" keeps
-/// a single definition. Pure, so the precedence is asserted without a launch.
+/// Pure, so the arrangement is asserted without a launch.
 fn pins_clear_of_masks(
     pins: Vec<binds::ExtraBind>,
     masks: &crate::sandbox::fsmask::Expanded,
+    fs_binds: &[binds::ExtraBind],
 ) -> Vec<binds::ExtraBind> {
-    pins.into_iter()
+    let kept: Vec<binds::ExtraBind> = pins
+        .into_iter()
         .filter(|pin| masks.covering(&pin.dest).is_none())
-        .collect()
+        .filter(|pin| !(pin.writable && fs_binds.iter().any(|b| b.writable && b.dest == pin.dest)))
+        .collect();
+    let again: Vec<binds::ExtraBind> = fs_binds
+        .iter()
+        .filter(|b| {
+            !b.writable
+                && kept
+                    .iter()
+                    .any(|pin| b.dest != pin.dest && b.dest.starts_with(&pin.dest))
+        })
+        .cloned()
+        .collect();
+    kept.into_iter().chain(again).collect()
 }
 
 /// Establish the mountpoint-chain pins that protect sbx's control plane: create each pin's host
@@ -2102,6 +2124,9 @@ struct FsMasks {
     masks: crate::sandbox::fsmask::Expanded,
     /// The staged decoy files the masks bind over their targets. `None` when nothing is masked.
     decoys: Option<crate::sandbox::fsmask::Decoys>,
+    /// The `[fs]` binds exactly as the agent's cage receives them (the held directories, then the
+    /// masks), so the control-plane pins emitted after them can be arranged not to cover any.
+    binds: Vec<binds::ExtraBind>,
 }
 
 /// Close the project paths `[fs]` names, appending the masking binds to `extra_binds`.
@@ -2141,6 +2166,7 @@ fn stage_fs_masks(
         ));
         return Err(ExitCode::FAILURE);
     }
+    let mut fs_binds = Vec::new();
     let fs_decoys = if fs_masks.is_empty() {
         None
     } else {
@@ -2150,11 +2176,9 @@ fn stage_fs_masks(
                 // The rule the project mount itself follows: read-only at or under one of sbx's own
                 // control-plane roots, read-write everywhere else.
                 let project_writable = crate::config::control_plane_root_of(&root).is_none();
-                extra_binds.extend(crate::sandbox::fsmask::agent_binds(
-                    &fs_masks,
-                    &decoys,
-                    project_writable,
-                ));
+                fs_binds =
+                    crate::sandbox::fsmask::agent_binds(&fs_masks, &decoys, project_writable);
+                extra_binds.extend(fs_binds.iter().cloned());
                 Some(decoys)
             }
             Err(e) => {
@@ -2171,6 +2195,7 @@ fn stage_fs_masks(
     Ok(FsMasks {
         masks: fs_masks,
         decoys: fs_decoys,
+        binds: fs_binds,
     })
 }
 
@@ -2671,11 +2696,11 @@ pub(super) fn build(
     // are appended after this block (the task control plane below); the rule they have to respect
     // is stated on `control_plane_pins`, and it is about their destination, not their position.
     //
-    // The `[fs]` masks are the one set of binds already emitted *above* this point whose
-    // destinations are project paths rather than sbx's own constants, and the pin chain can run
-    // straight through one of them (`$HOME/.config` under a project root of `$HOME`). A pin landing
-    // on a mask would replace it, so `pins_clear_of_masks` drops those — the mask is a read-only
-    // mount at that path and already gives the pin everything it was there for.
+    // The `[fs]` binds are the one set already emitted *above* this point whose destinations are
+    // project paths rather than sbx's own constants, and the pin chain can run straight through or
+    // above one of them (`$HOME/.config` under a project root of `$HOME`). A pin laid there would
+    // cover it, so `pins_clear_of_masks` arranges the pins around them: it drops a pin a mask or a
+    // held directory already provides, and lays again after the pins a mask that sits inside one.
     //
     // Interdependency: the protection assumes in-cage code cannot `umount` a pin. That holds because
     // bwrap drops all capabilities (no `CAP_SYS_ADMIN` in the cage's user namespace) and the seccomp
@@ -2700,7 +2725,7 @@ pub(super) fn build(
     // containment test.
     let sources = pin_sources(&prep.cfg.binds, &prep.cwd);
     match establish_control_plane_pins(&crate::config::control_plane_pins(&sources)) {
-        Ok(pins) => extra_binds.extend(pins_clear_of_masks(pins, &fs.masks)),
+        Ok(pins) => extra_binds.extend(pins_clear_of_masks(pins, &fs.masks, &fs.binds)),
         Err(e) => {
             // Fail closed: if a pin cannot be established the containing read-write bind would be
             // unprotected, so abort the launch rather than run with a gap. An extreme case — a
