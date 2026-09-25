@@ -235,8 +235,10 @@ allow = [
     "{*} https://api.deepseek.com",                  # DeepSeek
     "{*} https://api-inference.modelscope.cn",       # ModelScope (Alibaba)
     # AionUi's own account: the app asks you to sign in before it starts an agent. Signing in with
-    # Google also needs the Google sign-in hosts commented below.
+    # Google also needs the in-cage Google sign-in group; uncomment it after importing it
+    # (sbx net groups import examples/net-groups/google-signin-incage.toml):
     "{*} https://www.aionui.com",
+    #"@google-signin-incage",
     # The co-worked agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` near
     # the top of this file) and are unioned into this list at resolution. Check what that adds with
     # `sbx bundle opencode`, and what the launch ends up with via `sbx config show --app aionui`.
