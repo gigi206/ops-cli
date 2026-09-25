@@ -270,7 +270,9 @@ well as one that was already there (and made empty at launch when it is absent, 
 cannot create it), and the config, because `core.hooksPath`,
 `core.fsmonitor`, a filter or an alias names a program as surely as a hook does. Committing,
 switching branches, fetching and pushing still work; what is refused is writing the config
-(`remote add`, the upstream `push -u` records) and installing a hook. A project that needs
+(`remote add`, the upstream `push -u` records), installing a hook, and moving a repository into
+`.git` (`submodule absorbgitdirs`): `.git` itself is held in place, so the paths your git reads
+after the session are the protected ones. A project that needs
 those sets `[fs] git_writable = true` from a trusted layer, the one key of `[fs]` that opens
 rather than closes and therefore the one the trust gate decides.
 

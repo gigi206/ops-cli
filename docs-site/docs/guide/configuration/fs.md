@@ -67,6 +67,14 @@ cage fails with `EBUSY` (it is a mount point), and hard-linking around one fails
 mask apart. Neither can it unmount one: `umount2`, `mount` and `unshare` are refused by the
 [mandatory seccomp filter](seccomp), and the cage holds no capability in its user namespace.
 
+Nor can it move a mask by moving a directory above it. Every directory between the project
+root and a masked path is held in place the same way, so the path a mask was placed on names
+the file it protects for the whole session, for your own tools afterwards, and at the next
+launch, which resolves `[fs]` again by that path. The directories stay writable inside;
+renaming or removing one of them fails with `EBUSY`, and a `rename` across one's boundary fails
+with `EXDEV`, which `mv` answers by copying instead. Each held directory is a mount, and counts
+toward the same ceiling as the masks.
+
 ### Entries that overlap
 
 An entry inside a denied **directory** is dropped, with a warning: the directory is already empty
@@ -158,7 +166,9 @@ environment (`GIT_CONFIG_COUNT`, after any pair a trusted `[env]` passes, and ne
 value it sets for that key): a branch is pushed to its namesake, and nothing is written to
 the repository. A bare `git pull` still asks for the remote and branch
 (`git pull origin <branch>`). Installing a hook from inside the cage (husky,
-`pre-commit install`, `lefthook install`) is refused.
+`pre-commit install`, `lefthook install`) is refused. So is `git submodule absorbgitdirs`,
+with nothing changed: it moves a submodule's repository into `.git`, which is held in place so
+that `.git/config` and `.git/hooks/` keep naming the protected ones.
 
 A project that needs those opens them from a trusted layer:
 
@@ -230,8 +240,9 @@ denied directory it is, because nothing there is reachable at all.
 
 Directories are also the cheap shape. Each mask is one mount, and the launch cost grows
 faster than one-for-one with the count: 100 masks cost about 32 ms, 500 about 384 ms. One
-entry naming a directory closes it whatever it contains, at constant cost. Past 64 masks
-`sbx` says so; past 256 it refuses the launch rather than quietly dropping the tail.
+entry naming a directory closes it whatever it contains, at constant cost. Past 64 mounts,
+the masks and the directories held in place above them, `sbx` says so; past 256 it refuses
+the launch rather than quietly dropping the tail.
 
 ## `scan`: closing a file by what it holds
 

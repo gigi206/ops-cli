@@ -1461,3 +1461,111 @@ fn a_declared_distribution_is_the_cage_root_and_every_mount_still_lands() {
         "the root is writable:\n{stdout}"
     );
 }
+
+#[test]
+fn the_directories_above_a_mask_keep_their_path_inside_the_cage() {
+    // A mask is a mount point the cage cannot move, and what keeps the path it was placed on naming
+    // the protected file is every directory above it being one too. Only a mount namespace says
+    // whether they are, so the binds `fsmask` plans are emitted the way the launcher emits them and
+    // the cage is asked to rename each directory above a mask. bwrap and a userns are enough; no
+    // userland is built.
+    let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
+        skip_incapable!("skipping held-directory smoke: need bwrap");
+        return;
+    };
+    if !matches!(crate::probe_userns(), crate::Userns::Ok) {
+        skip_incapable!("skipping held-directory smoke: need a user namespace");
+        return;
+    }
+    let scratch = TmpDir::new();
+    let root = scratch.path().join("proj");
+    std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+    std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+    std::fs::create_dir_all(root.join("config/sub")).unwrap();
+    std::fs::write(root.join("config/sub/prod.key"), b"KEY").unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let policy = crate::config::fspolicy::FsPolicy {
+        deny: vec!["config/sub/prod.key".to_string()],
+        ..Default::default()
+    };
+    let expanded = crate::sandbox::fsmask::expand(&root, &policy);
+    assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
+    let decoys = crate::sandbox::fsmask::stage_decoys(&scratch.path().join("mask")).unwrap();
+    let mut mounts = vec![
+        Mount::RoBind {
+            src: "/usr".into(),
+            dest: "/usr".into(),
+        },
+        Mount::Symlink {
+            target: "usr/lib".into(),
+            dest: "/lib".into(),
+        },
+        Mount::Symlink {
+            target: "usr/lib64".into(),
+            dest: "/lib64".into(),
+        },
+        Mount::RoBindTry {
+            src: "/etc/ld.so.cache".into(),
+            dest: "/etc/ld.so.cache".into(),
+        },
+        Mount::Bind {
+            src: root.clone(),
+            dest: root.clone(),
+        },
+    ];
+    mounts.extend(
+        crate::sandbox::fsmask::agent_binds(&expanded, &decoys, true)
+            .iter()
+            .map(ExtraBind::mount),
+    );
+
+    // A directory that does move is put back at once, so the host tree is the same either way.
+    let script = r#"cd "$1" || exit 9
+for d in .git config config/sub; do
+  if mv "$d" "$d.moved" 2>&1; then echo "$d moved"; mv "$d.moved" "$d"; else echo "$d held"; fi
+done
+touch config/sub/new && echo "config/sub writable"
+echo x >> .git/config || echo ".git/config refused"
+echo end"#;
+    let spec = SandboxSpec::new(
+        "/".into(),
+        mounts,
+        Vec::new(),
+        NetPolicy::Shared,
+        vec![
+            OsString::from("/usr/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(script),
+            OsString::from("sh"),
+            root.clone().into_os_string(),
+        ],
+    )
+    .expect("a spec");
+    let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.lines().any(|l| l == "end"),
+        "the cage did not run to its end:\n{stdout}\n{stderr}"
+    );
+    for dir in [".git", "config", "config/sub"] {
+        assert!(
+            stdout.lines().any(|l| l == format!("{dir} held")),
+            "`{dir}` must keep its path inside the cage:\n{stdout}\n{stderr}"
+        );
+    }
+    assert!(
+        stdout.lines().any(|l| l == "config/sub writable"),
+        "a held directory stays writable inside:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == ".git/config refused"),
+        "the git config stays read-only:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".git/config")).unwrap(),
+        b"[core]\n",
+        "the host's git config is untouched"
+    );
+}

@@ -2147,7 +2147,14 @@ fn stage_fs_masks(
         let dir = crate::sandbox::fsmask::mask_dir(prep.layout.data_dir(), std::process::id());
         match crate::sandbox::fsmask::stage_decoys(&dir) {
             Ok(decoys) => {
-                extra_binds.extend(crate::sandbox::fsmask::agent_binds(&fs_masks, &decoys));
+                // The rule the project mount itself follows: read-only at or under one of sbx's own
+                // control-plane roots, read-write everywhere else.
+                let project_writable = crate::config::control_plane_root_of(&root).is_none();
+                extra_binds.extend(crate::sandbox::fsmask::agent_binds(
+                    &fs_masks,
+                    &decoys,
+                    project_writable,
+                ));
                 Some(decoys)
             }
             Err(e) => {

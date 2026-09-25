@@ -390,9 +390,10 @@ fn control_plane_mode(
 
 /// The control-plane root `canon` sits at or under, when there is one.
 ///
-/// One definition of "this path *is* the control plane", because two callers have to answer it the
+/// One definition of "this path *is* the control plane", because every caller has to answer it the
 /// same way: [`control_plane_mode`], which forces a declared bind read-only, and the launcher, which
-/// mounts the project root the caller's working directory chose. Written twice, it would be a rule
+/// mounts the project root the caller's working directory chose and holds the `[fs]` masks' parent
+/// directories in place only where that mount is writable. Written twice, it would be a rule
 /// two callers could come to apply differently — and the mount that escaped it would be the one
 /// nobody declared.
 pub(crate) fn control_plane_root_of(canon: &Path) -> Option<PathBuf> {

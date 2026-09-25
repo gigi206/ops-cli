@@ -517,10 +517,10 @@ pub(super) fn substrate(mounts: &[Mount]) -> Vec<Mount> {
         .collect()
 }
 
-/// One explicit bind injected by the launcher after the structural mounts (so it is
-/// neither shadowed by, nor shadows, them): a host source exposed at a distinct cage
-/// destination. Used for the network-allowlist machinery — the bound egress socket and
-/// the proxy's CA certificate — whose destinations are sbx's, not the project's.
+/// One explicit bind injected by the launcher after the structural mounts, so no structural mount
+/// shadows it. Most land on sbx's own destinations (the bound egress socket, the proxy's CA
+/// certificate); the control-plane pins and the `[fs]` masks, with the directories holding those in
+/// place, land on a host path on purpose, as [`cage_mounts`] records where it emits them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExtraBind {
     /// Host path bound into the cage.
@@ -529,6 +529,23 @@ pub(crate) struct ExtraBind {
     pub(crate) dest: PathBuf,
     /// Read-write when true, read-only otherwise.
     pub(crate) writable: bool,
+}
+
+impl ExtraBind {
+    /// The mount this bind is emitted as.
+    fn mount(&self) -> Mount {
+        if self.writable {
+            Mount::Bind {
+                src: self.src.clone(),
+                dest: self.dest.clone(),
+            }
+        } else {
+            Mount::RoBind {
+                src: self.src.clone(),
+                dest: self.dest.clone(),
+            }
+        }
+    }
 }
 
 /// The host `nix/` tree to expose at `/nix`, and whether the cage may write to it.
@@ -1092,20 +1109,9 @@ fn cage_mounts(
     // Two kinds deliberately land *on* a host path the structural block already mounted, and both
     // depend on arriving after it: the control-plane pins, which freeze sbx's own roots inside a
     // read-write bind, and the `[fs]` masks, which close a project path by mounting a decoy over
-    // it. For those, "emitted last" is not tidiness but the mechanism.
-    mounts.extend(extra_binds.iter().map(|b| {
-        if b.writable {
-            Mount::Bind {
-                src: b.src.clone(),
-                dest: b.dest.clone(),
-            }
-        } else {
-            Mount::RoBind {
-                src: b.src.clone(),
-                dest: b.dest.clone(),
-            }
-        }
-    }));
+    // it, after the directories above them are held in place. For those, "emitted last" is not
+    // tidiness but the mechanism.
+    mounts.extend(extra_binds.iter().map(ExtraBind::mount));
 
     // Under a declared distribution, drop the synthetic FHS the image supplies itself. Emitting one
     // over the image's own would not shadow it: bubblewrap refuses the mount and the launch never

@@ -22,7 +22,10 @@
 //! it, and the launch warns rather than passing over it in silence); and a path nobody listed is
 //! simply open. What the cage cannot do is defeat a mask from inside: `umount2`, `mount`, `unshare`
 //! and the rest of that family are refused by the mandatory seccomp filter, and it holds no
-//! capability in its user namespace.
+//! capability in its user namespace. Nor can it move one: every directory between the project root
+//! and a mask is held in place for the session ([`holding_dirs`]), so the path a mask was placed on
+//! still names the file it protects when the host's git reads it after the session and when the
+//! next launch resolves `[fs]` again.
 //!
 //! **Why the mid-session gap is not closed by re-masking a live cage.** Applying a mask after
 //! launch is reachable — a launcher that creates its own user namespace before `execve`ing
@@ -54,16 +57,17 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// How many masks a launch may emit before it says the cost is getting real.
+/// How many mounts `[fs]` may cost a launch before it says the cost is getting real.
 ///
-/// Each mask is one bind, and bubblewrap re-reads `/proc/self/mountinfo` per bind, so the launch
+/// Each mask is one bind, as is each directory held in place above one ([`holding_dirs`]), and
+/// bubblewrap re-reads `/proc/self/mountinfo` per bind, so the launch
 /// cost grows with the *square* of the count — measured at 32 ms for 100 masks and 384 ms for 500.
 /// The cure is always the same and is in the message: name the directory instead of its files.
 const MASK_WARN: usize = 64;
 
-/// How many masks a launch will emit at all. Past this the wait is seconds and an argv ceiling
-/// bubblewrap shares with every other mount comes into view, so the launch refuses rather than
-/// quietly dropping the tail — a silently truncated mask list reads exactly like a complete one.
+/// How many mounts `[fs]` may cost a launch at all. Past this the wait is seconds and an argv
+/// ceiling bubblewrap shares with every other mount comes into view, so the launch refuses rather
+/// than quietly dropping the tail: a truncated mask list reads exactly like a complete one.
 const MASK_MAX: usize = 256;
 
 /// The largest `.git/index` the tracked-file guard will read. An index is a few MiB on a large
@@ -92,11 +96,14 @@ pub(crate) struct Expanded {
     pub(crate) denied: Vec<Masked>,
     /// Paths the cage may read but not write.
     pub(crate) readonly: Vec<Masked>,
+    /// The directories between the project root and a mask, shallow to deep, that the agent's cage
+    /// holds in place so each mask keeps naming the file it protects. See [`holding_dirs`].
+    pub(crate) pins: Vec<PathBuf>,
     /// What the expansion found worth saying: an entry that matched nothing, a file reachable by a
     /// second name, a path git tracks. Surfaced by the launch, never fatal on its own.
     pub(crate) warnings: Vec<String>,
     /// Set when the expansion cannot deliver what the policy asks for: the project root does not
-    /// resolve, or the policy asks for more masks than [`MASK_MAX`]. The launch fails closed on it,
+    /// resolve, or the policy needs more mounts than [`MASK_MAX`]. The launch fails closed on it,
     /// because the alternative is a run whose paths are open while the config says they are shut.
     pub(crate) refused: Option<String>,
 }
@@ -146,9 +153,9 @@ impl Expanded {
             .or_else(|| under(&self.readonly, path).map(Cover::ReadOnly))
     }
 
-    /// How many binds this expansion costs.
+    /// How many binds this expansion costs: its masks and the directories that hold them in place.
     fn count(&self) -> usize {
-        self.denied.len() + self.readonly.len()
+        self.denied.len() + self.readonly.len() + self.pins.len()
     }
 }
 
@@ -303,6 +310,7 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
              which closes the whole path — this one adds nothing and is dropped"
         ));
     }
+    out.pins = holding_dirs(&root, &out);
 
     guard_hard_links(&out.denied, "deny", &mut out.warnings);
     guard_hard_links(&out.readonly, "readonly", &mut out.warnings);
@@ -311,18 +319,61 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     let count = out.count();
     if count > MASK_MAX {
         out.refused = Some(format!(
-            "`[fs]` asks for {count} masks and {MASK_MAX} is the ceiling — each one is a mount, and \
-             a launch pays for them faster than one-for-one. Name a directory instead of its files: \
-             one entry closes it, at constant cost, and it stays closed for anything created inside \
-             it later"
+            "`[fs]` needs {count} mounts, its masks and the directories that hold them in place, \
+             and {MASK_MAX} is the ceiling: a launch pays for mounts faster than one-for-one. Name \
+             a directory instead of its files: one entry closes it, at constant cost, and it stays \
+             closed for anything created inside it later"
         ));
     } else if count > MASK_WARN {
         out.warnings.push(format!(
-            "`[fs]` masks {count} paths — past about {MASK_WARN} the launch slows down noticeably \
-             (each mask is a mount). Naming a directory closes it in one entry, at constant cost"
+            "`[fs]` needs {count} mounts, its masks and the directories that hold them in place: \
+             past about {MASK_WARN} the launch slows down noticeably. Naming a directory closes it \
+             in one entry, at constant cost"
         ));
     }
     out
+}
+
+/// The directories the agent's cage holds in place so that each mask keeps naming the file it
+/// protects: every directory strictly between the project root and a masked path, shallow to deep.
+///
+/// A mask is a mount point, which the cage can neither rename nor remove; the directories above it
+/// are ordinary ones in a writable tree. The path a mask was placed on names the protected file
+/// only while none of them can be renamed, and that path is what the host's git reads after the
+/// session and what the next launch resolves `[fs]` against. So each of them is bound over itself
+/// read-write: its contents stay writable, and it becomes a mount point too. The project root needs
+/// no pin, being the project's own mount.
+///
+/// None is laid at or under a read-only directory mask. Nothing inside a read-only mount can be
+/// renamed already, and a read-write bind there would reopen that directory to writes.
+///
+/// What holding a directory costs the cage: renaming or removing it is refused (`EBUSY`), and a
+/// `rename` across its boundary is refused (`EXDEV`), which `mv` answers by copying. The one git
+/// command this reaches is `submodule absorbgitdirs`, which moves a submodule's repository into a
+/// held `.git` and is refused with nothing changed.
+fn holding_dirs(root: &Path, expanded: &Expanded) -> Vec<PathBuf> {
+    let read_only_dirs: Vec<&Path> = expanded
+        .readonly
+        .iter()
+        .filter(|m| m.is_dir)
+        .map(|m| m.path.as_path())
+        .collect();
+    let mut pins: BTreeSet<PathBuf> = BTreeSet::new();
+    for m in expanded.denied.iter().chain(&expanded.readonly) {
+        for dir in m
+            .path
+            .ancestors()
+            .skip(1)
+            .take_while(|d| *d != root && d.starts_with(root))
+        {
+            if !read_only_dirs.iter().any(|ro| dir.starts_with(ro)) {
+                pins.insert(dir.to_path_buf());
+            }
+        }
+    }
+    // Ordered component by component, so a directory comes before everything below it: a pin laid
+    // after a deeper one would cover it.
+    pins.into_iter().collect()
 }
 
 /// How a built-in entry is named in a message, in place of the `[fs]` field a declared one comes
@@ -346,9 +397,11 @@ const BUILTIN_READONLY: &str = "readonly (built-in)";
 /// `core.pager`, a filter, an alias), runs on the host at the user's next git command, outside any
 /// cage. The directory is named, so a hook created mid-session is refused too. What it costs is
 /// what writes the config: `remote add`, `config user.*`, and the upstream `push -u` records
-/// (the push itself succeeds). `git_writable` lifts both — the one opening in `[fs]`, and why it is
-/// honored only from a trusted layer. A `.git` that is a file (a linked worktree, a submodule)
-/// points at a directory outside the project, which the cage does not hold; nothing is added.
+/// (the push itself succeeds); and, `.git` being held in place above them ([`holding_dirs`]),
+/// `submodule absorbgitdirs`, which moves a repository into it. `git_writable` lifts both: the one
+/// opening in `[fs]`, and why it is honored only from a trusted layer. A `.git` that is a file (a
+/// linked worktree, a submodule) points at a directory outside the project, which the cage does
+/// not hold; nothing is added.
 ///
 /// Returned as `[fs]` entries relative to the project, for [`resolve_list`], which is what refuses
 /// one that cannot be looked at: an absent file is left out here, every other answer goes through.
@@ -1039,9 +1092,26 @@ fn parse_git_index(data: &[u8]) -> Option<BTreeSet<String>> {
 /// project included. Order is the whole mechanism: a mask emitted before the project mount would be
 /// covered by it, which is exactly why a `binds` entry aimed inside the project cannot mask
 /// anything today.
-pub(crate) fn agent_binds(expanded: &Expanded, decoys: &Decoys) -> Vec<ExtraBind> {
+///
+/// `project_writable` is whether the project itself is mounted read-write. The directories that
+/// hold the masks in place ([`holding_dirs`]) are bound only then: in a read-only project nothing
+/// can be renamed, and a read-write bind of one of its directories would reopen it to writes.
+pub(crate) fn agent_binds(
+    expanded: &Expanded,
+    decoys: &Decoys,
+    project_writable: bool,
+) -> Vec<ExtraBind> {
     let mut out = Vec::with_capacity(expanded.count());
-    // `readonly` first, then `deny`. The two can legitimately nest the one way round that is left
+    // The held directories first, shallow to deep, so every mask lands inside the directories
+    // already held above it rather than being covered by one laid after it.
+    if project_writable {
+        out.extend(expanded.pins.iter().map(|dir| ExtraBind {
+            src: dir.clone(),
+            dest: dir.clone(),
+            writable: true,
+        }));
+    }
+    // Then `readonly`, then `deny`. The two can legitimately nest the one way round that is left
     // after the expansion drops the other (`readonly = [".git/"]` with `deny = [".git/config"]`),
     // and the later mount is the one that wins — so the closed path has to be applied over the
     // merely-protected one, never under it.
@@ -1898,7 +1968,7 @@ mod tests {
             "the file mask survives a readonly parent"
         );
         assert_eq!(e.readonly.len(), 1);
-        let binds = agent_binds(&e, &decoys);
+        let binds = agent_binds(&e, &decoys, true);
         assert_eq!(binds[0].dest, root.join("secrets"), "readonly first");
         assert_eq!(
             binds[1].dest,
@@ -2014,7 +2084,7 @@ mod tests {
         let root = project(&tmp);
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
         let e = expand(&root, &policy(&["prod.key", "secrets/"], &["main.rs"]));
-        let binds = agent_binds(&e, &decoys);
+        let binds = agent_binds(&e, &decoys, true);
         assert_eq!(binds.len(), 3);
         // `readonly` is emitted first, so a `deny` nested inside one lands over it rather than
         // under it (see `a_deny_inside_a_readonly_directory_is_emitted_over_it`).
@@ -2030,6 +2100,107 @@ mod tests {
             "a directory gets the empty directory"
         );
         assert!(binds.iter().all(|b| !b.writable));
+    }
+
+    /// Every directory between the project root and a mask is held in place, shallow to deep, and
+    /// before any mask: a mask's path then keeps naming the file it protects for the host's git
+    /// after the session and for the next launch. The built-in git masks count as masks.
+    #[test]
+    fn each_directory_above_a_mask_is_held_in_place_before_the_masks() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+        std::fs::create_dir_all(root.join("config/sub")).unwrap();
+        std::fs::write(root.join("config/sub/prod.key"), b"KEY").unwrap();
+        let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
+
+        let e = expand(&root, &policy(&["config/sub/prod.key", "prod.key"], &[]));
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert_eq!(
+            e.pins,
+            vec![
+                root.join(".git"),
+                root.join("config"),
+                root.join("config/sub")
+            ],
+            "each directory above a mask, the project root excepted, shallow to deep"
+        );
+        let binds = agent_binds(&e, &decoys, true);
+        let (held, masks) = binds.split_at(e.pins.len());
+        assert!(
+            held.iter()
+                .zip(&e.pins)
+                .all(|(b, dir)| b.writable && b.src == *dir && b.dest == *dir),
+            "each held directory is bound over itself read-write, first: {binds:?}"
+        );
+        assert!(
+            masks.iter().all(|b| !b.writable),
+            "every mask comes after them: {binds:?}"
+        );
+    }
+
+    /// Inside a read-only directory mask nothing can be renamed already, and a read-write bind
+    /// there would reopen the directory to writes, so no directory at or under one is held. A mask
+    /// elsewhere in the same policy still has its own held.
+    #[test]
+    fn no_directory_is_held_at_or_under_a_read_only_directory() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::create_dir_all(root.join("config/sub")).unwrap();
+        std::fs::write(root.join("config/sub/prod.key"), b"KEY").unwrap();
+
+        let e = expand(
+            &root,
+            &policy(&["config/sub/prod.key", "certs/server.pem"], &["config/"]),
+        );
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert_eq!(e.denied.len(), 2, "both files are closed");
+        assert_eq!(
+            e.pins,
+            vec![root.join("certs")],
+            "nothing held inside `config/`, which is read-only"
+        );
+    }
+
+    /// A project mounted read-only (sbx's own control plane) has nothing to rename, and a
+    /// read-write bind of one of its directories would reopen it to writes: no held directory is
+    /// emitted there, and the masks still are.
+    #[test]
+    fn a_read_only_project_gets_no_read_write_bind() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
+        let e = expand(&root, &policy(&["certs/server.pem"], &[]));
+        assert_eq!(e.pins, vec![root.join("certs")]);
+
+        let binds = agent_binds(&e, &decoys, false);
+        assert_eq!(binds.len(), 1, "the mask alone: {binds:?}");
+        assert!(binds.iter().all(|b| !b.writable), "{binds:?}");
+    }
+
+    /// The held directories are mounts, and the ceiling counts mounts: a policy whose masks alone
+    /// fit is refused once the directories above them are counted.
+    #[test]
+    fn the_mask_ceiling_counts_the_held_directories() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let entries: Vec<String> = (0..MASK_MAX / 2 + 1)
+            .map(|i| {
+                let dir = root.join(format!("d{i}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("f.key"), b"x").unwrap();
+                format!("d{i}/f.key")
+            })
+            .collect();
+        let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let e = expand(&root, &policy(&entries, &[]));
+        assert!(e.denied.len() < MASK_MAX, "the masks alone fit");
+        assert!(
+            e.refused.as_ref().is_some_and(|r| r.contains("ceiling")),
+            "with their held directories they do not: {:?}",
+            e.refused
+        );
     }
 
     #[test]
