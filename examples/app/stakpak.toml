@@ -36,13 +36,23 @@
 #   - **BYOK**: point it at your own Anthropic/OpenAI key, or a custom OpenAI-compatible endpoint,
 #     and uncomment that host instead.
 #
-# UNVERIFIED (like every profile until run with a real key): the live authentication and the model
-# traffic through sbx's MITM; the `Authorization: Bearer` shape below is the standard one for this
-# API — confirm it against `sbx net logs -a stakpak` on your first real run. Grounded here: the
-# packaging (upstream's own GitHub release, tarball layout and binary type inspected), the endpoint
-# and the `STAKPAK_*` environment keys (read out of the shipped binary), and the auth options
-# (upstream's README).
+# STATUS — run in the cage (0.3.88): a BYOK profile (`type = "custom"` pointed at an
+# OpenAI-compatible endpoint) under `mode = "deny"`, with the key injected by the proxy, in `-p` and
+# in the interactive session. UNVERIFIED: the Stakpak-key path; the `Authorization: Bearer` shape
+# below is the standard one for this API — confirm it against `sbx net logs -a stakpak` on your
+# first real run. Grounded here: the packaging (upstream's own GitHub release, tarball layout and
+# binary type inspected), the endpoint and the `STAKPAK_*` environment keys (read out of the shipped
+# binary), and the auth options (upstream's README).
 cmd = "stakpak"
+
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects, which
+# operations it offers) handed to Stakpak as an extra system message, so a refused host or a
+# read-only file reads as the sandbox rather than as a fault to work around. Stakpak keeps its own
+# system prompt and adds this one to it. The option reaches the interactive session and `-p`; a
+# subcommand after it still runs but does not read it, and `acp` and `autopilot` take a system
+# prompt of their own. Bound to this `cmd`: a project that sets its own `cmd` for this app writes
+# its own `contract`, or has none.
+contract = { arg = "--system-prompt-file" }
 
 # Your host Stakpak config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
