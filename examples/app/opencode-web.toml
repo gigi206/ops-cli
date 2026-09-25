@@ -91,6 +91,12 @@ allow = [
 # openrouter.ai. (For a direct provider add its host to `allow` above and keep this block; for
 # Anthropic/OpenAI change the host, header, and env var — see the `opencode` CLI profile.)
 [env]
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers) added to opencode's instructions, so a refused host or a read-only file
+# reads as the sandbox rather than as a fault to work around. opencode merges this inline config over
+# the others and concatenates `instructions`, so the summary comes next to your `AGENTS.md` and the
+# `instructions` of your `opencode.json`, never in place of them.
+OPENCODE_CONFIG_CONTENT = '{"instructions":["/opt/sbx/contract-summary.md"]}'
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 # Optional: require a login on the web UI (recommended on a shared machine).
 #OPENCODE_SERVER_PASSWORD = "change-me"
