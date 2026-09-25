@@ -667,7 +667,17 @@ mod tests {
             "the proxy stopped only when its wait ran out: {:?}",
             begun.elapsed()
         );
-        let refused = UnixStream::connect(&path).map(drop).map_err(|e| e.kind());
+        // Waited for rather than tried once: a process another test starts holds a copy of every
+        // descriptor this one has from its fork to its exec, this socket among them. A copy the
+        // supervisor kept would hold it for good.
+        let deadline = std::time::Instant::now() + STOP_WAIT;
+        let refused = loop {
+            let tried = UnixStream::connect(&path).map(drop).map_err(|e| e.kind());
+            if tried.is_err() || std::time::Instant::now() >= deadline {
+                break tried;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
         assert_eq!(refused, Err(io::ErrorKind::ConnectionRefused));
     }
 
