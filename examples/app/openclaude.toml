@@ -61,6 +61,13 @@
 # "Supported Providers"), and the telemetry removal (src, init.ts).
 cmd = "openclaude"
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects, which
+# operations it offers) appended to OpenClaude's system prompt. It adds to the prompt: the
+# instructions in `~/.openclaude/CLAUDE.md` still apply. The file is read at startup into the
+# prompt both the interactive session and `-p` use. Bound to this `cmd`: a project that
+# sets its own `cmd` for this app writes its own `contract`, or has none.
+contract = { arg = "--append-system-prompt-file" }
+
 # Your host OpenClaude config, mounted read-write at its real absolute paths. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
 # caged `openclaude` read and write these host files (saved provider settings, credentials,
