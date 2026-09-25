@@ -995,6 +995,42 @@ fn prune_stale_returns_when_the_activation_is_a_fifo() {
     );
 }
 
+/// An app can have a home in each project besides its global one, and `--stale` sweeps them all:
+/// each version is listed under the home it is in, so the line says which project it comes from.
+#[test]
+fn prune_stale_lists_a_version_under_the_project_home_it_is_in() {
+    let fx = Project::new("app");
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[packages]\nkeep = \"mise:aqua:demo/keep\"\n",
+    );
+    let home = fx
+        .data_home
+        .path()
+        .join("sbx/projects/testproj/apps/demo-app/home");
+    let version = home.join(".local/share/mise/installs/aqua-demo-keep/1.0.0");
+    std::fs::create_dir_all(&version).unwrap();
+    std::fs::write(version.join("bin"), vec![b'x'; 2048]).unwrap();
+    std::fs::create_dir_all(home.join(".config/mise")).unwrap();
+    std::fs::write(
+        home.join(".config/mise/config.toml"),
+        "[tools]\n\"aqua:demo/keep\" = \"2.0.0\"\n",
+    )
+    .unwrap();
+
+    let out = fx.run(&["app", "prune", "demo-app", "--stale"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("project testproj home:") && s.contains("1.0.0"),
+        "the version must be listed under the project home it is in:\n{s}"
+    );
+    assert!(
+        !s.contains("global home"),
+        "there is no global home here:\n{s}"
+    );
+}
+
 /// Without `--stale` the pool version is not in scope: the flag is what widens the verb, and a
 /// `prune` that dropped versions by default would delete on a line that asked about tools.
 #[test]

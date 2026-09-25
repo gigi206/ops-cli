@@ -2431,11 +2431,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             if pruned.is_empty() && taken.is_empty() {
                 continue;
             }
-            let location = if home.global {
-                "global home".to_string()
-            } else {
-                format!("project {} home", home.project_id.as_deref().unwrap_or("?"))
-            };
+            let location = home_location(home);
             // Under `--all` the app has to be named, or a line cannot be attributed; named, the
             // heading would repeat what the command line already said.
             if all {
@@ -2499,12 +2495,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             let specs = match sandbox::mise_tool_specs(&home.dir.join(".config/mise/config.toml")) {
                 Ok(specs) => specs,
                 Err(e) => {
-                    let location = if home.global {
-                        "global home".to_string()
-                    } else {
-                        format!("project {} home", home.project_id.as_deref().unwrap_or("?"))
-                    };
-                    unread.push(format!("{app_name} {location}: {e}"));
+                    unread.push(format!("{app_name} {}: {e}", home_location(home)));
                     continue;
                 }
             };
@@ -2517,7 +2508,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             report_stale(
                 &stale_versions,
                 app_name,
-                "global home",
+                &home_location(home),
                 all,
                 &pal,
                 &mut totals,
@@ -2657,6 +2648,16 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Which of an app's homes a report line is about: its one global home, or the home it has in one
+/// project, named by the project's tree id.
+fn home_location(home: &sandbox::inspect::AppHome) -> String {
+    if home.global {
+        "global home".to_string()
+    } else {
+        format!("project {} home", home.project_id.as_deref().unwrap_or("?"))
     }
 }
 
