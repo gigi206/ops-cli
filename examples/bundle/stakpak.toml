@@ -2,6 +2,8 @@
 #
 #   sbx bundle import examples/bundle/stakpak.toml
 #   # then in an app profile:   use = ["stakpak"]
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
 #
 # Derived from `examples/app/stakpak.toml`, whose namesake profile now names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the agent's packages, env and
@@ -21,6 +23,9 @@
 
 allow = [
     "{*} https://apiv2.stakpak.dev",
+    # The model catalogue, read at every start to learn each model's limits; refused, the agent
+    # warns "Failed to load models cache" and runs without them.
+    "@models-catalog",
 ]
 mute = [
     "discord.com",

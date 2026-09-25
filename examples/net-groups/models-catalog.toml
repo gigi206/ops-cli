@@ -6,7 +6,7 @@
 #   # then in an app's or bundle's allow list:   "@models-catalog"
 #
 # The model catalogue (`models.dev`), fetched read-only by the agents that list models at
-# startup — shared by `cline`, `hermes`, `kilocode`, `kimi`, `mimo` and `opencode`. Groups are
+# startup — shared by `cline`, `hermes`, `kilocode`, `kimi`, `mimo`, `opencode` and `stakpak`. Groups are
 # global-only (like bundles): an app's or bundle's lists may reference one, a project may not
 # define one.
 

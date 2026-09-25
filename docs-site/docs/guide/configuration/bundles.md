@@ -362,7 +362,7 @@ The 67 shipped bundles, and what each carries:
 | `rovo` | 1 (`nix:`) | 12 egress entries | none |
 | `sigit` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `snow` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `stakpak` | 1 (`mise:`) | 4 egress entries | none |
+| `stakpak` | 1 (`mise:`) | 5 egress entries | `models-catalog` |
 | `trae` | 2 (`nix:`) | 2 egress entries, an install step | `github`, `pypi` |
 | `traycer` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `traycer-desktop` | 1 (`deb:`) | 7 egress entries, a `deb:` resolver | none |
