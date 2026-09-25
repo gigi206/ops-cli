@@ -44,7 +44,29 @@
 # UNVERIFIED (like every profile until run with a real account): the live login and the model
 # traffic through sbx's MITM. What is grounded here is the packaging (official GitHub release via
 # aqua), the auth mechanisms (GitHub's own README), and the host list (GitHub's allowlist doc).
-cmd = "copilot"
+#
+# The command hands Copilot the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as a custom-instructions file, staged under
+# the cage's own `/etc` (a tmpfs: it lives for this launch only and never reaches the host) and
+# named in `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`, ahead of any directories of yours. The file is named
+# `*.instructions.md`, because Copilot does not load an `AGENTS.md` from those directories. It adds
+# to the instructions: your `~/.copilot/copilot-instructions.md` still applies. Arguments after
+# `sbx app run copilot --` reach Copilot verbatim through `"$@"`. (Copilot also runs without a
+# GitHub account on a model provider of yours: `copilot help environment` lists the
+# `COPILOT_PROVIDER_*` variables.)
+cmd = [
+    "bash",
+    "-c",
+    '''
+if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/copilot-sbx 2>/dev/null; then
+  cp /opt/sbx/contract-summary.md /etc/copilot-sbx/sbx.instructions.md
+  export COPILOT_CUSTOM_INSTRUCTIONS_DIRS="/etc/copilot-sbx${COPILOT_CUSTOM_INSTRUCTIONS_DIRS:+,$COPILOT_CUSTOM_INSTRUCTIONS_DIRS}"
+fi
+exec copilot "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "copilot",
+]
 
 # Your host Copilot CLI config, mounted read-write at its real absolute path. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
