@@ -2159,7 +2159,7 @@ fn stage_fs_masks(
     // has not made); it is made now, empty, or the launch refuses, since an unbound mask would
     // leave the cage free to create it and fill it.
     let root = prep.cwd.canonicalize().unwrap_or_else(|_| prep.cwd.clone());
-    if let Err(e) = crate::sandbox::fsmask::create_absent_dirs(&fs_masks, &root) {
+    if let Err(e) = crate::sandbox::fsmask::create_absent_dirs(&fs_masks) {
         crate::diag::error(&format!(
             "sbx: cannot prepare a directory the cage must not write ({e}) — refusing to launch \
              with it open"

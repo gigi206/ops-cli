@@ -107,6 +107,44 @@ pub(crate) struct Expanded {
     /// resolve, or the policy needs more mounts than [`MASK_MAX`]. The launch fails closed on it,
     /// because the alternative is a run whose paths are open while the config says they are shut.
     pub(crate) refused: Option<String>,
+    /// Where the cage writes at a host path's own name, which each mask lies under.
+    pub(crate) reach: Reach,
+}
+
+/// The host directories the cage writes at their own path, canonical: the project root.
+///
+/// A file the host's git reads that lies under it is one the cage could rewrite before that git
+/// reads it, so it is held; a link under it is a name the cage could point elsewhere. A path under
+/// none of these directories is not the cage's to write.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Reach {
+    /// The canonical project root.
+    project: PathBuf,
+}
+
+impl Reach {
+    /// The reach of a launch in the project at canonical `root`.
+    fn of(root: &Path) -> Self {
+        Reach {
+            project: root.to_path_buf(),
+        }
+    }
+
+    /// The canonical project root.
+    fn project(&self) -> &Path {
+        &self.project
+    }
+
+    /// The directory `path` lies at or under, or `None` when the cage does not write it.
+    fn root_of(&self, path: &Path) -> Option<&Path> {
+        let known = !self.project.as_os_str().is_empty();
+        (known && path.starts_with(&self.project)).then_some(self.project.as_path())
+    }
+
+    /// Whether `path` lies at or under a directory the cage writes.
+    fn holds(&self, path: &Path) -> bool {
+        self.root_of(path).is_some()
+    }
 }
 
 /// What an expansion does to one project path: the two answers a bind produces, and the entry
@@ -255,11 +293,12 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     // Every question below is asked of the host's git, and a `.git` or a `.git/config` reached
     // through a link, or a `.git/commondir`, would have it answer from elsewhere: refused first,
     // and nothing is asked.
+    let reach = Reach::of(&root);
     let main = GitRepo::main(&root);
     let protected = git_protected(&root, policy.git_writable());
     let layout = git_dir_link_refusal(&root, policy.git_writable())
-        .or_else(|| git_file_target_refusal(&root, policy.git_writable()))
-        .or_else(|| protected.then(|| git_repo_refusal(&root, &main)).flatten());
+        .or_else(|| git_file_target_refusal(&reach, policy.git_writable()))
+        .or_else(|| protected.then(|| git_repo_refusal(&reach, &main)).flatten());
     let mut carrier: Vec<Masked> = Vec::new();
     let mut submodules = 0;
     match layout {
@@ -269,15 +308,15 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         None if !protected => {}
         None => {
             carrier.extend(git_hook_dirs(
-                &root,
+                &reach,
                 &main,
                 &mut out.warnings,
                 &mut out.refused,
             ));
-            carrier.extend(git_include_files(&root, &main, &mut out.refused));
-            carrier.extend(git_worktree_files(&root, &main, &mut out.refused));
+            carrier.extend(git_include_files(&reach, &main, &mut out.refused));
+            carrier.extend(git_worktree_files(&reach, &main, &mut out.refused));
             submodules = submodule_carrier(
-                &root,
+                &reach,
                 &main,
                 0,
                 &mut carrier,
@@ -339,7 +378,8 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
              which closes the whole path — this one adds nothing and is dropped"
         ));
     }
-    out.pins = holding_dirs(&root, &out);
+    out.reach = reach;
+    out.pins = holding_dirs(&out);
 
     guard_hard_links(&out.denied, "deny", &mut out.warnings);
     guard_hard_links(&out.readonly, "readonly", &mut out.warnings);
@@ -397,7 +437,7 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
 /// `rename` across its boundary is refused (`EXDEV`), which `mv` answers by copying. The one git
 /// command this reaches is `submodule absorbgitdirs`, which moves a submodule's repository into a
 /// held `.git` and is refused with nothing changed.
-fn holding_dirs(root: &Path, expanded: &Expanded) -> Vec<PathBuf> {
+fn holding_dirs(expanded: &Expanded) -> Vec<PathBuf> {
     let read_only_dirs: Vec<&Path> = expanded
         .readonly
         .iter()
@@ -406,6 +446,9 @@ fn holding_dirs(root: &Path, expanded: &Expanded) -> Vec<PathBuf> {
         .collect();
     let mut pins: BTreeSet<PathBuf> = BTreeSet::new();
     for m in expanded.denied.iter().chain(&expanded.readonly) {
+        let Some(root) = expanded.reach.root_of(&m.path) else {
+            continue;
+        };
         for dir in m
             .path
             .ancestors()
@@ -535,7 +578,8 @@ fn git_file_protected(root: &Path, git_writable: bool) -> bool {
 /// whose configuration and hooks nothing protects, since the carrier is looked for in a `.git`
 /// directory, so it refuses the launch, and so does a link inside the project on the way to it
 /// ([`git_link_on_the_way`]).
-fn git_file_target_refusal(root: &Path, git_writable: bool) -> Option<String> {
+fn git_file_target_refusal(reach: &Reach, git_writable: bool) -> Option<String> {
+    let root = reach.project();
     if !git_file_protected(root, git_writable) {
         return None;
     }
@@ -545,7 +589,7 @@ fn git_file_target_refusal(root: &Path, git_writable: bool) -> Option<String> {
         Err(e) => return Some(visible(&git_unreadable("read", &file, &e))),
     };
     let what = "the repository your git reads";
-    if let Some(reason) = git_link_on_the_way(root, &target, what, GIT_LINK_INSTEAD) {
+    if let Some(reason) = git_link_on_the_way(reach, &target, what, GIT_LINK_INSTEAD) {
         return Some(reason);
     }
     let canon = crate::trust::canonicalize_existing_prefix(&target);
@@ -582,7 +626,7 @@ const SUBMODULE_DEPTH: usize = 8;
 /// `.gitmodules`, or a `modules` directory in its git directory), since their repositories could not
 /// be found; otherwise there is nothing to look for.
 fn submodule_carrier(
-    root: &Path,
+    reach: &Reach,
     repo: &GitRepo,
     depth: usize,
     masks: &mut Vec<Masked>,
@@ -604,7 +648,7 @@ fn submodule_carrier(
     for dir in links {
         let dot_git = dir.join(".git");
         let what = "a submodule's repository";
-        if let Some(reason) = git_link_on_the_way(root, &dot_git, what, GIT_LINK_INSTEAD) {
+        if let Some(reason) = git_link_on_the_way(reach, &dot_git, what, GIT_LINK_INSTEAD) {
             refused.get_or_insert(reason);
             continue;
         }
@@ -616,7 +660,7 @@ fn submodule_carrier(
             }
             Ok(meta) if meta.is_dir() => dot_git,
             Ok(meta) if meta.is_file() => {
-                git_file(root, &dot_git, None, refused, masks);
+                git_file(reach, &dot_git, None, refused, masks);
                 let target = match gitfile_target(&dot_git) {
                     Ok(Some(target)) => target,
                     Ok(None) => continue,
@@ -626,13 +670,13 @@ fn submodule_carrier(
                         continue;
                     }
                 };
-                if let Some(reason) = git_link_on_the_way(root, &target, what, GIT_LINK_INSTEAD) {
+                if let Some(reason) = git_link_on_the_way(reach, &target, what, GIT_LINK_INSTEAD) {
                     refused.get_or_insert(reason);
                     continue;
                 }
                 let canon = crate::trust::canonicalize_existing_prefix(&target);
-                // Outside the project the cage does not reach it; the file naming it is held.
-                if !canon.starts_with(root) {
+                // Where the cage does not write, it does not reach it; the file naming it is held.
+                if !reach.holds(&canon) {
                     continue;
                 }
                 if !canon.is_dir() {
@@ -655,15 +699,15 @@ fn submodule_carrier(
             dir: git_dir,
             work_tree: dir,
         };
-        if let Some(reason) = git_repo_refusal(root, &sub) {
+        if let Some(reason) = git_repo_refusal(reach, &sub) {
             refused.get_or_insert(reason);
             continue;
         }
         found += 1;
-        git_file(root, &sub.dir.join("config"), None, refused, masks);
-        masks.extend(git_hook_dirs(root, &sub, warnings, refused));
-        masks.extend(git_include_files(root, &sub, refused));
-        masks.extend(git_worktree_files(root, &sub, refused));
+        git_file(reach, &sub.dir.join("config"), None, refused, masks);
+        masks.extend(git_hook_dirs(reach, &sub, warnings, refused));
+        masks.extend(git_include_files(reach, &sub, refused));
+        masks.extend(git_worktree_files(reach, &sub, refused));
         if depth + 1 == SUBMODULE_DEPTH {
             refused.get_or_insert_with(|| {
                 visible(&format!(
@@ -674,7 +718,7 @@ fn submodule_carrier(
             });
             continue;
         }
-        found += submodule_carrier(root, &sub, depth + 1, masks, warnings, refused);
+        found += submodule_carrier(reach, &sub, depth + 1, masks, warnings, refused);
         if found > MASK_MAX {
             break;
         }
@@ -741,15 +785,15 @@ fn git_dir_link_refusal(root: &Path, git_writable: bool) -> Option<String> {
 /// same name the cage could point elsewhere as a `.git` link ([`git_link_on_the_way`]), or a
 /// `commondir` ([`git_commondir_refusal`]). Both are checked before any question is asked of the
 /// host's git, which would read through them.
-fn git_repo_refusal(root: &Path, repo: &GitRepo) -> Option<String> {
+fn git_repo_refusal(reach: &Reach, repo: &GitRepo) -> Option<String> {
     git_link_on_the_way(
-        root,
+        reach,
         &repo.dir.join("config"),
         "the configuration your git reads",
         "Replace it with the file it names, or keep that file in the project and include it from a \
          `.git/config` of its own (`git config include.path <file>`), which sbx protects in place",
     )
-    .or_else(|| git_commondir_refusal(root, repo))
+    .or_else(|| git_commondir_refusal(reach, repo))
 }
 
 /// The directories git runs hooks from, as read-only masks: `.git/hooks`, and the directory
@@ -774,14 +818,14 @@ fn git_repo_refusal(root: &Path, repo: &GitRepo) -> Option<String> {
 /// the one `core.hooksPath` names, and wherever it leads ([`git_link_on_the_way`]). The refusal
 /// names the form sbx holds in place: `core.hooksPath` pointed at the directory itself.
 fn git_hook_dirs(
-    root: &Path,
+    reach: &Reach,
     repo: &GitRepo,
     warnings: &mut Vec<String>,
     refused: &mut Option<String>,
 ) -> Vec<Masked> {
     let mut dirs = vec![(
         repo.dir.join("hooks"),
-        format!("{}/", repo.shown(root, "hooks")),
+        format!("{}/", repo.shown(reach.project(), "hooks")),
         "Replace it with the directory it names, or remove it and point `core.hooksPath` at that \
          directory (`git config core.hooksPath <dir>`), which sbx protects in place",
     )];
@@ -796,7 +840,7 @@ fn git_hook_dirs(
     let mut out: Vec<Masked> = Vec::new();
     for (path, pattern, instead) in dirs {
         let what = format!("the directory your git runs hooks from ({pattern})");
-        if let Some(reason) = git_link_on_the_way(root, &path, &what, instead) {
+        if let Some(reason) = git_link_on_the_way(reach, &path, &what, instead) {
             refused.get_or_insert(reason);
             continue;
         }
@@ -828,9 +872,9 @@ fn git_hook_dirs(
                 }
             },
         };
-        if !canon.starts_with(root) {
+        let Some(root) = reach.root_of(&canon) else {
             continue;
-        }
+        };
         if canon == root {
             warnings.push(format!(
                 "`{pattern}` names the project root itself: its hooks cannot be protected without \
@@ -915,7 +959,7 @@ fn git_hooks_path(repo: &GitRepo) -> Option<PathBuf> {
 /// sbx's to write into the user's tree the way an empty hooks directory is. The refusal names the
 /// file and the way out. An include reached through a symbolic link inside the project refuses
 /// the launch as well, wherever the link leads ([`git_link_on_the_way`]).
-fn git_include_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
+fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
     let Some(out) = host_git_config(
         repo,
         &[
@@ -944,7 +988,7 @@ fn git_include_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>) 
         let pattern = format!("{key} = {value}");
         let what = format!("{GIT_CONFIG_READ} ({pattern})");
         if let Some(reason) = git_link_on_the_way(
-            root,
+            reach,
             &path,
             &what,
             "Name the file by a path with no link in it",
@@ -955,7 +999,7 @@ fn git_include_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>) 
         let canon = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let canon = crate::trust::canonicalize_existing_prefix(&path);
-                if canon.starts_with(root) {
+                if reach.holds(&canon) {
                     refused.get_or_insert_with(|| {
                         visible(&format!(
                             "git includes `{}` as configuration ({pattern}), and it does not \
@@ -992,7 +1036,7 @@ fn git_include_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>) 
         };
         // A directory is not a configuration file git can read; outside the project, the cage
         // does not hold it.
-        if !canon.starts_with(root) || canon.is_dir() {
+        if !reach.holds(&canon) || canon.is_dir() {
             continue;
         }
         if !masks.iter().any(|m| m.path == canon) {
@@ -1020,13 +1064,13 @@ fn git_include_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>) 
 /// stand in its place, since git refuses to run on an empty file or a directory there. The cage can
 /// therefore create one during a session: the end of that session names it ([`GitWatch`]), and the
 /// next launch refuses on it.
-fn git_commondir_refusal(root: &Path, repo: &GitRepo) -> Option<String> {
+fn git_commondir_refusal(reach: &Reach, repo: &GitRepo) -> Option<String> {
     let path = repo.dir.join("commondir");
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(format!(
             "`{}`: {}",
-            repo.shown(root, "commondir"),
+            repo.shown(reach.project(), "commondir"),
             visible(&git_unreadable("look at", &path, &e))
         )),
         Ok(_) => Some(format!(
@@ -1059,7 +1103,7 @@ fn git_commondir_refusal(root: &Path, repo: &GitRepo) -> Option<String> {
 /// [`MASK_MAX`]: more worktrees than masks can hold refuses the launch rather than reading on. What
 /// holding these costs is `git worktree remove` and `prune` of a worktree that existed at launch,
 /// which cannot delete its directory from the cage.
-fn git_worktree_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
+fn git_worktree_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
     let extension = host_git_config(
         repo,
         &[
@@ -1072,10 +1116,10 @@ fn git_worktree_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>)
     .is_some_and(|out| out.trim_ascii() == b"true");
     let mut out: Vec<Masked> = Vec::new();
     let git = &repo.dir;
-    let config = repo.shown(root, "config");
+    let config = repo.shown(reach.project(), "config");
     let required = extension.then_some(config.as_str());
     git_file(
-        root,
+        reach,
         &git.join("config.worktree"),
         required,
         refused,
@@ -1125,13 +1169,13 @@ fn git_worktree_files(root: &Path, repo: &GitRepo, refused: &mut Option<String>)
             }
             Ok(meta) if meta.is_dir() => {
                 git_file(
-                    root,
+                    reach,
                     &dir.join("config.worktree"),
                     required,
                     refused,
                     &mut out,
                 );
-                git_file(root, &dir.join("commondir"), None, refused, &mut out);
+                git_file(reach, &dir.join("commondir"), None, refused, &mut out);
             }
             // Not a worktree: git reads nothing from a file here.
             Ok(_) => {}
@@ -1193,7 +1237,7 @@ impl GitWatch {
             return None;
         }
         let configs = WorktreeScan::of(&root).configs;
-        let submodules = GitlinkScan::of(&root);
+        let submodules = GitlinkScan::of(&Reach::of(&root));
         Some(GitWatch {
             root,
             configs,
@@ -1239,7 +1283,7 @@ impl GitWatch {
                 self.root.join(".git/worktrees").display()
             ));
         }
-        let now = GitlinkScan::of(&self.root);
+        let now = GitlinkScan::of(&Reach::of(&self.root));
         for dot_git in now.repos.difference(&self.submodules.repos) {
             out.push(format!(
                 "`{}` is a submodule's repository that sbx did not protect at launch: a `git \
@@ -1333,13 +1377,13 @@ struct GitlinkScan {
 }
 
 impl GitlinkScan {
-    fn of(root: &Path) -> Self {
+    fn of(reach: &Reach) -> Self {
         let mut scan = GitlinkScan::default();
-        scan.walk(root, &GitRepo::main(root), 0);
+        scan.walk(reach, &GitRepo::main(reach.project()), 0);
         scan
     }
 
-    fn walk(&mut self, root: &Path, repo: &GitRepo, depth: usize) {
+    fn walk(&mut self, reach: &Reach, repo: &GitRepo, depth: usize) {
         let Ok(links) = gitlinks(repo) else {
             self.unread.push(repo.dir.join("index"));
             return;
@@ -1360,7 +1404,7 @@ impl GitlinkScan {
                 && let Ok(Some(target)) = gitfile_target(&dot_git)
             {
                 let canon = crate::trust::canonicalize_existing_prefix(&target);
-                if !canon.starts_with(root) || !canon.is_dir() {
+                if !reach.holds(&canon) || !canon.is_dir() {
                     continue;
                 }
                 canon
@@ -1371,7 +1415,7 @@ impl GitlinkScan {
                 dir: git_dir,
                 work_tree: dir,
             };
-            self.walk(root, &sub, depth + 1);
+            self.walk(reach, &sub, depth + 1);
         }
     }
 }
@@ -1381,15 +1425,16 @@ impl GitlinkScan {
 /// configuration, which makes an absent one a refusal: the cage could create it and git would read
 /// it.
 fn git_file(
-    root: &Path,
+    reach: &Reach,
     path: &Path,
     required: Option<&str>,
     refused: &mut Option<String>,
     out: &mut Vec<Masked>,
 ) {
+    let root = reach.root_of(path).unwrap_or(reach.project());
     let rel = visible(
         &path
-            .strip_prefix(root)
+            .strip_prefix(reach.project())
             .unwrap_or(path)
             .display()
             .to_string(),
@@ -1438,9 +1483,9 @@ fn git_file(
 /// project, which the cage does not hold, is followed, and a link inside the project that it leads
 /// through still counts. `what` says what git reads there, and `instead` the form sbx holds in
 /// place.
-fn git_link_on_the_way(root: &Path, path: &Path, what: &str, instead: &str) -> Option<String> {
+fn git_link_on_the_way(reach: &Reach, path: &Path, what: &str, instead: &str) -> Option<String> {
     use crate::trust::ResolutionStop;
-    match crate::trust::resolution_stop(path, |at, link| link && at.starts_with(root))? {
+    match crate::trust::resolution_stop(path, |at, link| link && reach.holds(at))? {
         ResolutionStop::At(link) => Some(git_link_refusal(&link, what, instead)),
         ResolutionStop::TooManyLinks(link) => Some(visible(&format!(
             "`{}`: resolving the path to {what} meets more symbolic links than the kernel follows \
@@ -1476,9 +1521,12 @@ const GIT_CONFIG_READ: &str = "a file your git reads as configuration";
 /// non-recursive `mkdir`: `create_dir_all` would follow a link the cage planted in an intermediate
 /// component and make the directory wherever it points. A component that exists and is not a
 /// directory is an error, and the launch refuses on it, since the mask it was for cannot be placed.
-pub(crate) fn create_absent_dirs(expanded: &Expanded, root: &Path) -> io::Result<()> {
+pub(crate) fn create_absent_dirs(expanded: &Expanded) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     for m in expanded.readonly.iter().filter(|m| m.builtin && m.is_dir) {
+        let Some(root) = expanded.reach.root_of(&m.path) else {
+            continue;
+        };
         let Ok(rel) = m.path.strip_prefix(root) else {
             continue;
         };
@@ -2671,7 +2719,7 @@ mod tests {
             !hooks.exists(),
             "expanding is read-only: the launch makes it"
         );
-        create_absent_dirs(&e, &root).unwrap();
+        create_absent_dirs(&e).unwrap();
         assert!(hooks.is_dir() && std::fs::read_dir(&hooks).unwrap().next().is_none());
 
         // A link where a component should be is refused, never followed.
@@ -2686,9 +2734,10 @@ mod tests {
                 pattern: String::new(),
                 builtin: true,
             }],
+            reach: Reach::of(&root),
             ..Expanded::default()
         };
-        assert!(create_absent_dirs(&planted, &root).is_err());
+        assert!(create_absent_dirs(&planted).is_err());
         assert!(
             !elsewhere.join("sub").exists(),
             "nothing made through the link"
