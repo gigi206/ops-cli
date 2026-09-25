@@ -234,6 +234,9 @@ allow = [
     "{*} https://openrouter.ai",                     # OpenRouter
     "{*} https://api.deepseek.com",                  # DeepSeek
     "{*} https://api-inference.modelscope.cn",       # ModelScope (Alibaba)
+    # AionUi's own account: the app asks you to sign in before it starts an agent. Signing in with
+    # Google also needs the Google sign-in hosts commented below.
+    "{*} https://www.aionui.com",
     # The co-worked agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` near
     # the top of this file) and are unioned into this list at resolution. Check what that adds with
     # `sbx bundle opencode`, and what the launch ends up with via `sbx config show --app aionui`.
@@ -272,7 +275,7 @@ mute = [
     "static.aionui.com",  # AionUi's own auto-update feed — the .deb is managed by `sbx upgrade`, not in-cage
 ]
 
-# AUTHENTICATION — no [secret]/[env] block. AionUi stores each provider's API key locally (entered
+# AUTHENTICATION — no [secret] block. AionUi stores each provider's API key locally (entered
 # in Settings → Models), so the key lives in the app's PERSISTENT ISOLATED HOME and travels straight
 # from the app to the provider over the MITM-inspected TLS to an allowed host — there is nothing for
 # sbx to inject. (This is AionUi's design: the key is briefly present in the cage's app config,
@@ -280,6 +283,15 @@ mute = [
 # provider's key host-side and keep it out of the cage entirely, add a `[secret."<host>"]` block +
 # an in-cage placeholder like the `codex`/`cline` CLI profiles — but AionUi's multi-key GUI is the
 # intended path.)
+
+[env]
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers), added to the instructions of the co-worked OpenCode agent, so a
+# refused host or a read-only file reads as the sandbox rather than as a fault to work around. AionUi
+# hands its environment to the `opencode acp` it starts, and OpenCode merges this variable over its
+# own config rather than replacing it. It reaches OpenCode only: AionUi's built-in agent and another
+# co-worked CLI take their instructions elsewhere.
+OPENCODE_CONFIG_CONTENT = '{"instructions":["/opt/sbx/contract-summary.md"]}'
 
 # The `deb:resolve` command for the `aionui` package above. sbx runs it in a hermetic sandbox (base
 # tools only, host network to reach the vendor) and pins the `.deb` URL it prints with its content
