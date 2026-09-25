@@ -76,7 +76,26 @@
 # The web server auto-opens a browser by default; the hermetic cage has none, so `cmd` passes
 # `--no-browser` and you open the URL yourself. Do NOT set OPENFOX_HOST=0.0.0.0 (that exposes the
 # UI to your LAN); keep the 127.0.0.1 default.
-cmd = ["openfox", "--no-browser"]
+#
+# The command also hands OpenFox the cage's summary (/opt/sbx/contract-summary.md: what it may
+# reach, which files it protects, which operations it offers) as an instruction file: a link at
+# `/AGENTS.md`. OpenFox reads the `AGENTS.md` and `CLAUDE.md` of every directory from `/` down to a
+# session's working directory and joins them into the system prompt, so the link reaches every
+# session whatever its directory, and your project's own files still apply, after it. The cage's
+# root is its own tmpfs: the link lives for this launch only and never reaches the host. Arguments
+# after `sbx app run openfox --` reach OpenFox verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+if [ -r /opt/sbx/contract-summary.md ]; then
+  ln -sf /opt/sbx/contract-summary.md /AGENTS.md
+fi
+exec openfox --no-browser "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "openfox",
+]
 
 # The INBOUND crossing: your browser's `http://127.0.0.1:10369` is bridged into the cage, where
 # openfox serves the UI on the same port. Keep this in step with OPENFOX_PORT if you change it.
@@ -110,8 +129,8 @@ mode = "deny"
 # port does not expose the rest of what listens on your machine. OpenFox probes the common ones on
 # first run (8000 vLLM, 11434 ollama, 8080 llama.cpp): a probe to a port not listed here is refused
 # by the allowlist, so uncomment the one your backend serves (or all three, if you switch between
-# them). The npm entry is the in-cage `npm rebuild` from `cmd` above; the release assets it then
-# downloads ride the built-in github allow-set.
+# them). The npm entry is the in-cage `npm rebuild` of the bundle's `provision`; the release assets
+# it then downloads ride the built-in github allow-set.
 allow = [
     "tcp://localhost:8000",    # vLLM — the OPENFOX_LLM_URL default
     #"tcp://localhost:11434",  # ollama

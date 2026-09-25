@@ -58,6 +58,14 @@
 # fallback (read out of the published tarball), the `AMP_*` environment keys and the `ampcode.com`
 # endpoints (read out of the shipped binary), and the bearer-token shape of the `Authorization`
 # header.
+#
+# The command also hands Amp the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as system-wide guidance: a link at
+# `/etc/ampcode/AGENTS.md`, the path Amp's AGENTS.md documentation gives for organization-managed
+# guidance and includes always, together with your `~/.config/amp/AGENTS.md`, `~/.config/AGENTS.md`
+# and the project's own files. `/etc` is the cage's own tmpfs: the link lives for this launch only and
+# never reaches the host. A root `/AGENTS.md` would not do, since Amp stops its walk up the parent
+# directories at `$HOME`. Not measured: Amp needs an Amp account before it assembles a thread.
 cmd = [
     "bash",
     "-c",
@@ -70,6 +78,11 @@ set -eu
 amp_root="$(mise where 'npm:@ampcode/cli')"
 amp="$amp_root/node_modules/@ampcode/cli"
 [ -d "$amp" ] || amp="$amp_root/lib/node_modules/@ampcode/cli"
+# The cage's summary as Amp's system-wide guidance file (see the note above `cmd`). A failure here
+# leaves the agent without the summary; it never stops the launch.
+if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/ampcode 2>/dev/null; then
+  ln -sf /opt/sbx/contract-summary.md /etc/ampcode/AGENTS.md || true
+fi
 # Skip the vendor's postinstall (mise blocks scripts on purpose) and use the package's own JS
 # fallback, which require.resolve's the platform optional dep and spawns the native binary
 # directly. No placement, no network — the binary is already on disk beside it.
