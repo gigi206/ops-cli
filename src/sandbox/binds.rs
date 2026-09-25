@@ -613,11 +613,12 @@ struct SandboxPaths<'a> {
     /// [`MISE_PROJECT_INCAGE`] (mise's primary for the split). `None` keeps the single app-global
     /// pool ([`mise_env`] then reads its whole install/shim set from the home).
     mise_project_src: Option<&'a Path>,
-    /// The other apps' per-project install pools this cage may read, as `(app name, host
-    /// installs dir)`. Each is bound read-only at `<MISE_SHARED_INCAGE>/<app>` and named to mise as
-    /// a fallback after the app's own. Empty unless a trusted project granted
-    /// `apps_share_install_pools`, and empty for every runtime but a global app.
-    mise_shared_installs: &'a [(String, PathBuf)],
+    /// The other apps' per-project mise pools this cage may read, as `(app name, host pool dir)`.
+    /// Each is bound read-only at `<MISE_SHARED_INCAGE>/<app>` ([`shared_pool_mounts`]), and the
+    /// `installs` inside it is named to mise as a fallback after the app's own. Empty unless a
+    /// trusted project granted `apps_share_install_pools`, and empty for every runtime but a
+    /// global app.
+    mise_shared_pools: &'a [(String, PathBuf)],
     /// Synthetic identity files; bound read-only at `/etc/passwd`/`/etc/group`.
     passwd_src: &'a Path,
     group_src: &'a Path,
@@ -1018,19 +1019,7 @@ fn cage_mounts(
     // spawn removes a directory this cage was about to bind, and a hard mount would fail the
     // launch of an app that merely had a neighbour tidied. Skipped, the app installs its own copy,
     // which is what it would have done had the neighbour never run.
-    //
-    // Each source sits below the neighbour's `mise` directory, whose contents that neighbour's
-    // cage writes, and the host resolves it for this one. So the list holds only pools that were
-    // real directories down to `installs` when the launch was planned
-    // ([`super::inspect::project_mise_pools`]), and a pool a cage left as a link is never bound.
-    // That check and bwrap's mount are two resolutions of the same path: a neighbour's cage
-    // running between them can still change what the path names.
-    for (app, installs) in paths.mise_shared_installs {
-        mounts.push(Mount::RoBindTry {
-            src: installs.clone(),
-            dest: Path::new(MISE_SHARED_INCAGE).join(app),
-        });
-    }
+    mounts.extend(shared_pool_mounts(paths.mise_shared_pools));
 
     // Zone 1 — the synthetic system-wide ssh client config, present only when a declared `tcp://`
     // destination needs one: a privileged port gets no in-cage listener, so ssh has to ask the
@@ -1299,7 +1288,7 @@ fn cage_env(
         nix.on_btrfs,
         overlay.fresh_release_tokens,
         overlay.ignored_mise_paths,
-        paths.mise_shared_installs,
+        paths.mise_shared_pools,
     ));
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
@@ -1531,6 +1520,33 @@ pub(crate) fn flake_inline_incage(name: &str) -> PathBuf {
 /// mount.
 pub(crate) const SHELL_RC_INCAGE: &str = "/opt/sbx/bashrc";
 
+/// The read-only binds that give a cage its neighbours' pools, one per app at
+/// `<MISE_SHARED_INCAGE>/<app>`.
+///
+/// The source is the neighbour's pool directory itself, never a path below it. That directory is
+/// the mount point of the neighbour's own cage, which therefore cannot rename or replace it, while
+/// everything inside it is that cage's to write. So the host resolves only names no cage can
+/// change, and `installs`, the one mise reads, is resolved inside the reading cage
+/// ([`shared_installs_incage`]), where a link names nothing that cage does not already see. A
+/// check made when the launch is planned could not give this on its own: bwrap resolves a source
+/// again when it mounts it, and a neighbour's cage running between the two would choose what that
+/// resolution finds.
+///
+/// What it costs is the rest of the pool: the reading cage also sees, read-only, whatever mise
+/// keeps in its data directory beside the installs, such as its shims, plugins and downloads.
+fn shared_pool_mounts(pools: &[(String, PathBuf)]) -> impl Iterator<Item = Mount> + '_ {
+    pools.iter().map(|(app, pool)| Mount::RoBindTry {
+        src: pool.clone(),
+        dest: Path::new(MISE_SHARED_INCAGE).join(app),
+    })
+}
+
+/// Where mise finds `app`'s installs inside the cage: below the bind [`shared_pool_mounts`] makes
+/// of its pool, so that name is resolved in the cage that reads it.
+fn shared_installs_incage(app: &str) -> String {
+    format!("{MISE_SHARED_INCAGE}/{app}/installs")
+}
+
 /// The structural environment that turns the cage's mise into a working
 /// self-equip front-end. Lowest precedence (a trusted config may still override
 /// it, which only harms that project's own in-cage builds):
@@ -1576,7 +1592,7 @@ fn mise_env(
     store_on_btrfs: bool,
     fresh_release_tokens: &[String],
     ignored_mise_paths: &[std::path::PathBuf],
-    shared_installs: &[(String, PathBuf)],
+    shared_pools: &[(String, PathBuf)],
 ) -> Vec<(String, String)> {
     let mut nix_config = "extra-experimental-features = nix-command flakes\n\
                           sandbox = false\n\
@@ -1607,9 +1623,9 @@ fn mise_env(
         // separators, and neither forgives the other's.
         let mut dirs = vec![format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs")];
         dirs.extend(
-            shared_installs
+            shared_pools
                 .iter()
-                .map(|(app, _)| format!("{MISE_SHARED_INCAGE}/{app}")),
+                .map(|(app, _)| shared_installs_incage(app)),
         );
         env.push(("MISE_SHARED_INSTALL_DIRS".to_string(), dirs.join(":")));
     }
@@ -1981,7 +1997,7 @@ pub(crate) fn build_spec(
     // own, so only a global app has neighbours to read; `project_mise_pools` discovers them on
     // disk, so the set is exactly the apps that have run in this project and equipped something.
     // The app's own pool is excluded by name — it is the writable primary, not a fallback.
-    let mise_shared_installs: Vec<(String, PathBuf)> =
+    let mise_shared_pools: Vec<(String, PathBuf)> =
         match (overlay.share_install_pools, runtime.app()) {
             (true, Some(app)) if rt.mise_project_src.is_some() => {
                 super::inspect::project_mise_pools(data_dir, &project_id(&project), app)
@@ -1995,7 +2011,7 @@ pub(crate) fn build_spec(
         distro_writable: &distro_writable,
         home_src: &rt.home_src,
         mise_project_src: rt.mise_project_src.as_deref(),
-        mise_shared_installs: &mise_shared_installs,
+        mise_shared_pools: &mise_shared_pools,
         passwd_src: &passwd,
         group_src: &group,
         mise_plugin_src: &mise_plugin,

@@ -320,22 +320,24 @@ pub(crate) fn app_per_project_mise_pools(data_dir: &Path, name: &str) -> Vec<App
 /// The other apps' per-project mise install pools in one project tree — the inverse of
 /// [`app_per_project_mise_pools`], which walks one app across every project.
 ///
-/// Returns `(app name, <pool>/installs)` for every app of `project_id` except `except`, keeping
-/// only the pools that actually hold an `installs/` directory: an app that has run in the project
-/// but equipped nothing has a pool with nothing to offer, and naming it would put an empty
-/// directory on a fallback list. Sorted by app name, so the order a cage is given is stable across
-/// launches rather than following the filesystem's.
+/// Returns `(app name, <pool>)`, the pool being the app's `mise` directory, for every app of
+/// `project_id` except `except`, keeping only the pools that actually hold an `installs/`
+/// directory: an app that has run in the project but equipped nothing has a pool with nothing to
+/// offer, and naming it would put an empty directory on a fallback list. Sorted by app name, so the
+/// order a cage is given is stable across launches rather than following the filesystem's.
 ///
 /// This is the set `apps_share_install_pools` grants a read of. It is discovered on disk rather
 /// than declared, so the grant covers exactly the apps that have run in this project, and it is
 /// symmetric by construction: each app sees the others, none sees itself twice.
 ///
-/// Each path becomes the source of a bind the host resolves for the asking app's cage, and
-/// everything below a neighbour's `mise` directory is written by the neighbour's own cage, which
-/// has it as its mount point. So a pool is kept only where `<app>/mise/installs` opens as a real
-/// directory at every component, walked from the project's `apps` directory without following a
-/// link ([`super::gc::open_beneath`]). A pool that is not what a launch left is not shared, and
-/// the asking app installs its own copy, as it would with no neighbour at all.
+/// Each pool becomes the source of a read-only bind in the asking app's cage. The pool directory
+/// is the mount point of the neighbour's own cage, which cannot replace it, and everything below it
+/// is that cage's to write, so the bind takes the pool itself and `installs` is resolved inside the
+/// reading cage. What is checked here is the shape a launch left: a pool is kept only where
+/// `<app>/mise/installs` opens as a real directory at every component, walked from the project's
+/// `apps` directory without following a link ([`super::gc::open_beneath`]). A pool that is not
+/// what a launch left is not shared, and the asking app installs its own copy, as it would with no
+/// neighbour at all.
 pub(crate) fn project_mise_pools(
     data_dir: &Path,
     project_id: &str,
@@ -345,9 +347,9 @@ pub(crate) fn project_mise_pools(
     project_mise_neighbours(data_dir, project_id, except)
         .into_iter()
         .filter_map(|name| {
-            let rel = Path::new(&name).join("mise").join("installs");
-            super::gc::open_beneath(&apps, &rel).ok()?;
-            Some((name, apps.join(rel)))
+            let pool = Path::new(&name).join("mise");
+            super::gc::open_beneath(&apps, &pool.join("installs")).ok()?;
+            Some((name, apps.join(pool)))
         })
         .collect()
 }
@@ -1094,7 +1096,7 @@ mod tests {
         let pools = project_mise_pools(data, "p1", "asker");
         let names: Vec<&str> = pools.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["beta", "zed"]);
-        assert_eq!(pools[0].1, apps.join("beta/mise/installs"));
+        assert_eq!(pools[0].1, apps.join("beta/mise"));
 
         // and an app alone in its project has nobody to read
         assert!(project_mise_pools(data, "p2", "other").is_empty());

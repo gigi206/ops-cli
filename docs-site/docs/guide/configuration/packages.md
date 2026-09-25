@@ -220,7 +220,10 @@ launch, which is what it would have done had the app never run there.
 
 A pool is shared only while it has the shape a launch left: each directory down to its `installs`
 is a real directory. A pool where one of them has been replaced by a link is left off the list,
-and the app reading it installs its own copy instead.
+and the app reading it installs its own copy instead. What is mounted is the neighbour's whole
+pool, read-only, so the reading app also sees whatever mise keeps in its data directory beside the
+installs, such as its shims, plugins and downloads. The `installs` inside it is then resolved
+within the reading app's sandbox, never on the host.
 
 This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only), and unlike the
 others it cannot be set in the global config at all. The grant is about *these* apps in *this*

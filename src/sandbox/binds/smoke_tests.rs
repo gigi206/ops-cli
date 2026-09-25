@@ -1123,6 +1123,91 @@ fn a_global_app_cage_puts_both_mise_shims_dirs_on_path_and_splits_the_pool() {
 }
 
 #[test]
+fn a_neighbour_pool_changed_after_the_plan_is_resolved_inside_the_cage() {
+    // A shared pool is checked when the launch is planned, and bwrap resolves each bind source
+    // again when it mounts it, while everything below a neighbour's pool directory is written by
+    // the neighbour's own cage. So what matters is what the reading cage finds at the fallback mise
+    // reads once the neighbour's `installs` has become a link after the plan: plan, change and spawn
+    // are run in that order rather than argued. bwrap and a userns are enough; no userland is built.
+    let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
+        skip_incapable!("skipping shared-pool resolution smoke: need bwrap");
+        return;
+    };
+    if !matches!(crate::probe_userns(), crate::Userns::Ok) {
+        skip_incapable!("skipping shared-pool resolution smoke: need a user namespace");
+        return;
+    }
+    let scratch = TmpDir::new();
+    let apps = scratch.path().join("projects/p1/apps");
+    std::fs::create_dir_all(apps.join("neighbour/mise/installs/nix-jq/1.8.1")).unwrap();
+    let elsewhere = scratch.path().join("elsewhere");
+    std::fs::create_dir_all(elsewhere.join("not-a-pool-entry")).unwrap();
+
+    let pools = super::super::inspect::project_mise_pools(scratch.path(), "p1", "asker");
+    assert_eq!(
+        pools.len(),
+        1,
+        "the plan must carry the neighbour's pool: {pools:?}"
+    );
+    let mut mounts = vec![
+        Mount::RoBind {
+            src: "/usr".into(),
+            dest: "/usr".into(),
+        },
+        Mount::Symlink {
+            target: "usr/lib".into(),
+            dest: "/lib".into(),
+        },
+        Mount::Symlink {
+            target: "usr/lib64".into(),
+            dest: "/lib64".into(),
+        },
+        Mount::RoBindTry {
+            src: "/etc/ld.so.cache".into(),
+            dest: "/etc/ld.so.cache".into(),
+        },
+    ];
+    mounts.extend(shared_pool_mounts(&pools));
+
+    // After the plan, the neighbour's `installs` is replaced by a link to a directory outside it.
+    let installs = apps.join("neighbour/mise/installs");
+    std::fs::rename(&installs, apps.join("neighbour/mise/installs.planned")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &installs).unwrap();
+
+    let spec = SandboxSpec::new(
+        "/".into(),
+        mounts,
+        Vec::new(),
+        NetPolicy::Shared,
+        vec![
+            OsString::from("/usr/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("ls -A \"$1/\" 2>&1; echo ---; ls -A \"$2\""),
+            OsString::from("sh"),
+            OsString::from(shared_installs_incage("neighbour")),
+            Path::new(MISE_SHARED_INCAGE)
+                .join("neighbour")
+                .into_os_string(),
+        ],
+    )
+    .expect("a spec");
+    let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (at_fallback, in_pool) = stdout
+        .split_once("---\n")
+        .unwrap_or_else(|| panic!("the cage did not run to its end:\n{stdout}\n{stderr}"));
+    assert!(
+        in_pool.lines().any(|l| l == "installs.planned"),
+        "the bind must be the neighbour's own pool, as the plan saw it:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        at_fallback.contains("installs/") && !stdout.contains("not-a-pool-entry"),
+        "the cage must find nothing of what the link names outside the pool:\n{stdout}"
+    );
+}
+
+#[test]
 fn a_neighbour_pool_removed_between_the_plan_and_the_spawn_does_not_fail_the_launch() {
     // The shared-pool binds are `-try` for one reason: the source belongs to another app, and
     // `sbx app prune <neighbour> --reset` can remove it after `build_spec` read it off disk and

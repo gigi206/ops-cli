@@ -75,7 +75,7 @@ fn base_paths() -> SandboxPaths<'static> {
         distro_writable: &[],
         home_src: Path::new("/data/sbx/projects/abc/home"),
         mise_project_src: None,
-        mise_shared_installs: &[],
+        mise_shared_pools: &[],
         passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
         group_src: Path::new("/data/sbx/projects/abc/etc/group"),
         mise_plugin_src: Path::new("/store/mise-plugin"),
@@ -172,11 +172,11 @@ fn assembled_with_ssh_config(ssh_config_src: Option<&Path>) -> SandboxSpec {
 fn assembled_with_every_conditional_mount() -> SandboxSpec {
     let shared = [(
         "neighbour".to_string(),
-        PathBuf::from("/data/sbx/projects/abc/apps/neighbour/mise/installs"),
+        PathBuf::from("/data/sbx/projects/abc/apps/neighbour/mise"),
     )];
     assembled_from(&SandboxPaths {
         mise_project_src: Some(Path::new("/data/sbx/projects/abc/mise")),
-        mise_shared_installs: &shared,
+        mise_shared_pools: &shared,
         ssh_config_src: Some(Path::new("/data/sbx/projects/abc/etc/ssh_config")),
         open_apps_src: Some(Path::new("/data/sbx/projects/abc/etc/applications")),
         open_mimeapps_src: Some(Path::new("/data/sbx/projects/abc/etc/mimeapps.list")),
@@ -2203,7 +2203,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
     // ambient env's, not PATH order).
     let pool = Path::new("/data/sbx/projects/abc/apps/demo-app/mise");
     let paths = SandboxPaths {
-        mise_shared_installs: &[],
+        mise_shared_pools: &[],
         project: Path::new("/home/u/proj"),
         project_writable: true,
         distro_writable: &[],
@@ -2577,7 +2577,7 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
             granted.mounts.iter().any(|m| matches!(
                 m,
                 Mount::RoBindTry { src, dest: d }
-                    if *d == dest && *src == apps.join(name).join("mise/installs")
+                    if *d == dest && *src == apps.join(name).join("mise")
             )),
             "{name}'s pool is not bound read-only (and -try) at {}",
             dest.display()
@@ -2587,7 +2587,7 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
         get(&granted, "MISE_SHARED_INSTALL_DIRS"),
         Some(format!(
             "{SANDBOX_HOME}/{MISE_DATA_REL}/installs:\
-             {MISE_SHARED_INCAGE}/neighbour:{MISE_SHARED_INCAGE}/other"
+             {MISE_SHARED_INCAGE}/neighbour/installs:{MISE_SHARED_INCAGE}/other/installs"
         )),
         "the app's own installs must come before every neighbour's, colon-joined"
     );
