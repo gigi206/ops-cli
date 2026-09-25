@@ -45,6 +45,12 @@ re-approval prompted by a change you did not make is exactly the moment to read 
 diff: a launch names each bind it drops from a changed file, and `sbx trust` shows the
 line that added it.
 
+For the same reason, the review never lets a line act on your terminal. A control
+character (an escape sequence, a carriage return) is printed as an escape such as `\x1b`
+or `\x0d`, and so is a character that reorders the text around it, such as `\u{202e}`.
+You see that the character is there rather than what it would do to the lines you read.
+A tab is left as it is.
+
 The global config and app profiles are **trusted by location**: they need no `sbx
 trust`, and asking for one says so and records nothing, since no reader looks for a
 marker on either. Only a project `.sbx.toml` uses content trust. One exception: [`[fs]`](../configuration/fs)

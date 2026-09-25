@@ -209,14 +209,13 @@ fn render_trust_review(
     pal: &style::Palette,
 ) -> String {
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    let shown_path = visible(&path.display().to_string());
     let mut out = match approved {
-        Some(_) => format!(
-            "sbx: {n}{}{r} changed since it was trusted; trusting it grants:\n",
-            path.display()
-        ),
+        Some(_) => {
+            format!("sbx: {n}{shown_path}{r} changed since it was trusted; trusting it grants:\n")
+        }
         None => format!(
-            "sbx: {n}{}{r} {dim}(no approved contents on record){r}; trusting it grants:\n",
-            path.display()
+            "sbx: {n}{shown_path}{r} {dim}(no approved contents on record){r}; trusting it grants:\n"
         ),
     };
     let find = |set: &[Shown], name: &str| {
@@ -236,8 +235,30 @@ fn render_trust_review(
         if approved.is_some() && old == new {
             continue;
         }
-        out.push_str(&format!("{n}--- {name}{r}\n"));
+        out.push_str(&format!("{n}--- {}{r}\n", visible(name)));
         out.push_str(&render_line_diff(&old, &new, pal));
+    }
+    out
+}
+
+/// A line of a reviewed file as the terminal is to show it.
+///
+/// The files under review sit in the project, which the cage writes, and one it created where none
+/// existed is shown whole. So a character that would move the cursor, erase a line, recolour the
+/// text or reorder it is written as an escape (`\x1b`, `\x0d`, `\u{202e}`): the reader sees that
+/// it is there instead of what it would do to the lines around it. A tab only moves forward, and is
+/// kept. The diff is taken on the lines as they are; only what is printed is escaped.
+fn visible(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        match c {
+            '\t' => out.push(c),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", u32::from(c))),
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                out.push_str(&format!("\\u{{{:04x}}}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
     }
     out
 }
@@ -276,10 +297,10 @@ fn render_line_diff(old: &str, new: &str, pal: &style::Palette) -> String {
             in_run = true;
         }
         if op == Op::Del {
-            out.push_str(&format!("{}-{}{}\n", pal.err, am[i], pal.reset));
+            out.push_str(&format!("{}-{}{}\n", pal.err, visible(am[i]), pal.reset));
             i += 1;
         } else {
-            out.push_str(&format!("{}+{}{}\n", pal.ok, bm[j], pal.reset));
+            out.push_str(&format!("{}+{}{}\n", pal.ok, visible(bm[j]), pal.reset));
             j += 1;
         }
     }
@@ -603,6 +624,31 @@ mod tests {
             "past the limit"
         );
         assert_eq!(ops.iter().filter(|o| **o == Op::Add).count(), 2999);
+    }
+
+    /// A config the cage created is shown whole, so what it holds reaches the terminal at the
+    /// moment the user decides what to grant. A character that would act on the terminal is shown
+    /// as an escape instead, whichever line or name carries it, and a tab stays a tab.
+    #[test]
+    fn the_review_shows_a_character_that_acts_on_the_terminal_as_an_escape() {
+        let p = style::Palette::plain();
+        let now = shown(&[
+            (
+                ".sbx.toml",
+                "a = 1\x1b[1A\x1b[2K\nb = 2\rc = 3\nd = \"\u{202e}x\"\te = 4\n",
+            ),
+            ("mise\x07.toml", "[tools]\n"),
+        ]);
+        let out = render_trust_review(Path::new("p\x1b/.sbx.toml"), None, &now, &p);
+        assert!(
+            !out.contains(['\x1b', '\r', '\x07', '\u{202e}']),
+            "a raw control character reached the review: {out:?}"
+        );
+        assert!(out.contains("p\\x1b/.sbx.toml"), "{out:?}");
+        assert!(out.contains("+a = 1\\x1b[1A\\x1b[2K\n"), "{out:?}");
+        assert!(out.contains("+b = 2\\x0dc = 3\n"), "{out:?}");
+        assert!(out.contains("+d = \"\\u{202e}x\"\te = 4\n"), "{out:?}");
+        assert!(out.contains("--- mise\\x07.toml\n"), "{out:?}");
     }
 
     #[test]
