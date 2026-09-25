@@ -54,6 +54,15 @@
 # check ahead with `sbx test net <url>`).
 cmd = "auggie"
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects, which
+# operations it offers) handed to Auggie through `--rules`, which pushes the file onto the same rule
+# list as the workspace rules and `~/.augment/rules`, so those still apply (read out of the shipped
+# `augment.mjs`; Augment's rules documentation says the option appends). The hidden
+# `--override-system-prompt` would replace the system prompt instead. Not measured: Auggie needs an
+# Augment account before it starts a turn. Bound to this `cmd`: a project that sets its own `cmd`
+# for this app writes its own `contract`, or has none.
+contract = { arg = "--rules" }
+
 # Your host Auggie config/credential dir, mounted read-write at its real absolute path.
 # `binds` is a security field, honored only because this profile lives in your trusted config
 # dir; `mode = "rw"` lets the caged `auggie` read and write these host files (login, settings).
