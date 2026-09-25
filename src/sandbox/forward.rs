@@ -393,7 +393,10 @@ pub(super) fn pump_tcp_uds(client: TcpStream, uds: UnixStream) -> io::Result<()>
     Ok(())
 }
 
-/// Connect to the in-cage forwarder's socket, refusing to follow a name the cage has replaced.
+/// Connect to a socket whose name the cage owns, refusing to follow a name the cage has replaced.
+/// The in-cage forwarder's sockets are dialed through it, and so is the private bus the
+/// notifications relay attaches to ([`super::notify_relay`]), whose socket sits in a directory
+/// bound read-write the same way.
 ///
 /// The per-launch directory is bound into the cage **read-write** — the in-cage `socat` has to
 /// create and unlink its own sockets there — so every name inside it belongs to the workload, and
@@ -417,7 +420,7 @@ pub(super) fn pump_tcp_uds(client: TcpStream, uds: UnixStream) -> io::Result<()>
 ///
 /// A missing socket keeps its old meaning — the cage forwarder may simply not have bound it yet,
 /// and the caller drops that connection for the client to retry.
-fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
+pub(crate) fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
     // Opened by the syscall rather than through `OpenOptions::custom_flags`, which cannot carry
     // `O_PATH` on the target this binary ships as. `OpenOptions` masks the custom flags with
     // `!O_ACCMODE` so they cannot disturb the access mode Rust set; glibc spells `O_ACCMODE` `3`,
@@ -452,8 +455,8 @@ fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "`{}` is not a socket — the cage replaced the forward's socket with something \
-                 else, and this port reaches nothing until it puts one back",
+                "`{}` is not a socket: the cage left something else at that name, and nothing \
+                 is dialed through it until a socket is back",
                 sock.display()
             ),
         ));

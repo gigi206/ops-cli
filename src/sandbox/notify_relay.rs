@@ -656,6 +656,12 @@ async fn run(
         async_io::Timer::after(POLL_INTERVAL).await;
     }
 
+    // The private bus's socket sits in a directory bound into the cage read-write, so the name is the
+    // cage's to replace. It is dialed first, through the inode it resolves to: a link, or anything
+    // but a socket, left at the name is refused there rather than followed to whatever it names on
+    // the host (see `forward::dial_cage_socket`, which the forward's own sockets are dialed through).
+    let private_stream = super::forward::dial_cage_socket(&private_socket)?;
+
     // Host session bus (ambient $DBUS_SESSION_BUS_ADDRESS) and a proxy onto its notifications daemon.
     let host_conn = zbus::Connection::session().await?;
     let host = HostNotificationsProxy::new(&host_conn).await?;
@@ -668,8 +674,7 @@ async fn run(
         ours: Arc::clone(&ours),
         needles,
     };
-    let address = format!("unix:path={}", private_socket.display());
-    let private_conn = connection::Builder::address(address.as_str())?
+    let private_conn = connection::Builder::async_io_unix_stream(private_stream)
         .name(IFACE)?
         .serve_at(OBJECT, served)?
         .build()
@@ -724,6 +729,39 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The private bus's socket is in a directory the cage writes, so a link left at its name must
+    /// not carry the relay to the socket the link names. The refusal comes before the host's own
+    /// session bus is asked for, so it holds on a host that has none.
+    ///
+    /// Bounded: a relay that followed the link would wait on a handshake the socket it reached
+    /// never gives, and the test has to fail rather than wait with it.
+    #[test]
+    fn a_link_at_the_private_bus_name_is_refused_rather_than_followed() {
+        let dir = crate::testutil::TmpDir::new();
+        let target = dir.join("target.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let bus = dir.join("bus");
+        std::os::unix::fs::symlink(&target, &bus).unwrap();
+        let (_keep, shutdown) = async_channel::bounded::<()>(1);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = async_io::block_on(run(bus, shutdown, Default::default()));
+            let _ = tx.send(outcome.map_err(|e| e.to_string()));
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the relay followed the link and waited on the socket it names")
+            .expect_err("a link at the bus name must not be dialed");
+
+        assert!(err.contains("not a socket"), "{err}");
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "nothing may reach the socket the link named"
+        );
+    }
 
     /// A write no one is reading is reported as one that did not happen.
     ///
