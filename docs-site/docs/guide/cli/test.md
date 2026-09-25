@@ -88,8 +88,9 @@ because there is none. A project closing its own files off gains nothing it coul
 user, while dropping its masks would leave a file the project asked to close wide open, so `deny`
 and `readonly` apply from an untrusted project too. The two gated keys are `scan_max_kb`, which
 raises how much of a file the content lens reads past, and `git_writable`, which lifts the
-read-only default on `.git/hooks/` and `.git/config`. Those defaults, and the project config and
-its mise files, are reported as protected by sbx itself.
+read-only default on what git reads in the project (`.git/hooks/`, `.git/config`, a `.git`
+file). Those defaults, and the project config and its mise files, are reported as protected by
+sbx itself.
 
 ## `sbx test proc`
 

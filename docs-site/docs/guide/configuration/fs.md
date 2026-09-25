@@ -217,9 +217,12 @@ It is the one key in `[fs]` that opens rather than closes, so it is honored only
 trusted project (where it appears in the diff [`sbx trust`](../cli/trust) shows), from the
 global config, or from an app profile; from an untrusted project it is dropped with a warning.
 A layer above decides in either direction: `git_writable = false` in a trusted project
-restores the protection the global config lifted. A `.git` that is a file (a linked worktree
-or a submodule) points at a directory outside the project, which the cage does not hold, so
-nothing is added for it.
+restores the protection the global config lifted. A `.git` that is a **file** (a linked
+worktree, or a submodule opened on its own) is read-only itself: it names the repository your
+git reads, which lies outside the project, where the cage does not reach, so git inside the
+cage already finds no repository there and nothing it does is lost. A `.git` file that names a
+repository inside the project refuses the launch, since nothing would protect that
+repository's configuration and hooks: move the repository into `.git` in place of the file.
 
 [`sbx test fs`](#seeing-what-is-closed) reports all of these as `READ-ONLY`, protected by sbx
 itself, and [`sbx config show`](../cli/config) prints `fs git: writable` when a layer lifted

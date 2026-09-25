@@ -838,6 +838,7 @@ fn counted(n: usize, one: &str, many: &str) -> String {
 fn fixed_protected_names() -> Vec<&'static str> {
     let mut names = vec![
         crate::config::PROJECT_CONFIG,
+        ".git",
         ".git/config",
         ".git/config.worktree",
         ".git/hooks",
@@ -2046,6 +2047,24 @@ mod tests {
             summary.contains("read the full contract"),
             "the count carries its instruction:\n{summary}"
         );
+    }
+
+    // A `.git` that is a file is protected under the name sbx chose, so it is named, not counted.
+    #[test]
+    fn the_summary_names_a_read_only_git_file() {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.path().join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        let root = root.canonicalize().unwrap();
+        let masks =
+            crate::sandbox::fsmask::expand(&root, &crate::config::fspolicy::FsPolicy::default());
+        let summary = summary_paths(&masks, &[], Some(&root));
+        assert!(
+            summary.contains("relative to the project root: `.git`\n"),
+            "{summary}"
+        );
+        assert!(!summary.contains("more paths"), "{summary}");
     }
 
     // A configured read-only bind is a path its trusted author wrote, so it is named as written.

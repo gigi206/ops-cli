@@ -880,6 +880,53 @@ fn a_linked_hooks_directory_refuses_and_the_hooks_path_it_names_is_held() {
     assert!(!root.join(".githooks/pre-commit").exists());
 }
 
+/// A linked worktree launched as the project keeps its `.git` file, the pointer to its repository,
+/// read-only and in place inside a real cage, and the host's copy is left as it was.
+#[test]
+fn a_linked_worktrees_git_file_is_read_only_and_keeps_its_path() {
+    let (main, linked, data) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "a linked worktree's .git file in a real cage",
+        sandbox_probe(main.path(), data.path())
+    );
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(main.path())
+            .output()
+    };
+    let Ok(init) = git(&["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    let wt = linked.path().join("wt");
+    for args in [
+        &["commit", "-q", "--no-verify", "--allow-empty", "-m", "i"][..],
+        &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+    ] {
+        assert!(git(args).unwrap().status.success(), "git {args:?}");
+    }
+    let before = std::fs::read(wt.join(".git")).unwrap();
+
+    let script = "(echo x >> .git) 2>/dev/null && echo WROTE || echo REFUSED; \
+        if mv .git moved 2>/dev/null; then echo MOVED; mv moved .git; else echo HELD; fi";
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(&wt)
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run sbx");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("REFUSED") && stdout.contains("HELD"),
+        "the .git file refuses writes and keeps its path\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(std::fs::read(wt.join(".git")).unwrap(), before);
+}
+
 /// What no mount can hold in the project's git is named once the cage has exited: a
 /// `.git/commondir` and a `config.worktree` that appeared during the session, and the next launch
 /// refuses on the first. Run under a network posture with no proxy, where a launch with nothing to

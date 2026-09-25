@@ -2514,9 +2514,9 @@ pub(super) const PAGES: &[Page] = &[
             is none: a project closing its own files off gains nothing it could turn on the user,\n\
             so `deny` and `readonly` apply from an untrusted project too. The two gated keys are\n\
             `scan_max_kb`, which raises how much of a file the content lens reads past, and\n\
-            `git_writable`, which lifts the read-only default on `.git/hooks/` and `.git/config`.\n\
-            Those defaults, and the project config and its mise files, are reported as protected\n\
-            by sbx itself. No launch, no nix.",
+            `git_writable`, which lifts the read-only default on what git reads in the project\n\
+            (`.git/hooks/`, `.git/config`, a `.git` file). Those defaults, and the project config\n\
+            and its mise files, are reported as protected by sbx itself. No launch, no nix.",
     },
     Page {
         path: &["test", "proc"],

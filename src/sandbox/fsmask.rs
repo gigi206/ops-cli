@@ -256,6 +256,7 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     // through a link, or a `.git/commondir`, would have it answer from elsewhere: refused first,
     // and nothing is asked.
     let layout = git_dir_link_refusal(&root, policy.git_writable())
+        .or_else(|| git_file_target_refusal(&root, policy.git_writable()))
         .or_else(|| git_commondir_refusal(&root, policy.git_writable()));
     let (hooks, includes, worktree) = match layout {
         Some(reason) => {
@@ -426,8 +427,9 @@ const BUILTIN_READONLY: &str = "readonly (built-in)";
 /// [`git_link_on_the_way`]): a mask holds what a path resolved to at launch, and a link is a name
 /// the cage could point elsewhere. `git_writable` lifts all of it: the one opening in `[fs]`, and
 /// why it is honored only from a trusted layer. A `.git` that is a file (a linked worktree, a
-/// submodule) points at a directory outside the project, which the cage does not hold; nothing is
-/// added.
+/// submodule) is read-only itself ([`git_file_protected`]): it names the repository git reads,
+/// outside the project where the cage does not reach, and one that names a repository inside the
+/// project refuses the launch ([`git_file_target_refusal`]).
 ///
 /// Returned as `[fs]` entries relative to the project, for [`resolve_list`], which is what refuses
 /// one that cannot be looked at: an absent file is left out here, every other answer goes through.
@@ -454,6 +456,9 @@ fn builtin_readonly_names(root: &Path, git_writable: bool) -> Vec<String> {
     if git_protected(root, git_writable) && present(".git/config") && !linked(".git/config") {
         out.push(".git/config".to_string());
     }
+    if git_file_protected(root, git_writable) {
+        out.push(".git".to_string());
+    }
     out
 }
 
@@ -461,6 +466,69 @@ fn builtin_readonly_names(root: &Path, git_writable: bool) -> Vec<String> {
 /// trusted layer set `git_writable`.
 fn git_protected(root: &Path, git_writable: bool) -> bool {
     !git_writable && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir())
+}
+
+/// Whether the project's `.git` is a file while no trusted layer set `git_writable`: the pointer a
+/// linked worktree or a submodule keeps to its repository, which is read-only in the cage.
+fn git_file_protected(root: &Path, git_writable: bool) -> bool {
+    !git_writable && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_file())
+}
+
+/// The refusal the repository a `.git` file names earns, or `None` when it lies outside the project
+/// or the file is not one git reads as a pointer.
+///
+/// git reads `gitdir: <path>` there, relative to the project root when it is not absolute, and uses
+/// the directory it names as the repository: its configuration and its hooks. A linked worktree's
+/// or a submodule's lies outside the project, where the cage does not reach, and the file itself is
+/// read-only in the cage ([`git_file_protected`]). One inside the project would be a repository
+/// whose configuration and hooks nothing protects, since the carrier is looked for in a `.git`
+/// directory, so it refuses the launch, and so does a link inside the project on the way to it
+/// ([`git_link_on_the_way`]).
+///
+/// The file is read the way git reads it: everything after `gitdir: `, less the line ends that close
+/// it, is the path. The read stops past the longest path the kernel resolves, since a file longer
+/// than that names a path git cannot open.
+fn git_file_target_refusal(root: &Path, git_writable: bool) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    /// Past the kernel's `PATH_MAX`, with room for the `gitdir: ` prefix.
+    const GITFILE_MAX: u64 = 8192;
+    if !git_file_protected(root, git_writable) {
+        return None;
+    }
+    let file = root.join(".git");
+    let mut head = Vec::new();
+    if let Err(e) =
+        std::fs::File::open(&file).and_then(|f| f.take(GITFILE_MAX).read_to_end(&mut head))
+    {
+        return Some(visible(&unreadable_refusal("read", &file, &e)));
+    }
+    if head.len() as u64 == GITFILE_MAX {
+        return None;
+    }
+    let mut named = head.strip_prefix(b"gitdir: ")?;
+    while let Some(rest) = named
+        .strip_suffix(b"\n")
+        .or_else(|| named.strip_suffix(b"\r"))
+    {
+        named = rest;
+    }
+    let target = root.join(std::ffi::OsStr::from_bytes(named));
+    let what = "the repository your git reads";
+    if let Some(reason) = git_link_on_the_way(root, &target, what, GIT_LINK_INSTEAD) {
+        return Some(reason);
+    }
+    let canon = crate::trust::canonicalize_existing_prefix(&target);
+    canon.starts_with(root).then(|| {
+        visible(&format!(
+            "`{}` names a repository inside the project (`{}`): sbx protects the files git reads \
+             in a `.git` directory, and a repository elsewhere in the tree would be left open to \
+             the cage. Move the repository into `.git` in place of the file, or set `[fs] \
+             git_writable = true` from a trusted layer, then launch again",
+            file.display(),
+            canon.display()
+        ))
+    })
 }
 
 /// Whether the project's `.git` is a symbolic link while no trusted layer set `git_writable`, which
@@ -2788,14 +2856,62 @@ mod tests {
         );
     }
 
-    /// A `.git` that is a file points at a directory outside the project, which the cage does not
-    /// hold, so there is nothing of it inside the project to protect.
+    /// A `.git` that is a file is read-only itself, and `git_writable` lifts it. The repository it
+    /// names outside the project is left alone, spelled absolute or relative. One inside the
+    /// project refuses the launch, present or not yet, and so does a link inside the project on
+    /// the way to it. A file git would not read as a pointer names no repository.
     #[test]
-    fn a_git_file_adds_nothing() {
+    fn a_git_file_is_read_only_and_one_naming_a_repository_inside_the_project_refuses() {
         let tmp = TmpDir::new();
-        let root = project(&tmp);
-        std::fs::write(root.join(".git"), b"gitdir: /elsewhere/.git/worktrees/w\n").unwrap();
-        assert!(expand(&root, &FsPolicy::default()).is_empty());
+        let root = project(&tmp).canonicalize().unwrap();
+        let git = root.join(".git");
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        let outside = tmp.path().join("main/.git/worktrees/w");
+        std::fs::create_dir_all(&outside).unwrap();
+        let held_alone = |e: &Expanded| {
+            assert!(e.refused.is_none(), "{:?}", e.refused);
+            let ro: Vec<(&Path, bool, bool)> = e
+                .readonly
+                .iter()
+                .map(|m| (m.path.as_path(), m.is_dir, m.builtin))
+                .collect();
+            assert_eq!(ro, vec![(git.as_path(), false, true)]);
+        };
+
+        for pointer in [
+            format!("gitdir: {}\n", outside.display()),
+            "gitdir: ../main/.git/worktrees/w\r\n".to_string(),
+        ] {
+            std::fs::write(&git, pointer).unwrap();
+            held_alone(&expand(&root, &FsPolicy::default()));
+            assert!(expand(&root, &lifted).is_empty(), "git_writable lifts it");
+        }
+
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        for pointer in ["gitdir: repo\n", "gitdir: not-there-yet"] {
+            std::fs::write(&git, pointer).unwrap();
+            let why = expand(&root, &FsPolicy::default())
+                .refused
+                .expect("a repository inside the project refuses");
+            assert!(
+                why.contains("names a repository inside the project"),
+                "{why}"
+            );
+            assert!(expand(&root, &lifted).refused.is_none());
+        }
+
+        std::os::unix::fs::symlink(&outside, root.join("via")).unwrap();
+        std::fs::write(&git, "gitdir: via\n").unwrap();
+        let why = expand(&root, &FsPolicy::default())
+            .refused
+            .expect("a link on the way refuses");
+        assert!(why.contains("via` is a symbolic link"), "{why}");
+
+        std::fs::write(&git, "not a pointer\n").unwrap();
+        held_alone(&expand(&root, &FsPolicy::default()));
     }
 
     #[test]

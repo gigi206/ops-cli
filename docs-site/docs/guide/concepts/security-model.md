@@ -278,7 +278,8 @@ git reads as configuration beside it are held the same way (`.git/config.worktre
 linked worktree's `config.worktree` and `commondir`), and a `.git/commondir` in the project's
 own repository, which would have git read its configuration from elsewhere, refuses the
 launch. Such a file cannot be held before it exists, so sbx names any that appeared once the
-cage has exited. Committing,
+cage has exited. A `.git` that is a file, the pointer a linked worktree keeps to its
+repository, is read-only as well. Committing,
 switching branches, fetching and pushing still work; what is refused is writing the config
 (`remote add`, the upstream `push -u` records), installing a hook, and moving a repository into
 `.git` (`submodule absorbgitdirs`): `.git` itself is held in place, and a symbolic link on the
