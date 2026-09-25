@@ -652,11 +652,13 @@ fn app_import(args: &[OsString]) -> ExitCode {
     // longer carries — a diff of the two files would bury it in prose, and the settings are what a
     // reader stands to lose — and point at the copy kept beside it.
     if let Some(replaced) = &installed.replaced {
-        let dropped = super::settings_dropped_by(
-            &String::from_utf8_lossy(&replaced.previous),
-            &String::from_utf8_lossy(&bytes),
-        );
-        diag::warn(&render_replaced_profile(&dropped, &replaced.kept));
+        let previous = String::from_utf8_lossy(&replaced.previous);
+        let incoming = String::from_utf8_lossy(&bytes);
+        diag::warn(&render_replaced_profile(
+            &super::settings_dropped_by(&previous, &incoming),
+            &super::settings_dropped_by(&incoming, &previous),
+            &replaced.kept,
+        ));
     }
     // A profile is NOT self-contained, and what it is short of is not only a bundle. Both kinds of
     // reference resolve against the global config, both are silent at launch in the way that matters
@@ -914,39 +916,37 @@ fn drop_replaced_copy(name: &str) {
     }
 }
 
-/// The overwrite warning: what the replacement no longer carries, and where the previous bytes are.
-/// A few dropped settings are named in full (the point is to recognize one's own edit); beyond that
-/// the count stands in, because the file itself is kept and is the better place to read the rest.
-fn render_replaced_profile(dropped: &[String], kept: &Path) -> String {
-    const NAMED: usize = 3;
+/// The overwrite warning: what the replacement no longer carries, what it carries on top, and where
+/// the previous bytes are. A few lines of each side are named in full (the point is to recognize
+/// one's own edit); beyond that the count stands in, because the file itself is kept and is the
+/// better place to read the rest.
+///
+/// Both sides are reported for the reason [`super::render_replaced_fragment`] reports them: the
+/// gaining side is the one that widens a posture, and a profile that dropped nothing but added a
+/// setting is not one that "differed only in comments or layout".
+fn render_replaced_profile(dropped: &[String], added: &[String], kept: &Path) -> String {
     let kept = kept.display();
-    if dropped.is_empty() {
-        return format!(
+    let back = format!(
+        "the previous file is kept at {kept}, so a per-machine setting can be read back and \
+         re-applied"
+    );
+    match (super::lines_named(dropped), super::lines_named(added)) {
+        (None, None) => format!(
             "replaced a profile that differed only in comments or layout — the previous file is \
              kept at {kept}"
-        );
+        ),
+        (Some((count, list)), None) => {
+            format!("replaced a profile carrying {count} the new one does not set: {list} — {back}")
+        }
+        (None, Some((count, list))) => format!(
+            "replaced a profile that drops nothing and sets {count} the previous one did not: \
+             {list} — {back}"
+        ),
+        (Some((lost, lost_list)), Some((gained, gained_list))) => format!(
+            "replaced a profile carrying {lost} the new one does not set: {lost_list}, and setting \
+             {gained} the previous one did not: {gained_list} — {back}"
+        ),
     }
-    let named = dropped
-        .iter()
-        .take(NAMED)
-        .map(|l| format!("`{l}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let rest = dropped.len().saturating_sub(NAMED);
-    let more = if rest > 0 {
-        format!(" (and {rest} more)")
-    } else {
-        String::new()
-    };
-    format!(
-        "replaced a profile carrying {} the new one does not set: {named}{more} — the previous \
-         file is kept at {kept}, so a per-machine setting can be read back and re-applied",
-        if dropped.len() == 1 {
-            "1 line".to_string()
-        } else {
-            format!("{} lines", dropped.len())
-        },
-    )
 }
 
 /// `sbx app export <name> [--out <file>]`: write a named app out as a portable profile — an
@@ -2828,7 +2828,7 @@ mod tests {
     #[test]
     fn the_overwrite_warning_names_a_few_losses_and_counts_the_rest() {
         let kept = Path::new("/config/sbx/apps/demo-app.toml.replaced");
-        let one = render_replaced_profile(&["forward = [7000]".to_string()], kept);
+        let one = render_replaced_profile(&["forward = [7000]".to_string()], &[], kept);
         assert!(
             one.contains("1 line") && one.contains("`forward = [7000]`"),
             "{one}"
@@ -2836,7 +2836,7 @@ mod tests {
         assert!(one.contains("demo-app.toml.replaced"), "{one}");
         // Beyond a few, the count stands in — the kept file is where the rest is read.
         let many: Vec<String> = (0..5).map(|i| format!("k{i} = {i}")).collect();
-        let lots = render_replaced_profile(&many, kept);
+        let lots = render_replaced_profile(&many, &[], kept);
         assert!(
             lots.contains("5 lines") && lots.contains("(and 2 more)"),
             "{lots}"
@@ -2846,10 +2846,28 @@ mod tests {
             "{lots}"
         );
         // A file that differs only in prose still names where the previous bytes went.
-        let none = render_replaced_profile(&[], kept);
+        let none = render_replaced_profile(&[], &[], kept);
         assert!(
             none.contains("comments or layout") && none.contains(".replaced"),
             "{none}"
+        );
+        // A profile that only gains a setting names it, rather than calling the change layout.
+        let contract = "contract = { arg = \"-c\", toml_key = \"developer_instructions\" }";
+        let gained = render_replaced_profile(&[], &[contract.to_string()], kept);
+        assert!(
+            gained.contains("drops nothing and sets 1 line")
+                && gained.contains(&format!("`{contract}`"))
+                && !gained.contains("comments or layout"),
+            "{gained}"
+        );
+        let both = render_replaced_profile(
+            &["forward = [7000]".to_string()],
+            &[contract.to_string()],
+            kept,
+        );
+        assert!(
+            both.contains("`forward = [7000]`") && both.contains(&format!("`{contract}`")),
+            "{both}"
         );
     }
 
