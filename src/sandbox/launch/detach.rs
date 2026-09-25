@@ -173,8 +173,11 @@ fn detached_child(
         )
     });
 
+    // Taken now, before the cage runs; what it finds goes to the session log.
+    let git_watch = crate::sandbox::fsmask::GitWatch::start(&prep.cwd, prep.cfg.fs.git_writable());
+
     match guard {
-        None if may_exec_replace(&prep.cfg.proc, observe) => {
+        None if may_exec_replace(&prep.cfg.proc, observe, git_watch.is_some()) => {
             // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
             //
             // This is the one launch that must not carry `--die-with-parent`. Replacing the daemon
@@ -194,6 +197,7 @@ fn detached_child(
             let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(observer);
             drop(maybe_guard);
+            report_git_watch(git_watch.as_ref());
             std::process::exit(code);
         }
     }

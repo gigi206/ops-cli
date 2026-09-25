@@ -684,7 +684,8 @@ fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<Strin
 ///
 /// An absent one cannot be protected: no mount can hold a path that does not exist, and nothing can
 /// stand in its place, since git refuses to run on an empty file or a directory there. The cage can
-/// therefore create one during a session, and the next launch refuses on it.
+/// therefore create one during a session: the end of that session names it ([`GitWatch`]), and the
+/// next launch refuses on it.
 fn git_commondir_refusal(root: &Path, git_writable: bool) -> Option<String> {
     if !git_protected(root, git_writable) {
         return None;
@@ -766,40 +767,26 @@ fn git_worktree_files(
             return out;
         }
         Ok(meta) if !meta.is_dir() => return out,
-        Ok(_) => std::fs::read_dir(&worktrees),
+        Ok(_) => worktree_entries(&worktrees),
     };
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    match listing {
-        Ok(entries) => {
-            for entry in entries.take(MASK_MAX + 1) {
-                match entry {
-                    Ok(entry) => dirs.push(entry.path()),
-                    Err(e) => {
-                        refused.get_or_insert_with(|| {
-                            visible(&unreadable_refusal("list", &worktrees, &e))
-                        });
-                        return out;
-                    }
-                }
-            }
+    let dirs = match listing {
+        Ok((dirs, false)) => dirs,
+        Ok((_, true)) => {
+            refused.get_or_insert_with(|| {
+            visible(&format!(
+                "`{}` holds more than {MASK_MAX} entries, more linked worktrees than a launch can \
+                 protect: remove the ones you no longer use (`git worktree prune`), or set `[fs] \
+                 git_writable = true` from a trusted layer, then launch again",
+                    worktrees.display()
+                ))
+            });
+            return out;
         }
         Err(e) => {
             refused.get_or_insert_with(|| visible(&unreadable_refusal("list", &worktrees, &e)));
             return out;
         }
-    }
-    if dirs.len() > MASK_MAX {
-        refused.get_or_insert_with(|| {
-            visible(&format!(
-                "`{}` holds more than {MASK_MAX} entries, more linked worktrees than a launch can \
-                 protect: remove the ones you no longer use (`git worktree prune`), or set `[fs] \
-                 git_writable = true` from a trusted layer, then launch again",
-                worktrees.display()
-            ))
-        });
-        return out;
-    }
-    dirs.sort();
+    };
     for dir in dirs {
         match std::fs::symlink_metadata(&dir) {
             Ok(meta) if meta.file_type().is_symlink() => {
@@ -824,6 +811,142 @@ fn git_worktree_files(
         }
     }
     out
+}
+
+/// The entries of a `.git/worktrees` directory, sorted, and whether it holds more than
+/// [`MASK_MAX`]: at most that many and one are read, since the cage can fill the directory and
+/// neither the launch nor the end of a session reads it to the end.
+fn worktree_entries(worktrees: &Path) -> io::Result<(Vec<PathBuf>, bool)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(worktrees)?.take(MASK_MAX + 1) {
+        dirs.push(entry?.path());
+    }
+    let more = dirs.len() > MASK_MAX;
+    dirs.truncate(MASK_MAX);
+    dirs.sort();
+    Ok((dirs, more))
+}
+
+/// What the end of a session looks for in the project's git, where no mount reaches: a file git
+/// reads as configuration that was not there at launch.
+///
+/// Two can appear. A `.git/commondir` has the host's git read its configuration from the directory
+/// it names ([`git_commondir_refusal`]), and a `config.worktree` is read as configuration while
+/// `extensions.worktreeConfig` is on ([`git_worktree_files`]). A mount can only hold a path that
+/// exists, and a placeholder would stop git, so the launch notes which `config.worktree` files
+/// exist, and once the cage has exited the supervisor names each of these files that appeared, and
+/// a link where the launch refuses one, for the user to check before their own git reads them. It
+/// reads names and file types only, never following a link or opening a file the cage wrote, and
+/// every name it prints is escaped.
+///
+/// It needs sbx alive when the cage exits, which is why a launch with a watch supervises the cage
+/// rather than replacing itself with it. A supervisor killed along with its terminal says nothing,
+/// and a detached session says it in its log; the next launch, which refuses a `.git/commondir`
+/// and protects every `config.worktree` present, covers both.
+pub(crate) struct GitWatch {
+    root: PathBuf,
+    configs: BTreeSet<PathBuf>,
+}
+
+impl GitWatch {
+    /// The watch for a launch in `project`, or `None` when the launch does not protect the git
+    /// carrier, where there is nothing for it to look at.
+    pub(crate) fn start(project: &Path, git_writable: bool) -> Option<Self> {
+        let root = project.canonicalize().ok()?;
+        if !git_protected(&root, git_writable) {
+            return None;
+        }
+        let configs = WorktreeScan::of(&root).configs;
+        Some(GitWatch { root, configs })
+    }
+
+    /// What appeared during the session, one message per finding, escaped for the terminal.
+    pub(crate) fn findings(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let commondir = self.root.join(".git/commondir");
+        if std::fs::symlink_metadata(&commondir).is_ok() {
+            out.push(format!(
+                "`{}` appeared during the session: git writes this file only for a linked \
+                 worktree, and in the project's own `.git` it makes your git read its \
+                 configuration from the directory it names instead of `.git/config`. Check what it \
+                 names and remove it before running git here; the next launch refuses until it is \
+                 gone",
+                commondir.display()
+            ));
+        }
+        let now = WorktreeScan::of(&self.root);
+        for path in now.configs.difference(&self.configs) {
+            out.push(format!(
+                "`{}` appeared during the session: git reads it as configuration for its worktree \
+                 while `extensions.worktreeConfig` is on in `.git/config`. Check it before running \
+                 git in that worktree",
+                path.display()
+            ));
+        }
+        for link in &now.links {
+            out.push(format!(
+                "`{}` is a symbolic link after the session: git would read a worktree's \
+                 configuration through it. Check where it points before running git in a worktree; \
+                 the next launch refuses until it is replaced",
+                link.display()
+            ));
+        }
+        if now.more {
+            out.push(format!(
+                "`{}` holds more than {MASK_MAX} entries after the session, more than sbx reads: \
+                 check what was created there before running git in a worktree",
+                self.root.join(".git/worktrees").display()
+            ));
+        }
+        out.iter().map(|m| visible(m)).collect()
+    }
+}
+
+/// The `config.worktree` files of a repository, main and linked, found by file type without
+/// following a link, with the links met where [`git_worktree_files`] refuses one, and whether
+/// `.git/worktrees` held more entries than were read.
+struct WorktreeScan {
+    configs: BTreeSet<PathBuf>,
+    links: Vec<PathBuf>,
+    more: bool,
+}
+
+impl WorktreeScan {
+    fn of(root: &Path) -> Self {
+        let git = root.join(".git");
+        let mut scan = WorktreeScan {
+            configs: BTreeSet::new(),
+            links: Vec::new(),
+            more: false,
+        };
+        let present = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+        let main = git.join("config.worktree");
+        if present(&main) {
+            scan.configs.insert(main);
+        }
+        let worktrees = git.join("worktrees");
+        match std::fs::symlink_metadata(&worktrees) {
+            Ok(meta) if meta.file_type().is_symlink() => scan.links.push(worktrees),
+            Ok(meta) if meta.is_dir() => {
+                let (dirs, more) = worktree_entries(&worktrees).unwrap_or_default();
+                scan.more = more;
+                for dir in dirs {
+                    match std::fs::symlink_metadata(&dir) {
+                        Ok(meta) if meta.file_type().is_symlink() => scan.links.push(dir),
+                        Ok(meta) if meta.is_dir() => {
+                            let config = dir.join("config.worktree");
+                            if present(&config) {
+                                scan.configs.insert(config);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        scan
+    }
 }
 
 /// Protect one of the files [`git_worktree_files`] names, adding it to `out` when it is there. The
@@ -2349,6 +2472,56 @@ mod tests {
             .refused
             .expect("past the ceiling");
         assert!(why.contains("more than"), "{why}");
+    }
+
+    /// The end of a session names what appeared in the project's git that no mount could hold: a
+    /// `.git/commondir`, a `config.worktree` absent at launch, and a link where the launch refuses
+    /// one. A file present at launch is not reported, and every name is escaped.
+    #[test]
+    fn the_git_watch_names_what_appeared_during_the_session() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::create_dir_all(root.join(".git/worktrees/kept")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        std::fs::write(root.join(".git/worktrees/kept/config.worktree"), "").unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let watch = GitWatch::start(&root, false).expect("a protected `.git` is watched");
+        assert!(watch.findings().is_empty(), "nothing appeared yet");
+        assert!(
+            GitWatch::start(&root, true).is_none(),
+            "git_writable: nothing to watch"
+        );
+
+        std::fs::write(root.join(".git/commondir"), "../x\n").unwrap();
+        std::fs::write(root.join(".git/config.worktree"), "").unwrap();
+        let odd = root.join(".git/worktrees/n\u{1b}[2Jew");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("config.worktree"), "").unwrap();
+        std::os::unix::fs::symlink("/elsewhere", root.join(".git/worktrees/linked")).unwrap();
+
+        let found = watch.findings();
+        assert_eq!(found.len(), 4, "{found:#?}");
+        assert!(found.iter().any(|f| f.contains(".git/commondir`")));
+        assert!(found.iter().any(|f| f.contains(".git/config.worktree`")));
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("\\x1b") && f.contains("config.worktree"))
+        );
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("worktrees/linked") && f.contains("symbolic link"))
+        );
+        assert!(
+            found.iter().all(|f| !f.contains('\u{1b}')),
+            "escaped: {found:#?}"
+        );
+        assert!(
+            !found.iter().any(|f| f.contains("kept")),
+            "present at launch: {found:#?}"
+        );
     }
 
     /// A `.git` that is a file points at a directory outside the project, which the cage does not

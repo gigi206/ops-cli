@@ -248,9 +248,22 @@ fn observation_flags(proc: &crate::proc_policy::ProcPolicy, observe: bool) -> (b
 /// observer and then exec'd it away (so `sbx proc logs` had nothing to read), and the foreground
 /// path never started one at all. Ask [`observation_flags`] — the same pair that decides whether
 /// to start the observer — so the two answers cannot disagree.
-fn may_exec_replace(proc: &crate::proc_policy::ProcPolicy, observe: bool) -> bool {
+///
+/// `git_watch` is whether the launch looks at the project's git again once the cage has exited
+/// ([`crate::sandbox::fsmask::GitWatch`]), which needs this process alive at that moment just as
+/// an observer does.
+fn may_exec_replace(proc: &crate::proc_policy::ProcPolicy, observe: bool, git_watch: bool) -> bool {
     let (exec_poll, fs) = observation_flags(proc, observe);
-    !(exec_poll || fs)
+    !(exec_poll || fs || git_watch)
+}
+
+/// Say what the git watch found once the cage has exited, whatever its exit status: the files git
+/// reads as configuration that appeared during the session, for the user to check before their own
+/// git reads them.
+fn report_git_watch(watch: Option<&crate::sandbox::fsmask::GitWatch>) {
+    for finding in watch.map(|w| w.findings()).unwrap_or_default() {
+        crate::diag::warn(&finding);
+    }
 }
 
 /// Why `--observe`'s inline `[sbx:exec]` feed will not appear, or `None` when it will.
@@ -401,12 +414,15 @@ fn launch_foreground(
     // observer below, so a config-declared `[proc] mode = "observe"` cannot be seen by one and
     // missed by the other.
     let (exec_poll, fs) = observation_flags(&prep.cfg.proc, observe);
+    // Taken now, before the cage runs: what the end of the session compares against.
+    let git_watch = crate::sandbox::fsmask::GitWatch::start(&prep.cwd, prep.cfg.fs.git_writable());
 
     match guard {
-        // The default postures with no observation: exec-replace, so the command's exit status
-        // becomes sbx's. The pid and its start time survive the exec, so the registry record keeps
-        // matching the sandbox and is reclaimed by liveness pruning once it exits.
-        None if may_exec_replace(&prep.cfg.proc, observe) => {
+        // The postures with no guard and nothing to do after the cage: exec-replace, so the
+        // command's exit status becomes sbx's. The pid and its start time survive the exec, so the
+        // registry record keeps matching the sandbox and is reclaimed by liveness pruning once it
+        // exits.
+        None if may_exec_replace(&prep.cfg.proc, observe, git_watch.is_some()) => {
             // On success this never returns; reaching past it means exec itself failed.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
             crate::diag::error(&format!("sbx: failed to launch the sandbox: {err}"));
@@ -435,6 +451,7 @@ fn launch_foreground(
             let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(observer);
             drop(maybe_guard);
+            report_git_watch(git_watch.as_ref());
             code
         }
     }

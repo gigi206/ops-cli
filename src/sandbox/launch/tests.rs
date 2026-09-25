@@ -260,22 +260,29 @@ fn config_declared_observation_blocks_the_exec_replace_shortcut() {
         "a config-declared observe mode runs the poll lens without `--observe`"
     );
     assert!(
-        !may_exec_replace(&declared, false),
+        !may_exec_replace(&declared, false, false),
         "so a guardless launch must fork+wait — an exec would replace the observer's own parent"
     );
 
     // The flag alone, on a policy that declares nothing, blocks it too (the fs lens follows
     // the flag).
-    assert!(!may_exec_replace(&with(ProcMode::Off), true));
+    assert!(!may_exec_replace(&with(ProcMode::Off), true, false));
     // Including under enforcement, where the poller is off but the inotify lens still runs.
-    assert!(!may_exec_replace(&with(ProcMode::Enforce), true));
+    assert!(!may_exec_replace(&with(ProcMode::Enforce), true, false));
 
     // And the shortcut is still granted where it belongs, or this guard would be satisfiable
     // by refusing every launch: with nothing observed there is nothing to outlive the cage.
-    assert!(may_exec_replace(&with(ProcMode::Off), false));
+    assert!(may_exec_replace(&with(ProcMode::Off), false, false));
     // An unasked enforcing launch keeps it here as well — its seccomp supervisor arrives as a
     // `LaunchGuard`, and it is the guard, not this predicate, that forces supervision.
-    assert!(may_exec_replace(&with(ProcMode::Enforce), false));
+    assert!(may_exec_replace(&with(ProcMode::Enforce), false, false));
+
+    // A git watch reads the project once the cage has exited, so it needs this process alive then
+    // just as an observer does: with one, a launch observing nothing still supervises.
+    assert!(
+        !may_exec_replace(&with(ProcMode::Off), false, true),
+        "a launch that looks at the project's git after the cage must outlive it"
+    );
 }
 
 /// The predicate is half the fix; the other half is that the two guardless launch paths
@@ -315,6 +322,12 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
             body.contains("observation_flags(&prep.cfg.proc, observe)"),
             "`{name}` no longer reads the resolved policy to decide observation"
         );
+        // And the git watch the supervised arm exists to report: supervising for it and then
+        // saying nothing would read as a session in which nothing appeared.
+        assert!(
+            body.contains("report_git_watch(git_watch.as_ref())"),
+            "`{name}` no longer reports what the git watch found once the cage has exited"
+        );
 
         let arms: Vec<&str> = body
             .match_indices("None if ")
@@ -331,7 +344,7 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
             arms.len()
         );
         assert_eq!(
-            arms[0], "may_exec_replace(&prep.cfg.proc, observe)",
+            arms[0], "may_exec_replace(&prep.cfg.proc, observe, git_watch.is_some())",
             "`{name}` decides the exec-replace shortcut with `{}` instead of asking \
              `may_exec_replace`, so a config-declared `[proc] mode = \"observe\"` — which sets \
              no flag — takes the shortcut again and its observation is lost with no error",

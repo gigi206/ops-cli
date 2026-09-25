@@ -816,6 +816,60 @@ fn the_worktree_configuration_files_are_read_only_and_a_main_commondir_refuses()
     );
 }
 
+/// What no mount can hold in the project's git is named once the cage has exited: a
+/// `.git/commondir` and a `config.worktree` that appeared during the session, and the next launch
+/// refuses on the first. Run under a network posture with no proxy, where a launch with nothing to
+/// do after the cage replaces sbx with it and would leave nothing to say so.
+#[test]
+fn what_appeared_in_the_projects_git_is_named_after_the_session() {
+    let (project, data, config) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "git watch after a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+    std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+    // The global config is trusted by location, so the posture applies: no proxy, no guard.
+    std::fs::create_dir_all(config.path().join("sbx")).unwrap();
+    std::fs::write(
+        config.path().join("sbx/sbx.toml"),
+        "[network]\nmode = \"none\"\n",
+    )
+    .unwrap();
+    let run = |script: &str| {
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(["run", "--", "sh", "-c", script])
+            .current_dir(root)
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .output()
+            .expect("run the cage")
+    };
+
+    let out = run("echo ../x > .git/commondir && mkdir -p .git/worktrees/w \
+         && : > .git/worktrees/w/config.worktree && echo WROTE");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("WROTE"),
+        "the cage wrote both files\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for path in [".git/commondir", ".git/worktrees/w/config.worktree"] {
+        assert!(
+            stderr.contains(&format!("{path}` appeared during the session")),
+            "{path} is named\nstderr: {stderr}"
+        );
+    }
+
+    let again = run("true");
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        !again.status.success() && stderr.contains(".git/commondir"),
+        "the next launch refuses on it\nstderr: {stderr}"
+    );
+}
+
 /// With `.git/config` read-only, git cannot record the upstream `push -u` sets, so the cage's git is
 /// told to push a branch to its namesake: a bare `git push` still publishes a new branch, and the
 /// repository's config is left as it was.

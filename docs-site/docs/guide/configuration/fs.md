@@ -151,8 +151,14 @@ A **`.git/commondir`** in the project's own `.git` refuses the launch, naming it
 that file only for a linked worktree; in a main repository it makes your git read its
 configuration from the directory it names instead of `.git/config`. Nothing can hold its
 place while it is absent, since git refuses to run with an empty file or a directory there,
-so a cage could create one during a session and the next launch refuses on it. Check what it
-names and remove it.
+so a cage could create one during a session. sbx therefore looks again once the cage has
+exited, and names a `.git/commondir` or a `config.worktree` that appeared during the session,
+or a link where the launch refuses one, before your own git reads them; the next launch
+refuses on a `.git/commondir` too. Check what it names and remove it. To be there when the
+cage exits, sbx stays its parent whenever `.git` is protected, which the default network
+posture already does. A detached session writes the warning to its log, and a session whose
+`sbx` is killed along with its terminal cannot write it at all: the next launch is then what
+catches a `.git/commondir`.
 
 **What this does not close: the hooks a project already has run its code.** The protection
 closes the hooks git would run without a trace: an untracked script in the hooks directory, a
