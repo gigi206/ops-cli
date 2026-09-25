@@ -19,6 +19,12 @@
 # in the app's own home and rolls the aqua package forward to the newest upstream release.
 cmd = "claude"
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects, which
+# operations it offers) handed to the agent as part of its system prompt, so a refused host or a
+# read-only file reads as the sandbox rather than as a fault to work around. Bound to this `cmd`: a
+# project that sets its own `cmd` for this app writes its own `contract`, or has none.
+contract = { arg = "--append-system-prompt-file" }
+
 # AUDIO — Claude Code has a terminal voice-dictation mode (the `/voice` command). It captures the
 # microphone through a native module (falling back to `arecord`/SoX), all of which speak the ALSA API.
 # `audio = true` provisions the PulseAudio client + the ALSA→PulseAudio compatibility shim

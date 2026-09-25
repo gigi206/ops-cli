@@ -46,6 +46,7 @@ use super::forward;
 use super::pty::fork_with_pty;
 use super::spec::{NetPolicy, SandboxSpec, TerminalPolicy};
 use super::sshagent;
+use crate::config::ends_with_shell_payload;
 use crate::session::{Kind, RecordGuard, Session};
 use crate::store::Layout;
 use std::ffi::{CString, OsString};
@@ -457,30 +458,43 @@ impl AppOutcome {
     }
 }
 
-/// The shells whose `-c` binds the *next* argv element to `$0`. All four are POSIX-family and
-/// agree on it, so the rule is theirs, not a per-shell quirk.
-const ARGV0_SHELLS: [&str; 4] = ["bash", "sh", "zsh", "dash"];
-
-/// Whether `cmd` ends in `<shell> -<flags>c <script>` — the shape whose trailing element is a
-/// script, not a program, so anything appended after it starts at `$0`.
+/// The argv an app launch runs: the declared `cmd`, then its contract option and the summary's
+/// in-cage path, then any trailing `sbx app <name> -- <args>`, so the caller can pass a flag to the
+/// launched program (e.g. `-c` to resume) without editing the profile.
 ///
-/// The script must be *last*: an argv that already carries an element after it has its `$0`, and a
-/// profile that wrote one is saying which name its script should report. The shell is matched on
-/// its file name so an absolute `/bin/bash` counts, and the flag must *end* in `c` because that is
-/// what makes the following element the script (`-c`, `-lc`, `-euc`); a flag with anything after
-/// the `c` consumes it differently and is left alone.
-fn ends_with_shell_payload(cmd: &[OsString]) -> bool {
-    let [shell, flag, _script] = &cmd[cmd.len().saturating_sub(3)..] else {
-        return false;
-    };
-    let is_shell = Path::new(shell)
-        .file_name()
-        .is_some_and(|s| ARGV0_SHELLS.iter().any(|k| s == *k));
-    let is_c_flag = flag.to_str().is_some_and(|f| {
-        f.strip_prefix('-')
-            .is_some_and(|rest| rest.ends_with('c') && rest.bytes().all(|b| b.is_ascii_lowercase()))
-    });
-    is_shell && is_c_flag
+/// The contract goes ahead of the caller's arguments because it belongs to the profile, not to
+/// this run: a caller's `-- mcp list` still reaches the program as its subcommand. A `cmd` ending
+/// in a shell script takes no contract at all — appended there it would land in the script's
+/// positional parameters, not on the program the script runs. Resolution already drops it with a
+/// warning; this refusal holds for an app that reached the launch another way.
+fn app_argv(
+    name: &str,
+    cmd: &[String],
+    contract_arg: Option<&str>,
+    extra: Vec<OsString>,
+) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = cmd.iter().map(OsString::from).collect();
+    let script = ends_with_shell_payload(&argv);
+    let mut tail: Vec<OsString> = Vec::new();
+    if let Some(arg) = contract_arg
+        && !script
+    {
+        tail.push(OsString::from(arg));
+        tail.push(OsString::from(super::contract::CONTRACT_SUMMARY_INCAGE));
+    }
+    tail.extend(extra);
+    if !tail.is_empty() && script {
+        // The shell's own `$0`, so the caller's first argument lands on `$1`. `<shell> -c <script>`
+        // binds the element right after the script to `$0`, not to `$1`: without this filler the
+        // append below silently eats one argument, and the profile sees a short `"$@"`. The app's
+        // name is the filler because `$0` is what the shell prints in its own diagnostics.
+        //
+        // Only when there is something to append: with no trailing arguments nothing can be eaten,
+        // and leaving the argv untouched keeps `$0` at whatever the shell defaults to.
+        argv.push(OsString::from(name));
+    }
+    argv.extend(tail);
+    argv
 }
 
 /// `sbx app <name>`: launch the named application profile — the project sandbox baseline
@@ -526,21 +540,8 @@ pub(crate) fn app(
     }
     // The argv and the home scope are owned by the app; read them before the overlay is folded
     // in (which moves the app but does not touch them). The scope keys this app's persistent
-    // home: one shared across projects (`Global`) or one per project (`Project`). Any trailing
-    // `sbx app <name> -- <args>` are appended to the declared `cmd`, so the caller can pass a flag
-    // to the launched program (e.g. `-c` to resume) without editing the profile.
-    let mut cmd: Vec<OsString> = app.cmd.iter().map(OsString::from).collect();
-    if !extra.is_empty() && ends_with_shell_payload(&cmd) {
-        // The shell's own `$0`, so the caller's first argument lands on `$1`. `<shell> -c <script>`
-        // binds the element right after the script to `$0`, not to `$1`: without this filler the
-        // append above silently eats one argument, and the profile sees a short `"$@"`. The app's
-        // name is the filler because `$0` is what the shell prints in its own diagnostics.
-        //
-        // Only when there is something to append: with no trailing arguments nothing can be eaten,
-        // and leaving the argv untouched keeps `$0` at whatever the shell defaults to.
-        cmd.push(OsString::from(name));
-    }
-    cmd.extend(extra);
+    // home: one shared across projects (`Global`) or one per project (`Project`).
+    let cmd = app_argv(name, &app.cmd, app.contract_arg.as_deref(), extra);
     // A bundle's install step and a declared service both run BEFORE the app's command, in this same
     // cage — same posture, same allowlist, same environment — and never in its place: the app's
     // command stays its identity. Both are composed in `build`, once the app overlay and any

@@ -52,6 +52,44 @@ fn only_a_trailing_shell_script_takes_an_argv0_filler() {
     assert!(!ends_with_shell_payload(&argv(&[])));
 }
 
+/// The contract goes after the declared command and ahead of the caller's arguments, so a caller's
+/// subcommand still reaches the program as one; a shell script takes no contract, and its `$0`
+/// filler is decided by the caller's arguments alone, as before the contract existed.
+#[test]
+fn an_app_argv_carries_its_contract_between_cmd_and_the_callers_arguments() {
+    let os = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
+    let cmd = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+    let path = "/opt/sbx/contract-summary.md";
+
+    assert_eq!(
+        app_argv("demo", &cmd(&["agent"]), None, os(&["-c"])),
+        os(&["agent", "-c"])
+    );
+    assert_eq!(
+        app_argv("demo", &cmd(&["agent"]), Some("--prompt-file"), Vec::new()),
+        os(&["agent", "--prompt-file", path])
+    );
+    assert_eq!(
+        app_argv(
+            "demo",
+            &cmd(&["agent", "--fast"]),
+            Some("--prompt-file"),
+            os(&["mcp", "list"])
+        ),
+        os(&["agent", "--fast", "--prompt-file", path, "mcp", "list"])
+    );
+
+    let script = cmd(&["bash", "-c", "exec agent \"$@\""]);
+    assert_eq!(
+        app_argv("demo", &script, Some("--prompt-file"), Vec::new()),
+        os(&["bash", "-c", "exec agent \"$@\""])
+    );
+    assert_eq!(
+        app_argv("demo", &script, Some("--prompt-file"), os(&["-c"])),
+        os(&["bash", "-c", "exec agent \"$@\"", "demo", "-c"])
+    );
+}
+
 const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
 
 /// `--observe` is accepted on every launch, but its inline feed is emitted on one path only.

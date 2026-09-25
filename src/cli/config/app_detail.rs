@@ -67,6 +67,13 @@ fn app_detail_head(o: &mut String, view: &config::view::AppDetailView, pal: &sty
             let _ = writeln!(o, "  {h}cmd:{r}     {warn}(no command){r}");
         }
     }
+    if let Some(contract) = &view.contract {
+        let _ = writeln!(
+            o,
+            "  {h}contract:{r} {contract}  {dim}(appended to cmd: the cage's summary){r}{}",
+            app_provenance_tag(view.cmd_origin, pal)
+        );
+    }
     // Ahead of the posture, beside the command: an install step runs in this cage before `cmd`, so
     // it belongs where a reader looks for what this app executes, not among the fields that shape
     // it.
@@ -700,6 +707,7 @@ fn package_name_tag(p: &config::view::PackageView, pal: &style::Palette) -> Stri
 pub(super) fn sample_app_detail_view() -> config::view::AppDetailView {
     use config::view::*;
     AppDetailView {
+        contract: None,
         open: vec![],
         service: vec![],
         provisions: Vec::new(),
@@ -806,6 +814,7 @@ pub(super) fn sample_app_detail_view() -> config::view::AppDetailView {
 fn all_defaults_app_detail_view() -> config::view::AppDetailView {
     use config::view::*;
     AppDetailView {
+        contract: None,
         name: "quiet".into(),
         cwd: "/proj".into(),
         cmd: None,
@@ -891,6 +900,7 @@ fn all_defaults_app_detail_view() -> config::view::AppDetailView {
 fn filled_app_detail_view() -> config::view::AppDetailView {
     use config::view::*;
     AppDetailView {
+        contract: None,
         name: "loaded".into(),
         cwd: "/proj".into(),
         cmd: Some("loaded-agent --serve".into()),

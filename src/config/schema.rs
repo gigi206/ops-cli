@@ -420,7 +420,8 @@ pub(crate) struct RawConfig {
 /// tables that pair with them), the configuration it reads (`env`), the egress it needs
 /// (`allow`/`deny`/`mute`), and the credential it authenticates with (`secret`) — and **nothing
 /// about the shape of the cage**. There is deliberately no `cmd` (an app's command is its own
-/// identity, and inheriting one would be an integrity hijack), no `binds`/`forward`/`devices`/
+/// identity, and inheriting one would be an integrity hijack) and no `contract` (an option of that
+/// command, so shared by apps that run different programs it would reach the wrong one), no `binds`/`forward`/`devices`/
 /// `ssh_agent`/`seccomp`/`limits` (host exposure and kernel surface stay declared where they are
 /// granted), and
 /// none of the posture scalars (`network.mode`, `gui`, `gpu`, `audio`, `dbus`, `proc`,
@@ -940,6 +941,17 @@ pub(crate) struct RawApp {
     /// (the program name, no arguments) — never split on whitespace, so a path with a
     /// space is not mis-parsed and there is no shell-quoting surface.
     pub(crate) cmd: Option<RawCmd>,
+    /// How [`Self::cmd`] is handed the cage's summary, `contract = { arg = "<flag>" }`: the flag
+    /// and the summary's in-cage path are appended to the command, ahead of any argument the
+    /// caller passes after `--`.
+    ///
+    /// Bound to `cmd`, not layered beside it. The flag is an option of one program, so the layer
+    /// that names the program is the only one that knows which flag it takes: a layer that sets
+    /// `cmd` sets the contract with it, to nothing when it declares none, and a `contract` in a
+    /// layer that sets no `cmd` is ignored with a warning. It is gated like `cmd` for the same
+    /// reason — an argument appended to a trusted app's command is a rewrite of that command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) contract: Option<RawContract>,
     /// Reusable tool bundles this app is built from, `use = ["<name>", …]` (see [`RawBundle`]).
     /// Each named bundle's packages, environment, egress entries and credentials are folded into
     /// this app before resolution, in the order written — a later bundle overrides an earlier one
@@ -1190,6 +1202,21 @@ impl RawCmd {
             RawCmd::Argv(argv) => argv,
         }
     }
+}
+
+/// An app's `contract` table: the channel through which its program is handed the cage's summary.
+///
+/// A table rather than a bare flag so a channel other than a command-line option can be added as a
+/// sibling key. Only `arg` exists: a key sbx does not know is reported and the contract ignored,
+/// rather than read as the flag it is not.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawContract {
+    /// The command-line option that takes a file path, such as `--append-system-prompt-file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) arg: Option<String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// One `[open]` entry: what a URI of a given scheme opens with. A bare argv

@@ -842,6 +842,9 @@ fn app_row_command(
             let _ = writeln!(o, "    {n}{}{r}: {warn}(no command){r}", app.name);
         }
     }
+    if let Some(contract) = &app.contract {
+        let _ = writeln!(o, "      {dim}contract:{r} {contract}");
+    }
     // Beside the command, for the reason the per-app view puts it there: an install step is a
     // command that runs inside this cage before `cmd`, so it belongs where a reader looks for
     // what this app executes. `AppView` has carried it all along and this section never read
@@ -1390,6 +1393,7 @@ mod tests {
     fn blank_app_view(name: &str) -> config::view::AppView {
         use config::view::*;
         AppView {
+            contract: None,
             open: vec![],
             service: vec![],
             provisions: Vec::new(),

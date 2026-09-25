@@ -33,6 +33,7 @@ The same agent command tends to be relaunched across projects with the same pack
 ```toml
 [app.review]
 cmd        = "claude"                 # or an argv: ["claude", "--flag"]
+contract   = { arg = "--append-system-prompt-file" }
 home_scope = "global"                 # "global" (default) or "project"
 gui        = "none"
 
@@ -58,6 +59,7 @@ tasks_max = 4096
 | Field | Kind | Notes |
 |---|---|---|
 | `cmd` | integrity-gated | a bare string (one-element argv, never whitespace-split) or an argv array |
+| `contract` | integrity-gated | `{ arg = "<option>" }`: the option `cmd` takes the cage's summary with, appended with the summary's path; bound to the `cmd` of the same declaration (see [below](#the-contract-field-handing-the-agent-its-sandbox)) |
 | `use` | security | tool [bundles](bundles) folded into this app, in the order written (a later one wins on a key, the app always wins); must sit above the first `[table]` header |
 | `env` | free | overlaid on the baseline `env`, app wins on collision |
 | `binds` | security | added to the baseline binds |
@@ -145,6 +147,61 @@ that element stays the script's `$0`. Use a shell only when the command derives 
 tests a path or writes a file; when it does not, a plain argv is one process fewer and
 needs no `"$@"` at all.
 
+### The `contract` field: handing the agent its sandbox
+
+Every cage carries a description of itself, generated at launch: the full contract at
+`/opt/sbx/contract.md` ([`SBX_CONTRACT`](../reference/environment-variables)) and its summary at
+`/opt/sbx/contract-summary.md` (`SBX_CONTRACT_SUMMARY`). Both are there whether an agent reads them
+or not, and an agent left to itself does not: it meets a refused host, a masked file or a missing
+credential as an unexplained failure and starts working around it.
+
+`contract` hands the summary to the agent through its own instruction channel, which it does read.
+The one channel is a command-line option that takes a file path:
+
+```toml
+cmd      = "claude"
+contract = { arg = "--append-system-prompt-file" }
+```
+
+At launch the option and the summary's path are appended to `cmd`, ahead of any argument passed
+after `sbx app run <name> --`:
+
+```text
+claude --append-system-prompt-file /opt/sbx/contract-summary.md <your arguments>
+```
+
+So the program must accept the option ahead of a subcommand: `sbx app run claude-code -- mcp list`
+runs `claude --append-system-prompt-file … mcp list`, which Claude Code accepts. An agent with no
+such option gets no `contract`, and the summary stays in the cage for it to find.
+
+**What the summary says.** The network posture and the hosts the cage may reach (hosts only, never
+their paths), the destinations a credential is attached to, the files sbx protects by name and a
+count of every other masked or read-only path, the families of refused system calls, the resource
+ceilings, and the [declared operations](../cli/task#how-an-agent-finds-them) by name. Its wording
+is sbx's own and fixed; the values in it are ones a trusted layer set, never a file name or a note
+the project chose, because an agent reads its instruction channel with more authority than it reads
+a file. Whatever the summary leaves out, it sends the agent to the full contract for.
+
+One value in it is not chosen by a trusted layer alone: a host learned by
+[`--net-learn`](../cli/app#learning-an-apps-egress---net-learn) is one the cage asked for, and
+once written into the profile it is listed like any other. A host name carries no sentence, but
+review what a learning run proposes before accepting it.
+
+**Bound to `cmd`.** The option belongs to one program, so the declaration that names the program
+names its contract. A project that sets its own `cmd` for an app sets the contract with it, and to
+nothing if it writes none: an option written for `claude` never reaches the program a project
+swapped in. sbx says so at launch and in `sbx config show --app <name>`, naming the option the
+profile's command carried. A `contract` in a declaration that sets no `cmd` is ignored with a
+warning. A trailing argument for one run belongs after `--`, which keeps the profile's contract.
+
+**When it is ignored.** Each of these is reported at launch and in
+[`sbx config show --app <name>`](../cli/config), and the app launches without the option:
+
+- `cmd` ends in a shell script (`["bash", "-c", "<script>"]`): an option appended there would reach
+  the script's positional parameters, not the program it runs;
+- `arg` is missing, or does not start with `-`, or is the bare `--` that ends option parsing;
+- the table has a key other than `arg`.
+
 ## Layering and gating
 
 An app resolves `global → project → app`, each field overriding per layer, and each
@@ -154,11 +211,14 @@ security field gated by the trust of the layer that supplied it. Then
 
 The **flagship property**: a **globally-declared app keeps its posture even under an
 untrusted project**: which is the whole point of running an agent *on* untrusted
-code. Two integrity gates enforce it:
+code. These integrity gates enforce it:
 
 - **`cmd`**, an untrusted project may define *its own* app but **cannot override the
   `cmd` of a trusted/global app** (else it would launch attacker code under that app's
   posture). An untrusted override is dropped with a warning.
+- **`contract`** follows `cmd`: an untrusted project may set it on *its own* app, never
+  on a trusted one, since an argument appended to a trusted app's command rewrites that
+  command.
 - **`home_scope`**, an untrusted project may set the scope of *its own* app but may
   not flip a trusted app from `"project"` to `"global"` (which would route an untrusted
   run into the home a trusted run shares). The safe direction (`"global"` → `"project"`,

@@ -1130,6 +1130,8 @@ mod tests {
         assert!(is_security_key("network"));
         assert!(is_security_key("app.demo-app.network"));
         assert!(is_security_key("app.demo-app.cmd"));
+        assert!(is_security_key("app.demo-app.contract"));
+        assert!(is_security_key("app.demo-app.contract.arg"));
         // a bare app table (no field) is gated too
         assert!(is_security_key("app.demo-app"));
     }

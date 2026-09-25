@@ -37,6 +37,10 @@ pub(crate) struct ResolvedApp {
     /// The argv to run. Empty when no layer declared a `cmd` — a launch error, never a
     /// silent default.
     pub(crate) cmd: Vec<String>,
+    /// The option [`Self::cmd`] is handed the cage's summary with (`contract = { arg = … }`), or
+    /// `None`. Set by the layer that set `cmd` and by no other, so it always belongs to the program
+    /// it is appended to; its provenance is therefore [`Self::cmd_origin`].
+    pub(crate) contract_arg: Option<String>,
     /// The install steps this app's bundles contribute, in `use` order, each stamped with its
     /// bundle. They run before [`Self::cmd`] and never in its place; an app declares none of its
     /// own, which is why they arrive only through the fold.
@@ -168,6 +172,41 @@ pub(crate) struct ResolvedApp {
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
     /// launched, not on every `sbx run`.
     pub(crate) warnings: Vec<String>,
+}
+
+/// The shells whose `-c` binds the *next* argv element to `$0`. All four are POSIX-family and
+/// agree on it, so the rule is theirs, not a per-shell quirk.
+const ARGV0_SHELLS: [&str; 4] = ["bash", "sh", "zsh", "dash"];
+
+/// Whether `cmd` ends in `<shell> -<flags>c <script>` — the shape whose trailing element is a
+/// script, not a program, so anything appended after it starts at `$0`.
+///
+/// The script must be *last*: an argv that already carries an element after it has its `$0`, and a
+/// profile that wrote one is saying which name its script should report. The shell is matched on
+/// its file name so an absolute `/bin/bash` counts, and the flag must *end* in `c` because that is
+/// what makes the following element the script (`-c`, `-lc`, `-euc`); a flag with anything after
+/// the `c` consumes it differently and is left alone.
+pub(crate) fn ends_with_shell_payload<S: AsRef<std::ffi::OsStr>>(cmd: &[S]) -> bool {
+    let [shell, flag, _script] = &cmd[cmd.len().saturating_sub(3)..] else {
+        return false;
+    };
+    let is_shell = std::path::Path::new(shell)
+        .file_name()
+        .is_some_and(|s| ARGV0_SHELLS.iter().any(|k| s == *k));
+    let is_c_flag = flag.as_ref().to_str().is_some_and(|f| {
+        f.strip_prefix('-')
+            .is_some_and(|rest| rest.ends_with('c') && rest.bytes().all(|b| b.is_ascii_lowercase()))
+    });
+    is_shell && is_c_flag
+}
+
+/// The warning for a `contract` in a layer that sets no `cmd`: the contract is bound to the command
+/// of its own layer, so one arriving alone has no program to be handed to.
+fn contract_without_cmd(source: &str) -> String {
+    format!(
+        "{source}: ignoring `contract` — it is bound to the `cmd` of the same declaration, and this \
+         one sets no `cmd`"
+    )
 }
 
 /// The built-in app default: a Mode-B agent's unscoped allow rules default to `{GET,HEAD}` (read by
@@ -370,6 +409,8 @@ fn resolve_app(
     let mut ssh_agent_origin = Provenance::Default;
     let mut ssh_agent_confirm = false;
     let mut cmd: Vec<String> = Vec::new();
+    // Bound to `cmd`: assigned wherever `cmd` is, from the same layer, and nowhere else.
+    let mut contract_arg: Option<String> = None;
     // The install steps the layers' bundles contributed, in the order they were folded. A step is
     // carried, never merged: two bundles each finish their own tool. The same bundle named by both
     // layers contributes once — running one install twice is at best waste and at worst a fight
@@ -602,6 +643,11 @@ fn resolve_app(
         if let Some(c) = app.cmd {
             cmd = c.into_argv();
             cmd_origin = Provenance::Global;
+            contract_arg = app
+                .contract
+                .and_then(|raw| validate_contract(&mut warnings, &source, raw, &cmd));
+        } else if app.contract.is_some() {
+            warnings.push(contract_without_cmd(&source));
         }
         if let Some(raw) = app.home_scope
             && let Some(scope) = validate_home_scope(&mut warnings, &source, &raw)
@@ -940,14 +986,49 @@ fn resolve_app(
                 gate.refuse(&format!("{} task(s)", section.tasks.len()), &mut warnings);
             }
         }
+        // The contract rides with `cmd`: a layer allowed to set the command sets the contract with
+        // it, to nothing when it declares none, so an option written for one program never reaches
+        // another. A layer refused the command is refused the contract for the same reason — an
+        // argument appended to a trusted app's command rewrites that command.
+        let may_set_cmd = trusted || !defined_by_a_trusted_layer;
         if let Some(c) = app.cmd {
-            if trusted || !defined_by_a_trusted_layer {
+            if may_set_cmd {
+                if app.contract.is_none()
+                    && let Some(lost) = &contract_arg
+                {
+                    // Said, not only done: the command still runs, so the one sign of the change
+                    // would be an agent that no longer knows its sandbox.
+                    warnings.push(format!(
+                        "{source}: this `cmd` replaces the profile's, and its `contract` \
+                         (`{lost}`) with it — the option belonged to that command. Declare \
+                         `contract` here to keep it, or pass one run's arguments after \
+                         `sbx app run {name} --`, which keeps the profile's command and contract"
+                    ));
+                }
                 cmd = c.into_argv();
                 cmd_origin = Provenance::Project;
+                contract_arg = app
+                    .contract
+                    .and_then(|raw| validate_contract(&mut warnings, &source, raw, &cmd));
             } else {
                 // Not phrased as an override: the trusted profile may have declared no `cmd` at
                 // all, which is exactly the case this refusal exists for.
                 gate.refuse("`cmd` for an app a trusted layer defines", &mut warnings);
+                if app.contract.is_some() {
+                    gate.refuse(
+                        "`contract` for an app a trusted layer defines",
+                        &mut warnings,
+                    );
+                }
+            }
+        } else if app.contract.is_some() {
+            if may_set_cmd {
+                warnings.push(contract_without_cmd(&source));
+            } else {
+                gate.refuse(
+                    "`contract` for an app a trusted layer defines",
+                    &mut warnings,
+                );
             }
         }
         if let Some(raw) = app.home_scope {
@@ -973,6 +1054,7 @@ fn resolve_app(
         allow_insecure_http: own_allow_insecure_http,
         allow_insecure_http_origin,
         cmd,
+        contract_arg,
         provisions,
         home_scope,
         env,

@@ -1079,6 +1079,7 @@ fn raw_app(
     network: Option<NetworkField>,
 ) -> RawApp {
     RawApp {
+        contract: None,
         accepts_fresh_releases: Default::default(),
         rest: Default::default(),
         open: Default::default(),
@@ -4168,6 +4169,7 @@ fn a_profile_declaring_every_explained_section_appends_no_catch_all() {
     let everything = validate_profile(
         br#"
             cmd = "demo-app"
+            contract = { arg = "--prompt-file" }
             home_scope = "project"
             use = ["demo-bundle"]
             allow_insecure_http = true
@@ -4203,6 +4205,31 @@ fn a_profile_declaring_every_explained_section_appends_no_catch_all() {
     );
 }
 
+/// The import report grants the contract only when the launch will honour it: one the resolution
+/// would ignore is reported as ignored, with the reason, rather than as an option to be appended.
+#[test]
+fn the_import_report_says_when_a_contract_will_be_ignored() {
+    let report = |profile: &str| {
+        validate_profile(profile.as_bytes())
+            .unwrap()
+            .summary
+            .join("\n")
+    };
+    let honoured = report("cmd = \"agent\"\ncontract = { arg = \"--prompt-file\" }\n");
+    assert!(
+        honoured.contains("contract: --prompt-file /opt/sbx/contract-summary.md"),
+        "{honoured}"
+    );
+    let script = report(
+        "cmd = [\"bash\", \"-c\", \"exec agent\"]\ncontract = { arg = \"--prompt-file\" }\n",
+    );
+    assert!(
+        script.contains("contract: ignored at launch — `cmd` ends in a shell script"),
+        "{script}"
+    );
+    assert!(!script.contains("appended to the command"), "{script}");
+}
+
 #[test]
 fn merge_app_overlays_the_baseline_with_app_precedence() {
     let mut base = resolve_no_plugins(raw(&[("A", "base"), ("B", "base")], &[]), None);
@@ -4220,6 +4247,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
     // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
     base.dbus = false;
     let app = ResolvedApp {
+        contract_arg: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4306,6 +4334,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
 fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        contract_arg: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4364,6 +4393,7 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
 fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        contract_arg: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4421,6 +4451,7 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     use crate::allowlist::{EgressPolicy, Methods, classify};
     let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
     let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
+        contract_arg: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4583,6 +4614,7 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
+        contract_arg: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4648,6 +4680,7 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         "the baseline-effective set is cleared under a shared posture"
     );
     let app = ResolvedApp {
+        contract_arg: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -12321,6 +12354,7 @@ const TRUSTED_APP: &str = "\
 const OVERRIDING_PROJECT: &str = "\
      [app.demo-app]\n\
      use = [\"demo-bundle\"]\ncmd = \"evil\"\nhome_scope = \"global\"\n\
+     contract = { arg = \"--evil\" }\n\
      [app.demo-app.packages]\n\
      demo-tool = \"mise:aqua:attacker/x\"\ndemo-tar = \"tarball:resolve\"\n\
      [app.demo-app.flakes.demo-flake]\n\
@@ -12346,6 +12380,7 @@ const TRUSTED_OVERRIDE_REFUSALS: &[&str] = &[
     "inline flake `demo-flake` override of a trusted app",
     "tarball resolver `demo-tar` override of a trusted app",
     "`cmd` for an app a trusted layer defines",
+    "`contract` for an app a trusted layer defines",
     "`home_scope` for an app a trusted layer defines",
 ];
 
@@ -13394,6 +13429,143 @@ fn a_bare_posture_names_the_table_it_drops_and_stays_quiet_when_it_drops_nothing
         assert!(
             Resolved::bare_posture_drops_a_table(&empty_handed, &bare).is_none(),
             "a posture with no table to start from drops nothing"
+        );
+    }
+}
+
+/// Resolve `global` under `project` at `state`, returning the `demo` app.
+fn contract_app(global: &str, project: Option<(&str, TrustState)>) -> ResolvedApp {
+    let global: RawConfig = toml::from_str(global).unwrap();
+    let project = project.map(|(src, state)| (toml::from_str::<RawConfig>(src).unwrap(), state));
+    let mut r = resolve_no_plugins(global, project);
+    r.apps.remove("demo").expect("the app resolves")
+}
+
+/// A trusted profile of the shape the catalogue ships: a command and the option it takes the
+/// summary with.
+const CONTRACT_PROFILE: &str = "\
+     [app.demo]\n\
+     cmd = \"agent\"\n\
+     contract = { arg = \"--system-prompt-file\" }\n";
+
+/// The contract belongs to the layer that names the program, and to no other.
+///
+/// Each case is one a layered field would get wrong: a project that points the app at another
+/// program must not hand that program the first one's option, a project that restates the command
+/// with its own contract gets its own, and a contract written without a command has no program to
+/// be bound to — it leaves the trusted one in place and says it was ignored.
+#[test]
+fn the_contract_is_set_by_the_layer_that_sets_cmd() {
+    let app = contract_app(CONTRACT_PROFILE, None);
+    assert_eq!(app.contract_arg.as_deref(), Some("--system-prompt-file"));
+    assert_eq!(app.cmd_origin, Provenance::Global);
+    assert!(app.warnings.is_empty(), "{:#?}", app.warnings);
+
+    let other_program = "[app.demo]\ncmd = \"other-agent\"\n";
+    let app = contract_app(CONTRACT_PROFILE, Some((other_program, TrustState::Trusted)));
+    assert_eq!(app.cmd, vec!["other-agent".to_string()]);
+    assert_eq!(app.contract_arg, None, "the option went to another program");
+    let dropped = |app: &ResolvedApp| {
+        app.warnings
+            .iter()
+            .any(|w| w.contains("and its `contract` (`--system-prompt-file`) with it"))
+    };
+    assert!(dropped(&app), "the drop went unsaid: {:#?}", app.warnings);
+    assert!(
+        !app.warnings.iter().any(|w| super::is_trust_drop(w)),
+        "a trusted layer's choice is not a trust refusal: {:#?}",
+        app.warnings
+    );
+
+    let restated = "[app.demo]\ncmd = [\"agent\", \"--fast\"]\ncontract = { arg = \"--prompt\" }\n";
+    let app = contract_app(CONTRACT_PROFILE, Some((restated, TrustState::Trusted)));
+    assert_eq!(app.contract_arg.as_deref(), Some("--prompt"));
+    assert_eq!(app.cmd_origin, Provenance::Project);
+    assert!(!dropped(&app), "{:#?}", app.warnings);
+
+    let alone = "[app.demo]\ncontract = { arg = \"--prompt\" }\n";
+    let app = contract_app(CONTRACT_PROFILE, Some((alone, TrustState::Trusted)));
+    assert_eq!(app.contract_arg.as_deref(), Some("--system-prompt-file"));
+    assert!(
+        app.warnings
+            .iter()
+            .any(|w| w.contains("ignoring `contract`") && w.contains("sets no `cmd`")),
+        "{:#?}",
+        app.warnings
+    );
+}
+
+/// An untrusted project may hand its own app the summary, as it may choose its own app's command:
+/// there is no trusted command for the option to be appended to.
+#[test]
+fn an_untrusted_project_sets_the_contract_of_its_own_app() {
+    for (state, _) in REFUSAL_REASONS {
+        let app = contract_app("", Some((CONTRACT_PROFILE, state)));
+        assert_eq!(
+            app.contract_arg.as_deref(),
+            Some("--system-prompt-file"),
+            "{state:?}: {:#?}",
+            app.warnings
+        );
+    }
+}
+
+/// An untrusted project's `contract` alone, with no `cmd` beside it, is still refused on a trusted
+/// app, and refused as a trust drop so the launch announces it: the option would be appended to the
+/// trusted command all the same.
+#[test]
+fn an_untrusted_contract_without_cmd_is_refused_on_a_trusted_app() {
+    let alone = "[app.demo]\ncontract = { arg = \"--evil\" }\n";
+    for (state, reason) in REFUSAL_REASONS {
+        let app = contract_app(CONTRACT_PROFILE, Some((alone, state)));
+        assert_eq!(app.contract_arg.as_deref(), Some("--system-prompt-file"));
+        let expected = format!(
+            ".sbx.toml [app.demo]: ignoring `contract` for an app a trusted layer defines ({reason})"
+        );
+        assert!(
+            app.warnings.contains(&expected),
+            "{state:?}: {:#?}",
+            app.warnings
+        );
+        assert!(super::is_trust_drop(&expected));
+    }
+}
+
+/// A contract the launch could not honour as written is dropped at resolution, with the reason.
+///
+/// A shell script is the case with a consequence: appended after `bash -c <script>`, the option
+/// and the path become the script's `$0` and `$1`, so the program it runs never sees them and the
+/// script's own arguments shift by two.
+#[test]
+fn a_contract_the_launch_cannot_honour_is_refused_with_its_reason() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "cmd = [\"bash\", \"-c\", \"exec agent\"]\ncontract = { arg = \"--prompt\" }",
+            "ends in a shell script",
+        ),
+        ("cmd = \"agent\"\ncontract = {}", "names no `arg`"),
+        (
+            "cmd = \"agent\"\ncontract = { arg = \"prompt\" }",
+            "must be a command-line option",
+        ),
+        (
+            "cmd = \"agent\"\ncontract = { arg = \"--\" }",
+            "must be a command-line option",
+        ),
+        (
+            "cmd = \"agent\"\ncontract = { env = \"PROMPT_FILE\" }",
+            "unknown key `env`",
+        ),
+    ];
+    for (body, reason) in cases {
+        let app = contract_app(&format!("[app.demo]\n{body}\n"), None);
+        assert_eq!(app.contract_arg, None, "{body}");
+        assert!(
+            app.warnings
+                .iter()
+                .any(|w| w.contains("ignoring `contract`") && w.contains(reason)),
+            "{body}: expected {reason:?}\n{:#?}",
+            app.warnings
         );
     }
 }

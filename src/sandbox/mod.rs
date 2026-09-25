@@ -147,6 +147,7 @@ pub(crate) use binds::{
     unestablishable_bind_warning,
 };
 pub(crate) use cgroup::{LimitReport, probe as resource_limits};
+pub(crate) use contract::CONTRACT_SUMMARY_INCAGE;
 pub(crate) use deb::{
     DebUpgrade, pinned_hashes as deb_pinned_hashes, upgrade_project as upgrade_deb,
     withheld as withheld_deb_packages,

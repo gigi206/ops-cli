@@ -977,6 +977,30 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
     if let Some(cmd) = &app.cmd {
         lines.push(format!("command: {}", cmd.clone().into_argv().join(" ")));
     }
+    // Read by the resolution's own validation, so the report grants no more than the launch will:
+    // a contract the launch ignores is said to be ignored, and why, never left to the catch-all.
+    if let Some(contract) = &app.contract {
+        let cmd = app
+            .cmd
+            .clone()
+            .map(schema::RawCmd::into_argv)
+            .unwrap_or_default();
+        let mut why = Vec::new();
+        lines.push(
+            match super::validate_contract(&mut why, "", contract.clone(), &cmd) {
+                Some(arg) => format!(
+                    "contract: {arg} {} (appended to the command)",
+                    crate::sandbox::CONTRACT_SUMMARY_INCAGE
+                ),
+                None => format!(
+                    "contract: ignored at launch — {}",
+                    why.first()
+                        .and_then(|w| w.split_once(" — "))
+                        .map_or("", |(_, reason)| reason)
+                ),
+            },
+        );
+    }
     lines.push(format!(
         "home: {}",
         app.home_scope.as_deref().unwrap_or("global")
@@ -1151,6 +1175,7 @@ fn undescribed_sections(app: &RawApp) -> Vec<String> {
     // Rendered in full above, so naming them again would be noise.
     const DESCRIBED: &[&str] = &[
         "cmd",
+        "contract",
         "home_scope",
         "use",
         "packages",

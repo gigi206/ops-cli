@@ -197,6 +197,53 @@ pub(super) fn validate_tasks_limit(
     }
 }
 
+/// Read an app's `contract` table into the option its command is handed the summary with, or
+/// `None`, with a warning, when the table names no usable channel.
+///
+/// `cmd` is the argv of the same layer, the one the contract is bound to. A command ending in a
+/// shell script takes no contract: an option appended after the script becomes one of its
+/// positional parameters, never an option of the program it runs.
+///
+/// The option must look like one — a leading `-`, and not the bare `--` that ends option parsing
+/// and would turn the summary's path into an operand.
+pub(super) fn validate_contract(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: schema::RawContract,
+    cmd: &[String],
+) -> Option<String> {
+    if let Some(key) = raw.rest.keys().next() {
+        warnings.push(format!(
+            "{source}: ignoring `contract` — unknown key `{key}` (the only channel is `arg`, a \
+             command-line option)"
+        ));
+        return None;
+    }
+    let Some(arg) = raw.arg else {
+        warnings.push(format!(
+            "{source}: ignoring `contract` — it names no `arg` (the command-line option that takes \
+             the summary's path)"
+        ));
+        return None;
+    };
+    if !arg.starts_with('-') || arg == "--" {
+        warnings.push(format!(
+            "{source}: ignoring `contract` — `arg` must be a command-line option such as \
+             `--append-system-prompt-file`, not `{}`",
+            arg.escape_debug()
+        ));
+        return None;
+    }
+    if super::ends_with_shell_payload(cmd) {
+        warnings.push(format!(
+            "{source}: ignoring `contract` — `cmd` ends in a shell script, and an option appended \
+             after it would reach the script's positional parameters, not the program it runs"
+        ));
+        return None;
+    }
+    Some(arg)
+}
+
 /// Parse an app's `home_scope` string into [`AppHomeScope`]. An unrecognized value is dropped
 /// with a warning and the caller keeps the prior (defaulting to `Global`) — fail-safe, never a
 /// silent mis-scope.

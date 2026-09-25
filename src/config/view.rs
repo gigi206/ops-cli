@@ -811,12 +811,24 @@ pub(crate) struct AppLimitsView {
     pub(crate) tasks_max: Option<String>,
 }
 
+/// The arguments a launch appends to an app's `cmd` for its contract — the option, then the
+/// summary's in-cage path — joined for display, or `None` when the app declares none.
+pub(crate) fn contract_view(app: &super::ResolvedApp) -> Option<String> {
+    app.contract_arg
+        .as_ref()
+        .map(|arg| format!("{arg} {}", crate::sandbox::CONTRACT_SUMMARY_INCAGE))
+}
+
 /// A named application profile: the command it runs and what its gated overlay adds.
 #[derive(Serialize)]
 pub(crate) struct AppView {
     pub(crate) name: String,
     /// The argv joined for display, or `None` when no layer declared a command.
     pub(crate) cmd: Option<String>,
+    /// What the launch appends to `cmd` to hand the program the cage's summary, or `None` when the
+    /// app declares no contract. See [`contract_view`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) contract: Option<String>,
     /// The install steps this app's bundles contribute, in the order a launch runs them — each the
     /// bundle's name and the command it declared. Shown because a step is a command that will run
     /// inside this cage: someone reading an app's resolved shape is entitled to see it here, not
@@ -915,6 +927,10 @@ pub(crate) struct AppDetailView {
     /// Which app layer set the command (`Global`/`Project`); never inherited (the baseline has no
     /// command of its own).
     pub(crate) cmd_origin: ProvenanceView,
+    /// What the launch appends to `cmd` to hand the program the cage's summary, or `None`. Its
+    /// provenance is `cmd_origin`: the contract is set by the layer that set the command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) contract: Option<String>,
     /// The install steps this app's bundles contribute, in the order a launch runs them. Rendered
     /// beside the command for the same reason it is carried at all: it is a command that runs in
     /// this cage, and the app's resolved shape is where someone checks what that is.
@@ -1545,6 +1561,7 @@ fn app_view(
         open: open_views(&app.open),
         service: service_views(&app.service),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
+        contract: contract_view(app),
         provisions: app
             .provisions
             .iter()
@@ -1859,6 +1876,7 @@ fn app_detail_view(
         service: service_views(&eff_service),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
         cmd_origin: app.cmd_origin.into(),
+        contract: contract_view(app),
         provisions: app
             .provisions
             .iter()
@@ -2220,6 +2238,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                contract: None,
                 open: vec![],
                 service: vec![],
                 provisions: Vec::new(),
@@ -2417,6 +2436,7 @@ mod tests {
 
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
+            contract_arg: None,
             accepts_fresh_releases: Default::default(),
             provisions: Vec::new(),
             open: Default::default(),
@@ -2655,6 +2675,7 @@ mod tests {
         };
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
+            contract_arg: None,
             accepts_fresh_releases: Default::default(),
             provisions: Vec::new(),
             open: Default::default(),
