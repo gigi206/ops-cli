@@ -2,11 +2,12 @@
 //!
 //! The proxy reads what the cage sends, which makes it the part of sbx an attacker in the cage
 //! talks to. It runs apart from the supervisor, in a cage of its own ([`cage`]): an empty network
-//! namespace, and no host filesystem but the read-only userland its binary may need to load. It
-//! holds what its work needs, the policy, the credentials it injects and the authority it mints
-//! leaves with, and asks the supervisor for the rest: every upstream connection, every parked
-//! request, every refreshed credential ([`super::link`]). What it did leaves it as reports
-//! ([`super::events`]).
+//! namespace, and no host filesystem but the read-only userland its binary may need to load; and
+//! under seccomp filters of its own, which name the calls it may make
+//! ([`crate::sandbox::seccomp::proxy`]). It holds what its work needs, the policy, the credentials
+//! it injects and the authority it mints leaves with, and asks the supervisor for the rest: every
+//! upstream connection, every parked request, every refreshed credential ([`super::link`]). What it
+//! did leaves it as reports ([`super::events`]).
 //!
 //! **Starting.** The supervisor binds the cage's socket, starts the proxy holding one descriptor,
 //! its end of the link, and sends it a [`Bootstrap`] first: the policy, as the very bytes the
@@ -210,11 +211,13 @@ pub(crate) fn main(argv: &[OsString]) -> ExitCode {
     }
 }
 
-/// Serve as the proxy at the other end of `link` until the link ends: read the start, mint the
-/// certificate authority, stand everything up, say so, and serve. Returns the thread accepting the
-/// cage's connections, which `stop` ends once it is set and the accept it waits in returns; a
-/// process ends it by exiting.
+/// Serve as the proxy at the other end of `link` until the link ends: go under the proxy's seccomp
+/// filters, read the start, mint the certificate authority, stand everything up, say so, and serve.
+/// Returns the thread accepting the cage's connections, which `stop` ends once it is set and the
+/// accept it waits in returns; a process ends it by exiting.
 fn run(link: wire::Socket, stop: &Arc<AtomicBool>) -> io::Result<JoinHandle<()>> {
+    // First, on the thread every other one of the proxy's is started from, before it reads a byte.
+    crate::sandbox::seccomp::proxy::confine()?;
     let (doc, fds) = link.recv_down()?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -772,6 +775,49 @@ mod tests {
         // A sixteenth of 1 GiB is one default body of 64 MiB. Any host that runs this has more, so a
         // budget read from here would be larger.
         assert_eq!(ctx.body.total, 64 * MIB);
+    }
+
+    /// How many seccomp filters the thread whose `status` is at `path` runs under.
+    fn filters(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix("Seccomp_filters:"))?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// A started proxy runs under its seccomp filters, and so does every thread it starts: the one
+    /// accepting the cage's connections carries exactly two filters more than the test that started
+    /// the proxy, which are the proxy's own.
+    #[test]
+    fn every_thread_a_proxy_starts_runs_under_its_filters() {
+        let Some(own) = filters(Path::new("/proc/thread-self/status")) else {
+            skip_incapable!("skipping: this kernel does not count a thread's seccomp filters");
+            return;
+        };
+        let dir = TmpDir::new();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let (_launched, _) = started(&dir, &log);
+        let mut accepting = Vec::new();
+        for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+            // A thread's name as the kernel keeps it, cut to fifteen bytes.
+            let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+            if comm.trim_end() == "sbx-proxy-accep"
+                && let Some(n) = filters(&task.path().join("status"))
+            {
+                accepting.push(n);
+            }
+        }
+        assert!(
+            !accepting.is_empty(),
+            "no thread accepts the cage's connections"
+        );
+        assert!(
+            accepting.iter().all(|&n| n == own + 2),
+            "{own} filters on this test's thread, {accepting:?} on the accepting ones"
+        );
     }
 
     /// The cage binds the running binary through its descriptor, or copies it when its file is gone,

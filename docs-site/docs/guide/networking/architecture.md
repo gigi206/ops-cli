@@ -58,7 +58,11 @@ read-only userland its binary may need to load. It holds the policy, the credent
 injects and the per-session CA, whose key it mints itself and never hands out. It cannot
 open a connection, so it asks sbx's supervisor for every upstream one
 ([the SSRF guard](#the-ssrf-guard) says what the supervisor checks), and it stops when
-the launch that started it ends.
+the launch that started it ends. In that cage it also runs under a seccomp filter of its
+own, the other way round from the one every cage gets: a list of the system calls its
+work makes, with every other call refused. A flaw that handed someone the proxy's
+execution would leave them unable to open a file, create or connect a socket, run a
+program or start a process.
 
 ---
 

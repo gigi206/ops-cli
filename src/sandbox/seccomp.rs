@@ -56,6 +56,11 @@
 //! that reopens a real escape surface (`clone`→userns, `ioctl`→terminal injection,
 //! `umount2`→a mount teardown that can defeat a control-plane pin) is surfaced with a
 //! [`Caution`] the resolver turns into a warning.
+//!
+//! ## The proxy's own filter
+//!
+//! The egress proxy runs under a filter of its own on top of its cage's ([`proxy`]), the other way
+//! round: a list of what it may call, and `EPERM` for the rest.
 
 #![allow(
     clippy::expect_used,
@@ -71,6 +76,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
+
+pub(crate) mod proxy;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("sbx's seccomp denylist is implemented only for x86_64 and aarch64");
@@ -442,13 +449,20 @@ fn refuse_x32(program: &mut BpfProgram) {
 #[cfg(not(target_arch = "x86_64"))]
 fn refuse_x32(_program: &mut BpfProgram) {}
 
-/// Compile a rule set with the given match action into raw cBPF bytes.
+/// Compile a rule set with the given match action into raw cBPF bytes, allowing every call it does
+/// not name.
 fn compile(rules: Rules, match_action: SeccompAction) -> Vec<u8> {
-    let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, TARGET_ARCH)
+    compile_with(rules, SeccompAction::Allow, match_action)
+}
+
+/// Compile a rule set into raw cBPF bytes: `match_action` for the calls it names, `default` for every
+/// other one.
+fn compile_with(rules: Rules, default: SeccompAction, match_action: SeccompAction) -> Vec<u8> {
+    let filter = SeccompFilter::new(rules, default, match_action, TARGET_ARCH)
         .expect("a statically-defined filter is always valid");
     let mut program: BpfProgram = filter.try_into().expect("the filter compiles to cBPF");
-    // Every program, not one of them: each is installed on its own and each defaults to `Allow`, so
-    // a bypass left open in any of them is a bypass.
+    // Every program, not one of them: each is installed on its own, and one that allows what it does
+    // not name would let a bypass left open in it through.
     refuse_x32(&mut program);
     serialize(&program)
 }
