@@ -516,7 +516,7 @@ A cage writes the project, its store, its home and its pools, and a later comman
 | `src/config/load.rs`, `src/config/safety.rs`, `src/trust.rs` | the project's `.sbx.toml`, the mise files beside it, and the `sops` files it names | every command that loads the configuration |
 | `src/cli/trust.rs` | the same files, shown for approval | `sbx trust` |
 | `src/sandbox/mise.rs` | what mise answers for the project's environment, from a cage of its own, over the approved bytes | a launch of a trusted project that has a mise file |
-| `src/sandbox/fsmask.rs` | the git configuration of the project and of its submodules, through the host's `git`, their git indexes, and the `.git` files that point at their repositories | a launch in a git repository, or with `[fs]` entries |
+| `src/sandbox/fsmask.rs` | the git configuration of the project and of its submodules, through the host's `git`, their git indexes, and the `.git` files that point at their repositories, at launch and again when a session that protects `.git` ends | a launch in a git repository, or with `[fs]` entries |
 | `src/sandbox/contract.rs` | the names of project files a mask matched, written into the in-cage contract | a launch with masks |
 | `src/sandbox/projectstore.rs` | the state of the project's store, checked before the host's `nix-store` loads it | every launch, and `sbx gc` |
 | `src/sandbox/gc.rs`, `src/sandbox/launch/reclaim.rs` | the project's store, the app homes and pools, a task's output | `sbx gc`, `sbx app prune`, `sbx app rm --purge` |

@@ -1161,14 +1161,18 @@ fn worktree_entries(worktrees: &Path) -> io::Result<(Vec<PathBuf>, bool)> {
 /// What the end of a session looks for in the project's git, where no mount reaches: a file git
 /// reads as configuration that was not there at launch.
 ///
-/// Two can appear. A `.git/commondir` has the host's git read its configuration from the directory
-/// it names ([`git_commondir_refusal`]), and a `config.worktree` is read as configuration while
-/// `extensions.worktreeConfig` is on ([`git_worktree_files`]). A mount can only hold a path that
-/// exists, and a placeholder would stop git, so the launch notes which `config.worktree` files
-/// exist, and once the cage has exited the supervisor names each of these files that appeared, and
-/// a link where the launch refuses one, for the user to check before their own git reads them. It
-/// reads names and file types only, never following a link or opening a file the cage wrote, and
-/// every name it prints is escaped.
+/// Three can appear. A `.git/commondir` has the host's git read its configuration from the
+/// directory it names ([`git_commondir_refusal`]), a `config.worktree` is read as configuration
+/// while `extensions.worktreeConfig` is on ([`git_worktree_files`]), and a repository in a
+/// gitlink's directory is a submodule whose configuration a `git status` in the superproject reads
+/// ([`submodule_carrier`]); the cage writes the index, so it can add the gitlink as well as the
+/// repository. A mount can only hold a path that exists, and a placeholder would stop git, so the
+/// launch notes which of these exist, and once the cage has exited the supervisor names each that
+/// appeared, and a link where the launch refuses one, for the user to check before their own git
+/// reads them. It reads names and file types, the indexes ([`gitlinks`]) and the `.git` files that
+/// point at a submodule's repository, each within a bound, never following a link to open what it
+/// names; an index it could read at launch and cannot read after the session is named too, rather
+/// than passed over. Every name it prints is escaped.
 ///
 /// It needs sbx alive when the cage exits, which is why a launch with a watch supervises the cage
 /// rather than replacing itself with it. A supervisor killed along with its terminal says nothing,
@@ -1177,6 +1181,7 @@ fn worktree_entries(worktrees: &Path) -> io::Result<(Vec<PathBuf>, bool)> {
 pub(crate) struct GitWatch {
     root: PathBuf,
     configs: BTreeSet<PathBuf>,
+    submodules: GitlinkScan,
 }
 
 impl GitWatch {
@@ -1188,7 +1193,12 @@ impl GitWatch {
             return None;
         }
         let configs = WorktreeScan::of(&root).configs;
-        Some(GitWatch { root, configs })
+        let submodules = GitlinkScan::of(&root);
+        Some(GitWatch {
+            root,
+            configs,
+            submodules,
+        })
     }
 
     /// What appeared during the session, one message per finding, escaped for the terminal.
@@ -1227,6 +1237,35 @@ impl GitWatch {
                 "`{}` holds more than {MASK_MAX} entries after the session, more than sbx reads: \
                  check what was created there before running git in a worktree",
                 self.root.join(".git/worktrees").display()
+            ));
+        }
+        let now = GitlinkScan::of(&self.root);
+        for dot_git in now.repos.difference(&self.submodules.repos) {
+            out.push(format!(
+                "`{}` is a submodule's repository that sbx did not protect at launch: a `git \
+                 status` in the superproject reads its configuration. Check it, or remove it, \
+                 before running git here",
+                dot_git.display()
+            ));
+        }
+        for index in now
+            .unread
+            .iter()
+            .filter(|index| !self.submodules.unread.contains(index))
+        {
+            out.push(format!(
+                "`{}` cannot be read in full after the session (split, larger than sbx reads, or of \
+                 another format), so a submodule's repository added during it cannot be named. \
+                 Check the gitlinks from a cage (`sbx run -- git ls-files --stage`) before running \
+                 git here",
+                index.display()
+            ));
+        }
+        if now.more && !self.submodules.more {
+            out.push(format!(
+                "`{}` names more submodules after the session than sbx follows: check them from a \
+                 cage (`sbx run -- git submodule status --recursive`) before running git here",
+                self.root.join(".git/index").display()
             ));
         }
         out.iter().map(|m| visible(m)).collect()
@@ -1277,6 +1316,63 @@ impl WorktreeScan {
             _ => {}
         }
         scan
+    }
+}
+
+/// The `.git` in each gitlink's directory that holds one, from the project's index and, below it,
+/// from the index of each submodule's repository in the project, with the indexes that could not
+/// be read in full and whether the walk stopped at its bound.
+///
+/// Found by file type, as [`submodule_carrier`] finds them, and followed through a `.git` file only
+/// to a repository inside the project, the one kind the cage can have written.
+#[derive(Default)]
+struct GitlinkScan {
+    repos: BTreeSet<PathBuf>,
+    unread: Vec<PathBuf>,
+    more: bool,
+}
+
+impl GitlinkScan {
+    fn of(root: &Path) -> Self {
+        let mut scan = GitlinkScan::default();
+        scan.walk(root, &GitRepo::main(root), 0);
+        scan
+    }
+
+    fn walk(&mut self, root: &Path, repo: &GitRepo, depth: usize) {
+        let Ok(links) = gitlinks(repo) else {
+            self.unread.push(repo.dir.join("index"));
+            return;
+        };
+        for dir in links {
+            if depth >= SUBMODULE_DEPTH || self.repos.len() >= MASK_MAX {
+                self.more = true;
+                return;
+            }
+            let dot_git = dir.join(".git");
+            let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
+                continue;
+            };
+            self.repos.insert(dot_git.clone());
+            let git_dir = if meta.is_dir() {
+                dot_git
+            } else if meta.is_file()
+                && let Ok(Some(target)) = gitfile_target(&dot_git)
+            {
+                let canon = crate::trust::canonicalize_existing_prefix(&target);
+                if !canon.starts_with(root) || !canon.is_dir() {
+                    continue;
+                }
+                canon
+            } else {
+                continue;
+            };
+            let sub = GitRepo {
+                dir: git_dir,
+                work_tree: dir,
+            };
+            self.walk(root, &sub, depth + 1);
+        }
     }
 }
 
@@ -3362,6 +3458,61 @@ mod tests {
             e.readonly
                 .iter()
                 .any(|m| m.path == sha.join("emb/.git/config"))
+        );
+    }
+
+    /// The end of a session names a submodule's repository that was not there at launch, found in
+    /// an index the cage rewrote in version 4 or in the index of a submodule held at launch, and an
+    /// index it can no longer read in full. One present at launch is not named.
+    #[test]
+    fn the_git_watch_names_a_submodule_repository_that_appeared() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the submodule watch: no git on this host");
+            return;
+        };
+        assert!(git_repo_at(&root.join("kept"), &[]) && git(&["add", "kept"]));
+        let watch = GitWatch::start(&root, false).expect("a protected `.git` is watched");
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+
+        assert!(git(&["update-index", "--index-version", "4"]));
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("emb/.git` is a submodule's repository")),
+            "{found:#?}"
+        );
+        assert!(
+            !found.iter().any(|f| f.contains("kept/.git`")),
+            "{found:#?}"
+        );
+
+        // A gitlink added inside a submodule held at launch is followed there too.
+        let in_kept = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", root.join("kept").to_str().unwrap()])
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        assert!(git_repo_at(&root.join("kept/inner"), &[]) && in_kept(&["add", "inner"]));
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("kept/inner/.git` is a submodule's repository")),
+            "{found:#?}"
+        );
+
+        assert!(git(&["update-index", "--split-index"]));
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains(".git/index` cannot be read in full")),
+            "{found:#?}"
         );
     }
 

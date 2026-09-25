@@ -152,8 +152,9 @@ that file only for a linked worktree; in a main repository it makes your git rea
 configuration from the directory it names instead of `.git/config`. Nothing can hold its
 place while it is absent, since git refuses to run with an empty file or a directory there,
 so a cage could create one during a session. sbx therefore looks again once the cage has
-exited, and names a `.git/commondir` or a `config.worktree` that appeared during the session,
-or a link where the launch refuses one, before your own git reads them; the next launch
+exited, and names a `.git/commondir`, a `config.worktree` or a submodule's repository that
+appeared during the session, or a link where the launch refuses one, before your own git reads
+them; the next launch
 refuses on a `.git/commondir` too. Check what it names and remove it. To be there when the
 cage exits, sbx stays its parent whenever `.git` is protected, which the default network
 posture already does. A detached session writes the warning to its log, and a session whose
@@ -189,7 +190,9 @@ puts each submodule on the commit the superproject records, which is what `updat
 submodule adds a few mounts to the ceiling `[fs]` counts, so a superproject with many of them
 can reach it; the refusal says so. What no mount can hold is a repository that appears during
 the session: one the cage creates in a gitlink's directory, or adds to the index, is read by
-your next `git status` in the superproject.
+your next `git status` in the superproject. sbx names it once the cage has exited, as it names
+a `.git/commondir`, and so does an index the cage leaves in a form sbx cannot read in full,
+since the repositories it names can then not be listed.
 
 **What this does not close: the hooks a project already has run its code.** The protection
 closes the hooks git would run without a trace: an untracked script in the hooks directory, a

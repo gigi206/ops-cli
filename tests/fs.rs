@@ -1069,6 +1069,64 @@ fn what_appeared_in_the_projects_git_is_named_after_the_session() {
     );
 }
 
+/// A repository the cage makes in a directory and adds to the index during the session is a
+/// submodule no mount could hold at launch, so it is named once the cage has exited. Run under a
+/// network posture with no proxy, as the test above.
+#[test]
+fn a_submodule_repository_added_in_the_session_is_named_after_it() {
+    let (project, data, config) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "a submodule added in a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(root)
+            .output()
+    };
+    let Ok(init) = git(&["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    assert!(
+        git(&["commit", "-q", "--no-verify", "--allow-empty", "-m", "i"])
+            .unwrap()
+            .status
+            .success()
+    );
+    std::fs::create_dir_all(config.path().join("sbx")).unwrap();
+    std::fs::write(
+        config.path().join("sbx/sbx.toml"),
+        "[network]\nmode = \"none\"\n",
+    )
+    .unwrap();
+
+    let script = "git init -q emb \
+        && git -c user.name=t -c user.email=t@t -C emb commit -q --allow-empty -m e \
+        && git add emb 2>/dev/null && echo ADDED";
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(root)
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("ADDED"),
+        "the cage added the repository\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("emb/.git` is a submodule's repository that sbx did not protect"),
+        "it is named after the session\nstderr: {stderr}"
+    );
+}
+
 /// With `.git/config` read-only, git cannot record the upstream `push -u` sets, so the cage's git is
 /// told to push a branch to its namesake: a bare `git push` still publishes a new branch, and the
 /// repository's config is left as it was.

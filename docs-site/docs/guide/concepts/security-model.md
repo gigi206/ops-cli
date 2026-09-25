@@ -287,7 +287,7 @@ switching branches, fetching and pushing still work; what is refused is writing 
 way to any of these paths refuses the launch, since the cage could point it elsewhere, so the
 paths your git reads after the session are the protected ones. The exception is a repository
 that appears during the session, in a submodule's directory or added to the index, which no
-mount can hold. A project that needs
+mount can hold; sbx names it once the cage has exited. A project that needs
 those sets `[fs] git_writable = true` from a trusted layer, the one key of `[fs]` that opens
 rather than closes and therefore the one the trust gate decides.
 
