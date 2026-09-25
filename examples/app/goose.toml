@@ -74,6 +74,12 @@ allow = [
 ]
 
 [env]
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers), read by Goose's built-in "Top Of Mind" extension and added to every
+# turn, so a refused host or a read-only file reads as the sandbox rather than as a fault to work
+# around. It is added next to the project's `.goosehints`/`AGENTS.md` and next to a
+# `GOOSE_MOIM_MESSAGE_TEXT` of yours, never in place of them.
+GOOSE_MOIM_MESSAGE_FILE = "/opt/sbx/contract-summary.md"
 # Provider-neutral: disable the parts that have no business in a cage, regardless of provider.
 # No system keyring exists in the hermetic cage; tell Goose to read the key from the env (or its
 # config file) instead.
