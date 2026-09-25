@@ -37,6 +37,14 @@
 # `sbx test net <url>`).
 cmd = ["hermes"]
 
+# No `contract`: the channel Hermes offers from outside the project, the
+# `HERMES_EPHEMERAL_SYSTEM_PROMPT` environment variable, costs you your own addition. Set, it
+# replaces the `agent.system_prompt` of your `~/.hermes/config.yaml` (and the personality it
+# carries) without a word. Point Hermes at the cage's summary yourself instead, for instance with a
+# line in that `agent.system_prompt` such as "When the environment variable SBX_SANDBOX is 1, read
+# the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # AUDIO — Hermes has a first-class terminal voice mode (push-to-talk Ctrl+B: Whisper speech-to-text,
 # confirmation beeps, and text-to-speech that reads the reply). It captures and plays through
 # `sounddevice`/PortAudio → the ALSA API; Hermes explicitly supports running over a PulseAudio socket
