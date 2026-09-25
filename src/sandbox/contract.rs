@@ -832,11 +832,16 @@ fn counted(n: usize, one: &str, many: &str) -> String {
 
 /// The project files sbx protects by itself under a name it chose, relative to the project root.
 ///
-/// Only the literal names: a hooks directory `core.hooksPath` points at, and a file git includes,
-/// are protected too, but under a name the project's own git configuration supplies, so they are
-/// counted rather than named.
+/// Only the literal names: a hooks directory `core.hooksPath` points at, a file git includes, and a
+/// linked worktree's files are protected too, but under a name the project's own git configuration
+/// or whoever made the worktree supplies, so they are counted rather than named.
 fn fixed_protected_names() -> Vec<&'static str> {
-    let mut names = vec![crate::config::PROJECT_CONFIG, ".git/config", ".git/hooks"];
+    let mut names = vec![
+        crate::config::PROJECT_CONFIG,
+        ".git/config",
+        ".git/config.worktree",
+        ".git/hooks",
+    ];
     names.extend(crate::trust::MISE_CONFIG_NAMES.iter().copied());
     names
 }

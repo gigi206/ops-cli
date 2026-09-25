@@ -11,6 +11,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::diag::visible;
 use crate::{diag, help, style, trust};
 
 /// The config path an `sbx trust`/`untrust` invocation targets: the given path,
@@ -241,28 +242,6 @@ fn render_trust_review(
         }
         out.push_str(&format!("{n}--- {}{r}\n", visible(name)));
         out.push_str(&render_line_diff(&old, &new, pal));
-    }
-    out
-}
-
-/// A line of a reviewed file as the terminal is to show it.
-///
-/// The files under review sit in the project, which the cage writes, and one it created where none
-/// existed is shown whole. So a character that would move the cursor, erase a line, recolour the
-/// text or reorder it is written as an escape (`\x1b`, `\x0d`, `\u{202e}`): the reader sees that
-/// it is there instead of what it would do to the lines around it. A tab only moves forward, and is
-/// kept. The diff is taken on the lines as they are; only what is printed is escaped.
-fn visible(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    for c in line.chars() {
-        match c {
-            '\t' => out.push(c),
-            c if c.is_control() => out.push_str(&format!("\\x{:02x}", u32::from(c))),
-            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
-                out.push_str(&format!("\\u{{{:04x}}}", u32::from(c)));
-            }
-            c => out.push(c),
-        }
     }
     out
 }

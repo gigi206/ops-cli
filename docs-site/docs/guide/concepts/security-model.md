@@ -273,7 +273,11 @@ without any entry, as is the directory `core.hooksPath` names inside the project
 `.husky/_`): the directory, so a hook created halfway through the session is refused as
 well as one that was already there (and made empty at launch when it is absent, so the cage
 cannot create it), and the config, because `core.hooksPath`,
-`core.fsmonitor`, a filter or an alias names a program as surely as a hook does. Committing,
+`core.fsmonitor`, a filter or an alias names a program as surely as a hook does. The files
+git reads as configuration beside it are held the same way (`.git/config.worktree`, and a
+linked worktree's `config.worktree` and `commondir`), and a `.git/commondir` in the project's
+own repository, which would have git read its configuration from elsewhere, refuses the
+launch. Committing,
 switching branches, fetching and pushing still work; what is refused is writing the config
 (`remote add`, the upstream `push -u` records), installing a hook, and moving a repository into
 `.git` (`submodule absorbgitdirs`): `.git` itself is held in place, so the paths your git reads

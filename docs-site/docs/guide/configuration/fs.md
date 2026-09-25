@@ -137,6 +137,23 @@ names a project file that does not exist **refuses the launch**, naming the file
 could create it and git would read it, and sbx does not write a configuration file into your
 tree. Create it (empty is enough), remove the include, or set `git_writable`.
 
+The files git reads **beside** `.git/config` are configuration as well.
+`.git/config.worktree` is read-only whenever it is there. git reads it when `.git/config`
+sets `extensions.worktreeConfig` (git honors that setting from `.git/config` alone, not from
+your global config or an included file), and then an absent one refuses the launch the way a
+missing include does. Each linked worktree's own `config.worktree` and `commondir`, under
+`.git/worktrees/`, are read-only too, so `git worktree remove` and `git worktree prune` cannot
+delete, from inside the cage, a worktree that existed at launch: run them on the host. A
+symbolic link at any of these paths, or in place of `.git/worktrees`, refuses the launch,
+since the cage could point it elsewhere during the session.
+
+A **`.git/commondir`** in the project's own `.git` refuses the launch, naming it. git writes
+that file only for a linked worktree; in a main repository it makes your git read its
+configuration from the directory it names instead of `.git/config`. Nothing can hold its
+place while it is absent, since git refuses to run with an empty file or a directory there,
+so a cage could create one during a session and the next launch refuses on it. Check what it
+names and remove it.
+
 **What this does not close: the hooks a project already has run its code.** The protection
 closes the hooks git would run without a trace: an untracked script in the hooks directory, a
 configuration key that names a program. It cannot close the hooks a project already uses,

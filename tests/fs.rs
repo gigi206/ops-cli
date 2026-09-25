@@ -723,6 +723,99 @@ fn a_hook_cannot_be_planted_through_an_absent_hooks_dir_or_core_hooks_path() {
     );
 }
 
+/// The files git reads as configuration beside `.git/config` are read-only inside a real cage: the
+/// main `config.worktree`, and a linked worktree's `config.worktree` and `commondir`, whose
+/// directory also keeps its path. A `.git/commondir` in the project's own repository refuses the
+/// launch, naming it.
+#[test]
+fn the_worktree_configuration_files_are_read_only_and_a_main_commondir_refuses() {
+    let (project, data, linked) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "worktree configuration in a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(root)
+            .output()
+    };
+    let Ok(init) = git(&["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    for args in [
+        &["commit", "-q", "--no-verify", "--allow-empty", "-m", "i"][..],
+        &["config", "extensions.worktreeConfig", "true"],
+    ] {
+        assert!(git(args).unwrap().status.success(), "git {args:?}");
+    }
+    std::fs::write(root.join(".git/config.worktree"), "").unwrap();
+    let wt = linked.path().join("wt");
+    assert!(
+        git(&["worktree", "add", "-q", "--detach", wt.to_str().unwrap()])
+            .unwrap()
+            .status
+            .success()
+    );
+    let files = [
+        ".git/config.worktree",
+        ".git/worktrees/wt/config.worktree",
+        ".git/worktrees/wt/commondir",
+    ];
+    let before: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(root.join(f)).unwrap())
+        .collect();
+
+    let script = "for f in .git/config.worktree .git/worktrees/wt/config.worktree \
+          .git/worktrees/wt/commondir; do \
+          (echo x >> $f) 2>/dev/null && echo WROTE-$f || echo REFUSED-$f; \
+        done; \
+        if mv .git/worktrees/wt .git/worktrees/moved 2>/dev/null; then \
+          echo MOVED-wt; mv .git/worktrees/moved .git/worktrees/wt; \
+        else echo HELD-wt; fi";
+    let run = |args: &[&str]| {
+        sbx_isolated()
+            .args(args)
+            .current_dir(root)
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run sbx")
+    };
+    let out = run(&["run", "--", "sh", "-c", script]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for f in files {
+        assert!(
+            stdout.contains(&format!("REFUSED-{f}")),
+            "{f}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assert!(
+        stdout.contains("HELD-wt"),
+        "the worktree's directory keeps its path\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for (f, was) in files.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read(root.join(f)).unwrap(),
+            was,
+            "{f} on the host"
+        );
+    }
+
+    std::fs::write(root.join(".git/commondir"), "../..\n").unwrap();
+    let out = run(&["run", "--", "true"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains(".git/commondir"),
+        "a main commondir refuses the launch, naming it\nstderr: {stderr}"
+    );
+}
+
 /// With `.git/config` read-only, git cannot record the upstream `push -u` sets, so the cage's git is
 /// told to push a branch to its namesake: a bare `git push` still publishes a new branch, and the
 /// repository's config is left as it was.

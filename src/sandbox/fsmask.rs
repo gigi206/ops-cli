@@ -52,6 +52,7 @@
 use super::binds::ExtraBind;
 use super::spec::Mount;
 use crate::config::fspolicy::{FsPolicy, has_wildcard, matches_component};
+use crate::diag::visible;
 use std::collections::BTreeSet;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -250,14 +251,30 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         &mut out.warnings,
         &mut out.refused,
     );
-    let hooks = git_hook_dirs(
-        &root,
-        policy.git_writable(),
-        &mut out.warnings,
-        &mut out.refused,
-    );
-    let includes = git_include_files(&root, policy.git_writable(), &mut out.refused);
-    for mut m in builtin.into_iter().chain(hooks).chain(includes) {
+    // Every question below is asked of the host's git, and a `.git/commondir` would have it answer
+    // from another directory: refused first, and nothing is asked.
+    let (hooks, includes, worktree) = match git_commondir_refusal(&root, policy.git_writable()) {
+        Some(reason) => {
+            out.refused.get_or_insert(reason);
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+        None => (
+            git_hook_dirs(
+                &root,
+                policy.git_writable(),
+                &mut out.warnings,
+                &mut out.refused,
+            ),
+            git_include_files(&root, policy.git_writable(), &mut out.refused),
+            git_worktree_files(&root, policy.git_writable(), &mut out.refused),
+        ),
+    };
+    for mut m in builtin
+        .into_iter()
+        .chain(hooks)
+        .chain(includes)
+        .chain(worktree)
+    {
         m.builtin = true;
         let covered = out
             .denied
@@ -398,7 +415,9 @@ const BUILTIN_READONLY: &str = "readonly (built-in)";
 /// cage. The directory is named, so a hook created mid-session is refused too. What it costs is
 /// what writes the config: `remote add`, `config user.*`, and the upstream `push -u` records
 /// (the push itself succeeds); and, `.git` being held in place above them ([`holding_dirs`]),
-/// `submodule absorbgitdirs`, which moves a repository into it. `git_writable` lifts both: the one
+/// `submodule absorbgitdirs`, which moves a repository into it. The files git reads as
+/// configuration beside `.git/config` are added by [`git_worktree_files`], and a `.git/commondir`
+/// refuses the launch ([`git_commondir_refusal`]). `git_writable` lifts all of it: the one
 /// opening in `[fs]`, and why it is honored only from a trusted layer. A `.git` that is a file (a
 /// linked worktree, a submodule) points at a directory outside the project, which the cage does
 /// not hold; nothing is added.
@@ -651,6 +670,221 @@ fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<Strin
         }
     }
     masks
+}
+
+/// The refusal a `.git/commondir` in the project's own repository earns, or `None` when there is
+/// none or the git carrier is not protected.
+///
+/// git writes `commondir` only in a linked worktree's directory under `.git/worktrees/`, never in a
+/// main repository's `.git`. Where one is present, the configuration the host's git reads comes
+/// from the directory it names rather than from `.git/config`, so the protection of `.git/config`
+/// would protect a file git no longer reads, and every question [`host_git_config`] asks would be
+/// answered from there too. It is therefore checked before any of them and refuses the launch,
+/// whatever its shape: a file the launch cannot look at is refused the same way.
+///
+/// An absent one cannot be protected: no mount can hold a path that does not exist, and nothing can
+/// stand in its place, since git refuses to run on an empty file or a directory there. The cage can
+/// therefore create one during a session, and the next launch refuses on it.
+fn git_commondir_refusal(root: &Path, git_writable: bool) -> Option<String> {
+    if !git_protected(root, git_writable) {
+        return None;
+    }
+    let path = root.join(".git/commondir");
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!(
+            "`.git/commondir`: {}",
+            visible(&unreadable_refusal("look at", &path, &e))
+        )),
+        Ok(_) => Some(format!(
+            "`{}` is present: git writes this file only for a linked worktree, and in the \
+             project's own `.git` it makes your git read its configuration from the directory it \
+             names instead of `.git/config`, which sbx protects. Check what it names and remove \
+             it, or set `[fs] git_writable = true` from a trusted layer, then launch again",
+            path.display()
+        )),
+    }
+}
+
+/// The files beside `.git/config` that the host's git also reads as configuration, as read-only
+/// masks: `.git/config.worktree`, and for each linked worktree under `.git/worktrees/`, its own
+/// `config.worktree` and the `commondir` that names the repository its configuration comes from.
+///
+/// A `config.worktree` is configuration when the repository's own `.git/config` turns
+/// `extensions.worktreeConfig` on, which is where git honors that setting and nowhere else (not
+/// from the global config, not from an included file); `.git/config` is read-only in the cage, so
+/// the cage cannot turn it on. With it on, an absent `config.worktree` refuses the launch, naming
+/// the file, for the reason an absent included file does. With it off, a present one is protected
+/// all the same, at no cost, and an absent one is not read.
+///
+/// **Links refuse the launch.** git never makes these as links, and a link is a name the cage can
+/// point elsewhere during the session while the mask holds the file it pointed to at launch. The
+/// same goes for `.git/worktrees` and for a worktree's own directory.
+///
+/// A worktree's name is chosen by whoever created it, the cage included, so the entries are built
+/// here rather than passed through [`resolve_list`] as patterns, and the listing stops past
+/// [`MASK_MAX`]: more worktrees than masks can hold refuses the launch rather than reading on. What
+/// holding these costs is `git worktree remove` and `prune` of a worktree that existed at launch,
+/// which cannot delete its directory from the cage.
+fn git_worktree_files(
+    root: &Path,
+    git_writable: bool,
+    refused: &mut Option<String>,
+) -> Vec<Masked> {
+    if !git_protected(root, git_writable) {
+        return Vec::new();
+    }
+    let extension = host_git_config(
+        root,
+        &[
+            "--local",
+            "--type=bool",
+            "--get",
+            "extensions.worktreeConfig",
+        ],
+    )
+    .is_some_and(|out| out.trim_ascii() == b"true");
+    let mut out: Vec<Masked> = Vec::new();
+    let git = root.join(".git");
+    worktree_file(
+        root,
+        &git.join("config.worktree"),
+        extension,
+        refused,
+        &mut out,
+    );
+
+    let worktrees = git.join("worktrees");
+    let listing = match std::fs::symlink_metadata(&worktrees) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            refused.get_or_insert_with(|| visible(&unreadable_refusal("look at", &worktrees, &e)));
+            return out;
+        }
+        Ok(meta) if meta.file_type().is_symlink() => {
+            refused.get_or_insert_with(|| git_link_refusal(&worktrees));
+            return out;
+        }
+        Ok(meta) if !meta.is_dir() => return out,
+        Ok(_) => std::fs::read_dir(&worktrees),
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    match listing {
+        Ok(entries) => {
+            for entry in entries.take(MASK_MAX + 1) {
+                match entry {
+                    Ok(entry) => dirs.push(entry.path()),
+                    Err(e) => {
+                        refused.get_or_insert_with(|| {
+                            visible(&unreadable_refusal("list", &worktrees, &e))
+                        });
+                        return out;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            refused.get_or_insert_with(|| visible(&unreadable_refusal("list", &worktrees, &e)));
+            return out;
+        }
+    }
+    if dirs.len() > MASK_MAX {
+        refused.get_or_insert_with(|| {
+            visible(&format!(
+                "`{}` holds more than {MASK_MAX} entries, more linked worktrees than a launch can \
+                 protect: remove the ones you no longer use (`git worktree prune`), or set `[fs] \
+                 git_writable = true` from a trusted layer, then launch again",
+                worktrees.display()
+            ))
+        });
+        return out;
+    }
+    dirs.sort();
+    for dir in dirs {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                refused.get_or_insert_with(|| git_link_refusal(&dir));
+            }
+            Ok(meta) if meta.is_dir() => {
+                worktree_file(
+                    root,
+                    &dir.join("config.worktree"),
+                    extension,
+                    refused,
+                    &mut out,
+                );
+                worktree_file(root, &dir.join("commondir"), false, refused, &mut out);
+            }
+            // Not a worktree: git reads nothing from a file here.
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                refused.get_or_insert_with(|| visible(&unreadable_refusal("look at", &dir, &e)));
+            }
+        }
+    }
+    out
+}
+
+/// Protect one of the files [`git_worktree_files`] names, adding it to `out` when it is there. The
+/// flag `required` is whether git reads it as configuration when present, which makes an absent one
+/// a refusal: the cage could create it and git would read it.
+fn worktree_file(
+    root: &Path,
+    path: &Path,
+    required: bool,
+    refused: &mut Option<String>,
+    out: &mut Vec<Masked>,
+) {
+    let rel = visible(
+        &path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string(),
+    );
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if required {
+                refused.get_or_insert_with(|| {
+                    visible(&format!(
+                        "git reads `{}` as configuration (`extensions.worktreeConfig` is on in \
+                         `.git/config`), and it does not exist: the cage could create it and your \
+                         git would read it. Create it (empty is enough), or set `[fs] \
+                         git_writable = true` from a trusted layer, then launch again",
+                        path.display()
+                    ))
+                });
+            }
+        }
+        Err(e) => {
+            refused.get_or_insert_with(|| visible(&unreadable_refusal("look at", path, &e)));
+        }
+        Ok(meta) if meta.file_type().is_symlink() => {
+            refused.get_or_insert_with(|| git_link_refusal(path));
+        }
+        Ok(_) => match admit(root, path, &rel, false) {
+            Ok(Some(mut masked)) => {
+                masked.builtin = true;
+                out.push(masked);
+            }
+            Ok(None) => {}
+            Err(NotMasked::Warn(reason) | NotMasked::Refuse(reason)) => {
+                refused.get_or_insert_with(|| format!("`{rel}`: {}", visible(&reason)));
+            }
+        },
+    }
+}
+
+/// The refusal a link among the git files [`git_worktree_files`] protects earns, with the path
+/// escaped for the terminal: a worktree's name is whoever created it's to spell, the cage included.
+fn git_link_refusal(path: &Path) -> String {
+    visible(&format!(
+        "`{}` is a symbolic link: git reads through it as configuration, and the cage could point \
+         it elsewhere during the session. Replace it with what it names, or set `[fs] git_writable \
+         = true` from a trusted layer, then launch again",
+        path.display()
+    ))
 }
 
 /// Create, empty, each built-in directory mask whose directory is absent, so its bind has
@@ -1889,6 +2123,232 @@ mod tests {
             expand(&root, &lifted).refused.is_none(),
             "git_writable lifts it"
         );
+    }
+
+    /// A project with a git repository made by the host's own git and one commit, or `None` where
+    /// there is no git to make it. The identity is passed on the command line and hooks are not
+    /// run, so the developer's own configuration writes nothing into the fixture.
+    fn git_project(tmp: &TmpDir) -> Option<(PathBuf, impl Fn(&[&str]) -> bool)> {
+        let root = project(tmp);
+        let dir = root.clone();
+        let git = move |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return None;
+        }
+        assert!(git(&[
+            "commit",
+            "-q",
+            "--no-verify",
+            "--allow-empty",
+            "-m",
+            "i"
+        ]));
+        Some((root.canonicalize().unwrap(), git))
+    }
+
+    /// A `.git/commondir` in the project's own repository refuses the launch, and before the host's
+    /// git is asked anything: here the directory it names carries a `core.hooksPath` into the
+    /// project, and no mask for that directory may come of it.
+    #[test]
+    fn a_commondir_in_the_main_repository_refuses_before_git_is_asked() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping commondir refusal: no git on this host");
+            return;
+        };
+        // A repository git accepts as the common directory, or it would answer nothing at all and
+        // the assertion below would hold whatever the order.
+        assert!(git(&["init", "-q", "--bare", "other.git"]));
+        assert!(git(&[
+            "--git-dir",
+            "other.git",
+            "config",
+            "core.hooksPath",
+            "named-hooks"
+        ]));
+        std::fs::create_dir_all(root.join("named-hooks")).unwrap();
+        std::fs::write(root.join(".git/commondir"), "../other.git\n").unwrap();
+
+        let e = expand(&root, &FsPolicy::default());
+        let why = e.refused.as_deref().expect("a main commondir refuses");
+        assert!(
+            why.contains(".git/commondir") && why.contains("git_writable"),
+            "{why}"
+        );
+        assert!(
+            !e.readonly
+                .iter()
+                .any(|m| m.path == root.join("named-hooks")),
+            "nothing was asked of git: {:?}",
+            e.readonly
+        );
+
+        // Whatever its shape.
+        std::fs::remove_file(root.join(".git/commondir")).unwrap();
+        std::fs::create_dir(root.join(".git/commondir")).unwrap();
+        assert!(expand(&root, &FsPolicy::default()).refused.is_some());
+
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        assert!(
+            expand(&root, &lifted).refused.is_none(),
+            "git_writable lifts it"
+        );
+    }
+
+    /// `.git/config.worktree` is read-only when present. When `.git/config` turns
+    /// `extensions.worktreeConfig` on, git reads it, so an absent one refuses the launch; the
+    /// setting in an included file is not honored by git, and does not refuse.
+    #[test]
+    fn a_config_worktree_is_read_only_and_an_absent_one_refuses_when_git_reads_it() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping config.worktree protection: no git on this host");
+            return;
+        };
+        let worktree_config = root.join(".git/config.worktree");
+        let protected = |e: &Expanded| e.readonly.iter().any(|m| m.path == worktree_config);
+
+        let e = expand(&root, &FsPolicy::default());
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert!(!protected(&e), "absent and not read: nothing to hold");
+
+        std::fs::write(&worktree_config, "").unwrap();
+        let e = expand(&root, &FsPolicy::default());
+        assert!(protected(&e), "present: read-only whatever the setting");
+
+        std::fs::remove_file(&worktree_config).unwrap();
+        std::fs::write(
+            root.join("inc.cfg"),
+            "[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        assert!(git(&["config", "include.path", "../inc.cfg"]));
+        assert!(
+            expand(&root, &FsPolicy::default()).refused.is_none(),
+            "git honors the setting from `.git/config` only"
+        );
+
+        assert!(git(&["config", "extensions.worktreeConfig", "true"]));
+        let e = expand(&root, &FsPolicy::default());
+        let why = e.refused.as_deref().expect("read by git and absent");
+        assert!(
+            why.contains("config.worktree") && why.contains("git_writable"),
+            "{why}"
+        );
+        assert!(!worktree_config.exists(), "nothing is created");
+    }
+
+    /// Each linked worktree's `commondir` and `config.worktree` are read-only, whatever its name,
+    /// and the directories above them are held in place.
+    #[test]
+    fn each_linked_worktrees_configuration_files_are_read_only() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping linked worktree protection: no git on this host");
+            return;
+        };
+        assert!(git(&["config", "extensions.worktreeConfig", "true"]));
+        std::fs::write(root.join(".git/config.worktree"), "").unwrap();
+        let linked = tmp.path().join("linked");
+        assert!(git(&[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap()
+        ]));
+        // git turns such a name into `w-t` for a worktree it makes; one made by hand keeps it.
+        let odd = root.join(".git/worktrees/w*t");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("commondir"), "../..\n").unwrap();
+        std::fs::write(odd.join("config.worktree"), "").unwrap();
+
+        let e = expand(&root, &FsPolicy::default());
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        let files: Vec<&Path> = e
+            .readonly
+            .iter()
+            .filter(|m| m.builtin)
+            .map(|m| m.path.as_path())
+            .collect();
+        for worktree in ["linked", "w*t"] {
+            for name in ["commondir", "config.worktree"] {
+                let path = root.join(".git/worktrees").join(worktree).join(name);
+                assert!(
+                    files.contains(&path.as_path()),
+                    "{worktree}/{name}: {files:?}"
+                );
+            }
+            assert!(
+                e.pins.contains(&root.join(".git/worktrees").join(worktree)),
+                "{:?}",
+                e.pins
+            );
+        }
+    }
+
+    /// A link among these files, or in place of `.git/worktrees`, refuses the launch: the cage
+    /// could point it elsewhere while the mask holds what it pointed to. A name the cage chose is
+    /// escaped in the refusal rather than written to the terminal as it is.
+    #[test]
+    fn a_link_among_the_worktree_configuration_files_refuses_and_is_shown_escaped() {
+        let tmp = TmpDir::new();
+        let Some((root, _git)) = git_project(&tmp) else {
+            skip_incapable!("skipping worktree link refusal: no git on this host");
+            return;
+        };
+        std::fs::write(root.join("real.cfg"), "").unwrap();
+        std::os::unix::fs::symlink("../real.cfg", root.join(".git/config.worktree")).unwrap();
+        let why = expand(&root, &FsPolicy::default())
+            .refused
+            .expect("a link refuses");
+        assert!(why.contains("symbolic link"), "{why}");
+        std::fs::remove_file(root.join(".git/config.worktree")).unwrap();
+
+        let named = root.join(".git/worktrees/a\u{1b}[2Jb");
+        std::fs::create_dir_all(&named).unwrap();
+        std::os::unix::fs::symlink("/elsewhere", named.join("commondir")).unwrap();
+        let why = expand(&root, &FsPolicy::default())
+            .refused
+            .expect("a link refuses");
+        assert!(
+            !why.contains('\u{1b}') && why.contains("\\x1b"),
+            "the name is escaped: {why:?}"
+        );
+        std::fs::remove_dir_all(root.join(".git/worktrees")).unwrap();
+
+        std::os::unix::fs::symlink(tmp.path(), root.join(".git/worktrees")).unwrap();
+        let why = expand(&root, &FsPolicy::default())
+            .refused
+            .expect("a linked worktrees directory refuses");
+        assert!(why.contains("symbolic link"), "{why}");
+    }
+
+    /// More worktree entries than masks can hold refuse the launch rather than being read on.
+    #[test]
+    fn more_worktrees_than_masks_can_hold_refuse_the_launch() {
+        let tmp = TmpDir::new();
+        let Some((root, _git)) = git_project(&tmp) else {
+            skip_incapable!("skipping worktree ceiling: no git on this host");
+            return;
+        };
+        for i in 0..=MASK_MAX {
+            std::fs::create_dir_all(root.join(format!(".git/worktrees/w{i}"))).unwrap();
+        }
+        let why = expand(&root, &FsPolicy::default())
+            .refused
+            .expect("past the ceiling");
+        assert!(why.contains("more than"), "{why}");
     }
 
     /// A `.git` that is a file points at a directory outside the project, which the cage does not

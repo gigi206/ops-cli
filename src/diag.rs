@@ -7,6 +7,29 @@
 use crate::style::Palette;
 use std::io::IsTerminal;
 
+/// Text sbx did not choose, as a terminal is to show it: a line of a file under review in the
+/// project, or a name the cage gave to something sbx reports.
+///
+/// A character that would move the cursor, erase a line, recolour the text or reorder it is written
+/// as an escape (`\x1b`, `\x0d`, `\u{202e}`): the reader sees that it is there instead of what it
+/// would do to the lines around it. A tab only moves forward, and is kept. Nothing is cut, unlike
+/// [`crate::sandbox::sanitize`], so a message that names a path still ends with what to do about
+/// it. Only what is printed is escaped; the text is compared and acted on as it is.
+pub(crate) fn visible(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\t' => out.push(c),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", u32::from(c))),
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                out.push_str(&format!("\\u{{{:04x}}}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Print `sbx: warning: <msg>` to stderr — the prefix in the caution hue, the message's
 /// `` `identifiers` `` in the identifier hue, when stderr is a terminal. The message must be the
 /// bare text (no `sbx: warning:` prefix — this adds it), so a slip cannot double the prefix.
