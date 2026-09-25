@@ -74,6 +74,10 @@ With no command, `sbx run` opens the project shell:
 - A **piped/non-tty** stdin, or `--detach`, keeps inherited stdio and propagates the
   exit status: the shape you want for scripts and CI.
 
+Either way, only the three standard streams come from what started `sbx`. Any other
+descriptor it was started with (a shell's `exec 9<file`, a build tool's pipe) is closed
+before the launch, so it never reaches the cage, and a detached session holds none of them.
+
 ### Observing a run (`--observe`)
 
 `--observe` records what the command does inside the cage: so you see the agent work as it works.

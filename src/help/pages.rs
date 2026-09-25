@@ -178,7 +178,8 @@ pub(super) const PAGES: &[Page] = &[
             host filesystem are absent — confidentiality by absence); on a pipe, a\n\
             non-interactive shell reading its script from stdin. An interactive command (a real\n\
             terminal on stdin, not `--detach`) runs under a private controlling terminal too, so\n\
-            a TUI gets job control; a non-tty or detached launch keeps inherited stdio.\n\n\
+            a TUI gets job control; a non-tty or detached launch keeps inherited stdio. No other\n\
+            descriptor sbx was started with reaches the cage: it closes them before the launch.\n\n\
             One-shot overrides let you change any configuration field for a single launch without\n\
             editing a file. The whole-schema `--config` takes inline TOML (or `@<file>`) shaped\n\
             exactly like an `sbx.toml`, so it can set any field; the typed flags\n\

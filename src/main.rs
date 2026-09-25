@@ -82,6 +82,12 @@ fn main() -> ExitCode {
     // arguments, and panicking on them would be wrong.
     let mut args = std::env::args_os().skip(1);
     let cmd = args.next();
+    if !cmd
+        .as_deref()
+        .is_some_and(|c| c.as_encoded_bytes().starts_with(b"__"))
+    {
+        close_inherited_descriptors();
+    }
     let rest: Vec<OsString> = args.collect();
     let name = match cmd.as_deref().and_then(|s| s.to_str()) {
         // No command at all is a usage error; an explicit help request is not. Both render
@@ -111,6 +117,52 @@ fn main() -> ExitCode {
     }
 
     cli::dispatch(name, rest)
+}
+
+/// Close every descriptor this process was started with past the standard three, before it opens
+/// one of its own.
+///
+/// A descriptor the invoker leaves open without `FD_CLOEXEC` (a shell's `exec 9<file`, a build
+/// tool's jobserver pipe, whatever the parent of `sbx` held) would otherwise cross every `exec`
+/// this process makes, bubblewrap's included, and reach the cage: the agent would hold a host file
+/// or socket no configuration named. They are closed rather than marked close-on-exec because the
+/// detached daemon forks without an `exec`, and would otherwise keep a pipe of its invoker open for
+/// the session's whole life.
+///
+/// The internal verbs keep theirs. sbx starts each of them itself, from a process that has already
+/// done this, and hands it the descriptors its arguments name: `__netns-holder` passes them on to
+/// the cage's bubblewrap, `__proxy` serves the link it is given.
+fn close_inherited_descriptors() {
+    // SAFETY: `close_range` takes no pointer, and nothing this process owns is open past the
+    // standard three yet.
+    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } == 0 {
+        return;
+    }
+    // A kernel older than 5.9, or a filter that refuses the call: one at a time, the ones the
+    // kernel lists, or every number below the limit when it cannot list them.
+    let open: Vec<libc::c_int> = match std::fs::read_dir("/proc/self/fd") {
+        Ok(dir) => dir
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|&fd| fd > 2)
+            .collect(),
+        Err(_) => {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `getrlimit` writes the one `rlimit` it is handed.
+            let top = match unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } {
+                0 => limit.rlim_cur.min(1 << 20),
+                _ => 1 << 20,
+            };
+            (3..top as libc::c_int).collect()
+        }
+    };
+    for fd in open {
+        // SAFETY: none of these numbers is one this process opened: the listing's own descriptor
+        // is closed by now, and a number that is not open answers `EBADF`.
+        unsafe { libc::close(fd) };
+    }
 }
 
 /// The canonical project root the command is standing in, resolved the way a launch resolves its own

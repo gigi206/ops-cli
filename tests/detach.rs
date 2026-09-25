@@ -329,3 +329,89 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
         "the exec-path cage was orphaned after stop"
     );
 }
+
+/// A detached session keeps no descriptor its invoker left open. The daemon forks without an
+/// `exec`, so a descriptor only marked close-on-exec would stay open in it for the session's whole
+/// life; here the write end of a pipe, handed over as descriptor 9, reads its end once the launch
+/// has returned, while the session runs on.
+#[test]
+fn a_detached_session_keeps_no_descriptor_of_its_invoker() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+
+    let project = TmpDir::prefixed("d", "proj");
+    let data = TmpDir::prefixed("d", "data");
+    let state = TmpDir::prefixed("d", "state");
+    probe_or_skip!(
+        "detached inherited descriptor e2e",
+        sandbox_probe(project.path(), data.path(), state.path())
+    );
+    let mut cleanup = Cleanup {
+        data: data.path().to_path_buf(),
+        state: state.path().to_path_buf(),
+        project: project.path().to_path_buf(),
+        pids: Vec::new(),
+        fingerprints: vec!["31353"],
+    };
+
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe2` fills the two-element array it is handed.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both ends are fresh descriptors this test owns and closes once, through these.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let from = write.as_raw_fd();
+    // A one-shot allowlist takes the supervised path, where the daemon lives on as a process of
+    // its own rather than becoming bubblewrap, whose `exec` would close the descriptor anyway.
+    let mut cmd = sbx();
+    cmd.args(["run", "--detach", "--net", "allow=example.com", "--"])
+        .args(["sleep", "31353"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .stdin(Stdio::null());
+    // SAFETY: `dup2` is async-signal-safe and allocates nothing. The copy it makes is descriptor 9
+    // of the child, without close-on-exec.
+    unsafe {
+        cmd.pre_exec(move || match libc::dup2(from, 9) {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    let started = cmd.output().expect("run sbx");
+    drop(write);
+    assert!(
+        started.status.success(),
+        "sbx run --detach must exit 0: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let pid = parse_detach_pid(&started.stderr).unwrap_or_else(|| {
+        panic!(
+            "could not parse the detached session id from: {}",
+            String::from_utf8_lossy(&started.stderr)
+        )
+    });
+    cleanup.pids.push(pid);
+    assert!(
+        egress_socket_exists(data.path()),
+        "expected a per-session egress socket: the launch did not take the supervised path"
+    );
+    assert!(
+        wait_until(Instant::now() + Duration::from_secs(30), || {
+            process_with_arg("31353")
+        }),
+        "the detached agent never appeared"
+    );
+
+    let mut pfd = libc::pollfd {
+        fd: read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one `pollfd`, over a descriptor this test owns.
+    let ready = unsafe { libc::poll(&mut pfd, 1, 5_000) };
+    assert!(
+        ready == 1 && pfd.revents & libc::POLLHUP != 0,
+        "the running session still holds the invoker's descriptor 9 (poll {ready}, revents {:#x})",
+        pfd.revents
+    );
+}

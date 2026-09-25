@@ -27,6 +27,11 @@ default; only what a *trusted* config explicitly binds appears.
 This is why `sbx` is not a container manager: there is no separate identity to lean
 on. The mount set *is* the boundary.
 
+An open file reaches past the mount set, so absence covers the descriptors `sbx` is started
+with too. One its parent left open without close-on-exec (a shell's `exec 9<file`, a build
+tool's pipe) would otherwise carry a host file or socket into the cage, so `sbx` closes every
+one of them except standard input, output and error before it builds anything.
+
 The same reasoning runs inward. The project tree is mounted, so everything in it is
 readable, including the `.env` or the private key that lives beside the code. Moving those
 files out is the answer that matches the model exactly (absent beats unreadable); when they

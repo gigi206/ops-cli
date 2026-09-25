@@ -198,6 +198,53 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
     );
 }
 
+/// The cage holds the standard three descriptors and nothing else `sbx` was started with: one its
+/// invoker left open without close-on-exec, a host file here, is closed before anything is built.
+#[test]
+fn a_descriptor_the_invoker_leaves_open_does_not_reach_the_cage() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let project = TmpDir::prefixed("r", "proj");
+    let data = TmpDir::prefixed("r", "data");
+    probe_or_skip!(
+        "inherited descriptor e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+
+    let marker = data.path().join("held-by-the-invoker");
+    std::fs::write(&marker, b"x").unwrap();
+    let held = std::fs::File::open(&marker).unwrap();
+    let from = held.as_raw_fd();
+    let mut cmd = sbx();
+    cmd.args(["run", "--", "ls", "-l", "/proc/self/fd"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path());
+    // SAFETY: `dup2` is async-signal-safe and allocates nothing. The copy it makes is descriptor 9
+    // of the child, without close-on-exec, as a shell's `exec 9<file` leaves it.
+    unsafe {
+        cmd.pre_exec(move || match libc::dup2(from, 9) {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    let out = cmd.output().expect("spawn sbx run");
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{listing}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Each entry reads `<fd> -> <target>`; the lister's own is the directory it reads.
+    let open: Vec<&str> = listing
+        .lines()
+        .filter_map(|l| l.split_once(" -> "))
+        .filter(|(_, target)| !target.ends_with("/fd"))
+        .filter_map(|(left, _)| left.split_whitespace().last())
+        .collect();
+    assert_eq!(open, ["0", "1", "2"], "{listing}");
+}
+
 #[test]
 fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
     // A hermetic cage carries no `/etc/hosts`, so the *name* `localhost` would fall through to
