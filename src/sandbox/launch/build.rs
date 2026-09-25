@@ -2915,6 +2915,7 @@ pub(super) fn build(
         // once, in the predicate, rather than read from a spec that does not exist yet.
         false,
         prep.cfg.gui.renders(),
+        &prep.bwrap,
         proxy_host_uds.as_deref(),
         proxy_report_uds.as_deref(),
     );
@@ -3113,6 +3114,7 @@ pub(super) fn holder_plan(
     net: NetPolicy,
     as_root: bool,
     gui_renders: bool,
+    bwrap: &std::path::Path,
     proxy_host_uds: Option<&std::path::Path>,
     proxy_report_uds: Option<&std::path::Path>,
 ) -> Option<crate::sandbox::spec::NetnsDummy> {
@@ -3125,6 +3127,7 @@ pub(super) fn holder_plan(
         // documented degradation to the environment-variable path.
         crate::store::find_trusted_on_path("nft").map(|nft| crate::sandbox::spec::TapWiring {
             uds: uds.to_path_buf(),
+            bwrap: bwrap.to_path_buf(),
             nft,
             report: proxy_report_uds.map(std::path::Path::to_path_buf),
         })

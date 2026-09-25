@@ -35,14 +35,18 @@
 //!
 //! ## Where it runs, and what that costs
 //!
-//! The tap is forked by the netns holder ([`super::netns`]) **before** it execs `bwrap`, so it
-//! lives in the cage's network namespace but keeps the host's mount and pid namespaces: the cage
-//! cannot see it, signal it, or reach its files, and it dials the host-side egress socket by its
-//! real path. It has no route of its own either — the namespace is the same empty one — so the
+//! The tap is started by the netns holder ([`super::netns`]) **before** it execs `bwrap`, so it
+//! lives in the cage's network namespace, and in a cage of its own for everything else: mount and
+//! pid namespaces of its own, with no host file but the read-only userland, its binary and the two
+//! sockets it dials (the egress socket, which the cage reaches as well, and the report socket,
+//! which answers its reports and nothing else); no capability; and a syscall filter it installs
+//! once its listeners are bound ([`crate::sandbox::seccomp::tap`]). The cage cannot see it or
+//! signal it. It has no route of its own either — the namespace is the same empty one — so the
 //! only way out remains the bound Unix socket, exactly as before.
 //!
 //! What is new is the surface: a DNS parser, inside the cage's namespace, reading bytes the
-//! workload writes. Three invariants hold it, and every one of them is load-bearing:
+//! workload writes. The tap's cage and filter bound what a flaw in it would reach. Three invariants
+//! keep the flaw out, and every one of them is load-bearing:
 //!
 //! - **Never resolve.** The tap must not call `getaddrinfo` (nor anything that does, such as
 //!   `ToSocketAddrs` on a `host:port` string): its own lookups would be redirected to its own DNS
@@ -154,7 +158,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// `SO_ORIGINAL_DST`, from `<linux/netfilter_ipv4.h>`. Not exposed by `libc` on every target, and a
 /// frozen kernel ABI, so it is spelled out here for the same reason the netlink constants are in
 /// [`super::netns`].
-const SO_ORIGINAL_DST: libc::c_int = 80;
+pub(crate) const SO_ORIGINAL_DST: libc::c_int = 80;
 
 /// The `resolv.conf` the cage is given when the tap is wired: one nameserver, [`CAGE_RESOLVER`],
 /// which the redirect rule catches whatever the client sends to it.
@@ -868,26 +872,42 @@ pub(crate) fn serve_capture(
     Capture::Proxied { host, port }
 }
 
-/// The `__net-tap` subcommand body. `argv` is `[<egress socket path>]`; the ports are the fixed
-/// constants above, because the redirect rule that feeds them is built from the same ones.
+/// The `__net-tap` subcommand body. `argv` is `[<egress socket path>]`, then `--report <socket>`;
+/// the ports are the fixed constants above, because the redirect rule that feeds them is built from
+/// the same ones.
+///
+/// In this order, and the order is the confinement: the three listeners are bound, which the tap's
+/// filter would refuse; the filter goes on ([`crate::sandbox::seccomp::tap`]); only then does the
+/// tap say it serves, start a thread, or read a byte of the cage's. A tap whose filter does not
+/// install exits before it says so, and the holder carries on without capture: a tap serving
+/// without its filter is not one of the outcomes.
 ///
 /// Never returns: it serves until the cage exits, at which point the parent-death signal set by the
-/// holder takes it down with `bwrap`.
+/// holder takes it down with its cage.
 pub(crate) fn run_tap(argv: &[OsString]) -> ! {
     let Some((uds, report)) = parse_tap_args(argv) else {
         eprintln!("__net-tap: usage: __net-tap <egress socket> [--report <socket>]");
         std::process::exit(2);
     };
+    let listeners = Listeners::bind().unwrap_or_else(|e| stop(&e));
+    if let Err(e) = crate::sandbox::seccomp::tap::confine() {
+        stop(&e);
+    }
+    // Every listener is bound; the holder may now install the rules that point at them.
+    println!("{READY}");
+    if let Err(e) = io::stdout().flush() {
+        stop(&e);
+    }
     let table = Arc::new(Mutex::new(FakeIps::new()));
     let reporter = Arc::new(Reporter::new(report));
+    serve(listeners, &uds, &table, &reporter);
+    std::process::exit(0)
+}
 
-    match serve(&uds, &table, &reporter) {
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            eprintln!("__net-tap: {e}");
-            std::process::exit(1);
-        }
-    }
+/// End the tap on `e`, which it says.
+fn stop(e: &io::Error) -> ! {
+    eprintln!("__net-tap: {e}");
+    std::process::exit(1)
 }
 
 /// The tap's own arguments: the egress socket, then optional flags.
@@ -910,16 +930,30 @@ fn parse_tap_args(argv: &[OsString]) -> Option<(PathBuf, Option<PathBuf>)> {
     Some((uds, report))
 }
 
-/// Bind the three listeners and serve them until the process is taken down.
-fn serve(uds: &Path, table: &Arc<Mutex<FakeIps>>, reporter: &Arc<Reporter>) -> io::Result<()> {
-    let dns_udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, TAP_DNS_PORT))?;
-    let dns_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, TAP_DNS_PORT))?;
-    let captured = TcpListener::bind((Ipv4Addr::LOCALHOST, TAP_PORT))?;
+/// The tap's three listeners, bound before its filter goes on.
+struct Listeners {
+    dns_udp: std::net::UdpSocket,
+    dns_tcp: TcpListener,
+    captured: TcpListener,
+}
 
-    // Every listener is bound; the holder may now install the rules that point at them.
-    println!("{READY}");
-    io::stdout().flush()?;
+impl Listeners {
+    fn bind() -> io::Result<Self> {
+        Ok(Self {
+            dns_udp: std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, TAP_DNS_PORT))?,
+            dns_tcp: TcpListener::bind((Ipv4Addr::LOCALHOST, TAP_DNS_PORT))?,
+            captured: TcpListener::bind((Ipv4Addr::LOCALHOST, TAP_PORT))?,
+        })
+    }
+}
 
+/// Serve the three listeners until the process is taken down.
+fn serve(listeners: Listeners, uds: &Path, table: &Arc<Mutex<FakeIps>>, reporter: &Arc<Reporter>) {
+    let Listeners {
+        dns_udp,
+        dns_tcp,
+        captured,
+    } = listeners;
     {
         let table = Arc::clone(table);
         let reporter = Arc::clone(reporter);
@@ -931,7 +965,6 @@ fn serve(uds: &Path, table: &Arc<Mutex<FakeIps>>, reporter: &Arc<Reporter>) -> i
         std::thread::spawn(move || serve_dns_tcp(&dns_tcp, &table, &reporter));
     }
     serve_captured(&captured, table, reporter, uds);
-    Ok(())
 }
 
 /// The UDP resolver. The socket is bound to loopback on purpose: the redirect rewrites the

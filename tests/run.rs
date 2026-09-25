@@ -3392,7 +3392,8 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 /// its name, bends its connection, and hands it to the proxy as a `CONNECT`; the proxy, in a process
 /// of its own, decides it like any other: an allowed host answers, a denied one is refused with the
 /// proxy's 403. Skips (never fails) when the host cannot sandbox, the binary cache is unreachable,
-/// or no `nft` is there to install the redirect, in which case a launch wires no tap at all.
+/// no `nft` is there to install the redirect (a launch then wires no tap at all), or the kernel
+/// refuses the redirect or its route. A tap that does not start in its cage fails it.
 #[test]
 fn a_client_that_ignores_the_proxy_variables_is_judged_by_the_proxy_through_the_tap() {
     let project = TmpDir::prefixed("r", "tap-proj");
@@ -3441,9 +3442,20 @@ fn a_client_that_ignores_the_proxy_variables_is_judged_by_the_proxy_through_the_
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // The tap runs in a cage of its own: one that did not start or did not come up is a failure,
+    // not a host that cannot capture, which says so in other words (the redirect or its route).
+    for own in [
+        "cannot start the capture tap",
+        "the capture tap did not come up",
+    ] {
+        assert!(
+            !stderr.contains(own),
+            "the capture tap must stand up: {stderr}"
+        );
+    }
     if stderr.contains("transparent capture unavailable") {
         skip_incapable!(
-            "skipping tap e2e: the capture tap did not stand up ({})",
+            "skipping tap e2e: this host cannot capture ({})",
             stderr.trim()
         );
         return;

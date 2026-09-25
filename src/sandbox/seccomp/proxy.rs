@@ -11,34 +11,25 @@
 //! the proxy hand someone its execution.
 //!
 //! The proxy installs it itself ([`confine`]), on the thread that runs it and before it starts any
-//! other: a filter holds for the thread that installs it and every thread that thread starts, and
-//! for no other. That is also what lets a test run the proxy's body on a thread of the test process
-//! with the filter on, and the rest of the process without it.
+//! other ([`allowlist`] says why that order, and what every such list starts from).
 //!
 //! ## What is on the list
 //!
-//! Two halves, kept apart below. The calls the proxy's own work makes ([`work`]), read from a trace
-//! of the proxy serving every plane (cleartext, tunnelled, spliced, HTTP/2, refusals, parked
-//! requests, signers, refreshes) under both C libraries sbx is built with, and from its code where
-//! no trace reaches. And a floor the runtime needs under a load no trace is sure to reach
-//! ([`floor`]): memory grown in place, a wait that sleeps or yields, a signal delivered, an abort
-//! that should still read as one.
+//! Two halves. The calls the proxy's own work makes ([`work`]), read from a trace of the proxy
+//! serving every plane (cleartext, tunnelled, spliced, HTTP/2, refusals, parked requests, signers,
+//! refreshes) under both C libraries sbx is built with, and from its code where no trace reaches.
+//! And the floor every helper's list shares ([`allowlist::starting_from`]): memory grown in place,
+//! a wait that sleeps or yields, a signal delivered, an abort that should still read as one;
+//! `clone` for threads alone, and memory never mapped executable.
 //!
-//! A few calls are allowed only with some arguments:
-//!
-//! - `clone` only with `CLONE_THREAD`: threads, not processes. `clone3` hides its flags in a
-//!   structure a filter cannot read, so a program of its own answers it `ENOSYS`, and the C library
-//!   falls back to `clone`, where they are visible.
-//! - `mmap` and `mprotect` never with `PROT_EXEC`: nothing the proxy does maps new code.
-//! - `ioctl` only to set a socket blocking or not, `prctl` only to name a thread, `fcntl` only to
-//!   duplicate a descriptor, mark it close-on-exec or read its flags, `setsockopt` only the options
-//!   the proxy sets.
+//! A few calls are allowed only with some arguments: `ioctl` only to set a socket blocking or not,
+//! `prctl` only to name a thread, `fcntl` only to duplicate a descriptor, mark it close-on-exec or
+//! read its flags, `setsockopt` only the options the proxy sets.
 //!
 //! On aarch64 the list names the same calls, less the two that architecture has only under another
 //! name (`poll` and `epoll_wait`, which its C libraries make as `ppoll` and `epoll_pwait`).
 
-use super::{Rules, arg0_has_flag, arg1_is, compile, compile_with};
-use seccompiler::{SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+use super::{Rules, allowlist, arg1_is};
 use std::io;
 
 /// The calls the proxy's own work makes, allowed with any argument.
@@ -95,89 +86,19 @@ fn work() -> Vec<i64> {
     calls
 }
 
-/// What the runtime may call under a load the proxy's work does not always reach, allowed with any
-/// argument.
-fn floor() -> Vec<i64> {
-    vec![
-        // A large buffer grown in place.
-        libc::SYS_mremap,
-        // A lock that spins before it parks, and a sleep the C library makes the older way.
-        libc::SYS_sched_yield,
-        libc::SYS_nanosleep,
-        // The clock, where the kernel's shared page does not answer it.
-        libc::SYS_clock_gettime,
-        // Returning from a signal handler, and resuming a wait a signal interrupted.
-        libc::SYS_rt_sigreturn,
-        libc::SYS_restart_syscall,
-        // An abort, which signals its own process: refused, it would end in some other fault and
-        // no longer read as one.
-        libc::SYS_getpid,
-        libc::SYS_tgkill,
-        libc::SYS_tkill,
-    ]
-}
-
-/// Match a call whose argument `index`, read as the kernel reads an `int`, equals `value`.
-fn arg_is(index: u8, value: u64) -> SeccompRule {
-    SeccompRule::new(vec![
-        SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value)
-            .expect("a constant condition is valid"),
-    ])
-    .expect("a single-condition rule is valid")
-}
-
-/// Match a call whose argument `index` carries none of the bits in `mask`.
-fn arg_lacks(index: u8, mask: u64) -> SeccompRule {
-    SeccompRule::new(vec![
-        SeccompCondition::new(
-            index,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::MaskedEq(mask),
-            0,
-        )
-        .expect("a constant condition is valid"),
-    ])
-    .expect("a single-condition rule is valid")
-}
-
-/// Match a `setsockopt` of option `name` at `level`.
-fn sets(level: libc::c_int, name: libc::c_int) -> SeccompRule {
-    let is = |index, value: libc::c_int| {
-        SeccompCondition::new(
-            index,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            value as u64,
-        )
-        .expect("a constant condition is valid")
-    };
-    SeccompRule::new(vec![is(1, level), is(2, name)]).expect("a two-condition rule is valid")
-}
-
 /// What the proxy may call: every call named here, under its conditions when it has some.
 fn allowed() -> Rules {
-    let mut m = Rules::new();
-    for nr in work().into_iter().chain(floor()) {
-        m.insert(nr, vec![]);
-    }
-    // Answered `ENOSYS` by the program installed before this one ([`programs`]), and allowed here
-    // so that answer stands: of two refusals, the kernel keeps the later filter's, and `EPERM`
-    // would stop the C library from falling back to `clone`.
-    m.insert(libc::SYS_clone3, vec![]);
-    m.insert(
-        libc::SYS_clone,
-        vec![arg0_has_flag(libc::CLONE_THREAD as u64)],
-    );
-    let no_exec = || vec![arg_lacks(2, libc::PROT_EXEC as u64)];
-    m.insert(libc::SYS_mmap, no_exec());
-    m.insert(libc::SYS_mprotect, no_exec());
+    let mut m = allowlist::starting_from(work());
     // Spelled through `c_ulong`, which is `u64` on every target sbx builds for: the constant is a
     // `c_ulong` under glibc and a `c_int` under musl.
     m.insert(
         libc::SYS_ioctl,
         vec![arg1_is(libc::FIONBIO as libc::c_ulong)],
     );
-    m.insert(libc::SYS_prctl, vec![arg_is(0, libc::PR_SET_NAME as u64)]);
+    m.insert(
+        libc::SYS_prctl,
+        vec![allowlist::arg_is(0, libc::PR_SET_NAME as u64)],
+    );
     m.insert(
         libc::SYS_fcntl,
         [
@@ -187,89 +108,34 @@ fn allowed() -> Rules {
             libc::F_GETFL,
         ]
         .into_iter()
-        .map(|cmd| arg_is(1, cmd as u64))
+        .map(|cmd| allowlist::arg_is(1, cmd as u64))
         .collect(),
     );
     m.insert(
         libc::SYS_setsockopt,
         vec![
-            sets(libc::SOL_SOCKET, libc::SO_RCVTIMEO),
-            sets(libc::SOL_SOCKET, libc::SO_SNDTIMEO),
-            sets(libc::IPPROTO_TCP, libc::TCP_NODELAY),
+            allowlist::sockopt(libc::SOL_SOCKET, libc::SO_RCVTIMEO),
+            allowlist::sockopt(libc::SOL_SOCKET, libc::SO_SNDTIMEO),
+            allowlist::sockopt(libc::IPPROTO_TCP, libc::TCP_NODELAY),
         ],
     );
     m
-}
-
-/// The proxy's filters, in load order: `clone3` answered with `ENOSYS`, then the list, refusing
-/// everything it does not name with `EPERM`. The list comes last because it is the end of
-/// installing any: `prctl` is on it only to name a thread.
-fn programs() -> Vec<Vec<u8>> {
-    let mut clone3 = Rules::new();
-    clone3.insert(libc::SYS_clone3, vec![]);
-    vec![
-        compile(clone3, SeccompAction::Errno(libc::ENOSYS as u32)),
-        compile_with(
-            allowed(),
-            SeccompAction::Errno(libc::EPERM as u32),
-            SeccompAction::Allow,
-        ),
-    ]
 }
 
 /// Put the calling thread, and every thread it starts from now on, under the proxy's filters. Called
 /// by the proxy first thing, before it starts any thread: one started earlier would run without
 /// them.
 pub(crate) fn confine() -> io::Result<()> {
-    let refused =
-        |e: io::Error| io::Error::new(e.kind(), format!("its seccomp filter did not install: {e}"));
-    // SAFETY: `PR_SET_NO_NEW_PRIVS` takes plain integers and sets a flag of the calling thread.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(refused(io::Error::last_os_error()));
-    }
-    if !super::install_filters(&programs()) {
-        return Err(refused(io::Error::last_os_error()));
-    }
-    Ok(())
+    allowlist::confine(allowed())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::allowlist::probe::{Outcome, call, opening, outcome};
     use super::*;
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    /// What a call answered: its return, or the errno it failed with.
-    type Outcome = Result<i64, i32>;
-
-    /// The outcome of a raw call's return value, read before anything else can change `errno`.
-    fn outcome(rc: libc::c_long) -> Outcome {
-        if rc == -1 {
-            Err(io::Error::last_os_error().raw_os_error().unwrap_or(0))
-        } else {
-            Ok(rc)
-        }
-    }
-
-    /// The raw call `nr` with `args`, its unused trailing arguments zero.
-    fn call(nr: libc::c_long, args: &[libc::c_long]) -> Outcome {
-        let mut a = [0; 6];
-        a[..args.len()].copy_from_slice(args);
-        // SAFETY: every call made through this is given integers, null pointers or pointers to live
-        // buffers of the lengths it states, and none of them writes past what it is handed.
-        outcome(unsafe { libc::syscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]) })
-    }
-
-    /// A call that opens a descriptor, which is closed again when the filter let it through.
-    fn opening(nr: libc::c_long, args: &[libc::c_long]) -> Outcome {
-        let got = call(nr, args);
-        if let Ok(fd) = got {
-            // SAFETY: the descriptor was just opened by this call and is owned by nothing else.
-            drop(unsafe { OwnedFd::from_raw_fd(fd as i32) });
-        }
-        got
-    }
 
     /// What the probes found: each call's outcome under the proxy's filters, by name, and the
     /// process a `clone` let through, if one did, for the caller to reap.

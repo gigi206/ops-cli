@@ -105,6 +105,14 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 ///
 /// The report is sent from a thread of the tap's own after the answer, and the tap ends with the
 /// command, so the command waits for the report to land before it exits.
+///
+/// The tap parses what the cage writes, so it runs caged: the command reads, from outside, what the
+/// tap and each of its threads hold. Every one of them is under its filter with no new privileges
+/// and no capability, and the tap sees a mount namespace of its own, not the holder's.
+///
+/// A tap that did not start or did not come up fails this test rather than skipping it. The
+/// environment gaps the capture has say so in their own words, and still skip: a kernel that
+/// refuses the redirect rules, and one without the `dummy` module, which leaves no route.
 #[test]
 fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     let python = std::path::Path::new("/usr/bin/python3");
@@ -114,6 +122,10 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     }
     let Some(nft) = common::nft_on_path() else {
         skip_incapable!("skipping tap DNS e2e: no nft on PATH to install the redirect");
+        return;
+    };
+    let Some(bwrap) = common::bwrap_on_path() else {
+        skip_incapable!("skipping tap DNS e2e: no bwrap on PATH to cage the tap");
         return;
     };
     // The egress socket a captured connection would be handed to. A query is answered by the tap
@@ -154,10 +166,34 @@ else:
         time.sleep(0.05)
     if os.path.exists(sys.argv[1]):
         print("reported", open(sys.argv[1]).read())
+# The tap, found among this process's descendants (this process is the holder, become the command).
+def children(pid):
+    out = []
+    for task in os.listdir(f"/proc/{pid}/task"):
+        out += open(f"/proc/{pid}/task/{task}/children").read().split()
+    return out
+todo, tap = children(os.getpid()), None
+while todo and tap is None:
+    pid = todo.pop()
+    # The tap itself, not the bwrap that cages it, whose own arguments name it too.
+    if open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")[1:2] == [b"__net-tap"]:
+        tap = pid
+    else:
+        todo += children(pid)
+if tap is None:
+    print("tap none")
+else:
+    for task in sorted(os.listdir(f"/proc/{tap}/task")):
+        fields = dict(l.split(":\t", 1) for l in open(f"/proc/{tap}/task/{task}/status").read().splitlines() if ":\t" in l)
+        print("thread", fields["NoNewPrivs"], fields["Seccomp_filters"], fields["CapEff"])
+    own = os.readlink(f"/proc/{tap}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
+    print("tap mount", "own" if own else "shared")
 "#;
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["__netns-holder", "--tap"])
         .arg(&egress)
+        .arg("--bwrap")
+        .arg(&bwrap)
         .arg("--nft")
         .arg(&nft)
         .arg("--report")
@@ -170,9 +206,18 @@ else:
         .expect("spawn sbx __netns-holder");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    for own in [
+        "cannot start the capture tap",
+        "the capture tap did not come up",
+    ] {
+        assert!(
+            !stderr.contains(own),
+            "the capture tap must stand up: {stderr}"
+        );
+    }
     if !out.status.success() || stderr.contains("transparent capture unavailable") {
         skip_incapable!(
-            "skipping tap DNS e2e: the holder or its tap did not stand up ({})",
+            "skipping tap DNS e2e: the holder, the redirect or its route did not stand up ({})",
             stderr.trim()
         );
         return;
@@ -202,5 +247,25 @@ else:
     assert!(
         stdout.lines().any(|l| l == "reported RESOLVED example.com"),
         "the name must reach the report socket: {stdout}{stderr}"
+    );
+    let threads: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("thread "))
+        .collect();
+    assert!(
+        !threads.is_empty(),
+        "the tap was not found: {stdout}{stderr}"
+    );
+    // Four filters: the two every cage gets from its bwrap, and the tap's own two (the program that
+    // answers `clone3`, then its list). Without its own, a tap would show the cage's two alone.
+    for thread in &threads {
+        assert_eq!(
+            *thread, "1 4 0000000000000000",
+            "every thread of the tap: no new privileges, its own filters, no capability: {stdout}"
+        );
+    }
+    assert!(
+        stdout.lines().any(|l| l == "tap mount own"),
+        "the tap must not see the holder's mount namespace: {stdout}"
     );
 }

@@ -85,6 +85,7 @@ mod nettap;
 pub(crate) mod proclearn;
 mod proxy;
 pub(crate) mod redact;
+mod selfcage;
 
 // The observation-lens substrate: the bounded event ring and the per-session control socket the
 // filesystem, process and ssh-agent lenses below are each built from.

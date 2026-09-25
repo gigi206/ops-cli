@@ -51,11 +51,13 @@ pub(crate) fn holder_wrap(
     match dummy {
         None => (bwrap.to_path_buf(), bwrap_argv),
         Some(nd) => {
-            let mut argv = Vec::with_capacity(bwrap_argv.len() + 6);
+            let mut argv = Vec::with_capacity(bwrap_argv.len() + 10);
             argv.push(OsString::from("__netns-holder"));
             if let Some(tap) = &nd.tap {
                 argv.push(OsString::from("--tap"));
                 argv.push(tap.uds.as_os_str().to_owned());
+                argv.push(OsString::from("--bwrap"));
+                argv.push(tap.bwrap.as_os_str().to_owned());
                 argv.push(OsString::from("--nft"));
                 argv.push(tap.nft.as_os_str().to_owned());
                 if let Some(report) = &tap.report {
@@ -82,22 +84,29 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
     let (opts, rest) = argv.split_at(sep);
     let rest = &rest[1..];
     let mut uds = None;
+    let mut bwrap = None;
     let mut nft = None;
     let mut report = None;
     let mut i = 0;
     while i < opts.len() {
         match opts[i].to_str() {
             Some("--tap") => uds = opts.get(i + 1).map(PathBuf::from),
+            Some("--bwrap") => bwrap = opts.get(i + 1).map(PathBuf::from),
             Some("--nft") => nft = opts.get(i + 1).map(PathBuf::from),
             Some("--report") => report = opts.get(i + 1).map(PathBuf::from),
             _ => return None,
         }
         i += 2;
     }
-    let tap = match (uds, nft) {
-        (Some(uds), Some(nft)) => Some(TapWiring { uds, nft, report }),
-        // Half a wiring is not one: the launcher emits both or neither. The report socket is not
-        // part of that pair: without it the tap still captures, it just reports no resolutions.
+    let tap = match (uds, bwrap, nft) {
+        (Some(uds), Some(bwrap), Some(nft)) => Some(TapWiring {
+            uds,
+            bwrap,
+            nft,
+            report,
+        }),
+        // Part of a wiring is not one: the launcher emits all three or none. The report socket is
+        // not one of them: without it the tap still captures, it just reports no resolutions.
         _ => None,
     };
     Some((tap, rest))
@@ -222,26 +231,13 @@ pub(crate) fn run_probe(argv: &[OsString]) -> ! {
 /// reports every listener bound, so no connection is ever bent toward a port with nothing behind it.
 /// A tap that never reports leaves the rules uninstalled, which is exactly the degraded mode.
 ///
-/// The child inherits this network namespace (it is spawned before the `execve`) but keeps the
-/// host's mount and pid namespaces, so it is invisible and unreachable from inside the cage while
-/// still able to dial the host-side egress socket by its real path. `PR_SET_PDEATHSIG` ties it to
-/// this process, which `execve` turns into `bwrap`: when the cage ends, so does the tap.
+/// The tap runs in a cage of its own ([`tap_cage`]), started before the `execve` so it shares this
+/// network namespace, and nothing else of this process: not the host's mount or pid namespaces, not
+/// the capabilities this process holds over the namespace, and under a filter of its own
+/// ([`crate::sandbox::seccomp::tap`]). `PR_SET_PDEATHSIG` ties it to this process, which `execve`
+/// turns into the cage's `bwrap`: when the cage ends, so does the tap.
 fn wire_tap(tap: &TapWiring) {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return degraded(&format!("cannot locate sbx's own binary ({e})")),
-    };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("__net-tap").arg(&tap.uds);
-    if let Some(report) = &tap.report {
-        cmd.arg("--report").arg(report);
-    }
-    let mut child = match cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .pre_exec_pdeathsig()
-        .spawn()
-    {
+    let mut child = match start_tap(tap) {
         Ok(child) => child,
         Err(e) => return degraded(&format!("cannot start the capture tap ({e})")),
     };
@@ -271,6 +267,62 @@ fn wire_tap(tap: &TapWiring) {
     if let Err(e) = with_netlink(add_default_route) {
         degraded(&format!("the capture route could not be installed ({e})"));
     }
+}
+
+/// Start the tap in its cage, its stdout piped for the line that says it serves.
+fn start_tap(tap: &TapWiring) -> io::Result<std::process::Child> {
+    use std::os::fd::AsRawFd;
+    let (binary, copy) = super::selfcage::running()?;
+    let spec = tap_cage(binary.as_raw_fd(), copy, tap)?;
+    let (mut cmd, files) = super::selfcage::command(&tap.bwrap, &spec, binary)?;
+    super::memfd::inherit_across_exec(&mut cmd, &files);
+    let child = cmd
+        .stdout(std::process::Stdio::piped())
+        .pre_exec_pdeathsig()
+        .spawn();
+    // Read by bwrap by now, or never; closed here, so none reaches the cage this process becomes.
+    drop(files);
+    child
+}
+
+/// Where the tap's cage binds the egress socket.
+const TAP_EGRESS: &str = "/egress.sock";
+
+/// Where the tap's cage binds the report socket.
+const TAP_REPORT: &str = "/report.sock";
+
+/// The cage the tap runs in ([`super::selfcage::spec`]): nothing of the host but the read-only
+/// userland, the binary, and the two sockets the tap dials, read-only at fixed paths. The egress
+/// socket is one the cage already reaches; the report socket answers the tap's reports alone.
+///
+/// Its network is shared, and shared with the process that starts its `bwrap`: that is what puts
+/// the tap in the cage's namespace, where the redirect sends it the cage's traffic. It is sound here
+/// and nowhere else, because only the holder starts it, and only once it has left the host's
+/// namespace for the cage's. The same spec started from any other process would share the host's
+/// network, which is why this is private to the holder.
+fn tap_cage(
+    binary: std::os::fd::RawFd,
+    copy: bool,
+    tap: &TapWiring,
+) -> io::Result<super::spec::SandboxSpec> {
+    let ro = |src: &Path, dest: &str| super::spec::Mount::RoBind {
+        src: src.to_path_buf(),
+        dest: dest.into(),
+    };
+    let mut mounts = vec![ro(&tap.uds, TAP_EGRESS)];
+    let mut args = vec![OsString::from("__net-tap"), OsString::from(TAP_EGRESS)];
+    if let Some(report) = &tap.report {
+        mounts.push(ro(report, TAP_REPORT));
+        args.extend([OsString::from("--report"), OsString::from(TAP_REPORT)]);
+    }
+    super::selfcage::spec(
+        "the capture tap",
+        binary,
+        copy,
+        mounts,
+        super::spec::NetPolicy::Shared,
+        args,
+    )
 }
 
 /// Run one netlink operation against `dummy0`, opening and closing the socket around it.
@@ -308,9 +360,10 @@ fn tap_is_ready(child: &mut std::process::Child) -> std::io::Result<()> {
     }
 }
 
-/// How long the holder waits for the tap to report its listeners bound. Binding three loopback
-/// sockets is immediate; this bounds a tap that cannot bind at all (a port already taken) so the
-/// launch degrades in a moment rather than stalling.
+/// How long the holder waits for the tap to report it serves: its cage started, its three loopback
+/// sockets bound and its filter installed. Far above what that costs; it bounds a tap that hangs on
+/// the way, so the launch degrades in a moment rather than stalling. One that fails outright (a
+/// port already taken, a filter that does not install) exits at once and is not waited for.
 const TAP_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Say why the cage is launching without transparent capture, then carry on. Never fatal: the
@@ -777,6 +830,7 @@ mod tests {
             holder_exe: PathBuf::from("/opt/sbx"),
             tap: Some(TapWiring {
                 uds: PathBuf::from("/run/sbx/proxy.sock"),
+                bwrap: PathBuf::from("/usr/bin/bwrap"),
                 nft: PathBuf::from("/usr/sbin/nft"),
                 report: Some(PathBuf::from("/run/sbx/report.sock")),
             }),
@@ -796,6 +850,8 @@ mod tests {
                 OsString::from("__netns-holder"),
                 OsString::from("--tap"),
                 OsString::from("/run/sbx/proxy.sock"),
+                OsString::from("--bwrap"),
+                OsString::from("/usr/bin/bwrap"),
                 OsString::from("--nft"),
                 OsString::from("/usr/sbin/nft"),
                 OsString::from("--report"),

@@ -28,13 +28,13 @@ use super::inject::Transfer;
 use super::link::{Judge, Parks, Supervisor, wire};
 use super::{Ca, CredentialRefresh, Credentials, ProxyCtx};
 use crate::allowlist::EgressPolicy;
-use crate::sandbox::spec::{Mount, NetPolicy, SandboxSpec};
+use crate::sandbox::selfcage;
+use crate::sandbox::spec::{NetPolicy, SandboxSpec};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -55,9 +55,6 @@ const START_WAIT: Duration = Duration::from_secs(10);
 
 /// How long a proxy whose link was closed has to exit before it is killed.
 pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
-
-/// Where the proxy's binary is inside its cage.
-const BINARY: &str = "/sbx";
 
 /// What a proxy is started with. The descriptors handed over beside it are, in order: the socket
 /// to serve, the proxy's end of the report channel, then the signers' sockets its credentials name.
@@ -281,78 +278,30 @@ fn stand_up(
 /// The cage a proxy runs in, and the descriptors bwrap reads, the proxy's end of the link `link`
 /// among them.
 fn command(bwrap: &Path, link: wire::Socket) -> io::Result<(Command, Vec<File>)> {
-    // The build that is running, whatever has become of its file since: a proxy started from a
-    // binary replaced mid-session would speak another build's messages.
-    let binary = File::open("/proc/self/exe")?;
+    let (binary, copy) = selfcage::running()?;
     let spec = cage(
         binary.as_raw_fd(),
-        deleted(&binary),
+        copy,
         std::os::fd::AsFd::as_fd(&link).as_raw_fd(),
     )?;
-    let (mut command, mut files) = caged(bwrap, &spec, binary)?;
+    let (mut command, mut files) = selfcage::command(bwrap, &spec, binary)?;
     files.push(File::from(OwnedFd::from(link)));
     command.stdout(Stdio::null());
     Ok((command, files))
 }
 
-/// bwrap starting `spec`, and the descriptors it reads: the spec's own, then `binary`, the file the
-/// spec binds at [`BINARY`].
-fn caged(bwrap: &Path, spec: &SandboxSpec, binary: File) -> io::Result<(Command, Vec<File>)> {
-    let (argv, mut files) = crate::sandbox::argv::compose(spec)?;
-    files.push(binary);
-    let mut command = Command::new(bwrap);
-    command.args(argv).stdin(Stdio::null());
-    Ok((command, files))
-}
-
-/// The cage a proxy runs in: the empty network namespace and the hardening every cage gets, the
-/// host's userland read-only for a binary that loads libraries, and the binary open as `binary`
-/// at [`BINARY`], bound where it is or `copy`'d when its file is gone. Nothing else of the host.
+/// The cage a proxy runs in ([`selfcage::spec`]): the empty network namespace, and nothing of the
+/// host but the read-only userland and the binary, open as `binary` and `copy`'d when its file is
+/// gone.
 fn cage(binary: RawFd, copy: bool, link: RawFd) -> io::Result<SandboxSpec> {
-    let ro = |p: &str| Mount::RoBind {
-        src: p.into(),
-        dest: p.into(),
-    };
-    let symlink = |target: &str, dest: &str| Mount::Symlink {
-        target: target.into(),
-        dest: dest.into(),
-    };
-    let mounts = vec![
-        ro("/usr"),
-        symlink("usr/lib", "/lib"),
-        symlink("usr/lib64", "/lib64"),
-        Mount::RoBindTry {
-            src: "/etc/ld.so.cache".into(),
-            dest: "/etc/ld.so.cache".into(),
-        },
-        if copy {
-            Mount::Copy {
-                fd: binary,
-                dest: BINARY.into(),
-            }
-        } else {
-            // Through the descriptor's own link, which names the file it was opened on even after
-            // a rename.
-            Mount::RoBind {
-                src: format!("/proc/self/fd/{binary}").into(),
-                dest: BINARY.into(),
-            }
-        },
-    ];
-    SandboxSpec::new(
-        "/".into(),
-        mounts,
+    selfcage::spec(
+        "the egress proxy",
+        binary,
+        copy,
         Vec::new(),
         NetPolicy::Isolated,
-        vec![BINARY.into(), "__proxy".into(), link.to_string().into()],
+        vec!["__proxy".into(), link.to_string().into()],
     )
-    .map_err(|e| io::Error::other(format!("cannot build the egress proxy's cage: {e:?}")))
-}
-
-/// Whether the file `open` was opened on has been deleted since, as its `/proc` link says.
-fn deleted(open: &File) -> bool {
-    std::fs::read_link(format!("/proc/self/fd/{}", open.as_raw_fd()))
-        .is_ok_and(|target| target.as_os_str().as_bytes().ends_with(b" (deleted)"))
 }
 
 /// A start the thread in [`spawn_lasting`] runs: the command, the descriptors it reads, and where
@@ -552,6 +501,7 @@ mod tests {
     use super::*;
     use crate::sandbox::control::{LOG_RING_CAP, LogRing, PendingState};
     use crate::sandbox::proxy::events::Sinks;
+    use crate::sandbox::selfcage::BINARY;
     use crate::testutil::TmpDir;
     use std::io::{BufRead, BufReader, Write};
 
@@ -941,7 +891,7 @@ mod tests {
             PROBE_HOST_FILE.to_string(),
             host_file.to_string_lossy().into_owned(),
         )];
-        let (mut command, files) = caged(&bwrap, &spec, binary).unwrap();
+        let (mut command, files) = selfcage::command(&bwrap, &spec, binary).unwrap();
         crate::sandbox::memfd::inherit_across_exec(&mut command, &files);
         let out = command.output().unwrap();
         drop(files);
@@ -996,24 +946,6 @@ mod tests {
         for fd in &named {
             assert!(handed.contains(fd), "{fd} named but not handed: {argv:?}");
         }
-    }
-
-    /// A file deleted after it was opened reads as such through its descriptor; one still there
-    /// does not.
-    #[test]
-    fn a_binary_deleted_since_it_was_opened_is_seen_as_gone() {
-        let dir = TmpDir::new();
-        let path = dir.join("sbx");
-        std::fs::write(&path, b"x").unwrap();
-        let open = File::open(&path).unwrap();
-        assert!(!deleted(&open));
-        std::fs::rename(&path, dir.join("moved")).unwrap();
-        assert!(
-            !deleted(&open),
-            "a rename leaves the file where the descriptor finds it"
-        );
-        std::fs::remove_file(dir.join("moved")).unwrap();
-        assert!(deleted(&open));
     }
 
     /// A process the launcher starts lives on after the thread that asked for it ends, though it

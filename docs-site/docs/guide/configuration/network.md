@@ -235,6 +235,12 @@ same proxy, so the request meets the **same** policy as any other: host, path, m
 anti-fronting check, credential injection, the SSRF guard. Nothing is loosened; a name the allowlist
 does not permit is refused exactly as it would be through the proxy.
 
+The tap reads what the cage sends, so it runs in a cage of its own: nothing of the host but the
+read-only system userland, sbx's own binary, the proxy's socket and the socket it reports on; no
+capability; and a system-call filter that allows only the calls its work makes. The socket it
+reports on takes its two reports and nothing else, so the tap cannot answer a pending request or add
+a rule.
+
 Wiring the tap changes what the namespace looks like from inside: it gains a black-hole `dummy0`
 interface and a default route through it. The route is what makes the redirect reachable at all
 (the kernel resolves a route *before* the rules run), and it opens nothing: TCP and DNS are bent to

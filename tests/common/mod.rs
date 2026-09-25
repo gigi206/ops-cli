@@ -115,8 +115,18 @@ pub fn sbx(args: &[&str]) -> Output {
 /// The first `nft` on `PATH`, where a launch looks for the one that installs its capture redirect,
 /// or `None` on a host without nftables. Without it a launch wires no capture tap, and says nothing.
 pub fn nft_on_path() -> Option<std::path::PathBuf> {
+    on_path("nft")
+}
+
+/// The first `bwrap` on `PATH`, or `None` on a host without bubblewrap.
+pub fn bwrap_on_path() -> Option<std::path::PathBuf> {
+    on_path("bwrap")
+}
+
+/// The first file called `name` in a directory of `PATH`.
+fn on_path(name: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join("nft"))
+        .map(|dir| dir.join(name))
         .find(|p| p.is_file())
 }
 

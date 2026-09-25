@@ -227,14 +227,17 @@ pub(crate) struct NetnsDummy {
 
 /// The transparent-capture tap's wiring, resolved by the launcher and carried to the holder.
 ///
-/// Both paths are host-side and are used *before* `bwrap` runs, in the holder's own mount namespace
-/// — the cage never sees either. `None` on [`NetnsDummy::tap`] is the degraded mode: the namespace
-/// is still pre-created (for the dummy interface), simply with no redirect and no tap.
+/// Every path is host-side and is used *before* the cage's `bwrap` runs, by the holder — the cage
+/// never sees any. The tap itself runs in a cage of its own, which binds the two sockets at fixed
+/// paths. `None` on [`NetnsDummy::tap`] is the degraded mode: the namespace is still pre-created
+/// (for the dummy interface), simply with no redirect and no tap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TapWiring {
     /// The host-side egress socket the proxy serves — what the tap dials for each captured
-    /// connection, by its real path.
+    /// connection. The cage reaches the same socket through its own bind.
     pub(super) uds: PathBuf,
+    /// The bubblewrap the tap is caged by: the launch's own.
+    pub(super) bwrap: PathBuf,
     /// The `nft` binary that installs the redirect rules.
     pub(super) nft: PathBuf,
     /// The proxy's report socket, where the tap reports each name the cage resolves so the

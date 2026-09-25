@@ -829,3 +829,68 @@ fn the_taps_arguments_are_parsed_strictly() {
         "an option this process does not understand"
     );
 }
+
+/// The tap's work, under its filter: on a thread of this process confined as the tap confines
+/// itself, the destination of an accepted connection is asked for and answered (the local address,
+/// or `ENOENT` where no connection tracking follows loopback, and never `EPERM`), a name is answered
+/// and reported from a thread the filter holds as well, and the captured connection reaches the
+/// proxy and is pumped both ways. What the filter
+/// refuses is pinned beside it ([`crate::sandbox::seccomp::tap`]); this pins what it must not.
+#[test]
+fn the_taps_work_runs_under_its_filter() {
+    let dir = TmpDir::new();
+    let uds = dir.join("egress.sock");
+    let heads = stand_in_proxy(&uds, "HTTP/1.1 200 Connection established\r\n\r\n");
+    let report = dir.join("report.sock");
+    let lines = stand_in_report_socket(&report);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the client side");
+    let addr = listener.local_addr().expect("addr");
+    let client = std::thread::spawn(move || {
+        let mut c = TcpStream::connect(addr).expect("connect");
+        let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = c.write_all(b"hello");
+        let mut back = Vec::new();
+        let _ = c.read_to_end(&mut back);
+        back
+    });
+
+    let (unredirected, outcome) = std::thread::spawn(move || {
+        crate::sandbox::seccomp::tap::confine().expect("the tap's filter installs");
+        let (stream, _) = listener.accept().expect("accept under the filter");
+        let unredirected = original_dst(&stream).map_err(|e| e.raw_os_error());
+        let table = Mutex::new(FakeIps::new());
+        let reporter = Reporter::new(Some(report));
+        let reply = answer_query(&query("github.com", QTYPE_A), &table, &reporter).expect("answer");
+        let at = reply.len() - 4;
+        let ip = Ipv4Addr::new(reply[at], reply[at + 1], reply[at + 2], reply[at + 3]);
+        let outcome = serve_capture(stream, SocketAddrV4::new(ip, 443), &table, &uds);
+        (unredirected, outcome)
+    })
+    .join()
+    .expect("the confined thread");
+
+    match unredirected {
+        Ok(dest) => assert_eq!(std::net::SocketAddr::V4(dest), addr),
+        Err(errno) => assert_eq!(
+            errno,
+            Some(libc::ENOENT),
+            "the filter must let the question through"
+        ),
+    }
+    assert_eq!(
+        outcome,
+        Capture::Proxied {
+            host: "github.com".to_string(),
+            port: 443
+        }
+    );
+    assert_eq!(
+        heads.recv_timeout(Duration::from_secs(5)).expect("head"),
+        synthesize_connect("github.com", 443)
+    );
+    assert_eq!(client.join().expect("client thread"), b"hello");
+    assert_eq!(
+        lines.recv_timeout(Duration::from_secs(5)).expect("report"),
+        "RESOLVED github.com"
+    );
+}

@@ -57,10 +57,11 @@
 //! `umount2`→a mount teardown that can defeat a control-plane pin) is surfaced with a
 //! [`Caution`] the resolver turns into a warning.
 //!
-//! ## The proxy's own filter
+//! ## The helpers' own filters
 //!
-//! The egress proxy runs under a filter of its own on top of its cage's ([`proxy`]), the other way
-//! round: a list of what it may call, and `EPERM` for the rest.
+//! The egress proxy ([`proxy`]) and the transparent-capture tap ([`tap`]) each run under a filter of
+//! their own on top of their cage's, the other way round: a list of what it may call, and `EPERM`
+//! for the rest ([`allowlist`]).
 
 #![allow(
     clippy::expect_used,
@@ -77,7 +78,9 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 
+mod allowlist;
 pub(crate) mod proxy;
+pub(crate) mod tap;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("sbx's seccomp denylist is implemented only for x86_64 and aarch64");
