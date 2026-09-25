@@ -2493,8 +2493,12 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         // A home's own activation record governs its own pool, and nothing else reaches it.
         for home in &homes {
             let specs = sandbox::mise_tool_specs(&home.dir.join(".config/mise/config.toml"));
-            let installs = home.dir.join(".local/share/mise/installs");
-            let stale_versions = sandbox::prune_stale_versions(&installs, &specs, apply);
+            let stale_versions = sandbox::prune_stale_versions(
+                &home.dir,
+                Path::new(".local/share/mise/installs"),
+                &specs,
+                apply,
+            );
             report_stale(
                 &stale_versions,
                 app_name,
@@ -2547,7 +2551,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                 }
             }
             let stale_versions =
-                sandbox::prune_stale_versions(&pool.dir.join("installs"), &specs, apply);
+                sandbox::prune_stale_versions(&pool.dir, Path::new("installs"), &specs, apply);
             let where_ = format!("project {} mise pool", pool.project_id);
             report_stale(&stale_versions, app_name, &where_, all, &pal, &mut totals);
         }

@@ -885,6 +885,41 @@ fn prune_stale_drops_a_pool_version_no_activation_asks_for() {
     );
 }
 
+/// `--stale` deletes from a home the cage writes, and the cage writes both of its inputs: the pool
+/// and the activation that says what is stale. A link planted above the pool must not point the
+/// sweep at a directory of the host, so the verb reads the pool below the home following none.
+#[test]
+fn prune_stale_does_not_follow_a_link_planted_above_the_pool() {
+    let fx = Project::new("app");
+    fx.write_profile("demo-app", "cmd = \"demo\"\n");
+    let outside = fx.scratch().join("outside");
+    std::fs::create_dir_all(outside.join("installs/victim/v1")).unwrap();
+    std::fs::write(outside.join("installs/victim/v1/keep.txt"), b"mine").unwrap();
+    let mise = fx
+        .data_home
+        .path()
+        .join("sbx/apps/demo-app/home/.local/share/mise");
+    std::fs::create_dir_all(mise.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &mise).unwrap();
+    // Every version under `victim` is stale by this activation, which names one that is not there.
+    fx.write_home_mise_config("demo-app", "[tools]\nvictim = \"none\"\n");
+
+    let preview = fx.run(&["app", "prune", "demo-app", "--stale"]);
+    assert!(preview.status.success(), "{}", text(&preview));
+    assert!(
+        !String::from_utf8_lossy(&preview.stdout).contains("victim"),
+        "the preview must not offer a directory reached through the link: {}",
+        text(&preview)
+    );
+    let applied = fx.run(&["app", "prune", "demo-app", "--stale", "--yes"]);
+    assert!(applied.status.success(), "{}", text(&applied));
+    assert!(
+        outside.join("installs/victim/v1/keep.txt").exists(),
+        "the directory the link pointed at was deleted: {}",
+        text(&applied)
+    );
+}
+
 /// Without `--stale` the pool version is not in scope: the flag is what widens the verb, and a
 /// `prune` that dropped versions by default would delete on a line that asked about tools.
 #[test]

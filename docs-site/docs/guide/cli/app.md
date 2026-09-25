@@ -511,6 +511,11 @@ asking for it was not among those read, and a tool the app does not declare is w
 `prune` is for), and a pool whose project directory is gone (its tree is removed whole by
 [`sbx projects rm --dead`](projects#rm)).
 
+A pool is read below the home or the pool directory without following any symlink. The agent
+writes both the pool and the activation record that decides what is stale, so a link there would
+point the sweep at a directory that is not a pool. A pool reached through one is skipped, and so
+is a tool directory that is a link.
+
 Under `--all`, an app whose session is running is **skipped and named** rather than refusing
 the whole sweep, so one live agent does not hold up the rest; the sweep then exits non-zero
 so a script notices that not everything was covered.

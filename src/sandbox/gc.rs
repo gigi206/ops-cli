@@ -1205,19 +1205,42 @@ pub(crate) struct PrunedVersion {
 ///
 /// Alias symlinks pointing at a removed version go with it, so the pool is not left with links to
 /// nothing. With `apply = false` nothing is removed.
+///
+/// The pool is `rel` under `anchor`, the directory a cage has as its mount point: a home, or a
+/// global app's per-project pool. Everything below the anchor is the cage's to rewrite, so it is
+/// read the way [`prune_app_tools`] reads it: `installs` and each tool directory are opened through
+/// [`open_beneath`], following nothing, and the listings, the sizes and the removals go through those
+/// descriptors. A link planted at `installs`, at an ancestor of it or at a tool, is refused where it
+/// is met, rather than turning somebody else's directories into versions to delete.
 pub(crate) fn prune_stale_versions(
-    installs: &Path,
+    anchor: &Path,
+    rel: &Path,
     wanted: &std::collections::BTreeMap<String, Vec<String>>,
     apply: bool,
 ) -> Vec<PrunedVersion> {
+    use std::os::unix::ffi::OsStrExt;
+
     let mut pruned = Vec::new();
-    for tool in super::inspect::mise_installed_in(installs) {
+    let Ok(root) = open_beneath(anchor, rel) else {
+        return pruned;
+    };
+    let listing = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+    for tool in super::inspect::mise_installed_in(&listing) {
         let Some(specs) = wanted.get(&super::inspect::mise_munge(&tool.name)) else {
             continue;
         };
-        let tool_dir = installs.join(&tool.dir_name);
+        let Ok(name) = std::ffi::CString::new(tool.dir_name.as_bytes()) else {
+            continue;
+        };
+        let Ok(tool_fd) = open_dir_nofollow(Some(&root), &name) else {
+            continue;
+        };
+        let tool_dir = PathBuf::from(format!("/proc/self/fd/{}", tool_fd.as_raw_fd()));
         // Each spec names an entry in the tool's directory: the version itself, or an alias link to
-        // it. Reading the link is what makes `latest` mean the version it currently points at.
+        // it. Reading the link is what makes `latest` mean the version it currently points at. A spec
+        // is the cage's text too, and one that is absolute or climbs with `..` is joined somewhere
+        // else; what it finds only ever adds to the versions kept, so it can keep one, never remove
+        // one.
         let mut live: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for spec in specs {
             let named = tool_dir.join(spec);
@@ -1253,13 +1276,12 @@ pub(crate) fn prune_stale_versions(
             if live.contains(name.as_ref()) {
                 continue;
             }
-            let dir = tool_dir.join(&version);
-            let bytes = tree_size(&dir);
+            let bytes = tree_size(&tool_dir.join(&version));
             if apply {
-                if force_remove_dir_all(&dir).is_err() {
+                if remove_child(&tool_fd, &version).is_err() {
                     continue;
                 }
-                drop_dangling_aliases(&tool_dir);
+                drop_dangling_aliases(&tool_fd);
             }
             pruned.push(PrunedVersion {
                 token: tool.label().to_string(),
@@ -1273,9 +1295,11 @@ pub(crate) fn prune_stale_versions(
 
 /// Remove the alias symlinks in a tool's install directory whose target no longer exists. mise
 /// writes `latest`, `2` and `2.1` beside the version they name, so removing that version leaves
-/// links to nothing, and a `mise which` following one reports a path rather than an absence.
-fn drop_dangling_aliases(tool_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(tool_dir) else {
+/// links to nothing, and a `mise which` following one reports a path rather than an absence. The
+/// directory is the one `tool` was opened on, whatever its name has become since.
+fn drop_dangling_aliases(tool: &OwnedFd) {
+    let tool_dir = PathBuf::from(format!("/proc/self/fd/{}", tool.as_raw_fd()));
+    let Ok(entries) = std::fs::read_dir(&tool_dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -2409,7 +2433,7 @@ mod tests {
             vec!["2.0.0".to_string()],
         )]);
 
-        let pruned = prune_stale_versions(&installs, &wanted, true);
+        let pruned = prune_stale_versions(tmp.path(), Path::new("installs"), &wanted, true);
 
         assert_eq!(
             pruned.iter().map(|p| p.version.clone()).collect::<Vec<_>>(),
@@ -2438,7 +2462,7 @@ mod tests {
             vec!["2.0.0".to_string()],
         )]);
 
-        let pruned = prune_stale_versions(&installs, &wanted, true);
+        let pruned = prune_stale_versions(tmp.path(), Path::new("installs"), &wanted, true);
 
         assert_eq!(
             pruned.iter().map(|p| p.version.clone()).collect::<Vec<_>>(),
@@ -2468,7 +2492,7 @@ mod tests {
             vec!["latest".to_string()],
         )]);
 
-        let pruned = prune_stale_versions(&installs, &wanted, true);
+        let pruned = prune_stale_versions(tmp.path(), Path::new("installs"), &wanted, true);
 
         assert!(
             pruned.is_empty(),
@@ -2491,7 +2515,7 @@ mod tests {
             vec!["latest".to_string()],
         )]);
 
-        let pruned = prune_stale_versions(&installs, &wanted, true);
+        let pruned = prune_stale_versions(tmp.path(), Path::new("installs"), &wanted, true);
 
         assert!(
             pruned.is_empty(),
@@ -2514,7 +2538,7 @@ mod tests {
             vec!["9.9.9".to_string()],
         )]);
 
-        let pruned = prune_stale_versions(&installs, &wanted, true);
+        let pruned = prune_stale_versions(tmp.path(), Path::new("installs"), &wanted, true);
 
         assert!(
             pruned.is_empty(),
@@ -2540,7 +2564,7 @@ mod tests {
             vec!["2.0.0".to_string()],
         )]);
 
-        let pruned = prune_stale_versions(&installs, &wanted, true);
+        let pruned = prune_stale_versions(tmp.path(), Path::new("installs"), &wanted, true);
 
         assert_eq!(pruned.len(), 1);
         assert!(
@@ -2551,6 +2575,90 @@ mod tests {
             installs.join("demo-tool/2").exists(),
             "a link to a version that stays is untouched"
         );
+    }
+
+    /// A directory `victim` outside every pool, holding a version-shaped `v1` with a file in it: what a
+    /// link planted in a pool points the sweep at. An activation naming `victim` at a version that
+    /// does not exist makes every directory under it stale.
+    fn victim_under(outside: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+        std::fs::create_dir_all(outside.join("victim/v1")).unwrap();
+        std::fs::write(outside.join("victim/v1/keep.txt"), b"mine").unwrap();
+        std::collections::BTreeMap::from([("victim".to_string(), vec!["none".to_string()])])
+    }
+
+    /// Neither a preview nor an applied sweep of the pool `rel` names under `anchor` reaches
+    /// `victim`, and the link planted at `link` is left as it was.
+    fn assert_the_sweep_stays_in(anchor: &Path, rel: &str, link: &Path, outside: &Path) {
+        let wanted = victim_under(outside);
+        for apply in [false, true] {
+            let pruned = prune_stale_versions(anchor, Path::new(rel), &wanted, apply);
+            assert!(
+                pruned.is_empty(),
+                "a pool reached through a link must yield nothing (apply = {apply}), got {:?}",
+                pruned.iter().map(|p| &p.version).collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            outside.join("victim/v1/keep.txt").exists(),
+            "the host directory the link pointed at was deleted"
+        );
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link itself must be left alone"
+        );
+    }
+
+    /// `sbx app prune --stale` deletes from the cage's own `$HOME`, and the cage writes both inputs:
+    /// the pool and the activation that says which versions are stale. A link planted at `installs`
+    /// used to make the sweep read another directory as the pool and delete what the activation did
+    /// not name, recursively.
+    #[test]
+    fn stale_prune_refuses_a_home_whose_installs_was_pointed_out_of_it() {
+        let tmp = TmpDir::new();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(home.join(".local/share/mise")).unwrap();
+        let link = home.join(".local/share/mise/installs");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        assert_the_sweep_stays_in(&home, ".local/share/mise/installs", &link, &outside);
+    }
+
+    /// The same link one level up: `installs` is a real directory, but under a `mise` that is not
+    /// the home's. Refusing a link only at the last component would let this one through.
+    #[test]
+    fn stale_prune_refuses_a_home_whose_mise_dir_was_pointed_out_of_it() {
+        let tmp = TmpDir::new();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(home.join(".local/share")).unwrap();
+        std::fs::create_dir_all(outside.join("installs")).unwrap();
+        let link = home.join(".local/share/mise");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        assert_the_sweep_stays_in(
+            &home,
+            ".local/share/mise/installs",
+            &link,
+            &outside.join("installs"),
+        );
+    }
+
+    /// A global app's per-project pool is the cage's too: the pool directory is its mount point, and
+    /// `installs` under it is swept by the same function.
+    #[test]
+    fn stale_prune_refuses_a_pool_whose_installs_was_pointed_out_of_it() {
+        let tmp = TmpDir::new();
+        let pool = tmp.path().join("mise");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&pool).unwrap();
+        let link = pool.join("installs");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        assert_the_sweep_stays_in(&pool, "installs", &link, &outside);
     }
 
     /// A home with `.rustup`, `.npm` and `.config`, each holding one file of the given size.
