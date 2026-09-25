@@ -41,7 +41,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
 | `agy` | `mise:aqua:google-antigravity/antigravity-cli` | `accounts.google.com` (Google account) |
-| `aider` | `mise:pipx:aider-chat` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / any OpenAI-compatible) |
+| `aider` | `mise:pipx:aider-chat` (+ `nix:uv`, `nix:python312`, `nix:gcc.cc`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / any OpenAI-compatible) |
 | `amp` | `nix:nodejs` (+ `mise:npm:@ampcode/cli`) | `ampcode.com` (account / `AMP_API_KEY`) |
 | `ante` | `mise:github:AntigmaLabs/ante-preview` | provider-dependent (BYOK) or local (`/offline-mode` llama.cpp) |
 | `atomic-agent` | `tarball:resolve` (the tag behind GitHub's `releases/latest` redirect) (+ `nix:chromium`) | local first: a `llama.cpp` server on the host loopback, or weights the agent manages in-cage; BYOK cloud optional |

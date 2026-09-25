@@ -41,3 +41,8 @@ mute = [
 aider = "mise:pipx:aider-chat"  # the tool itself, from PyPI via uv
 uv = "nix:uv"                   # mise's pipx backend runs `uv tool install`
 python = "nix:python312"        # an interpreter in aider's `>=3.10,<3.15` range
+# The C++ runtime aider's native wheels link against (`tokenizers`, loaded on the first message):
+# `libstdc++.so.6` is not on the nix interpreter's search path, and without it every message fails
+# with `ImportError: libstdc++.so.6`. Declared here so it rides the same nixpkgs lock as the
+# interpreter above; the profile's `cmd` finds its library directory at each start.
+libstdc = "nix:gcc.cc"

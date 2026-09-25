@@ -304,7 +304,7 @@ The 67 shipped bundles, and what each carries:
 |---|---|---|---|
 | `agy` | 1 (`mise:`) | 9 egress entries | none |
 | `atomic-agent` | 1 (`tarball:`) | 7 egress entries, 2 env vars, a `tarball:` resolver | none |
-| `aider` | 3 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
+| `aider` | 4 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
 | `amp` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `ante` | 1 (`mise:`) | 4 egress entries | none |
 | `antigravity` | 2 (`nix:`, `tarball:`) | 27 egress entries, a `tarball:` resolver | `chromium-background` |
