@@ -83,7 +83,40 @@
 # GitHub host set (read out of `dist/cli.mjs`), the `~/.commandcode/auth.json`
 # credential path (read out of the official quickstart), and the Axiom OTel sink
 # (read out of the binary's strings + the Axiom Node SDK docs).
-cmd = "cmd"
+#
+# The command hands Command Code the cage's summary (/opt/sbx/contract-summary.md:
+# what it may reach, which files it protects, which operations it offers) through a
+# mod loaded with `--mod`, whose `appendSystemPrompt` hook adds the summary after
+# the system prompt. Command Code has no system-prompt option, and a mod is the
+# channel it offers for one. The mod is written into the cage's own `/etc`, a
+# tmpfs, so it lives for this launch only and never reaches the host; it reads the
+# summary once, at load. It adds to the prompt: `~/.commandcode/AGENTS.md` and the
+# mods in `~/.commandcode/mods` still apply. Arguments after
+# `sbx app run command-code --` reach Command Code verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+mod=/etc/command-code/sbx-contract.ts
+if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/command-code 2>/dev/null; then
+  cat > "$mod" <<'MOD'
+import {readFileSync} from 'node:fs';
+
+export default function (cmd) {
+  let text = '';
+  try {
+    text = readFileSync('/opt/sbx/contract-summary.md', 'utf8');
+  } catch {}
+  cmd.hooks({appendSystemPrompt: () => text || undefined});
+}
+MOD
+  exec cmd --mod "$mod" "$@"
+fi
+exec cmd "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "cmd",
+]
 
 # Your host Command Code config/auth, mounted read-write at its real absolute path.
 # `binds` is a security field, honored only because this profile lives in your
