@@ -2941,3 +2941,130 @@ fn net_allow_session_validates_flags_and_reports_when_no_session_is_reachable() 
         "a --session load must not write the project config"
     );
 }
+
+/// `sbx net logs --follow` marks an event the session sends again as the same exchange, in the line
+/// view and in the NDJSON stream alike.
+///
+/// A stand-in session answers the reads a follow makes, in order. The opening listing holds one
+/// event with no status yet. The next read hands back a new event past the cursor, then the first
+/// one again, now carrying its status. Then the socket goes, which is how a session ends. The
+/// follow prints three lines for two requests, and exactly one of them is marked.
+#[test]
+fn a_followed_event_sent_again_with_its_status_is_marked_as_an_update() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let event = |seq: u32, status: &str, path: &str| {
+        format!(
+            "event seq={seq} at=1700000000000 port=443 verdict=allow proto=https reason=allowed\
+             {status} method=GET host=api.test path={path}\n"
+        )
+    };
+    for json in [false, true] {
+        let fx = Project::new("net");
+        let egress = fx.data_home.path().join("sbx").join("egress");
+        std::fs::create_dir_all(&egress).unwrap();
+        let pid = 55561u32;
+        let socket = egress.join(format!("control-{pid}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let replies = [
+            format!("head=1\namended=0\n{}ok\n", event(1, "", "/slow")),
+            format!(
+                "head=2\namended=1\n{}{}ok\n",
+                event(2, "", "/next"),
+                event(1, " status=200", "/slow")
+            ),
+        ];
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let server = std::thread::spawn(move || {
+            for reply in replies {
+                let (stream, _) = listener.accept().unwrap();
+                let mut cmd = String::new();
+                BufReader::new(&stream).read_line(&mut cmd).unwrap();
+                seen.lock().unwrap().push(cmd.trim_end().to_string());
+                (&stream).write_all(reply.as_bytes()).unwrap();
+            }
+            // The session ends: its socket goes, and the next read of the follow finds nothing.
+            std::fs::remove_file(&socket).unwrap();
+        });
+
+        let mut args = vec!["net", "logs", "--follow", "--with-status"];
+        if json {
+            args.push("--json");
+        }
+        let mut follower = fx
+            .cmd(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sbx net logs --follow");
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&lines);
+        let stdout = follower.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                sink.lock().unwrap().push(line);
+            }
+        });
+        // The line view says when the session ended; the NDJSON stream carries events only.
+        let done = |ls: &[String]| match json {
+            false => ls.iter().any(|l| l.contains("ended")),
+            true => ls.len() >= 3,
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done(&lines.lock().unwrap()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = follower.kill();
+        let _ = follower.wait();
+        server.join().unwrap();
+        let lines = lines.lock().unwrap().clone();
+        let all = lines.join("\n");
+
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(
+            asked[1].contains("after=1") && asked[1].contains("amended=0"),
+            "the second read carries both cursors: {asked:?}"
+        );
+        if json {
+            let objs: Vec<serde_json::Value> = lines
+                .iter()
+                .map(|l| serde_json::from_str(l).expect("one object per line"))
+                .collect();
+            let shape: Vec<(u64, &str, bool)> = objs
+                .iter()
+                .map(|o| {
+                    (
+                        o["seq"].as_u64().unwrap(),
+                        o["path"].as_str().unwrap(),
+                        o["update"].as_bool().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                shape,
+                [(1, "/slow", false), (2, "/next", false), (1, "/slow", true)],
+                "{all}"
+            );
+            assert_eq!(objs[2]["status"], serde_json::json!(200), "{all}");
+        } else {
+            let events: Vec<&String> = lines
+                .iter()
+                .filter(|l| l.contains("api.test:443"))
+                .collect();
+            assert_eq!(events.len(), 3, "{all}");
+            let marked: Vec<&&String> = events.iter().filter(|l| l.ends_with("update")).collect();
+            assert_eq!(marked.len(), 1, "exactly one line is the update:\n{all}");
+            assert!(
+                marked[0].contains("/slow") && marked[0].contains("200"),
+                "the update is the first request, with its status:\n{all}"
+            );
+        }
+    }
+}

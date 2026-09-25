@@ -230,12 +230,12 @@ proxy made. **Live-only**: the log lives in the running session's memory and is
 | `-n <N>` | the last `N` events (the listing is chronological, so this is a tail) |
 | `--all` | also show refusals a [`[network] mute`](../configuration/network) rule suppressed, tagged `muted`; they are counted in `stats` either way |
 | `--with-query` | keep the URL query in the shown path. Dropped by default because a token can ride in one; what is shown is already redacted, the proxy masking configured secret values before an event enters the log |
-| `--with-status` | add the upstream HTTP status the server answered, for a completed inspected-`https` request only: an L4 (`tcp://`) splice, a refusal or an `error` shows `-`, having no HTTP response to read. Distinct from the verdict: an allowed request can still get a 404. Under `--follow`, an event whose response has not returned yet prints once without a status and again carrying it, since a live tail cannot un-print a line |
+| `--with-status` | add the upstream HTTP status the server answered, for a completed inspected-`https` request only: an L4 (`tcp://`) splice, a refusal or an `error` shows `-`, having no HTTP response to read. Distinct from the verdict: an allowed request can still get a 404. Under `--follow`, an event whose response has not returned yet prints once without a status and again carrying it, tagged `update`, since a live tail cannot un-print a line |
 | `--with-headers` | the request and response heads that actually crossed (needs `capture`) |
 | `--with-body` | the leading bytes of each body as well (needs `capture = "bodies"`) |
 | `-f`, `--follow` | tail the log instead of printing a snapshot |
 | `-i <secs>` | the poll interval under `--follow` |
-| `--json` | one JSON object per event (NDJSON), for a pipe |
+| `--json` | one JSON object per event (NDJSON), for a pipe. Each carries `seq`, the event's number in its session; under `--follow`, each also carries `update`, `true` when it shows an event again |
 
 The four verdicts are a **superset** of the `stats` counters: `allow`, `deny` and
 `blocked` are the three `stats` records, and `error` is the extra one, a request

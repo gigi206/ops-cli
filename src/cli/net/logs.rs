@@ -276,7 +276,9 @@ pub(super) fn net_logs(args: &[OsString]) -> ExitCode {
 /// ring overflow between polls (`dropped` > 0) is announced, never dropped silently. A session that
 /// ends (its control socket vanishes) is noted once; a new one is picked up. Runs until interrupted
 /// (Ctrl-C); the append shape is pipe-friendly (unlike `pending watch`'s in-place redraw), so it
-/// needs no terminal. The `--follow` NDJSON stream (`--json`) emits one event object per line.
+/// needs no terminal. The `--follow` NDJSON stream (`--json`) emits one event object per line. An
+/// event the session sends again once its status or traffic arrived is marked as such
+/// ([`render_followed`]).
 fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> ExitCode {
     use std::collections::HashMap;
     use std::fmt::Write as _;
@@ -304,15 +306,16 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         for s in &sessions {
             let c = ctx_of(&context, s.pid);
             for e in filtered_log_events(&s.snapshot.events, view) {
-                let obj = log_event_json(
+                let cap = capture_of(&s.snapshot, e.seq, view);
+                seed.push_str(&render_followed(
                     e,
                     s.pid,
-                    c.as_ref().map(|(p, _)| p.as_str()),
-                    c.as_ref().map(|(_, l)| l.as_str()),
+                    false,
+                    c.as_ref(),
+                    cap,
                     view,
-                    capture_of(&s.snapshot, e.seq, view),
-                );
-                let _ = writeln!(seed, "{obj}");
+                    pal,
+                ));
             }
         }
     } else if has_events {
@@ -405,35 +408,21 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
             if !new.is_empty() {
                 let c = ctx_of(&context, pid);
                 for e in new {
-                    if view.json {
-                        let obj = log_event_json(
-                            e,
+                    // A session header only when the stream switches sessions, so a single-session
+                    // follow does not repeat it every event.
+                    if !view.json && last_pid != Some(pid) {
+                        write_session_header_line(
+                            &mut tick,
                             pid,
-                            c.as_ref().map(|(p, _)| p.as_str()),
-                            c.as_ref().map(|(_, l)| l.as_str()),
-                            view,
-                            capture_of(&snap, e.seq, view),
+                            c.as_ref()
+                                .map(|(proj, label)| (label.as_str(), proj.as_str())),
+                            pal,
                         );
-                        let _ = writeln!(tick, "{obj}");
-                    } else {
-                        // A session header only when the stream switches sessions, so a single-session
-                        // follow does not repeat it every event.
-                        if last_pid != Some(pid) {
-                            write_session_header_line(
-                                &mut tick,
-                                pid,
-                                c.as_ref()
-                                    .map(|(proj, label)| (label.as_str(), proj.as_str())),
-                                pal,
-                            );
-                            last_pid = Some(pid);
-                        }
-                        let _ = writeln!(tick, "{}", render_log_line(e, pid, view, pal));
-                        tick.push_str(&render_sightings(e, pal));
-                        if let Some(cap) = capture_of(&snap, e.seq, view) {
-                            tick.push_str(&render_capture(cap, view, pal));
-                        }
+                        last_pid = Some(pid);
                     }
+                    let cap = capture_of(&snap, e.seq, view);
+                    let update = is_update(e, after);
+                    tick.push_str(&render_followed(e, pid, update, c.as_ref(), cap, view, pal));
                 }
             }
             cursor.insert(pid, (snap.head, snap.amend_head));
@@ -455,6 +444,55 @@ fn flush_stream(s: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
     out.write_all(s.as_bytes())?;
     out.flush()
+}
+
+/// Whether a `--follow` read handed back an event the stream has already printed. The session sends
+/// an event again when its status, its traffic or a sighting arrived after the stream passed it, and
+/// such an event is at or behind the cursor the read was made with, where a new one is past it. A
+/// session the stream reads for the first time (`after` is `None`) has shown nothing yet.
+fn is_update(e: &sandbox::control::LogEvent, after: Option<u64>) -> bool {
+    after.is_some_and(|cursor| e.seq <= cursor)
+}
+
+/// One event as the `--follow` stream appends it: an NDJSON object, or the human line with its
+/// sightings and captured traffic under it. `context` is the session's project and label.
+///
+/// `update` marks an event the stream has already printed ([`is_update`]). The copy is marked so it
+/// reads as the same exchange rather than as a second request: the JSON object carries
+/// `"update": true`, and the line ends with an `update` tag. Every object the stream writes carries
+/// the field, so a consumer can keep `update == false` to count requests.
+fn render_followed(
+    e: &sandbox::control::LogEvent,
+    pid: u32,
+    update: bool,
+    context: Option<&(String, String)>,
+    capture: Option<&sandbox::control::Capture>,
+    view: &LogView,
+    pal: &style::Palette,
+) -> String {
+    if view.json {
+        let mut obj = log_event_json(
+            e,
+            pid,
+            context.map(|(project, _)| project.as_str()),
+            context.map(|(_, label)| label.as_str()),
+            view,
+            capture,
+        );
+        obj["update"] = update.into();
+        return format!("{obj}\n");
+    }
+    let (dim, r) = (pal.dim, pal.reset);
+    let mut out = render_log_line(e, pid, view, pal);
+    if update {
+        out.push_str(&format!("  {dim}update{r}"));
+    }
+    out.push('\n');
+    out.push_str(&render_sightings(e, pal));
+    if let Some(cap) = capture {
+        out.push_str(&render_capture(cap, view, pal));
+    }
+    out
 }
 
 /// The ANSI span for a verdict: green for `allow`, red for a refusal (`deny`/`blocked`), yellow for
@@ -794,6 +832,9 @@ fn is_mostly_text(bytes: &[u8]) -> bool {
 /// (it fits u64); the path honors `--with-query`. The `status` field is included only under
 /// `--with-status` (a number for a completed L7 request, else null) — parity with `--with-query`.
 /// Shared so the two JSON paths cannot diverge.
+///
+/// `seq` is the event's number within its session, so `pid` and `seq` together name one event: the
+/// key a consumer of the `--follow` stream pairs a shown-again event with its first appearance by.
 fn log_event_json(
     e: &sandbox::control::LogEvent,
     pid: u32,
@@ -804,6 +845,7 @@ fn log_event_json(
 ) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "pid": pid,
+        "seq": e.seq,
         "project": project,
         "label": label,
         "at_epoch_ms": e.at_epoch_ms as u64,

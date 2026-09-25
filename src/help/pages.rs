@@ -3183,9 +3183,11 @@ pub(super) const PAGES: &[Page] = &[
             an error shows `-` (no HTTP response to read). This is the server's answer to a delivered\n\
             request, distinct from the egress verdict: an allowed request can still get a 404. Under\n\
             `--follow --with-status`, an event whose response has not yet returned first appears with\n\
-            no status, then reappears once — carrying its status — when the response lands (a live\n\
-            `tail` cannot un-print a line, so the status arrives as a follow-up); the one-shot\n\
-            listing shows each event's status directly.\n\
+            no status, then reappears once, carrying its status and tagged `update`, when the response\n\
+            lands (a live `tail` cannot un-print a line, so the status arrives as a follow-up); the\n\
+            one-shot listing shows each event's status directly. Under `--json`, each object carries\n\
+            `seq`, the event's number in its session, and under `--follow` also `update`, true on an\n\
+            event shown again: leaving those out counts each request once.\n\
             \n\
             A WebSocket is flagged `ws` on its line (it opens with a `101` status, which only an\n\
             upgrade produces) — shown even without `--with-status`, since a long-lived bidirectional\n\

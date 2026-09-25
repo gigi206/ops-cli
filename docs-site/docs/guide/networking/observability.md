@@ -521,6 +521,12 @@ exchange whose traffic is being captured appears first as a bare line, then **on
 more: complete, with its status and its traffic, when it finishes. A followed
 exchange is never printed piecemeal.
 
+A line that shows an event again is tagged `update`, so it reads as the same exchange
+and not as a second request. Under `--json`, every object of the stream carries
+`update` (`true` on such a line) and `seq`, the event's number in its session, which
+with `pid` pairs an update with the event's first line. Leaving the updates out
+counts each request once.
+
 The one exception is a **WebSocket**, which is genuinely several events rather than one:
 it appears when the tunnel opens (with its handshake), then as each direction's transcript
 fills, then once more at close if that changed anything. **Four lines of traffic** over the

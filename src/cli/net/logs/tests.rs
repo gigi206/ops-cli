@@ -631,6 +631,58 @@ fn a_websocket_event_is_flagged_ws_even_without_with_status() {
     );
 }
 
+/// Under `--follow`, an event the session sends again once its status or traffic arrived is the
+/// same exchange, and says so: the copy carries an `update` tag and `"update": true`, the first
+/// appearance carries neither, and every JSON object carries the `seq` that pairs the two. A reader
+/// counting the lines of a follow counts each request once by leaving the updates out.
+#[test]
+fn a_followed_event_shown_again_is_marked_as_the_same_exchange() {
+    use sandbox::control::LogVerdict::Allow;
+    let p = style::Palette::plain();
+    let ev = log_event(5, "api.test", Some("GET"), Some("/p"), Allow, "allowed");
+
+    // An update is an event at or behind the read's cursor; a session read for the first time has
+    // shown nothing yet.
+    assert!(!is_update(&ev, None));
+    assert!(is_update(&ev, Some(5)));
+    assert!(is_update(&ev, Some(9)));
+    assert!(!is_update(&ev, Some(4)));
+
+    let human = LogView {
+        follow: true,
+        ..LogView::default()
+    };
+    let first = render_followed(&ev, 7, false, None, None, &human, &p);
+    let again = render_followed(&ev, 7, true, None, None, &human, &p);
+    assert!(!first.contains("update"), "{first}");
+    assert_eq!(
+        again
+            .lines()
+            .next()
+            .and_then(|l| l.strip_suffix("  update")),
+        first.lines().next(),
+        "the copy is the first line with the tag appended:\n{first}{again}"
+    );
+
+    let json = LogView {
+        follow: true,
+        json: true,
+        ..LogView::default()
+    };
+    for update in [false, true] {
+        let line = render_followed(&ev, 7, update, None, None, &json, &p);
+        let obj: serde_json::Value = serde_json::from_str(line.trim_end()).expect("one object");
+        assert_eq!(obj["update"], serde_json::json!(update), "{line}");
+        assert_eq!(obj["seq"], serde_json::json!(5), "{line}");
+        assert_eq!(obj["pid"], serde_json::json!(7), "{line}");
+    }
+    // The one-shot listing names the event the same way, and has no update to mark: it shows each
+    // event once.
+    let once = log_event_json(&ev, 7, None, None, &LogView::default(), None);
+    assert_eq!(once["seq"], serde_json::json!(5));
+    assert!(once.get("update").is_none(), "{once}");
+}
+
 #[test]
 fn render_logs_groups_events_by_session_with_verdict_and_reason() {
     use sandbox::control::{LogVerdict::*, SessionLog};
