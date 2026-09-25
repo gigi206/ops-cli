@@ -169,13 +169,13 @@ dsh_dir="$dsh_root/node_modules/@deepseek-ai/dsh"
 # The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
 # which operations it offers), handed to the agent as instructions through a patch overlay that
 # inserts a second `dsh-agent-instructions` row. That row reads only the `AGENTS.md` of a home
-# directory staged under the cage's own `/etc`, a tmpfs, so both files live for this launch only and
-# never reach the host. It adds to the instructions: your `~/.dsh/AGENTS.md` and the project's
+# directory under the cage's own `/etc`, there a link to the summary; `/etc` is a tmpfs, so the link
+# and the patch live for this launch only and never reach the host. It adds to the instructions: your `~/.dsh/AGENTS.md` and the project's
 # files still load through the stock row. The persona options (`personaSuffix` and the like) are
 # left alone, because a patch replaces a row's whole config and the bundles already set them.
 patch=()
 if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/deepseek-harness/home 2>/dev/null; then
-  cp /opt/sbx/contract-summary.md /etc/deepseek-harness/home/AGENTS.md
+  ln -sf /opt/sbx/contract-summary.md /etc/deepseek-harness/home/AGENTS.md
   cat > /etc/deepseek-harness/contract.patch.yml <<'PATCH'
 - insert:
     - id: sbx-contract
