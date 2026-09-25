@@ -424,8 +424,10 @@ impl FakeIps {
 /// Where the tap reports what it saw: the names the cage asked for, and the connections it refused
 /// for want of one.
 ///
-/// The report goes to the proxy's control socket, so it lands in the same record `sbx net logs`
-/// reads rather than in a second place with its own reader. A report is never a prerequisite:
+/// The report goes to the proxy's report socket, so it lands in the same record `sbx net logs`
+/// reads rather than in a second place with its own reader. That socket answers the two reports
+/// and nothing else ([`super::control::serve_reports`]): the tap never holds the control socket,
+/// whose verbs decide egress. A report is never a prerequisite:
 /// every failure is swallowed, because a cage whose egress works must not lose it because a log
 /// line could not be delivered.
 ///
@@ -450,7 +452,7 @@ impl FakeIps {
 /// prerequisite — and the thing that is bounded is the one the cage controls.
 #[derive(Debug, Default)]
 pub(crate) struct Reporter {
-    /// The queue the sender thread drains; `None` when there is no control plane to report to,
+    /// The queue the sender thread drains; `None` when there is no report socket to report to,
     /// which is every test and any launch without one.
     outbox: Option<std::sync::mpsc::SyncSender<String>>,
 }
@@ -472,8 +474,8 @@ pub(crate) struct Reporter {
 const REPORT_BACKLOG: usize = 256;
 
 impl Reporter {
-    pub(crate) fn new(control: Option<PathBuf>) -> Self {
-        let Some(control) = control else {
+    pub(crate) fn new(report: Option<PathBuf>) -> Self {
+        let Some(report) = report else {
             return Self { outbox: None };
         };
         let (outbox, queue) = std::sync::mpsc::sync_channel::<String>(REPORT_BACKLOG);
@@ -482,7 +484,7 @@ impl Reporter {
         // last sender goes, which is this `Reporter` being dropped.
         std::thread::spawn(move || {
             for line in queue {
-                if let Ok(mut sock) = UnixStream::connect(&control) {
+                if let Ok(mut sock) = UnixStream::connect(&report) {
                     let _ = sock.set_write_timeout(Some(REPORT_TIMEOUT));
                     let _ = sock.write_all(line.as_bytes());
                     let _ = sock.flush();
@@ -872,12 +874,12 @@ pub(crate) fn serve_capture(
 /// Never returns: it serves until the cage exits, at which point the parent-death signal set by the
 /// holder takes it down with `bwrap`.
 pub(crate) fn run_tap(argv: &[OsString]) -> ! {
-    let Some((uds, control)) = parse_tap_args(argv) else {
-        eprintln!("__net-tap: usage: __net-tap <egress socket> [--control <socket>]");
+    let Some((uds, report)) = parse_tap_args(argv) else {
+        eprintln!("__net-tap: usage: __net-tap <egress socket> [--report <socket>]");
         std::process::exit(2);
     };
     let table = Arc::new(Mutex::new(FakeIps::new()));
-    let reporter = Arc::new(Reporter::new(control));
+    let reporter = Arc::new(Reporter::new(report));
 
     match serve(&uds, &table, &reporter) {
         Ok(()) => std::process::exit(0),
@@ -892,20 +894,20 @@ pub(crate) fn run_tap(argv: &[OsString]) -> ! {
 ///
 /// Strict, like the holder's own parse and for the same reason: an argument list this process does
 /// not fully understand is one it was not given by the launcher, and guessing at it would leave a
-/// tap serving with a wiring nobody chose. `--control` is the one option, and its absence costs the
+/// tap serving with a wiring nobody chose. `--report` is the one option, and its absence costs the
 /// cage nothing but the record — the tap still answers DNS and still captures.
 fn parse_tap_args(argv: &[OsString]) -> Option<(PathBuf, Option<PathBuf>)> {
     let uds = PathBuf::from(argv.first()?);
-    let mut control = None;
+    let mut report = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].to_str() {
-            Some("--control") => control = Some(PathBuf::from(argv.get(i + 1)?)),
+            Some("--report") => report = Some(PathBuf::from(argv.get(i + 1)?)),
             _ => return None,
         }
         i += 2;
     }
-    Some((uds, control))
+    Some((uds, report))
 }
 
 /// Bind the three listeners and serve them until the process is taken down.

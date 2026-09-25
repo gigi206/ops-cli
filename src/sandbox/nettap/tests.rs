@@ -657,9 +657,9 @@ fn the_cage_resolver_file_names_an_address_the_redirect_catches() {
     );
 }
 
-/// A stand-in control plane: collects the lines the tap reports, and answers `ok` like the real one.
-fn stand_in_control(uds: &Path) -> std::sync::mpsc::Receiver<String> {
-    let listener = UnixListener::bind(uds).expect("bind the stand-in control plane");
+/// A stand-in report socket: collects the lines the tap reports, and answers `ok` like the real one.
+fn stand_in_report_socket(uds: &Path) -> std::sync::mpsc::Receiver<String> {
+    let listener = UnixListener::bind(uds).expect("bind the stand-in report socket");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -685,9 +685,9 @@ fn stand_in_control(uds: &Path) -> std::sync::mpsc::Receiver<String> {
 #[test]
 fn a_name_is_reported_once_however_often_it_is_asked_for() {
     let dir = TmpDir::new();
-    let control = dir.join("control.sock");
-    let lines = stand_in_control(&control);
-    let reporter = Reporter::new(Some(control));
+    let report = dir.join("report.sock");
+    let lines = stand_in_report_socket(&report);
+    let reporter = Reporter::new(Some(report));
     let table = Mutex::new(FakeIps::new());
 
     for _ in 0..3 {
@@ -714,9 +714,9 @@ fn a_name_is_reported_once_however_often_it_is_asked_for() {
 #[test]
 fn a_question_that_gets_no_address_is_not_reported() {
     let dir = TmpDir::new();
-    let control = dir.join("control.sock");
-    let lines = stand_in_control(&control);
-    let reporter = Reporter::new(Some(control));
+    let report = dir.join("report.sock");
+    let lines = stand_in_report_socket(&report);
+    let reporter = Reporter::new(Some(report));
     let table = Mutex::new(FakeIps::new());
 
     answer_query(&query("github.com", 28 /* AAAA */), &table, &reporter).expect("answered");
@@ -733,9 +733,9 @@ fn a_question_that_gets_no_address_is_not_reported() {
 #[test]
 fn only_the_address_with_no_name_is_reported_to_the_record() {
     let dir = TmpDir::new();
-    let control = dir.join("control.sock");
-    let lines = stand_in_control(&control);
-    let reporter = Reporter::new(Some(control));
+    let report = dir.join("report.sock");
+    let lines = stand_in_report_socket(&report);
+    let reporter = Reporter::new(Some(report));
 
     for quiet in [
         Capture::Proxied {
@@ -773,7 +773,7 @@ fn only_the_address_with_no_name_is_reported_to_the_record() {
     );
 }
 
-/// Reporting is never a prerequisite: a tap wired without a control plane, or pointed at a socket
+/// Reporting is never a prerequisite: a tap wired without a report socket, or pointed at a socket
 /// nothing serves, must answer DNS exactly the same. A cage whose egress works must not lose it
 /// because a log line could not be delivered.
 #[test]
@@ -796,29 +796,35 @@ fn a_reporter_with_nowhere_to_report_still_answers() {
 #[test]
 fn the_taps_arguments_are_parsed_strictly() {
     let sock = OsString::from("/run/sbx/egress.sock");
-    let control = OsString::from("/run/sbx/control.sock");
+    let report = OsString::from("/run/sbx/report.sock");
 
     let (uds, reported) =
         parse_tap_args(std::slice::from_ref(&sock)).expect("the socket alone is enough");
     assert_eq!(uds, PathBuf::from("/run/sbx/egress.sock"));
     assert_eq!(
         reported, None,
-        "no control socket is a tap that reports nothing"
+        "no report socket is a tap that reports nothing"
     );
 
-    let (_, reported) =
-        parse_tap_args(&[sock.clone(), OsString::from("--control"), control.clone()])
-            .expect("with a control socket");
-    assert_eq!(reported, Some(PathBuf::from("/run/sbx/control.sock")));
+    let (_, reported) = parse_tap_args(&[sock.clone(), OsString::from("--report"), report.clone()])
+        .expect("with a report socket");
+    assert_eq!(reported, Some(PathBuf::from("/run/sbx/report.sock")));
 
     assert_eq!(parse_tap_args(&[]), None, "no socket at all");
     assert_eq!(
-        parse_tap_args(&[sock.clone(), OsString::from("--control")]),
+        parse_tap_args(&[sock.clone(), OsString::from("--report")]),
         None,
         "a flag with no value"
     );
+    // The flag the tap reported through before it had a socket of its own: a launcher still
+    // passing it is handing over the control socket, which this process must not accept.
     assert_eq!(
-        parse_tap_args(&[sock, OsString::from("--unknown"), control]),
+        parse_tap_args(&[sock.clone(), OsString::from("--control"), report.clone()]),
+        None,
+        "the control socket is not the tap's to report on"
+    );
+    assert_eq!(
+        parse_tap_args(&[sock, OsString::from("--unknown"), report]),
         None,
         "an option this process does not understand"
     );

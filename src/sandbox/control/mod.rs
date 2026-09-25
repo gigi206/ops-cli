@@ -1497,11 +1497,12 @@ impl FlowRegistry {
 
 /// Everything a control command is served against, shared in from the proxy that holds them.
 ///
-/// One value rather than a parameter each, because they travel as a set: `serve` clones the whole
-/// set onto every connection's thread, and the dispatcher reaches for a different member per verb.
-/// The two `Option`s are the planes a launch may not have configured, and a verb that writes to one
-/// must keep answering when it is absent — a tap does not stop reporting because no register was
-/// asked for.
+/// One value rather than a parameter each, because they travel as a set: `serve` shares the whole
+/// set with every connection's thread, and the dispatcher reaches for a different member per verb.
+/// The `Option` is the plane a launch may not have configured.
+///
+/// The durable counters are not here: the only verb that writes them is the tap's `RESOLVED`,
+/// which [`serve_reports`] serves on a socket of its own.
 pub(crate) struct Planes {
     /// The `ask` queue a decision is parked in.
     pub(crate) state: Arc<PendingState>,
@@ -1513,8 +1514,6 @@ pub(crate) struct Planes {
     pub(crate) flows: Arc<FlowRegistry>,
     /// The head/body ring, when `[network] capture` asked for one.
     pub(crate) capture: Option<Arc<CaptureRing>>,
-    /// The durable counters, when the launch keeps them.
-    pub(crate) stats: Option<Arc<super::egress_stats::EgressStats>>,
 }
 
 /// Serve the control socket: one short-lived thread per connection, each handling exactly one
@@ -1525,10 +1524,62 @@ pub(crate) fn serve(
     planes: Planes,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
+    accept_each(listener, &stop, "egress control", None, move |cmd| {
+        dispatch(
+            cmd,
+            &planes.state,
+            &planes.manual,
+            &planes.log,
+            &planes.flows,
+            planes.capture.as_deref(),
+        )
+    });
+    Ok(())
+}
+
+/// The most report connections served at once. The transparent-capture tap reports from a single
+/// thread, one connection at a time, so a handful covers a slow control plane; the ceiling is for a
+/// peer that opens more.
+const REPORT_CONNS: usize = 8;
+
+/// Serve the transparent-capture tap's report socket: the same one-command connections as
+/// [`serve`], answered by [`report`] alone.
+///
+/// The tap parses bytes the cage writes, so it is the one peer of the control plane that runs next
+/// to the workload. It was handed the owner's socket, whose other verbs answer parked requests and
+/// remember rules, so a flaw in the tap would have been a way to decide egress. This server is
+/// handed the event ring and the durable counters and nothing else: the owner's verbs are not
+/// refused here, they are out of its reach.
+pub(crate) fn serve_reports(
+    listener: UnixListener,
+    log: Arc<LogRing>,
+    stats: Option<Arc<super::egress_stats::EgressStats>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> io::Result<()> {
+    let cap = super::conncap::ConnCap::new(REPORT_CONNS);
+    accept_each(listener, &stop, "egress reports", Some(cap), move |cmd| {
+        report(cmd, &log, stats.as_deref())
+    });
+    Ok(())
+}
+
+/// The accept loop of both of this module's sockets: each connection on a thread of its own,
+/// answered by `dispatch`, until `stop` is set. With a `cap`, a connection past the ceiling is
+/// closed unanswered.
+fn accept_each<F>(
+    listener: UnixListener,
+    stop: &std::sync::atomic::AtomicBool,
+    who: &'static str,
+    cap: Option<super::conncap::ConnCap>,
+    dispatch: F,
+) where
+    F: Fn(&str) -> String + Send + Sync + 'static,
+{
+    let dispatch = Arc::new(dispatch);
     for stream in listener.incoming() {
         // See [`super::proxy::serve`]: the owner sets this and pokes the socket to unpark `accept`.
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(());
+            return;
         }
         let stream = match stream {
             Ok(s) => s,
@@ -1542,32 +1593,26 @@ pub(crate) fn serve(
                 // of the launch. Every `sbx net` verb then failed for a session that was otherwise
                 // running fine, while the socket file stayed on disk (only `Egress::drop` unlinks
                 // it) and `session_pids` kept reporting the pid, so nothing said the control plane
-                // was gone. The doc three lines up already stated the rule this broke: "A
+                // was gone. The doc of [`serve`] already stated the rule this broke: "A
                 // per-connection error is that connection's problem, never the server's."
-                crate::diag::error(&format!("sbx: egress control: accept error: {e}"));
+                crate::diag::error(&format!("sbx: {who}: accept error: {e}"));
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
         };
-        let state = planes.state.clone();
-        let manual = planes.manual.clone();
-        let log = planes.log.clone();
-        let flows = planes.flows.clone();
-        let capture = planes.capture.clone();
-        let stats = planes.stats.clone();
-        super::conncap::spawn_conn("egress control", move || {
-            let _ = handle(
-                stream,
-                &state,
-                &manual,
-                &log,
-                &flows,
-                capture.as_deref(),
-                stats.as_deref(),
-            );
+        let slot = match &cap {
+            Some(cap) => match cap.take() {
+                Some(slot) => Some(slot),
+                None => continue,
+            },
+            None => None,
+        };
+        let dispatch = Arc::clone(&dispatch);
+        super::conncap::spawn_conn(who, move || {
+            let _slot = slot;
+            let _ = handle(stream, dispatch.as_ref());
         });
     }
-    Ok(())
 }
 
 /// The largest control command accepted. Most commands are short (`ALLOW <seq>`), but `REMEMBER
@@ -1595,17 +1640,8 @@ pub(crate) const UNCONFIRMED: &str = "err unconfirmed";
 const REPLY_MAX: u64 = 8 * 1024;
 
 /// Handle one control connection: read a single command line, dispatch it, write the response, and
-/// close. The socket is owner-only and host-side, so the peer is trusted; the bound read and the
-/// timeout are belt-and-braces against a stuck or malformed caller.
-fn handle(
-    stream: UnixStream,
-    state: &PendingState,
-    manual: &ManualRules,
-    log: &LogRing,
-    flows: &FlowRegistry,
-    capture: Option<&CaptureRing>,
-    stats: Option<&super::egress_stats::EgressStats>,
-) -> io::Result<()> {
+/// close. The bound read and the timeout hold against a stuck or malformed caller on either socket.
+fn handle(stream: UnixStream, dispatch: &dyn Fn(&str) -> String) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(CMD_MAX));
@@ -1618,7 +1654,7 @@ fn handle(
     // ([`client`]), where a partial host would be persisted by `--save`.
     let response = match n as u64 >= CMD_MAX && !line.ends_with('\n') {
         true => "err bad-request\n".to_string(),
-        false => dispatch(line.trim(), state, manual, log, flows, capture, stats),
+        false => dispatch(line.trim()),
     };
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
@@ -1641,11 +1677,8 @@ fn handle(
 /// cursor. `path` is emitted last on a `pending`/`event` line so a query string's `=` cannot be
 /// mistaken for a field separator (the reader splits each token on its first `=`).
 ///
-/// `RESOLVED <host>` and `BYPASSED <addr> <port>` are the transparent-capture tap's two reports —
-/// the names a cage asked for, and a connection it made to an address no name was handed out for —
-/// and both answer `ok`. They are the only verbs whose argument originates in the cage's own
-/// traffic, which is why each is held to a type or a restricted alphabet before it becomes a
-/// record.
+/// The transparent-capture tap's reports are not verbs of this socket: they arrive on the tap's own
+/// ([`report`]), and here they are a bad request like any other unknown word.
 fn dispatch(
     cmd: &str,
     state: &PendingState,
@@ -1653,7 +1686,6 @@ fn dispatch(
     log: &LogRing,
     flows: &FlowRegistry,
     capture: Option<&CaptureRing>,
-    stats: Option<&super::egress_stats::EgressStats>,
 ) -> String {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
@@ -1801,75 +1833,6 @@ fn dispatch(
             out.push_str("ok\n");
             out
         }
-        // The transparent-capture tap reporting a name the cage asked for. It is a *write* on a
-        // socket whose other verbs already answer parked requests and remember policy, so it adds
-        // no authority: anything that can reach this socket could already decide egress, and the
-        // socket is bound under the 0700 data directory and never bound into a cage.
-        //
-        // One line per name, not per query: the tap sends this when it first hands a name an
-        // address, so a build resolving one host a thousand times leaves one entry, and what the
-        // record answers is "which names did this cage ask for" rather than "how often".
-        Some("RESOLVED") => {
-            let Some(host) = parts.next() else {
-                return "err bad-request\n".to_string();
-            };
-            // The host is cage-chosen text. It arrives already restricted to name bytes by the
-            // tap's own parser, and `push` sanitises every free-form value again on the way in —
-            // the second layer being the one that holds if this verb ever gains another caller.
-            log.push(
-                false,
-                host,
-                53,
-                None,
-                None,
-                LogVerdict::Resolved,
-                "resolved",
-                Proto::Dns,
-                HttpVer::Unknown,
-                RpcKind::None,
-                Plane::Agent,
-            );
-            // Counted as well as logged. The ring above is bounded, so a cage that asks for enough
-            // names carries its own earlier entries off the end of it; this is the one number that
-            // survives that, and it is why the durable register hears from the tap at all.
-            if let Some(stats) = stats {
-                stats.record_resolution();
-            }
-            "ok\n".to_string()
-        }
-        Some("BYPASSED") => {
-            // Machine-checked rather than merely sanitised: this verb carries an address the tap
-            // read off a socket, so anything that does not parse as one is a bad request instead of
-            // a log line. The refusal is the tap's own — the connection never reached the proxy, so
-            // without this the one thing transparent capture makes visible would be visible only in
-            // the session's stderr.
-            let Some(addr) = parts
-                .next()
-                .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
-            else {
-                return "err bad-request\n".to_string();
-            };
-            let Some(port) = parts.next().and_then(|p| p.parse::<u16>().ok()) else {
-                return "err bad-request\n".to_string();
-            };
-            log.push(
-                false,
-                &addr.to_string(),
-                port,
-                None,
-                None,
-                LogVerdict::Blocked,
-                // Not the proxy's `ip-literal`, which has a different remedy: that one is admitted
-                // by a rule naming the address, and this one cannot be — the tap has no name to
-                // decide with. A reader who sees this must make the client resolve the name.
-                "dns-bypassed",
-                Proto::Tcp,
-                HttpVer::Unknown,
-                RpcKind::None,
-                Plane::Agent,
-            );
-            "ok\n".to_string()
-        }
         Some("LOG") => {
             // An optional `after=<seq>` makes this a follow read (events past the cursor, with the
             // eviction gap reported); absent, it is a tail read of the whole retained window. An
@@ -1936,6 +1899,84 @@ fn dispatch(
             }
             out.push_str("ok\n");
             out
+        }
+        _ => "err bad-request\n".to_string(),
+    }
+}
+
+/// Map one of the transparent-capture tap's reports to its response, on the socket
+/// [`serve_reports`] serves. `RESOLVED <host>` records a name the cage asked for, and
+/// `BYPASSED <addr> <port>` a connection it made to an address no name was handed out for; both
+/// answer `ok`. Any other verb, the owner's included, is `err bad-request`.
+///
+/// They are the only verbs whose argument originates in the cage's own traffic, which is why each
+/// is held to a type or a restricted alphabet before it becomes a record.
+fn report(cmd: &str, log: &LogRing, stats: Option<&super::egress_stats::EgressStats>) -> String {
+    let mut parts = cmd.split_whitespace();
+    match parts.next() {
+        // One line per name, not per query: the tap sends this when it first hands a name an
+        // address, so a build resolving one host a thousand times leaves one entry, and what the
+        // record answers is "which names did this cage ask for" rather than "how often".
+        Some("RESOLVED") => {
+            let Some(host) = parts.next() else {
+                return "err bad-request\n".to_string();
+            };
+            // The host is cage-chosen text. It arrives already restricted to name bytes by the
+            // tap's own parser, and `push` sanitises every free-form value again on the way in —
+            // the second layer being the one that holds if this verb ever gains another caller.
+            log.push(
+                false,
+                host,
+                53,
+                None,
+                None,
+                LogVerdict::Resolved,
+                "resolved",
+                Proto::Dns,
+                HttpVer::Unknown,
+                RpcKind::None,
+                Plane::Agent,
+            );
+            // Counted as well as logged. The ring above is bounded, so a cage that asks for enough
+            // names carries its own earlier entries off the end of it; this is the one number that
+            // survives that, and it is why the durable register hears from the tap at all.
+            if let Some(stats) = stats {
+                stats.record_resolution();
+            }
+            "ok\n".to_string()
+        }
+        Some("BYPASSED") => {
+            // Machine-checked rather than merely sanitised: this verb carries an address the tap
+            // read off a socket, so anything that does not parse as one is a bad request instead of
+            // a log line. The refusal is the tap's own — the connection never reached the proxy, so
+            // without this the one thing transparent capture makes visible would be visible only in
+            // the session's stderr.
+            let Some(addr) = parts
+                .next()
+                .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
+            else {
+                return "err bad-request\n".to_string();
+            };
+            let Some(port) = parts.next().and_then(|p| p.parse::<u16>().ok()) else {
+                return "err bad-request\n".to_string();
+            };
+            log.push(
+                false,
+                &addr.to_string(),
+                port,
+                None,
+                None,
+                LogVerdict::Blocked,
+                // Not the proxy's `ip-literal`, which has a different remedy: that one is admitted
+                // by a rule naming the address, and this one cannot be — the tap has no name to
+                // decide with. A reader who sees this must make the client resolve the name.
+                "dns-bypassed",
+                Proto::Tcp,
+                HttpVer::Unknown,
+                RpcKind::None,
+                Plane::Agent,
+            );
+            "ok\n".to_string()
         }
         _ => "err bad-request\n".to_string(),
     }
@@ -2364,7 +2405,7 @@ mod tests {
                 let (log, flows) = (log.clone(), flows.clone());
                 thread::spawn(move || {
                     let cmd = format!("ALLOW {target} session");
-                    dispatch(&cmd, &state, &manual, &log, &flows, None, None)
+                    dispatch(&cmd, &state, &manual, &log, &flows, None)
                 })
             };
             let rule = crate::allowlist::host_port_rule("api.test", port);
@@ -2428,7 +2469,7 @@ mod tests {
                 let (log, flows) = (log.clone(), flows.clone());
                 thread::spawn(move || {
                     let cmd = format!("ALLOW {target} session");
-                    dispatch(&cmd, &state, &manual, &log, &flows, None, None)
+                    dispatch(&cmd, &state, &manual, &log, &flows, None)
                 })
             };
             // The answer is waiting for its confirmation once its rule is in the supervisor's copy.
@@ -2490,7 +2531,7 @@ mod tests {
             let (log, flows) = (log.clone(), flows.clone());
             thread::spawn(move || {
                 let cmd = format!("ALLOW {seq} session");
-                dispatch(&cmd, &state, &manual, &log, &flows, None, None)
+                dispatch(&cmd, &state, &manual, &log, &flows, None)
             })
         };
         let rule = crate::allowlist::host_port_rule("api.test", 443);
@@ -2544,7 +2585,7 @@ mod tests {
             let (log, flows) = (log.clone(), flows.clone());
             thread::spawn(move || {
                 let cmd = format!("ALLOW {seq} session");
-                dispatch(&cmd, &state, &manual, &log, &flows, None, None)
+                dispatch(&cmd, &state, &manual, &log, &flows, None)
             })
         };
         let rule = crate::allowlist::host_port_rule("api.test", 8080);
@@ -2552,15 +2593,7 @@ mod tests {
         while !manual.snapshot().0.contains(&rule) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
-        let other = dispatch(
-            &format!("DENY {seq}"),
-            &state,
-            &manual,
-            &log,
-            &flows,
-            None,
-            None,
-        );
+        let other = dispatch(&format!("DENY {seq}"), &state, &manual, &log, &flows, None);
         drop(stall);
         let reply = answer.join().unwrap();
         state.answer_all(Verdict::Deny);
@@ -2585,15 +2618,7 @@ mod tests {
         let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
         let seq = wait_for_one(&state);
         assert_eq!(
-            dispatch(
-                &format!("ALLOW {seq}"),
-                &state,
-                &manual,
-                &log,
-                &flows,
-                None,
-                None
-            ),
+            dispatch(&format!("ALLOW {seq}"), &state, &manual, &log, &flows, None),
             "ok host=api.test count=1\n"
         );
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
@@ -2613,13 +2638,12 @@ mod tests {
             &log,
             &flows,
             None,
-            None,
         );
         parked.join().unwrap();
         assert_eq!(manual.snapshot().0.len(), 1, "`… session` must remember");
         // And `RULES` reports the remembered rule with its exact port.
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows, None, None)
+            dispatch("RULES", &state, &manual, &log, &flows, None)
                 .contains("manual allow https://api.test:8080"),
             "RULES must list the remembered host:port"
         );
@@ -2632,26 +2656,15 @@ mod tests {
     /// newly makes visible — a client that reached an address without ever asking for a name —
     /// would appear only in the session's stderr, which is not where a refusal is looked for.
     #[test]
-    fn dispatch_bypassed_records_the_address_no_name_was_handed_out_for() {
+    fn report_bypassed_records_the_address_no_name_was_handed_out_for() {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let log = LogRing::new(LOG_RING_CAP);
         let flows = FlowRegistry::new();
 
-        assert_eq!(
-            dispatch(
-                "BYPASSED 198.18.0.7 443",
-                &state,
-                &manual,
-                &log,
-                &flows,
-                None,
-                None
-            ),
-            "ok\n"
-        );
+        assert_eq!(report("BYPASSED 198.18.0.7 443", &log, None), "ok\n");
 
-        let out = dispatch("LOG", &state, &manual, &log, &flows, None, None);
+        let out = dispatch("LOG", &state, &manual, &log, &flows, None);
         let line = out
             .lines()
             .find(|l| l.starts_with("event "))
@@ -2679,39 +2692,17 @@ mod tests {
     fn a_reported_resolution_reaches_the_durable_count_and_is_a_no_op_without_one() {
         use crate::sandbox::egress_stats::EgressStats;
         use crate::testutil::TmpDir;
-        let state = PendingState::new();
-        let manual = ManualRules::new();
         let log = LogRing::new(LOG_RING_CAP);
-        let flows = FlowRegistry::new();
 
         // No register: the verb still answers, and nothing panics on the way.
-        assert_eq!(
-            dispatch(
-                "RESOLVED unregistered.test",
-                &state,
-                &manual,
-                &log,
-                &flows,
-                None,
-                None
-            ),
-            "ok\n"
-        );
+        assert_eq!(report("RESOLVED unregistered.test", &log, None), "ok\n");
 
         let dir = TmpDir::new();
         let path = dir.path().join("stats-1-11");
         let stats = EgressStats::new(path.clone(), "/home/u/proj".into(), None);
         for host in ["a.test", "b.test"] {
             assert_eq!(
-                dispatch(
-                    &format!("RESOLVED {host}"),
-                    &state,
-                    &manual,
-                    &log,
-                    &flows,
-                    None,
-                    Some(&stats)
-                ),
+                report(&format!("RESOLVED {host}"), &log, Some(&stats)),
                 "ok\n"
             );
         }
@@ -2734,7 +2725,7 @@ mod tests {
     /// one is a bad request and leaves no row, rather than becoming a record of something the tap
     /// never saw.
     #[test]
-    fn dispatch_bypassed_refuses_anything_that_is_not_an_address() {
+    fn report_bypassed_refuses_anything_that_is_not_an_address() {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let log = LogRing::new(LOG_RING_CAP);
@@ -2752,13 +2743,67 @@ mod tests {
             "BYPASSED ::1 443",
         ] {
             assert_eq!(
-                dispatch(bad, &state, &manual, &log, &flows, None, None),
+                report(bad, &log, None),
                 "err bad-request\n",
                 "`{bad}` must be refused"
             );
         }
         assert!(
-            !dispatch("LOG", &state, &manual, &log, &flows, None, None).contains("event "),
+            !dispatch("LOG", &state, &manual, &log, &flows, None).contains("event "),
+            "a refused report must leave no row"
+        );
+    }
+
+    /// The owner's verbs, each in a form the owner's socket would carry out.
+    const OWNER_VERBS: [&str; 11] = [
+        "LIST",
+        "ALLOW 1",
+        "ALLOW 1 session",
+        "DENY 1",
+        "ALLOW *",
+        "DENY *",
+        "REMEMBER ALLOW https://api.test",
+        "REMEMBER DENY https://api.test",
+        "REMEMBER MUTE https://api.test",
+        "RULES",
+        "LOG",
+    ];
+
+    /// The tap's socket answers its two reports and nothing else. The tap parses what the cage
+    /// writes, so a verb that answers a parked request or remembers a rule must not be reachable
+    /// from it, however the command is spelled.
+    #[test]
+    fn the_report_socket_answers_no_owner_verb() {
+        let log = LogRing::new(LOG_RING_CAP);
+        for verb in OWNER_VERBS.iter().chain(&["FLOWS", ""]) {
+            assert_eq!(
+                report(verb, &log, None),
+                "err bad-request\n",
+                "`{verb}` must not be answered on the tap's socket"
+            );
+        }
+        assert!(
+            log.snapshot(None, None, true).events.is_empty(),
+            "a refusal leaves no row"
+        );
+    }
+
+    /// And the owner's socket takes no report: each socket has one peer and that peer's verbs.
+    #[test]
+    fn the_owner_socket_takes_no_tap_report() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
+        for verb in ["RESOLVED api.test", "BYPASSED 198.18.0.7 443"] {
+            assert_eq!(
+                dispatch(verb, &state, &manual, &log, &flows, None),
+                "err bad-request\n",
+                "`{verb}` belongs to the tap's socket"
+            );
+        }
+        assert!(
+            !dispatch("LOG", &state, &manual, &log, &flows, None).contains("event "),
             "a refused report must leave no row"
         );
     }
@@ -2780,32 +2825,23 @@ mod tests {
                 &manual,
                 &log,
                 &flows,
-                None,
                 None
             ),
             "ok\n"
         );
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows, None, None)
+            dispatch("RULES", &state, &manual, &log, &flows, None)
                 .contains("manual allow https://*.foo.test"),
             "REMEMBER must load the rule"
         );
 
         // A malformed rule (a `*` catch-all) and a missing kind/rule are `err bad-request`.
         assert_eq!(
-            dispatch(
-                "REMEMBER ALLOW *",
-                &state,
-                &manual,
-                &log,
-                &flows,
-                None,
-                None
-            ),
+            dispatch("REMEMBER ALLOW *", &state, &manual, &log, &flows, None),
             "err bad-request\n"
         );
         assert_eq!(
-            dispatch("REMEMBER ALLOW", &state, &manual, &log, &flows, None, None),
+            dispatch("REMEMBER ALLOW", &state, &manual, &log, &flows, None),
             "err bad-request\n"
         );
 
@@ -2818,7 +2854,6 @@ mod tests {
                 &manual,
                 &log,
                 &flows,
-                None,
                 None
             ),
             "ok\n"
@@ -2843,7 +2878,7 @@ mod tests {
         // …and `RULES` reports it as a `manual mute` line, so `sbx net rules --source session` lists
         // a live mute (distinct from the allow/deny lines).
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows, None, None)
+            dispatch("RULES", &state, &manual, &log, &flows, None)
                 .contains("manual mute https://play.googleapis.com"),
             "RULES must list a live mute"
         );
@@ -2999,7 +3034,7 @@ mod tests {
         flows.open(1, "api.test", 8443, Proto::Https);
         flows.count(1, 100, 200);
 
-        let resp = dispatch("FLOWS", &state, &manual, &log, &flows, None, None);
+        let resp = dispatch("FLOWS", &state, &manual, &log, &flows, None);
         assert!(resp.ends_with("ok\n"), "the reply ends with ok: {resp:?}");
         let parsed: Vec<FlowSnapshot> = resp.lines().filter_map(parse_flow_line).collect();
         assert_eq!(parsed.len(), 1, "one open flow is listed");
@@ -3012,7 +3047,7 @@ mod tests {
         // An empty registry lists no flow, just `ok`.
         flows.close(1);
         assert_eq!(
-            dispatch("FLOWS", &state, &manual, &log, &flows, None, None),
+            dispatch("FLOWS", &state, &manual, &log, &flows, None),
             "ok\n"
         );
     }
@@ -3044,7 +3079,6 @@ mod tests {
                     log: Arc::new(LogRing::new(LOG_RING_CAP)),
                     flows: Arc::new(FlowRegistry::new()),
                     capture: None,
-                    stats: None,
                 },
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             );
@@ -3091,7 +3125,6 @@ mod tests {
                     log,
                     flows,
                     capture: None,
-                    stats: None,
                 },
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             );
@@ -3137,7 +3170,6 @@ mod tests {
                         log: Arc::new(LogRing::new(LOG_RING_CAP)),
                         flows: Arc::new(FlowRegistry::new()),
                         capture: None,
-                        stats: None,
                     },
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );
@@ -3219,7 +3251,6 @@ mod tests {
                         log,
                         flows,
                         capture: None,
-                        stats: None,
                     },
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );
@@ -3294,7 +3325,6 @@ mod tests {
                         log,
                         flows,
                         capture: None,
-                        stats: None,
                     },
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );
@@ -3411,7 +3441,6 @@ mod tests {
                 &manual,
                 &log,
                 &flows,
-                None,
                 None
             ),
             "err not-found\n",
@@ -3420,15 +3449,7 @@ mod tests {
 
         // Untagged, as an older `sbx` sends it: answered, which is the behaviour this field is a
         // strict addition to rather than a replacement of.
-        let reply = dispatch(
-            &format!("ALLOW {seq}"),
-            &state,
-            &manual,
-            &log,
-            &flows,
-            None,
-            None,
-        );
+        let reply = dispatch(&format!("ALLOW {seq}"), &state, &manual, &log, &flows, None);
         assert!(reply.starts_with("ok host=api.test"), "{reply}");
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
     }
@@ -3540,7 +3561,7 @@ mod tests {
             )
         });
         wait_for_one(&state);
-        let response = dispatch("LIST", &state, &manual, &log, &flows, None, None);
+        let response = dispatch("LIST", &state, &manual, &log, &flows, None);
         let line = response.lines().next().expect("the pending line");
 
         // The reader's own contract, applied here so the assertion is the parse and not a guess at
@@ -3614,7 +3635,7 @@ mod tests {
         // response lines come back in a deterministic oldest-first order.
         let _ = park_next(&state, "x.test", 8080, 0);
         let _ = park_next(&state, "y.test", 8080, 1);
-        let response = dispatch("DENY *", &state, &manual, &log, &flows, None, None);
+        let response = dispatch("DENY *", &state, &manual, &log, &flows, None);
         assert_eq!(response, "answered host=x.test\nanswered host=y.test\nok\n");
         assert!(
             manual.snapshot().1.is_empty(),
@@ -3624,13 +3645,13 @@ mod tests {
         // `ALLOW * session` drains and remembers each host:port as a manual rule.
         let _ = park_next(&state, "p.test", 8080, 0);
         let _ = park_next(&state, "q.test", 8080, 1);
-        let _ = dispatch("ALLOW * session", &state, &manual, &log, &flows, None, None);
+        let _ = dispatch("ALLOW * session", &state, &manual, &log, &flows, None);
         let (allow, _) = manual.snapshot();
         assert_eq!(allow.len(), 2, "`* session` remembers each answered host");
 
         // An empty queue replies a clean `ok` with no `answered` lines.
         assert_eq!(
-            dispatch("ALLOW *", &state, &manual, &log, &flows, None, None),
+            dispatch("ALLOW *", &state, &manual, &log, &flows, None),
             "ok\n"
         );
     }
@@ -3663,7 +3684,6 @@ mod tests {
                         log,
                         flows,
                         capture: None,
-                        stats: None,
                     },
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );
@@ -4271,7 +4291,6 @@ mod tests {
                         log,
                         flows,
                         capture: None,
-                        stats: None,
                     },
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );

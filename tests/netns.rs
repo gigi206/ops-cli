@@ -93,7 +93,8 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
     );
 }
 
-/// A query to the cage's resolver is answered through the capture tap, over UDP.
+/// A query to the cage's resolver is answered through the capture tap, over UDP, and the name
+/// reaches the report socket the holder handed the tap.
 ///
 /// The cage's resolver is off loopback (`nettap::CAGE_RESOLVER`), so a query leaves with `dummy0`'s
 /// address as its source, the `nat` chain bends it to the tap, and the tap answers at that address.
@@ -101,6 +102,9 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 /// and every client resolving over UDP waited out its timeout. The query is written by hand rather
 /// than asked of `getent`, which would ask the host's resolver: that one is on loopback, and its
 /// answer never met the refusal.
+///
+/// The report is sent from a thread of the tap's own after the answer, and the tap ends with the
+/// command, so the command waits for the report to land before it exits.
 #[test]
 fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     let python = std::path::Path::new("/usr/bin/python3");
@@ -117,8 +121,23 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     let dir = TmpDir::new("tapdns");
     let egress = dir.join("egress.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&egress).expect("bind egress socket");
+    // The report socket: its first line is written to `reported`, which the command waits for.
+    let report = dir.join("report.sock");
+    let reported = dir.join("reported");
+    let listener = std::os::unix::net::UnixListener::bind(&report).expect("bind report socket");
+    {
+        let reported = reported.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            if let Ok((stream, _)) = listener.accept() {
+                let mut line = String::new();
+                let _ = std::io::BufReader::new(stream).read_line(&mut line);
+                let _ = std::fs::write(&reported, line.trim());
+            }
+        });
+    }
     let query = r#"
-import socket, struct
+import os, socket, struct, sys, time
 q = struct.pack(">HHHHHH", 0x5b5b, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 1, 1)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(3)
@@ -130,15 +149,23 @@ except OSError as e:
 else:
     count = struct.unpack(">H", r[6:8])[0]
     print("answer", count, socket.inet_ntoa(r[-4:]) if count else "-")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not os.path.exists(sys.argv[1]):
+        time.sleep(0.05)
+    if os.path.exists(sys.argv[1]):
+        print("reported", open(sys.argv[1]).read())
 "#;
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["__netns-holder", "--tap"])
         .arg(&egress)
         .arg("--nft")
         .arg(&nft)
+        .arg("--report")
+        .arg(&report)
         .arg("--")
         .arg(python)
         .args(["-c", query])
+        .arg(&reported)
         .output()
         .expect("spawn sbx __netns-holder");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -157,12 +184,23 @@ else:
         return;
     }
     // One address, out of the tap's own range (`198.18.0.0/15`).
-    let answered = match stdout.split_whitespace().collect::<Vec<_>>().as_slice() {
+    let answered = match stdout
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["answer", "1", addr] => addr.starts_with("198.18.") || addr.starts_with("198.19."),
         _ => false,
     };
     assert!(
         answered,
         "the tap's answer did not come back: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == "reported RESOLVED example.com"),
+        "the name must reach the report socket: {stdout}{stderr}"
     );
 }

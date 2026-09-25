@@ -81,10 +81,11 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
 /// The proxy runs in a process of its own ([`super::proxy::child`]) and stops when its link ends, so
 /// [`Drop`] closes the link and gives the process a moment before it kills it.
 ///
-/// The control thread [`start`] spawns is detached and holds its listening fd, and
-/// [`super::control::serve`] does not return on its own: `UnixListener::incoming()` yields forever,
-/// and the loop deliberately treats every `accept(2)` error as transient (log, sleep 20 ms,
-/// continue) so host fd exhaustion cannot take a session's control plane down.
+/// The control and report threads [`start`] spawns are detached and each holds its listening fd,
+/// and neither [`super::control::serve`] nor [`super::control::serve_reports`] returns on its own:
+/// `UnixListener::incoming()` yields forever, and the loop deliberately treats every `accept(2)`
+/// error as transient (log, sleep 20 ms, continue) so host fd exhaustion cannot take a session's
+/// control plane down.
 ///
 /// While the only `Egress` was the session's, that cost nothing: "until sbx exits" and "until the
 /// launch ends" named the same instant. They are not the same instant for the per-invocation proxy
@@ -92,8 +93,8 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
 /// dropped when the invocation finishes, so a session running N task invocations would accumulate
 /// N parked threads and N listening sockets nothing would ever connect to again.
 ///
-/// So the guard carries a stop flag the loop reads, and [`Drop`] sets it and then connects once to
-/// the socket to unpark the `accept`. It has to be a flag plus a poke: a `shutdown(2)` on the
+/// So the guard carries a stop flag both loops read, and [`Drop`] sets it and then connects once to
+/// each socket to unpark its `accept`. It has to be a flag plus a poke: a `shutdown(2)` on the
 /// listener would be read as one more transient accept error and turn the parked thread into a
 /// 50 Hz error-logging spin, and `close(2)` is worse still — an `EBADF` spin, plus an fd-reuse
 /// hazard against the thread's own eventual close.
@@ -103,6 +104,9 @@ pub(crate) struct Egress {
     /// The per-session control socket (pending answers + the live egress log), present whenever the
     /// proxy runs — always `Some` here, an `Option` only so the guard's unlink stays uniform.
     control_uds: Option<PathBuf>,
+    /// The transparent-capture tap's report socket ([`super::control::serve_reports`]), bound and
+    /// torn down beside the control socket and stopped by the same flag.
+    report_uds: PathBuf,
     /// The session's per-host decision counters, when stats are on. The guard owns a flush on a
     /// graceful exit — but unlike the socket and CA, the session stat file is **not** removed: it
     /// persists for `sbx net stats` to aggregate after the session ends (cleared by `--reset`).
@@ -112,8 +116,8 @@ pub(crate) struct Egress {
     /// `sbx app <name> --net-learn` synthesizes rules from. The proxy appends to it; this is a
     /// read handle.
     log: Arc<super::control::LogRing>,
-    /// The stop signal the control loop reads, set by [`Drop`]: the header above says why the
-    /// thread cannot be ended any other way.
+    /// The stop signal the control and report loops read, set by [`Drop`]: the header above says
+    /// why the threads cannot be ended any other way.
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// The supervisor's end of the link to the proxy, held so [`Drop`] and
     /// [`Self::observed_events`] can ask the proxy to wait until what it reported is applied, and so
@@ -196,11 +200,13 @@ impl Drop for Egress {
         if let Some(control) = &self.control_uds {
             let _ = std::os::unix::net::UnixStream::connect(control);
         }
+        let _ = std::os::unix::net::UnixStream::connect(&self.report_uds);
         let _ = std::fs::remove_file(&self.host_uds);
         let _ = std::fs::remove_file(&self.ca_file);
         if let Some(control) = &self.control_uds {
             let _ = std::fs::remove_file(control);
         }
+        let _ = std::fs::remove_file(&self.report_uds);
         // A final flush for a graceful exit; the per-decision flush already keeps the file current
         // for the common case of a killed session, where this Drop never runs.
         if let Some(stats) = &self.stats {
@@ -218,10 +224,11 @@ pub(crate) struct Wiring {
     /// transparent-capture tap ([`super::nettap`]) dials it by this real path, from outside the
     /// cage's mount namespace, so the launcher has to carry it out of here.
     pub(crate) host_uds: PathBuf,
-    /// This proxy's control socket, or `None` under a posture that stands no control plane. The tap
-    /// reports each name the cage resolves through it, so the resolutions land in the same record
-    /// `sbx net logs` reads — the alternative being a second place to look.
-    pub(crate) control_uds: Option<PathBuf>,
+    /// The socket the tap reports on ([`super::control::serve_reports`]): each name the cage
+    /// resolves, so the resolutions land in the same record `sbx net logs` reads, and each address
+    /// it reached without one. Not the control socket, whose verbs decide egress: the tap parses
+    /// what the cage writes and is handed this one alone.
+    pub(crate) report_uds: PathBuf,
     /// The destinations this proxy will attach a credential to, rendered, for the in-cage
     /// contract to name.
     ///
@@ -1098,10 +1105,17 @@ pub(crate) fn start(
     // Bind+listen here, before the serving thread, so the control plane is reachable the moment the
     // launch is up: never a race with the first `sbx net pending`/`sbx net log`.
     let control_listener = UnixListener::bind(&control_uds).map_err(&unlink_socket)?;
+    // The tap's own socket, bound beside it and before either thread starts, so a failure here has
+    // only the two paths to take back. The tap reports on it, never on the owner's socket above.
+    let report_uds = dir.join(format!("report-{pid}{instance}.sock"));
+    let _ = std::fs::remove_file(&report_uds);
+    let report_listener = UnixListener::bind(&report_uds).map_err(|e| {
+        let _ = std::fs::remove_file(&control_uds);
+        unlink_socket(e)
+    })?;
     {
         let control_log = log.clone();
         let control_capture = capture;
-        let control_stats = stats.clone();
         let control_stop = stop.clone();
         std::thread::spawn(move || {
             let _ = super::control::serve(
@@ -1112,9 +1126,19 @@ pub(crate) fn start(
                     log: control_log,
                     flows,
                     capture: control_capture,
-                    stats: control_stats,
                 },
                 control_stop,
+            );
+        });
+    }
+    {
+        let (report_log, report_stats, report_stop) = (log.clone(), stats.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let _ = super::control::serve_reports(
+                report_listener,
+                report_log,
+                report_stats,
+                report_stop,
             );
         });
     }
@@ -1139,6 +1163,8 @@ pub(crate) fn start(
             let _ = std::os::unix::net::UnixStream::connect(control);
             let _ = std::fs::remove_file(control);
         }
+        let _ = std::os::unix::net::UnixStream::connect(&report_uds);
+        let _ = std::fs::remove_file(&report_uds);
         unlink_socket(e)
     };
 
@@ -1235,6 +1261,7 @@ pub(crate) fn start(
             host_uds: host_uds.clone(),
             ca_file,
             control_uds: control_uds.clone(),
+            report_uds: report_uds.clone(),
             stats,
             log,
             stop,
@@ -1246,7 +1273,7 @@ pub(crate) fn start(
             binds,
             env,
             host_uds,
-            control_uds: control_uds.clone(),
+            report_uds,
             authenticated,
             withdrawn,
         },
@@ -2233,6 +2260,20 @@ mod tests {
                 .any(|b| b.src == control || b.dest == control),
             "the control socket must not be a cage bind"
         );
+        // The tap's report socket is a second one, host-side as well, and no more a cage bind.
+        let report = wiring.report_uds.clone();
+        assert_ne!(
+            report, control,
+            "the tap must not report on the control socket"
+        );
+        assert!(report.exists(), "the report socket must be bound host-side");
+        assert!(
+            !wiring
+                .binds
+                .iter()
+                .any(|b| b.src == report || b.dest == report),
+            "the report socket must not be a cage bind"
+        );
         drop(guard);
         // the guard unlinks every artifact when the launch ends — the new control socket included
         assert!(!host_uds.exists(), "the socket must be unlinked on drop");
@@ -2240,6 +2281,10 @@ mod tests {
         assert!(
             !control.exists(),
             "the control socket must be unlinked on drop"
+        );
+        assert!(
+            !report.exists(),
+            "the report socket must be unlinked on drop"
         );
     }
 
@@ -2286,7 +2331,7 @@ mod tests {
     #[test]
     fn the_guard_unlinks_every_path_it_owns() {
         let dir = TmpDir::new();
-        let paths: Vec<PathBuf> = ["proxy.sock", "ca.pem", "control.sock"]
+        let paths: Vec<PathBuf> = ["proxy.sock", "ca.pem", "control.sock", "report.sock"]
             .iter()
             .map(|name| {
                 let path = dir.path().join(name);
@@ -2299,6 +2344,7 @@ mod tests {
             host_uds: paths[0].clone(),
             ca_file: paths[1].clone(),
             control_uds: Some(paths[2].clone()),
+            report_uds: paths[3].clone(),
             stats: None,
             log: Arc::new(super::super::control::LogRing::new(
                 super::super::control::LOG_RING_CAP,
@@ -2310,6 +2356,72 @@ mod tests {
         for path in &paths {
             assert!(!path.exists(), "left behind: {}", path.display());
         }
+    }
+
+    /// One command on the socket at `path`, and its whole reply.
+    fn ask(path: &Path, cmd: &str) -> String {
+        use std::io::{Read, Write};
+        let mut sock = std::os::unix::net::UnixStream::connect(path).expect("connect");
+        sock.write_all(format!("{cmd}\n").as_bytes()).unwrap();
+        let mut reply = String::new();
+        sock.read_to_string(&mut reply).unwrap();
+        reply
+    }
+
+    /// The tap's socket, as a launch binds it, takes the tap's reports into the session's record
+    /// and nothing that decides egress: a rule sent there is refused and never reaches the rules
+    /// the owner's socket lists.
+    #[test]
+    fn the_report_socket_records_the_taps_reports_and_remembers_no_rule() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let ask_policy = EgressPolicy::default().with_default(crate::allowlist::DefaultAction::Ask);
+        let (guard, wiring) = start(
+            &layout,
+            ask_policy,
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            false,
+            None,
+            "-6",
+            None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            None,
+            Plane::Agent,
+            None,
+            Unresolved::Abort,
+            None,
+        )
+        .expect("start the ask egress proxy");
+        let control = guard.control_uds.clone().expect("a control socket");
+        let report = wiring.report_uds.clone();
+
+        for verb in ["REMEMBER ALLOW https://api.test", "ALLOW *", "RULES", "LOG"] {
+            assert_eq!(
+                ask(&report, verb),
+                "err bad-request\n",
+                "`{verb}` must be refused on the tap's socket"
+            );
+        }
+        assert_eq!(ask(&control, "RULES"), "ok\n", "no rule was remembered");
+
+        assert_eq!(ask(&report, "RESOLVED api.test"), "ok\n");
+        let log = ask(&control, "LOG");
+        assert!(
+            log.lines()
+                .any(|l| l.starts_with("event ") && l.contains("host=api.test")),
+            "the report reaches the session's record: {log}"
+        );
+        assert_eq!(
+            ask(&control, "RESOLVED other.test"),
+            "err bad-request\n",
+            "the owner's socket takes no report"
+        );
+        drop(guard);
     }
 
     /// What the cage's trust anchor holds answers to two things, and the test keeps them apart.

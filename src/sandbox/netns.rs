@@ -58,9 +58,9 @@ pub(crate) fn holder_wrap(
                 argv.push(tap.uds.as_os_str().to_owned());
                 argv.push(OsString::from("--nft"));
                 argv.push(tap.nft.as_os_str().to_owned());
-                if let Some(control) = &tap.control {
-                    argv.push(OsString::from("--control"));
-                    argv.push(control.as_os_str().to_owned());
+                if let Some(report) = &tap.report {
+                    argv.push(OsString::from("--report"));
+                    argv.push(report.as_os_str().to_owned());
                 }
             }
             // Always emitted, tap or no tap: it is what makes the command unambiguous to parse, so
@@ -83,20 +83,20 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
     let rest = &rest[1..];
     let mut uds = None;
     let mut nft = None;
-    let mut control = None;
+    let mut report = None;
     let mut i = 0;
     while i < opts.len() {
         match opts[i].to_str() {
             Some("--tap") => uds = opts.get(i + 1).map(PathBuf::from),
             Some("--nft") => nft = opts.get(i + 1).map(PathBuf::from),
-            Some("--control") => control = opts.get(i + 1).map(PathBuf::from),
+            Some("--report") => report = opts.get(i + 1).map(PathBuf::from),
             _ => return None,
         }
         i += 2;
     }
     let tap = match (uds, nft) {
-        (Some(uds), Some(nft)) => Some(TapWiring { uds, nft, control }),
-        // Half a wiring is not one: the launcher emits both or neither. The control socket is not
+        (Some(uds), Some(nft)) => Some(TapWiring { uds, nft, report }),
+        // Half a wiring is not one: the launcher emits both or neither. The report socket is not
         // part of that pair: without it the tap still captures, it just reports no resolutions.
         _ => None,
     };
@@ -233,8 +233,8 @@ fn wire_tap(tap: &TapWiring) {
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__net-tap").arg(&tap.uds);
-    if let Some(control) = &tap.control {
-        cmd.arg("--control").arg(control);
+    if let Some(report) = &tap.report {
+        cmd.arg("--report").arg(report);
     }
     let mut child = match cmd
         .stdin(std::process::Stdio::null())
@@ -778,7 +778,7 @@ mod tests {
             tap: Some(TapWiring {
                 uds: PathBuf::from("/run/sbx/proxy.sock"),
                 nft: PathBuf::from("/usr/sbin/nft"),
-                control: Some(PathBuf::from("/run/sbx/control.sock")),
+                report: Some(PathBuf::from("/run/sbx/report.sock")),
             }),
         }
     }
@@ -798,8 +798,8 @@ mod tests {
                 OsString::from("/run/sbx/proxy.sock"),
                 OsString::from("--nft"),
                 OsString::from("/usr/sbin/nft"),
-                OsString::from("--control"),
-                OsString::from("/run/sbx/control.sock"),
+                OsString::from("--report"),
+                OsString::from("/run/sbx/report.sock"),
                 OsString::from("--"),
                 OsString::from("/usr/bin/bwrap"),
                 OsString::from("--cap-drop"),

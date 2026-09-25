@@ -237,10 +237,12 @@ pub(crate) struct TapWiring {
     pub(super) uds: PathBuf,
     /// The `nft` binary that installs the redirect rules.
     pub(super) nft: PathBuf,
-    /// The proxy's control socket, where the tap reports each name the cage resolves so the
-    /// resolutions land in the same record `sbx net logs` reads. `None` leaves the tap serving DNS
-    /// silently: it is a report, not a prerequisite, and its absence never costs the cage egress.
-    pub(super) control: Option<PathBuf>,
+    /// The proxy's report socket, where the tap reports each name the cage resolves so the
+    /// resolutions land in the same record `sbx net logs` reads. Never the control socket: that
+    /// one's verbs decide egress, and the tap parses what the cage writes. `None` leaves the tap
+    /// serving DNS silently: it is a report, not a prerequisite, and its absence never costs the
+    /// cage egress.
+    pub(super) report: Option<PathBuf>,
 }
 
 impl SandboxSpec {

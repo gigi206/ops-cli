@@ -7389,7 +7389,6 @@ fn a_session_injected_allow_makes_a_request_proceed_without_parking() {
                     log,
                     flows,
                     capture: None,
-                    stats: None,
                 },
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             );
