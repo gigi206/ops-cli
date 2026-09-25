@@ -37,7 +37,27 @@
 #    (OpenRouter, Requesty, ModelScope, …) authenticate with a key you paste; the Qwen OAuth
 #    free tier was discontinued on 2026-04-15, so there is no browser OAuth loopback to forward.
 #    The allowlist already opens the Dashscope + Coding Plan hosts the keyed flows hit.
-cmd = "qwen"
+#
+# The command hands Qwen Code the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) through `--append-system-prompt`, which adds
+# to the system prompt: the instructions in `~/.qwen/QWEN.md` still apply. Without it the agent's
+# own prompt tells the model it runs outside any sandbox. `--append-system-prompt` takes text rather
+# than a path, so the file is read here and passed as one argument, never evaluated; a summary too
+# large for one argument is left out rather than stopping the launch. `--system-prompt` and
+# `QWEN_SYSTEM_MD` would replace the system prompt instead. Arguments after
+# `sbx app run qwen-code --` reach Qwen Code verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+if [ -r "$SBX_CONTRACT_SUMMARY" ] && [ "$(wc -c < "$SBX_CONTRACT_SUMMARY")" -lt 100000 ]; then
+  exec qwen --append-system-prompt "$(cat "$SBX_CONTRACT_SUMMARY")" "$@"
+fi
+exec qwen "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "qwen",
+]
 
 # AUDIO — Qwen Code ships an `@qwen-code/audio-capture` dependency, so it may grow a mic
 # capture path. When it does, `audio = true` provisions the PulseAudio client + the
