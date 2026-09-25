@@ -893,15 +893,6 @@ fn every_unwatched_tree_is_named_in_the_file_feed_page() {
     );
 }
 
-/// Every refusal category the proxy's own reference table lists is named in the guide's list of
-/// them.
-///
-/// Both lists claim to be complete, and both are written by hand, so a new category lands in the
-/// table beside the code that emits it and the guide keeps a shorter list that still says
-/// "every refusal". That is what happened: five categories, `asked-denied` among them, were
-/// answered by the proxy and shown by `sbx net logs` while appearing nowhere in the guide, so a
-/// reader who met one had no page to look it up on.
-///
 /// Every check `sbx doctor` can print is named on the page that explains its output.
 ///
 /// `doctor`'s lines are the first thing a new user reads, and the page carries both a sample run
@@ -948,6 +939,15 @@ fn every_check_doctor_prints_is_named_on_its_page() {
     }
 }
 
+/// Every refusal category the proxy's own reference table lists is named in the guide's list of
+/// them.
+///
+/// Both lists claim to be complete, and both are written by hand, so a new category lands in the
+/// table beside the code that emits it and the guide keeps a shorter list that still says
+/// "every refusal". That is what happened: five categories, `asked-denied` among them, were
+/// answered by the proxy and shown by `sbx net logs` while appearing nowhere in the guide, so a
+/// reader who met one had no page to look it up on.
+///
 /// The rustdoc table is the source of truth because it sits next to the emitting code; this only
 /// asserts that the guide names each of its tokens. It says nothing about the reverse direction:
 /// the guide legitimately names sub-categories (`bad-request:head`) that are not rows of their own,
