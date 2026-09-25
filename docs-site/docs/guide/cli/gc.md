@@ -48,6 +48,16 @@ an empty one. So `sbx gc` fails closed, differently per scope, and says which on
 The verbs that only report are not gated: [`sbx projects`](projects) still lists every
 tree, with the state `unknown` in place of a `live`/`idle` finding nothing established.
 
+## When the store holds an entry nix did not make
+
+A project's store is writable from inside its cage, and `nix-store` runs on it on the host,
+at each launch and in `sbx gc`. So before `nix-store` starts, what it writes to is checked:
+its database directory, its lock and root directories, its temporary roots and its
+deduplication pool must be real directories, and the database files, its locks and the
+temporary roots must be regular files. A symlink or anything else in their place stops the
+launch or the collection with that entry's path, and `nix-store` does not run. The entry is
+left where it is, so you can see it: remove it by hand, then run again.
+
 ## Runtime files
 
 A launch stands up per-launch plumbing under the data directory: the egress MITM CA and

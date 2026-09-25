@@ -237,6 +237,9 @@ pub(crate) fn prepare(
     // read-write into the cage, so a component may be a symlink the cage left pointing anywhere.
     // See [`ensure_dir_chain`] — the seed below copies the whole base closure into this directory.
     let project_paths = ensure_dir_chain(&store_dir, "store")?;
+    // Before the first `nix-store` run, and before the early return below: `sbx gc` runs its own
+    // `nix-store` calls on this store once this returns, so the check covers those too.
+    ensure_nix_state(&store_dir)?;
 
     // Enumerate the closure to copy and register. Passing no roots would make
     // `--dump-db` dump the *whole* shared database, so an empty request seeds
@@ -701,6 +704,75 @@ fn ensure_dir_chain(store_dir: &Path, rel: &str) -> io::Result<PathBuf> {
     super::cagedir::ensure_under(store_dir, &format!("nix/{rel}"), DIR_MODE)
 }
 
+/// The directories under `nix/` that `nix-store` writes into when it opens a store: the database,
+/// the gc roots, the temporary roots, the gc socket and the deduplication pool.
+const NIX_STATE_DIRS: &[&str] = &[
+    "store/.links",
+    "var/nix/db",
+    "var/nix/gcroots",
+    "var/nix/temproots",
+    "var/nix/gc-socket",
+];
+
+/// The files under `nix/` that `nix-store` opens for writing: the database with its journals and
+/// locks, and the gc lock.
+const NIX_STATE_FILES: &[&str] = &[
+    "var/nix/db/big-lock",
+    "var/nix/db/db.sqlite",
+    "var/nix/db/db.sqlite-journal",
+    "var/nix/db/db.sqlite-shm",
+    "var/nix/db/db.sqlite-wal",
+    "var/nix/db/reserved",
+    "var/nix/db/schema",
+    "var/nix/gc.lock",
+];
+
+/// Check the part of `store_dir`'s tree that `nix-store` writes, before any `nix-store` runs on it.
+///
+/// `nix-store` runs on the host, as the user, against a tree the cage rewrites at will (see
+/// [`ensure_dir_chain`]), and it opens each name below by path. So each directory of
+/// [`NIX_STATE_DIRS`] must be a real directory, each file of [`NIX_STATE_FILES`] that exists must
+/// be a regular file, and so must every entry of `temproots`, which `nix-store` names after its
+/// own pid. Anything else is refused before `nix-store` is started, and left in place for the user
+/// to see.
+///
+/// A missing directory is created, as `nix-store` would create it. The names are checked, not held:
+/// the tree is still the cage's between this check and the `nix-store` run, which is why a live
+/// cage keeps `sbx gc` away from its store.
+fn ensure_nix_state(store_dir: &Path) -> io::Result<()> {
+    for rel in NIX_STATE_DIRS {
+        ensure_dir_chain(store_dir, rel)?;
+    }
+    let nix = store_dir.join("nix");
+    for rel in NIX_STATE_FILES {
+        refuse_unless_file(&nix.join(rel))?;
+    }
+    for entry in fs::read_dir(nix.join("var/nix/temproots"))? {
+        refuse_unless_file(&entry?.path())?;
+    }
+    Ok(())
+}
+
+/// Refuse `path` when it exists and is not a regular file. `lstat`, so a symlink is reported as
+/// one rather than judged by what it points at; an entry that is gone is no refusal.
+fn refuse_unless_file(path: &Path) -> io::Result<()> {
+    let kind = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => return Ok(()),
+        Ok(meta) if meta.file_type().is_symlink() => "a symlink",
+        Ok(_) => "not a regular file",
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "`{}` is {kind}, where `nix-store` keeps a file of its own. This tree is writable by \
+             the cage, so `nix-store` is not run on it until that entry is removed by hand",
+            path.display()
+        ),
+    ))
+}
+
 /// Register each logical `roots` path (`/nix/store/<hash>-name`) as a direct gc root in
 /// `store_dir`'s store, so `nix-store --gc` keeps it and its closure. A root is a symlink
 /// `gcroots/<hash-name> -> /nix/store/<hash-name>` — the relocated store interprets that
@@ -980,6 +1052,182 @@ mod tests {
             ensure_dir_chain(&store_dir, "var/nix/gcroots").unwrap(),
             made
         );
+    }
+
+    /// A stand-in for `nix-store` that appends each run's arguments to `ran` and prints nothing,
+    /// which [`prepare`] reads as an empty closure. It tells whether `nix-store` was started at all.
+    fn fake_nix_store(dir: &Path, ran: &Path) -> PathBuf {
+        let path = dir.join("nix-store");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// [`prepare`], waiting out the `ETXTBSY` a just-written executable meets under the parallel
+    /// runner, which says nothing about `prepare` itself.
+    fn prepare_past_etxtbsy(
+        nix_store: &Path,
+        layout: &Layout,
+        roots: &[PathBuf],
+    ) -> io::Result<()> {
+        for _ in 0..100 {
+            match prepare(nix_store, layout, "p", roots) {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => return other.map(drop),
+            }
+        }
+        panic!("the fake nix-store stayed held open for writing by another thread");
+    }
+
+    /// `nix-store` runs on the host, as the user, on a tree the cage writes, and opens by path the
+    /// directories and files it keeps there. Each one the cage replaced is refused before
+    /// `nix-store` starts, and left in place.
+    #[test]
+    fn nix_store_is_not_started_on_a_store_whose_state_the_cage_replaced() {
+        let roots = [PathBuf::from(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-base",
+        )];
+        // Every directory `nix-store` writes into, with each ancestor below `nix/`.
+        let dirs = [
+            "store/.links",
+            "var",
+            "var/nix",
+            "var/nix/db",
+            "var/nix/gcroots",
+            "var/nix/temproots",
+            "var/nix/gc-socket",
+        ];
+        // Every file it opens there, and a temporary root, which it names after its own pid.
+        let files = [
+            "var/nix/db/big-lock",
+            "var/nix/db/db.sqlite",
+            "var/nix/db/db.sqlite-journal",
+            "var/nix/db/db.sqlite-shm",
+            "var/nix/db/db.sqlite-wal",
+            "var/nix/db/reserved",
+            "var/nix/db/schema",
+            "var/nix/gc.lock",
+            "var/nix/temproots/4242",
+        ];
+        let cases = dirs
+            .iter()
+            .map(|rel| (*rel, true))
+            .chain(files.iter().map(|rel| (*rel, false)));
+
+        for (rel, is_dir) in cases {
+            let base = TmpDir::new();
+            let layout = Layout::under(&base.join("data"));
+            let store_dir = store_dir_for(&layout, "p");
+            let ran = base.join("ran");
+            let nix_store = fake_nix_store(base.path(), &ran);
+            let elsewhere = base.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("held"), b"held\n").unwrap();
+            let target = if is_dir {
+                elsewhere.clone()
+            } else {
+                elsewhere.join("held")
+            };
+
+            let planted = store_dir.join("nix").join(rel);
+            std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            symlink(&target, &planted).unwrap();
+
+            let err = prepare_past_etxtbsy(&nix_store, &layout, &roots)
+                .err()
+                .unwrap_or_else(|| panic!("a symlink at nix/{rel} must be refused"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "nix/{rel}: {err}");
+            assert!(
+                err.to_string().contains("is a symlink"),
+                "nix/{rel}: the refusal must name what it found: {err}"
+            );
+            assert!(
+                !ran.exists(),
+                "nix/{rel}: nix-store was started on the store before the refusal"
+            );
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).unwrap().count(),
+                1,
+                "nix/{rel}: something was written where the link points"
+            );
+            assert_eq!(std::fs::read(elsewhere.join("held")).unwrap(), b"held\n");
+            assert_eq!(
+                std::fs::read_link(&planted).unwrap(),
+                target,
+                "nix/{rel}: the planted link must be left for the user to see"
+            );
+        }
+
+        // Not a link, but still not what `nix-store` keeps there: refused the same way.
+        for (rel, make) in [("var/nix/db", "file"), ("var/nix/db/db.sqlite", "dir")] {
+            let base = TmpDir::new();
+            let layout = Layout::under(&base.join("data"));
+            let ran = base.join("ran");
+            let nix_store = fake_nix_store(base.path(), &ran);
+            let planted = store_dir_for(&layout, "p").join("nix").join(rel);
+            std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            if make == "file" {
+                std::fs::write(&planted, b"").unwrap();
+            } else {
+                std::fs::create_dir(&planted).unwrap();
+            }
+            let err = prepare_past_etxtbsy(&nix_store, &layout, &roots)
+                .err()
+                .unwrap_or_else(|| panic!("a {make} at nix/{rel} must be refused"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "nix/{rel}: {err}");
+            assert!(!ran.exists(), "nix/{rel}: nix-store was started");
+        }
+    }
+
+    /// And a store whose state is its own is still handed to `nix-store`, first seed or not: a
+    /// check that refused everything would pass the test above while stopping every launch.
+    #[test]
+    fn a_store_whose_state_is_its_own_is_handed_to_nix_store() {
+        let roots = [PathBuf::from(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-base",
+        )];
+        for seeded_before in [false, true] {
+            let base = TmpDir::new();
+            let layout = Layout::under(&base.join("data"));
+            let nix = store_dir_for(&layout, "p").join("nix");
+            if seeded_before {
+                std::fs::create_dir_all(nix.join("var/nix/db")).unwrap();
+                std::fs::create_dir_all(nix.join("var/nix/temproots")).unwrap();
+                for file in [
+                    "var/nix/db/db.sqlite",
+                    "var/nix/gc.lock",
+                    "var/nix/temproots/77",
+                ] {
+                    std::fs::write(nix.join(file), b"").unwrap();
+                }
+            }
+            let ran = base.join("ran");
+            let nix_store = fake_nix_store(base.path(), &ran);
+
+            prepare_past_etxtbsy(&nix_store, &layout, &roots)
+                .unwrap_or_else(|e| panic!("seeded before: {seeded_before}: {e}"));
+
+            let runs = std::fs::read_to_string(&ran).unwrap_or_default();
+            assert!(
+                runs.contains("--load-db"),
+                "seeded before: {seeded_before}: nix-store never registered the seed: {runs:?}"
+            );
+            for dir in [
+                "store/.links",
+                "var/nix/db",
+                "var/nix/temproots",
+                "var/nix/gc-socket",
+            ] {
+                let meta = std::fs::symlink_metadata(nix.join(dir)).unwrap();
+                assert!(meta.is_dir(), "nix/{dir} is not a real directory");
+            }
+        }
     }
 
     #[test]
