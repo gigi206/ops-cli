@@ -60,6 +60,14 @@
 # out of the shipped application).
 cmd = "junie"
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers) handed to Junie through `--ide-guidelines`, whose file Junie prepends
+# to the guidelines it already loads rather than replacing them, so a refused host or a read-only
+# file reads as the sandbox rather than as a fault to work around. The option reaches Junie ahead of
+# the task and of `--version`/`--help`; whether the model acts on it was not measured. Bound to this
+# `cmd`: a project that sets its own `cmd` for this app writes its own `contract`, or has none.
+contract = { arg = "--ide-guidelines" }
+
 # Your host Junie install/config, mounted read-write at its real absolute path. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
 # lets the caged `junie` read and write these host files. Uncomment to share your host Junie setup

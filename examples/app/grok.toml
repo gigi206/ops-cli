@@ -44,7 +44,26 @@
 # UNVERIFIED (like every profile until run with a real key/account): the live authentication and
 # the model traffic through sbx's MITM. Grounded here: the packaging (xAI's own bucket and the
 # channel file its updater reads), the endpoints, and the environment keys.
-cmd = "grok"
+# The command hands Grok the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) through `--rules`, which Grok appends to its system
+# prompt in a `<human_rules>` block next to the project's rules, so a refused host or a read-only
+# file reads as the sandbox rather than as a fault to work around. `--rules` takes text rather than
+# a path, so the file is read here and passed as one argument, never evaluated; a summary too large
+# for one argument is left out rather than stopping the launch. Arguments after
+# `sbx app run grok --` reach Grok verbatim through `"$@"`, subcommands included. Whether the model
+# acts on it was not measured.
+cmd = [
+    "bash",
+    "-c",
+    '''
+if [ -r "$SBX_CONTRACT_SUMMARY" ] && [ "$(wc -c < "$SBX_CONTRACT_SUMMARY")" -lt 100000 ]; then
+  exec grok --rules "$(cat "$SBX_CONTRACT_SUMMARY")" "$@"
+fi
+exec grok "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "grok",
+]
 
 # Your host Grok config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
