@@ -286,8 +286,62 @@ fn command(bwrap: &Path, link: wire::Socket) -> io::Result<(Command, Vec<File>)>
     )?;
     let (mut command, mut files) = selfcage::command(bwrap, &spec, binary)?;
     files.push(File::from(OwnedFd::from(link)));
-    command.stdout(Stdio::null());
+    // Its standard error is a pipe [`relay_stderr`] reads, never this process's own descriptor: a
+    // detached session starts its proxy before it moves its output to the session log, and a
+    // proxy holding the invoker's stderr would keep it open for the session's whole life.
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
     Ok((command, files))
+}
+
+/// The most bytes of one line of the proxy's standard error read at a time; a longer line is
+/// relayed in pieces, so a proxy that never ends a line holds no more than this in the supervisor.
+const RELAY_LINE_MAX: u64 = 4096;
+
+/// Relay the caged proxy's standard error to this process's standard error, on a thread of its own
+/// that ends when the proxy closes it ([`relay_lines`]).
+///
+/// Each line goes to descriptor 2 as it is at the moment of writing, which is the terminal for an
+/// inline session and the session log once a detached one has moved its output there.
+#[cfg(not(test))]
+fn relay_stderr(stderr: std::process::ChildStderr) {
+    let started = std::thread::Builder::new()
+        .name("sbx-proxy-stderr".into())
+        .spawn(move || relay_lines(stderr, io::stderr()));
+    if let Err(e) = started {
+        crate::diag::warn(&format!(
+            "the egress proxy's diagnostics cannot be relayed: {e}"
+        ));
+    }
+}
+
+/// Copy `input` to `out` a line at a time until `input` ends, each line through
+/// [`crate::sandbox::observe_feed::sanitize`].
+///
+/// The proxy is the least trusted process of a session, so what it writes is treated as a value the
+/// cage chose: control characters cannot reach a terminal, and a line is read in pieces of at most
+/// [`RELAY_LINE_MAX`] bytes, so a proxy that never ends one holds no more than that in the
+/// supervisor. A write that fails (the invoker gone) is dropped and reading goes on: a relay that
+/// stopped reading would fill the pipe and stall the proxy on its next diagnostic.
+fn relay_lines(input: impl io::Read, mut out: impl io::Write) {
+    use std::io::{BufRead as _, Read as _};
+    let mut reader = io::BufReader::new(input);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match (&mut reader)
+            .take(RELAY_LINE_MAX)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) => return,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&line);
+                let text = text.strip_suffix('\n').unwrap_or(&text);
+                let _ = writeln!(out, "{}", crate::sandbox::observe_feed::sanitize(text));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// The cage a proxy runs in ([`selfcage::spec`]): the empty network namespace, and nothing of the
@@ -380,9 +434,11 @@ mod process {
             _listener: &UnixListener,
         ) -> io::Result<Proxy> {
             let (command, files) = command(bwrap, link)?;
-            Ok(Proxy {
-                child: Some(spawn_lasting(command, files)?),
-            })
+            let mut child = spawn_lasting(command, files)?;
+            if let Some(stderr) = child.stderr.take() {
+                relay_stderr(stderr);
+            }
+            Ok(Proxy { child: Some(child) })
         }
 
         /// Give the proxy up to `wait` to exit, its link closed, then kill it; and reap it. A proxy
@@ -504,6 +560,54 @@ mod tests {
     use crate::sandbox::selfcage::BINARY;
     use crate::testutil::TmpDir;
     use std::io::{BufRead, BufReader, Write};
+
+    /// The relay writes each line of the proxy's standard error with its control characters
+    /// neutralised, so an escape sequence the proxy writes never reaches a terminal as one.
+    #[test]
+    fn the_relay_writes_each_line_with_its_controls_neutralised() {
+        let mut out = Vec::new();
+        relay_lines(&b"first\n\x1b[2Jcleared\rover\nlast"[..], &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "first\n [2Jcleared over\nlast\n"
+        );
+    }
+
+    /// A line longer than the relay reads at once is relayed in pieces, so the supervisor never
+    /// holds more than [`RELAY_LINE_MAX`] bytes of a line the proxy does not end.
+    #[test]
+    fn a_line_longer_than_the_bound_is_relayed_in_pieces() {
+        let long = vec![b'a'; RELAY_LINE_MAX as usize * 2 + 10];
+        let mut out = Vec::new();
+        relay_lines(&long[..], &mut out);
+        let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+        assert_eq!(lines.len(), 3, "two full pieces and the rest");
+        assert!(lines.iter().all(|l| l.len() <= RELAY_LINE_MAX as usize));
+    }
+
+    /// A write that fails does not stop the relay: it keeps reading, so the proxy is never left
+    /// writing into a full pipe once its invoker has gone.
+    #[test]
+    fn a_failed_write_does_not_stop_the_relay_reading() {
+        /// Refuses its first write, then keeps what it is given.
+        struct FailsOnce(bool, Vec<u8>);
+        impl Write for FailsOnce {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
+                self.1.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = FailsOnce(false, Vec::new());
+        relay_lines(&b"lost\nkept\n"[..], &mut out);
+        assert_eq!(String::from_utf8(out.1).unwrap(), "kept\n");
+    }
 
     /// No credential to inject.
     fn nothing_to_inject() -> Credentials {

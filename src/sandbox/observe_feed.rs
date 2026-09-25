@@ -108,7 +108,7 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 /// # What now depends on this, and why it must not be narrowed
 ///
 /// It began as the exec lens's own and is now the crate's one answer to a value the cage chooses.
-/// Six sinks reach it, and on each one it is the only filter between a name the cage picked and a
+/// Seven sinks reach it, and on each one it is the only filter between a name the cage picked and a
 /// line somebody reads:
 ///
 /// - [`command_of`], for the exec feed's inline stderr echo;
@@ -119,8 +119,10 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 /// - [`super::notify_sink`], where the stderr fallback composes one line per announcement, the lines
 ///   a detached session leaves in the log `sbx logs` reads;
 /// - [`super::egress_stats`], for a destination host in a tab-delimited row;
-/// - and `crate::observe`, outside this module through the [`super::sanitize`] re-export, for the
-///   `sbx proc ls` tree.
+/// - `crate::observe`, outside this module through the [`super::sanitize`] re-export, for the
+///   `sbx proc ls` tree;
+/// - and the relay of the caged egress proxy's standard error (`proxy::child`), the one process of a
+///   session that writes to the supervisor's terminal or session log without a parser in between.
 ///
 /// Each of those was, at some point, a place a caged process could write a line of its own. Narrowing
 /// what this replaces, or moving it somewhere a caller stops finding it, reopens all of them at once

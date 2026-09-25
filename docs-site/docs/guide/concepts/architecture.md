@@ -548,8 +548,10 @@ sockets it dials; no capability; and a system-call filter that lists what their 
 where every other cage gets a list of what it may not.
 
 Some bytes reach your terminal with no parser of sbx's in between: the agent's own output, in
-a foreground session, through a terminal or in `sbx session logs`, and what the egress proxy
-writes to its standard error. Your terminal reads those bytes, not sbx.
+a foreground session, through a terminal or in `sbx session logs`. Your terminal reads those
+bytes, not sbx. What the egress proxy writes to its standard error is not among them: the
+supervisor relays it a line at a time, with control characters replaced, to the terminal of a
+foreground session or to the log of a detached one.
 
 ## Where each decision is made
 
