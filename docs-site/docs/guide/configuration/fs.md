@@ -160,6 +160,17 @@ posture already does. A detached session writes the warning to its log, and a se
 `sbx` is killed along with its terminal cannot write it at all: the next launch is then what
 catches a `.git/commondir`.
 
+A **symbolic link** on the way to any of these refuses the launch, naming the link, wherever it
+leads: `.git` itself, `.git/hooks`, `.git/config`, a directory above the one `core.hooksPath`
+names, or a directory on the way to a file git includes. sbx protects each of these paths by
+laying a read-only mount on what it resolves to at launch, and a link inside the project is a
+name the cage could point elsewhere during the session, after which your git would read what
+the link names instead. The refusal names a form sbx holds in place. For a hooks directory kept
+in the tree, remove the `.git/hooks` link and point `core.hooksPath` at the directory
+(`git config core.hooksPath .githooks`). For a configuration file kept in the tree, give the
+repository a `.git/config` of its own that includes it (`git config include.path
+../repo.gitconfig`). `git_writable` lifts this along with the rest.
+
 **What this does not close: the hooks a project already has run its code.** The protection
 closes the hooks git would run without a trace: an untracked script in the hooks directory, a
 configuration key that names a program. It cannot close the hooks a project already uses,

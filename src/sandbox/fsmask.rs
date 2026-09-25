@@ -210,6 +210,7 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     if policy.is_empty()
         && builtin_readonly_names(project, policy.git_writable()).is_empty()
         && !git_protected(project, policy.git_writable())
+        && !git_linked(project, policy.git_writable())
     {
         return out;
     }
@@ -251,9 +252,12 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         &mut out.warnings,
         &mut out.refused,
     );
-    // Every question below is asked of the host's git, and a `.git/commondir` would have it answer
-    // from another directory: refused first, and nothing is asked.
-    let (hooks, includes, worktree) = match git_commondir_refusal(&root, policy.git_writable()) {
+    // Every question below is asked of the host's git, and a `.git` or a `.git/config` reached
+    // through a link, or a `.git/commondir`, would have it answer from elsewhere: refused first,
+    // and nothing is asked.
+    let layout = git_dir_link_refusal(&root, policy.git_writable())
+        .or_else(|| git_commondir_refusal(&root, policy.git_writable()));
+    let (hooks, includes, worktree) = match layout {
         Some(reason) => {
             out.refused.get_or_insert(reason);
             (Vec::new(), Vec::new(), Vec::new())
@@ -417,10 +421,13 @@ const BUILTIN_READONLY: &str = "readonly (built-in)";
 /// (the push itself succeeds); and, `.git` being held in place above them ([`holding_dirs`]),
 /// `submodule absorbgitdirs`, which moves a repository into it. The files git reads as
 /// configuration beside `.git/config` are added by [`git_worktree_files`], and a `.git/commondir`
-/// refuses the launch ([`git_commondir_refusal`]). `git_writable` lifts all of it: the one
-/// opening in `[fs]`, and why it is honored only from a trusted layer. A `.git` that is a file (a
-/// linked worktree, a submodule) points at a directory outside the project, which the cage does
-/// not hold; nothing is added.
+/// refuses the launch ([`git_commondir_refusal`]). A symbolic link inside the project on the way
+/// to any of these paths, `.git` itself included, refuses the launch too ([`git_dir_link_refusal`],
+/// [`git_link_on_the_way`]): a mask holds what a path resolved to at launch, and a link is a name
+/// the cage could point elsewhere. `git_writable` lifts all of it: the one opening in `[fs]`, and
+/// why it is honored only from a trusted layer. A `.git` that is a file (a linked worktree, a
+/// submodule) points at a directory outside the project, which the cage does not hold; nothing is
+/// added.
 ///
 /// Returned as `[fs]` entries relative to the project, for [`resolve_list`], which is what refuses
 /// one that cannot be looked at: an absent file is left out here, every other answer goes through.
@@ -440,7 +447,11 @@ fn builtin_readonly_names(root: &Path, git_writable: bool) -> Vec<String> {
                 .map(str::to_string),
         );
     }
-    if git_protected(root, git_writable) && present(".git/config") {
+    // A link there is refused rather than followed ([`git_dir_link_refusal`]).
+    let linked = |name: &str| {
+        std::fs::symlink_metadata(root.join(name)).is_ok_and(|m| m.file_type().is_symlink())
+    };
+    if git_protected(root, git_writable) && present(".git/config") && !linked(".git/config") {
         out.push(".git/config".to_string());
     }
     out
@@ -450,6 +461,41 @@ fn builtin_readonly_names(root: &Path, git_writable: bool) -> Vec<String> {
 /// trusted layer set `git_writable`.
 fn git_protected(root: &Path, git_writable: bool) -> bool {
     !git_writable && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir())
+}
+
+/// Whether the project's `.git` is a symbolic link while no trusted layer set `git_writable`, which
+/// refuses the launch ([`git_dir_link_refusal`]).
+fn git_linked(root: &Path, git_writable: bool) -> bool {
+    !git_writable
+        && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// The refusal a `.git` or a `.git/config` that is a symbolic link earns, or `None`.
+///
+/// The launch holds `.git` in place and lays its masks on the paths inside it, which protects what
+/// git reads there only while those paths are the ones git reads. A link at either is a name the
+/// cage could point elsewhere during the session ([`git_link_on_the_way`]), and a `.git` that is a
+/// link would leave nothing protected at all, since the carrier is looked for in a directory. Both
+/// are checked before any question is asked of the host's git, which would read through them.
+fn git_dir_link_refusal(root: &Path, git_writable: bool) -> Option<String> {
+    let git = root.join(".git");
+    if git_linked(root, git_writable) {
+        return Some(git_link_refusal(
+            &git,
+            "the repository your git reads",
+            "Replace it with the directory it names",
+        ));
+    }
+    if !git_protected(root, git_writable) {
+        return None;
+    }
+    git_link_on_the_way(
+        root,
+        &git.join("config"),
+        "the configuration your git reads",
+        "Replace it with the file it names, or keep that file in the project and include it from a \
+         `.git/config` of its own (`git config include.path <file>`), which sbx protects in place",
+    )
 }
 
 /// The directories git runs hooks from, as read-only masks: `.git/hooks`, and the directory
@@ -468,7 +514,11 @@ fn git_protected(root: &Path, git_writable: bool) -> bool {
 /// global config among what decides it. husky points it at `.husky/_`, inside the working tree and
 /// ignored by git: a hook rewritten there does not even show in `git status`. With no git on the
 /// host, no hook can run on it, and there is nothing to ask. A value outside the project is left
-/// alone: the cage does not hold it.
+/// alone, since the cage does not hold it.
+///
+/// **A link on the way refuses the launch**, whether it is `.git/hooks` itself or a directory above
+/// the one `core.hooksPath` names, and wherever it leads ([`git_link_on_the_way`]). The refusal
+/// names the form sbx holds in place: `core.hooksPath` pointed at the directory itself.
 fn git_hook_dirs(
     root: &Path,
     git_writable: bool,
@@ -478,13 +528,27 @@ fn git_hook_dirs(
     if !git_protected(root, git_writable) {
         return Vec::new();
     }
-    let mut dirs = vec![(root.join(".git/hooks"), ".git/hooks/".to_string())];
+    let mut dirs = vec![(
+        root.join(".git/hooks"),
+        ".git/hooks/".to_string(),
+        "Replace it with the directory it names, or remove it and point `core.hooksPath` at that \
+         directory (`git config core.hooksPath <dir>`), which sbx protects in place",
+    )];
     if let Some(named) = git_hooks_path(root) {
         let shown = format!("core.hooksPath = {}", named.display());
-        dirs.push((named, shown));
+        dirs.push((
+            named,
+            shown,
+            "Point `core.hooksPath` at the directory by a path with no link in it",
+        ));
     }
     let mut out: Vec<Masked> = Vec::new();
-    for (path, pattern) in dirs {
+    for (path, pattern, instead) in dirs {
+        let what = format!("the directory your git runs hooks from ({pattern})");
+        if let Some(reason) = git_link_on_the_way(root, &path, &what, instead) {
+            refused.get_or_insert(reason);
+            continue;
+        }
         let canon = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 crate::trust::canonicalize_existing_prefix(&path)
@@ -592,7 +656,8 @@ fn git_hooks_path(root: &Path) -> Option<PathBuf> {
 /// An include naming a file inside the project that does not exist refuses the launch rather than
 /// being created: the cage could create it and git would read it, and a configuration file is not
 /// sbx's to write into the user's tree the way an empty hooks directory is. The refusal names the
-/// file and the way out.
+/// file and the way out. An include reached through a symbolic link inside the project refuses
+/// the launch as well, wherever the link leads ([`git_link_on_the_way`]).
 fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<String>) -> Vec<Masked> {
     if !git_protected(root, git_writable) {
         return Vec::new();
@@ -623,6 +688,16 @@ fn git_include_files(root: &Path, git_writable: bool, refused: &mut Option<Strin
             continue;
         };
         let pattern = format!("{key} = {value}");
+        let what = format!("{GIT_CONFIG_READ} ({pattern})");
+        if let Some(reason) = git_link_on_the_way(
+            root,
+            &path,
+            &what,
+            "Name the file by a path with no link in it",
+        ) {
+            refused.get_or_insert(reason);
+            continue;
+        }
         let canon = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let canon = crate::trust::canonicalize_existing_prefix(&path);
@@ -763,7 +838,9 @@ fn git_worktree_files(
             return out;
         }
         Ok(meta) if meta.file_type().is_symlink() => {
-            refused.get_or_insert_with(|| git_link_refusal(&worktrees));
+            refused.get_or_insert_with(|| {
+                git_link_refusal(&worktrees, GIT_CONFIG_READ, GIT_LINK_INSTEAD)
+            });
             return out;
         }
         Ok(meta) if !meta.is_dir() => return out,
@@ -790,7 +867,9 @@ fn git_worktree_files(
     for dir in dirs {
         match std::fs::symlink_metadata(&dir) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                refused.get_or_insert_with(|| git_link_refusal(&dir));
+                refused.get_or_insert_with(|| {
+                    git_link_refusal(&dir, GIT_CONFIG_READ, GIT_LINK_INSTEAD)
+                });
             }
             Ok(meta) if meta.is_dir() => {
                 worktree_file(
@@ -984,7 +1063,8 @@ fn worktree_file(
             refused.get_or_insert_with(|| visible(&unreadable_refusal("look at", path, &e)));
         }
         Ok(meta) if meta.file_type().is_symlink() => {
-            refused.get_or_insert_with(|| git_link_refusal(path));
+            refused
+                .get_or_insert_with(|| git_link_refusal(path, GIT_CONFIG_READ, GIT_LINK_INSTEAD));
         }
         Ok(_) => match admit(root, path, &rel, false) {
             Ok(Some(mut masked)) => {
@@ -999,16 +1079,47 @@ fn worktree_file(
     }
 }
 
-/// The refusal a link among the git files [`git_worktree_files`] protects earns, with the path
-/// escaped for the terminal: a worktree's name is whoever created it's to spell, the cage included.
-fn git_link_refusal(path: &Path) -> String {
+/// The refusal a symbolic link inside the project on the way to what the host's git reads earns,
+/// or `None` when resolving `path` meets none.
+///
+/// A mask holds what a path resolved to at launch. A link is a name, and one inside the project is
+/// a name the cage could point elsewhere during the session, after which the host's git would read
+/// what the link names instead of what the mask holds. So each link the resolution meets is looked
+/// at, in the order the kernel meets them ([`crate::trust::resolution_stop`]): one outside the
+/// project, which the cage does not hold, is followed, and a link inside the project that it leads
+/// through still counts. `what` says what git reads there, and `instead` the form sbx holds in
+/// place.
+fn git_link_on_the_way(root: &Path, path: &Path, what: &str, instead: &str) -> Option<String> {
+    use crate::trust::ResolutionStop;
+    match crate::trust::resolution_stop(path, |at, link| link && at.starts_with(root))? {
+        ResolutionStop::At(link) => Some(git_link_refusal(&link, what, instead)),
+        ResolutionStop::TooManyLinks(link) => Some(visible(&format!(
+            "`{}`: resolving the path to {what} meets more symbolic links than the kernel follows \
+             in one resolution. Name it by a path with fewer links, or set `[fs] git_writable = \
+             true` from a trusted layer, then launch again",
+            link.display()
+        ))),
+    }
+}
+
+/// The refusal a symbolic link on the way to what the host's git reads earns, with the path escaped
+/// for the terminal: the project's names are whoever created them's to spell, the cage included.
+/// `what` names what git reads through it, and `instead` the form sbx holds in place.
+fn git_link_refusal(link: &Path, what: &str, instead: &str) -> String {
     visible(&format!(
-        "`{}` is a symbolic link: git reads through it as configuration, and the cage could point \
-         it elsewhere during the session. Replace it with what it names, or set `[fs] git_writable \
-         = true` from a trusted layer, then launch again",
-        path.display()
+        "`{}` is a symbolic link on the way to {what}, and the cage could point it elsewhere \
+         during the session: your git would then read what it names rather than what sbx \
+         protects. {instead}, or set `[fs] git_writable = true` from a trusted layer, then launch \
+         again",
+        link.display()
     ))
 }
+
+/// What [`git_link_refusal`] tells a link among the files git reads as configuration to become.
+const GIT_LINK_INSTEAD: &str = "Replace it with what it names";
+
+/// What git reads through the files [`git_worktree_files`] protects, for [`git_link_refusal`].
+const GIT_CONFIG_READ: &str = "a file your git reads as configuration";
 
 /// Create, empty, each built-in directory mask whose directory is absent, so its bind has
 /// something to land on. See [`git_hook_dirs`] for why an absent one is masked at all.
@@ -2472,6 +2583,159 @@ mod tests {
             .refused
             .expect("past the ceiling");
         assert!(why.contains("more than"), "{why}");
+    }
+
+    /// A `.git`, a `.git/hooks` or a `.git/config` that is a symbolic link refuses the launch,
+    /// wherever it leads, naming the link and the form sbx holds in place; `git_writable` lifts it.
+    /// A `.git/config` that leads out of the project is refused rather than warned about twice.
+    #[test]
+    fn a_link_at_the_paths_git_reads_refuses_the_launch() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+        let root = root.canonicalize().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("config"), b"[core]\n").unwrap();
+        std::fs::create_dir_all(root.join("kept-hooks")).unwrap();
+        std::fs::write(root.join("repo.gitconfig"), b"[core]\n").unwrap();
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        let refused = |link: &str, instead: &str| {
+            let e = expand(&root, &FsPolicy::default());
+            let why = e.refused.expect("a link refuses");
+            assert!(
+                why.contains(&format!(
+                    "{}` is a symbolic link",
+                    root.join(link).display()
+                )) && why.contains(instead),
+                "{why}"
+            );
+            assert!(
+                e.warnings.is_empty(),
+                "refused, not warned about: {:?}",
+                e.warnings
+            );
+            assert!(
+                expand(&root, &lifted).refused.is_none(),
+                "git_writable lifts it"
+            );
+        };
+
+        let hooks = root.join(".git/hooks");
+        for target in [Path::new("../kept-hooks"), outside.as_path()] {
+            std::os::unix::fs::symlink(target, &hooks).unwrap();
+            refused(".git/hooks", "core.hooksPath");
+            std::fs::remove_file(&hooks).unwrap();
+        }
+
+        let config = root.join(".git/config");
+        std::fs::remove_file(&config).unwrap();
+        let outside_config = outside.join("config");
+        for target in [Path::new("../repo.gitconfig"), outside_config.as_path()] {
+            std::os::unix::fs::symlink(target, &config).unwrap();
+            refused(".git/config", "include.path");
+            std::fs::remove_file(&config).unwrap();
+        }
+        std::fs::write(&config, b"[core]\n").unwrap();
+
+        std::fs::rename(root.join(".git"), root.join("realgit")).unwrap();
+        std::os::unix::fs::symlink("realgit", root.join(".git")).unwrap();
+        refused(".git", "the directory it names");
+    }
+
+    /// A link above the directory `core.hooksPath` names, or on the way to a file git includes,
+    /// refuses the launch as well: a link inside the project counts wherever the resolution meets
+    /// it, including through a link outside the project that leads back in, and a resolution
+    /// that meets more links than the kernel follows is refused too.
+    #[test]
+    fn a_link_on_the_way_to_the_hooks_path_or_an_include_refuses_the_launch() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping links on the way to git's files: no git on this host");
+            return;
+        };
+        let refused_at = |link: &Path| {
+            let why = expand(&root, &FsPolicy::default())
+                .refused
+                .expect("a link refuses");
+            assert!(
+                why.contains(&format!("{}` is a symbolic link", link.display())),
+                "{why}"
+            );
+        };
+
+        std::fs::create_dir_all(root.join("tools-husky/_")).unwrap();
+        std::os::unix::fs::symlink("tools-husky", root.join(".husky")).unwrap();
+        assert!(git(&["config", "core.hooksPath", ".husky/_"]));
+        refused_at(&root.join(".husky"));
+        assert!(git(&["config", "--unset", "core.hooksPath"]));
+
+        std::fs::create_dir_all(root.join("realcfg")).unwrap();
+        std::fs::write(root.join("realcfg/inc.cfg"), "").unwrap();
+        std::os::unix::fs::symlink("realcfg", root.join("cfgdir")).unwrap();
+        assert!(git(&["config", "include.path", "../cfgdir/inc.cfg"]));
+        refused_at(&root.join("cfgdir"));
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(root.join("cfgdir/inc.cfg"), outside.join("back-in")).unwrap();
+        let back_in = outside.join("back-in");
+        assert!(git(&["config", "include.path", back_in.to_str().unwrap()]));
+        refused_at(&root.join("cfgdir"));
+
+        // git refuses to read an include it cannot resolve, so the loop is met by the hooks path,
+        // whose value git reports without resolving it.
+        assert!(git(&["config", "--unset", "include.path"]));
+        std::os::unix::fs::symlink("loop-b", outside.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink("loop-a", outside.join("loop-b")).unwrap();
+        let looped = outside.join("loop-a");
+        assert!(git(&["config", "core.hooksPath", looped.to_str().unwrap()]));
+        let why = expand(&root, &FsPolicy::default())
+            .refused
+            .expect("a loop refuses");
+        assert!(why.contains("more symbolic links"), "{why}");
+    }
+
+    /// The forms a link refusal names are held in place: `core.hooksPath` pointed at a directory of
+    /// the tree, and a `.git/config` of its own that includes a file of the tree. Each is masked at
+    /// the path git reads, and one outside the project is left alone with no refusal.
+    #[test]
+    fn the_forms_a_link_refusal_names_are_masked_where_git_reads_them() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the forms a link refusal names: no git on this host");
+            return;
+        };
+        std::fs::create_dir_all(root.join(".githooks")).unwrap();
+        std::fs::write(root.join("repo.gitconfig"), "").unwrap();
+        assert!(git(&["config", "core.hooksPath", ".githooks"]));
+        assert!(git(&["config", "include.path", "../repo.gitconfig"]));
+        let e = expand(&root, &FsPolicy::default());
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        for held in [".githooks", ".git/hooks", ".git/config", "repo.gitconfig"] {
+            assert!(
+                e.readonly.iter().any(|m| m.path == root.join(held)),
+                "{held}: {:?}",
+                e.readonly
+            );
+        }
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("inc.cfg"), "").unwrap();
+        assert!(git(&[
+            "config",
+            "core.hooksPath",
+            outside.to_str().unwrap()
+        ]));
+        let inc = outside.join("inc.cfg");
+        assert!(git(&["config", "include.path", inc.to_str().unwrap()]));
+        let e = expand(&root, &FsPolicy::default());
+        assert!(e.refused.is_none(), "{:?}", e.refused);
     }
 
     /// The end of a session names what appeared in the project's git that no mount could hold: a

@@ -2503,7 +2503,8 @@ pub(super) const PAGES: &[Page] = &[
             drift from the mounts; the expansion's own warnings (an entry matching nothing, a\n\
             second hard link to a closed file, a path git tracks) are printed here too, and a\n\
             refusal is fatal here because it is fatal to a launch. Symlinks are followed, since a\n\
-            mask names a link's target rather than the link.\n\
+            mask names a link's target rather than the link, except on the way to the files git\n\
+            reads, where a link refuses the launch.\n\
             \n\
             What it does not answer is `[fs] scan`, the other half of the same table: that lens\n\
             decides at each open on what a file holds, so there is no verdict without the bytes and\n\

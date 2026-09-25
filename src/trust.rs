@@ -150,13 +150,33 @@ fn in_project(root: &Path, path: &Path) -> bool {
         || resolution_visits(root, path)
 }
 
-/// Whether resolving the absolute `path` passes through `root` at any step, reading each link it
-/// meets and resolving the rest from where the link leads, as the kernel does. Where the path ends
-/// is not enough: a link in `root` that leads out of it is one the cage can point anywhere, and
-/// resolving from outside through it lands wherever the cage chose. Past as many links as the
-/// kernel follows, the answer is that it does. A relative `path` answers no: the callers' paths are
-/// absolute, and the spelled and resolved checks of [`in_project`] still apply to one.
+/// Whether resolving the absolute `path` passes through `root` at any step ([`resolution_stop`]).
+/// Where the path ends is not enough: a link in `root` that leads out of it is one the cage can
+/// point anywhere, and resolving from outside through it lands wherever the cage chose. Past as
+/// many links as the kernel follows, the answer is that it does. A relative `path` answers no: the
+/// callers' paths are absolute, and the spelled and resolved checks of [`in_project`] still apply
+/// to one.
 fn resolution_visits(root: &Path, path: &Path) -> bool {
+    resolution_stop(path, |at, _| at.starts_with(root)).is_some()
+}
+
+/// Where a walk of [`resolution_stop`] stopped.
+pub(crate) enum ResolutionStop {
+    /// The first step the caller's test answered yes to.
+    At(PathBuf),
+    /// A link met past as many as the kernel follows in one resolution, where it answers `ELOOP`.
+    TooManyLinks(PathBuf),
+}
+
+/// Walk the resolution of the absolute `path` as the kernel does it, one component at a time,
+/// reading each link met and resolving the rest from where that link leads, and stop at the first
+/// step `stop` answers yes to. `stop` is given each path the walk reaches, spelled with no link
+/// above its last component, and whether that last component is a link. `None` is a walk that ran
+/// to the end, or a relative `path`, which has no start to walk from.
+pub(crate) fn resolution_stop(
+    path: &Path,
+    mut stop: impl FnMut(&Path, bool) -> bool,
+) -> Option<ResolutionStop> {
     use std::path::Component;
     /// The links the kernel follows in one resolution before it answers `ELOOP`.
     const MAX_LINKS: usize = 40;
@@ -170,7 +190,7 @@ fn resolution_visits(root: &Path, path: &Path) -> bool {
         steps
     }
     if !path.is_absolute() {
-        return false;
+        return None;
     }
     let mut links = 0;
     let mut pending: Vec<std::ffi::OsString> = steps(path)
@@ -186,12 +206,13 @@ fn resolution_visits(root: &Path, path: &Path) -> bool {
             }
             Some(Component::Normal(name)) => {
                 at.push(name);
-                if at.starts_with(root) {
-                    return true;
+                let target = std::fs::read_link(&at).ok();
+                if stop(&at, target.is_some()) {
+                    return Some(ResolutionStop::At(at));
                 }
-                if let Ok(target) = std::fs::read_link(&at) {
+                if let Some(target) = target {
                     if links == MAX_LINKS {
-                        return true;
+                        return Some(ResolutionStop::TooManyLinks(at));
                     }
                     links += 1;
                     at.pop();
@@ -201,7 +222,7 @@ fn resolution_visits(root: &Path, path: &Path) -> bool {
             _ => {}
         }
     }
-    false
+    None
 }
 
 /// Whether `path` is in the project at `project_root`, as [`in_project`] answers once the root is

@@ -816,6 +816,70 @@ fn the_worktree_configuration_files_are_read_only_and_a_main_commondir_refuses()
     );
 }
 
+/// A `.git/hooks` that is a symbolic link refuses a real launch, naming the link and the form sbx
+/// holds in place, and that form launches with the hooks directory held: `core.hooksPath` pointed
+/// at a directory of the tree keeps its path and refuses writes inside the cage.
+#[test]
+fn a_linked_hooks_directory_refuses_and_the_hooks_path_it_names_is_held() {
+    let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "a linked hooks directory in a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(root)
+            .output()
+    };
+    let Ok(init) = git(&["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    std::fs::create_dir_all(root.join(".githooks")).unwrap();
+    std::fs::remove_dir_all(root.join(".git/hooks")).unwrap();
+    std::os::unix::fs::symlink("../.githooks", root.join(".git/hooks")).unwrap();
+    let run = |args: &[&str]| {
+        sbx_isolated()
+            .args(args)
+            .current_dir(root)
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run sbx")
+    };
+
+    let out = run(&["run", "--", "true"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success()
+            && stderr.contains(".git/hooks` is a symbolic link")
+            && stderr.contains("core.hooksPath"),
+        "a linked hooks directory refuses the launch\nstderr: {stderr}"
+    );
+
+    std::fs::remove_file(root.join(".git/hooks")).unwrap();
+    assert!(
+        git(&["config", "core.hooksPath", ".githooks"])
+            .unwrap()
+            .status
+            .success()
+    );
+    let script = "if mv .githooks moved 2>/dev/null; then echo MOVED; mv moved .githooks; \
+          else echo HELD; fi; \
+          (echo x > .githooks/pre-commit) 2>/dev/null && echo WROTE || echo REFUSED";
+    let out = run(&["run", "--", "sh", "-c", script]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("HELD") && stdout.contains("REFUSED"),
+        "the hooks path keeps its place and refuses writes\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!root.join(".githooks/pre-commit").exists());
+}
+
 /// What no mount can hold in the project's git is named once the cage has exited: a
 /// `.git/commondir` and a `config.worktree` that appeared during the session, and the next launch
 /// refuses on the first. Run under a network posture with no proxy, where a launch with nothing to

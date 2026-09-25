@@ -67,7 +67,8 @@ fs: 2 denied, 1 read-only
 The path **need not exist**. A denied directory is an empty one inside the cage, so a file that
 appears there later in the session is unreachable too, and that is the answer this reports: a name
 nothing bears yet still reads as `DENIED`. Symlinks are followed, since a mask names a link's
-target rather than the link.
+target rather than the link, except on the way to the files git reads, where a link refuses the
+launch and so this report too ([the git files](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)).
 
 The expansion's own warnings are printed here as well, which is half of what the verb is for: an
 entry that matched nothing, a second hard link reaching a closed file, a path git tracks. A
