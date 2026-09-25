@@ -93,13 +93,6 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
     );
 }
 
-/// The first `nft` on `PATH`, as the launcher finds it, or `None` on a host without nftables.
-fn nft() -> Option<std::path::PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join("nft"))
-        .find(|p| p.is_file())
-}
-
 /// A query to the cage's resolver is answered through the capture tap, over UDP.
 ///
 /// The cage's resolver is off loopback (`nettap::CAGE_RESOLVER`), so a query leaves with `dummy0`'s
@@ -115,7 +108,7 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
         skip_incapable!("skipping tap DNS e2e: no /usr/bin/python3 to ask the query");
         return;
     }
-    let Some(nft) = nft() else {
+    let Some(nft) = common::nft_on_path() else {
         skip_incapable!("skipping tap DNS e2e: no nft on PATH to install the redirect");
         return;
     };

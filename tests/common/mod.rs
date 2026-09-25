@@ -112,6 +112,14 @@ pub fn sbx(args: &[&str]) -> Output {
         .expect("spawn sbx")
 }
 
+/// The first `nft` on `PATH`, where a launch looks for the one that installs its capture redirect,
+/// or `None` on a host without nftables. Without it a launch wires no capture tap, and says nothing.
+pub fn nft_on_path() -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join("nft"))
+        .find(|p| p.is_file())
+}
+
 pub fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

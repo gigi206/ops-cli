@@ -3388,6 +3388,77 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     );
 }
 
+/// A client that ignores the proxy variables is still judged by the proxy. The capture tap answers
+/// its name, bends its connection, and hands it to the proxy as a `CONNECT`; the proxy, in a process
+/// of its own, decides it like any other: an allowed host answers, a denied one is refused with the
+/// proxy's 403. Skips (never fails) when the host cannot sandbox, the binary cache is unreachable,
+/// or no `nft` is there to install the redirect, in which case a launch wires no tap at all.
+#[test]
+fn a_client_that_ignores_the_proxy_variables_is_judged_by_the_proxy_through_the_tap() {
+    let project = TmpDir::prefixed("r", "tap-proj");
+    let data = TmpDir::prefixed("r", "tap-data");
+    let state = TmpDir::prefixed("r", "tap-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
+    )
+    .unwrap();
+    probe_or_skip!("tap e2e", run_in(project.path(), data.path(), &["true"]));
+    need_reachable!(
+        cache_reachable(),
+        "skipping tap e2e: the binary cache is unreachable"
+    );
+    if common::nft_on_path().is_none() {
+        skip_incapable!("skipping tap e2e: no nft on PATH, so a launch wires no capture tap");
+        return;
+    }
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            r#"unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+               code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$1"; }
+               printf 'allowed=%s\n' "$(code https://cache.nixos.org/nix-cache-info)"
+               printf 'denied=%s\n' "$(code https://example.com/)""#,
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("transparent capture unavailable") {
+        skip_incapable!(
+            "skipping tap e2e: the capture tap did not stand up ({})",
+            stderr.trim()
+        );
+        return;
+    }
+    assert!(out.status.success(), "the launch must stand: {stderr}");
+    assert!(
+        stdout.contains("allowed=200\n"),
+        "an allowed host must answer through the tap: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains("denied=403\n"),
+        "a denied host must be refused by the proxy through the tap: {stdout}{stderr}"
+    );
+}
+
 #[test]
 fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
     // The HTTP/2 (gRPC) MITM path end to end through the real binary. A trusted `deny` allowlist

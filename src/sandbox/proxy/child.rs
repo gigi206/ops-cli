@@ -289,14 +289,19 @@ fn command(bwrap: &Path, link: wire::Socket) -> io::Result<(Command, Vec<File>)>
         deleted(&binary),
         std::os::fd::AsFd::as_fd(&link).as_raw_fd(),
     )?;
-    let (argv, mut files) = crate::sandbox::argv::compose(&spec)?;
-    files.push(binary);
+    let (mut command, mut files) = caged(bwrap, &spec, binary)?;
     files.push(File::from(OwnedFd::from(link)));
+    command.stdout(Stdio::null());
+    Ok((command, files))
+}
+
+/// bwrap starting `spec`, and the descriptors it reads: the spec's own, then `binary`, the file the
+/// spec binds at [`BINARY`].
+fn caged(bwrap: &Path, spec: &SandboxSpec, binary: File) -> io::Result<(Command, Vec<File>)> {
+    let (argv, mut files) = crate::sandbox::argv::compose(spec)?;
+    files.push(binary);
     let mut command = Command::new(bwrap);
-    command
-        .args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
+    command.args(argv).stdin(Stdio::null());
     Ok((command, files))
 }
 
@@ -860,6 +865,108 @@ mod tests {
                 assert!(!argv.iter().any(|w| w == absent), "{absent} in {argv:?}");
             }
         }
+    }
+
+    /// The variable that tells [`probe_in_the_proxys_cage`] it runs in the proxy's cage, and names
+    /// the file of the host it must not find there.
+    const PROBE_HOST_FILE: &str = "SBX_PROXY_CAGE_PROBE";
+
+    /// What a process in the proxy's cage reaches, before and after the proxy's own filters: a line
+    /// `sbx-probe: <call> <errno>` per call, `0` for one that succeeded. Run in the cage by
+    /// [`the_proxys_cage_and_its_filters_hold_what_runs_in_them`]; anywhere else it does nothing.
+    #[test]
+    #[ignore = "run in the proxy's cage by the test that reads what it prints"]
+    fn probe_in_the_proxys_cage() {
+        let Some(host_file) = std::env::var_os(PROBE_HOST_FILE) else {
+            return;
+        };
+        let errno = |r: io::Result<()>| r.map_or_else(|e| e.raw_os_error().unwrap_or(-1), |()| 0);
+        let open = |path: &Path| errno(File::open(path).map(drop));
+        let inet =
+            || errno(std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).map(drop));
+        let unix = || errno(std::os::unix::net::UnixDatagram::unbound().map(drop));
+        // An address no network of the cage's leads to: without a route the call is refused at
+        // once, and with one it would time out.
+        let connect = || {
+            let to = (std::net::Ipv4Addr::new(192, 0, 2, 1), 443).into();
+            errno(std::net::TcpStream::connect_timeout(&to, Duration::from_secs(1)).map(drop))
+        };
+        let exec = || {
+            let argv = [c"/nonexistent".as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null()];
+            // SAFETY: NUL-terminated strings in null-terminated lists that outlive the call. The
+            // path does not exist, so a call the kernel reaches fails and returns.
+            unsafe { libc::execve(argv[0], argv.as_ptr(), envp.as_ptr()) };
+            io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        };
+        let say = |call: &str, outcome: i32| println!("sbx-probe: {call} {outcome}");
+        say("host-file", open(Path::new(&host_file)));
+        say("binary", open(Path::new(BINARY)));
+        say("inet", inet());
+        say("connect", connect());
+        say("confine", errno(crate::sandbox::seccomp::proxy::confine()));
+        say("binary", open(Path::new(BINARY)));
+        say("inet", inet());
+        say("unix", unix());
+        say("exec", exec());
+    }
+
+    /// A process in the proxy's cage finds no file of the host and no network, and once under the
+    /// proxy's filters opens no file, makes no socket and runs no program. The process is this
+    /// test's own binary, bound where the proxy's is and run as [`probe_in_the_proxys_cage`].
+    #[test]
+    fn the_proxys_cage_and_its_filters_hold_what_runs_in_them() {
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            skip_incapable!("skipping the proxy's cage: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let dir = TmpDir::new();
+        let host_file = dir.join("of-the-host");
+        std::fs::write(&host_file, b"x").unwrap();
+        let binary = File::open("/proc/self/exe").unwrap();
+        let mut spec = cage(binary.as_raw_fd(), false, 0).unwrap();
+        spec.cmd = [
+            BINARY,
+            "sandbox::proxy::child::tests::probe_in_the_proxys_cage",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        spec.env = vec![(
+            PROBE_HOST_FILE.to_string(),
+            host_file.to_string_lossy().into_owned(),
+        )];
+        let (mut command, files) = caged(&bwrap, &spec, binary).unwrap();
+        crate::sandbox::memfd::inherit_across_exec(&mut command, &files);
+        let out = command.output().unwrap();
+        drop(files);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let seen: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.split_once("sbx-probe: ").map(|(_, said)| said))
+            .collect();
+        let expected = [
+            format!("host-file {}", libc::ENOENT),
+            "binary 0".to_string(),
+            "inet 0".to_string(),
+            format!("connect {}", libc::ENETUNREACH),
+            "confine 0".to_string(),
+            format!("binary {}", libc::EPERM),
+            format!("inet {}", libc::EPERM),
+            format!("unix {}", libc::EPERM),
+            format!("exec {}", libc::EPERM),
+        ];
+        assert_eq!(
+            seen,
+            expected,
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Every descriptor the cage's argv names is one the command hands bwrap: its filters, the
