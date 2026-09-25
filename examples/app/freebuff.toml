@@ -34,6 +34,13 @@
 # (or check ahead with `sbx test net <url>`).
 cmd = "freebuff"
 
+# No `contract`: Freebuff takes no option that carries instructions. Its knowledge files come from
+# the project (`knowledge.md`, `AGENTS.md`, `CLAUDE.md`) and from your home (`~/.knowledge.md`,
+# `~/.AGENTS.md`, `~/.CLAUDE.md`). Point Freebuff at the cage's summary yourself instead, for
+# instance with a line in your `~/.knowledge.md` such as "When the environment variable SBX_SANDBOX
+# is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Freebuff config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
 # the caged `freebuff` read and write these host files (Codebuff login token, settings). Uncomment

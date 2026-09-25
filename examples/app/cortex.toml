@@ -59,6 +59,13 @@ exec Cortex "$@"
     "cortex",
 ]
 
+# No `contract`: Cortex's only prompt option, `--system-prompt`, is used instead of the default
+# prompt rather than added to it, and its instructions come only from
+# `AGENTS.md`/`AGENTS.override.md` files. Point Cortex at the cage's summary yourself instead, for
+# instance with a line in an `AGENTS.md` it reads such as "When the environment variable SBX_SANDBOX
+# is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Cortex config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
 # CLI read and write these host files. Uncomment to share your host Cortex setup with the cage

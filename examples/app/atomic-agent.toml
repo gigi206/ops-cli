@@ -80,6 +80,13 @@ exec atomic-agent tui
     # arrive as `$1 $2 …` (this element fills `$0`) and reach the agent verbatim via `exec … "$@"`.
     "atomic-agent",
 ]
+
+# No `contract`: Atomic Agent takes no flag or environment variable for instructions, and its
+# persona override replaces the persona rather than adding to it. `ATOMIC_AGENT_STATE_DIR` would
+# move its whole state and config. Point the agent at the cage's summary yourself instead, for
+# instance with a line in your first message of a session such as "When the environment variable
+# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
 # One memory, one model catalogue, one set of skills, shared across the projects you launch from:
 # the agent's state (sessions, memory and its SQLite stores, tasks, traces, skills, the browser
 # profile, and any managed GGUF weights) lives in a dedicated persistent isolated home rather than

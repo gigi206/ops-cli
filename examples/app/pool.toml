@@ -62,6 +62,13 @@
 # API URL, pass it with `--env POOLSIDE_API_URL=…` and add that host to `allow`.
 cmd = "pool"
 
+# No `contract`: Poolside documents no option or environment variable that adds instruction files;
+# your instructions live in `~/.config/poolside/AGENTS.md`, `XDG_CONFIG_HOME` would move that
+# directory, and `--agent-config-file` replaces the agent. Point pool at the cage's summary yourself
+# instead, for instance with a line in that file such as "When the environment variable SBX_SANDBOX
+# is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Poolside config, mounted read-write at its real absolute path. `binds` is
 # a security field, honored only because this profile lives in your trusted config
 # dir; `mode = "rw"` lets the caged `pool` read and write these host files (settings,

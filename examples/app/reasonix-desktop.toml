@@ -64,6 +64,13 @@
 # payload layout and the ELF NEEDED list read out of the published `.deb`).
 cmd = "reasonix-desktop"
 
+# No `contract`: the desktop app runs the same Reasonix engine as the CLI, which takes no option
+# that appends to its system prompt; its instructions come from `REASONIX.md`/`AGENTS.md`. Point
+# Reasonix at the cage's summary yourself instead, for instance with a line in a `REASONIX.md` it
+# reads such as "When the environment variable SBX_SANDBOX is 1, read the file named by
+# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
+# at every launch.
+
 gui = "wayland"
 gpu = true
 # `audio = true` binds the host sound server so the shell can play notification sounds and page

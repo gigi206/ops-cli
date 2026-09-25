@@ -76,6 +76,13 @@ echo "jcode: no equipped binary on PATH" >&2
 exit 127
 ''', "jcode"]
 
+# No `contract`: jcode reads no environment variable or option that adds instructions; they come
+# from its built-in prompt, the project's `.jcode/` prompt files and the `AGENTS.md` files of the
+# project and your home, and `JCODE_HOME` would move `~/.jcode` rather than add to it. Point jcode
+# at the cage's summary yourself instead, for instance with a line in your `~/AGENTS.md` such as
+# "When the environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY
+# before anything else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host jcode config/data, mounted read-write at their real absolute paths. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir;
 # `mode = "rw"` lets the caged `jcode` read and write these host files (login, settings,

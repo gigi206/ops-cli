@@ -48,6 +48,13 @@
 # and the `x-api-key` header shape (read out of the shipped bundle).
 cmd = "nova"
 
+# No `contract`: none of the options found in Nova's bundle adds a system prompt, rules or
+# instructions, and `COMPASS_CONFIG` names a replacement config file rather than adding to yours.
+# Its instruction files are `NOVA.md` and `NOVA.local.md`. Point Nova at the cage's summary yourself
+# instead, for instance with a line in a `NOVA.md` it reads such as "When the environment variable
+# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Nova config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
 # `nova` read and write these host files (config, credentials, session data). Uncomment to share your

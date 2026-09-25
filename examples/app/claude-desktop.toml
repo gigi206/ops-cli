@@ -156,6 +156,13 @@ exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usag
 ''',
 ]
 
+# No `contract`: the Code tab builds its Claude Code session itself and sets the appended system
+# prompt from the app's own settings, so the option the `claude-code` profile passes cannot be
+# handed to it from outside. Point Claude at the cage's summary yourself instead, for instance with
+# a line in your own instructions such as "When the environment variable SBX_SANDBOX is 1, read the
+# file named by SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md)
+# is rewritten at every launch.
+
 gui = "wayland"
 gpu = true
 audio = true

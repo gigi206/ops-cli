@@ -108,6 +108,12 @@ exec trae-cli "$@"
     "trae-cli",
 ]
 
+# No `contract`: Trae Agent's system prompt is a constant in its code, it reads no `AGENTS.md`, and
+# none of its options adds instructions. Point Trae Agent at the cage's summary yourself instead,
+# for instance with a line in the task you give it such as "When the environment variable
+# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Trae config/trajectories, mounted read-write at their real
 # absolute paths. `binds` is a security field, honored only because this
 # profile lives in your trusted config dir; `mode = "rw"` lets the caged

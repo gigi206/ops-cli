@@ -144,6 +144,12 @@ exec hermes-webui "$@"
 ''',
 ]
 
+# No `contract`: the WebUI sets the agent's ephemeral system prompt itself, and reads no environment
+# variable that adds to it. Point Hermes at the cage's summary yourself instead, for instance with a
+# line in your own instructions such as "When the environment variable SBX_SANDBOX is 1, read the
+# file named by SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md)
+# is rewritten at every launch.
+
 
 # The inbound hole: forward host 127.0.0.1:8787 into the cage at the same port, so your HOST browser
 # reaches the server the cage binds on its own loopback (the cage runs in an empty network namespace,

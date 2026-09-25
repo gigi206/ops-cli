@@ -52,6 +52,13 @@
 # absence of any credential (read out of the shipped binary and upstream's README).
 cmd = "sigit"
 
+# No `contract`: sigit parses no option or environment variable for instructions; it loads
+# `CLAUDE.md`/`AGENTS.md`, and `SIGIT_CONFIG_DIR` would move its config directory rather than add to
+# it. Point sigit at the cage's summary yourself instead, for instance with a line in an `AGENTS.md`
+# it reads such as "When the environment variable SBX_SANDBOX is 1, read the file named by
+# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
+# at every launch.
+
 # Your host siGit model cache, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir. Uncomment to reuse a
 # model you have already downloaded on the host instead of paying for a second copy in the app's

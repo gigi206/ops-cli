@@ -67,6 +67,13 @@
 # (`deepagents_code/_version.py`).
 cmd = "dcode"
 
+# No `contract`: `dcode` takes no system-prompt or instructions option, and its memory comes only
+# from `~/.deepagents/<agent>/AGENTS.md` and the project's `AGENTS.md`; `DEEPAGENTS_HOME` would move
+# your profile rather than add to it. Point the agent at the cage's summary yourself instead, for
+# instance with a line in your `~/.deepagents/<agent>/AGENTS.md` such as "When the environment
+# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
+# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Deep Agents config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
 # caged `dcode` write back to these host files (sessions, saved credentials, hooks). Uncomment to

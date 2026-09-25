@@ -37,6 +37,14 @@
 # missing host the proxy surfaces.
 cmd = "kimi"
 
+# No `contract`: Kimi Code's options replace rather than add. `--agent-file` loads an agent
+# definition whose body becomes that agent's whole prompt, `--skills-dir` is used instead of the
+# discovered skill directories, and `KIMI_CODE_HOME` moves its home. Its `AGENTS.md` files come from
+# `~/.kimi-code`, `~/.agents/AGENTS.md` and the project. Point Kimi at the cage's summary yourself
+# instead, for instance with a line in your `~/.agents/AGENTS.md` such as "When the environment
+# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
+# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # AUDIO — Kimi Code may add voice features in the future. If/when it does,
 # `audio = true` will provision the PulseAudio client + the ALSA→PulseAudio
 # compatibility shim (alsa-plugins + an asound.conf routing `default` → pulse),

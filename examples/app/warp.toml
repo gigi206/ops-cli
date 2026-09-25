@@ -63,6 +63,13 @@
 # flow (docs + the binary's OAuth strings).
 cmd = "warp"
 
+# No `contract`: Warp documents no option or environment variable that adds rules to the agent; its
+# rules come from the project's `AGENTS.md`/`WARP.md` and from `~/.agents/AGENTS.md`, and
+# `WARP_AGENT_CONFIG_FILE` serves `agent run` only. Point Warp at the cage's summary yourself
+# instead, for instance with a line in your `~/.agents/AGENTS.md` such as "When the environment
+# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
+# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Warp CLI settings (theme, statusline, MCP config, execution profiles), mounted
 # read-write at its real absolute path. `binds` is a security field, honored only because this
 # profile lives in your trusted config dir; `mode = "rw"` lets the caged `warp` read and write

@@ -44,6 +44,13 @@
 # add it to `allow` (or check ahead with `sbx test net <url>`).
 cmd = ["hermes", "dashboard", "--no-open"]
 
+# No `contract`: `hermes dashboard` takes its ephemeral prompt from the config only;
+# `HERMES_EPHEMERAL_SYSTEM_PROMPT` is read by the `hermes` CLI and the messaging gateway, not by the
+# dashboard (and there it replaces your own). Point Hermes at the cage's summary yourself instead,
+# for instance with a line in the `agent.system_prompt` of your `~/.hermes/config.yaml` such as
+# "When the environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY
+# before anything else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Forward the host's localhost:9119 into the cage so your host browser reaches the dashboard.
 # `hermes dashboard` binds 127.0.0.1:9119 inside the cage; this hole bridges it to the host. A
 # port already in use on the host fails the launch closed. Must stay a top-level key: written

@@ -167,6 +167,13 @@ cmd = [
     "--password-store=gnome-libsecret",
 ]
 
+# No `contract`: the app starts its bundled Codex engine itself and sends its own per-thread
+# developer instructions, so the `-c developer_instructions` the `codex` profile passes cannot reach
+# it from this `cmd`. `CODEX_HOME` would move your configuration rather than add to it. Point Codex
+# at the cage's summary yourself instead, for instance with a line in your `~/.codex/AGENTS.md` such
+# as "When the environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY
+# before anything else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 gui = "wayland"
 gpu = true
 audio = true

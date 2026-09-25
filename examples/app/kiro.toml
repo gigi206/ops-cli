@@ -92,6 +92,13 @@
 #     sbx app run kiro --env KIRO_LOG_LEVEL=trace --env KIRO_LOG_STDOUT=1 -- login --license free >trace.log
 cmd = ["kiro-cli"]
 
+# No `contract`: `kiro-cli` has no option for a system prompt or a steering path. `KIRO_HOME`
+# replaces the whole `~/.kiro`, and a custom `--agent` leaves global steering out unless the agent
+# names it. Global steering lives in `~/.kiro/steering/`. Point Kiro at the cage's summary yourself
+# instead, for instance with a line in a steering file there such as "When the environment variable
+# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # DISPLAY + GPU + DBUS for the in-cage login browser. `gui = "wayland"` binds the host Wayland
 # socket (read-only) so the in-cage Chromium can map a window; `gpu = true` opens hardware-
 # accelerated rendering (mesa into sbx's store + the `/dev/dri` render node), without which a

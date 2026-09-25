@@ -119,6 +119,13 @@ exec uvicorn app:app --host 127.0.0.1 --port 7000 "$@"
 ''',
 ]
 
+# No `contract`: Odysseus takes its chat system prompts from presets stored in its database and from
+# per-feature constants; no environment variable sets one, and it reads no `AGENTS.md`. Point the
+# assistant at the cage's summary yourself instead, for instance with a line in a system-prompt
+# preset such as "When the environment variable SBX_SANDBOX is 1, read the file named by
+# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
+# at every launch.
+
 # The inbound hole: forward host 127.0.0.1:7000 into the cage at the same port
 # (TOP-LEVEL, not under [network] — there it would be silently ignored). The host
 # port and the cage port must match the `--port` in `cmd` above. A security field,

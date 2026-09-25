@@ -92,6 +92,13 @@ exec nanobot "$@"
     "nanobot",
 ]
 
+# No `contract`: nanobot builds its system prompt from the project's `AGENTS.md` and the
+# `SOUL.md`/`USER.md` of its workspace, and no option, environment variable or config field adds to
+# it; `--workspace` and `--config` would replace yours. Point nanobot at the cage's summary yourself
+# instead, for instance with a line in the `USER.md` of its workspace such as "When the environment
+# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
+# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # --- The agent's requirements come from its bundle ------------------------------------------------
 # `use` pulls in the `nanobot` BUNDLE — the package(s) (uv/python312 for the pipx install), the
 # PyPI install lane, and its (empty) telemetry mutes — from one declaration shared with the

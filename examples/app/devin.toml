@@ -76,6 +76,13 @@
 # default (read out of `share/devin/docs/reference/configuration/config-file.mdx`).
 cmd = "devin"
 
+# No `contract`: the Devin CLI takes no option or environment variable that adds rules
+# (`--prompt-file` is the first user prompt, not an instruction), and its global rules live in
+# `~/.config/devin/AGENTS.md`. Point Devin at the cage's summary yourself instead, for instance with
+# a line in that file such as "When the environment variable SBX_SANDBOX is 1, read the file named
+# by SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is
+# rewritten at every launch.
+
 # Your host Devin config/auth, mounted read-write at their real absolute paths.
 # `binds` is a security field, honored only because this profile lives in your
 # trusted config dir; `mode = "rw"` lets the caged `devin` read and write these

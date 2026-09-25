@@ -100,6 +100,13 @@ cmd = [
     "--use-system-ca",
     "--password-store=gnome-libsecret",
 ]
+
+# No `contract`: the app runs the same Codebuff engine as the `freebuff` CLI, with the same
+# knowledge files (the project's, and `~/.knowledge.md`, `~/.AGENTS.md`, `~/.CLAUDE.md` in your
+# home), and reads no environment variable that adds instructions. Point Freebuff at the cage's
+# summary yourself instead, for instance with a line in your `~/.knowledge.md` such as "When the
+# environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything
+# else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
 home_scope = "global"
 
 gui = "wayland"

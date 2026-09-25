@@ -115,6 +115,13 @@ exec pnpm tools-dev run web --daemon-port 17456 --web-port 17573 "$@"
 ''',
 ]
 
+# No `contract`: the Open Design daemon starts OpenCode with an `OPENCODE_CONFIG_CONTENT` of its
+# own, layered over the environment on essentially every run, so the value the `opencode` profile
+# sets would be replaced here. Point the agent at the cage's summary yourself instead, for instance
+# with a line in your own instructions such as "When the environment variable SBX_SANDBOX is 1, read
+# the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # The host browser reaches the in-cage web UI.  The daemon port intentionally stays private to the
 # cage.  Do not reserve OpenCode's fixed OAuth callback port here: another sbx OpenCode session may
 # already own it, and the normal API-key path below does not need a callback.

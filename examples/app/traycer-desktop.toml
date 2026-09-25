@@ -46,6 +46,14 @@ cmd = [
     "--disable-dev-shm-usage",
     "--use-system-ca",
 ]
+
+# No `contract`: Traycer Desktop is the windowed half of an orchestrator that drives other coding
+# agents through its bundled copy of the CLI; it has no model of its own, and the agents it drives
+# are not started by sbx, so the `contract` of their own profiles does not apply. Point the driven
+# agent at the cage's summary yourself instead, for instance with a line in that agent's own
+# instructions such as "When the environment variable SBX_SANDBOX is 1, read the file named by
+# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
+# at every launch.
 gui = "wayland"
 gpu = true
 dbus = true

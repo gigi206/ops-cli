@@ -77,6 +77,14 @@ cmd = [
     "--disable-dev-shm-usage",
 ]
 
+# No `contract`: the app runs `hermes dashboard`, and the dashboard takes its ephemeral prompt from
+# the config only; `HERMES_EPHEMERAL_SYSTEM_PROMPT` is read by the `hermes` CLI and the messaging
+# gateway, not here (and there it replaces your own). Point Hermes at the cage's summary yourself
+# instead, for instance with a line in the `agent.system_prompt` of your `~/.hermes/config.yaml`
+# such as "When the environment variable SBX_SANDBOX is 1, read the file named by
+# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
+# at every launch.
+
 # The native desktop window: the Wayland socket (gui), the GPU render node + scoped /sys (gpu), and
 # a private in-cage desktop portal (dbus) so the app's file chooser renders in-cage and follows the
 # host theme. All three are trusted-only security fields, honored because this profile lives in

@@ -138,6 +138,12 @@ cmd = [
     "--password-store=gnome-libsecret",
 ]
 
+# No `contract`: Kiro documents no option or environment variable that adds a steering file; global
+# steering lives in `~/.kiro/steering/`, shared with the CLI. Point Kiro at the cage's summary
+# yourself instead, for instance with a line in a steering file there such as "When the environment
+# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
+# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 gui = "wayland"
 gpu = true
 dbus = true

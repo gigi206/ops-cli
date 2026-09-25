@@ -63,6 +63,14 @@ fi
 exec reasonix "$@"
 ''', "reasonix"]
 
+# No `contract`: Reasonix takes no option that appends to its system prompt
+# (`--prompt`/`--prompt-file` carry the task), `system_prompt_file` is a config key rather than an
+# option, and `REASONIX_HOME` would move your whole home. Its instructions come from
+# `REASONIX.md`/`AGENTS.md`. Point Reasonix at the cage's summary yourself instead, for instance
+# with a line in a `REASONIX.md` it reads such as "When the environment variable SBX_SANDBOX is 1,
+# read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Reasonix home, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
 # the caged `reasonix` read and write your host config, keys, and sessions. Uncomment to share

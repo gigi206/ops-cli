@@ -55,6 +55,13 @@
 # blocks at the bottom of this file.
 cmd = ["vibe"]
 
+# No `contract`: Vibe's instructions come from `$VIBE_HOME/AGENTS.md` and the project's `AGENTS.md`,
+# and its configuration has no additive field. `VIBE_SYSTEM_PROMPT_ID` swaps the whole system prompt
+# and `VIBE_HOME` moves your home, `~/.vibe/AGENTS.md` included. Point Vibe at the cage's summary
+# yourself instead, for instance with a line in your `~/.vibe/AGENTS.md` such as "When the
+# environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything
+# else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # DISPLAY + GPU — needed so the in-cage Chromium (the SSO sign-in window) actually maps. `gui =
 # "wayland"` binds the host Wayland compositor socket (read-only) and provisions fonts; X11 is never
 # offered. Isolation is compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway,

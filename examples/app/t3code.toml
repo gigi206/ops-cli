@@ -91,6 +91,14 @@ cmd = [
     "--password-store=gnome-libsecret",
 ]
 
+# No `contract`: T3 Code has no model of its own; it drives CLI agents it starts itself. sbx does
+# not start them, so the `contract` of the driven agent's own profile never applies here, and Claude
+# Code, the default, takes its appended prompt from an option only. Point the driven agent at the
+# cage's summary yourself instead, for instance with a line in its own user instructions in this
+# app's home (`~/.claude/CLAUDE.md` for Claude Code) such as "When the environment variable
+# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 gui = "wayland"
 gpu = true
 dbus = true

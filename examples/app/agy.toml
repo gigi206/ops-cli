@@ -55,6 +55,14 @@
 # check ahead with `sbx test net <url>`).
 cmd = "agy"
 
+# No `contract`: Antigravity takes no option or environment variable that adds rules. Its rules come
+# from the workspace (`AGENTS.md`, `GEMINI.md`, `.agents/rules/`) and from your files under
+# `~/.gemini/`, and the `ANTIGRAVITY_APP_DATA_DIR`/`JETSKI_APP_DATA_DIR` variables would move your
+# whole state rather than add to it. Point Antigravity at the cage's summary yourself instead, for
+# instance with a line in your `~/.gemini/AGENTS.md` such as "When the environment variable
+# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
+# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+
 # Your host Antigravity CLI config, mounted read-write at its real absolute path. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
 # lets the caged `agy` read and write these host files (login, settings). Uncomment to share your

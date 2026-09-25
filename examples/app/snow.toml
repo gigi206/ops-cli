@@ -37,6 +37,13 @@
 # of the published package), and the provider endpoints (read out of the shipped bundle).
 cmd = "snow"
 
+# No `contract`: Snow's startup parameters carry no instructions; its system prompts are chosen in
+# the UI and its role files are `~/.snow/ROLE.md` and `./ROLE.md`, while `SNOW_CONFIG_DIR` would
+# move your config. Point Snow at the cage's summary yourself instead, for instance with a line in
+# your `~/.snow/ROLE.md` such as "When the environment variable SBX_SANDBOX is 1, read the file
+# named by SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is
+# rewritten at every launch.
+
 # Your host Snow config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
 # `snow` read and write these host files. Uncomment to share your host Snow setup with the cage
