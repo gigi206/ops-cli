@@ -27,6 +27,27 @@ pub(crate) enum AppHomeScope {
     Project,
 }
 
+/// How an app's program is handed the cage's summary: the validated `contract` table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppContract {
+    /// The command-line option the launch appends after `cmd`.
+    pub(crate) arg: String,
+    /// `None` when [`Self::arg`] takes the summary's in-cage path; `Some(key)` when it takes
+    /// `key=<the summary's text as a TOML string>`.
+    pub(crate) toml_key: Option<String>,
+}
+
+impl AppContract {
+    /// What the launch appends to `cmd`, joined for display. The text form names the summary rather
+    /// than spelling it out: it is rendered per launch, from that launch's decisions.
+    pub(crate) fn appended(&self) -> String {
+        match &self.toml_key {
+            None => format!("{} {}", self.arg, crate::sandbox::CONTRACT_SUMMARY_INCAGE),
+            Some(key) => format!("{} {key}=<the summary's text>", self.arg),
+        }
+    }
+}
+
 /// An app's resolved overlay over the sandbox baseline: the command to run plus the extra
 /// environment, binds, packages, network posture, and credentials it declares — each
 /// already gated by the trust of the layer that supplied it (the global config, trusted by
@@ -37,10 +58,10 @@ pub(crate) struct ResolvedApp {
     /// The argv to run. Empty when no layer declared a `cmd` — a launch error, never a
     /// silent default.
     pub(crate) cmd: Vec<String>,
-    /// The option [`Self::cmd`] is handed the cage's summary with (`contract = { arg = … }`), or
-    /// `None`. Set by the layer that set `cmd` and by no other, so it always belongs to the program
-    /// it is appended to; its provenance is therefore [`Self::cmd_origin`].
-    pub(crate) contract_arg: Option<String>,
+    /// How [`Self::cmd`] is handed the cage's summary (`contract = { arg = … }`), or `None`. Set by
+    /// the layer that set `cmd` and by no other, so it always belongs to the program it is appended
+    /// to; its provenance is therefore [`Self::cmd_origin`].
+    pub(crate) contract: Option<AppContract>,
     /// The install steps this app's bundles contribute, in `use` order, each stamped with its
     /// bundle. They run before [`Self::cmd`] and never in its place; an app declares none of its
     /// own, which is why they arrive only through the fold.
@@ -410,7 +431,7 @@ fn resolve_app(
     let mut ssh_agent_confirm = false;
     let mut cmd: Vec<String> = Vec::new();
     // Bound to `cmd`: assigned wherever `cmd` is, from the same layer, and nowhere else.
-    let mut contract_arg: Option<String> = None;
+    let mut contract: Option<AppContract> = None;
     // The install steps the layers' bundles contributed, in the order they were folded. A step is
     // carried, never merged: two bundles each finish their own tool. The same bundle named by both
     // layers contributes once — running one install twice is at best waste and at worst a fight
@@ -643,7 +664,7 @@ fn resolve_app(
         if let Some(c) = app.cmd {
             cmd = c.into_argv();
             cmd_origin = Provenance::Global;
-            contract_arg = app
+            contract = app
                 .contract
                 .and_then(|raw| validate_contract(&mut warnings, &source, raw, &cmd));
         } else if app.contract.is_some() {
@@ -994,20 +1015,21 @@ fn resolve_app(
         if let Some(c) = app.cmd {
             if may_set_cmd {
                 if app.contract.is_none()
-                    && let Some(lost) = &contract_arg
+                    && let Some(lost) = &contract
                 {
                     // Said, not only done: the command still runs, so the one sign of the change
                     // would be an agent that no longer knows its sandbox.
                     warnings.push(format!(
                         "{source}: this `cmd` replaces the profile's, and its `contract` \
-                         (`{lost}`) with it — the option belonged to that command. Declare \
+                         (`{}`) with it — the option belonged to that command. Declare \
                          `contract` here to keep it, or pass one run's arguments after \
-                         `sbx app run {name} --`, which keeps the profile's command and contract"
+                         `sbx app run {name} --`, which keeps the profile's command and contract",
+                        lost.appended()
                     ));
                 }
                 cmd = c.into_argv();
                 cmd_origin = Provenance::Project;
-                contract_arg = app
+                contract = app
                     .contract
                     .and_then(|raw| validate_contract(&mut warnings, &source, raw, &cmd));
             } else {
@@ -1054,7 +1076,7 @@ fn resolve_app(
         allow_insecure_http: own_allow_insecure_http,
         allow_insecure_http_origin,
         cmd,
-        contract_arg,
+        contract,
         provisions,
         home_scope,
         env,

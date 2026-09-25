@@ -59,7 +59,7 @@ tasks_max = 4096
 | Field | Kind | Notes |
 |---|---|---|
 | `cmd` | integrity-gated | a bare string (one-element argv, never whitespace-split) or an argv array |
-| `contract` | integrity-gated | `{ arg = "<option>" }`: the option `cmd` takes the cage's summary with, appended with the summary's path; bound to the `cmd` of the same declaration (see [below](#the-contract-field-handing-the-agent-its-sandbox)) |
+| `contract` | integrity-gated | `{ arg = "<option>" }`: the option `cmd` takes the cage's summary with, appended with the summary's path, or with `toml_key = "<key>"` its text as `<key>=<text>`; bound to the `cmd` of the same declaration (see [below](#the-contract-field-handing-the-agent-its-sandbox)) |
 | `use` | security | tool [bundles](bundles) folded into this app, in the order written (a later one wins on a key, the app always wins); must sit above the first `[table]` header |
 | `env` | free | overlaid on the baseline `env`, app wins on collision |
 | `binds` | security | added to the baseline binds |
@@ -156,7 +156,7 @@ or not, and an agent left to itself does not: it meets a refused host, a masked 
 credential as an unexplained failure and starts working around it.
 
 `contract` hands the summary to the agent through its own instruction channel, which it does read.
-The one channel is a command-line option that takes a file path:
+The channel is a command-line option, which by default takes the summary's file path:
 
 ```toml
 cmd      = "claude"
@@ -173,6 +173,32 @@ claude --append-system-prompt-file /opt/sbx/contract-summary.md <your arguments>
 So the program must accept the option ahead of a subcommand: `sbx app run claude-code -- mcp list`
 runs `claude --append-system-prompt-file … mcp list`, which Claude Code accepts. An agent with no
 such option gets no `contract`, and the summary stays in the cage for it to find.
+
+**The text instead of the path.** Some agents take their instructions as a config value, not as a
+file. `toml_key` names the config key the summary's text is assigned to, and `arg` then takes
+`<toml_key>=<text>`:
+
+```toml
+cmd      = ["codex", "--sandbox", "danger-full-access"]
+contract = { arg = "-c", toml_key = "developer_instructions" }
+```
+
+```text
+codex --sandbox danger-full-access -c developer_instructions="# sbx sandbox — summary\n…" <your arguments>
+```
+
+The text is encoded as a TOML string, so the program reads back the summary exactly. `toml_key` is
+a bare or dotted TOML key (`developer_instructions`, or `section.key` for a nested one). Four
+consequences come with passing the text rather than a path:
+
+- the option **replaces** any value for that key in the program's own configuration: with
+  `developer_instructions`, one set in `~/.codex/config.toml` is not applied for the run;
+- the last assignment of a key wins, so a caller's `-- -c developer_instructions=…` replaces the
+  summary for that run;
+- the summary is in the command line, which any user on the host can read with `ps` unless `/proc`
+  is mounted with `hidepid`;
+- a summary longer than the kernel's single-argument limit (128 KiB) is left out of the launch,
+  option included, with a warning, and stays at its path in the cage.
 
 **What the summary says.** The network posture and the hosts the cage may reach (hosts only, never
 their paths), the destinations a credential is attached to, the files sbx protects by name and a
@@ -200,7 +226,8 @@ warning. A trailing argument for one run belongs after `--`, which keeps the pro
 - `cmd` ends in a shell script (`["bash", "-c", "<script>"]`): an option appended there would reach
   the script's positional parameters, not the program it runs;
 - `arg` is missing, or does not start with `-`, or is the bare `--` that ends option parsing;
-- the table has a key other than `arg`.
+- `toml_key` is not a bare or dotted TOML key;
+- the table has a key other than `arg` and `toml_key`.
 
 ## Layering and gating
 

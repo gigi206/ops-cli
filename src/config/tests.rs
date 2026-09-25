@@ -4220,6 +4220,15 @@ fn the_import_report_says_when_a_contract_will_be_ignored() {
         honoured.contains("contract: --prompt-file /opt/sbx/contract-summary.md"),
         "{honoured}"
     );
+    let text = report(
+        "cmd = \"agent\"\ncontract = { arg = \"-c\", toml_key = \"developer_instructions\" }\n",
+    );
+    assert!(
+        text.contains(
+            "contract: -c developer_instructions=<the summary's text> (appended to the command)"
+        ),
+        "{text}"
+    );
     let script = report(
         "cmd = [\"bash\", \"-c\", \"exec agent\"]\ncontract = { arg = \"--prompt-file\" }\n",
     );
@@ -4247,7 +4256,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
     // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
     base.dbus = false;
     let app = ResolvedApp {
-        contract_arg: None,
+        contract: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4334,7 +4343,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
 fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
-        contract_arg: None,
+        contract: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4393,7 +4402,7 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
 fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
-        contract_arg: None,
+        contract: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4451,7 +4460,7 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     use crate::allowlist::{EgressPolicy, Methods, classify};
     let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
     let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
-        contract_arg: None,
+        contract: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4614,7 +4623,7 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
-        contract_arg: None,
+        contract: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -4680,7 +4689,7 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         "the baseline-effective set is cleared under a shared posture"
     );
     let app = ResolvedApp {
-        contract_arg: None,
+        contract: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
@@ -13457,18 +13466,23 @@ const CONTRACT_PROFILE: &str = "\
 #[test]
 fn the_contract_is_set_by_the_layer_that_sets_cmd() {
     let app = contract_app(CONTRACT_PROFILE, None);
-    assert_eq!(app.contract_arg.as_deref(), Some("--system-prompt-file"));
+    assert_eq!(
+        app.contract.as_ref().map(|c| c.arg.as_str()),
+        Some("--system-prompt-file")
+    );
     assert_eq!(app.cmd_origin, Provenance::Global);
     assert!(app.warnings.is_empty(), "{:#?}", app.warnings);
 
     let other_program = "[app.demo]\ncmd = \"other-agent\"\n";
     let app = contract_app(CONTRACT_PROFILE, Some((other_program, TrustState::Trusted)));
     assert_eq!(app.cmd, vec!["other-agent".to_string()]);
-    assert_eq!(app.contract_arg, None, "the option went to another program");
+    assert_eq!(app.contract, None, "the option went to another program");
     let dropped = |app: &ResolvedApp| {
-        app.warnings
-            .iter()
-            .any(|w| w.contains("and its `contract` (`--system-prompt-file`) with it"))
+        app.warnings.iter().any(|w| {
+            w.contains(
+                "and its `contract` (`--system-prompt-file /opt/sbx/contract-summary.md`) with it",
+            )
+        })
     };
     assert!(dropped(&app), "the drop went unsaid: {:#?}", app.warnings);
     assert!(
@@ -13479,13 +13493,19 @@ fn the_contract_is_set_by_the_layer_that_sets_cmd() {
 
     let restated = "[app.demo]\ncmd = [\"agent\", \"--fast\"]\ncontract = { arg = \"--prompt\" }\n";
     let app = contract_app(CONTRACT_PROFILE, Some((restated, TrustState::Trusted)));
-    assert_eq!(app.contract_arg.as_deref(), Some("--prompt"));
+    assert_eq!(
+        app.contract.as_ref().map(|c| c.arg.as_str()),
+        Some("--prompt")
+    );
     assert_eq!(app.cmd_origin, Provenance::Project);
     assert!(!dropped(&app), "{:#?}", app.warnings);
 
     let alone = "[app.demo]\ncontract = { arg = \"--prompt\" }\n";
     let app = contract_app(CONTRACT_PROFILE, Some((alone, TrustState::Trusted)));
-    assert_eq!(app.contract_arg.as_deref(), Some("--system-prompt-file"));
+    assert_eq!(
+        app.contract.as_ref().map(|c| c.arg.as_str()),
+        Some("--system-prompt-file")
+    );
     assert!(
         app.warnings
             .iter()
@@ -13502,7 +13522,7 @@ fn an_untrusted_project_sets_the_contract_of_its_own_app() {
     for (state, _) in REFUSAL_REASONS {
         let app = contract_app("", Some((CONTRACT_PROFILE, state)));
         assert_eq!(
-            app.contract_arg.as_deref(),
+            app.contract.as_ref().map(|c| c.arg.as_str()),
             Some("--system-prompt-file"),
             "{state:?}: {:#?}",
             app.warnings
@@ -13518,7 +13538,10 @@ fn an_untrusted_contract_without_cmd_is_refused_on_a_trusted_app() {
     let alone = "[app.demo]\ncontract = { arg = \"--evil\" }\n";
     for (state, reason) in REFUSAL_REASONS {
         let app = contract_app(CONTRACT_PROFILE, Some((alone, state)));
-        assert_eq!(app.contract_arg.as_deref(), Some("--system-prompt-file"));
+        assert_eq!(
+            app.contract.as_ref().map(|c| c.arg.as_str()),
+            Some("--system-prompt-file")
+        );
         let expected = format!(
             ".sbx.toml [app.demo]: ignoring `contract` for an app a trusted layer defines ({reason})"
         );
@@ -13528,6 +13551,30 @@ fn an_untrusted_contract_without_cmd_is_refused_on_a_trusted_app() {
             app.warnings
         );
         assert!(super::is_trust_drop(&expected));
+    }
+}
+
+/// A contract whose option takes the summary's text resolves with its key, bare or dotted.
+#[test]
+fn a_contract_names_the_config_key_its_text_is_assigned_to() {
+    for key in [
+        "developer_instructions",
+        "profiles.sbx.developer_instructions",
+    ] {
+        let app = contract_app(
+            &format!(
+                "[app.demo]\ncmd = \"agent\"\ncontract = {{ arg = \"-c\", toml_key = \"{key}\" }}\n"
+            ),
+            None,
+        );
+        assert_eq!(
+            app.contract,
+            Some(crate::config::AppContract {
+                arg: "-c".into(),
+                toml_key: Some(key.into()),
+            })
+        );
+        assert!(app.warnings.is_empty(), "{:#?}", app.warnings);
     }
 }
 
@@ -13556,10 +13603,26 @@ fn a_contract_the_launch_cannot_honour_is_refused_with_its_reason() {
             "cmd = \"agent\"\ncontract = { env = \"PROMPT_FILE\" }",
             "unknown key `env`",
         ),
+        (
+            "cmd = \"agent\"\ncontract = { toml_key = \"developer_instructions\" }",
+            "names no `arg`",
+        ),
+        (
+            "cmd = \"agent\"\ncontract = { arg = \"-c\", toml_key = \"model=x\" }",
+            "bare or dotted TOML key",
+        ),
+        (
+            "cmd = \"agent\"\ncontract = { arg = \"-c\", toml_key = \"\" }",
+            "bare or dotted TOML key",
+        ),
+        (
+            "cmd = \"agent\"\ncontract = { arg = \"-c\", toml_key = \"tui..x\" }",
+            "bare or dotted TOML key",
+        ),
     ];
     for (body, reason) in cases {
         let app = contract_app(&format!("[app.demo]\n{body}\n"), None);
-        assert_eq!(app.contract_arg, None, "{body}");
+        assert_eq!(app.contract, None, "{body}");
         assert!(
             app.warnings
                 .iter()

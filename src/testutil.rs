@@ -398,7 +398,7 @@ pub(crate) fn resolved_channels(
 /// own layer combine. `cmd` is a placeholder -- the overlay is never launched.
 pub(crate) fn app_with(packages: Vec<crate::config::Package>) -> crate::config::ResolvedApp {
     crate::config::ResolvedApp {
-        contract_arg: None,
+        contract: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         open: Default::default(),

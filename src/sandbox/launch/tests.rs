@@ -60,34 +60,75 @@ fn an_app_argv_carries_its_contract_between_cmd_and_the_callers_arguments() {
     let os = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
     let cmd = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
     let path = "/opt/sbx/contract-summary.md";
+    let file = crate::config::AppContract {
+        arg: "--prompt-file".into(),
+        toml_key: None,
+    };
 
     assert_eq!(
         app_argv("demo", &cmd(&["agent"]), None, os(&["-c"])),
-        os(&["agent", "-c"])
+        (os(&["agent", "-c"]), None)
     );
     assert_eq!(
-        app_argv("demo", &cmd(&["agent"]), Some("--prompt-file"), Vec::new()),
-        os(&["agent", "--prompt-file", path])
+        app_argv("demo", &cmd(&["agent"]), Some(&file), Vec::new()),
+        (os(&["agent", "--prompt-file", path]), None)
     );
     assert_eq!(
         app_argv(
             "demo",
             &cmd(&["agent", "--fast"]),
-            Some("--prompt-file"),
+            Some(&file),
             os(&["mcp", "list"])
         ),
-        os(&["agent", "--fast", "--prompt-file", path, "mcp", "list"])
+        (
+            os(&["agent", "--fast", "--prompt-file", path, "mcp", "list"]),
+            None
+        )
     );
 
     let script = cmd(&["bash", "-c", "exec agent \"$@\""]);
     assert_eq!(
-        app_argv("demo", &script, Some("--prompt-file"), Vec::new()),
-        os(&["bash", "-c", "exec agent \"$@\""])
+        app_argv("demo", &script, Some(&file), Vec::new()),
+        (os(&["bash", "-c", "exec agent \"$@\""]), None)
     );
     assert_eq!(
-        app_argv("demo", &script, Some("--prompt-file"), os(&["-c"])),
-        os(&["bash", "-c", "exec agent \"$@\"", "demo", "-c"])
+        app_argv("demo", &script, Some(&file), os(&["-c"])),
+        (os(&["bash", "-c", "exec agent \"$@\"", "demo", "-c"]), None)
     );
+}
+
+/// A contract that takes the summary's text leaves the argv without it and returns where it goes —
+/// after `cmd`, ahead of the caller's arguments — and a shell script takes it no more than the path.
+#[test]
+fn an_app_argv_defers_a_text_contract_to_the_position_after_cmd() {
+    let os = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
+    let cmd = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+    let text = crate::config::AppContract {
+        arg: "-c".into(),
+        toml_key: Some("developer_instructions".into()),
+    };
+
+    let (argv, pending) = app_argv(
+        "demo",
+        &cmd(&["codex", "--sandbox", "danger-full-access"]),
+        Some(&text),
+        os(&["exec", "hi"]),
+    );
+    assert_eq!(
+        argv,
+        os(&["codex", "--sandbox", "danger-full-access", "exec", "hi"])
+    );
+    assert_eq!(
+        pending,
+        Some(TextDelivery {
+            at: 3,
+            arg: "-c".into(),
+            key: "developer_instructions".into(),
+        })
+    );
+
+    let script = cmd(&["bash", "-c", "exec codex \"$@\""]);
+    assert_eq!(app_argv("demo", &script, Some(&text), Vec::new()).1, None);
 }
 
 const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";

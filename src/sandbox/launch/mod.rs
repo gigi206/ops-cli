@@ -41,6 +41,7 @@
 
 use super::binds::{self, Userland};
 use super::broker;
+use super::contract::TextDelivery;
 use super::egress;
 use super::forward;
 use super::pty::fork_with_pty;
@@ -126,6 +127,10 @@ struct Prepared {
     /// Kept beside the config rather than inside it because it is not a posture the project
     /// declared: it is what this invocation was asked to find out.
     learn_exec: bool,
+    /// The app's contract when its option takes the summary's text, which [`build()`] splices into
+    /// the argv once it has rendered the summary. `None` for every other launch, including an app
+    /// whose option takes the summary's path, which [`app_argv`] already placed.
+    contract_text: Option<TextDelivery>,
     /// Whether this launch is one cage of a batch — set on the `sbx upgrade` rolls, which build one
     /// cage per app, and left `false` for an ordinary launch.
     ///
@@ -462,6 +467,10 @@ impl AppOutcome {
 /// in-cage path, then any trailing `sbx app <name> -- <args>`, so the caller can pass a flag to the
 /// launched program (e.g. `-c` to resume) without editing the profile.
 ///
+/// A contract whose option takes the summary's text (`toml_key`) is not in the returned argv: the
+/// text is rendered later, from the launch's own decisions, so its place is returned instead and
+/// [`build()`] splices it in ([`TextDelivery::splice`]).
+///
 /// The contract goes ahead of the caller's arguments because it belongs to the profile, not to
 /// this run: a caller's `-- mcp list` still reaches the program as its subcommand. A `cmd` ending
 /// in a shell script takes no contract at all — appended there it would land in the script's
@@ -470,17 +479,33 @@ impl AppOutcome {
 fn app_argv(
     name: &str,
     cmd: &[String],
-    contract_arg: Option<&str>,
+    contract: Option<&crate::config::AppContract>,
     extra: Vec<OsString>,
-) -> Vec<OsString> {
+) -> (Vec<OsString>, Option<TextDelivery>) {
     let mut argv: Vec<OsString> = cmd.iter().map(OsString::from).collect();
     let script = ends_with_shell_payload(&argv);
     let mut tail: Vec<OsString> = Vec::new();
-    if let Some(arg) = contract_arg
-        && !script
-    {
-        tail.push(OsString::from(arg));
-        tail.push(OsString::from(super::contract::CONTRACT_SUMMARY_INCAGE));
+    let mut text = None;
+    match contract {
+        Some(_) if script => {}
+        None => {}
+        Some(crate::config::AppContract {
+            arg,
+            toml_key: None,
+        }) => {
+            tail.push(OsString::from(arg));
+            tail.push(OsString::from(super::contract::CONTRACT_SUMMARY_INCAGE));
+        }
+        Some(crate::config::AppContract {
+            arg,
+            toml_key: Some(key),
+        }) => {
+            text = Some(TextDelivery {
+                at: argv.len(),
+                arg: arg.clone(),
+                key: key.clone(),
+            });
+        }
     }
     tail.extend(extra);
     if !tail.is_empty() && script {
@@ -494,7 +519,7 @@ fn app_argv(
         argv.push(OsString::from(name));
     }
     argv.extend(tail);
-    argv
+    (argv, text)
 }
 
 /// `sbx app <name>`: launch the named application profile — the project sandbox baseline
@@ -541,7 +566,7 @@ pub(crate) fn app(
     // The argv and the home scope are owned by the app; read them before the overlay is folded
     // in (which moves the app but does not touch them). The scope keys this app's persistent
     // home: one shared across projects (`Global`) or one per project (`Project`).
-    let cmd = app_argv(name, &app.cmd, app.contract_arg.as_deref(), extra);
+    let (cmd, contract_text) = app_argv(name, &app.cmd, app.contract.as_ref(), extra);
     // A bundle's install step and a declared service both run BEFORE the app's command, in this same
     // cage — same posture, same allowlist, same environment — and never in its place: the app's
     // command stays its identity. Both are composed in `build`, once the app overlay and any
@@ -558,6 +583,7 @@ pub(crate) fn app(
         Err(code) => return AppOutcome::plain(code),
     };
     crate::diag::hint(&format!("sbx: launching app `{name}`"));
+    prep.contract_text = contract_text;
     prep.cfg.merge_app(app);
     // The override is the authoritative final word — applied *after* the app overlay so a one-shot
     // `sbx app <name> --config …`/`SBX_*` beats the app's own posture, not the other way round.
@@ -1136,6 +1162,7 @@ fn prepare_engines(
         in_batch: false,
         unresolved_secret: crate::sandbox::egress::Unresolved::Abort,
         learn_exec: false,
+        contract_text: None,
     })
 }
 

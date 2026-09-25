@@ -1207,13 +1207,20 @@ impl RawCmd {
 /// An app's `contract` table: the channel through which its program is handed the cage's summary.
 ///
 /// A table rather than a bare flag so a channel other than a command-line option can be added as a
-/// sibling key. Only `arg` exists: a key sbx does not know is reported and the contract ignored,
-/// rather than read as the flag it is not.
+/// sibling key. The channel is always a command-line option, `arg`; `toml_key` changes what that
+/// option is given, from the summary's path to its text. A key sbx does not know is reported and
+/// the contract ignored, rather than read as the flag it is not.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawContract {
-    /// The command-line option that takes a file path, such as `--append-system-prompt-file`.
+    /// The command-line option, such as `--append-system-prompt-file` (which takes a file path)
+    /// or `-c` (which, with [`Self::toml_key`], takes a `key=value` config override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) arg: Option<String>,
+    /// The config key the summary's **text** is assigned to, encoded as a TOML string, for a
+    /// program that takes instructions as a config value rather than as a file: `arg` is then
+    /// given `<toml_key>=<text>` instead of the summary's path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) toml_key: Option<String>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,

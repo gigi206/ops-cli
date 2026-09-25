@@ -812,11 +812,10 @@ pub(crate) struct AppLimitsView {
 }
 
 /// The arguments a launch appends to an app's `cmd` for its contract — the option, then the
-/// summary's in-cage path — joined for display, or `None` when the app declares none.
+/// summary's in-cage path or its text's `key=` assignment — joined for display, or `None` when the
+/// app declares none.
 pub(crate) fn contract_view(app: &super::ResolvedApp) -> Option<String> {
-    app.contract_arg
-        .as_ref()
-        .map(|arg| format!("{arg} {}", crate::sandbox::CONTRACT_SUMMARY_INCAGE))
+    app.contract.as_ref().map(super::AppContract::appended)
 }
 
 /// A named application profile: the command it runs and what its gated overlay adds.
@@ -2436,7 +2435,7 @@ mod tests {
 
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
-            contract_arg: None,
+            contract: None,
             accepts_fresh_releases: Default::default(),
             provisions: Vec::new(),
             open: Default::default(),
@@ -2675,7 +2674,7 @@ mod tests {
         };
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
-            contract_arg: None,
+            contract: None,
             accepts_fresh_releases: Default::default(),
             provisions: Vec::new(),
             open: Default::default(),

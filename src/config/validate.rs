@@ -197,32 +197,34 @@ pub(super) fn validate_tasks_limit(
     }
 }
 
-/// Read an app's `contract` table into the option its command is handed the summary with, or
-/// `None`, with a warning, when the table names no usable channel.
+/// Read an app's `contract` table into how its command is handed the summary, or `None`, with a
+/// warning, when the table names no usable channel.
 ///
 /// `cmd` is the argv of the same layer, the one the contract is bound to. A command ending in a
 /// shell script takes no contract: an option appended after the script becomes one of its
 /// positional parameters, never an option of the program it runs.
 ///
 /// The option must look like one — a leading `-`, and not the bare `--` that ends option parsing
-/// and would turn the summary's path into an operand.
+/// and would turn the summary into an operand. A `toml_key` must be a bare or dotted TOML key: the
+/// program splits `key=value` at its first `=`, so a key is what keeps the text a value of the
+/// setting the profile named, whatever the text holds.
 pub(super) fn validate_contract(
     warnings: &mut Vec<String>,
     source: &str,
     raw: schema::RawContract,
     cmd: &[String],
-) -> Option<String> {
+) -> Option<AppContract> {
     if let Some(key) = raw.rest.keys().next() {
         warnings.push(format!(
-            "{source}: ignoring `contract` — unknown key `{key}` (the only channel is `arg`, a \
-             command-line option)"
+            "{source}: ignoring `contract` — unknown key `{key}` (the keys are `arg`, a \
+             command-line option, and `toml_key`, the config key it assigns the summary's text to)"
         ));
         return None;
     }
     let Some(arg) = raw.arg else {
         warnings.push(format!(
             "{source}: ignoring `contract` — it names no `arg` (the command-line option that takes \
-             the summary's path)"
+             the summary)"
         ));
         return None;
     };
@@ -234,6 +236,16 @@ pub(super) fn validate_contract(
         ));
         return None;
     }
+    if let Some(key) = &raw.toml_key
+        && !is_toml_dotted_key(key)
+    {
+        warnings.push(format!(
+            "{source}: ignoring `contract` — `toml_key` must be a bare or dotted TOML key such as \
+             `developer_instructions`, not `{}`",
+            key.escape_debug()
+        ));
+        return None;
+    }
     if super::ends_with_shell_payload(cmd) {
         warnings.push(format!(
             "{source}: ignoring `contract` — `cmd` ends in a shell script, and an option appended \
@@ -241,7 +253,20 @@ pub(super) fn validate_contract(
         ));
         return None;
     }
-    Some(arg)
+    Some(AppContract {
+        arg,
+        toml_key: raw.toml_key,
+    })
+}
+
+/// Whether `key` is a TOML key made of bare segments (`A-Za-z0-9_-`) joined by single dots.
+fn is_toml_dotted_key(key: &str) -> bool {
+    key.split('.').all(|segment| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
 }
 
 /// Parse an app's `home_scope` string into [`AppHomeScope`]. An unrecognized value is dropped

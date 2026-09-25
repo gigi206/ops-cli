@@ -40,6 +40,17 @@
 # restrictions; the real filesystem and network boundary stays sbx's cage and its egress allowlist.
 cmd = ["codex", "--sandbox", "danger-full-access"]
 
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects, which
+# operations it offers) handed to the agent as developer instructions, so a refused host or a
+# read-only file reads as the sandbox rather than as a fault to work around. codex takes them as a
+# config value, not a file, so the summary's TEXT is passed: `-c developer_instructions="<text>"`,
+# encoded as a TOML string. `model_instructions_file` would take the path, but it REPLACES codex's
+# own base instructions. Two consequences: a `developer_instructions` in ~/.codex/config.toml is
+# not applied while this is set, and a `-- -c developer_instructions=…` of your own replaces the
+# summary for that run. Bound to this `cmd`: a project that sets its own `cmd` for this app writes
+# its own `contract`, or has none.
+contract = { arg = "-c", toml_key = "developer_instructions" }
+
 # Forward the host's localhost:1455 into the cage so the OAuth callback reaches codex.
 # A port already in use on the host fails the launch closed (the redirect URL is fixed).
 # Must stay a top-level key: written after a `[table]` header, TOML would fold it into that

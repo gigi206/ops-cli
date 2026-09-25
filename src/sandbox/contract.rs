@@ -42,6 +42,7 @@
 //! where a process already looks, because a capability that cannot be found is worth the
 //! same as one that was never granted.
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use crate::allowlist::{DefaultAction, EgressPolicy, Layer, Methods, Rule, RuleKind};
@@ -63,6 +64,69 @@ pub(crate) const CONTRACT_INCAGE: &str = "/opt/sbx/contract.md";
 /// path to the agent through the agent's own instruction channel, so the text arrives before the
 /// agent acts rather than when it thinks to look.
 pub(crate) const CONTRACT_SUMMARY_INCAGE: &str = "/opt/sbx/contract-summary.md";
+
+/// The longest single argument the kernel passes to a program: `MAX_ARG_STRLEN`, 32 pages of
+/// 4 KiB, its terminating NUL included. The smallest page size is taken, so the bound holds on
+/// every host.
+const MAX_ARG_STRLEN: usize = 32 * 4096;
+
+/// A contract whose option takes the summary's **text** (`contract = { arg, toml_key }`), which the
+/// launch cannot write into the argv until the summary is rendered: the app's argv is settled
+/// before the launch has decided what the summary says.
+///
+/// A pending insertion rather than a placeholder in the argv, so that a path which never splices it
+/// launches the program without a contract instead of with an empty value its option would take
+/// for one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TextDelivery {
+    /// Where the option goes: after the app's `cmd`, ahead of the caller's arguments.
+    pub(crate) at: usize,
+    /// The command-line option, such as `-c`.
+    pub(crate) arg: String,
+    /// The config key the text is assigned to, such as `developer_instructions`.
+    pub(crate) key: String,
+}
+
+impl TextDelivery {
+    /// `argv` with the option and `key=<summary as a TOML string>` inserted at [`Self::at`].
+    ///
+    /// The value is encoded as a TOML string rather than interpolated, so the program reads back
+    /// exactly the summary, whatever quotes, backslashes or newlines a project's file names put in
+    /// it. An assignment the kernel would refuse as one argument is left out whole, option
+    /// included: a bare option would take the caller's next argument as its value.
+    pub(crate) fn splice(&self, mut argv: Vec<OsString>, summary: &str) -> Vec<OsString> {
+        let value = format!("{}={}", self.key, toml::Value::String(summary.to_owned()));
+        if value.len() >= MAX_ARG_STRLEN {
+            crate::diag::warn(&format!(
+                "sbx: the cage's summary is too long to pass as one argument ({} bytes, the \
+                 kernel's limit is {MAX_ARG_STRLEN}): `{} {}=…` is left out of this launch, and \
+                 the summary stays at {CONTRACT_SUMMARY_INCAGE}",
+                value.len(),
+                self.arg,
+                self.key
+            ));
+            return argv;
+        }
+        if self.at > argv.len() {
+            // The argv was reshaped after the position was taken; appended anywhere else, the
+            // option would land among arguments it was never meant to precede.
+            crate::diag::warn(&format!(
+                "sbx: `{} {}=…` is left out of this launch: its position ({}) is past the end of the \
+                 command ({} arguments)",
+                self.arg,
+                self.key,
+                self.at,
+                argv.len()
+            ));
+            return argv;
+        }
+        argv.splice(
+            self.at..self.at,
+            [OsString::from(&self.arg), OsString::from(value)],
+        );
+        argv
+    }
+}
 
 /// Render the egress contract for a resolved network posture. Pure: the text derives only
 /// from the policy and the destinations this run withdrew.
@@ -2162,5 +2226,69 @@ mod tests {
             text.contains("``"),
             "the backtick name gets a longer fence:\n{text}"
         );
+    }
+
+    fn delivery(at: usize) -> TextDelivery {
+        TextDelivery {
+            at,
+            arg: "-c".into(),
+            key: "developer_instructions".into(),
+        }
+    }
+
+    /// The text reaches the program as the exact summary: the assignment is a TOML document the
+    /// program reads back byte for byte, whatever quotes, backslashes, newlines or control bytes the
+    /// summary carries (a project's file names are among its contents), and it lands between the
+    /// command and the caller's arguments.
+    #[test]
+    fn a_text_contract_is_spliced_as_a_toml_string_that_reads_back_exactly() {
+        let hostile = "# sbx sandbox\nit's ''' and \"\"\" and \\ and `x`\n\t80% \u{1} é ✓\n";
+        let argv: Vec<OsString> = ["codex", "--fast", "exec"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out = delivery(2).splice(argv, hostile);
+
+        assert_eq!(out.len(), 5, "{out:?}");
+        assert_eq!(out[0], "codex");
+        assert_eq!(out[1], "--fast");
+        assert_eq!(out[2], "-c");
+        assert_eq!(out[4], "exec");
+        let assignment = out[3].to_str().expect("utf-8");
+        assert!(
+            assignment.starts_with("developer_instructions="),
+            "{assignment}"
+        );
+        let table: toml::Table = toml::from_str(assignment).expect("a TOML assignment");
+        assert_eq!(
+            table.get("developer_instructions").and_then(|v| v.as_str()),
+            Some(hostile)
+        );
+    }
+
+    /// An assignment the kernel would refuse as one argument is left out with its option: a bare
+    /// `-c` would take the caller's next argument as its value. One byte under the limit goes in.
+    #[test]
+    fn a_text_contract_past_the_kernels_argument_limit_is_left_out_whole() {
+        let argv: Vec<OsString> = ["codex", "exec"].iter().map(OsString::from).collect();
+        // `developer_instructions="…"`: the key, `=`, and two quotes around a plain run of `a`.
+        let overhead = "developer_instructions=\"\"".len();
+
+        let fits = "a".repeat(MAX_ARG_STRLEN - 1 - overhead);
+        let out = delivery(1).splice(argv.clone(), &fits);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[2].len(), MAX_ARG_STRLEN - 1);
+
+        let too_long = "a".repeat(MAX_ARG_STRLEN - overhead);
+        assert_eq!(delivery(1).splice(argv.clone(), &too_long), argv);
+    }
+
+    /// A position past the end of the argv is refused rather than clamped: appended at the end, the
+    /// option would follow arguments it was placed to precede.
+    #[test]
+    fn a_text_contract_whose_position_is_past_the_argv_is_left_out() {
+        let argv: Vec<OsString> = ["codex"].iter().map(OsString::from).collect();
+        assert_eq!(delivery(2).splice(argv.clone(), "summary"), argv);
+        assert_eq!(delivery(1).splice(argv, "summary").len(), 3);
     }
 }

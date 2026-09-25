@@ -988,9 +988,9 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
         let mut why = Vec::new();
         lines.push(
             match super::validate_contract(&mut why, "", contract.clone(), &cmd) {
-                Some(arg) => format!(
-                    "contract: {arg} {} (appended to the command)",
-                    crate::sandbox::CONTRACT_SUMMARY_INCAGE
+                Some(contract) => format!(
+                    "contract: {} (appended to the command)",
+                    contract.appended()
                 ),
                 None => format!(
                     "contract: ignored at launch — {}",

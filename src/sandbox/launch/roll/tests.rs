@@ -134,7 +134,7 @@ fn app_overlay(
     packages: Vec<crate::config::Package>,
 ) -> crate::config::ResolvedApp {
     crate::config::ResolvedApp {
-        contract_arg: None,
+        contract: None,
         accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         open: Default::default(),

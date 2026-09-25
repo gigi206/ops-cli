@@ -2833,6 +2833,11 @@ pub(super) fn build(
             refused_syscalls: &refused_syscalls,
             limits: limit_scope.properties(),
         });
+    // A contract whose option takes the summary's text goes in now, the first point the text exists.
+    let cmd = match &prep.contract_text {
+        Some(text) => text.splice(cmd, &documents.summary),
+        None => cmd,
+    };
     // The device grant: the resolved `[devices]` plus, under `gpu = true`, this host's DRM **render**
     // nodes (`/dev/dri/renderD*`), so the cage can reach the GPU. Both become `--dev-bind-try`
     // mounts. Never the whole `/dev/dri` directory: that carries the `card*` primary nodes in with
