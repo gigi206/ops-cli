@@ -262,9 +262,9 @@ mod tests {
                 r#"accept_backoff("task control (logs)""#,
             ),
             (
-                "egress control",
+                "egress control and reports",
                 include_str!("control/mod.rs"),
-                "sbx: egress control: accept error",
+                "sbx: {who}: accept error",
             ),
             (
                 "egress proxy",
