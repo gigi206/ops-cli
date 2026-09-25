@@ -121,6 +121,16 @@ exec "$bin" "$@"
     "muse",
 ]
 
+# No `contract`: Muse documents no option or environment variable that adds instructions from
+# outside the project; its instructions come from the `AGENTS.md`/`CLAUDE.md` files it finds
+# walking up from the workspace, and from your own rules. The binary does read an undocumented
+# `TBH_EVAL_APPEND_SYSTEM_PROMPT` family, but a provider without base instructions (`--provider
+# echo`, for one) then refuses to run ("provider does not support base instructions"), so it is not
+# set here. Point Muse at the cage's summary yourself instead, for instance with a line in your
+# instructions such as "When the environment variable SBX_SANDBOX is 1, read the file named by
+# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
+# at every launch.
+
 # Your host Meta Code config/auth, mounted read-write at its real absolute
 # paths. `binds` is a security field, honored only because this profile lives in
 # your trusted config dir; `mode = "rw"` lets the caged `muse` read and write
