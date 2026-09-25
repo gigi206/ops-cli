@@ -2333,6 +2333,9 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
     let mut totals = PruneTotals::default();
     let mut skipped: Vec<String> = Vec::new();
+    // The `--stale` sweeps left alone because a file that says what to keep was there but could
+    // not be read, each with the reason.
+    let mut unread: Vec<String> = Vec::new();
     let mut had_error = false;
 
     // The live-session guard below reads the registry once for the whole sweep, and an error
@@ -2490,9 +2493,21 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         if !stale {
             continue;
         }
-        // A home's own activation record governs its own pool, and nothing else reaches it.
+        // A home's own activation record governs its own pool, and nothing else reaches it. One that
+        // is there but cannot be read leaves the pool alone: an unknown answer is not an empty one.
         for home in &homes {
-            let specs = sandbox::mise_tool_specs(&home.dir.join(".config/mise/config.toml"));
+            let specs = match sandbox::mise_tool_specs(&home.dir.join(".config/mise/config.toml")) {
+                Ok(specs) => specs,
+                Err(e) => {
+                    let location = if home.global {
+                        "global home".to_string()
+                    } else {
+                        format!("project {} home", home.project_id.as_deref().unwrap_or("?"))
+                    };
+                    unread.push(format!("{app_name} {location}: {e}"));
+                    continue;
+                }
+            };
             let stale_versions = sandbox::prune_stale_versions(
                 &home.dir,
                 Path::new(".local/share/mise/installs"),
@@ -2529,27 +2544,46 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                     .join(app)
                     .join("home/.config/mise/config.toml")
             };
-            let mut specs = sandbox::mise_tool_specs(&activation_of(app_name));
-            for file in crate::trust::mise_files_for(&project.join(".sbx.toml")) {
-                for (tool, versions) in sandbox::mise_tool_specs(&file) {
-                    specs.entry(tool).or_default().extend(versions);
+            // Every file below is read or the pool is left alone: the specs are a union, so one file
+            // that was there and not read would narrow it, and the sweep would delete a version
+            // that file asks to keep.
+            let wanted = || -> std::io::Result<std::collections::BTreeMap<String, Vec<String>>> {
+                let mut specs = sandbox::mise_tool_specs(&activation_of(app_name))?;
+                for file in crate::trust::mise_files_for(&project.join(".sbx.toml")) {
+                    for (tool, versions) in sandbox::project_mise_tool_specs(&file)? {
+                        specs.entry(tool).or_default().extend(versions);
+                    }
                 }
-            }
-            // And the other apps of this project, because `apps_share_install_pools` lets one
-            // resolve out of another's pool: a tool this app equipped once and no longer asks for
-            // may be the one a neighbour found here and therefore never installed itself, so
-            // reading this app's activations alone would empty a pool under a running neighbour.
-            // Not gated on the grant, which lives in the project's config rather than on disk here:
-            // when it is off those activations name versions no launch resolves from this pool, so
-            // the widening only ever keeps a version, and keeping one is this sweep's stated bias
-            // (see `prune_stale_versions`, which leaves a tool with no spec entirely alone).
-            for (neighbour, _) in
-                sandbox::inspect::project_mise_pools(layout.data_dir(), &pool.project_id, app_name)
-            {
-                for (tool, versions) in sandbox::mise_tool_specs(&activation_of(&neighbour)) {
-                    specs.entry(tool).or_default().extend(versions);
+                // And the other apps of this project, because `apps_share_install_pools` lets one
+                // resolve out of another's pool: a tool this app equipped once and no longer asks
+                // for may be the one a neighbour found here and therefore never installed itself,
+                // so reading this app's activations alone would empty a pool under a running
+                // neighbour. Not gated on the grant, which lives in the project's config rather
+                // than on disk here: when it is off those activations name versions no launch
+                // resolves from this pool, so the widening only ever keeps a version, and keeping
+                // one is this sweep's stated bias (see `prune_stale_versions`, which leaves a tool
+                // with no spec entirely alone).
+                for (neighbour, _) in sandbox::inspect::project_mise_pools(
+                    layout.data_dir(),
+                    &pool.project_id,
+                    app_name,
+                ) {
+                    for (tool, versions) in sandbox::mise_tool_specs(&activation_of(&neighbour))? {
+                        specs.entry(tool).or_default().extend(versions);
+                    }
                 }
-            }
+                Ok(specs)
+            };
+            let specs = match wanted() {
+                Ok(specs) => specs,
+                Err(e) => {
+                    unread.push(format!(
+                        "{app_name} project {} mise pool: {e}",
+                        pool.project_id
+                    ));
+                    continue;
+                }
+            };
             let stale_versions =
                 sandbox::prune_stale_versions(&pool.dir, Path::new("installs"), &specs, apply);
             let where_ = format!("project {} mise pool", pool.project_id);
@@ -2560,6 +2594,13 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     for line in &skipped {
         diag::note(&format!(
             "sbx: app prune: skipped {line} — a live session holds that home"
+        ));
+        had_error = true;
+    }
+    for line in &unread {
+        diag::note(&format!(
+            "sbx: app prune: {line}. Its stale versions are left alone, since what it asks to \
+             keep could not be read"
         ));
         had_error = true;
     }

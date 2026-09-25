@@ -521,6 +521,13 @@ writes both the pool and the activation record that decides what is stale, so a 
 point the sweep at a directory that is not a pool. A pool reached through one is skipped, and so
 is a tool directory that is a link.
 
+Every file that says what to keep has to be read, or the pool it governs is **left alone**. An
+activation record must be a regular file, not a link, and the project's mise files are read the
+way [the trust gate](../concepts/trust) reads them; each is bounded in size, and a `.tool-versions`
+is read in its own format. A file that is there but is something else, too large, or does not
+parse is named in a note, the pool's stale versions stay, and the sweep exits non-zero. Reading it
+as empty instead would narrow what is kept and delete a version that file asks for.
+
 Under `--all`, an app whose session is running is **skipped and named** rather than refusing
 the whole sweep, so one live agent does not hold up the rest; the sweep then exits non-zero
 so a script notices that not everything was covered.

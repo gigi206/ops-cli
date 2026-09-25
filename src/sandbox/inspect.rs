@@ -179,26 +179,57 @@ const CAGE_METADATA_CAP: u64 = 8 * 1024;
 /// open from blocking, the file type is checked on the **descriptor** — a check on the path would
 /// answer about whatever was there at that instant, and the payload can swap the entry before the
 /// open — and the read stops at [`CAGE_METADATA_CAP`]. `None` for anything that is not a readable
-/// regular file, which reads the same as absent metadata.
+/// regular file within it, which reads the same as absent metadata.
 ///
-/// Every future reader of a path under the cage's writable home belongs on this function rather
-/// than on `std::fs::read_to_string`.
+/// Every future reader of a path under the cage's writable home belongs on this function, or on
+/// [`read_cage_file`] beneath it, rather than on `std::fs::read_to_string`.
 fn read_cage_metadata(path: &Path) -> Option<String> {
-    use std::io::Read as _;
+    let body = read_cage_file(path, CAGE_METADATA_CAP).ok()??;
+    String::from_utf8(body).ok()
+}
+
+/// How much of a cage-written mise config is read: a home's `.config/mise/config.toml`, which
+/// `mise use -g` writes, and a task pool's. A few short lines per tool, so a mebibyte is far above
+/// any real one; a file past it is refused, never read in part.
+pub(crate) const CAGE_MISE_CONFIG_CAP: u64 = 1024 * 1024;
+
+/// Read a file inside the cage's writable home, opened as [`read_cage_metadata`] explains, with
+/// each outcome told apart.
+///
+/// `Ok(None)` when nothing is at `path`, `Ok(Some)` for a regular file of at most `cap` bytes, and
+/// `Err` for anything else found there (a symlink, a FIFO, a device, a directory, a larger file)
+/// or a read that failed. The distinction is for a caller that decides what to delete from the
+/// contents: a file that was there but was not read must not count as an empty one.
+pub(crate) fn read_cage_file(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::{Error, ErrorKind, Read as _};
     use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
+    let refused = |why: &str| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("`{}` {why}", path.display()),
+        )
+    };
+    let named = |e: Error| Error::new(e.kind(), format!("`{}`: {e}", path.display()));
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refused("is a symlink")),
+        Err(e) => return Err(named(e)),
+    };
+    if !file.metadata().map_err(named)?.is_file() {
+        return Err(refused("is not a regular file"));
     }
-    let mut body = String::new();
-    file.take(CAGE_METADATA_CAP)
-        .read_to_string(&mut body)
-        .ok()?;
-    Some(body)
+    // One byte past the ceiling, so a file exactly at it and one over it are told apart.
+    let mut body = Vec::new();
+    file.take(cap + 1).read_to_end(&mut body).map_err(named)?;
+    if body.len() as u64 > cap {
+        return Err(refused(&format!("is larger than {cap} bytes")));
+    }
+    Ok(Some(body))
 }
 
 /// One isolated home an app has on disk. An app's mise-installed tools are per-home, so `sbx app
@@ -885,6 +916,51 @@ mod tests {
             bare.is("bare-tool"),
             "pairing with a declared token survives"
         );
+    }
+
+    /// A caller that deletes on what a cage-written file says has to tell "nothing there" from
+    /// "something there, not read". Each entry the cage could leave is refused as the latter, and
+    /// none of them holds the caller: a FIFO in particular returns at once.
+    #[test]
+    fn a_cage_file_is_absent_read_or_refused_and_never_waited_on() {
+        let dir = crate::testutil::TmpDir::new();
+        let cap = 64;
+        let at = |name: &str| dir.path().join(name);
+
+        assert!(read_cage_file(&at("absent"), cap).unwrap().is_none());
+
+        std::fs::write(at("regular"), b"[tools]\n").unwrap();
+        assert_eq!(
+            read_cage_file(&at("regular"), cap).unwrap().unwrap(),
+            b"[tools]\n"
+        );
+        std::fs::write(at("at-cap"), vec![b'#'; 64]).unwrap();
+        assert_eq!(
+            read_cage_file(&at("at-cap"), cap).unwrap().unwrap().len(),
+            64
+        );
+
+        std::fs::write(at("over-cap"), vec![b'#'; 65]).unwrap();
+        std::os::unix::fs::symlink(at("regular"), at("link")).unwrap();
+        std::fs::create_dir(at("dir")).unwrap();
+        crate::testutil::make_fifo(&at("fifo"));
+        for (name, why) in [
+            ("over-cap", "is larger than 64 bytes"),
+            ("link", "is a symlink"),
+            ("dir", "is not a regular file"),
+            ("fifo", "is not a regular file"),
+        ] {
+            let path = at(name);
+            let err = crate::testutil::returns_within(
+                std::time::Duration::from_secs(10),
+                &format!("reading {name}"),
+                move || read_cage_file(&path, cap),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be refused"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{name}: {err}");
+            assert!(err.to_string().contains(why), "{name}: {err}");
+        }
     }
 
     /// The cage's metadata file is opened defensively, not just filtered afterwards.

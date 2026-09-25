@@ -920,6 +920,81 @@ fn prune_stale_does_not_follow_a_link_planted_above_the_pool() {
     );
 }
 
+/// A pool's kept versions are the union of several files, the project's mise file among them. One
+/// that is there and cannot be read leaves the pool alone and says so: reading it as empty would
+/// narrow the union and delete the version it asks to keep.
+#[test]
+fn prune_stale_leaves_a_pool_alone_when_a_file_that_says_what_to_keep_is_refused() {
+    let fx = fixture_with_a_leftover();
+    fx.write_home_mise_config("demo-app", "[tools]\n\"aqua:demo/keep\" = \"2.0.0\"\n");
+    fx.install_pool_tool("demo-app", "testproj", "aqua-demo-keep", "1.0.0");
+    let marker = fx.data_home.path().join("sbx/projects/testproj/project");
+    std::fs::write(&marker, fx.proj.path().as_os_str().as_bytes()).unwrap();
+    // The project asks for 1.0.0, in a file past the bound its mise files are read within.
+    let mut asks = String::from("[tools]\n\"aqua:demo/keep\" = \"1.0.0\"\n#");
+    asks.push_str(&"#".repeat(1024 * 1024));
+    std::fs::write(fx.proj.path().join("mise.toml"), asks).unwrap();
+
+    let out = fx.run(&["app", "prune", "demo-app", "--stale", "--yes"]);
+    assert!(
+        fx.data_home
+            .path()
+            .join("sbx/projects/testproj/apps/demo-app/mise/installs/aqua-demo-keep/1.0.0")
+            .exists(),
+        "the version the refused file asks for was deleted: {}",
+        text(&out)
+    );
+    assert!(!out.status.success(), "a sweep left undone is a failure");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("mise.toml") && err.contains("left alone"),
+        "the note must name the file and what was not done: {err}"
+    );
+}
+
+/// The home's activation is the cage's to replace, with a FIFO among other things. `--stale` and
+/// the tool sweep both read it; neither waits on it, and the pool is left alone.
+#[test]
+fn prune_stale_returns_when_the_activation_is_a_fifo() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let fx = fixture_with_a_leftover();
+    let config = fx.app_home("demo-app").join(".config/mise/config.toml");
+    std::fs::remove_file(&config).unwrap();
+    let name = std::ffi::CString::new(config.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `mkfifo` only creates a FIFO at the given path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+    let mut child = fx
+        .cmd(&["app", "prune", "demo-app", "--stale", "--yes"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sbx");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("`sbx app prune --stale` waited on the FIFO the cage left as its activation");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not a regular file"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        fx.installs_dir("demo-app")
+            .join("aqua-demo-keep/1.0.0")
+            .is_dir(),
+        "the home's own version is kept: {}",
+        text(&out)
+    );
+}
+
 /// Without `--stale` the pool version is not in scope: the flag is what widens the verb, and a
 /// `prune` that dropped versions by default would delete on a line that asked about tools.
 #[test]

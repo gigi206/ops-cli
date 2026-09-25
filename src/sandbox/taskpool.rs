@@ -190,9 +190,20 @@ fn shims_incage() -> PathBuf {
 /// Parsed line-wise (it is a tiny flat table), the same way the install metadata is read, so this
 /// needs no TOML dependency here. A bare request is recorded as `"latest"`, a pinned one as its
 /// version — `ripgrep = "latest"`, `"aqua:cli/gh" = "2.62.0"`.
+///
+/// The install cage writes this file, so it is opened through [`inspect::read_cage_file`]: this
+/// runs on the launch path, where a file that blocks the open or has no end would hold the launch.
+/// Anything but a bounded regular file reads as no record, which [`bins_for`] answers by
+/// installing again.
 fn recorded_specs(pool: &Path) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
-    let Ok(body) = std::fs::read_to_string(pool.join("config/config.toml")) else {
+    let Some(body) = inspect::read_cage_file(
+        &pool.join("config/config.toml"),
+        inspect::CAGE_MISE_CONFIG_CAP,
+    )
+    .ok()
+    .flatten()
+    .and_then(|body| String::from_utf8(body).ok()) else {
         return out;
     };
     let mut in_tools = false;
@@ -1209,6 +1220,23 @@ mod tests {
             "only `[tools]` is read: {specs:?}"
         );
         assert!(!specs.contains_key("experimental"));
+    }
+
+    /// The install cage writes the pool's config, and this is read on the launch path: an entry
+    /// that is not a bounded regular file reads as no record, at once, and the launch installs
+    /// again rather than waiting on it.
+    #[test]
+    fn a_pool_config_that_is_not_a_regular_file_reads_as_no_record() {
+        let base = TmpDir::new();
+        let pool = base.join("task-mise");
+        std::fs::create_dir_all(pool.join("config")).unwrap();
+        crate::testutil::make_fifo(&pool.join("config/config.toml"));
+        let specs = crate::testutil::returns_within(
+            std::time::Duration::from_secs(10),
+            "reading a FIFO pool config",
+            move || recorded_specs(&pool),
+        );
+        assert!(specs.is_empty(), "{specs:?}");
     }
 
     /// A task's mise environment must point resolution at the read-only pool while sending the dirs

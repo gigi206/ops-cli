@@ -137,6 +137,36 @@ pub(crate) fn output_past_etxtbsy(cmd: &mut std::process::Command) -> std::proce
     past_etxtbsy("run", || cmd.output())
 }
 
+/// Create a FIFO at `path`, with no writer: a reader that opens it without `O_NONBLOCK` waits for
+/// one for good.
+pub(crate) fn make_fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path without NUL");
+    // SAFETY: `mkfifo` only creates a FIFO at the given NUL-terminated path.
+    assert_eq!(
+        unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}",
+        path.display()
+    );
+}
+
+/// Run `f` on a thread of its own and hand back what it returned, failing the test when that takes
+/// longer than `limit`. A read that blocks then shows as a red test naming `what`, not as a run
+/// that never ends; the blocked thread is left behind and goes with the test process.
+pub(crate) fn returns_within<T: Send + 'static>(
+    limit: std::time::Duration,
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit)
+        .unwrap_or_else(|_| panic!("{what} did not return within {limit:?}"))
+}
+
 /// Every `.rs` source under `dir`, sorted, subdirectories included. The walk descends because a
 /// module that outgrew one file keeps its root in `<name>.rs` and everything else in a `<name>/`
 /// beside it: a flat listing would read the root, skip the children, and report the silence as a
