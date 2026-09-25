@@ -40,7 +40,7 @@ What the host-side proxy does with each request:
 - terminates TLS with a per-session, cage-only CA;
 - checks host / port / path / method / regex against the policy;
 - requires `CONNECT` authority == SNI == decrypted `Host`;
-- resolves DNS host-side, with an SSRF guard on the resolved IP;
+- has sbx's supervisor resolve DNS host-side, with an SSRF guard on the resolved IP;
 - validates the **upstream** certificate against the system trust store;
 - injects a `[secret]` header, and redacts secret bytes.
 

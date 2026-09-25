@@ -201,6 +201,20 @@ resource use where the host supports them. Network egress defaults to a
 nobody configured reaches only the self-equip set; opening it back up to the host
 network is the deliberate act.
 
+## The code that reads what the cage sends
+
+The boundary has a host side too: the code of sbx's that reads bytes the agent chose. Run
+outside every cage, a parser the agent can feed runs as you, so the two that the cage feeds at
+volume each run in a cage of their own. The egress proxy has no network, and the capture tap
+has only the cage's; neither holds anything of your files, and each runs under a system-call
+filter that lists what its work calls, so a flaw that handed someone its execution would leave
+them unable to open a file or start a program. The proxy still holds the credentials it injects,
+so a proxy the agent subverted could send one to another host the policy allows, and not only
+to the one it was declared for.
+
+What still runs uncaged and reads what a cage chose is named module by module in
+[the trusted computing base](architecture#the-trusted-computing-base).
+
 ## Where the protection stops
 
 Everything above is about what the agent can reach **while it runs**. The likeliest way

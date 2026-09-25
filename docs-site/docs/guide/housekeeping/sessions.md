@@ -78,7 +78,7 @@ agent is still running:
 | [`sbx session logs`](../cli/session#logs) | what the agent **printed** | on disk, under the session's runtime tree | still there, for a detached session |
 | [`sbx proc logs`](../cli/proc) | what it **executed** | the supervisor's memory (needs `--observe`, or a [`[proc]`](../configuration/proc) mode of `observe`, `enforce` or `ask`) | gone |
 | [`sbx fs logs`](../cli/fs) | what it **wrote** | the supervisor's memory (needs `--observe`) | gone |
-| [`sbx net logs`](../cli/net) | where it **went** | the running proxy's memory | gone |
+| [`sbx net logs`](../cli/net) | where it **went** | the supervisor's memory | gone |
 
 So a record of what an agent *did*, rather than what it said, has to be taken while it
 runs: pipe a `--json` feed to a file. What persists on its own is the printed output,

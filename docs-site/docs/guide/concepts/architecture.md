@@ -15,10 +15,13 @@ See also: [What sbx is](./) · [Security model](security-model) ·
 `sbx` is a single binary, and nothing of it runs between launches. Everything that
 *decides* lives on the **host side**, inside the process you invoked: it reads the
 configuration, applies the trust gate, resolves the secrets, builds the description of the
-sandbox, launches it, and supervises what it launched. The one part that runs apart is the
-egress proxy, which reads what the cage sends: a child process in a cage of its own, with no
-network, that asks the supervisor for every connection it opens
-([networking architecture](../networking/architecture#the-ssrf-guard)).
+sandbox, launches it, and supervises what it launched. Two parts run apart, because they read
+what the cage sends: the egress proxy, and the
+[capture tap](../configuration/network#clients-that-ignore-the-proxy-variables) that routes a
+client ignoring the proxy variables. Each is a child process in a cage of its own, and neither
+can open a network connection: the proxy, which has no network, asks the supervisor for every
+one it needs ([networking architecture](../networking/architecture#the-ssrf-guard)), and the
+tap, which shares the cage's network, hands every connection it catches to the proxy.
 
 The cage holds no policy of its own. It receives a filesystem, an environment, and a small
 number of sockets, and every one of those was placed there by a decision taken before it
@@ -31,7 +34,7 @@ flowchart LR
         direction TB
         SBX["<b>the sbx process</b><br/><i>config · trust gate · spec · supervisor</i>"]
         DATA["<b>the data directory, owner-only</b><br/><i>shared store · sessions · plugins · stores</i>"]
-        PROXY["<b>the egress proxy</b><br/><i>policy · TLS · credential injection</i>"]
+        PROXY["<b>the egress proxy, caged</b><br/><i>policy · TLS · credential injection</i>"]
         RES["<b>the resolver cages</b><br/><i>one run per secret reference</i>"]
         PLANES["<b>the control planes</b><br/><i>ask queue · lenses · task log</i>"]
     end
@@ -433,7 +436,7 @@ itself, so the vocabulary reachable from inside is exactly the vocabulary intend
 
 Four lenses answer four questions about a live session: what it ran, what it wrote, where
 it went, and what it asked your keys to sign. Each keeps a bounded record in the
-supervisor's or the proxy's memory rather than on disk, and each is read over a socket the
+supervisor's memory rather than on disk, and each is read over a socket the
 cage never sees. A lens is not a fence: only the exec lens has an enforcing sibling, and
 only egress has a policy behind it. See [Observability](observability).
 
@@ -455,6 +458,98 @@ decision. A private in-cage desktop portal is different in kind: it stands up it
 [`gui`](../configuration/gui), [`gpu`](../configuration/gpu),
 [`audio`](../configuration/audio) and [`dbus`](../configuration/dbus).
 
+## The trusted computing base
+
+The cage runs as your uid, so the code of sbx's that matters most is the code that reads what a
+cage chose: a parser the agent can feed, run outside every cage, runs with your files in reach.
+That code is named here module by module, so that "one binary makes the trusted computing base
+something you can point at" can be checked against the source rather than taken on trust.
+
+It comes in two tiers, and the difference between them is what a flaw would reach.
+
+- **Uncaged, and reading what a cage chose.** A flaw here runs as you, with your files and the
+  host's network. This tier is the lists below, and it is kept short on purpose: the two parsers
+  the cage feeds at volume, the egress proxy and the capture tap, were moved out of it.
+- **Caged, and trusted with what it holds.** A flaw here is bounded by its cage, but what the
+  process holds is still in reach: the egress proxy holds the credentials it injects and the
+  session CA's key, and a resolver plugin sees the plaintext it produces. That is the sense in
+  which a plugin is in the trusted computing base on its own pages.
+
+### In the supervisor, while a session runs
+
+| Module | What it reads | Written by | Present when |
+|---|---|---|---|
+| `src/sandbox/proxy/link.rs`, `link/judge.rs`, `link/wire.rs` | the proxy's questions: may this host and port be reached, open the connection, refresh a credential | the proxy | every proxy |
+| `src/sandbox/proxy/child.rs` | the proxy's answer when it starts, carrying the session CA's certificate | the proxy | every proxy |
+| `src/sandbox/proxy/events.rs`, `events/wire.rs` | the proxy's account of what it decided, captured bodies included | the proxy | every proxy |
+| `src/sandbox/control/mod.rs`, the report socket | a name the tap answered, an address it could not map back to one | the tap | the capture tap is wired |
+| `src/sandbox/broker.rs` | the cage's frames, and the plugin's verdicts on them | the agent, and the plugin that read its frames | a `[broker.<name>]` binding |
+| `src/sandbox/sshagent.rs` | ssh-agent requests | the agent | `[ssh_agent] allow` |
+| `src/sandbox/task_control.rs` | an invocation: the task's name, its parameters, the variables passed | the agent | a `[task.<name>]` is declared |
+| `src/sandbox/task.rs` | a task's output, and the tree of its output directory | the task's cage, run with the agent's parameters | the same |
+| `src/sandbox/egress.rs`, `src/trust.rs` | a secret source, again at each task invocation and each credential refresh | the agent, where the source lies in the project | a secret names a source in the project |
+| `src/sandbox/proc_enforce/`, `src/proc_policy.rs`, `src/open_policy.rs` | the descriptor the shim hands over, then each notified `execve` or open: the path and arguments in the caller's memory, the head of the file it runs, the bytes of a file it opens | the agent | `[proc]` in `enforce` or `ask`, an `[fs] scan` list, `--proc-learn` |
+| `src/sandbox/notify_relay.rs` | the notifications sent on the cage's private bus | the agent | `dbus = true` with `gui = "wayland"` |
+| `src/sandbox/theme_relay.rs` | nothing of the cage's, but it writes into the app's home, whose names are the cage's | the agent, names only | the same |
+| `src/sandbox/observe_feed.rs`, `src/observe.rs` | the command lines of the cage's processes | the agent | `--observe`, or `[proc] mode = "observe"` |
+| `src/sandbox/fs_watch.rs` | the names of what the agent writes in the project | the agent | `--observe` |
+| `src/sandbox/forward.rs` | the name of the socket a forward dials; the bytes are relayed, never read | the agent, names only | `forward = [...]` |
+
+Of the secret sources, only a `sops` file is held to the bytes [`sbx trust`](trust) approved.
+
+### In the commands you run against a session
+
+| Module | What it reads | Command |
+|---|---|---|
+| `src/sandbox/attach.rs` | the environment and `/proc` entries of the process it joins | `sbx session attach` |
+| `src/cli/session.rs`, `src/sandbox/launch/detach.rs` | a detached session's log, for the lines that head each run | `sbx session logs` |
+| `src/cli/proc.rs`, `src/observe.rs` | the command lines of the cage's processes | `sbx proc ls`, `sbx proc live` |
+| `src/sandbox/inspect.rs`, `src/cli/app.rs`, `src/sandbox/projects.rs` | the app homes and install pools, their tools and their entries | `sbx app show`, `sbx app list`, `sbx projects show` |
+
+### In what reads an earlier session's work
+
+A cage writes the project, its store, its home and its pools, and a later command reads them.
+
+| Module | What it reads | When |
+|---|---|---|
+| `src/config/load.rs`, `src/config/safety.rs`, `src/trust.rs` | the project's `.sbx.toml`, the mise files beside it, and the `sops` files it names | every command that loads the configuration |
+| `src/cli/trust.rs` | the same files, shown for approval | `sbx trust` |
+| `src/sandbox/mise.rs` | what mise answers for the project's environment, from a cage of its own, over the approved bytes | a launch of a trusted project that has a mise file |
+| `src/sandbox/fsmask.rs` | the project's git configuration, through the host's `git`, and its git index | a launch in a git repository, or with `[fs]` entries |
+| `src/sandbox/contract.rs` | the names of project files a mask matched, written into the in-cage contract | a launch with masks |
+| `src/sandbox/projectstore.rs` | the state of the project's store, checked before the host's `nix-store` loads it | every launch, and `sbx gc` |
+| `src/sandbox/gc.rs`, `src/sandbox/launch/reclaim.rs` | the project's store, the app homes and pools, a task's output | `sbx gc`, `sbx app prune`, `sbx app rm --purge` |
+| `src/sandbox/taskpool.rs` | the pool the tasks' tools are installed into | a launch that declares tasks, and each invocation |
+| `src/sandbox/miseplugin.rs`, `src/sandbox/cagedir.rs`, `src/sandbox/binds.rs` | the directories of a home, a pool or a declared userland that a launch places a mount in | every launch |
+| `src/sandbox/distro/build.rs`, `src/sandbox/distro/store.rs` | the root filesystem a `distro` `run` list wrote | the build, and each launch on it |
+| `src/sandbox/portal.rs` | the directory the cage's bus wrote in, as it is removed | the end of a `dbus = true` session |
+| `src/sandbox/egress_stats.rs`, `src/sandbox/lens.rs`, `src/cli/logs.rs` | hosts, commands and paths the cage chose, as the supervisor recorded them | `sbx net stats`, `sbx logs`, the lens logs |
+| `src/cli/app.rs`, `src/sandbox/netlearn.rs`, `src/sandbox/proclearn.rs` | refused destinations and programs, turned into rules | `--net-learn`, `--proc-learn` |
+
+Three host programs run on what a cage wrote: the host's `git`, asked only for configuration
+values; `nix-store`, over the project's store once its state has been checked to be what sbx
+made; and `sops`, over a private copy of the bytes `sbx trust` approved.
+
+### Outside it, in cages of their own
+
+| Process | Module | What it reads | What it still holds |
+|---|---|---|---|
+| the egress proxy | `src/sandbox/proxy/`, filter `src/sandbox/seccomp/proxy.rs` | every request the cage sends: request lines, headers, bodies, WebSocket and HTTP/2 frames | the credentials it injects, the session CA's key, the method and path decisions |
+| the capture tap | `src/sandbox/nettap.rs`, filter `src/sandbox/seccomp/tap.rs` | the cage's DNS queries, and the connections the redirect sends it | the names it handed out; it reports on a socket that takes its two reports and nothing else |
+| a resolver plugin | `src/sandbox/resolver.rs` | a secret reference | the plaintext it resolves |
+| a broker or signer plugin | `src/sandbox/broker.rs`, `src/sandbox/signer.rs` | the frames or requests it judges | what its manifest grants |
+| the mise helper | `src/sandbox/mise.rs` | the project's approved mise files | nothing past its run |
+| a task's cage | `src/sandbox/task.rs` | its parameters | the credentials declared for it |
+
+The proxy and the tap are sbx's own binary, started the same way (`src/sandbox/selfcage.rs`):
+of the host, the binary, `/usr` and the loader's cache, read-only, and for the tap the two
+sockets it dials; no capability; and a system-call filter that lists what their work calls,
+where every other cage gets a list of what it may not.
+
+Some bytes reach your terminal with no parser of sbx's in between: the agent's own output, in
+a foreground session, through a terminal or in `sbx session logs`, and what the egress proxy
+writes to its standard error. Your terminal reads those bytes, not sbx.
+
 ## Where each decision is made
 
 | Decision | Made by | Enforced at |
@@ -465,7 +560,7 @@ decision. A private in-cage desktop portal is different in kind: it stands up it
 | what syscalls are reachable | the mandatory denylist, relaxable only when trusted | the kernel, every launch |
 | what the agent may execute | the [`[proc]`](../configuration/proc) posture | a parked syscall, host-side verdict |
 | how much it may consume | the [`[limits]`](../configuration/limits) table, over built-in defaults | a cgroup scope, best-effort |
-| where the agent may connect | the egress policy | the host proxy for the cage's own traffic; the same policy admits a [`tcp://` broker](../configuration/broker#the-honest-limits), which it does not inspect |
+| where the agent may connect | the egress policy | the caged proxy for the cage's own traffic, then the supervisor, which judges the host and port again and checks the address before it dials; the same policy admits a [`tcp://` broker](../configuration/broker#the-honest-limits), which it does not inspect |
 | which credential goes where | a host-scoped secret entry | the proxy, on the wire |
 | where a secret's value comes from | a scheme, built-in or plugin | a host-side resolver cage |
 | what a plugin may touch | its signed manifest, plus your own answer | the resolver's cage |

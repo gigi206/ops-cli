@@ -214,6 +214,41 @@ several concurrent cages sharing one egress policy. Both would have to be weighe
 turning "the cage cannot reach its judge" from a property of the process layout into a claim
 about a service's access control, which is a much weaker thing to have to defend.
 
+### The egress proxy in a cage of its own
+
+The proxy terminates the cage's TLS, so it parses whatever the agent chooses to send: request
+lines, headers, bodies, WebSocket frames and HTTP/2. It runs as a child of the launch, in a cage
+with no network and nothing of the host's filesystem but its own binary, the host's `/usr` and
+the loader's cache, read-only, under a seccomp filter that lists the calls it makes. It cannot open a connection: it
+asks the supervisor for each upstream one, and the supervisor judges the host and the port
+against the policy and the [SSRF guard](../networking/architecture#the-ssrf-guard) before it
+dials and hands the socket over. The
+[capture tap](../configuration/network#clients-that-ignore-the-proxy-variables), which parses
+the cage's DNS, runs the same way in the cage's own network, and reports on a socket that takes
+its two reports and nothing else.
+
+**What it buys** is a bound on a defect in the largest parser the cage talks to. A proxy the
+agent subverts no longer holds the supervisor's memory, your files, the other control planes or
+the host network: it reaches the hosts the policy allows and nothing else. What it reports back
+is read as an account rather than a verdict, bounded on arrival, because what binds is the
+supervisor's own decision at each connection. What still reads the cage's bytes outside any
+cage is listed in [the trusted computing base](architecture#the-trusted-computing-base).
+
+**What it costs** is what the proxy must keep to do its job, and a cage to start for each one.
+It still holds the credentials it injects and the session CA's key, so a subverted proxy can
+send a credential to any host the policy allows, not only the one it is for. The layer-7
+decisions (method, path, WebSocket, HTTP/2) stay its own, since the supervisor sees a host and
+a port. Every launch that filters its egress starts one, and so does every invocation of a
+declared operation with a `network` list, and every `distro` build that runs commands under a
+filtering posture. And each channel between the two is now a protocol with bounds, which is
+code the supervisor parses.
+
+**What would reopen it**: a delegated connection whose cost approaches a TLS handshake, which
+would argue for giving the proxy a filtered network of its own; operations whose invocation
+cost is dominated by starting their proxy, which would argue for one proxy per session serving
+their planes; or a use for one proxy shared by several cages, which is the daemon argument
+[above](#one-process-no-daemon).
+
 ### bubblewrap as the cage engine
 
 The namespaces, the mounts and the hardening are driven through `bwrap` rather than by
@@ -293,7 +328,8 @@ without inspection.
 ### One binary, and where extension lives
 
 `sbx` ships as a single static binary, which is what makes the trusted computing base
-something you can point at.
+something you can point at: [Architecture](architecture#the-trusted-computing-base) names it
+module by module.
 
 **What it costs** is the pull of that shape on everything else: a new capability is cheapest
 to add **inside**, so that is where each one has gone. Meanwhile the extension model that
