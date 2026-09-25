@@ -159,6 +159,12 @@ pub(super) fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
 /// tokens handed in here are repaired, never a directory the cage created on its own; the version
 /// alias links mise keeps beside the real directories are skipped; and the check is bash tests and
 /// globs only, so a launch where nothing is broken runs no extra process.
+///
+/// The version is the one value the cage chooses: it is the name of a directory in the cage's
+/// writable pool, and it reaches both mise's version spec and the launching terminal, where mise
+/// prints it. So a directory whose name is anything but a plain version (digits, letters, `.`, `_`,
+/// `+`, `-`) is left alone: no escape sequence reaches the terminal that way, and no `ref:` or
+/// `path:` form reaches mise.
 pub(super) fn wrap_mise_equip(
     mise: &Path,
     bash: &Path,
@@ -203,6 +209,7 @@ pub(super) fn wrap_mise_equip(
              loc=\"${{!a}}\"; b=$((a + 1)); dir=\"${{!b}}\"; c=$((a + 2)); shown=\"${{!c}}\"\n\
              for v in \"$d/installs/$dir\"/*; do\n\
              [ -d \"$v\" ] && [ ! -L \"$v\" ] || continue\n\
+             case \"${{v##*/}}\" in ''|*[!0-9A-Za-z._+-]*) continue;; esac\n\
              for py in \"$v\"/*/bin/python; do\n\
              if [ -L \"$py\" ] && [ ! -e \"$py\" ]; then\n\
              echo \"sbx: $shown: the Python its environment was built on is no longer in the cage; reinstalling it\" 1>&2\n\

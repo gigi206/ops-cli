@@ -153,7 +153,7 @@ since. So each launch checks the `pipx:` tools it equips: one whose interpreter 
 reinstalled at the same version before the app starts, and the launch says so
 (`sbx: <tool>: the Python its environment was built on is no longer in the cage; reinstalling
 it`). The reinstall fetches from PyPI, so under an allowlist it needs the same hosts as the
-first install.
+first install, and under `network = "none"`, where a launch equips nothing, it does not run.
 
 **`mise:` is the one backend equipped inside the cage**: every other backend is
 provisioned host-side, before the cage, so only `mise:` is governed by the cage's

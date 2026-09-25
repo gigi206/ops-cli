@@ -350,6 +350,10 @@ fn running_the_equip_script_reinstalls_a_pipx_tool_whose_python_is_gone() {
     venv("pipx-broken-tool", "1.2.0", gone);
     std::os::unix::fs::symlink("./1.2.0", installs.join("pipx-broken-tool").join("latest"))
         .unwrap();
+    // Broken too, but under names the cage chose: an escape sequence mise would print on the
+    // launching terminal, and a `ref:` spec mise would build from. Neither is repaired.
+    venv("pipx-broken-tool", "1.0\u{1b}[2K", gone);
+    venv("pipx-broken-tool", "ref:main", gone);
     // Healthy: its interpreter is present.
     venv("pipx-healthy-tool", "3.0", &present);
     // Not a pipx token, even though its install looks like a broken virtualenv.
