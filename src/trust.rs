@@ -193,10 +193,21 @@ pub(crate) fn sops_inputs_for(config_path: &Path, sbx_bytes: &[u8]) -> io::Resul
         if !in_project(&root, &path) {
             continue;
         }
-        match crate::config::safety::read_safe_bytes(&path) {
+        match crate::config::safety::read_safe_bytes_as(&path, "sops file") {
             Ok(bytes) => out.push((format!("{SOPS_TAG_PREFIX}{}", file.display()), bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            // `sbx trust` cannot clear this refusal, since it reads the same file; the way out is
+            // the one the hash leaves open, a file outside the project.
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{e}; {} names it, so its trust must cover it: fix it, or keep it outside \
+                         the project and name it by its absolute path",
+                        crate::config::PROJECT_CONFIG
+                    ),
+                ));
+            }
         }
     }
     Ok(out)
@@ -1094,6 +1105,27 @@ mod tests {
         let plain = b"network = \"isolated\"\n";
         assert!(sops_inputs_for(&cfg, plain).unwrap().is_empty());
         assert_eq!(content_hash(plain, &[]), hash_bytes(plain));
+    }
+
+    /// A sops file the gate refuses (here, one over the size ceiling) makes the project
+    /// unverifiable, and `sbx trust` cannot fix that: the refusal names the file as a sops file,
+    /// not a config, and points at the way out, an absolute path outside the project.
+    #[test]
+    fn a_refused_sops_file_is_named_with_its_way_out() {
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        let big = vec![b'a'; 1024 * 1024 + 1];
+        std::fs::write(proj.join("big.enc.yaml"), &big).unwrap();
+        let err = sops_inputs_for(&cfg, b"x = \"sops://big.enc.yaml#k\"\n").unwrap_err();
+        let text = err.to_string();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{text}");
+        for part in ["big.enc.yaml", "sops file", "larger than", "absolute path"] {
+            assert!(text.contains(part), "missing `{part}`: {text}");
+        }
+        assert!(
+            !text.contains("config"),
+            "a sops file is not a config: {text}"
+        );
     }
 
     /// The bytes a resolution may hand `sops`: `None` outside the project, the approved bytes for a

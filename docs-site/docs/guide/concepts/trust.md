@@ -168,6 +168,12 @@ file, checks that the project is trusted over those very bytes, and hands `sops`
 private copy of them rather than the path. A file the trust does not cover, or one
 rewritten since, is refused before `sops` runs.
 
+A named sops file passes the same [safety gate](#the-safety-gate) as the config, size
+ceiling of 1 MiB included. One it refuses makes the project unverifiable, so the
+project reads untrusted, and `sbx trust` refuses too: it reads the same file. The
+error names the file. Fix it, or keep it outside the project and name it by its
+absolute path, which the trust does not hash.
+
 ## Why the whole file
 
 Hashing a parsed subset would let an attacker add a security field a later `sbx`

@@ -18,20 +18,23 @@ use std::path::Path;
 /// Refuses a non-regular file, one not owned by us, or a world-writable one;
 /// group-writable (`0o020`) is tolerated — only the other-write bit (`0o002`) is
 /// checked. `mode` is the full `st_mode` (type bits included), so the
-/// regular-file test reads its `S_IFMT` field.
-fn verdict(file_uid: u32, mode: u32, euid: u32) -> io::Result<()> {
+/// regular-file test reads its `S_IFMT` field. `what` names the kind of file in a refusal.
+fn verdict(file_uid: u32, mode: u32, euid: u32, what: &str) -> io::Result<()> {
     // A non-regular file (FIFO, socket, device, directory) must never be loaded: a device could
     // feed back attacker-controlled bytes, a FIFO would stall a reader. The owner/mode checks alone
     // do not catch it. (The descriptor is opened `O_NONBLOCK` so a writer-less FIFO reaches this
     // refusal instead of hanging the open — see `read_safe_bytes`.)
     if mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(refuse("not a regular file"));
+        return Err(refuse(what, "not a regular file"));
     }
     if file_uid != euid {
-        return Err(refuse(&format!("owned by uid {file_uid}, expected {euid}")));
+        return Err(refuse(
+            what,
+            &format!("owned by uid {file_uid}, expected {euid}"),
+        ));
     }
     if mode & 0o002 != 0 {
-        return Err(refuse("world-writable"));
+        return Err(refuse(what, "world-writable"));
     }
     Ok(())
 }
@@ -47,25 +50,25 @@ fn verdict(file_uid: u32, mode: u32, euid: u32) -> io::Result<()> {
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// A refusal carries `PermissionDenied`, the closest kind to "this file is not
-/// trustworthy to load".
-fn refuse(why: &str) -> io::Error {
+/// trustworthy to load". `what` is the kind of file, as the reader knows it.
+fn refuse(what: &str, why: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        format!("refusing to load config: {why}"),
+        format!("refusing to load {what}: {why}"),
     )
 }
 
 /// Apply the owner/mode verdict to an already-open file (its `fstat`), so the
 /// safety decision covers the same inode whose bytes a caller reads through that
-/// descriptor. `path` is used only to name the file in an error.
-pub(crate) fn check_safe_file(f: &std::fs::File, path: &Path) -> io::Result<()> {
+/// descriptor. `path` and `what` are used only to name the file, and its kind, in an error.
+fn check_safe_file(f: &std::fs::File, path: &Path, what: &str) -> io::Result<()> {
     let m = f.metadata()?;
     // The owner check uses the EFFECTIVE uid (`geteuid`), the identity whose
     // files we are willing to act on; a pure syscall, musl-safe.
     // SAFETY: `geteuid` takes no argument and only reads this process's own effective uid — the
     // identity the verdict below weighs the file's owner against.
     let euid = unsafe { libc::geteuid() };
-    verdict(m.uid(), m.mode(), euid).map_err(|e| with_path(&e, path))
+    verdict(m.uid(), m.mode(), euid, what).map_err(|e| with_path(&e, path))
 }
 
 /// Open `path`, gate the OPEN descriptor with [`check_safe_file`], and read its
@@ -83,6 +86,13 @@ pub(crate) fn check_safe_file(f: &std::fs::File, path: &Path) -> io::Result<()> 
 /// is worse than unhelpful. A caller that also renders errors of its own (a parse failure, a store
 /// write) names the path in those, since nothing else will.
 pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    read_safe_bytes_as(path, "config")
+}
+
+/// [`read_safe_bytes`] for a file the gate covers that is not a config, `what` naming its kind in
+/// a refusal: the trust gate reads the sops files a project names through the same checks, and a
+/// reader told a "config" was refused would look for the wrong file.
+pub(crate) fn read_safe_bytes_as(path: &Path, what: &str) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     // Open non-blocking: a writer-less FIFO would otherwise hang this `O_RDONLY` open indefinitely,
@@ -93,7 +103,7 @@ pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| with_path(&e, path))?;
-    check_safe_file(&f, path)?;
+    check_safe_file(&f, path, what)?;
     // Read one byte past the ceiling so "exactly at the ceiling" and "over it" are distinguishable,
     // the way `read_line_bounded` distinguishes them in the proxy's framing reader.
     let mut out = Vec::new();
@@ -103,7 +113,7 @@ pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
         .map_err(|e| with_path(&e, path))?;
     if out.len() as u64 > MAX_CONFIG_BYTES {
         return Err(with_path(
-            &refuse(&format!("larger than {MAX_CONFIG_BYTES} bytes")),
+            &refuse(what, &format!("larger than {MAX_CONFIG_BYTES} bytes")),
             path,
         ));
     }
@@ -148,28 +158,28 @@ mod tests {
 
     #[test]
     fn verdict_accepts_an_owned_non_world_writable_regular_file() {
-        assert!(verdict(1000, reg(0o644), 1000).is_ok());
+        assert!(verdict(1000, reg(0o644), 1000, "config").is_ok());
         // group-writable is tolerated
-        assert!(verdict(1000, reg(0o664), 1000).is_ok());
+        assert!(verdict(1000, reg(0o664), 1000, "config").is_ok());
     }
 
     #[test]
     fn verdict_refuses_a_foreign_owner() {
-        let err = verdict(1234, reg(0o600), 1000).unwrap_err();
+        let err = verdict(1234, reg(0o600), 1000, "config").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("owned by uid 1234"));
     }
 
     #[test]
     fn verdict_refuses_a_world_writable_file() {
-        let err = verdict(1000, reg(0o666), 1000).unwrap_err();
+        let err = verdict(1000, reg(0o666), 1000, "config").unwrap_err();
         assert!(err.to_string().contains("world-writable"));
     }
 
     #[test]
     fn verdict_refuses_a_non_regular_file() {
         // a directory's mode: no S_IFREG bits
-        let err = verdict(1000, libc::S_IFDIR | 0o755, 1000).unwrap_err();
+        let err = verdict(1000, libc::S_IFDIR | 0o755, 1000, "config").unwrap_err();
         assert!(err.to_string().contains("not a regular file"));
     }
 
