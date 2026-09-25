@@ -2816,8 +2816,9 @@ pub(super) fn build(
     // really apply, taken from the decision the launch itself will take: read from the profile
     // instead, the document would name a ceiling on every host that carries none. Informational
     // only; bound read-only by `build_spec`.
-    let contract_text =
-        crate::sandbox::contract::cage_contract(&crate::sandbox::contract::CageFacts {
+    let documents =
+        crate::sandbox::contract::Documents::render(&crate::sandbox::contract::CageFacts {
+            project: project_root.as_deref(),
             policy: &prep.cfg.network,
             // The proxy's own lists, not the declared ones: a credential that did not resolve had
             // its destination denied as the proxy started, so it is withdrawn from what is
@@ -2921,7 +2922,7 @@ pub(super) fn build(
         &overlay,
         &extra_binds,
         net_policy(&prep.cfg.network),
-        &contract_text,
+        &documents,
         // The `tcp://` destinations get `/etc/hosts` entries pointing at the addresses the preamble
         // above listens on, so a declaration reads the same inside the cage as outside it — and the
         // ones whose port is privileged, which can have no such listener, get a generated ssh

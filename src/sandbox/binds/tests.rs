@@ -83,6 +83,7 @@ fn base_paths() -> SandboxPaths<'static> {
         xdg_open_src: Path::new("/data/sbx/projects/abc/etc/open/xdg-open"),
         open_router_src: Path::new("/data/sbx/projects/abc/etc/open"),
         contract_src: Path::new("/store/contract.md"),
+        contract_summary_src: Path::new("/store/contract-summary.md"),
         hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
         ssh_config_src: None,
         machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
@@ -976,6 +977,14 @@ fn assemble_builds_a_hermetic_environment() {
         joined[contract_i + 1],
         super::super::contract::CONTRACT_INCAGE
     );
+    let summary_i = joined
+        .iter()
+        .position(|s| s == "SBX_CONTRACT_SUMMARY")
+        .unwrap();
+    assert_eq!(
+        joined[summary_i + 1],
+        super::super::contract::CONTRACT_SUMMARY_INCAGE
+    );
 }
 
 #[test]
@@ -995,6 +1004,23 @@ fn the_contract_is_bound_read_only() {
         argv[src + 1],
         super::super::contract::CONTRACT_INCAGE,
         "contract bound at the in-cage contract path"
+    );
+}
+
+#[test]
+fn the_contract_summary_is_bound_read_only() {
+    // The summary is handed to the agent as an instruction, so the agent must not be able to
+    // rewrite what it is told: a read-only bind from the synthetic source, like the contract.
+    let argv = argv_strings(&assembled());
+    let src = argv
+        .iter()
+        .position(|s| s == "/store/contract-summary.md")
+        .expect("the summary is bound");
+    assert_eq!(argv[src - 1], "--ro-bind", "the summary must be read-only");
+    assert_eq!(
+        argv[src + 1],
+        super::super::contract::CONTRACT_SUMMARY_INCAGE,
+        "summary bound at the in-cage summary path"
     );
 }
 
@@ -1489,7 +1515,7 @@ fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
         &overlay,
         &[],
         NetPolicy::Shared,
-        "",
+        &Default::default(),
         &Default::default(),
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
@@ -1741,6 +1767,7 @@ fn an_empty_config_adds_nothing() {
             "NIX_LD_LIBRARY_PATH",
             "SBX_SANDBOX",
             "SBX_CONTRACT",
+            "SBX_CONTRACT_SUMMARY",
             "LOCALE_ARCHIVE",
             "LANG",
             "TZDIR",
@@ -2187,6 +2214,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
         mise_plugin_src: Path::new("/store/mise-plugin"),
         shell_rc_src: Path::new("/store/bashrc"),
         contract_src: Path::new("/store/contract.md"),
+        contract_summary_src: Path::new("/store/contract-summary.md"),
         xdg_open_src: Path::new("/data/sbx/apps/demo-app/etc/open/xdg-open"),
         open_router_src: Path::new("/data/sbx/apps/demo-app/etc/open"),
         hosts_src: Path::new("/data/sbx/apps/demo-app/etc/hosts"),
@@ -2318,7 +2346,7 @@ fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
         &overlay,
         &[],
         NetPolicy::Shared,
-        "",
+        &Default::default(),
         &Default::default(),
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
@@ -2454,7 +2482,7 @@ fn every_runtime_names_the_host_directory_a_declared_tool_installs_into() {
             &overlay,
             &[],
             NetPolicy::Shared,
-            "",
+            &Default::default(),
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
@@ -2525,7 +2553,7 @@ fn the_grant_puts_the_other_apps_pools_behind_the_apps_own_and_read_only() {
             &overlay,
             &[],
             NetPolicy::Shared,
-            "",
+            &Default::default(),
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
@@ -2897,7 +2925,7 @@ fn the_capture_tap_replaces_the_cages_resolver_with_exactly_one_mount() {
             &overlay,
             &[],
             NetPolicy::Isolated,
-            "",
+            &Default::default(),
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],

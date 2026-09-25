@@ -627,6 +627,8 @@ struct SandboxPaths<'a> {
     shell_rc_src: &'a Path,
     /// Generated in-cage contract; bound read-only at [`super::contract::CONTRACT_INCAGE`].
     contract_src: &'a Path,
+    /// Its summary; bound read-only at [`super::contract::CONTRACT_SUMMARY_INCAGE`].
+    contract_summary_src: &'a Path,
     /// Synthetic `xdg-open` script; bound read-only at [`XDG_OPEN_INCAGE`]. It is the single file
     /// inside [`Self::open_router_src`], so both in-cage names serve one staged source.
     xdg_open_src: &'a Path,
@@ -866,6 +868,13 @@ fn cage_mounts(
         Mount::RoBind {
             src: paths.contract_src.to_path_buf(),
             dest: PathBuf::from(super::contract::CONTRACT_INCAGE),
+        },
+        // Zone 1 — its summary, read-only and from the same place, for the same reason: an app
+        // profile hands this path to the agent as an instruction, so the agent must not be able
+        // to rewrite what it will be told at its next launch.
+        Mount::RoBind {
+            src: paths.contract_summary_src.to_path_buf(),
+            dest: PathBuf::from(super::contract::CONTRACT_SUMMARY_INCAGE),
         },
         // Zone 1 — synthetic identity (no host accounts leaked).
         Mount::RoBind {
@@ -1230,16 +1239,20 @@ fn cage_env(
             join_paths(&userland.foreign_lib_paths),
         ),
         // The sandbox-awareness handle: `SBX_SANDBOX=1` lets a process tell it is running
-        // inside an sbx cage, and `SBX_CONTRACT` points it at the read-only contract
-        // describing what the cage permits. Both are structural (lowest precedence): a
-        // trusted `[env]` could override them, but that only mispoints the project's own
-        // tools at its own value — self-sabotage of an informational handle, not an escape
-        // (the same class as `FONTCONFIG_FILE`/`WAYLAND_DISPLAY`) — so neither needs a
-        // denylist entry.
+        // inside an sbx cage, `SBX_CONTRACT` points it at the read-only contract describing
+        // what the cage permits, and `SBX_CONTRACT_SUMMARY` at that contract's summary. All three
+        // are structural (lowest precedence): a trusted `[env]` could override them, but that
+        // only mispoints the project's own tools at its own value — self-sabotage of an
+        // informational handle, not an escape (the same class as
+        // `FONTCONFIG_FILE`/`WAYLAND_DISPLAY`) — so none needs a denylist entry.
         ("SBX_SANDBOX".to_string(), "1".to_string()),
         (
             "SBX_CONTRACT".to_string(),
             super::contract::CONTRACT_INCAGE.to_string(),
+        ),
+        (
+            "SBX_CONTRACT_SUMMARY".to_string(),
+            super::contract::CONTRACT_SUMMARY_INCAGE.to_string(),
         ),
         // Locale. `LOCALE_ARCHIVE` names sbx's own UTF-8 locale archive so the cage's glibc
         // can load a UTF-8 `LANG` — a hermetic cage has no host `/usr/lib/locale`, so without
@@ -1364,6 +1377,7 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     MISE_PROJECT_INCAGE,
     MISE_SHARED_INCAGE,
     super::contract::CONTRACT_INCAGE,
+    super::contract::CONTRACT_SUMMARY_INCAGE,
 ];
 
 /// The entries of [`STRUCTURAL_DESTS`] that [`assemble`] lays down as a symlink rather than a mount.
@@ -1709,7 +1723,7 @@ pub(crate) fn build_spec(
     overlay: &Overlay,
     extra_binds: &[ExtraBind],
     net: NetPolicy,
-    contract_text: &str,
+    documents: &super::contract::Documents,
     tcp: &super::egress::TcpPlan,
     seccomp: super::seccomp::SeccompPolicy,
     devices: &[PathBuf],
@@ -1765,7 +1779,9 @@ pub(crate) fn build_spec(
     // atomically (temp + rename) because this directory is shared by concurrent cages of the
     // same project — an in-place write could show a running cage a torn, half-written file.
     let contract = rt.etc_dir.join("contract.md");
-    super::atomicfile::write_atomic(&contract, contract_text.as_bytes())?;
+    super::atomicfile::write_atomic(&contract, documents.contract.as_bytes())?;
+    let contract_summary = rt.etc_dir.join("contract-summary.md");
+    super::atomicfile::write_atomic(&contract_summary, documents.summary.as_bytes())?;
 
     // Materialize the URL router beside the other synthetic files (outside every writable mount, so
     // it has no writable alias the agent could rewrite), then make it executable so a tool calling
@@ -1978,6 +1994,7 @@ pub(crate) fn build_spec(
         mise_plugin_src: &mise_plugin,
         shell_rc_src: &shell_rc,
         contract_src: &contract,
+        contract_summary_src: &contract_summary,
         xdg_open_src: &xdg_open,
         open_router_src: &open_router,
         hosts_src: &hosts,

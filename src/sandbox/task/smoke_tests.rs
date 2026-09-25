@@ -88,7 +88,7 @@ fn engine_on(
         &overlay,
         &[],
         NetPolicy::Isolated,
-        "",
+        &Default::default(),
         &Default::default(),
         super::super::seccomp::SeccompPolicy::default(),
         &[],
