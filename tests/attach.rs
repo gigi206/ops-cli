@@ -278,7 +278,10 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
 /// sibling in `tests/run.rs` failed — the shell was up and waiting, and the wait for it did not
 /// recognise the line, so the script was never written and the failure read as a shell that never
 /// came up. The second is the attach banner alone, which is what the wait sees before any shell
-/// has spoken; a predicate that answered "ready" to it would send the script into nothing.
+/// has spoken; a predicate that answered "ready" to it would send the script into nothing. The
+/// third is what an interactive launch prints before its shell, a flake reference and a variable
+/// among it: a predicate that took either character anywhere fired there, and the script it sent
+/// was discarded with the type-ahead when the supervisor took the terminal.
 #[test]
 fn a_prompt_is_recognised_whichever_character_the_shell_ends_it_with() {
     let banner = "sbx: attaching to session 84845 (run) (a shell in its live cage \u{2014} type exit \
@@ -287,7 +290,15 @@ fn a_prompt_is_recognised_whichever_character_the_shell_ends_it_with() {
         !common::shell_prompt_seen(banner.as_bytes()),
         "the banner is not a prompt: nothing has been asked of the shell yet"
     );
+    // What an interactive launch prints before its shell is up: both characters, and no prompt.
+    let launch = "\r\x1b[K'github:NixOS/nixpkgs/4975466d324710c576dc11ad614684e6bd8cad8e#fd'\
+         \x1b[0m\x1b[K\r\nsbx: set $SBX_DATA_DIR to a shorter path\r\n";
+    assert!(
+        !common::shell_prompt_seen(launch.as_bytes()),
+        "a launch's own output is not a prompt, whatever characters it carries"
+    );
     for prompt in [
+        format!("{launch}(sbx-sh-proj-2914738-0) /work/sh-proj$ "),
         format!("{banner}root@runnervm:~/.cache/sbx/test-tmp/r-attach-pro-28391-200# "),
         format!("{banner}(sbx-r-attach-pro-756913-0) /$ "),
         format!("{banner}bash-5.3$ "),

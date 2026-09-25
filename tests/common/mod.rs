@@ -142,11 +142,13 @@ pub fn stdout_of(out: &Output) -> String {
 /// root: the script was never written, and the failure read as a shell that never came up, with its
 /// prompt sitting in the transcript the assertion printed.
 ///
-/// Asked over the whole transcript rather than its tail, because the prompt is what these tests
-/// wait for and nothing before it — the attach banner names a session and a verb — carries either
-/// character.
+/// Asked of the transcript's end, the prompt's last character and the space after it, because a
+/// launch prints before its shell does and what it prints carries both characters: a nixpkgs flake
+/// reference names its package after a `#`. A wait that took either character anywhere in the
+/// transcript fired on that line, before the shell was up, and the supervisor, which discards
+/// type-ahead as it takes the terminal, dropped the script.
 pub fn shell_prompt_seen(out: &[u8]) -> bool {
-    out.iter().any(|b| matches!(b, b'$' | b'#'))
+    out.ends_with(b"$ ") || out.ends_with(b"# ")
 }
 
 /// A process's start-time ticks — field 22 of `/proc/<pid>/stat`.
