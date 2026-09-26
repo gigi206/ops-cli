@@ -32,14 +32,41 @@
 #
 # If a request is blocked, the proxy reports the host it refused — add it to `allow`
 # (or check ahead with `sbx test net <url>`).
-cmd = "freebuff"
-
-# No `contract`: Freebuff takes no option that carries instructions. Its knowledge files come from
-# the project (`knowledge.md`, `AGENTS.md`, `CLAUDE.md`) and from your home (`~/.knowledge.md`,
-# `~/.AGENTS.md`, `~/.CLAUDE.md`). Point Freebuff at the cage's summary yourself instead, for
-# instance with a line in your `~/.knowledge.md` such as "When the environment variable SBX_SANDBOX
-# is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Freebuff the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as your home knowledge file.
+# Freebuff reads the first of `~/.agents.md` and `~/.claude.md` it finds in your home (any letter
+# case) and adds it to the project's knowledge files. That file is yours to keep, so the command
+# writes `~/.agents.md` only while you have neither: a copy marked as sbx's, rewritten at every
+# launch and removed by a launch without a summary, or as soon as a file of yours appears, since
+# Freebuff would read only one of the two. Once you write your own, it is left untouched and the
+# summary is no longer added. The file lives in the app's isolated home, which only this app's
+# cages read. A `~/.knowledge.md` is not read from the home, whatever the system prompt says.
+# No option is used: Freebuff takes none that carries instructions. Not measured: Freebuff needs a
+# signed-in account before it assembles a session; the loader was read in the shipped binary.
+# Arguments after `sbx app run freebuff --` reach Freebuff verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+f="$HOME/.agents.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+other=
+for x in "$HOME"/.[AaCc]*; do
+  case "$(printf '%s' "${x##*/}" | tr 'A-Z' 'a-z')" in
+    .agents.md|.claude.md) { [ "$x" = "$f" ] && grep -qsF "$m" "$x"; } || other=1 ;;
+  esac
+done
+if [ -r "$s" ] && [ -z "$other" ]; then
+  { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec freebuff "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "freebuff",
+]
 
 # Your host Freebuff config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
