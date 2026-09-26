@@ -129,6 +129,49 @@ fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_di
     assert_eq!((budget.bytes, budget.members), (100, 1));
 }
 
+/// A directory the unpack makes on the way to a member is an entry of the budget, not free.
+///
+/// `create_dir_all` made every missing parent for the price of the one member that named them, so
+/// a member whose path is a few kilobytes long created close to two thousand directories while the
+/// budget counted one. Here the three parents of `a/b/c/f` cost three entries: with four left the
+/// member applies, with three it is refused at its last parent, before that parent is made.
+#[test]
+fn a_directory_made_for_a_members_path_counts_against_the_member_ceiling() {
+    let tmp = crate::testutil::TmpDir::new();
+    let archive = tar_of(&[("a/b/c/f", Member::File("x"))]);
+
+    let mut budget = Budget {
+        bytes: 0,
+        members: MAX_MEMBERS - 4,
+    };
+    let root = tmp.join("fits");
+    apply_tar_within(tmp.path(), &root, &archive, &mut budget).expect("four entries left");
+    assert_eq!(budget.members, MAX_MEMBERS);
+    assert!(root.join("a/b/c/f").is_file());
+
+    let mut budget = Budget {
+        bytes: 0,
+        members: MAX_MEMBERS - 3,
+    };
+    let root = tmp.join("over");
+    let err =
+        apply_tar_within(tmp.path(), &root, &archive, &mut budget).expect_err("one entry short");
+    assert!(
+        err.to_string().contains("directories made to hold them"),
+        "{err}"
+    );
+    assert!(
+        root.join("a/b").is_dir() && !root.join("a/b/c").exists(),
+        "refused before the parent past the ceiling was made"
+    );
+
+    // Witness: a parent the layer declares is its own member, and is not counted a second time.
+    let mut budget = Budget::new();
+    let declared = tar_of(&[("a/", Member::Dir), ("a/f", Member::File("x"))]);
+    apply_tar_within(tmp.path(), &tmp.join("declared"), &declared, &mut budget).unwrap();
+    assert_eq!(budget.members, 2);
+}
+
 #[test]
 fn a_layer_lands_with_its_files_directories_and_links() {
     let tmp = crate::testutil::TmpDir::new();

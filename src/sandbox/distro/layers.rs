@@ -53,7 +53,8 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Component, Path, PathBuf};
 
-/// The most one image's layers may unpack to on disk, and the most members they may carry.
+/// The most one image's layers may unpack to on disk, and the most entries they may create: a
+/// member, or a directory made on the way to one.
 ///
 /// The fetch is bounded ([`super::http::MAX_STREAMED_BODY`], 8 GiB per blob) and `safe_path` bounds
 /// *where* a member lands, but nothing bounded how much arrives: gzip expands, so a blob inside the
@@ -64,6 +65,10 @@ use std::path::{Component, Path, PathBuf};
 ///
 /// The budget spans the **image**, not the layer, because the layers of one image are applied over
 /// the same tree and a per-layer ceiling would multiply by however many the manifest lists.
+///
+/// A directory the unpack makes for a member's path counts as an entry of its own: one member names
+/// as many directories as its path has components, and a path of a few kilobytes is close to two
+/// thousand of them, each an inode and a block the byte ceiling does not see.
 const MAX_UNPACKED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_MEMBERS: u64 = 1_000_000;
 
@@ -82,13 +87,14 @@ impl Budget {
         }
     }
 
-    /// Count one member, refusing past [`MAX_MEMBERS`].
+    /// Count one entry, a member or a directory made for one, refusing past [`MAX_MEMBERS`].
     fn member(&mut self) -> io::Result<()> {
         self.members += 1;
         if self.members > MAX_MEMBERS {
             return Err(io::Error::other(format!(
-                "this image's layers carry more than {MAX_MEMBERS} members, which is past what a \
-                 userland is: refusing rather than filling the store's filesystem"
+                "this image's layers create more than {MAX_MEMBERS} entries (members, and the \
+                 directories made to hold them), which is past what a userland is: refusing \
+                 rather than filling the store's filesystem"
             )));
         }
         Ok(())
@@ -301,6 +307,27 @@ fn clear_directory(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Create the directories missing on the way to `dir`, each counted as an entry of the budget.
+///
+/// `create_dir_all` made them for the price of the one member that named them, which is how a
+/// single member could create thousands. See [`MAX_UNPACKED_BYTES`].
+fn create_parents(dir: &Path, budget: &mut Budget) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = dir;
+    while at.symlink_metadata().is_err() {
+        missing.push(at);
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    for dir in missing.into_iter().rev() {
+        budget.member()?;
+        fs::create_dir(dir)?;
+    }
+    Ok(())
+}
+
 /// Write one member at `dest`.
 fn write_member<R: io::Read>(
     entry: &mut tar::Entry<'_, R>,
@@ -315,7 +342,7 @@ fn write_member<R: io::Read>(
     let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
 
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        create_parents(parent, budget)?;
     }
 
     if kind.is_dir() {
