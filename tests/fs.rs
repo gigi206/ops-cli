@@ -818,8 +818,10 @@ fn what_the_projects_git_reads_in_a_read_write_bind_is_read_only_in_a_real_cage(
 /// A linked worktree's repository is carried like a `.git` directory inside a real cage. Without
 /// a bind, the directory a relative `core.hooksPath` names in the worktree refuses a write. With
 /// the main repository in a read-write bind, its hooks, its configuration and the worktree's
-/// `commondir` refuse a write too, while commits, branches, checkouts and the worktree list work,
-/// and the cage's git pushes a branch to its namesake without writing the configuration.
+/// `commondir` refuse a write too, and so do the repository's other work trees there: the
+/// directory `core.hooksPath` names in the main checkout, and a worktree's `.git` file, hooks
+/// directory and `gitdir`. Commits, branches, checkouts and the worktree list work, and the cage's
+/// git pushes a branch to its namesake without writing the configuration.
 #[test]
 fn a_linked_worktrees_repository_is_held_in_a_real_cage() {
     let (project, data, state, bound) = (
@@ -862,6 +864,7 @@ fn a_linked_worktrees_repository_is_held_in_a_real_cage() {
             "feat",
             root.to_str().unwrap(),
         ],
+        &["worktree", "add", "-q", "--detach", ".wt/sib"],
     ] {
         let out = git(args).unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
@@ -911,6 +914,14 @@ fn a_linked_worktrees_repository_is_held_in_a_real_cage() {
            && echo WROTE-CONFIG || echo REFUSED-CONFIG; \
          (printf x > {common}/worktrees/feat/commondir) 2>/dev/null \
            && echo WROTE-COMMONDIR || echo REFUSED-COMMONDIR; \
+         (mkdir -p {main}/.husky/_ && printf x > {main}/.husky/_/pre-commit) 2>/dev/null \
+           && echo WROTE-CHECKOUT-HOOK || echo REFUSED-CHECKOUT-HOOK; \
+         (mkdir -p {sib}/.husky/_ && printf x > {sib}/.husky/_/pre-commit) 2>/dev/null \
+           && echo WROTE-SIB-HOOK || echo REFUSED-SIB-HOOK; \
+         (printf 'gitdir: /x\\n' > {sib}/.git) 2>/dev/null \
+           && echo WROTE-SIB-DOTGIT || echo REFUSED-SIB-DOTGIT; \
+         (printf x > {common}/worktrees/sib/gitdir) 2>/dev/null \
+           && echo WROTE-SIB-GITDIR || echo REFUSED-SIB-GITDIR; \
          g() {{ git -c user.name=t -c user.email=t@t \"$@\"; }}; \
          g commit -q --no-verify --allow-empty -m c && echo COMMIT-OK; \
          g branch b1 && echo BRANCH-OK; \
@@ -918,13 +929,20 @@ fn a_linked_worktrees_repository_is_held_in_a_real_cage() {
          g worktree list >/dev/null && echo LIST-OK; \
          echo AUTOSETUP-$(git config --get push.autoSetupRemote)",
         common = common.display(),
+        main = main.display(),
+        sib = main.join(".wt/sib").display(),
     );
+    let sib_git = std::fs::read(main.join(".wt/sib/.git")).unwrap();
     let out = run(&script);
     for word in [
         "REFUSED-HOOK",
         "REFUSED-MAIN-HOOK",
         "REFUSED-CONFIG",
         "REFUSED-COMMONDIR",
+        "REFUSED-CHECKOUT-HOOK",
+        "REFUSED-SIB-HOOK",
+        "REFUSED-SIB-DOTGIT",
+        "REFUSED-SIB-GITDIR",
         "COMMIT-OK",
         "BRANCH-OK",
         "CHECKOUT-OK",
@@ -933,12 +951,90 @@ fn a_linked_worktrees_repository_is_held_in_a_real_cage() {
     ] {
         assert!(out.contains(word), "expected {word}\n{out}");
     }
+    assert!(!out.contains("WROTE-"), "a write went through\n{out}");
     assert!(
         !common.join("hooks/pre-commit").exists(),
         "no hook on the host"
     );
     assert_eq!(std::fs::read(common.join("config")).unwrap(), config_before);
+    assert!(!main.join(".husky/_/pre-commit").exists());
+    assert_eq!(std::fs::read(main.join(".wt/sib/.git")).unwrap(), sib_git);
     let branch = git(&["rev-parse", "--verify", "-q", "b1"]).unwrap();
+    assert!(branch.status.success(), "the cage's branch is on the host");
+}
+
+/// A linked worktree kept inside the project is held inside a real cage like the project: its
+/// `.git` file, the directory a relative `core.hooksPath` names in it and its `gitdir` refuse a
+/// write, while a commit and a checkout in it work. A worktree the cage adds is named once the
+/// cage has exited.
+#[test]
+fn a_worktree_kept_inside_the_project_is_held_in_a_real_cage() {
+    let (project, data, state) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
+    probe_or_skip!(
+        "a worktree inside the project, in a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let root = project.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&root)
+            .output()
+    };
+    let Ok(init) = git(&["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    for args in [
+        &["commit", "-q", "--no-verify", "--allow-empty", "-m", "i"][..],
+        &["config", "core.hooksPath", ".husky/_"],
+        &["worktree", "add", "-q", "--detach", ".wt/inner"],
+    ] {
+        let out = git(args).unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+    let inner = root.join(".wt/inner");
+    let inner_git = std::fs::read(inner.join(".git")).unwrap();
+    let script = "(mkdir -p .wt/inner/.husky/_ && printf x > .wt/inner/.husky/_/pre-commit) \
+                    2>/dev/null && echo WROTE-HOOK || echo REFUSED-HOOK; \
+                  (printf 'gitdir: /x\\n' > .wt/inner/.git) 2>/dev/null \
+                    && echo WROTE-DOTGIT || echo REFUSED-DOTGIT; \
+                  (printf x > .git/worktrees/inner/gitdir) 2>/dev/null \
+                    && echo WROTE-GITDIR || echo REFUSED-GITDIR; \
+                  g() { git -c user.name=t -c user.email=t@t \"$@\"; }; \
+                  (cd .wt/inner && g commit -q --no-verify --allow-empty -m c) \
+                    && echo COMMIT-OK; \
+                  (cd .wt/inner && g checkout -q -b b3) && echo CHECKOUT-OK; \
+                  g worktree add -q --detach .wt/added && echo ADDED-OK";
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(&root)
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("run the cage");
+    let out = format!(
+        "{}\n--- stderr\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for word in [
+        "REFUSED-HOOK",
+        "REFUSED-DOTGIT",
+        "REFUSED-GITDIR",
+        "COMMIT-OK",
+        "CHECKOUT-OK",
+        "ADDED-OK",
+        ".wt/added` became a worktree of this repository",
+    ] {
+        assert!(out.contains(word), "expected {word}\n{out}");
+    }
+    assert!(!out.contains("WROTE-"), "a write went through\n{out}");
+    assert!(!inner.join(".husky/_/pre-commit").exists());
+    assert_eq!(std::fs::read(inner.join(".git")).unwrap(), inner_git);
+    let branch = git(&["rev-parse", "--verify", "-q", "b3"]).unwrap();
     assert!(branch.status.success(), "the cage's branch is on the host");
 }
 

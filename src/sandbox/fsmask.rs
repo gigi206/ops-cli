@@ -469,7 +469,7 @@ pub(crate) fn expand(
         _ => root.join(".git").is_dir().then(|| root.join(".git/config")),
     };
     let mut carrier: Vec<Masked> = Vec::new();
-    let mut submodules = 0;
+    let mut carried = Carried::default();
     match repo {
         Err(reason) => {
             out.refused.get_or_insert(reason);
@@ -481,15 +481,7 @@ pub(crate) fn expand(
                 let config = repo.common.join("config");
                 git_file(&reach, &config, None, &mut out.refused, &mut carrier);
             }
-            carrier.extend(git_hook_dirs(
-                &reach,
-                &repo,
-                &mut out.warnings,
-                &mut out.refused,
-            ));
-            carrier.extend(git_include_files(&reach, &repo, &mut out.refused));
-            carrier.extend(git_worktree_files(&reach, &repo, &mut out.refused));
-            submodules = submodule_carrier(
+            carried = repo_carrier(
                 &reach,
                 &repo,
                 0,
@@ -560,19 +552,33 @@ pub(crate) fn expand(
     guard_git_tracked(&root, &out.denied, &mut out.warnings);
 
     let count = out.count();
-    // A submodule's files are git's: sbx lays them itself, and naming a directory does not apply.
-    let among = if submodules > 0 {
-        format!(
-            " The git files of {submodules} submodule repositories, which sbx protects by itself, \
-             are among them."
-        )
-    } else {
-        String::new()
-    };
+    // A submodule's or another work tree's files are git's: sbx lays them itself, and naming a
+    // directory does not apply.
+    let mut among = String::new();
+    if carried.submodules > 0 {
+        among.push_str(&format!(
+            " The git files of {} submodule repositories, which sbx protects by itself, are among \
+             them.",
+            carried.submodules
+        ));
+    }
+    if carried.worktrees > 0 {
+        among.push_str(&format!(
+            " The git files of the repository's {} other work trees, which sbx protects by itself, \
+             are among them.",
+            carried.worktrees
+        ));
+    }
     if count > MASK_MAX {
-        let advice = if submodules > 0 {
+        let advice = if carried.submodules > 0 || carried.worktrees > 0 {
+            let unused = if carried.worktrees > 0 {
+                " Remove the worktrees you no longer use (`git worktree remove`)."
+            } else {
+                ""
+            };
             format!(
-                " An `[fs]` entry costs less naming a directory than its files. {GIT_WRITABLE_HINT}"
+                " An `[fs]` entry costs less naming a directory than its files.{unused} \
+                 {GIT_WRITABLE_HINT}"
             )
         } else {
             " Name a directory instead of its files: one entry closes it, at constant cost, and it \
@@ -588,7 +594,13 @@ pub(crate) fn expand(
         out.warnings.push(format!(
             "`[fs]` needs {count} mounts, its masks and the directories that hold them in place: \
              past about {MASK_WARN} the launch slows down noticeably.{among} Naming a directory \
-             closes an `[fs]` entry in one mount, at constant cost"
+             closes an `[fs]` entry in one mount, at constant cost{fewer}",
+            fewer = if carried.worktrees > 0 {
+                ", and removing a worktree you no longer use (`git worktree remove`) takes off \
+                 the mounts it costs"
+            } else {
+                ""
+            }
         ));
     }
     out
@@ -711,14 +723,15 @@ fn git_protected(root: &Path, git_writable: bool) -> bool {
     !git_writable && std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir())
 }
 
-/// A repository whose files the host's git reads: its git directory, the directory holding what
-/// its work trees share, and the top of the work tree a relative `core.hooksPath` resolves
-/// against.
+/// A repository whose files the host's git reads for one of its work trees: its git directory, the
+/// directory holding what its work trees share, and the top of the work tree a relative
+/// `core.hooksPath` resolves against, the repository itself for a bare one ([`main_work_tree`]).
 ///
 /// The two directories differ for a linked worktree only. Its own directory, under the main
 /// repository's `worktrees/`, holds its index, its `config.worktree` and its submodules'
 /// repositories; the main repository's git directory holds the configuration, the hooks and the
 /// list of worktrees ([`git_common_dir`]).
+#[derive(Clone)]
 struct GitRepo {
     /// What `--git-dir` names when the host's git is asked about the repository, and where its
     /// index and its submodules' repositories are.
@@ -896,6 +909,54 @@ fn git_common_dir(dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// What a carrier found beyond the repository it was given, for the mount budget's message.
+#[derive(Default)]
+struct Carried {
+    /// The submodules' repositories, below it and below its other work trees.
+    submodules: usize,
+    /// Its other work trees ([`other_work_trees`]).
+    worktrees: usize,
+}
+
+/// The carrier of `repo`, a repository the host's git reads for the project or a submodule, and of
+/// its other work trees, as read-only masks added to `masks`, with what it found beyond `repo`.
+///
+/// Each work tree of a repository reads what they share, the configuration and the hooks, and
+/// some of its own: git runs hooks from the directory a relative `core.hooksPath` names in the
+/// work tree it runs in, reads the configuration its own `config.worktree` includes, and reads the
+/// repositories of the submodules its index names. So `repo` gets its hooks directories, the files
+/// its configuration includes, the files beside its configuration ([`git_worktree_files`]) and its
+/// submodules ([`submodule_carrier`]), and each of its other work trees the ones that are its own
+/// ([`other_work_trees`]). A mask the work trees share is found once per work tree, and the
+/// expansion keeps one.
+fn repo_carrier(
+    reach: &Reach,
+    repo: &GitRepo,
+    depth: usize,
+    masks: &mut Vec<Masked>,
+    warnings: &mut Vec<String>,
+    refused: &mut Option<String>,
+) -> Carried {
+    masks.extend(git_hook_dirs(reach, repo, warnings, refused));
+    masks.extend(git_include_files(reach, repo, refused));
+    let found = worktree_dirs(reach, &repo.common);
+    masks.extend(git_worktree_files(reach, repo, &found, refused));
+    let trees = other_work_trees(reach, repo, &found, masks, refused);
+    let mut carried = Carried {
+        submodules: submodule_carrier(reach, repo, depth, masks, warnings, refused),
+        worktrees: trees.len(),
+    };
+    for tree in &trees {
+        if carried.submodules > MASK_MAX {
+            break;
+        }
+        masks.extend(git_hook_dirs(reach, tree, warnings, refused));
+        masks.extend(git_include_files(reach, tree, refused));
+        carried.submodules += submodule_carrier(reach, tree, depth, masks, warnings, refused);
+    }
+    carried
+}
+
 /// How deep submodules of submodules are followed; one nested deeper refuses the launch.
 const SUBMODULE_DEPTH: usize = 8;
 
@@ -910,9 +971,8 @@ const SUBMODULE_DEPTH: usize = 8;
 /// held read-only and the repository it names is protected when the cage writes it ([`Reach`]) and
 /// refuses the launch when it lies in sbx's data directory, a directory is the repository, a link
 /// refuses the launch, and none means there is no repository for git to read yet. Each repository
-/// found gets what the project's own does: its `config`, its hooks, the files it includes and the
-/// files beside its configuration, and a link or a `commondir` in it refuses the launch
-/// ([`git_repo_refusal`]).
+/// found gets what the project's own does: its `config`, and its carrier and its other work trees'
+/// ([`repo_carrier`]), and a link or a `commondir` in it refuses the launch ([`git_repo_refusal`]).
 ///
 /// An index this cannot read refuses the launch when the repository shows submodules (a
 /// `.gitmodules`, or a `modules` directory in its git directory), since their repositories could not
@@ -998,9 +1058,6 @@ fn submodule_carrier(
         }
         found += 1;
         git_file(reach, &sub.common.join("config"), None, refused, masks);
-        masks.extend(git_hook_dirs(reach, &sub, warnings, refused));
-        masks.extend(git_include_files(reach, &sub, refused));
-        masks.extend(git_worktree_files(reach, &sub, refused));
         if depth + 1 == SUBMODULE_DEPTH {
             refused.get_or_insert_with(|| {
                 visible(&format!(
@@ -1011,7 +1068,7 @@ fn submodule_carrier(
             });
             continue;
         }
-        found += submodule_carrier(reach, &sub, depth + 1, masks, warnings, refused);
+        found += repo_carrier(reach, &sub, depth + 1, masks, warnings, refused).submodules;
         if found > MASK_MAX {
             break;
         }
@@ -1204,9 +1261,12 @@ fn git_hook_dirs(
                     root.display()
                 )
             };
-            warnings.push(format!(
-                "`{pattern}` names {whole}, so they stay writable to the cage"
-            ));
+            // Each work tree of the repository asks ([`repo_carrier`]), and an absolute value names
+            // the same directory for all of them.
+            let warning = format!("`{pattern}` names {whole}, so they stay writable to the cage");
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
             continue;
         }
         if !out.iter().any(|m| m.path == canon) {
@@ -1423,9 +1483,10 @@ fn git_commondir_refusal(reach: &Reach, repo: &GitRepo) -> Option<String> {
 }
 
 /// The files beside `.git/config` that the host's git also reads as configuration, as read-only
-/// masks where the cage writes them: `.git/config.worktree`, and for each linked worktree under
-/// `.git/worktrees/`, its own `config.worktree` and the `commondir` that names the repository its
-/// configuration comes from. For a linked worktree's repository, these are the main repository's
+/// masks where the cage writes them: `.git/config.worktree`, and for each linked worktree `found`
+/// lists under `.git/worktrees/`, its own `config.worktree`, the `commondir` that names the
+/// repository its configuration comes from, and the `gitdir` that names its work tree
+/// ([`other_work_trees`]). For a linked worktree's repository, these are the main repository's
 /// ([`GitRepo`]).
 ///
 /// A `config.worktree` is configuration when the repository's own `.git/config` turns
@@ -1444,8 +1505,14 @@ fn git_commondir_refusal(reach: &Reach, repo: &GitRepo) -> Option<String> {
 /// here rather than passed through [`resolve_list`] as patterns, and the listing stops past
 /// [`MASK_MAX`]: more worktrees than masks can hold refuses the launch rather than reading on. What
 /// holding these costs is `git worktree remove` and `prune` of a worktree that existed at launch,
-/// which cannot delete its directory from the cage.
-fn git_worktree_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
+/// which cannot delete its directory from the cage, and `git worktree move` and `repair` of one,
+/// which cannot rewrite its `gitdir`.
+fn git_worktree_files(
+    reach: &Reach,
+    repo: &GitRepo,
+    found: &WorktreeDirs,
+    refused: &mut Option<String>,
+) -> Vec<Masked> {
     let extension = host_git_config(
         repo,
         &[
@@ -1468,7 +1535,6 @@ fn git_worktree_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String
         &mut out,
     );
 
-    let found = worktree_dirs(reach, git);
     if found.more {
         refused.get_or_insert_with(|| {
             visible(&format!(
@@ -1483,10 +1549,10 @@ fn git_worktree_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String
     if let Some(link) = found.links.first() {
         refused.get_or_insert_with(|| git_link_refusal(link, GIT_CONFIG_READ, GIT_LINK_INSTEAD));
     }
-    if let Some(reason) = found.unread {
-        refused.get_or_insert(reason);
+    if let Some(reason) = &found.unread {
+        refused.get_or_insert_with(|| reason.clone());
     }
-    for dir in found.dirs {
+    for dir in &found.dirs {
         git_file(
             reach,
             &dir.join("config.worktree"),
@@ -1495,6 +1561,7 @@ fn git_worktree_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String
             &mut out,
         );
         git_file(reach, &dir.join("commondir"), None, refused, &mut out);
+        git_file(reach, &dir.join("gitdir"), None, refused, &mut out);
     }
     out
 }
@@ -1582,30 +1649,176 @@ fn worktree_entries(worktrees: &Path) -> io::Result<(Vec<PathBuf>, bool)> {
     Ok((dirs, more))
 }
 
-/// What the end of a session looks for in the repository the project's git reads, where no mount
-/// reaches: a file git reads as configuration that was not there at launch, where the cage writes.
+/// The work trees of `repo`'s repository other than `repo`'s own, each as the [`GitRepo`] the
+/// host's git reads there: the main one when `repo` is a linked worktree's ([`main_work_tree`]),
+/// and each linked worktree `found` lists whose `.git` file names its directory back
+/// ([`linked_work_tree`]), that file held where the cage writes it. None is listed past the bound
+/// [`git_worktree_files`] refuses on.
+fn other_work_trees(
+    reach: &Reach,
+    repo: &GitRepo,
+    found: &WorktreeDirs,
+    masks: &mut Vec<Masked>,
+    refused: &mut Option<String>,
+) -> Vec<GitRepo> {
+    let mut trees: Vec<GitRepo> = main_work_tree(repo).into_iter().collect();
+    if found.more {
+        return trees;
+    }
+    for dir in found.dirs.iter().filter(|dir| **dir != repo.dir) {
+        match linked_work_tree(reach, dir) {
+            Ok(Some(work_tree)) => {
+                git_file(reach, &work_tree.join(".git"), None, refused, masks);
+                trees.push(GitRepo {
+                    dir: dir.clone(),
+                    common: repo.common.clone(),
+                    work_tree,
+                });
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                refused.get_or_insert(reason);
+            }
+        }
+    }
+    trees
+}
+
+/// The main work tree of the repository `repo` is a linked worktree of, as the [`GitRepo`] the
+/// host's git reads there, or `None` when `repo` is not a linked worktree's or git records none.
 ///
-/// Three can appear. A `commondir` in the repository's common directory (`.git/commondir` for a
+/// A repository whose git directory is `<dir>/.git` checks out `<dir>`. A bare one checks out
+/// nothing, and git resolves a relative `core.hooksPath` against the repository itself when it is
+/// run there (`git -C <repo>`), which is therefore its work tree here; run from another directory
+/// with `--git-dir`, git resolves it against that directory, which nothing records. One whose git
+/// directory was placed apart with `--separate-git-dir` records its main work tree nowhere, and git
+/// lists the repository in its place: nothing is carried there.
+fn main_work_tree(repo: &GitRepo) -> Option<GitRepo> {
+    if repo.dir == repo.common {
+        return None;
+    }
+    let bare = GitRepo::at(repo.common.clone(), repo.common.clone());
+    if host_git_config(&bare, &["--type=bool", "--get", "core.bare"])
+        .is_some_and(|out| out.trim_ascii() == b"true")
+    {
+        return Some(bare);
+    }
+    let checkout = repo
+        .common
+        .parent()
+        .filter(|_| repo.common.file_name() == Some(std::ffi::OsStr::new(".git")))?;
+    Some(GitRepo::at(repo.common.clone(), checkout.to_path_buf()))
+}
+
+/// The work tree, canonical, of the linked worktree whose directory under `worktrees` is `dir`,
+/// when git lists one ([`listed_work_tree`]) whose `.git` file names `dir` back; the refusal one
+/// where the cage writes earns otherwise.
+///
+/// git lists the worktree at the path its `gitdir` names, and the host's git run there reads the
+/// repository that work tree's `.git` file names, which is `dir` for every worktree git made. Where
+/// the cage writes that `.git`, anything else there refuses the launch: a link on the way to it
+/// ([`git_link_on_the_way`]), a directory, a file naming another repository or none, or one that
+/// cannot be read, since the repository git reads there would not be the one sbx protects. Where
+/// the cage does not write it, or where there is no `.git`, git reads no work tree of this
+/// repository there.
+fn linked_work_tree(reach: &Reach, dir: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(listed) = listed_work_tree(dir) else {
+        return Ok(None);
+    };
+    let what = "the `.git` file of a worktree";
+    if let Some(reason) = git_link_on_the_way(reach, &listed.join(".git"), what, GIT_LINK_INSTEAD) {
+        return Err(reason);
+    }
+    let work_tree = crate::trust::canonicalize_existing_prefix(&listed);
+    let dot_git = work_tree.join(".git");
+    let (named, is_dir) = match std::fs::symlink_metadata(&dot_git) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => (Err(git_unreadable("look at", &dot_git, &e)), false),
+        Ok(meta) if meta.is_file() => (
+            gitfile_target(&dot_git).map_err(|e| git_unreadable("read", &dot_git, &e)),
+            false,
+        ),
+        Ok(meta) => (Ok(None), meta.is_dir()),
+    };
+    if let Ok(Some(named)) = &named
+        && named.canonicalize().is_ok_and(|named| named == dir)
+    {
+        return Ok(Some(work_tree));
+    }
+    if !reach.holds(&dot_git) {
+        return Ok(None);
+    }
+    // `git worktree prune` keeps an entry whose path exists, so a path reused for another
+    // checkout is left to the user to unlist by hand.
+    let reason = match named {
+        Err(reason) => reason,
+        Ok(_) if is_dir => format!(
+            "`{}` is a directory, a repository of its own, where `{}` lists a worktree of this \
+             repository: your git there reads that repository rather than the one sbx protects. \
+             If `{}` is no longer that worktree, remove `{}`, the entry that lists it, then \
+             launch again. {GIT_WRITABLE_HINT}",
+            dot_git.display(),
+            dir.join("gitdir").display(),
+            work_tree.display(),
+            dir.display()
+        ),
+        Ok(_) => format!(
+            "`{}` does not name `{}`, whose `gitdir` lists `{}` as that worktree: your git there \
+             would read another repository than the one sbx protects. If `{}` is still that \
+             worktree, `git worktree repair {}` points its `.git` back; if it is not, remove \
+             `{}`, the entry that lists it. Then launch again. {GIT_WRITABLE_HINT}",
+            dot_git.display(),
+            dir.display(),
+            work_tree.display(),
+            work_tree.display(),
+            work_tree.display(),
+            dir.display()
+        ),
+    };
+    Err(visible(&reason))
+}
+
+/// The work tree git lists for the linked worktree whose directory is `dir`: the path its `gitdir`
+/// names, less a final `.git`, or `None` when there is none to read ([`read_git_path`]).
+fn listed_work_tree(dir: &Path) -> Option<PathBuf> {
+    let named = read_git_path(&dir.join("gitdir"), b"").ok().flatten()?;
+    if named.file_name() == Some(std::ffi::OsStr::new(".git")) {
+        return named.parent().map(Path::to_path_buf);
+    }
+    Some(named)
+}
+
+/// What the end of a session looks for in the repository the project's git reads, where no mount
+/// reaches: a file git reads as configuration that was not there at launch, where the cage writes,
+/// and a work tree of the repository the launch did not carry.
+///
+/// Four can appear. A `commondir` in the repository's common directory (`.git/commondir` for a
 /// `.git` directory) has the host's git read its configuration from the directory it names
 /// ([`git_commondir_refusal`]), a `config.worktree` is read as configuration
-/// while `extensions.worktreeConfig` is on ([`git_worktree_files`]), and a repository in a
-/// gitlink's directory is a submodule whose configuration a `git status` in the superproject reads
-/// ([`submodule_carrier`]); the cage writes the index, so it can add the gitlink as well as the
-/// repository. A mount can only hold a path that exists, and a placeholder would stop git, so the
-/// launch notes which of these exist, and once the cage has exited the supervisor names each that
-/// appeared, and a link where the launch refuses one, for the user to check before their own git
-/// reads them. It reads names and file types, the indexes ([`gitlinks`]) and the `.git` files that
-/// point at a submodule's repository, each within a bound, never following a link where the cage
-/// writes; an index it could read at launch and cannot read after the session is named too, rather
-/// than passed over. Every name it prints is escaped.
+/// while `extensions.worktreeConfig` is on ([`git_worktree_files`]), a repository in a gitlink's
+/// directory of one of the work trees the launch carried is a submodule whose configuration a `git
+/// status` there reads ([`submodule_carrier`]), and a linked worktree whose `.git` appeared where
+/// the cage writes is one git lists and runs hooks in ([`other_work_trees`]); the cage writes the
+/// index, so it can add the gitlink as well as the repository, and the repository's `worktrees`
+/// directory, so it can add a worktree. A mount can only hold a path that exists, and a placeholder
+/// would stop git, so the launch notes which of these exist, and once the cage has exited the
+/// supervisor names each that appeared, and a link where the launch refuses one, for the user to
+/// check before their own git reads them. It reads names and file types, the indexes
+/// ([`gitlinks`]), the `.git` files that point at a submodule's repository and the `gitdir` files
+/// that name a worktree, each within a bound, never following a link where the cage writes; an
+/// index it could read at launch and cannot read after the session is named too, rather than
+/// passed over. Every name it prints is escaped.
 ///
 /// It needs sbx alive when the cage exits, which is why a launch with a watch supervises the cage
 /// rather than replacing itself with it. A supervisor killed along with its terminal says nothing,
 /// and a detached session says it in its log; the next launch, which refuses a `commondir` in the
-/// common directory and protects every `config.worktree` present, covers both.
+/// common directory and protects every `config.worktree` present and every worktree git lists,
+/// covers all but what a submodule or a worktree added during the session already holds.
 pub(crate) struct GitWatch {
     reach: Reach,
     repo: GitRepo,
+    /// The repository's work trees the launch carried, `repo`'s own first.
+    trees: Vec<GitRepo>,
     configs: BTreeSet<PathBuf>,
     submodules: GitlinkScan,
 }
@@ -1624,11 +1837,15 @@ impl GitWatch {
         let root = project.canonicalize().ok()?;
         let reach = Reach::of(&root, binds, data);
         let repo = project_repo(&reach, git_writable).ok().flatten()?;
+        let found = worktree_dirs(&reach, &repo.common);
+        let others = other_work_trees(&reach, &repo, &found, &mut Vec::new(), &mut None);
+        let trees: Vec<GitRepo> = std::iter::once(repo.clone()).chain(others).collect();
         let configs = WorktreeScan::of(&reach, &repo.common).configs;
-        let submodules = GitlinkScan::of(&reach, &repo);
+        let submodules = GitlinkScan::of(&reach, &trees);
         Some(GitWatch {
             reach,
             repo,
+            trees,
             configs,
             submodules,
         })
@@ -1672,7 +1889,8 @@ impl GitWatch {
                 self.repo.common.join("worktrees").display()
             ));
         }
-        let now = GitlinkScan::of(&self.reach, &self.repo);
+        out.extend(self.added_work_trees());
+        let now = GitlinkScan::of(&self.reach, &self.trees);
         for dot_git in now.repos.difference(&self.submodules.repos) {
             out.push(format!(
                 "`{}` is a submodule's repository that sbx did not protect at launch: a `git \
@@ -1703,6 +1921,33 @@ impl GitWatch {
         }
         out.iter().map(|m| visible(m)).collect()
     }
+
+    /// One finding for each linked worktree of the repository the launch did not carry whose `.git`
+    /// is now where the cage writes: one added during the session, or one whose work tree came
+    /// back.
+    fn added_work_trees(&self) -> Vec<String> {
+        let found = worktree_dirs(&self.reach, &self.repo.common);
+        found
+            .dirs
+            .iter()
+            .filter(|dir| !self.trees.iter().any(|tree| tree.dir == **dir))
+            .filter_map(|dir| {
+                let work_tree = crate::trust::canonicalize_existing_prefix(&listed_work_tree(dir)?);
+                let dot_git = work_tree.join(".git");
+                let there = std::fs::symlink_metadata(&dot_git).is_ok();
+                (there && self.reach.holds(&dot_git)).then(|| {
+                    format!(
+                        "`{}` became a worktree of this repository during the session (`{}`), and \
+                         sbx did not protect it at launch: its `.git` file, the hooks a relative \
+                         `core.hooksPath` names there and its submodules' repositories were \
+                         writable to the cage. Check them before running git in it",
+                        work_tree.display(),
+                        dir.display()
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 /// The `config.worktree` files where the cage writes of the repository whose common directory is
@@ -1730,10 +1975,10 @@ impl WorktreeScan {
     }
 }
 
-/// The `.git` in each gitlink's directory that holds one, from the index of the repository the
-/// project's git reads and, below it, from the index of each submodule's repository the cage
-/// writes, with the indexes that could not be read in full and whether the walk stopped at its
-/// bound.
+/// The `.git` in each gitlink's directory that holds one, from the index of each work tree given
+/// (the project's and the repository's other ones the launch carried) and, below it, from the
+/// index of each submodule's repository the cage writes, with the indexes that could not be read
+/// in full and whether the walk stopped at its bound.
 ///
 /// Found by file type, as [`submodule_carrier`] finds them, and followed through a `.git` file only
 /// to a repository the cage writes ([`Reach`]), the one kind it can have added a gitlink to.
@@ -1745,9 +1990,11 @@ struct GitlinkScan {
 }
 
 impl GitlinkScan {
-    fn of(reach: &Reach, repo: &GitRepo) -> Self {
+    fn of(reach: &Reach, trees: &[GitRepo]) -> Self {
         let mut scan = GitlinkScan::default();
-        scan.walk(reach, repo, 0);
+        for tree in trees {
+            scan.walk(reach, tree, 0);
+        }
         scan
     }
 
@@ -4063,8 +4310,9 @@ mod tests {
     /// it. Without a bind, the directory a relative `core.hooksPath` names in the worktree is held,
     /// and the main repository, which the cage does not write, neither holds nor refuses anything.
     /// With the main repository in a read-write bind, its configuration and hooks and the
-    /// worktree's own files are held, an absent `config.worktree` git reads refuses, and the cage's
-    /// git is told the configuration is held. A read-only bind over the main `.git` holds nothing.
+    /// worktree's own files are held, and so are its other work trees there, the main checkout and
+    /// a worktree kept inside it; an absent `config.worktree` git reads refuses, and the cage's git
+    /// is told the configuration is held. A read-only bind over the main `.git` holds nothing.
     #[test]
     fn a_linked_worktrees_repository_is_carried_where_the_cage_writes() {
         let tmp = TmpDir::new();
@@ -4073,9 +4321,11 @@ mod tests {
             return;
         };
         assert!(git(&["config", "core.hooksPath", ".husky/_"]));
+        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/sib"]));
         assert!(git(&["config", "extensions.worktreeConfig", "true"]));
         let common = main.join(".git");
         let own = common.join("worktrees/feat");
+        let sib = common.join("worktrees/sib");
         let held =
             |e: &Expanded, path: &Path| e.readonly.iter().any(|m| m.path == path && m.builtin);
 
@@ -4091,7 +4341,11 @@ mod tests {
         );
 
         let binds = [rw_bind(&main)];
-        for absent in [common.join("config.worktree"), own.join("config.worktree")] {
+        for absent in [
+            common.join("config.worktree"),
+            own.join("config.worktree"),
+            sib.join("config.worktree"),
+        ] {
             let why = expand(&feat, &FsPolicy::default(), &binds, None)
                 .refused
                 .expect("absent and read by git");
@@ -4106,7 +4360,12 @@ mod tests {
             common.join("config.worktree"),
             own.join("commondir"),
             own.join("config.worktree"),
+            own.join("gitdir"),
             feat.join(".husky/_"),
+            main.join(".husky/_"),
+            sib.join("gitdir"),
+            main.join(".wt/sib/.git"),
+            main.join(".wt/sib/.husky/_"),
         ] {
             assert!(held(&e, &path), "{}: {:?}", path.display(), e.readonly);
         }
@@ -4260,6 +4519,264 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{what}: the read waited"));
             assert!(refused, "{what} is read as an error");
         }
+    }
+
+    /// A linked worktree kept inside the project is carried like the project: its `.git` file, the
+    /// directory a relative `core.hooksPath` names in it and the `gitdir` that lists it are held,
+    /// in the form `--relative-paths` writes too, and nothing is laid under a worktree whose work
+    /// tree is gone.
+    #[test]
+    fn a_worktree_kept_inside_the_project_is_carried_like_the_project() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a worktree inside the project: no git on this host");
+            return;
+        };
+        assert!(git(&["config", "core.hooksPath", ".husky/_"]));
+        for name in [".wt/inner", ".wt/gone"] {
+            assert!(git(&["worktree", "add", "-q", "--detach", name]));
+        }
+        let mut trees = vec!["inner"];
+        if git(&[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            "--relative-paths",
+            ".wt/rel",
+        ]) {
+            trees.push("rel");
+        } else {
+            skip_incapable!("skipping a worktree's relative paths: git has no --relative-paths");
+        }
+        std::fs::remove_dir_all(root.join(".wt/gone")).unwrap();
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        let held = |path: &Path| e.readonly.iter().any(|m| m.path == path && m.builtin);
+        for name in trees {
+            let tree = root.join(".wt").join(name);
+            let listed = root.join(".git/worktrees").join(name).join("gitdir");
+            for path in [tree.join(".git"), tree.join(".husky/_"), listed] {
+                assert!(held(&path), "{}: {:?}", path.display(), e.readonly);
+            }
+        }
+        assert!(held(&root.join(".git/worktrees/gone/gitdir")));
+        let gone = root.join(".wt/gone");
+        assert!(
+            !e.readonly.iter().any(|m| m.path.starts_with(&gone)),
+            "{:?}",
+            e.readonly
+        );
+        assert!(!e.pins.iter().any(|p| p.starts_with(&gone)), "{:?}", e.pins);
+
+        // An absolute value names the same directory for every work tree, and is said once.
+        assert!(git(&["config", "core.hooksPath", root.to_str().unwrap()]));
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        let said = e
+            .warnings
+            .iter()
+            .filter(|w| w.contains("the project root itself"));
+        assert_eq!(said.count(), 1, "{:#?}", e.warnings);
+    }
+
+    /// What git reads for a worktree kept inside the project and for it alone is held too: the
+    /// repository of a submodule its index names, under its directory in `worktrees`, and a file in
+    /// the project its `config.worktree` includes.
+    #[test]
+    fn a_sibling_worktrees_own_submodules_and_includes_are_held() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a sibling worktree's own files: no git on this host");
+            return;
+        };
+        let source = tmp.path().join("source");
+        assert!(git_repo_at(&source, &[]));
+        let file = ["-c", "protocol.file.allow=always"];
+        let add = ["submodule", "add", "-q", source.to_str().unwrap(), "sub"];
+        assert!(git(&[&file[..], &add[..]].concat()));
+        assert!(git(&["commit", "-q", "--no-verify", "-m", "sub"]));
+        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/inner"]));
+        let inner = root.join(".wt/inner");
+        let at_inner = ["-C", inner.to_str().unwrap()];
+        let update = ["submodule", "update", "-q", "--init"];
+        assert!(git(&[&at_inner[..], &file[..], &update[..]].concat()));
+        assert!(git(&["config", "extensions.worktreeConfig", "true"]));
+        std::fs::write(root.join(".git/config.worktree"), "").unwrap();
+        let included = root.join("inc.cfg");
+        std::fs::write(&included, "").unwrap();
+        let include = [
+            "config",
+            "--worktree",
+            "include.path",
+            included.to_str().unwrap(),
+        ];
+        assert!(git(&[&at_inner[..], &include[..]].concat()));
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        let modules = root.join(".git/worktrees/inner/modules/sub");
+        for path in [
+            modules.join("config"),
+            modules.join("hooks"),
+            inner.join("sub/.git"),
+            included,
+        ] {
+            assert!(
+                e.readonly.iter().any(|m| m.path == path && m.builtin),
+                "{}: {:?}",
+                path.display(),
+                e.readonly
+            );
+        }
+    }
+
+    /// A worktree's `.git` where the cage writes that does not name back the directory whose
+    /// `gitdir` lists it refuses the launch: a file naming another repository, a directory, a link.
+    /// Where there is none, or where the cage does not write it, nothing is refused.
+    #[test]
+    fn a_worktrees_git_file_that_does_not_name_its_directory_back_refuses_the_launch() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a worktree's `.git` file: no git on this host");
+            return;
+        };
+        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/inner"]));
+        let dot_git = root.join(".wt/inner/.git");
+        let other = tmp.path().canonicalize().unwrap().join("other.git");
+        std::fs::create_dir_all(&other).unwrap();
+        let refused = || expand(&root, &FsPolicy::default(), &[], None).refused;
+        assert_eq!(refused(), None);
+        std::fs::write(&dot_git, format!("gitdir: {}\n", other.display())).unwrap();
+        let why = refused().expect("another repository");
+        assert!(why.contains(".wt/inner/.git` does not name"), "{why}");
+        std::fs::remove_file(&dot_git).unwrap();
+        std::fs::create_dir(&dot_git).unwrap();
+        let why = refused().expect("a directory");
+        assert!(
+            why.contains("is a directory, a repository of its own"),
+            "{why}"
+        );
+        std::fs::remove_dir(&dot_git).unwrap();
+        std::os::unix::fs::symlink(&other, &dot_git).unwrap();
+        let why = refused().expect("a link");
+        assert!(why.contains("is a symbolic link"), "{why}");
+        std::fs::remove_file(&dot_git).unwrap();
+        assert_eq!(refused(), None, "a work tree with no `.git`");
+
+        // Beside the project, named by a `gitdir` relative to the worktree's directory, which
+        // climbs out of the project on its way there.
+        let beside = tmp.path().canonicalize().unwrap().join("beside");
+        let add = [
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            beside.to_str().unwrap(),
+        ];
+        if !git(&[&add[..], &["--relative-paths"][..]].concat()) {
+            skip_incapable!("skipping a relative `gitdir`: git has no --relative-paths");
+            assert!(git(&add));
+        }
+        std::fs::write(
+            beside.join(".git"),
+            format!("gitdir: {}\n", other.display()),
+        )
+        .unwrap();
+        assert_eq!(refused(), None, "not the cage's to write");
+    }
+
+    /// A bare repository in a read-write bind, whose linked worktree is the project, has the
+    /// directory a relative `core.hooksPath` names held inside the repository itself, where git
+    /// resolves it when it runs there, and nothing there without the bind.
+    #[test]
+    fn a_bare_repositorys_relative_hooks_path_is_held_inside_it() {
+        let tmp = TmpDir::new();
+        let Some((main, _feat, git)) = linked_worktree(&tmp) else {
+            skip_incapable!("skipping a bare repository's hooks: no git, or a cage mount");
+            return;
+        };
+        let base = tmp.path().canonicalize().unwrap();
+        let (bare, project) = (base.join("bare.git"), base.join("bw"));
+        let (main, bare_s) = (main.to_str().unwrap(), bare.to_str().unwrap());
+        assert!(git(&["clone", "-q", "--bare", main, bare_s]));
+        assert!(git(&["-C", bare_s, "config", "core.hooksPath", ".husky/_"]));
+        let add = [
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            project.to_str().unwrap(),
+        ];
+        assert!(git(&[&["-C", bare_s][..], &add[..]].concat()));
+        let held = |e: &Expanded, path: &Path| e.readonly.iter().any(|m| m.path == path);
+        let e = expand(&project, &FsPolicy::default(), &[rw_bind(&bare)], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        for path in [bare.join(".husky/_"), project.join(".husky/_")] {
+            assert!(held(&e, &path), "{}: {:?}", path.display(), e.readonly);
+        }
+        let e = expand(&project, &FsPolicy::default(), &[], None);
+        assert!(!held(&e, &bare.join(".husky/_")), "{:?}", e.readonly);
+    }
+
+    /// The end of a session names a worktree that became one of the repository's where the cage
+    /// writes, not one the launch carried, and a submodule's repository added to the index of a
+    /// worktree the launch carried.
+    #[test]
+    fn the_git_watch_names_a_worktree_added_during_the_session() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the watch of the worktrees: no git on this host");
+            return;
+        };
+        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/inner"]));
+        let watch = GitWatch::start(&root, false, &[], None).expect("a carried repository");
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/added"]));
+        let inner = root.join(".wt/inner");
+        let at_inner = ["-C", inner.to_str().unwrap()];
+        assert!(git_repo_at(&inner.join("emb"), &[]));
+        assert!(git(&[&at_inner[..], &["add", "emb"][..]].concat()));
+        let found = watch.findings();
+        let named = |what: &str| found.iter().any(|f| f.contains(what));
+        assert!(named(".wt/added` became a worktree"), "{found:#?}");
+        assert!(!named(".wt/inner` became a worktree"), "{found:#?}");
+        assert!(
+            named("inner/emb/.git` is a submodule's repository"),
+            "{found:#?}"
+        );
+    }
+
+    /// Near the mount budget and past it, a launch whose repository has many work trees says they
+    /// are among its mounts and names the way out that fits them.
+    #[test]
+    fn a_launch_past_the_mount_budget_names_the_worktrees_among_its_mounts() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(git_dir.join("hooks")).unwrap();
+        std::fs::write(git_dir.join("config"), "").unwrap();
+        let worktree = |i: usize| {
+            let dir = git_dir.join(format!("worktrees/w{i}"));
+            let tree = root.join(format!("wt/w{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(dir.join("commondir"), "../..\n").unwrap();
+            let listed = format!("{}\n", tree.join(".git").display());
+            std::fs::write(dir.join("gitdir"), listed).unwrap();
+            std::fs::write(tree.join(".git"), format!("gitdir: {}\n", dir.display())).unwrap();
+        };
+        (0..20).for_each(worktree);
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        let warned = e.warnings.iter().any(|w| {
+            w.contains("repository's 20 other work trees") && w.contains("`git worktree remove`")
+        });
+        assert!(warned, "{:#?}", e.warnings);
+        (20..90).for_each(worktree);
+        let why = expand(&root, &FsPolicy::default(), &[], None)
+            .refused
+            .expect("past the ceiling");
+        assert!(why.contains("repository's 90 other work trees"), "{why}");
+        assert!(why.contains("`git worktree remove`"), "{why}");
     }
 
     /// A repository at `dir` with one empty commit, made by the host's git; `false` when git is

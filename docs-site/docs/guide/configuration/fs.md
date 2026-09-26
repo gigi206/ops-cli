@@ -123,8 +123,9 @@ The hooks directory is the one git will run hooks from: `.git/hooks`, and also t
 `core.hooksPath` names when the cage writes it, in the project or in a read-write bind ([where
 the cage writes](#where-the-cage-writes)). husky, for one, points it at `.husky/_`, a
 directory git ignores, where a rewritten hook would not even show in `git status`. A relative
-value is resolved against the top of the work tree git runs in, so in a linked worktree it names
-a directory of the worktree, and that one is held. The value
+value is resolved against the top of the work tree git runs in, so each work tree of the
+repository has its own, and each one the cage writes is held ([other work
+trees](#where-the-cage-writes)). The value
 is read from your host's own `git` at launch, so an include file or your global config counts;
 a directory the cage does not write is left alone, and with no `git` on the host there is
 nothing to ask and no hook to run. A hooks directory that does not exist yet is **created
@@ -144,9 +145,10 @@ The files git reads **beside** `.git/config` are configuration as well.
 `.git/config.worktree` is read-only whenever it is there. git reads it when `.git/config`
 sets `extensions.worktreeConfig` (git honors that setting from `.git/config` alone, not from
 your global config or an included file), and then an absent one refuses the launch the way a
-missing include does. Each linked worktree's own `config.worktree` and `commondir`, under
-`.git/worktrees/`, are read-only too, so `git worktree remove` and `git worktree prune` cannot
-delete, from inside the cage, a worktree that existed at launch: run them on the host. A
+missing include does. Each linked worktree's own `config.worktree`, `commondir` and `gitdir`,
+under `.git/worktrees/`, are read-only too, so `git worktree remove`, `prune`, `move` and
+`repair` cannot change, from inside the cage, a worktree that existed at launch: run them on the
+host. A
 symbolic link at any of these paths, or in place of `.git/worktrees`, refuses the launch,
 since the cage could point it elsewhere during the session.
 
@@ -155,9 +157,9 @@ that file only for a linked worktree; in a main repository it makes your git rea
 configuration from the directory it names instead of `.git/config`. Nothing can hold its
 place while it is absent, since git refuses to run with an empty file or a directory there,
 so a cage could create one during a session. sbx therefore looks again once the cage has
-exited, and names a `.git/commondir`, a `config.worktree` or a submodule's repository that
-appeared during the session, or a link where the launch refuses one, before your own git reads
-them; the next launch
+exited, and names a `.git/commondir`, a `config.worktree`, a submodule's repository or a
+worktree that appeared during the session, or a link where the launch refuses one, before your
+own git reads them; the next launch
 refuses on a `.git/commondir` too. Check what it names and remove it. To be there when the
 cage exits, sbx stays its parent whenever `.git` is protected, which the default network
 posture already does. A detached session writes the warning to its log, and a session whose
@@ -253,13 +255,13 @@ restores the protection the global config lifted. A `.git` that is a **file** (a
 worktree, or a submodule opened on its own) is read-only itself, and the repository it names is
 protected like a `.git` directory wherever the cage writes it: the directory a relative
 `core.hooksPath` names in the project, and, when a read-write bind carries the main repository,
-its configuration, its hooks and the worktree's own files ([where the cage
-writes](#where-the-cage-writes)). Where no bind shows the repository, git inside the cage finds
-none and nothing it does is lost. A `.git` file that names a repository inside the project
-refuses the launch, a layout sbx does not hold: move the repository into `.git` in place of the
-file. So does a `commondir` in the repository it names that git would not have written: git
-writes one only in `.git/worktrees/<name>/`, naming the repository that holds it, and any other
-would have your git read its configuration from elsewhere.
+its configuration, its hooks, the worktree's own files and the repository's other work trees
+([where the cage writes](#where-the-cage-writes)). Where no bind shows the repository, git
+inside the cage finds none and nothing it does is lost. A `.git` file that names a repository
+inside the project refuses the launch, a layout sbx does not hold: move the repository into
+`.git` in place of the file. So does a `commondir` in the repository it names that git would
+not have written: git writes one only in `.git/worktrees/<name>/`, naming the repository that
+holds it, and any other would have your git read its configuration from elsewhere.
 
 [`sbx test fs`](#seeing-what-is-closed) reports all of these as `READ-ONLY`, protected by sbx
 itself, and [`sbx config show`](../cli/config) prints `fs git: writable` when a layer lifted
@@ -281,10 +283,31 @@ A **linked worktree** is the common case: to let git work inside the cage, bind 
 repository read-write. Its `.git/config` and `.git/hooks/`, and the worktree's `commondir` and
 `config.worktree` under `.git/worktrees/`, are then read-only in the cage, while commits,
 branches, checkouts and `git worktree list` work, and a bare `git push` pushes a branch to its
-namesake as it does in a `.git` directory. What sbx does not hold is a repository's other work
-trees where the cage writes them: in the main checkout, or in a linked worktree other than the
-project (one kept inside the project, or in a read-write bind), the directory a relative
-`core.hooksPath` names, and that worktree's `.git` file, stay writable to the cage.
+namesake as it does in a `.git` directory.
+
+The repository's **other work trees** are held where the cage writes them, since your git runs
+in each: the main checkout, and every linked worktree `git worktree list` shows, one kept inside
+the project as much as one in a read-write bind. Each keeps read-only
+what git reads for it alone: the directory a relative `core.hooksPath` names in it, its `.git`
+file, the file its own `config.worktree` includes, and the repositories of the submodules its
+index names. A worktree whose `.git` does not name back the entry under `.git/worktrees/` that
+lists it refuses the launch, naming both. If the path is still that worktree, `git worktree
+repair <path>` points its `.git` back, and also writes into the repository a wrong file names,
+so check that one first; if it is no longer that worktree (a clone made at the same path, say),
+remove the entry, which `git worktree prune` keeps while the path exists. A bare repository has
+no checkout, and git resolves a relative `core.hooksPath` against the repository itself when you
+run git there (`git -C repo.git`), so that directory is held inside it, created empty when it is
+absent. A worktree added during the session holds what the cage wrote, its `.git` file included,
+so sbx names it once the cage has exited: check it before running git there. Each worktree held
+this way adds a few mounts to the ceiling `[fs]` counts ([prefer a
+directory](#prefer-a-directory)), so a repository with many of them can reach it; the warning
+and the refusal say so, and removing the worktrees you no longer use lowers it.
+
+What sbx cannot find is a work tree git records nowhere: the checkout of a repository made with
+`--separate-git-dir`, which git lists as the repository itself, and the top of a work tree that
+`core.worktree` moves, where git then resolves a relative `core.hooksPath`. Nor does it hold the
+directory a bare repository resolves a relative `core.hooksPath` against when git runs there with
+`--git-dir` from another directory, which is that other directory.
 
 A read-write bind that holds your **global git configuration** (`~/.gitconfig`,
 `~/.config/git/config`, or the file `GIT_CONFIG_GLOBAL` names), such as a bind of your whole

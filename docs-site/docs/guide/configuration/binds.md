@@ -62,7 +62,8 @@ takes one.
 A read-write bind is written the way the project is, so what your git reads there is held the
 same way: the directory `core.hooksPath` names in the bind, a file git includes from it, a
 submodule's repository in it, and, when the project is a linked worktree, the configuration and
-hooks of its main repository in it, are read-only in the cage, and a symbolic link in the bind
+hooks of its main repository and the repository's other work trees in it, are read-only in the
+cage, and a symbolic link in the bind
 on the way to one refuses the launch ([where the cage writes](fs#where-the-cage-writes)). The
 directories between the bind and each of them can no longer be renamed or removed from the cage.
 The rest of the bind stays writable: another repository in it is what the bind grants. A bind
