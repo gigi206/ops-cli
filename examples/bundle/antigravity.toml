@@ -85,6 +85,17 @@ mute = [
     "www.googletagmanager.com",
 ]
 
+# The Google access token the agent holds is sent to the account profile endpoint
+# (`www.googleapis.com/oauth2/*`) and to its Cloud Code service, which the outbound tripwire reads
+# as a leak unless the hosts are declared one service. Measured with the `agy` CLI, which runs the
+# same engine against the same hosts: without the group, every Cloud Code call after the first is
+# refused `outbound-secret`. Not measured in the IDE.
+shared_credential = [[
+    "www.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+]]
+
 [packages]
 # Google's official prebuilt IDE tarball, tracked automatically through the resolver below.
 # Provisioned and autoPatchelf'd HOST-SIDE (Electron, no source build).
