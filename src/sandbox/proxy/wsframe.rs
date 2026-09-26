@@ -483,6 +483,14 @@ pub(super) struct Deflate {
 ///
 /// The list is the whole list, and a response may split it over several `Sec-WebSocket-Extensions`
 /// fields: every one of them is read, so an entry named in a later field is not a way past the rule.
+/// An empty element is no entry at all, as RFC 9110 §5.6.1 has a recipient read one: a client
+/// that reads the list that way compresses under `permessage-deflate,`, and taking the empty
+/// element for an extension this cannot follow left the scan reading DEFLATE bytes for text.
+///
+/// Where this and a peer could read the list apart, the reading leans towards "negotiated", which
+/// is why an element loses every blank around it rather than only the spaces and tabs a peer takes
+/// off. A decoder that expects compression where the peers agreed none costs nothing, since an
+/// honest peer then sets no `RSV1`; one that misses it scans compressed bytes and finds nothing.
 pub(super) fn negotiated_deflate(resp_head: &[u8]) -> Deflate {
     let head = String::from_utf8_lossy(resp_head);
     let values: Vec<&str> = head
@@ -501,6 +509,9 @@ pub(super) fn negotiated_deflate(resp_head: &[u8]) -> Deflate {
     // deflate entry — see the doc above for why an entry beside it is not skipped past.
     let mut negotiated: Option<Deflate> = None;
     for entry in values.iter().flat_map(|value| value.split(',')) {
+        if entry.trim().is_empty() {
+            continue;
+        }
         let mut params = entry.split(';').map(str::trim);
         if !params
             .next()
@@ -1666,6 +1677,56 @@ mod tests {
             .negotiated,
             "a response naming only permessage-deflate is exactly what this follows"
         );
+    }
+
+    /// An empty element of the extension list is no extension, as a client reading RFC 9110's list
+    /// rule takes it: Python's `websockets` compresses under `permessage-deflate,` and
+    /// `, permessage-deflate`, so the decoder has to inflate there too. The reading only widens:
+    /// every head read as negotiated before is still read so, the ones naming an extension beside
+    /// the deflate entry are still refused, and a list of empty elements names nothing.
+    #[test]
+    fn an_empty_element_of_the_extension_list_is_no_extension() {
+        let read = |fields: &[&str]| {
+            let mut head = String::from("HTTP/1.1 101 Switching Protocols\r\n");
+            for value in fields {
+                head.push_str(&format!("Sec-WebSocket-Extensions:{value}\r\n"));
+            }
+            head.push_str("\r\n");
+            negotiated_deflate(head.as_bytes()).negotiated
+        };
+        for fields in [
+            &[" permessage-deflate,"][..],
+            &[" , permessage-deflate"],
+            &[" permessage-deflate,,"],
+            &[" permessage-deflate", ""],
+            &["", " permessage-deflate"],
+            &[" permessage-deflate; server_no_context_takeover,"],
+            &[" ,\u{a0}permessage-deflate"],
+        ] {
+            assert!(read(fields), "{fields:?} negotiates permessage-deflate");
+        }
+        // What was read as negotiated still is: the reading leans that way on purpose.
+        for fields in [
+            &[" permessage-deflate"][..],
+            &["\tpermessage-deflate\t"],
+            &[" \u{a0}permessage-deflate"],
+            &[" permessage-deflate;"],
+            &[" permessage-deflate\u{a0}; server_no_context_takeover"],
+            &[" PerMessage-Deflate"],
+        ] {
+            assert!(read(fields), "{fields:?} is still read as negotiated");
+        }
+        for fields in [
+            &[" permessage-deflate, , x-custom"][..],
+            &[" ,x-custom,"],
+            &[" ,"],
+            &[""],
+        ] {
+            assert!(
+                !read(fields),
+                "{fields:?} negotiates nothing this can follow"
+            );
+        }
     }
 
     /// The sink's cap bounds a chatty tunnel, and filling it is the signal the relay uses to show a
