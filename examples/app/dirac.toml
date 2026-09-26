@@ -46,14 +46,35 @@
 # traffic through sbx's MITM. Grounded here: the packaging and the ripgrep resolution order (read out
 # of the published package), the provider env-var names, and the telemetry endpoints (read out of the
 # shipped bundle).
-cmd = "dirac"
-
-# No `contract`: Dirac takes no system-prompt, rules or instructions option, and its global rules
-# live in `~/Documents/Dirac/Rules`; `--config` would move its data directory rather than add to it.
-# Point Dirac at the cage's summary yourself instead, for instance with a line in a rule file in
-# that directory such as "When the environment variable SBX_SANDBOX is 1, read the file named by
-# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
-# at every launch.
+# The command hands Dirac the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as a global rule: a copy at
+# `~/.dirac/Rules/sbx-contract.md`. Dirac loads every file of that directory beside the project's
+# rules and enables a file it has not seen before, so nothing of yours is replaced; turning the rule
+# off in Dirac keeps it off. The copy lives in the app's isolated home, which only this app's cages
+# read: it is rewritten at every launch, removed by a launch without a summary, and a file of yours at
+# that path is left untouched (the summary is then not added). No option is used: Dirac has no
+# system-prompt, rules or instructions option, and `--config` would move its data directory.
+# Arguments after `sbx app run dirac --` reach Dirac verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+d="$HOME/.dirac/Rules"
+f="$d/sbx-contract.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec dirac "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "dirac",
+]
 
 # Your host Dirac config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged

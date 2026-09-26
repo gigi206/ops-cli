@@ -213,8 +213,8 @@ instructions rather than replace them; the shipped `aider`, `amp`, `claude-deskt
 An agent that reads its instructions from its own home only can still take the summary when it
 loads every file of a directory there: the command drops a copy of its own beside the user's files,
 rewrites it at every launch, and never overwrites a file it did not write. The app's home is
-isolated, so only that app's cages read the copy. The shipped `nanobot`, `omp` and `reasonix`
-profiles work this way.
+isolated, so only that app's cages read the copy. The shipped `cline`, `dirac`, `nanobot`, `omp`
+and `reasonix` profiles work this way.
 
 **What the summary says.** The network posture and the hosts the cage may reach (hosts only, never
 their paths), the destinations a credential is attached to, the files sbx protects by name and a
