@@ -21,11 +21,12 @@
 # never leaves your machine — and here it additionally cannot leave the cage, since the only hosts
 # it can reach are the two model-download ones below.
 #
-# PACKAGING. Upstream documents `npm install -g @smbcloud/sigit` alongside cargo/brew/pip; the npm
-# package is a small shim that dispatches to a prebuilt platform package (`@smbcloud/sigit-linux-x64`,
-# ~78 MB) — a plain optional dependency with **no install script**, so mise's `--ignore-scripts`
-# costs nothing. The binary is dynamically linked and runs through the cage's nix-ld shim, the same
-# path `cursor-agent`'s bootstrap binary takes. `sbx upgrade mise` rolls it forward.
+# PACKAGING. Upstream publishes the npm package as `@getsigit/sigit` (formerly `@smbcloud/sigit`,
+# which now prints a notice pointing to the new name) alongside cargo/brew/pip; it is a small shim
+# that dispatches to a prebuilt platform package (`@getsigit/sigit-linux-x64`, ~78 MB) — a plain
+# optional dependency with **no install script**, so mise's `--ignore-scripts` costs nothing. The
+# binary is dynamically linked and runs through the cage's nix-ld shim, the same path
+# `cursor-agent`'s bootstrap binary takes. `sbx upgrade mise` rolls it forward.
 #
 # COST AND SPEED, stated plainly: the first launch pays a 1–2 GB download, and inference runs on
 # **your CPU** unless you have GPU offload configured (`gpu = true` opens the render node — see

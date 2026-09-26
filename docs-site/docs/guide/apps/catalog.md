@@ -84,7 +84,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `qwen-code` | `nix:nodejs` (+ `mise:npm:@qwen-code/qwen-code`) | `dashscope.aliyuncs.com` (`DASHSCOPE_API_KEY`) |
 | `reasonix` | `nix:nodejs` (+ `mise:npm:reasonix`) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
 | `rovo` | `nix:acli.unwrapped` (the Atlassian CLI; Rovo Dev is its subcommand) | `api.atlassian.com` + `*.atlassian.net` (Atlassian API token, scoped to Rovo Dev) |
-| `sigit` | `nix:nodejs` (+ `mise:npm:@smbcloud/sigit`) | **none**: the model runs in-cage |
+| `sigit` | `nix:nodejs` (+ `mise:npm:@getsigit/sigit`) | **none**: the model runs in-cage |
 | `snow` | `nix:nodejs` (+ `mise:npm:snow-ai`) | provider-dependent (BYOK) |
 | `stakpak` | `mise:github:stakpak/agent` | `apiv2.stakpak.dev` (`STAKPAK_API_KEY`) or BYOK: a DevOps agent |
 | `trae` | bootstrap installer (`cmd` wrapper; + `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / OpenRouter / Doubao / Azure / Ollama) |

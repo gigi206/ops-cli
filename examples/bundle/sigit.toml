@@ -46,7 +46,7 @@ mute = [
 
 [packages]
 nodejs = "nix:nodejs"                # the npm entry point is a JS shim
-sigit = "mise:npm:@smbcloud/sigit"   # upstream's documented npm package
+sigit = "mise:npm:@getsigit/sigit"   # upstream's npm package (formerly `@smbcloud/sigit`)
 
 [env]
 # mise picks the client that performs an `npm:` install itself (`npm.package_manager = "auto"`), and
@@ -60,5 +60,5 @@ sigit = "mise:npm:@smbcloud/sigit"   # upstream's documented npm package
 # this bundle builds carries exactly one. Measured cost on a package that works either way: 22 s
 # instead of 18 s, once, when the app home is first filled.
 #
-# THE TRIGGER THAT REMOVES THIS: the default client installs `npm:@smbcloud/sigit` without failing.
+# THE TRIGGER THAT REMOVES THIS: the default client installs `npm:@getsigit/sigit` without failing.
 MISE_NPM_PACKAGE_MANAGER = "npm"
