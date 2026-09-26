@@ -75,14 +75,36 @@
 # `*.atlassian.net` sites — read out of the binary's outbound URL table), the
 # `ACLI_*` env-var list (read out of the binary), and the basic-auth headless flow
 # (read out of the binary's help text + the official install docs).
-cmd = ["acli", "rovodev"]
-
-# No `contract`: Rovo Dev's additive setting, `agent.additionalSystemPrompt`, lives only in
-# `~/.rovodev/config.yml` with no environment override, and `--config-file` swaps in another
-# configuration rather than adding to yours. Point Rovo Dev at the cage's summary yourself instead,
-# for instance with a line in that `agent.additionalSystemPrompt` such as "When the environment
-# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
-# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Rovo Dev the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as its user memory file,
+# `~/.rovodev/AGENTS.md`, which Rovo Dev loads beside the project's `AGENTS.md` files (Atlassian's
+# "Use memory in Rovo Dev CLI"). That file is yours to keep, so the command writes it only while you
+# have none: a copy marked as sbx's, rewritten at every launch and removed by a launch without a
+# summary. Once you write your own there, it is left untouched and the summary is no longer added.
+# The file lives in the app's isolated home, which only this app's cages read. No option is used:
+# `agent.additionalSystemPrompt` lives only in your `~/.rovodev/config.yml`, and `--config-file`
+# swaps in another configuration. Not measured: Rovo Dev needs a signed-in Atlassian account before
+# it assembles a session. Arguments after `sbx app run rovo --` reach `acli rovodev` verbatim through
+# `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+f="$HOME/.rovodev/AGENTS.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$HOME/.rovodev" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec acli rovodev "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "rovo",
+]
 
 # Your host ACLI config/auth, mounted read-write at its real absolute path. `binds`
 # is a security field, honored only because this profile lives in your trusted
