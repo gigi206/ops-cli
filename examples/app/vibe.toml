@@ -53,14 +53,34 @@
 #
 # API-KEY (BYOK) is available as an alternative to the browser sign-in — see the [env]/[secret]
 # blocks at the bottom of this file.
-cmd = ["vibe"]
-
-# No `contract`: Vibe's instructions come from `$VIBE_HOME/AGENTS.md` and the project's `AGENTS.md`,
-# and its configuration has no additive field. `VIBE_SYSTEM_PROMPT_ID` swaps the whole system prompt
-# and `VIBE_HOME` moves your home, `~/.vibe/AGENTS.md` included. Point Vibe at the cage's summary
-# yourself instead, for instance with a line in your `~/.vibe/AGENTS.md` such as "When the
-# environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything
-# else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Vibe the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as its user instructions file, `~/.vibe/AGENTS.md`,
+# which Vibe loads beside the project's `AGENTS.md`. That file is yours to keep, so the command
+# writes it only while you have none: a copy marked as sbx's, rewritten at every launch and removed
+# by a launch without a summary. Once you write your own there, it is left untouched and the summary
+# is no longer added. The file lives in the app's isolated home, which only this app's cages read.
+# No option is used: Vibe's configuration has no additive field, `VIBE_SYSTEM_PROMPT_ID` swaps the
+# whole system prompt, and `VIBE_HOME` moves your home (the command follows it). Arguments after
+# `sbx app run vibe --` reach Vibe verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+f="${VIBE_HOME:-$HOME/.vibe}/AGENTS.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "${f%/*}" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec vibe "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "vibe",
+]
 
 # DISPLAY + GPU — needed so the in-cage Chromium (the SSO sign-in window) actually maps. `gui =
 # "wayland"` binds the host Wayland compositor socket (read-only) and provisions fonts; X11 is never
