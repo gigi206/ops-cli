@@ -203,6 +203,14 @@ consequences come with passing the text rather than a path:
 - a summary longer than the kernel's single-argument limit (128 KiB) is left out of the launch,
   option included, with a warning, and stays at its path in the cage.
 
+The first consequence is why the shipped `codex` profile does not use this form: its command
+writes the summary into Codex's managed requirements file, `/etc/codex/requirements.toml`, as
+`additional_developer_instructions`, which Codex sends as a developer message of its own beside
+yours. When an agent reads a file sbx can place in the cage's own `/etc` or `/` (both live for one
+launch and never reach the host), a command that writes it there is the way to add to the user's
+instructions rather than replace them; the shipped `amp`, `openfox`, `pi`, `prime-agent` and
+`open-design` profiles do the same.
+
 **What the summary says.** The network posture and the hosts the cage may reach (hosts only, never
 their paths), the destinations a credential is attached to, the files sbx protects by name and a
 count of every other masked or read-only path, the families of refused system calls, the resource

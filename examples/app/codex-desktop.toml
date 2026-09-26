@@ -155,24 +155,37 @@
 # If a request is refused, the proxy names the host — watch `sbx net logs -a codex-desktop` and add
 # it below (or check ahead with `sbx test net <url>`).
 cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+q=$(printf '\047\047\047')
+if [ -r "$s" ] && [ "$(wc -c < "$s")" -lt 30000 ] && ! grep -qF "$q" "$s" \
+   && ! tr -d '\t\n' < "$s" | LC_ALL=C grep -q '[[:cntrl:]]' && mkdir -p /etc/codex 2>/dev/null; then
+  { printf 'additional_developer_instructions = %s\n' "$q"; cat "$s"; printf '%s\n' "$q"; } > /etc/codex/requirements.toml
+fi
+# Name the credential store explicitly. Chromium does NOT pick its backend from what is on the
+# bus: it reads `XDG_CURRENT_DESKTOP`, and a cage sets no desktop name, so it falls back to the
+# plaintext store even when a Secret Service is right there. Naming the backend is what makes it
+# use the keyring `dbus = true` provides.
+exec codex-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --use-system-ca \
+    --password-store=gnome-libsecret "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
     "codex-desktop",
-    "--no-sandbox",
-    "--ozone-platform=wayland",
-    "--disable-dev-shm-usage",
-    "--use-system-ca",
-    # Name the credential store explicitly. Chromium does NOT pick its backend from what is on the
-    # bus: it reads `XDG_CURRENT_DESKTOP`, and a cage sets no desktop name, so it falls back to the
-    # plaintext store even when a Secret Service is right there. Naming the backend is what makes it
-    # use the keyring `dbus = true` provides.
-    "--password-store=gnome-libsecret",
 ]
 
-# No `contract`: the app starts its bundled Codex engine itself and sends its own per-thread
-# developer instructions, so the `-c developer_instructions` the `codex` profile passes cannot reach
-# it from this `cmd`. `CODEX_HOME` would move your configuration rather than add to it. Point Codex
-# at the cage's summary yourself instead, for instance with a line in your `~/.codex/AGENTS.md` such
-# as "When the environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY
-# before anything else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands the app's bundled Codex engine the cage's summary (/opt/sbx/contract-summary.md:
+# what it may reach, which files it protects, which operations it offers). The app starts that
+# engine itself and sends developer instructions of its own with each thread, so the summary goes
+# through its managed requirements file, `/etc/codex/requirements.toml`: the summary's text as
+# `additional_developer_instructions`, which Codex sends as a developer message of its own
+# (`<managed_developer_instructions>`) beside your `developer_instructions`, never in their place.
+# `/etc` is the cage's own tmpfs: the file lives for this launch only and never reaches the host.
+# The text sits inline in the TOML, so the command leaves the file out, and Codex runs without the
+# summary, when the text cannot be written there as a literal string (a `'''` or a control
+# character in it) or comes near Codex's 10,000-token cap for that key, above which Codex fails to
+# load its configuration.
 
 gui = "wayland"
 gpu = true
