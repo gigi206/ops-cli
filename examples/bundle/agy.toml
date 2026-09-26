@@ -40,5 +40,16 @@ mute = [
     "playwright-verizon.azureedge.net",
 ]
 
+# The Google access token this agent holds is first sent to the account profile endpoint
+# (`www.googleapis.com/oauth2/v2/userinfo`), then to its Cloud Code service, which the outbound
+# tripwire reads as a leak unless the hosts are declared one service: without this group, every
+# `daily-cloudcode-pa` call after the first is refused `outbound-secret` and `agy -p` stops at its
+# eligibility check. The telemetry host `play.googleapis.com` stays out of the group and refused.
+shared_credential = [[
+    "www.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+]]
+
 [packages]
 agy = "mise:aqua:google-antigravity/antigravity-cli"
