@@ -2015,5 +2015,7 @@ pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
     }
 }
 
+// Reached from the proxy's tests for `host_spellings`, the hosts the supervisor's judge is asked
+// about as well.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

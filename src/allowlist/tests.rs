@@ -3022,3 +3022,126 @@ fn an_ipv6_spelling_of_an_ipv4_is_refused_as_a_request_host() {
         assert!(is_request_host(host), "{host:?} is a request host");
     }
 }
+
+/// Hosts as a cage, or a proxy that no longer follows its planes, may spell them: names of labels
+/// that are words, decimal, `0x` or octal numbers, joined by dots and now and then by a byte that
+/// ends a host in a URL, and addresses in every family and shorthand a resolver reads.
+pub(crate) fn host_spellings() -> impl proptest::strategy::Strategy<Value = String> {
+    use proptest::prelude::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let label = prop_oneof![
+        "[a-z]{1,6}",
+        "[a-z0-9_-]{1,6}",
+        "[0-9]{1,5}",
+        "0x[0-9a-f]{0,8}",
+        "0[0-7]{1,4}",
+        "[A-Z]{1,3}",
+        Just(String::new()),
+    ];
+    let separator = prop_oneof![
+        12 => Just(".".to_string()),
+        1 => "[/?#@:%\\\\ \\[\\]\u{e9}\u{1b}]",
+    ];
+    let name = (
+        label.clone(),
+        prop::collection::vec((separator, label), 0..4),
+    )
+        .prop_map(|(first, rest)| {
+            rest.into_iter()
+                .fold(first, |mut host, (separator, label)| {
+                    host.push_str(&separator);
+                    host.push_str(&label);
+                    host
+                })
+        });
+    let halves = |a: Ipv4Addr| {
+        let [w, x, y, z] = a.octets();
+        (u16::from_be_bytes([w, x]), u16::from_be_bytes([y, z]))
+    };
+    prop_oneof![
+        6 => name,
+        1 => any::<Ipv4Addr>().prop_map(|a| a.to_string()),
+        1 => any::<Ipv6Addr>().prop_map(|a| a.to_string()),
+        1 => any::<Ipv4Addr>().prop_map(|a| a.to_ipv6_mapped().to_string()),
+        1 => any::<Ipv4Addr>().prop_map(move |a| {
+            let (hi, lo) = halves(a);
+            format!("64:ff9b::{hi:x}:{lo:x}")
+        }),
+        1 => any::<Ipv4Addr>().prop_map(move |a| {
+            let (hi, lo) = halves(a);
+            format!("2002:{hi:x}:{lo:x}::1")
+        }),
+        1 => any::<u32>().prop_map(|n| n.to_string()),
+        1 => any::<u32>().prop_map(|n| format!("0x{n:x}")),
+        1 => (any::<u8>(), any::<u8>(), any::<u16>()).prop_map(|(a, b, c)| format!("{a}.{b}.{c}")),
+    ]
+}
+
+// The C library's own address parsers, which its resolver consults before any lookup.
+unsafe extern "C" {
+    fn inet_aton(text: *const libc::c_char, address: *mut libc::in_addr) -> libc::c_int;
+    fn inet_pton(
+        family: libc::c_int,
+        text: *const libc::c_char,
+        out: *mut libc::c_void,
+    ) -> libc::c_int;
+}
+
+/// The address the C library's own parsers read in `text`, the ones its resolver consults before
+/// any lookup, or `None` when they read no address and a lookup would take it as a name.
+fn libc_address(text: &str) -> Option<IpAddr> {
+    let text = std::ffi::CString::new(text).ok()?;
+    let mut v4 = libc::in_addr { s_addr: 0 };
+    // SAFETY: `text` is a NUL-terminated string that outlives the call, and `v4` is a valid
+    // `in_addr` for `inet_aton` to write.
+    if unsafe { inet_aton(text.as_ptr(), &mut v4) } != 0 {
+        return Some(IpAddr::from(u32::from_be(v4.s_addr).to_be_bytes()));
+    }
+    let mut v6 = [0u8; 16];
+    // SAFETY: as above, and `v6` holds the 16 bytes `inet_pton` writes for `AF_INET6`.
+    let read = unsafe { inet_pton(libc::AF_INET6, text.as_ptr(), v6.as_mut_ptr().cast()) };
+    (read == 1).then(|| IpAddr::from(v6))
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+    /// A request host is one host to the policy and to the resolver, read against the C library's
+    /// own address parsers rather than against this module. An address is the address the
+    /// resolver reads, in its own family; a name is one the resolver takes as a name, and the URL
+    /// a `re:` rule is tested against carries it whole, up to where a URL reader ends a host.
+    #[test]
+    fn a_request_host_is_one_host_to_the_policy_and_to_the_resolver(host in host_spellings()) {
+        if is_request_host(&host) {
+            proptest::prop_assert_eq!(canonical_host(&host), host.clone());
+            match host.parse::<IpAddr>() {
+                Ok(ip) => {
+                    proptest::prop_assert_eq!(libc_address(&host), Some(ip));
+                    if let IpAddr::V6(v6) = ip {
+                        proptest::prop_assert!(embedded_v4(v6).is_none(), "{:?}", host);
+                    }
+                }
+                Err(_) => {
+                    proptest::prop_assert_eq!(libc_address(&host), None, "{:?}", host);
+                    let url = Request::new(&host, 443, "/").url;
+                    let rest = url.strip_prefix("https://").unwrap_or(&url);
+                    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+                    let read = authority.rsplit('@').next().unwrap_or("");
+                    proptest::prop_assert_eq!(read.split(':').next(), Some(host.as_str()));
+                }
+            }
+        }
+    }
+
+    /// Every address in its own family, and every name whose last label starts with a letter, is a
+    /// request host: the gate refuses spellings, never a destination one can write plainly.
+    #[test]
+    fn every_plain_address_and_name_is_a_request_host(
+        ip in proptest::prelude::any::<IpAddr>(),
+        name in "[a-z0-9]{1,8}(\\.[a-z0-9_-]{1,8}){0,3}\\.[a-z][a-z0-9]{0,5}",
+    ) {
+        proptest::prop_assert!(is_request_host(&name), "{:?}", name);
+        let embeds = matches!(ip, IpAddr::V6(v6) if embedded_v4(v6).is_some());
+        proptest::prop_assert_eq!(is_request_host(&ip.to_string()), !embeds, "{}", ip);
+    }
+}

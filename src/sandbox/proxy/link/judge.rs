@@ -824,6 +824,45 @@ mod tests {
         assert!(so_far.is_empty(), "resolved: {so_far:?}");
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Whatever host the proxy asks about, the judge admits only a request host, and the
+        /// resolver is handed nothing else: the name a verdict read is the name resolved. Asked
+        /// under a policy that admits by default, with an address rule and a `re:` rule beside it,
+        /// so the refusal is the host's and not the policy's.
+        #[test]
+        fn the_judge_admits_and_resolves_only_a_request_host(
+            host in crate::allowlist::tests::host_spellings(),
+        ) {
+            let policy = EgressPolicy::new(
+                vec![classify("re:^https://allowed\\.test/").unwrap()],
+                vec![classify("1.1.1.1").unwrap()],
+            )
+            .with_default(DefaultAction::Allow);
+            let judge = Judge::new(&policy.encode().unwrap()).unwrap();
+            let resolved = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&resolved);
+            // An address the guard refuses to a request no exact rule decides, so nothing is
+            // dialled whatever the verdict.
+            judge.set_resolver(Arc::new(move |host: &str| {
+                locked(&seen).push(host.to_string());
+                Ok(vec![IpAddr::from([192, 0, 2, 1])])
+            }));
+            let asked = Asked::inspected(&host, 443, "GET", "/");
+            if judge.admits(&asked) {
+                proptest::prop_assert!(is_request_host(&host), "{:?}", host);
+            }
+            let _ = judge.check(1, &asked);
+            let so_far = locked(&resolved).clone();
+            proptest::prop_assert!(
+                so_far.iter().all(|h| *h == host && is_request_host(h)),
+                "{:?}",
+                so_far
+            );
+        }
+    }
+
     /// The judge reaches the verdict the proxy reaches, deciding rule and its flags included, on
     /// every shipped policy, for requests to the hosts it names and to the built-in ones: the two
     /// copies are decoded from the same bytes and unioned the same way, and a copy that is not
