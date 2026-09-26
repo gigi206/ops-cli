@@ -46,14 +46,35 @@
 # model traffic through sbx's MITM. Grounded here: the packaging and the absence of an install-script
 # trap (read out of the published package and its dependencies' registry metadata), and the endpoints
 # and the `x-api-key` header shape (read out of the shipped bundle).
-cmd = "nova"
-
-# No `contract`: none of the options found in Nova's bundle adds a system prompt, rules or
-# instructions, and `COMPASS_CONFIG` names a replacement config file rather than adding to yours.
-# Its instruction files are `NOVA.md` and `NOVA.local.md`. Point Nova at the cage's summary yourself
-# instead, for instance with a line in a `NOVA.md` it reads such as "When the environment variable
-# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Nova the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as its global instructions file, `~/.nova/NOVA.md`,
+# which Nova adds to its system prompt beside the project's `NOVA.md`. That file is yours to keep, so
+# the command writes it only while you have none: a copy marked as sbx's, rewritten at every launch
+# and removed by a launch without a summary. Once you write your own there, it is left untouched and
+# the summary is no longer added. The file lives in the app's isolated home, which only this app's
+# cages read. Measured through the system-prompt length Nova records in `.nova/logs/llm-*.jsonl`: the
+# file adds its full length, and the project's `NOVA.md` still counts; the model turn is not
+# measured. No option is used: none of Nova's adds instructions, and `COMPASS_CONFIG` names a
+# replacement config file. Arguments after `sbx app run nova --` reach Nova verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+f="$HOME/.nova/NOVA.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$HOME/.nova" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec nova "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "nova",
+]
 
 # Your host Nova config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
