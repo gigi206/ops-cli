@@ -215,7 +215,8 @@ loads every file of a directory there: the command drops a copy of its own besid
 rewrites it at every launch, and never overwrites a file it did not write. The app's home is
 isolated, so only that app's cages read the copy. The shipped `agy`, `antigravity`, `cline`,
 `devin`, `dirac`, `kiro`, `kiro-desktop`, `nanobot`, `omp`, `reasonix` and `reasonix-desktop`
-profiles work this way.
+profiles work this way, and the `snow` profile the same with a global hook file that returns the
+summary on a conversation's first message.
 
 **What the summary says.** The network posture and the hosts the cage may reach (hosts only, never
 their paths), the destinations a credential is attached to, the files sbx protects by name and a

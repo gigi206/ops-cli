@@ -35,14 +35,51 @@
 # UNVERIFIED (like every profile until run with a real key): the live authentication and the model
 # traffic through sbx's MITM. Grounded here: the packaging and the postinstall's behaviour (read out
 # of the published package), and the provider endpoints (read out of the shipped bundle).
-cmd = "snow"
-
-# No `contract`: Snow's startup parameters carry no instructions; its system prompts are chosen in
-# the UI and its role files are `~/.snow/ROLE.md` and `./ROLE.md`, while `SNOW_CONFIG_DIR` would
-# move your config. Point Snow at the cage's summary yourself instead, for instance with a line in
-# your `~/.snow/ROLE.md` such as "When the environment variable SBX_SANDBOX is 1, read the file
-# named by SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is
-# rewritten at every launch.
+# The command hands Snow the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) through a global `onUserMessage` hook: the file
+# `~/.snow/hooks/onUserMessage.json` runs `/etc/snow/sbx-contract-hook.js`, which returns the summary
+# as `additionalContext` on the first message of a conversation and nothing afterwards, so Snow
+# prepends it once, to your own first message, and your system prompt and `ROLE.md` stay as they are.
+# The script lives in the cage's own `/etc` for this launch only; the hook file lives in the app's
+# isolated home, which only this app's cages read. The hook file is rewritten at every launch, removed
+# by a launch without a summary, and an `onUserMessage.json` of yours is left untouched (the summary
+# is then not added). Two limits: a project's own `.snow/hooks/onUserMessage.json` replaces the global
+# one for that project, and Snow keeps 8 KiB of a hook's context, so a longer summary is cut. A
+# `snow --ask` run triggers no hook and does not receive it. No option is used: Snow's startup
+# parameters carry no instructions, and `SNOW_CONFIG_DIR` would move your config. Arguments after
+# `sbx app run snow --` reach Snow verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+d="$HOME/.snow/hooks"
+f="$d/onUserMessage.json"
+m='sbx: the cage summary, rewritten at every launch'
+if [ -r "$s" ] && mkdir -p /etc/snow 2>/dev/null && cat > /etc/snow/sbx-contract-hook.js <<'HOOK'
+let input = "";
+process.stdin.on("data", (c) => (input += c)).on("end", () => {
+  let n = 0;
+  try { n = JSON.parse(input).messageCount || 0; } catch {}
+  if (n !== 0) return;
+  const text = require("fs").readFileSync("/opt/sbx/contract-summary.md", "utf8");
+  process.stdout.write(JSON.stringify({ additionalContext: text }));
+});
+HOOK
+then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && printf '%s\n' \
+      '[{"description": "'"$m"'", "hooks": [{"type": "command", "enabled": true,' \
+      ' "command": "node /etc/snow/sbx-contract-hook.js"}]}]' > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec snow "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "snow",
+]
 
 # Your host Snow config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
