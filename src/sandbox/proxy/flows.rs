@@ -6,7 +6,7 @@
 //! totals; an opening and a closing are reported as they happen ([`super::events`]). The view trails
 //! the relay by at most one tick, and a total applied late or twice is still the right total.
 
-use super::events::{Emitter, ProxyEvent};
+use super::events::{Emitter, MAX_FLOW_COUNTS, ProxyEvent};
 use crate::sandbox::control::Proto;
 use crate::sandbox::locks::locked;
 use std::collections::BTreeMap;
@@ -97,8 +97,9 @@ impl LiveFlows {
         }
     }
 
-    /// Report the totals of every open flow that moved since it was last reported. Sent outside the
-    /// lock, so a full queue slows this thread without holding up a relay opening or closing a flow.
+    /// Report the totals of every open flow that moved since it was last reported, in reports of at
+    /// most [`MAX_FLOW_COUNTS`], the most the supervisor reads in one. Sent outside the lock, so a
+    /// full queue slows this thread without holding up a relay opening or closing a flow.
     pub(super) fn report(&self) {
         let moved: Vec<(u64, u64, u64)> = {
             let mut inner = locked(&self.inner);
@@ -117,8 +118,8 @@ impl LiveFlows {
                 })
                 .collect()
         };
-        if !moved.is_empty() {
-            self.events.send(ProxyEvent::FlowCounts(moved));
+        for counts in moved.chunks(MAX_FLOW_COUNTS) {
+            self.events.send(ProxyEvent::FlowCounts(counts.to_vec()));
         }
     }
 
@@ -267,6 +268,41 @@ mod tests {
         assert_eq!(unreported(&flows), 1);
         flows.report();
         assert_eq!(unreported(&flows), 0, "reported, and nothing moved since");
+    }
+
+    /// The counts of more flows than one report carries all reach the view: the proxy sends them in
+    /// several reports, each one the supervisor reads. Built without the reporting thread, so the
+    /// one report is this test's, whole.
+    #[test]
+    fn the_counts_of_more_flows_than_one_report_carries_all_reach_the_view() {
+        let registry = Arc::new(FlowRegistry::new());
+        let emitter = events::spawn(events::Sinks {
+            flows: Some(Arc::clone(&registry)),
+            ..events::Sinks::default()
+        })
+        .unwrap();
+        let flows = Arc::new(LiveFlows {
+            events: emitter.clone(),
+            inner: Mutex::new(Inner {
+                next_id: 1,
+                open: BTreeMap::new(),
+            }),
+        });
+        let guards: Vec<FlowGuard> = (0..=MAX_FLOW_COUNTS)
+            .map(|_| flows.open("api.test", 443, Proto::Https))
+            .collect();
+        for g in &guards {
+            g.up.fetch_add(1, Ordering::Relaxed);
+        }
+        flows.report();
+        emitter.flush();
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), MAX_FLOW_COUNTS + 1);
+        assert!(
+            snap.iter().all(|f| f.up == 1),
+            "{} flows left uncounted",
+            snap.iter().filter(|f| f.up != 1).count()
+        );
     }
 
     /// The reporting thread lets go of the reporter once the proxy has let go of the table, so the

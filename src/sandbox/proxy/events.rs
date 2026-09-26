@@ -72,6 +72,12 @@ const MAX_ANNOUNCED: usize = MAX_FIELD + 512;
 /// ([`crate::sandbox::lens::sanitize_detail`]), at most that many characters of up to four bytes.
 const MAX_SIGNER_DETAIL: usize = 4 * crate::sandbox::lens::DETAIL_MAX;
 
+/// The most flow counts one report carries. The proxy sends a tick's counts in reports of at most
+/// this many ([`super::flows::LiveFlows::report`]), so a report carrying more is none it made, and
+/// it is refused while it is read: a count takes a few bytes as JSON and twenty-four once read, so
+/// a frame of them would otherwise be held at several times its size.
+pub(super) const MAX_FLOW_COUNTS: usize = 4096;
+
 /// One thing the proxy did, as the supervisor learns it, with its capture as `C`: the proxy's
 /// [`Masked`], or the form it crosses in ([`wire`]).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -111,8 +117,8 @@ pub(crate) enum ProxyEvent<C = Masked> {
         proto: Proto,
     },
     /// The absolute byte totals `(id, up, down)` of the open flows that moved since their last
-    /// report.
-    FlowCounts(Vec<(u64, u64, u64)>),
+    /// report, at most [`MAX_FLOW_COUNTS`] of them.
+    FlowCounts(#[serde(deserialize_with = "at_most_flow_counts")] Vec<(u64, u64, u64)>),
     /// The tunnel `id` closed.
     FlowClosed { id: u64 },
 }
@@ -177,6 +183,37 @@ impl<C> ProxyEvent<C> {
             ProxyEvent::FlowClosed { id } => ProxyEvent::FlowClosed { id },
         })
     }
+}
+
+/// The counts of a [`ProxyEvent::FlowCounts`], refused at the first past [`MAX_FLOW_COUNTS`]
+/// rather than once all of them are held.
+fn at_most_flow_counts<'de, D>(deserializer: D) -> Result<Vec<(u64, u64, u64)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Counts;
+    impl<'de> serde::de::Visitor<'de> for Counts {
+        type Value = Vec<(u64, u64, u64)>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "at most {MAX_FLOW_COUNTS} flow counts")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut counts = Vec::new();
+            while let Some(count) = seq.next_element()? {
+                if counts.len() == MAX_FLOW_COUNTS {
+                    return Err(serde::de::Error::invalid_length(counts.len() + 1, &self));
+                }
+                counts.push(count);
+            }
+            Ok(counts)
+        }
+    }
+    deserializer.deserialize_seq(Counts)
 }
 
 /// One decision for the live log, as the proxy composes it. What the ring adds — its own number,
@@ -1501,6 +1538,32 @@ mod tests {
             counts.snapshot().get("api.example.com").map(|c| c.allow),
             Some(1),
             "the event after the dropped one was applied"
+        );
+    }
+
+    /// A report carrying more flow counts than the proxy sends in one is refused as it is read,
+    /// before the counts past the bound are held; one carrying the bound crosses whole.
+    #[test]
+    fn a_report_of_more_flow_counts_than_the_proxy_sends_in_one_is_refused() {
+        let counts = |n: usize| ProxyEvent::FlowCounts(vec![(1, 2, 3); n]);
+        let frame = |n: usize| {
+            wire::encode(wire::Frame::Event(counts(n)))
+                .unwrap()
+                .unwrap()
+        };
+        // Compared rather than printed: a failure would list thousands of counts.
+        let read = wire::read(&mut frame(MAX_FLOW_COUNTS).as_slice()).unwrap();
+        assert!(
+            read == Some(wire::Frame::Event(counts(MAX_FLOW_COUNTS))),
+            "the bound itself crosses whole"
+        );
+        let refused = wire::read(&mut frame(MAX_FLOW_COUNTS + 1).as_slice())
+            .map(drop)
+            .expect_err("one count past the bound was read")
+            .to_string();
+        assert!(
+            refused.contains("a document that does not parse"),
+            "refused for another reason: {refused}"
         );
     }
 }
