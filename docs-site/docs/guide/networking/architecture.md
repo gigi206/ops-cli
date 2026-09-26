@@ -536,7 +536,11 @@ handshake fails moves on to the next address the same way.
 The resolution, this guard and the dial are done by sbx's supervisor, not by the proxy,
 which has no network of its own. The proxy asks the supervisor for every upstream
 connection, and the supervisor decides the request again from its own copy of the policy
-before it resolves or dials anything. The two copies agree, since they are
+before it resolves or dials anything. It takes a host only in the form the policy compares,
+an IP address or a lowercase name of letters, digits, `-`, `_` and `.`: a byte such as `/`
+would end the host in the URL a `re:` rule is tested against, while the resolver read on into
+a name of another zone. A CONNECT whose host carries any other byte is refused
+`400 bad-request` before the proxy decides it. The two copies agree, since they are
 read from the same bytes; they can differ only for the moment a `--session` rule has
 been sent and is not yet in force, and a connection refused then carries
 `supervisor-denied`.

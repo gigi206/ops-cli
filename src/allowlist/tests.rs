@@ -2903,3 +2903,44 @@ fn a_pattern_that_does_not_compile_on_arrival_refuses_the_policy() {
         "a malformed document is refused"
     );
 }
+
+/// A request host is taken in its canonical spelling, as an address or as a name made of the bytes
+/// a name carries, and every host the absolute-form parser hands on is one.
+///
+/// The refused spellings are each a byte that ends a host in the URL a `re:` rule reads while the
+/// resolver keeps it inside the name, or a spelling [`canonical_host`] would still change. The
+/// underscore is accepted because a TLS server name may carry one and a CONNECT host must equal it.
+#[test]
+fn a_request_host_is_canonical_and_made_of_the_bytes_a_name_carries() {
+    for host in [
+        "api.test",
+        "a-b.api.test",
+        "foo_bar.api.test",
+        "127.0.0.1",
+        "::1",
+        "2001:db8::1",
+    ] {
+        assert!(is_request_host(host), "{host:?} is a request host");
+    }
+    for delimiter in [
+        "/", "?", "#", "@", ":", "%", " ", "\\", "[", "]", "\n", "\u{7f}", "é",
+    ] {
+        let host = format!("allowed.test{delimiter}.attacker.test");
+        assert!(!is_request_host(&host), "{host:?} is not a request host");
+    }
+    for host in ["", "API.test", "api.test.", "0:0:0:0:0:0:0:1"] {
+        assert!(
+            !is_request_host(host),
+            "{host:?} is not in its canonical spelling"
+        );
+    }
+    for url in [
+        "https://API.Test./x",
+        "http://h.test:8080?q",
+        "https://[0:0:0:0:0:0:0:1]/",
+        "https://127.0.0.1/",
+    ] {
+        let (host, _, _) = parse_url_target(url).unwrap();
+        assert!(is_request_host(&host), "{url}: {host:?}");
+    }
+}

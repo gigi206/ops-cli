@@ -895,12 +895,17 @@ fn read_proxy(side: &Arc<SupervisorSide>, socket: &wire::Socket) -> io::Result<(
 }
 
 /// Let a request the proxy parked into the queue and wait for its answer on a thread of its own, or
-/// deny it at once: nobody serves parks, or the queue is full. When no thread can be started, the
-/// request leaves the queue with whatever answer it was given in between.
+/// deny it at once: nobody serves parks, the queue is full, or the host is one the judge refuses
+/// whatever the answer ([`crate::allowlist::is_request_host`]), which an operator is then never
+/// asked about. When no thread can be started, the request leaves the queue with whatever answer it
+/// was given in between.
 fn serve_park(side: &Arc<SupervisorSide>, id: u64, host: &str, port: u16, path: &str) {
     let Some(parks) = &side.parks else {
         return answer(side, id, Verdict::Deny);
     };
+    if !crate::allowlist::is_request_host(host) {
+        return answer(side, id, Verdict::Deny);
+    }
     let Some(parked) = parks.pending.enqueue(host, port, path, parks.cap) else {
         return answer(side, id, Verdict::Deny);
     };
@@ -1168,11 +1173,11 @@ mod tests {
     }
 
     /// Park `host` through `link` from a thread of its own; the verdict arrives on the receiver.
-    fn park_on(link: &Arc<Link>, host: &'static str) -> Receiver<Verdict> {
+    fn park_on(link: &Arc<Link>, host: &str) -> Receiver<Verdict> {
         let (tx, rx) = channel();
-        let link = Arc::clone(link);
+        let (link, host) = (Arc::clone(link), host.to_string());
         std::thread::spawn(move || {
-            let _ = tx.send(link.park(host, 443, "/v1"));
+            let _ = tx.send(link.park(&host, 443, "/v1"));
         });
         rx
     }
@@ -1251,6 +1256,24 @@ mod tests {
         assert_eq!(hosts, ["first.test"]);
         pending.answer_like(rows[0].seq, Verdict::Allow);
         assert_eq!(first.recv_timeout(ANSWER_WAIT), Ok(Verdict::Allow));
+    }
+
+    /// A parked host the judge would refuse whatever the answer is denied at once, and no operator
+    /// is asked about it.
+    #[test]
+    fn a_parked_host_the_judge_refuses_is_denied_without_entering_the_queue() {
+        let pending = Arc::new(PendingState::new());
+        let link = Arc::new(joined(default_judge(), Some(parks(&pending, 4, None)), None).0);
+        let controls = "\u{1b}".repeat(100_000);
+        for host in ["api.test/.attacker.test", "API.test", &controls] {
+            assert_eq!(
+                park_on(&link, host).recv_timeout(ANSWER_WAIT),
+                Ok(Verdict::Deny),
+                "{:?}",
+                host.chars().take(40).collect::<String>()
+            );
+        }
+        assert!(pending.list().is_empty(), "{:?}", pending.list());
     }
 
     /// A request parked where nobody answers is denied at once rather than left waiting.
@@ -1894,12 +1917,16 @@ mod tests {
     }
 
     /// A park is listed as the queue shows the whole of its host and path, however long they are:
-    /// what the proxy sends is cut to one character past what the queue keeps, by characters.
+    /// what the proxy sends is cut to one character past what the queue keeps, by characters. A
+    /// host carrying anything but the bytes of a name never reaches the queue
+    /// (`a_parked_host_the_judge_refuses_is_denied_without_entering_the_queue`), so the control
+    /// characters ride the path.
     #[test]
     fn a_park_is_listed_as_the_queue_shows_the_whole_of_it() {
         let long_path = format!("/{}", "a".repeat(600));
         let straddling = format!("{}é{}", "a".repeat(crate::sandbox::SANITIZED_CHARS), "é");
         let controls = "\u{1b}".repeat(100_000);
+        let long_host = "a".repeat(crate::sandbox::SANITIZED_CHARS + 1);
         for (host, path) in [
             (
                 "api.test".to_string(),
@@ -1911,7 +1938,8 @@ mod tests {
             ),
             ("api.test".to_string(), long_path),
             ("api.test".to_string(), straddling),
-            (controls.clone(), controls),
+            ("api.test".to_string(), controls),
+            (long_host, "/".to_string()),
         ] {
             let pending = Arc::new(PendingState::new());
             let link = Arc::new(joined(default_judge(), Some(parks(&pending, 4, None)), None).0);

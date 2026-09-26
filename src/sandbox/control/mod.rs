@@ -145,7 +145,9 @@ impl PendingState {
         // are chosen by the cage — a `Host` header, an SNI or a CONNECT authority, and the
         // target of the request being asked about — so they may carry any byte, including an
         // ESC, which paints over the operator's terminal when `sbx net pending` prints the row
-        // while they are deciding whether to open egress.
+        // while they are deciding whether to open egress. The supervisor lets a host in only as a
+        // name or an address (`serve_park`), so of the two it is the path that can still carry
+        // one; the host is filtered here all the same, so that this door holds whoever calls it.
         //
         // This is not the verdict's view of either: the decision is reached on the raw values
         // the proxy still holds, and only what is *reported* passes through here. What the

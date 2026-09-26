@@ -5723,6 +5723,55 @@ fn a_first_head_that_never_finished_is_logged_and_answered() {
     );
 }
 
+/// A CONNECT whose host the supervisor would refuse is malformed here, before this proxy decides
+/// it. Under a `tcp://` rule for the zone the host ends in, the proxy would otherwise splice it and
+/// the supervisor refuse what the proxy admitted.
+#[test]
+fn a_connect_host_the_supervisor_refuses_is_a_bad_request() {
+    let log = Arc::new(crate::sandbox::control::LogRing::new(
+        crate::sandbox::control::LOG_RING_CAP,
+    ));
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            policy(&["tcp://*.allowed.test:22"]),
+        )
+        .unwrap()
+        .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
+    );
+    let authorities = [
+        "x/.allowed.test:22",
+        "x%2f.allowed.test:22",
+        "x@.allowed.test:22",
+        "\u{e9}.allowed.test:22",
+    ];
+    for authority in authorities {
+        let (mut test_end, cage_end) = UnixStream::pair().unwrap();
+        test_end
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+        handle_client(cage_end, &ctx).unwrap();
+        let mut answer = String::new();
+        test_end.read_to_string(&mut answer).unwrap();
+        assert!(
+            answer.contains("400 Bad Request")
+                && answer.contains("X-Sbx-Egress-Reason: bad-request\r\n"),
+            "{authority}: {answer:?}"
+        );
+    }
+    ctx.events.as_ref().unwrap().flush();
+    let events = log.snapshot(None, None, false).events;
+    assert_eq!(events.len(), authorities.len(), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|e| e.reason == "bad-request" && e.host.is_empty()),
+        "{events:?}"
+    );
+}
+
 /// A request head *inside a tunnel* that never arrives whole is answered and recorded against the
 /// tunnel's own host, which the entrance's line has none to name. And a tunnel a client is simply
 /// finished with is not an attempt: it leaves nothing behind.

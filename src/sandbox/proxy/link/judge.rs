@@ -10,7 +10,9 @@
 //! the verdict it reached itself, and a compromised one gets no connection its policy would not
 //! give. The bound is the host and port the policy admits, not the method or the path: those are
 //! the proxy's to report, and a proxy that lies about them reaches only a host and port some request
-//! to them could have reached.
+//! to them could have reached. The host is taken only as the proxy's planes spell one
+//! ([`is_request_host`]): no byte of it ends the host where a `re:` rule reads it while the
+//! resolver reads on.
 //!
 //! Two questions, asked where the proxy used to do the work itself. A **check** replaces the
 //! resolution and the address guard: it answers whether the request may connect, and keeps the
@@ -21,7 +23,7 @@
 //! after them.
 
 use super::Overlay;
-use crate::allowlist::{Decision, EgressPolicy, L4Decision, Rule};
+use crate::allowlist::{Decision, EgressPolicy, L4Decision, Rule, is_request_host};
 use crate::sandbox::locks::{locked, read_locked, write_locked};
 use crate::sandbox::proxy::dns::{SharedResolver, caching_resolver};
 use crate::sandbox::proxy::ssrf::{ConnectRefusal, dial_bounded, permitted};
@@ -312,12 +314,17 @@ impl Judge {
 
     /// The rule that decides `asked` under this judge's policy and overlay (the proxy's own
     /// decision, through the same functions), or a refusal. A request the policy leaves to an
-    /// operator is decided by `granted`, which says whether one allowed it.
+    /// operator is decided by `granted`, which says whether one allowed it. A host no plane of the
+    /// proxy would hand on is refused before any rule reads it: a check and a connect both come
+    /// here before they resolve.
     fn decide(
         &self,
         asked: &Asked,
         granted: impl FnOnce() -> bool,
     ) -> Result<Option<Rule>, ConnectRefusal> {
+        if !is_request_host(&asked.host) {
+            return Err(ConnectRefusal::Supervisor);
+        }
         let overlay = Arc::clone(&read_locked(&self.overlay).1);
         let policy = crate::sandbox::proxy::ctx::folded(&self.policy, &overlay);
         let (host, port) = (asked.host.as_str(), asked.port);
@@ -686,6 +693,75 @@ mod tests {
         drop(first);
         assert!(judge.enter().is_some(), "an answered question makes room");
         drop(second);
+    }
+
+    /// A host no plane of the proxy hands on is refused before any rule reads it or any resolver
+    /// sees it, by a check and by a connect that names none.
+    ///
+    /// Under `re:^https://allowed\.test/`, the host `allowed.test/.attacker.test` rebuilds a URL
+    /// the pattern matches, while a resolver that takes the whole string asks for a name in the
+    /// zone `attacker.test`. Each byte tried is one that splits the two readings; the host rule and
+    /// the subdomain rule are there so the refusal is seen whatever rule would have admitted it.
+    #[test]
+    fn a_host_no_plane_hands_on_is_refused_before_it_is_decided_or_resolved() {
+        // A judge that records every name it resolves, to an address routed nowhere which the
+        // guard opens to an exact rule alone: a host let through by mistake fails without a packet
+        // leaving the machine.
+        let recording = |rules: &[&str]| {
+            let resolved = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&resolved);
+            let judge = judge(rules, DefaultAction::Deny, vec![]);
+            judge.set_timeout(Duration::from_millis(50));
+            judge.set_resolver(Arc::new(move |host: &str| {
+                locked(&seen).push(host.to_string());
+                Ok(vec![IpAddr::from([192, 0, 2, 1])])
+            }));
+            (judge, resolved)
+        };
+        let (judge, resolved) = recording(&[
+            "re:^https://allowed\\.test/",
+            "allowed.test",
+            "*.allowed.test",
+        ]);
+        let mut refused: Vec<String> = ["ALLOWED.test", "allowed.test."]
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        for byte in ["/", "?", "#", "@", ":", "%", " ", "\\"] {
+            refused.push(format!("allowed.test{byte}.attacker.test"));
+            refused.push(format!("attacker.test{byte}.allowed.test"));
+        }
+        for host in &refused {
+            let asked = Asked::inspected(host, 443, "GET", "/");
+            assert_eq!(
+                judge.check(1, &asked),
+                Err(ConnectRefusal::Supervisor),
+                "{host:?}"
+            );
+            assert!(
+                matches!(
+                    judge.connect(&asked, None, 0),
+                    Err(ConnectRefusal::Supervisor)
+                ),
+                "{host:?}"
+            );
+        }
+        let so_far = locked(&resolved).clone();
+        assert!(so_far.is_empty(), "resolved: {so_far:?}");
+
+        // What the rules admit spelled as a host still passes, underscore included.
+        for host in ["allowed.test", "foo_bar.allowed.test"] {
+            assert!(
+                judge.admits(&Asked::inspected(host, 443, "GET", "/")),
+                "{host:?}"
+            );
+        }
+        // And the name resolved is the one decided.
+        let (exact, resolved) = recording(&["allowed.test"]);
+        exact
+            .check(2, &Asked::inspected("allowed.test", 443, "GET", "/"))
+            .unwrap();
+        assert_eq!(*locked(&resolved), ["allowed.test"]);
     }
 
     /// The judge reaches the verdict the proxy reaches, deciding rule and its flags included, on

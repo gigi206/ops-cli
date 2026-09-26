@@ -450,9 +450,15 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
              bare origin-form request has no host to route",
         );
     }
-    // 2. The CONNECT authority.
-    let Some((host, port)) = split_authority(&target) else {
-        // The authority is malformed (not host:port): log the raw target the agent asked for.
+    // 2. The CONNECT authority. Its host must be one the supervisor accepts
+    //    (`allowlist::is_request_host`): a host it would refuse is malformed here, rather than
+    //    decided by this proxy and then contradicted by the supervisor.
+    let Some((connect_host, port)) = split_authority(&target)
+        .map(|(host, port)| (allowlist::canonical_host(&host), port))
+        .filter(|(host, _)| allowlist::is_request_host(host))
+    else {
+        // The authority is malformed (not host:port, or its host is neither a name nor an
+        // address): log the raw target the agent asked for.
         ctx.push_log(
             super::control::Proto::Other,
             "",
@@ -469,7 +475,6 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             "the CONNECT authority must be host:port",
         );
     };
-    let connect_host = allowlist::canonical_host(&host);
 
     // 2b. The enforcement-layer decision, made from host:port alone (pre-decrypt). A `tcp://` (L4)
     //     allow rule splices the connection raw — no TLS termination, no inspection — so this is

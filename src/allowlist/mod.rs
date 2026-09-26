@@ -740,6 +740,27 @@ pub(crate) fn canonical_host(host: &str) -> String {
     }
 }
 
+/// Whether `host` is a request host as the proxy's planes hand one on: already in the form
+/// [`canonical_host`] gives it, and either an IP literal or a name made of letters, digits,
+/// `-`, `_` and `.`.
+///
+/// A verdict and the resolution that follows it read the same string, and this keeps a byte of it
+/// from ending the host for one of them only. A `re:` rule is tested against a URL rebuilt around
+/// the host ([`Request::new`]), where a `/`, `?`, `#`, `@` or `:` ends the host and hands the rest
+/// to the path; the resolver takes the whole string as one name, in the zone its last labels name.
+/// The underscore is kept because a TLS server name may carry one, and a CONNECT host must equal
+/// it.
+pub(crate) fn is_request_host(host: &str) -> bool {
+    if canonical_host(host) != host {
+        return false;
+    }
+    host.parse::<IpAddr>().is_ok()
+        || (!host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+}
+
 /// Format a host for display in a URL context, bracketing an IPv6 literal so a following
 /// `:port` is unambiguous (`2001:db8::1` → `[2001:db8::1]`); a hostname or IPv4 is unchanged.
 ///
