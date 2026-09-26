@@ -92,6 +92,12 @@ memchr = "2.8.3"
 # so no new third-party surface). Used only when a `bundled-*` feature is enabled.
 sha2 = "0.11"
 
+[dev-dependencies]
+# Generated inputs for the parsers that read what a cage or a registry chooses, shrunk to the
+# smallest one that fails. Tests only: nothing of it reaches the shipped binary. `std` alone, since
+# the forking and timeout runners it defaults to pull in crates these tests do not need.
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+
 [profile.release]
 strip = true
 lto = true
