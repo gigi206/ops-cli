@@ -67,7 +67,14 @@ impl<R: BufRead> GzipReader<R> {
     /// last member is refused rather than ignored, because it is not an archive this can read.
     fn next_member(&mut self) -> io::Result<bool> {
         loop {
-            let input = self.inner.fill_buf()?;
+            let input = match self.inner.fill_buf() {
+                Ok(input) => input,
+                // Retried here rather than handed back: this runs after the member's end is
+                // consumed and before `read` keeps the output of its last round, so a caller's
+                // retry would find that output gone and the stream already closed.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
             if input.is_empty() {
                 return Ok(false);
             }

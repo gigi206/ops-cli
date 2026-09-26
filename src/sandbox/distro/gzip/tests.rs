@@ -197,3 +197,68 @@ fn an_empty_read_keeps_the_output_not_yet_read() {
     assert_eq!(rest.len(), payload.len() - first.len());
     assert!([&first[..], &rest[..]].concat() == payload);
 }
+
+/// The bytes of `bytes`, read through a buffer, with one `fill_buf` interrupted: the first one
+/// asked at `at`. `fired` says whether it was.
+struct InterruptedAt<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    at: usize,
+    fired: &'a std::cell::Cell<bool>,
+}
+
+impl Read for InterruptedAt<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for InterruptedAt<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos == self.at && !self.fired.get() {
+            self.fired.set(true);
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(&self.bytes[self.pos..])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos += n;
+    }
+}
+
+/// A read of the layer interrupted where one member ends is retried, and loses nothing.
+///
+/// The reader consumes a member's end before it looks for the next member, and keeps the output of
+/// its last round only after. An interruption in between was handed back with that output lost and
+/// the stream already closed, so the caller's retry found nothing more to inflate: with zeros after
+/// the member, a clean end short of the whole output. The interruption here falls exactly there.
+#[test]
+fn a_read_interrupted_where_a_member_ends_loses_nothing() {
+    let payload = b"the member's contents\n".repeat(100);
+    let mut file = member_of(&payload);
+    let end = file.len();
+    file.extend([0u8; 16]);
+    let fired = std::cell::Cell::new(false);
+    let layer = InterruptedAt {
+        bytes: &file,
+        pos: 0,
+        at: end,
+        fired: &fired,
+    };
+    let mut out = Vec::new();
+    GzipReader::new(layer)
+        .expect("a gzip header")
+        .read_to_end(&mut out)
+        .expect("the retried read ends");
+    assert!(
+        fired.get(),
+        "the read was interrupted where the member ends"
+    );
+    assert_eq!(out.len(), payload.len());
+    assert!(out == payload);
+}
