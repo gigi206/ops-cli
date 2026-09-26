@@ -42,14 +42,91 @@
 # step in the browser (the same provider login, or a local dashboard password); that traffic
 # rides the allowlist below. If a request is blocked, the proxy reports the host it refused —
 # add it to `allow` (or check ahead with `sbx test net <url>`).
-cmd = ["hermes", "dashboard", "--no-open"]
+cmd = [
+    "bash",
+    "-c",
+    '''
+# The cage's summary as the context of a managed `pre_llm_call` hook (see the note below `cmd`).
+home="${HERMES_HOME:-$HOME/.hermes}"
+# The interpreter Hermes runs on: the first `#!…python` along the launcher's `exec` chain (nix wraps
+# the entry point in a shell script that execs the real one). The desktop app keeps its `hermes` off
+# PATH and names it in its own launcher.
+py=
+f="$(command -v hermes 2>/dev/null)" \
+  || f="$(grep -o '/nix/store/[a-z0-9]*-hermes-agent-[^/]*/bin/hermes' \
+          "$(readlink -f "$(command -v hermes-desktop)" 2>/dev/null)" 2>/dev/null | head -n 1)"
+f="$(readlink -f "$f" 2>/dev/null)"
+for _ in 1 2 3; do
+  [ -r "$f" ] && read -r first < "$f" || break
+  case "$first" in
+    '#!'*python*) py="${first#\#!}"; py="${py# }"; py="${py%% *}"; break ;;
+  esac
+  f="$(grep -o '^exec "[^"]*"' "$f" | tail -n 1)"; f="${f#exec \"}"; f="${f%\"}"
+done
+if [ -r /opt/sbx/contract-summary.md ] && [ -x "$py" ] \
+   && ! grep -qs 'pre_llm_call' "$home/config.yaml" && mkdir -p /etc/hermes 2>/dev/null; then
+  { printf '#!%s\n' "$py"; cat <<'PY'; } > /etc/hermes/sbx-contract-hook
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except ValueError:
+    payload = {}
+if isinstance(payload, dict) and (payload.get("extra") or {}).get("is_first_turn"):
+    try:
+        with open("/opt/sbx/contract-summary.md", encoding="utf-8") as f:
+            print(json.dumps({"context": f.read()}))
+    except OSError:
+        pass
+PY
+  chmod 755 /etc/hermes/sbx-contract-hook
+  printf '%s\n' 'hooks:' '  pre_llm_call:' '    - command: /etc/hermes/sbx-contract-hook' > /etc/hermes/config.yaml
+  "$py" - "$home" <<'PY'
+import json, os, sys, tempfile
+home, command = sys.argv[1], "/etc/hermes/sbx-contract-hook"
+path = os.path.join(home, "shell-hooks-allowlist.json")
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+except (OSError, ValueError):
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+approvals = data.get("approvals")
+if not isinstance(approvals, list):
+    approvals = data["approvals"] = []
+if any(isinstance(e, dict) and e.get("event") == "pre_llm_call" and e.get("command") == command
+       for e in approvals):
+    sys.exit(0)
+approvals.append({"event": "pre_llm_call", "command": command})
+os.makedirs(home, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".sbx-allowlist.", dir=home)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+os.replace(tmp, path)
+PY
+fi
+exec hermes dashboard --no-open "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "hermes",
+]
 
-# No `contract`: `hermes dashboard` takes its ephemeral prompt from the config only;
-# `HERMES_EPHEMERAL_SYSTEM_PROMPT` is read by the `hermes` CLI and the messaging gateway, not by the
-# dashboard (and there it replaces your own). Point Hermes at the cage's summary yourself instead,
-# for instance with a line in the `agent.system_prompt` of your `~/.hermes/config.yaml` such as
-# "When the environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY
-# before anything else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Hermes the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) through its managed configuration, the
+# `/etc/hermes/config.yaml` layer Hermes reads over yours. That layer declares one `pre_llm_call`
+# shell hook, `/etc/hermes/sbx-contract-hook`, which returns the summary as context on the first turn
+# of a session; Hermes adds it to that turn's user message (never the system prompt) and replays it
+# on the turns that follow. Your `agent.system_prompt`, personality and context files still apply.
+# `/etc` is the cage's own tmpfs: both files live for this launch only and never reach the host. A
+# shell hook runs only once approved, so the command adds that one hook to the approvals in
+# `~/.hermes/shell-hooks-allowlist.json`, leaving yours as they are, rather than turning on
+# `hooks_auto_accept`, which would approve any hook of yours still waiting. The managed layer would
+# replace a `pre_llm_call` list of your own, so when your `config.yaml` has one the command adds
+# nothing. `HERMES_SAFE_MODE=1` turns every shell hook off, this one included.
+# The dashboard registers these hooks the way the CLI does (read in its `tui_gateway`); the reply
+# of a model was measured on the CLI, not here.
 
 # Forward the host's localhost:9119 into the cage so your host browser reaches the dashboard.
 # `hermes dashboard` binds 127.0.0.1:9119 inside the cage; this hole bridges it to the host. A
