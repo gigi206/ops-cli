@@ -2944,3 +2944,50 @@ fn a_request_host_is_canonical_and_made_of_the_bytes_a_name_carries() {
         assert!(is_request_host(&host), "{url}: {host:?}");
     }
 }
+
+/// A name whose last label is a number is refused, as the address the resolver would read it as,
+/// by the predicate and by the parsers of a request target alike.
+///
+/// A rule reads such a name as a name, which an address rule never matches, while the resolver
+/// returns the address it spells without asking DNS: `deny 1.1.1.1` did not refuse `0x01010101`. A
+/// number anywhere but in the last label keeps the name a name.
+#[test]
+fn a_name_that_ends_in_a_number_is_refused_as_the_address_a_resolver_reads() {
+    for host in [
+        "0x01010101",
+        "16843009",
+        "1.1.257",
+        "0x1.1.1.1",
+        "01.01.01.01",
+        "0177.0.0.1",
+        "127.1",
+        "a.123",
+        "a.0x",
+        "a.0xff",
+    ] {
+        assert!(!is_request_host(host), "{host:?} ends in a number");
+        assert!(
+            parse_url_target(&format!("https://{host}/")).is_err(),
+            "{host:?}"
+        );
+        assert!(
+            parse_tcp_target(&format!("tcp://{host}:22")).is_err(),
+            "{host:?}"
+        );
+    }
+    for host in [
+        "1.test",
+        "0x1.test",
+        "123.example",
+        "a1",
+        "x0",
+        "0xg",
+        "a.0x1g",
+    ] {
+        assert!(is_request_host(host), "{host:?} is a name");
+        assert!(
+            parse_url_target(&format!("https://{host}/")).is_ok(),
+            "{host:?}"
+        );
+    }
+}

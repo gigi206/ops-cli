@@ -764,6 +764,39 @@ mod tests {
         assert_eq!(*locked(&resolved), ["allowed.test"]);
     }
 
+    /// A name that ends in a number is refused before any rule reads it: a rule would read a name
+    /// that an address rule never matches, and the resolver the address it spells.
+    #[test]
+    fn a_name_that_ends_in_a_number_is_refused_before_an_address_rule_can_miss_it() {
+        let policy = EgressPolicy::new(vec![], vec![classify("1.1.1.1").unwrap()])
+            .with_default(DefaultAction::Allow);
+        let judge = Judge::new(&policy.encode().unwrap()).unwrap();
+        let resolved = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&resolved);
+        // An address the guard refuses to a request no exact rule decides: a host let through by
+        // mistake fails without a packet leaving the machine.
+        judge.set_resolver(Arc::new(move |host: &str| {
+            locked(&seen).push(host.to_string());
+            Ok(vec![IpAddr::from([192, 0, 2, 1])])
+        }));
+        for host in [
+            "1.1.1.1",
+            "0x01010101",
+            "16843009",
+            "1.1.257",
+            "01.01.01.01",
+        ] {
+            let asked = Asked::inspected(host, 443, "GET", "/");
+            assert_eq!(
+                judge.check(1, &asked),
+                Err(ConnectRefusal::Supervisor),
+                "{host:?}"
+            );
+        }
+        let so_far = locked(&resolved).clone();
+        assert!(so_far.is_empty(), "resolved: {so_far:?}");
+    }
+
     /// The judge reaches the verdict the proxy reaches, deciding rule and its flags included, on
     /// every shipped policy, for requests to the hosts it names and to the built-in ones: the two
     /// copies are decoded from the same bytes and unioned the same way, and a copy that is not

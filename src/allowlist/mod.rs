@@ -742,14 +742,15 @@ pub(crate) fn canonical_host(host: &str) -> String {
 
 /// Whether `host` is a request host as the proxy's planes hand one on: already in the form
 /// [`canonical_host`] gives it, and either an IP literal or a name made of letters, digits,
-/// `-`, `_` and `.`.
+/// `-`, `_` and `.` whose last label is not a number.
 ///
-/// A verdict and the resolution that follows it read the same string, and this keeps a byte of it
-/// from ending the host for one of them only. A `re:` rule is tested against a URL rebuilt around
-/// the host ([`Request::new`]), where a `/`, `?`, `#`, `@` or `:` ends the host and hands the rest
-/// to the path; the resolver takes the whole string as one name, in the zone its last labels name.
-/// The underscore is kept because a TLS server name may carry one, and a CONNECT host must equal
-/// it.
+/// A verdict and the resolution that follows it read the same string, and this keeps them reading
+/// the same host in it. A `re:` rule is tested against a URL rebuilt around the host
+/// ([`Request::new`]), where a `/`, `?`, `#`, `@` or `:` ends the host and hands the rest to the
+/// path; the resolver takes the whole string as one name, in the zone its last labels name. A name
+/// that ends in a number ([`ends_in_a_number`]) is read by the resolver as an IPv4 address, while
+/// a rule reads it as a name, which an address rule never matches. The underscore is kept because a
+/// TLS server name may carry one, and a CONNECT host must equal it.
 pub(crate) fn is_request_host(host: &str) -> bool {
     if canonical_host(host) != host {
         return false;
@@ -758,7 +759,22 @@ pub(crate) fn is_request_host(host: &str) -> bool {
         || (!host.is_empty()
             && host
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            && !ends_in_a_number(host))
+}
+
+/// Whether the last label of `name` is a number: decimal digits, or `0x` and hexadecimal digits.
+///
+/// That is the shape the C resolver's address parser takes before any lookup (`0x7f.1`,
+/// `2130706433`, `127.1`, `0177.0.0.1`), and the one URL parsers read as an IPv4 address. No
+/// name a registry delegates ends that way, since no top-level domain is a number.
+fn ends_in_a_number(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name);
+    !last.is_empty()
+        && (last.bytes().all(|b| b.is_ascii_digit())
+            || last
+                .strip_prefix("0x")
+                .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())))
 }
 
 /// Format a host for display in a URL context, bracketing an IPv6 literal so a following

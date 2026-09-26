@@ -5723,9 +5723,10 @@ fn a_first_head_that_never_finished_is_logged_and_answered() {
     );
 }
 
-/// A CONNECT whose host the supervisor would refuse is malformed here, before this proxy decides
-/// it. Under a `tcp://` rule for the zone the host ends in, the proxy would otherwise splice it and
-/// the supervisor refuse what the proxy admitted.
+/// A host the supervisor would refuse is malformed here, before this proxy decides it, whether a
+/// CONNECT or an absolute-form target names it. Under a `tcp://` rule for the zone the host ends
+/// in, the proxy would otherwise splice it and the supervisor refuse what the proxy admitted; a
+/// name that ends in a number would be decided as a name and dialled as the address it spells.
 #[test]
 fn a_connect_host_the_supervisor_refuses_is_a_bad_request() {
     let log = Arc::new(crate::sandbox::control::LogRing::new(
@@ -5739,31 +5740,37 @@ fn a_connect_host_the_supervisor_refuses_is_a_bad_request() {
         .unwrap()
         .with_events(crate::sandbox::proxy::events::for_log(log.clone(), None)),
     );
-    let authorities = [
-        "x/.allowed.test:22",
-        "x%2f.allowed.test:22",
-        "x@.allowed.test:22",
-        "\u{e9}.allowed.test:22",
+    let requests = [
+        ("CONNECT x/.allowed.test:22", "x/.allowed.test:22"),
+        ("CONNECT x%2f.allowed.test:22", "x%2f.allowed.test:22"),
+        ("CONNECT x@.allowed.test:22", "x@.allowed.test:22"),
+        ("CONNECT \u{e9}.allowed.test:22", "\u{e9}.allowed.test:22"),
+        ("CONNECT 0x01010101:443", "0x01010101:443"),
+        ("CONNECT 127.1:443", "127.1:443"),
+        ("GET https://0x01010101/", "0x01010101"),
     ];
-    for authority in authorities {
+    for (line, host) in requests {
         let (mut test_end, cage_end) = UnixStream::pair().unwrap();
-        test_end
-            .write_all(
-                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
-            )
+        // Bounded, so a request let through to a tunnel waiting for a handshake fails here rather
+        // than holding the test.
+        cage_end
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        handle_client(cage_end, &ctx).unwrap();
+        test_end
+            .write_all(format!("{line} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .unwrap();
+        let _ = handle_client(cage_end, &ctx);
         let mut answer = String::new();
         test_end.read_to_string(&mut answer).unwrap();
         assert!(
             answer.contains("400 Bad Request")
                 && answer.contains("X-Sbx-Egress-Reason: bad-request\r\n"),
-            "{authority}: {answer:?}"
+            "{line}: {answer:?}"
         );
     }
     ctx.events.as_ref().unwrap().flush();
     let events = log.snapshot(None, None, false).events;
-    assert_eq!(events.len(), authorities.len(), "{events:?}");
+    assert_eq!(events.len(), requests.len(), "{events:?}");
     assert!(
         events
             .iter()

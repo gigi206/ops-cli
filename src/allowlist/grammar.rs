@@ -546,10 +546,14 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
 /// tester refusing forms the wire decides, which is the one divergence a tester exists to prevent.
 ///
 /// What the folding does not do is invent a host: a spelling that reduces to nothing, or to labels
-/// no name can carry, is still refused here.
+/// no name can carry, is still refused here. So is a name the supervisor refuses
+/// ([`is_request_host`]), one that ends in a number: the tester and the absolute-form planes then
+/// answer it as the supervisor would.
 fn canonical_target_host(host: &str) -> Option<String> {
     let canonical = canonical_host(host);
-    (is_valid_hostname(&canonical) || canonical.parse::<IpAddr>().is_ok()).then_some(canonical)
+    ((is_valid_hostname(&canonical) || canonical.parse::<IpAddr>().is_ok())
+        && is_request_host(&canonical))
+    .then_some(canonical)
 }
 
 /// Parse a `tcp://host:port` target naming one **L4 request** (for `sbx test net tcp://…`) into

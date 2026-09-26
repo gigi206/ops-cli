@@ -99,7 +99,10 @@ IPv4 is written bare. IPv6 is written **bracketed** when it carries a port
 (`[::1]:8443`, `[2001:db8::1]:*`) and may be bare when it does not (`::1`). An IP
 literal is normalized once on both sides, so every spelling of the same address
 (`::1` and `0:0:0:0:0:0:0:1`) compares equal: a `deny [::1]/secret` cannot be
-dodged by writing the long form.
+dodged by writing the long form. The shorthand spellings a resolver also reads as an
+address (`0x01020304`, `16909060`, `1.2.772`) are not taken as names either: a request
+naming a host whose last label is a number is refused `400 bad-request`, so a
+`deny 1.2.3.4` cannot be dodged that way.
 
 Note the proxy resolves DNS host-side and never connects to a private or internal
 address for an *unnamed* host: see the [SSRF guard](architecture#the-ssrf-guard).
