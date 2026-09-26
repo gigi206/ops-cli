@@ -44,55 +44,11 @@ fn classify_ip(ip: IpAddr) -> IpClass {
         // An IPv6 address that embeds a v4 (mapped, NAT64, 6to4, Teredo) is classified as that v4,
         // so an internal/metadata v4 cannot dodge the v4 guard wearing a v6 spelling (e.g.
         // `64:ff9b::a9fe:a9fe`, NAT64 of `169.254.169.254`).
-        IpAddr::V6(v6) => match embedded_v4(v6) {
+        IpAddr::V6(v6) => match allowlist::embedded_v4(v6) {
             Some(v4) => classify_v4(v4),
             None => classify_v6(v6),
         },
     }
-}
-
-/// The IPv4 address an IPv6 address embeds through a translation/transition form, or `None`.
-///
-/// Covers IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 well-known
-/// (`64:ff9b::/96`, the v4 in the low 32 bits), 6to4 (`2002:AABB:CCDD::/16`), and Teredo
-/// (`2001:0::/32`, the client v4 in the last two segments, bit-inverted). The host's stack actually
-/// routing these is what makes the SSRF real; classifying them by their embedded v4 keeps the
-/// metadata/internal guard sound where it does.
-///
-/// **`::` and `::1` are deliberately not unwrapped**, though they match the IPv4-compatible shape.
-/// They denote the unspecified and loopback addresses in their own right, and [`classify_v6`]
-/// already answers for both (`Blocked` and `Private`). Unwrapping them is not a wash: `::1` becomes
-/// `0.0.0.1`, which is not loopback, not private and not unspecified, so [`classify_v4`] calls it
-/// `Public` and the loopback guard comes off for the one spelling most likely to be tried. This is
-/// why the check below is written out rather than delegated to `Ipv6Addr::to_ipv4`, which unwraps
-/// those two along with everything else.
-fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
-    if let Some(v4) = v6.to_ipv4_mapped() {
-        return Some(v4);
-    }
-    let s = v6.segments();
-    let v4_of =
-        |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
-    // IPv4-compatible `::a.b.c.d` (RFC 4291 §2.5.5.1): 96 zero bits, then the v4. Deprecated as a
-    // transition mechanism and still unwrapped by host stacks, which is what makes it reachable —
-    // `::127.0.0.1` is not `::1`, not `fe80::/10` and not `fc00::/7`, so the v6 classifier called
-    // it public while every other spelling of that address is refused.
-    if s[..6] == [0, 0, 0, 0, 0, 0] && !(s[6] == 0 && matches!(s[7], 0 | 1)) {
-        return Some(v4_of(s[6], s[7]));
-    }
-    // NAT64 well-known prefix 64:ff9b::/96 — the v4 is the low 32 bits.
-    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
-        return Some(v4_of(s[6], s[7]));
-    }
-    // 6to4 2002::/16 — the v4 is segments 1 and 2.
-    if s[0] == 0x2002 {
-        return Some(v4_of(s[1], s[2]));
-    }
-    // Teredo 2001:0::/32 — the client v4 is the last two segments, bit-inverted.
-    if s[0] == 0x2001 && s[1] == 0x0000 {
-        return Some(v4_of(!s[6], !s[7]));
-    }
-    None
 }
 
 fn classify_v4(v4: Ipv4Addr) -> IpClass {

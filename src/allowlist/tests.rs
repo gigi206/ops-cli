@@ -2991,3 +2991,34 @@ fn a_name_that_ends_in_a_number_is_refused_as_the_address_a_resolver_reads() {
         );
     }
 }
+
+/// An IPv6 address that embeds an IPv4 is refused as a request host, by the predicate and by the
+/// parsers of a request target alike, while an IPv6 address of its own is taken.
+///
+/// An address rule compares it as IPv6, so `deny 1.1.1.1` did not refuse `::ffff:1.1.1.1`, which
+/// the host's stack dials as 1.1.1.1. The other forms reach their IPv4 wherever a network carries
+/// them. `::` and `::1` are addresses in their own right and stay requests.
+#[test]
+fn an_ipv6_spelling_of_an_ipv4_is_refused_as_a_request_host() {
+    for host in [
+        "::ffff:1.1.1.1",
+        "::101:101",
+        "64:ff9b::101:101",
+        "2002:101:101::",
+        "2001:0:1:2:3:4:fefe:fefe",
+    ] {
+        assert!(!is_request_host(host), "{host:?} embeds an IPv4");
+        assert!(
+            parse_url_target(&format!("https://[{host}]/")).is_err(),
+            "{host:?}"
+        );
+        assert!(
+            parse_tcp_target(&format!("tcp://[{host}]:22")).is_err(),
+            "{host:?}"
+        );
+    }
+    assert!(parse_url_target("https://[::1.1.1.1]/").is_err());
+    for host in ["::1", "::", "2001:db8::1", "fe80::1", "1.1.1.1"] {
+        assert!(is_request_host(host), "{host:?} is a request host");
+    }
+}

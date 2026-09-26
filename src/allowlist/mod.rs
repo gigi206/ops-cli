@@ -80,7 +80,7 @@
 //! rule is canonical by construction; a `re:` names a family.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -741,26 +741,79 @@ pub(crate) fn canonical_host(host: &str) -> String {
 }
 
 /// Whether `host` is a request host as the proxy's planes hand one on: already in the form
-/// [`canonical_host`] gives it, and either an IP literal or a name made of letters, digits,
-/// `-`, `_` and `.` whose last label is not a number.
+/// [`canonical_host`] gives it, and either an IP literal that embeds no IPv4 in an IPv6 spelling
+/// ([`embedded_v4`]) or a name made of letters, digits, `-`, `_` and `.` whose last label is not a
+/// number.
 ///
 /// A verdict and the resolution that follows it read the same string, and this keeps them reading
 /// the same host in it. A `re:` rule is tested against a URL rebuilt around the host
 /// ([`Request::new`]), where a `/`, `?`, `#`, `@` or `:` ends the host and hands the rest to the
 /// path; the resolver takes the whole string as one name, in the zone its last labels name. A name
 /// that ends in a number ([`ends_in_a_number`]) is read by the resolver as an IPv4 address, while
-/// a rule reads it as a name, which an address rule never matches. The underscore is kept because a
-/// TLS server name may carry one, and a CONNECT host must equal it.
+/// a rule reads it as a name, which an address rule never matches. An IPv6 address that embeds an
+/// IPv4 is compared as IPv6 by an address rule, while a stack or a network that carries it reaches
+/// the IPv4. The underscore is kept because a TLS server name may carry one, and a CONNECT host
+/// must equal it.
 pub(crate) fn is_request_host(host: &str) -> bool {
     if canonical_host(host) != host {
         return false;
     }
-    host.parse::<IpAddr>().is_ok()
-        || (!host.is_empty()
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-            && !ends_in_a_number(host))
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(_) => true,
+            IpAddr::V6(v6) => embedded_v4(v6).is_none(),
+        };
+    }
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !ends_in_a_number(host)
+}
+
+/// The IPv4 address an IPv6 address embeds through a translation/transition form, or `None`.
+///
+/// Covers IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 well-known
+/// (`64:ff9b::/96`, the v4 in the low 32 bits), 6to4 (`2002:AABB:CCDD::/16`), and Teredo
+/// (`2001:0::/32`, the client v4 in the last two segments, bit-inverted). A stack or a network
+/// that carries one of these reaches the v4 it embeds. The SSRF guard classifies them by that v4,
+/// which keeps the metadata/internal guard sound where one does, and a request naming one is
+/// refused ([`is_request_host`]), so an address rule cannot be dodged by writing its v4 as a v6.
+///
+/// **`::` and `::1` are deliberately not unwrapped**, though they match the IPv4-compatible shape.
+/// They denote the unspecified and loopback addresses in their own right, and the guard's IPv6
+/// classifier already answers for both (`Blocked` and `Private`). Unwrapping them is not a wash:
+/// `::1` becomes `0.0.0.1`, which is not loopback, not private and not unspecified, so the IPv4
+/// classifier calls it `Public` and the loopback guard comes off for the one spelling most likely
+/// to be tried. This is why the check below is written out rather than delegated to
+/// `Ipv6Addr::to_ipv4`, which unwraps those two along with everything else.
+pub(crate) fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    let v4_of =
+        |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    // IPv4-compatible `::a.b.c.d` (RFC 4291 §2.5.5.1): 96 zero bits, then the v4. Deprecated as a
+    // transition mechanism, and reachable wherever a stack or a network still carries it:
+    // `::127.0.0.1` is not `::1`, not `fe80::/10` and not `fc00::/7`, so the v6 classifier called
+    // it public while every other spelling of that address is refused.
+    if s[..6] == [0, 0, 0, 0, 0, 0] && !(s[6] == 0 && matches!(s[7], 0 | 1)) {
+        return Some(v4_of(s[6], s[7]));
+    }
+    // NAT64 well-known prefix 64:ff9b::/96: the v4 is the low 32 bits.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+        return Some(v4_of(s[6], s[7]));
+    }
+    // 6to4 2002::/16: the v4 is segments 1 and 2.
+    if s[0] == 0x2002 {
+        return Some(v4_of(s[1], s[2]));
+    }
+    // Teredo 2001:0::/32: the client v4 is the last two segments, bit-inverted.
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        return Some(v4_of(!s[6], !s[7]));
+    }
+    None
 }
 
 /// Whether the last label of `name` is a number: decimal digits, or `0x` and hexadecimal digits.

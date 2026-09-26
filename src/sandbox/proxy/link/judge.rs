@@ -797,6 +797,33 @@ mod tests {
         assert!(so_far.is_empty(), "resolved: {so_far:?}");
     }
 
+    /// An IPv6 address that embeds an IPv4 is refused before any rule reads it: an address rule
+    /// would compare it as IPv6, and the host's stack dial the IPv4 it carries.
+    #[test]
+    fn an_ipv6_spelling_of_an_ipv4_is_refused_before_an_address_rule_can_miss_it() {
+        let policy = EgressPolicy::new(vec![], vec![classify("1.1.1.1").unwrap()])
+            .with_default(DefaultAction::Allow);
+        let judge = Judge::new(&policy.encode().unwrap()).unwrap();
+        let resolved = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&resolved);
+        // An address the guard refuses to a request no exact rule decides: a host let through by
+        // mistake fails without a packet leaving the machine.
+        judge.set_resolver(Arc::new(move |host: &str| {
+            locked(&seen).push(host.to_string());
+            Ok(vec![IpAddr::from([192, 0, 2, 1])])
+        }));
+        for host in ["::ffff:1.1.1.1", "64:ff9b::101:101", "2002:101:101::"] {
+            let asked = Asked::inspected(host, 443, "GET", "/");
+            assert_eq!(
+                judge.check(1, &asked),
+                Err(ConnectRefusal::Supervisor),
+                "{host:?}"
+            );
+        }
+        let so_far = locked(&resolved).clone();
+        assert!(so_far.is_empty(), "resolved: {so_far:?}");
+    }
+
     /// The judge reaches the verdict the proxy reaches, deciding rule and its flags included, on
     /// every shipped policy, for requests to the hosts it names and to the built-in ones: the two
     /// copies are decoded from the same bytes and unioned the same way, and a copy that is not

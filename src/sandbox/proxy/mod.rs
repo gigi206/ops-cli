@@ -473,7 +473,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             "400 Bad Request",
             "bad-request",
             "the CONNECT authority must be host:port, the host a DNS name or an IP address written \
-             in full",
+             in full, an IPv4 as an IPv4",
         );
     };
 

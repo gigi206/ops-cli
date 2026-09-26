@@ -5748,6 +5748,8 @@ fn a_connect_host_the_supervisor_refuses_is_a_bad_request() {
         ("CONNECT 0x01010101:443", "0x01010101:443"),
         ("CONNECT 127.1:443", "127.1:443"),
         ("GET https://0x01010101/", "0x01010101"),
+        ("CONNECT [::ffff:1.1.1.1]:443", "[::ffff:1.1.1.1]:443"),
+        ("GET https://[64:ff9b::101:101]/", "[64:ff9b::101:101]"),
     ];
     for (line, host) in requests {
         let (mut test_end, cage_end) = UnixStream::pair().unwrap();
