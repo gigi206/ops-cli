@@ -80,23 +80,31 @@ if gcc_bin="$(command -v gcc)"; then
     fi
   done
 fi
+# The cage's summary as a read-only file, through a `--load` command file (see the note below
+# `cmd`). `load` holds one file, so a `load` of yours is left in place and this one is not added.
+if [ -r /opt/sbx/contract-summary.md ] && [ -z "${AIDER_LOAD:-}" ] \
+   && ! grep -qs '^load:' "$HOME/.aider.conf.yml" .aider.conf.yml \
+        "$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.aider.conf.yml" \
+   && mkdir -p /etc/aider 2>/dev/null \
+   && printf '%s\n' '/read-only /opt/sbx/contract-summary.md' > /etc/aider/sbx.load; then
+  set -- --load /etc/aider/sbx.load "$@"
+fi
 exec aider "$@"
 ''',
     # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
     "aider",
 ]
 
-# No `contract`: the one channel aider offers, `--read FILE`, costs the project its own files. On
-# the command line it makes aider drop the `read:` list of `.aider.conf.yml` (and `AIDER_READ`),
-# the documented way to load a project's conventions, without a word. Hand aider the summary
-# (/opt/sbx/contract-summary.md, rewritten at every launch) yourself, in whichever way fits:
-#  - in the session, `/read-only /opt/sbx/contract-summary.md` adds it next to the project's
-#    files (a bare `/drop` removes it again);
-#  - for a headless run, pass it with the project's files, since the option replaces them:
-#        sbx app run aider -- --read CONVENTIONS.md --read /opt/sbx/contract-summary.md --message "…"
-#  - to load it every time, list it under `read:` in the `~/.aider.conf.yml` of the app's isolated
-#    home; a project's own `read:` replaces that list rather than adding to it, so a project that
-#    has one lists the summary there too.
+# The command hands aider the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as a read-only file: it writes a command file under
+# the cage's own `/etc` (a tmpfs: it lives for this launch only and never reaches the host) holding
+# `/read-only /opt/sbx/contract-summary.md`, and passes it as `--load`, which runs it before the
+# session or the `--message` starts. The files the project's `read:` list (or `AIDER_READ`) names
+# still load beside it; `--read` is not used, since on the command line it drops that list without a
+# word. `load` holds one file: when you set your own (`load:` in a `.aider.conf.yml` of your home,
+# the project or its git root, or `AIDER_LOAD`), the command leaves yours in place and adds nothing,
+# and a `--load` you pass after `--` replaces this one. A bare `/drop` removes the summary for the
+# rest of the session. Arguments after `sbx app run aider --` reach aider verbatim through `"$@"`.
 
 # Your host aider config, mounted read-write at its real absolute paths. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
