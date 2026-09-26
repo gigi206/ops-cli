@@ -113,6 +113,17 @@ bin="$HOME/.local/bin/muse"
 # time this starts; what stays here is the launch. A `provision` is a separate
 # process, so its own PATH export does not reach this shell.
 export PATH="$HOME/.local/bin:$PATH"
+# The cage's summary as Claude Code personal rules, Muse's fallback (see the note below `cmd`).
+s=/opt/sbx/contract-summary.md
+f="$HOME/.claude/CLAUDE.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+    if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+        mkdir -p "$HOME/.claude" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f" || true
+    fi
+elif grep -qsF "$m" "$f"; then
+    rm -f "$f"
+fi
 exec "$bin" "$@"
     ''',
     # `$0` placeholder: `sbx app run muse -- <args>` appends <args> to this cmd
@@ -121,15 +132,17 @@ exec "$bin" "$@"
     "muse",
 ]
 
-# No `contract`: Muse documents no option or environment variable that adds instructions from
-# outside the project; its instructions come from the `AGENTS.md`/`CLAUDE.md` files it finds
-# walking up from the workspace, and from your own rules. The binary does read an undocumented
-# `TBH_EVAL_APPEND_SYSTEM_PROMPT` family, but a provider without base instructions (`--provider
-# echo`, for one) then refuses to run ("provider does not support base instructions"), so it is not
-# set here. Point Muse at the cage's summary yourself instead, for instance with a line in your
-# instructions such as "When the environment variable SBX_SANDBOX is 1, read the file named by
-# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
-# at every launch.
+# The command hands Muse the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as Claude Code personal rules, `~/.claude/CLAUDE.md`
+# in the app's isolated home. Muse falls back to "compatible personal rules" when you keep none of
+# its own (the "Personal rules fallback" setting, on by default), and loads them beside the
+# project's `AGENTS.md`/`CLAUDE.md`: the first session of a home reports "Including your Claude Code
+# personal rules" (a notice Muse shows once), and does not without the file. The file is written only while it is absent or already
+# sbx's, rewritten at every launch and removed by a launch without a summary; once you keep personal
+# rules of Muse's own, or turn the fallback off, the summary is no longer added. The model turn is not
+# measured: Muse serves its models through a Meta account only. The undocumented
+# `TBH_EVAL_APPEND_SYSTEM_PROMPT` family is not used, since a provider without base instructions
+# (`--provider echo`, for one) then refuses to run.
 
 # Your host Meta Code config/auth, mounted read-write at its real absolute paths. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir; `mode =
