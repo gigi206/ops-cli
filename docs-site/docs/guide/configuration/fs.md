@@ -122,7 +122,9 @@ protection stops](../concepts/security-model#where-the-protection-stops). The ho
 The hooks directory is the one git will run hooks from: `.git/hooks`, and also the directory
 `core.hooksPath` names when the cage writes it, in the project or in a read-write bind ([where
 the cage writes](#where-the-cage-writes)). husky, for one, points it at `.husky/_`, a
-directory git ignores, where a rewritten hook would not even show in `git status`. The value
+directory git ignores, where a rewritten hook would not even show in `git status`. A relative
+value is resolved against the top of the work tree git runs in, so in a linked worktree it names
+a directory of the worktree, and that one is held. The value
 is read from your host's own `git` at launch, so an include file or your global config counts;
 a directory the cage does not write is left alone, and with no `git` on the host there is
 nothing to ask and no hook to run. A hooks directory that does not exist yet is **created
@@ -248,11 +250,16 @@ trusted project (where it appears in the diff [`sbx trust`](../cli/trust) shows)
 global config, or from an app profile; from an untrusted project it is dropped with a warning.
 A layer above decides in either direction: `git_writable = false` in a trusted project
 restores the protection the global config lifted. A `.git` that is a **file** (a linked
-worktree, or a submodule opened on its own) is read-only itself: it names the repository your
-git reads, which lies outside the project, where the cage does not reach, so git inside the
-cage already finds no repository there and nothing it does is lost. A `.git` file that names a
-repository inside the project refuses the launch, since nothing would protect that
-repository's configuration and hooks: move the repository into `.git` in place of the file.
+worktree, or a submodule opened on its own) is read-only itself, and the repository it names is
+protected like a `.git` directory wherever the cage writes it: the directory a relative
+`core.hooksPath` names in the project, and, when a read-write bind carries the main repository,
+its configuration, its hooks and the worktree's own files ([where the cage
+writes](#where-the-cage-writes)). Where no bind shows the repository, git inside the cage finds
+none and nothing it does is lost. A `.git` file that names a repository inside the project
+refuses the launch, a layout sbx does not hold: move the repository into `.git` in place of the
+file. So does a `commondir` in the repository it names that git would not have written: git
+writes one only in `.git/worktrees/<name>/`, naming the repository that holds it, and any other
+would have your git read its configuration from elsewhere.
 
 [`sbx test fs`](#seeing-what-is-closed) reports all of these as `READ-ONLY`, protected by sbx
 itself, and [`sbx config show`](../cli/config) prints `fs git: writable` when a layer lifted
@@ -269,6 +276,15 @@ longer rename or remove them (`EBUSY`). The rest of a read-write bind stays writ
 is what the bind grants, another repository in it included. A read-only bind is not written,
 nor is a read-only bind of a directory inside a read-write one listed after it, and nothing is
 added there.
+
+A **linked worktree** is the common case: to let git work inside the cage, bind its main
+repository read-write. Its `.git/config` and `.git/hooks/`, and the worktree's `commondir` and
+`config.worktree` under `.git/worktrees/`, are then read-only in the cage, while commits,
+branches, checkouts and `git worktree list` work, and a bare `git push` pushes a branch to its
+namesake as it does in a `.git` directory. What sbx does not hold is a repository's other work
+trees where the cage writes them: in the main checkout, or in a linked worktree other than the
+project (one kept inside the project, or in a read-write bind), the directory a relative
+`core.hooksPath` names, and that worktree's `.git` file, stay writable to the cage.
 
 A read-write bind that holds your **global git configuration** (`~/.gitconfig`,
 `~/.config/git/config`, or the file `GIT_CONFIG_GLOBAL` names), such as a bind of your whole

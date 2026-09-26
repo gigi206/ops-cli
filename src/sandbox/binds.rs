@@ -600,10 +600,11 @@ pub(crate) struct Overlay<'a> {
     /// (`apps_share_install_pools`, a trusted project's grant). Only a global app has such a pool,
     /// so it changes nothing for the other runtimes.
     pub(crate) share_install_pools: bool,
-    /// Whether the cage cannot write the project's `.git/config` (sbx's own read-only default, or a
-    /// declared mask). Then git cannot record the upstream a `push -u` sets, and the cage's git is
-    /// told to push a branch to its namesake instead ([`git_config_env`]), so a bare `git push`
-    /// keeps working without anything written to the repository.
+    /// Whether the cage cannot write the configuration the project's git reads, `.git/config` or
+    /// the one a `.git` file leads to (sbx's own read-only default, or a declared mask). Then git
+    /// cannot record the upstream a `push -u` sets, and the cage's git is told to push a branch to
+    /// its namesake instead ([`git_config_env`]), so a bare `git push` keeps working without
+    /// anything written to the repository.
     pub(crate) git_config_read_only: bool,
 }
 

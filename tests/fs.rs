@@ -815,6 +815,133 @@ fn what_the_projects_git_reads_in_a_read_write_bind_is_read_only_in_a_real_cage(
     );
 }
 
+/// A linked worktree's repository is carried like a `.git` directory inside a real cage. Without
+/// a bind, the directory a relative `core.hooksPath` names in the worktree refuses a write. With
+/// the main repository in a read-write bind, its hooks, its configuration and the worktree's
+/// `commondir` refuse a write too, while commits, branches, checkouts and the worktree list work,
+/// and the cage's git pushes a branch to its namesake without writing the configuration.
+#[test]
+fn a_linked_worktrees_repository_is_held_in_a_real_cage() {
+    let (project, data, state, bound) = (
+        TmpDir::new("f"),
+        TmpDir::new("f"),
+        TmpDir::new("f"),
+        TmpDir::new("f"),
+    );
+    probe_or_skip!(
+        "a linked worktree's repository, in a real cage",
+        sandbox_probe(project.path(), data.path())
+    );
+    let main = bound.path().canonicalize().unwrap();
+    if main.starts_with("/tmp") {
+        // The cage mounts its own `/tmp` after the config binds, so a bind there is not written.
+        skip_incapable!("the fixture root is under /tmp, which a bind cannot reach in the cage");
+        return;
+    }
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&main)
+            .output()
+    };
+    let Ok(init) = git(&["init", "-q"]) else {
+        skip_incapable!("git is not installed on this host");
+        return;
+    };
+    assert!(init.status.success());
+    let root = project.path().canonicalize().unwrap().join("feat");
+    for args in [
+        &["commit", "-q", "--no-verify", "--allow-empty", "-m", "i"][..],
+        &["config", "core.hooksPath", ".husky/_"],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            root.to_str().unwrap(),
+        ],
+    ] {
+        let out = git(args).unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+    let run = |script: &str| {
+        let out = sbx_isolated()
+            .args(["run", "--", "sh", "-c", script])
+            .current_dir(&root)
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("run the cage");
+        format!(
+            "{}\n--- stderr\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let hook = "(mkdir -p .husky/_ && printf x > .husky/_/pre-commit) 2>/dev/null \
+                  && echo WROTE-HOOK || echo REFUSED-HOOK";
+    let out = run(hook);
+    assert!(out.contains("REFUSED-HOOK"), "no bind\n{out}");
+    assert!(!root.join(".husky/_/pre-commit").exists());
+
+    std::fs::write(
+        root.join(".sbx.toml"),
+        format!(
+            "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
+            main.display()
+        ),
+    )
+    .unwrap();
+    let trusted = sbx_isolated()
+        .args(["trust", "--yes"])
+        .current_dir(&root)
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("trust");
+    assert!(trusted.status.success(), "{trusted:?}");
+    let common = main.join(".git");
+    let config_before = std::fs::read(common.join("config")).unwrap();
+    let script = format!(
+        "{hook}; \
+         (printf x > {common}/hooks/pre-commit) 2>/dev/null \
+           && echo WROTE-MAIN-HOOK || echo REFUSED-MAIN-HOOK; \
+         (printf '[core]\\n\\tfsmonitor = x\\n' >> {common}/config) 2>/dev/null \
+           && echo WROTE-CONFIG || echo REFUSED-CONFIG; \
+         (printf x > {common}/worktrees/feat/commondir) 2>/dev/null \
+           && echo WROTE-COMMONDIR || echo REFUSED-COMMONDIR; \
+         g() {{ git -c user.name=t -c user.email=t@t \"$@\"; }}; \
+         g commit -q --no-verify --allow-empty -m c && echo COMMIT-OK; \
+         g branch b1 && echo BRANCH-OK; \
+         g checkout -q -b b2 && echo CHECKOUT-OK; \
+         g worktree list >/dev/null && echo LIST-OK; \
+         echo AUTOSETUP-$(git config --get push.autoSetupRemote)",
+        common = common.display(),
+    );
+    let out = run(&script);
+    for word in [
+        "REFUSED-HOOK",
+        "REFUSED-MAIN-HOOK",
+        "REFUSED-CONFIG",
+        "REFUSED-COMMONDIR",
+        "COMMIT-OK",
+        "BRANCH-OK",
+        "CHECKOUT-OK",
+        "LIST-OK",
+        "AUTOSETUP-true",
+    ] {
+        assert!(out.contains(word), "expected {word}\n{out}");
+    }
+    assert!(
+        !common.join("hooks/pre-commit").exists(),
+        "no hook on the host"
+    );
+    assert_eq!(std::fs::read(common.join("config")).unwrap(), config_before);
+    let branch = git(&["rev-parse", "--verify", "-q", "b1"]).unwrap();
+    assert!(branch.status.success(), "the cage's branch is on the host");
+}
+
 /// The files git reads as configuration beside `.git/config` are read-only inside a real cage: the
 /// main `config.worktree`, and a linked worktree's `config.worktree` and `commondir`, whose
 /// directory also keeps its path. A `.git/commondir` in the project's own repository refuses the

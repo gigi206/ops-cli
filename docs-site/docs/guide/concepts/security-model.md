@@ -280,8 +280,9 @@ linked worktree's `config.worktree` and `commondir`), and a `.git/commondir` in 
 own repository, which would have git read its configuration from elsewhere, refuses the
 launch. Such a file cannot be held before it exists, so sbx names any that appeared once the
 cage has exited. A `.git` that is a file, the pointer a linked worktree keeps to its
-repository, is read-only as well, and so are the repositories of the submodules the index
-names, which a `git status` in the superproject reads too. What your git reads in a read-write
+repository, is read-only as well, and the repository it names is held like `.git` wherever the
+cage writes it; so are the repositories of the submodules the index names, which a
+`git status` in the superproject reads too. What your git reads in a read-write
 bind is held as in the project, unless the bind holds your global git configuration, which the
 cage could then rewrite (the launch warns), and a file it reads in sbx's data directory, which
 the cage writes under other names, refuses the launch ([where the cage
@@ -290,9 +291,11 @@ switching branches, fetching and pushing still work; what is refused is writing 
 (`remote add`, the upstream `push -u` records), installing a hook, and moving a repository into
 `.git` (`submodule absorbgitdirs`): `.git` itself is held in place, and a symbolic link on the
 way to any of these paths refuses the launch, since the cage could point it elsewhere, so the
-paths your git reads after the session are the protected ones. The exception is a repository
+paths your git reads after the session are the protected ones. The exceptions are a repository
 that appears during the session, in a submodule's directory or added to the index, which no
-mount can hold; sbx names it once the cage has exited. A project that needs
+mount can hold, and sbx names once the cage has exited; and the repository's other work trees
+where the cage writes them: the directory a relative `core.hooksPath` names in the main checkout
+or in another linked worktree, and that worktree's `.git` file, are not held. A project that needs
 those sets `[fs] git_writable = true` from a trusted layer, the one key of `[fs]` that opens
 rather than closes and therefore the one the trust gate decides.
 
