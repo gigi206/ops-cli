@@ -59,14 +59,38 @@
 # this profile runs. If a request is refused, the proxy NAMES the host: add it to `allow` (or check
 # ahead with `sbx test net <url>`, or run once with `--net-learn` to have the refusals propose the
 # rules), and watch `sbx net logs -a traycer`.
-cmd = ["traycer"]
-
-# No `contract`: Traycer is an orchestrator. It manages the host that drives other coding agents and
-# has no model of its own, and the agents it drives are started by that host, not by sbx, so the
-# `contract` of their own profiles does not apply. Point the driven agent at the cage's summary
-# yourself instead, for instance with a line in that agent's own instructions such as "When the
-# environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything
-# else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands the agents Traycer drives the cage's summary (/opt/sbx/contract-summary.md: what
+# it may reach, which files it protects, which operations it offers). Traycer's host starts the agent
+# itself, in this same cage, so the agent's own profile and its command never run; the command
+# therefore places, for this launch only, the summary where the agents whose route is measured read
+# it: Claude Code's managed instructions file (`/etc/claude-code/CLAUDE.md`), Codex's managed
+# requirements (`/etc/codex/requirements.toml`, as `additional_developer_instructions`) and an
+# `AGENTS.md` at `/`, which Pi's parent walk reaches. Each is loaded beside your own instructions
+# rather than replacing them, and `/etc` and `/` are the cage's own tmpfs, so nothing reaches the
+# host. Measured by running `claude -p` in this cage with `claude-code` added to `use`; the Codex and
+# Pi routes are the ones their own profiles measure. Another agent you add takes nothing from here.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+if [ -r "$s" ]; then
+  # Claude Code: its managed instructions file.
+  mkdir -p /etc/claude-code 2>/dev/null && ln -sf "$s" /etc/claude-code/CLAUDE.md
+  # Codex: managed requirements, sent as a developer message of their own.
+  q=$(printf '\047\047\047')
+  if [ "$(wc -c < "$s")" -lt 30000 ] && ! grep -qF "$q" "$s" \
+     && ! tr -d '\t\n' < "$s" | LC_ALL=C grep -q '[[:cntrl:]]' && mkdir -p /etc/codex 2>/dev/null; then
+    { printf 'additional_developer_instructions = %s\n' "$q"; cat "$s"; printf '%s\n' "$q"; } > /etc/codex/requirements.toml
+  fi
+  # Pi: an AGENTS.md at the root its parent walk reaches.
+  ln -sf "$s" /AGENTS.md 2>/dev/null
+fi
+exec traycer "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "traycer",
+]
 
 # Your host Traycer config and session, mounted read-write at their real absolute paths. `binds` is
 # a security field, honored only because this profile lives in your trusted config dir; `mode =
