@@ -50,14 +50,37 @@
 # inside them is not proven; if a fetch is refused, `sbx net log -a sigit` names the host it wanted.
 # Grounded here: the packaging (read out of the published packages), the model provider and the
 # absence of any credential (read out of the shipped binary and upstream's README).
-cmd = "sigit"
-
-# No `contract`: sigit parses no option or environment variable for instructions; it loads
-# `CLAUDE.md`/`AGENTS.md`, and `SIGIT_CONFIG_DIR` would move its config directory rather than add to
-# it. Point sigit at the cage's summary yourself instead, for instance with a line in an `AGENTS.md`
-# it reads such as "When the environment variable SBX_SANDBOX is 1, read the file named by
-# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
-# at every launch.
+# The command hands siGit the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as its global instructions file,
+# `~/.config/sigit/AGENTS.md`, which siGit loads first, beneath the `AGENTS.md`/`CLAUDE.md` files
+# from the repository root down to the working directory. That file is yours to keep, so the
+# command writes it only while you have none: a copy marked as sbx's, rewritten at every launch and
+# removed by a launch without a summary. Once you write your own there, it is left untouched and the
+# summary is no longer added. It is not written while a `CLAUDE.md` of yours sits in that directory
+# either, since siGit reads only the first of the two names there. The file lives in the app's
+# isolated home, which only this app's cages read, and `SIGIT_CONFIG_DIR` moves it (the command
+# follows it). Not measured: the first launch downloads the model before any session starts; the
+# loader was read in siGit's source (`src/instructions.rs`, v1.5.10).
+cmd = [
+    "bash",
+    "-c",
+    '''
+d="${SIGIT_CONFIG_DIR:-$HOME/.config/sigit}"
+s=/opt/sbx/contract-summary.md
+f="$d/AGENTS.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ] && [ ! -e "$d/CLAUDE.md" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec sigit "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "sigit",
+]
 
 # Your host siGit model cache, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir. Uncomment to reuse a
