@@ -167,6 +167,49 @@ pub(crate) fn returns_within<T: Send + 'static>(
         .unwrap_or_else(|_| panic!("{what} did not return within {limit:?}"))
 }
 
+/// A reader handing out `bytes` in pieces, as a socket or a slow filesystem may: never more in one
+/// read than the next of `sizes`, taken in turn, and a read interrupted where `interrupts` says,
+/// never twice in a row. A read returns nothing only once every byte is out.
+pub(crate) struct Trickle<'a> {
+    bytes: &'a [u8],
+    sizes: Vec<usize>,
+    interrupts: Vec<bool>,
+    reads: usize,
+    interrupted: bool,
+}
+
+impl<'a> Trickle<'a> {
+    /// `sizes` and `interrupts` are read in turn, round and round, so neither may be empty.
+    pub(crate) fn new(bytes: &'a [u8], sizes: Vec<usize>, interrupts: Vec<bool>) -> Self {
+        Trickle {
+            bytes,
+            sizes,
+            interrupts,
+            reads: 0,
+            interrupted: false,
+        }
+    }
+}
+
+impl std::io::Read for Trickle<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let turn = self.reads;
+        self.reads += 1;
+        if !self.interrupted && self.interrupts[turn % self.interrupts.len()] {
+            self.interrupted = true;
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        self.interrupted = false;
+        let n = self.sizes[turn % self.sizes.len()]
+            .min(buf.len())
+            .min(self.bytes.len());
+        let (out, rest) = self.bytes.split_at(n);
+        buf[..n].copy_from_slice(out);
+        self.bytes = rest;
+        Ok(n)
+    }
+}
+
 /// Every `.rs` source under `dir`, sorted, subdirectories included. The walk descends because a
 /// module that outgrew one file keeps its root in `<name>.rs` and everything else in a `<name>/`
 /// beside it: a flat listing would read the root, skip the children, and report the silence as a

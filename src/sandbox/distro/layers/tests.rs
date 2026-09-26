@@ -1,4 +1,8 @@
 use super::*;
+use proptest::collection::vec;
+use proptest::prelude::{Just, Strategy, any, prop_oneof};
+use proptest::sample::{Index, select};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 
@@ -747,4 +751,529 @@ fn an_opaque_marker_at_the_layer_root_empties_the_root() {
 
     assert!(!root.join("etc/old").exists(), "the root was emptied");
     assert!(root.join("etc/new").is_file(), "and refilled by this layer");
+}
+
+/// Where a generated link points. The relative spellings may climb; `Outside` and `OutsideFile`
+/// are absolute, the fixture's `outside` directory and a file in it, known once it exists.
+#[derive(Clone, Debug)]
+enum Aim {
+    Relative(&'static str),
+    Outside,
+    OutsideFile,
+}
+
+/// What a generated member is. `Other` is a type flag the unpacker skips or refuses: a character
+/// or block device, a fifo, a type no tar defines.
+#[derive(Clone, Debug)]
+enum Kind {
+    Dir,
+    File(Vec<u8>),
+    Symlink(Aim),
+    HardLink(Aim),
+    Other(u8),
+}
+
+/// A generated member: its name as the archive spells it, what it is, and its mode.
+#[derive(Clone, Debug)]
+struct Generated {
+    name: String,
+    kind: Kind,
+    mode: u32,
+}
+
+/// A name built from a few components, so that one layer's link and a later layer's path through
+/// it meet often: two plain names, and the spellings that try to leave or that mark a deletion.
+fn names() -> impl Strategy<Value = String> {
+    let component = prop_oneof![
+        6 => select(&["a", "b"][..]),
+        1 => select(&[".", "..", ".wh.a", ".wh.b", ".wh..wh..opq", ".wh.", ".wh..."][..]),
+    ];
+    (
+        prop_oneof![4 => Just(""), 1 => Just("./"), 1 => Just("/")],
+        vec(component, 1..4),
+        any::<bool>(),
+    )
+        .prop_map(|(lead, parts, slash)| {
+            format!("{lead}{}{}", parts.join("/"), if slash { "/" } else { "" })
+        })
+}
+
+fn aims() -> impl Strategy<Value = Aim> {
+    prop_oneof![
+        3 => select(&["a", "b", "a/b", ".", "..", "../..", "../outside", "../outside/a"][..])
+            .prop_map(Aim::Relative),
+        1 => Just(Aim::Outside),
+        1 => Just(Aim::OutsideFile),
+    ]
+}
+
+fn kinds() -> impl Strategy<Value = Kind> {
+    prop_oneof![
+        3 => Just(Kind::Dir),
+        3 => vec(any::<u8>(), 0..32).prop_map(Kind::File),
+        3 => aims().prop_map(Kind::Symlink),
+        1 => aims().prop_map(Kind::HardLink),
+        1 => select(&b"346Z"[..]).prop_map(Kind::Other),
+    ]
+}
+
+fn modes() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        Just(0o4755u32),
+        Just(0o2755),
+        Just(0o1777),
+        Just(0),
+        (0u32..0o10000),
+    ]
+}
+
+fn generated() -> impl Strategy<Value = Generated> {
+    (names(), kinds(), modes()).prop_map(|(name, kind, mode)| Generated { name, kind, mode })
+}
+
+/// An image's layers, each with whether it is framed by gzip: generated members in any order, or
+/// starting with a pair of layers that meet, one planting a link at `a` or `b` and the next naming
+/// paths at it and through it. Drawn at random, such a pair is rare, and it is the shape every
+/// escape through a link needs.
+fn images() -> impl Strategy<Value = Vec<(Vec<Generated>, bool)>> {
+    let layers = |count| vec((vec(generated(), 1..8), any::<bool>()), count);
+    let tails = select(&["", "/a", "/b", "/b/a", "/.wh.a", "/.wh.b", "/.wh..wh..opq"][..]);
+    let pair = (
+        select(&["a", "b"][..]),
+        aims(),
+        vec((tails, kinds(), modes()), 1..5),
+        any::<bool>(),
+    )
+        .prop_map(|(link, aim, uses, gzip)| {
+            let plant = Generated {
+                name: link.to_string(),
+                kind: Kind::Symlink(aim),
+                mode: 0o777,
+            };
+            let uses = uses
+                .into_iter()
+                .map(|(tail, kind, mode)| Generated {
+                    name: format!("{link}{tail}"),
+                    kind,
+                    mode,
+                })
+                .collect();
+            vec![(vec![plant], gzip), (uses, !gzip)]
+        });
+    prop_oneof![
+        layers(1..4),
+        (pair, layers(0..3)).prop_map(|(mut pair, rest)| {
+            pair.extend(rest);
+            pair
+        }),
+    ]
+    .boxed()
+}
+
+/// Where a layer is applied, and what lies around it for a member to reach.
+///
+/// The root is three levels below the fixture, so that a member climbing as far as a generated
+/// name can climb stays inside it where the snapshot sees it. `outside` sits beside the root, where
+/// a link spelled `../outside` from the root's top lands. It holds a file `a` and a directory `b`
+/// with a file `a` in it, named as the members are so that a path through a link meets them, at
+/// modes a chmod through a link would change.
+struct Ground {
+    tmp: crate::testutil::TmpDir,
+    root: PathBuf,
+    outside: PathBuf,
+}
+
+impl Ground {
+    fn new() -> Self {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.join("x/y/root");
+        let outside = tmp.join("x/y/outside");
+        fs::create_dir_all(outside.join("b")).unwrap();
+        fs::write(outside.join("a"), "a").unwrap();
+        fs::write(outside.join("b/a"), "b/a").unwrap();
+        fs::write(tmp.join("sibling"), "sibling").unwrap();
+        fs::set_permissions(outside.join("a"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(outside.join("b"), fs::Permissions::from_mode(0o750)).unwrap();
+        fs::create_dir_all(tmp.join("blobs")).unwrap();
+        Ground { tmp, root, outside }
+    }
+
+    fn aim(&self, aim: &Aim) -> String {
+        match aim {
+            Aim::Relative(path) => path.to_string(),
+            Aim::Outside => self.outside.display().to_string(),
+            Aim::OutsideFile => self.outside.join("a").display().to_string(),
+        }
+    }
+
+    /// Everything around the root, which no layer may change: the root and the blobs aside.
+    fn around(&self) -> BTreeMap<PathBuf, (&'static str, u32, Vec<u8>)> {
+        snapshot(
+            self.tmp.path(),
+            &[self.root.clone(), self.tmp.join("blobs")],
+        )
+    }
+
+    /// The files under the root that are also a file around it: a hard link out of the tree,
+    /// which changes nothing the snapshot of the ground reads and hands the cage a file it was
+    /// never given.
+    fn linked_out(&self) -> Vec<PathBuf> {
+        let files = |paths: Vec<PathBuf>| -> BTreeMap<(u64, u64), PathBuf> {
+            use std::os::unix::fs::MetadataExt;
+            paths
+                .into_iter()
+                .filter_map(|path| {
+                    let meta = path.symlink_metadata().ok()?;
+                    meta.is_file().then(|| ((meta.dev(), meta.ino()), path))
+                })
+                .collect()
+        };
+        let around = files(self.around().into_keys().collect());
+        files(snapshot(&self.root, &[]).into_keys().collect())
+            .into_iter()
+            .filter(|(inode, _)| around.contains_key(inode))
+            .map(|(_, path)| path)
+            .collect()
+    }
+
+    /// Apply `layer` as the `n`th blob, framed by gzip when `gzip` says so.
+    fn apply(&self, n: usize, layer: &[u8], gzip: bool, budget: &mut Budget) -> io::Result<()> {
+        let blob = self.tmp.join(&format!("blobs/{n}"));
+        let media_type = if gzip {
+            fs::write(&blob, gzip_member(layer)).unwrap();
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+        } else {
+            fs::write(&blob, layer).unwrap();
+            "application/vnd.oci.image.layer.v1.tar"
+        };
+        apply(&blob, media_type, &self.root, budget)
+    }
+}
+
+/// Every entry under `dir` but the trees at `skip`, by path: its kind, its mode, and its contents
+/// or its link's target. A link is read, never followed.
+fn snapshot(dir: &Path, skip: &[PathBuf]) -> BTreeMap<PathBuf, (&'static str, u32, Vec<u8>)> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut seen = BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if skip.contains(&path) {
+                continue;
+            }
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            let mode = meta.permissions().mode();
+            let what = if meta.file_type().is_symlink() {
+                let target = fs::read_link(&path).unwrap_or_default();
+                ("link", mode, target.as_os_str().as_bytes().to_vec())
+            } else if meta.is_dir() {
+                pending.push(path.clone());
+                ("dir", mode, Vec::new())
+            } else if meta.is_file() {
+                ("file", mode, fs::read(&path).unwrap_or_default())
+            } else {
+                ("other", mode, Vec::new())
+            };
+            seen.insert(path, what);
+        }
+    }
+    seen
+}
+
+/// Every entry under the root that carries a set-user-ID, set-group-ID or sticky bit, or that its
+/// owner cannot read and write (search, too, on a directory).
+fn privileged_or_locked(root: &Path) -> Vec<(PathBuf, u32)> {
+    snapshot(root, &[])
+        .into_iter()
+        .filter(|(_, (kind, mode, _))| {
+            let owner = if *kind == "dir" { 0o700 } else { 0o600 };
+            *kind != "link" && (mode & 0o7000 != 0 || mode & owner != owner)
+        })
+        .map(|(path, (_, mode, _))| (path, mode & 0o7777))
+        .collect()
+}
+
+/// `bytes` as one gzip member, the trailer left as zeros: the unpacker does not check it.
+fn gzip_member(bytes: &[u8]) -> Vec<u8> {
+    let mut member = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    member.extend(miniz_oxide::deflate::compress_to_vec(bytes, 1));
+    member.extend([0u8; 8]);
+    member
+}
+
+/// A tar of `members`, each name and link name written into its header field as generated, since
+/// the hostile spellings are the ones a well-behaved writer refuses to write. Also where each
+/// header starts.
+fn raw_tar(members: &[Generated], ground: &Ground) -> (Vec<u8>, Vec<usize>) {
+    let mut out = Vec::new();
+    let mut headers = Vec::new();
+    for member in members {
+        let mut header = tar::Header::new_gnu();
+        let (kind, link, data) = match &member.kind {
+            Kind::Dir => (tar::EntryType::Directory, None, &[][..]),
+            Kind::File(data) => (tar::EntryType::Regular, None, &data[..]),
+            Kind::Symlink(aim) => (tar::EntryType::Symlink, Some(ground.aim(aim)), &[][..]),
+            Kind::HardLink(aim) => (tar::EntryType::Link, Some(ground.aim(aim)), &[][..]),
+            Kind::Other(flag) => (tar::EntryType::new(*flag), None, &[][..]),
+        };
+        header.set_entry_type(kind);
+        header.set_mode(member.mode);
+        header.set_size(data.len() as u64);
+        let gnu = header.as_gnu_mut().expect("a gnu header");
+        assert!(member.name.len() <= gnu.name.len(), "{}", member.name);
+        gnu.name[..member.name.len()].copy_from_slice(member.name.as_bytes());
+        if let Some(link) = link {
+            assert!(
+                link.len() <= gnu.linkname.len(),
+                "the fixture's path is too long: {link}"
+            );
+            gnu.linkname[..link.len()].copy_from_slice(link.as_bytes());
+        }
+        header.set_cksum();
+        headers.push(out.len());
+        out.extend(header.as_bytes());
+        out.extend(data);
+        out.resize(out.len().next_multiple_of(512), 0);
+    }
+    out.extend([0u8; 1024]);
+    (out, headers)
+}
+
+/// `layer`, each of `mutations` made to it in turn: a header field overwritten and the header's
+/// checksum made right again, so the change reaches the unpacker rather than stopping at the tar
+/// reader's check; a byte replaced; the layer cut; or a block inserted.
+fn mutated(
+    mut layer: Vec<u8>,
+    headers: &[usize],
+    mutations: &[(u8, Index, Index, u64)],
+) -> Vec<u8> {
+    // Name, mode, size, type flag and link name: where they start and how long they are.
+    const FIELDS: [(usize, usize); 5] = [(0, 100), (100, 8), (124, 12), (156, 1), (157, 100)];
+    for &(how, which, at, value) in mutations {
+        match how {
+            0 | 1 if !headers.is_empty() => {
+                let start = headers[which.index(headers.len())];
+                if start + 512 > layer.len() {
+                    continue;
+                }
+                let (offset, len) = FIELDS[at.index(FIELDS.len())];
+                let bytes = if how == 0 {
+                    // A number in the octal the fields hold, so a size or a mode stays readable.
+                    format!(
+                        "{:0width$o}\0",
+                        value % (1 << 33),
+                        width = len.saturating_sub(1)
+                    )
+                    .into_bytes()
+                } else {
+                    value.to_le_bytes().to_vec()
+                };
+                let n = bytes.len().min(len);
+                layer[start + offset..start + offset + n].copy_from_slice(&bytes[..n]);
+                let mut header = tar::Header::from_byte_slice(&layer[start..start + 512]).clone();
+                header.set_cksum();
+                layer[start..start + 512].copy_from_slice(header.as_bytes());
+            }
+            2 if !layer.is_empty() => {
+                let at = at.index(layer.len());
+                layer[at] = value as u8;
+            }
+            3 => layer.truncate(at.index(layer.len() + 1)),
+            _ => {
+                let at = at.index(layer.len() + 1);
+                layer.splice(at..at, [value as u8; 512]);
+            }
+        }
+    }
+    layer
+}
+
+/// A member of an honest layer, named so that no two kinds ever share a name: directories `d<n>`,
+/// files `f<n>`, links `l<n>`, and the deletion of a file or a directory.
+#[derive(Clone, Debug)]
+struct Honest {
+    parents: Vec<u8>,
+    leaf: u8,
+    kind: u8,
+    size: usize,
+}
+
+impl Honest {
+    fn name(&self) -> String {
+        let leaf = match self.kind {
+            0 => format!("d{}/", self.leaf),
+            1 => format!("f{}", self.leaf),
+            2 => format!("l{}", self.leaf),
+            3 => format!(".wh.f{}", self.leaf),
+            _ => format!(".wh.d{}", self.leaf),
+        };
+        let parents: String = self.parents.iter().map(|d| format!("d{d}/")).collect();
+        format!("{parents}{leaf}")
+    }
+
+    /// What the member costs the budget at most: itself, and each parent it may have to make.
+    fn entries_at_most(&self) -> u64 {
+        1 + self.parents.len() as u64
+    }
+}
+
+fn honest() -> impl Strategy<Value = Honest> {
+    (vec(0u8..3, 0..3), 0u8..4, 0u8..5, 0usize..400).prop_map(|(parents, leaf, kind, size)| {
+        Honest {
+            parents,
+            leaf,
+            kind,
+            size: if kind == 1 { size } else { 0 },
+        }
+    })
+}
+
+/// What `layers` declare: the bytes of their files, and at most how many entries they cost.
+fn declared(layers: &[Vec<Honest>]) -> (u64, u64) {
+    let members = || layers.iter().flatten();
+    (
+        members().map(|m| m.size as u64).sum(),
+        members().map(Honest::entries_at_most).sum(),
+    )
+}
+
+/// Honest layers, and what is left of each ceiling for them: drawn at random, or exactly what they
+/// declare, or one short of it, where a ceiling off by one shows.
+fn budgets() -> impl Strategy<Value = (Vec<Vec<Honest>>, u64, u64)> {
+    vec(vec(honest(), 1..8), 1..4).prop_flat_map(|layers| {
+        let (bytes, entries) = declared(&layers);
+        (
+            Just(layers),
+            prop_oneof![0u64..3000, Just(bytes), Just(bytes.saturating_sub(1))],
+            prop_oneof![0u64..40, Just(entries), Just(entries.saturating_sub(1))],
+        )
+    })
+}
+
+fn honest_tar(members: &[Honest]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for member in members {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(member.size as u64);
+        let name = member.name();
+        match member.kind {
+            0 => header.set_entry_type(tar::EntryType::Directory),
+            2 => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_link_name("f0").unwrap();
+            }
+            _ => header.set_entry_type(tar::EntryType::Regular),
+        }
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &name, &vec![b'x'; member.size][..])
+            .unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+/// What lies on disk under `root`: the bytes of its files, each counted once however many names
+/// it has, and its entries.
+fn on_disk(root: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let mut inodes = std::collections::BTreeSet::new();
+    let (mut bytes, mut entries) = (0, 0);
+    for path in snapshot(root, &[]).into_keys() {
+        entries += 1;
+        let meta = path.symlink_metadata().unwrap();
+        if meta.is_file() && inodes.insert(meta.ino()) {
+            bytes += meta.len();
+        }
+    }
+    (bytes, entries)
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+    /// Nothing a layer holds reaches outside the root, whatever layers came before it: no file
+    /// written, removed or chmodded around it, through a climbing or absolute name, a link an
+    /// earlier layer planted, a hard link, or a deletion marker, and no file around it linked into
+    /// the tree. Whatever it lands under the root carries no set-user-ID, set-group-ID or sticky
+    /// bit, and its owner can read and write it.
+    /// Each layer is applied over whatever the ones before left, refused or not, so the root is
+    /// in states a real image's unpack, which stops at the first refusal, never leaves it in.
+    #[test]
+    fn no_layer_reaches_outside_its_root_or_keeps_a_privileged_bit(
+        layers in images(),
+    ) {
+        let ground = Ground::new();
+        let before = ground.around();
+        for (n, (members, gzip)) in layers.iter().enumerate() {
+            let (layer, _) = raw_tar(members, &ground);
+            let _ = ground.apply(n, &layer, *gzip, &mut Budget::new());
+        }
+        proptest::prop_assert_eq!(ground.around(), before, "the ground around the root changed");
+        let linked = ground.linked_out();
+        proptest::prop_assert!(linked.is_empty(), "linked out of the tree: {:?}", linked);
+        let wrong = privileged_or_locked(&ground.root);
+        proptest::prop_assert!(wrong.is_empty(), "modes left under the root: {:?}", wrong);
+    }
+
+    /// An image's layers stay within what was left of both ceilings, and are refused only past
+    /// one. On disk after them: no more bytes than were left plus the one that proves a member ran
+    /// over, and no more entries than were left. Layers that fit both ceilings apply whole, and a
+    /// refusal is a ceiling's. The layers are honest ones, whose only possible refusal is the
+    /// budget's, applied as an image's are: one budget across them, stopping at the first refusal.
+    #[test]
+    fn an_images_layers_stay_within_both_ceilings_and_are_refused_only_past_one(
+        (layers, bytes_left, entries_left) in budgets(),
+    ) {
+        let ground = Ground::new();
+        let mut budget = Budget {
+            bytes: MAX_UNPACKED_BYTES - bytes_left,
+            members: MAX_MEMBERS - entries_left,
+        };
+        let mut refused = None;
+        for (n, members) in layers.iter().enumerate() {
+            if let Err(e) = ground.apply(n, &honest_tar(members), n % 2 == 1, &mut budget) {
+                refused = Some(e.to_string());
+                break;
+            }
+        }
+        let (bytes, entries) = on_disk(&ground.root);
+        proptest::prop_assert!(bytes <= bytes_left + 1, "{} bytes on disk, {} left", bytes, bytes_left);
+        proptest::prop_assert!(entries <= entries_left, "{} entries on disk, {} left", entries, entries_left);
+        let (bytes_declared, entries_at_most) = declared(&layers);
+        if bytes_declared <= bytes_left && entries_at_most <= entries_left {
+            proptest::prop_assert!(refused.is_none(), "refused within both ceilings: {:?}", refused);
+        }
+        if let Some(refusal) = refused {
+            proptest::prop_assert!(refusal.contains("more than"), "refused for another reason: {}", refusal);
+        }
+    }
+
+    /// Whatever bytes a layer holds, applying it ends in a tree or a refusal, without a panic and
+    /// without reaching outside the root or leaving a privileged bit. The bytes are generated
+    /// layers, then changed: a header field rewritten with its checksum made right, a byte, the
+    /// layer cut, a block inserted.
+    #[test]
+    fn any_bytes_as_a_layer_are_applied_or_refused_without_reaching_outside(
+        members in vec(generated(), 1..8),
+        mutations in vec((0u8..5, any::<Index>(), any::<Index>(), any::<u64>()), 1..5),
+        gzip in any::<bool>(),
+    ) {
+        let ground = Ground::new();
+        let before = ground.around();
+        let (layer, headers) = raw_tar(&members, &ground);
+        let layer = mutated(layer, &headers, &mutations);
+        let _ = ground.apply(0, &layer, gzip, &mut Budget::new());
+        proptest::prop_assert_eq!(ground.around(), before, "the ground around the root changed");
+        let linked = ground.linked_out();
+        proptest::prop_assert!(linked.is_empty(), "linked out of the tree: {:?}", linked);
+        let wrong = privileged_or_locked(&ground.root);
+        proptest::prop_assert!(wrong.is_empty(), "modes left under the root: {:?}", wrong);
+    }
 }

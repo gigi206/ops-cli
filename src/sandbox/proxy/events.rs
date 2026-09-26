@@ -826,7 +826,7 @@ mod tests {
     use super::*;
     use crate::sandbox::control::{CAPTURE_PARTS, CaptureBytes, CaptureLevel, LOG_RING_CAP};
     use crate::sandbox::signer_control::SIGNER_RING_CAP;
-    use crate::testutil::TmpDir;
+    use crate::testutil::{TmpDir, Trickle};
     use proptest::prelude::{Just, Strategy, any, prop_oneof};
     use proptest::sample::{Index, select};
 
@@ -1735,36 +1735,6 @@ mod tests {
         (stream, ends)
     }
 
-    /// A channel handing out `bytes` as a socket may: never more in one read than the next of
-    /// `sizes`, taken in turn, and a read interrupted where `interrupts` says, never twice in a
-    /// row. A read returns nothing only once every byte is out.
-    struct Trickle<'a> {
-        bytes: &'a [u8],
-        sizes: Vec<usize>,
-        interrupts: Vec<bool>,
-        reads: usize,
-        interrupted: bool,
-    }
-
-    impl Read for Trickle<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let turn = self.reads;
-            self.reads += 1;
-            if !self.interrupted && self.interrupts[turn % self.interrupts.len()] {
-                self.interrupted = true;
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            self.interrupted = false;
-            let n = self.sizes[turn % self.sizes.len()]
-                .min(buf.len())
-                .min(self.bytes.len());
-            let (out, rest) = self.bytes.split_at(n);
-            buf[..n].copy_from_slice(out);
-            self.bytes = rest;
-            Ok(n)
-        }
-    }
-
     /// Where a stream whose frames end at `ends` is cut, as `how` says: where a frame ends (the
     /// stream's start and its end among them), inside the header of one, or anywhere. A cut drawn
     /// anywhere seldom falls where a frame ends, too seldom to find what a clean end gets wrong.
@@ -1822,13 +1792,7 @@ mod tests {
         ) {
             let (stream, ends) = stream_of(&sent);
             let cut = cut_at(&ends, &cut);
-            let mut channel = Trickle {
-                bytes: &stream[..cut],
-                sizes,
-                interrupts,
-                reads: 0,
-                interrupted: false,
-            };
+            let mut channel = Trickle::new(&stream[..cut], sizes, interrupts);
             for (i, expected) in sent.iter().enumerate().take_while(|&(i, _)| ends[i + 1] <= cut) {
                 let read = wire::read(&mut channel);
                 proptest::prop_assert!(
