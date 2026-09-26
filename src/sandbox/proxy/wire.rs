@@ -2147,4 +2147,415 @@ mod tests {
             "fewer bytes than the declared length is a truncated-body error"
         );
     }
+
+    /// RFC 3986's `authority` without userinfo (§3.2.2, §3.2.3), recognized from its character
+    /// classes rather than split on `:`: an `IP-literal` in brackets, or the run of `reg-name` and
+    /// `IPv4address` characters, then `":" port` or nothing. On top of the grammar, the two choices
+    /// sbx makes: a port holds at least one digit, and it is not 0. The host comes back as written.
+    fn authority_by_the_grammar(authority: &str) -> Option<(&str, Option<u16>)> {
+        let bytes = authority.as_bytes();
+        let reg_name = |b: &u8| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=%".contains(b);
+        let (host, rest) = if bytes.first() == Some(&b'[') {
+            let close = 1 + bytes[1..].iter().position(|&b| b == b']')?;
+            authority[1..close].parse::<std::net::Ipv6Addr>().ok()?;
+            (&authority[1..close], &bytes[close + 1..])
+        } else {
+            let end = bytes
+                .iter()
+                .position(|b| !reg_name(b))
+                .unwrap_or(bytes.len());
+            (&authority[..end], &bytes[end..])
+        };
+        let port = match rest {
+            [] => None,
+            [b':', digits @ ..] if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
+                let value = digits.iter().try_fold(0u32, |n, &d| {
+                    let n = n * 10 + u32::from(d - b'0');
+                    (n <= u32::from(u16::MAX)).then_some(n)
+                })?;
+                Some(u16::try_from(value).ok().filter(|&port| port != 0)?)
+            }
+            _ => return None,
+        };
+        Some((host, port))
+    }
+
+    /// A name a target may carry, as DNS limits one: labels of 1 to 63 letters, digits, `-` and
+    /// `_`, none starting or ending with `-`, 253 bytes in all.
+    fn a_dns_name(host: &str) -> bool {
+        host.len() <= 253
+            && host.split('.').all(|label| {
+                (1..=63).contains(&label.len())
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+            })
+    }
+
+    /// Authorities as a cage may write them: the hosts of [`host_spellings`] and IPv6 addresses,
+    /// bare, in brackets, in brackets with text after, with an opening bracket only, or behind
+    /// userinfo; then no port, a port in and out of range, with leading zeros, or spelled another
+    /// way; and now and then a character put in or taken out.
+    ///
+    /// [`host_spellings`]: crate::allowlist::tests::host_spellings
+    fn request_authorities() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let host = prop_oneof![
+            4 => crate::allowlist::tests::host_spellings(),
+            1 => any::<std::net::Ipv6Addr>().prop_map(|a| a.to_string()),
+            1 => "[a-zA-Z0-9_.@%:-]{0,12}",
+        ];
+        let port = prop_oneof![
+            3 => Just(String::new()),
+            4 => prop_oneof![0u32..70_000, proptest::sample::select(vec![0, 1, 65_535, 65_536])]
+                .prop_map(|p| format!(":{p}")),
+            1 => (0u32..70_000, 1usize..3).prop_map(|(p, z)| format!(":{}{p}", "0".repeat(z))),
+            1 => proptest::sample::select(vec![
+                ":", ":+443", ": 443", ":443 ", ":\u{a0}443", ":443:1", ":-1", ":0x1bb",
+                ":4430000000000", "::443", ":44\u{0}3",
+            ])
+            .prop_map(str::to_string),
+        ];
+        let mutation = proptest::option::weighted(
+            0.15,
+            (
+                any::<proptest::sample::Index>(),
+                proptest::sample::select(vec!['[', ']', ':', '@', '.', '0', ' ', '\u{a0}', 'x']),
+                any::<bool>(),
+            ),
+        );
+        (host, port, 0u8..5, mutation).prop_map(|(host, port, shape, mutation)| {
+            let authority = match shape {
+                0 => format!("{host}{port}"),
+                1 => format!("[{host}]{port}"),
+                2 => format!("[{host}]x{port}"),
+                3 => format!("[{host}{port}"),
+                _ => format!("user@{host}{port}"),
+            };
+            let Some((at, byte, insert)) = mutation else {
+                return authority;
+            };
+            let mut chars: Vec<char> = authority.chars().collect();
+            match (insert, chars.is_empty()) {
+                (true, _) => chars.insert(at.index(chars.len() + 1), byte),
+                (false, false) => {
+                    chars.remove(at.index(chars.len()));
+                }
+                (false, true) => {}
+            }
+            chars.into_iter().collect()
+        })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+        /// Every reader of a request's authority reads it to the grammar: the `Host` header, the
+        /// CONNECT line with its port required, the binding of a `Host` to its connection, an
+        /// absolute-form URL with the scheme's port for none, and a `tcp://` target with its port
+        /// required. The two targets also hold the host to what a DNS name can be.
+        #[test]
+        fn every_reader_of_a_request_authority_reads_it_to_the_grammar(
+            authority in request_authorities(),
+            connection_port in 1u16..,
+        ) {
+            use proptest::prop_assert_eq;
+            let named = authority_by_the_grammar(&authority).and_then(|(host, port)| {
+                let host = allowlist::canonical_host(host);
+                allowlist::is_request_host(&host).then_some((host, port))
+            });
+            prop_assert_eq!(request_authority(&authority), named.clone());
+            prop_assert_eq!(
+                connect_authority(&authority),
+                named.clone().and_then(|(host, port)| Some((host, port?)))
+            );
+            for host in named.iter().map(|(host, _)| host.as_str()).chain(["h.test"]) {
+                prop_assert_eq!(
+                    authority_bound_to(&authority, host, connection_port),
+                    named.as_ref().is_some_and(|(named, port)| {
+                        named == host && port.is_none_or(|port| port == connection_port)
+                    }),
+                    "{:?} on {}:{}", authority, host, connection_port
+                );
+            }
+            let target = named.filter(|(host, _)| {
+                host.parse::<std::net::IpAddr>().is_ok() || a_dns_name(host)
+            });
+            if !authority.contains(['/', '?', '#']) {
+                prop_assert_eq!(
+                    allowlist::parse_url_target(&format!("https://{authority}/x"))
+                        .ok()
+                        .map(|(host, port, _)| (host, port)),
+                    target.clone().map(|(host, port)| (host, port.unwrap_or(443)))
+                );
+            }
+            if !authority.contains('/') {
+                prop_assert_eq!(
+                    allowlist::parse_tcp_target(&format!("tcp://{authority}")).ok(),
+                    target.and_then(|(host, port)| Some((host, port?)))
+                );
+            }
+        }
+    }
+
+    /// The size a chunk-size line names, the line without its terminator, as the grammar reads it:
+    /// `1*HEXDIG` fitting 64 bits, then an extension that is whatever follows `;`. No blank is
+    /// taken before the `;`, which RFC 9112 allows and this module refuses.
+    fn size_by_the_grammar(line: &[u8]) -> Option<u64> {
+        let field = line.split(|&b| b == b';').next()?;
+        if field.is_empty() || !field.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        field.iter().try_fold(0u64, |size, &digit| {
+            let digit = u64::from(char::from(digit).to_digit(16)?);
+            size.checked_mul(16)?.checked_add(digit)
+        })
+    }
+
+    /// A chunked body as the grammar reads it, recognized over the whole input at once: the
+    /// decoded body and how far the message runs, or `None` when the input holds no whole message.
+    /// A line ends at LF with at most one CR before it and holds at most [`CHUNK_LINE_MAX`] bytes,
+    /// chunk data is followed by CRLF, and after the zero chunk come at most
+    /// [`TRAILER_LINES_MAX`] trailer lines and the empty line that ends the body.
+    fn chunked_by_the_grammar(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+        let line_at = |at: usize| -> Option<(&[u8], usize)> {
+            let end = at + input.get(at..)?.iter().position(|&b| b == b'\n')? + 1;
+            if end - at > CHUNK_LINE_MAX as usize {
+                return None;
+            }
+            let text = &input[at..end - 1];
+            Some((text.strip_suffix(b"\r").unwrap_or(text), end))
+        };
+        let mut body = Vec::new();
+        let mut at = 0;
+        loop {
+            let (line, next) = line_at(at)?;
+            let size = usize::try_from(size_by_the_grammar(line)?).ok()?;
+            at = next;
+            if size == 0 {
+                break;
+            }
+            body.extend_from_slice(input.get(at..at.checked_add(size)?)?);
+            at += size;
+            if input.get(at..at + 2)? != b"\r\n" {
+                return None;
+            }
+            at += 2;
+        }
+        for _ in 0..=TRAILER_LINES_MAX {
+            let (line, next) = line_at(at)?;
+            at = next;
+            if line.is_empty() {
+                return Some((body, at));
+            }
+        }
+        None
+    }
+
+    /// A line ending as a sender may write one: CRLF, or LF alone.
+    fn line_ends() -> impl proptest::strategy::Strategy<Value = &'static [u8]> {
+        use proptest::prelude::*;
+        prop_oneof![3 => Just(&b"\r\n"[..]), 1 => Just(&b"\n"[..])]
+    }
+
+    /// A chunk-size line: the size in hex of either case, now and then with leading zeros, a sign,
+    /// a blank, or digits enough to overflow, then an extension or none; or bytes of any kind.
+    fn chunk_size_lines() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        let lead = proptest::sample::select(vec!["", "", "", "0", "00", "+", " ", "\u{a0}", "-"]);
+        let extension = proptest::sample::select(vec!["", "", ";a=b", ";", " ;x", ";\r", "\t"]);
+        let spelled = (
+            lead,
+            prop_oneof![any::<u64>(), 0u64..300],
+            any::<bool>(),
+            proptest::option::weighted(0.1, "[0-9a-fA-F]{17,20}"),
+            extension,
+            proptest::option::weighted(0.9, line_ends()),
+        )
+            .prop_map(|(lead, size, upper, overflow, extension, end)| {
+                let digits = match (overflow, upper) {
+                    (Some(digits), _) => digits,
+                    (None, true) => format!("{size:X}"),
+                    (None, false) => format!("{size:x}"),
+                };
+                let mut line = format!("{lead}{digits}{extension}").into_bytes();
+                line.extend_from_slice(end.unwrap_or_default());
+                line
+            });
+        prop_oneof![4 => spelled, 1 => proptest::collection::vec(any::<u8>(), 0..12)]
+    }
+
+    /// A chunked body, then what the connection carries next: chunks of a few bytes under size
+    /// lines spelled in both cases, with and without leading zeros and extensions, a zero chunk,
+    /// trailers, the ending line, and now and then a byte replaced or put in, or the input cut.
+    fn chunked_inputs() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        let extension = || proptest::sample::select(vec!["", "", "", ";a=b", ";", " ;x"]);
+        let chunk = (
+            proptest::collection::vec(any::<u8>(), 1..12),
+            0usize..3,
+            any::<bool>(),
+            extension(),
+            line_ends(),
+        )
+            .prop_map(|(data, zeros, upper, extension, end)| {
+                let size = match upper {
+                    true => format!("{:X}", data.len()),
+                    false => format!("{:x}", data.len()),
+                };
+                let mut wire = format!("{}{size}{extension}", "0".repeat(zeros)).into_bytes();
+                wire.extend_from_slice(end);
+                wire.extend_from_slice(&data);
+                wire.extend_from_slice(b"\r\n");
+                wire
+            });
+        // A size line at the bound on a line's length, and one past it.
+        let at_bound = |past: usize| {
+            let extension = "e".repeat(CHUNK_LINE_MAX as usize - 4 + past);
+            format!("1;{extension}\r\nx\r\n").into_bytes()
+        };
+        let odd_chunk = proptest::sample::select(vec![
+            b"10000000000000000\r\nx\r\n".to_vec(),
+            b"ffffffff\r\nx\r\n".to_vec(),
+            b"3\r\nabcXX".to_vec(),
+            at_bound(0),
+            at_bound(1),
+        ]);
+        let chunks = proptest::collection::vec(prop_oneof![8 => chunk, 1 => odd_chunk], 0..4);
+        let last = (0usize..3, extension(), line_ends()).prop_map(|(zeros, extension, end)| {
+            let mut wire = format!("0{}{extension}", "0".repeat(zeros)).into_bytes();
+            wire.extend_from_slice(end);
+            wire
+        });
+        let trailers = proptest::collection::vec(("[a-z]{1,4}: [a-z]{0,4}", line_ends()), 0..3);
+        let mutation = proptest::option::weighted(
+            0.3,
+            (
+                any::<proptest::sample::Index>(),
+                proptest::sample::select(vec![b'+', b' ', 0xa0, b'g', b'\r', b'\n', b'0', b';']),
+                0u8..3,
+            ),
+        );
+        (
+            chunks,
+            last,
+            trailers,
+            line_ends(),
+            proptest::collection::vec(any::<u8>(), 0..8),
+            mutation,
+        )
+            .prop_map(|(chunks, last, trailers, end, next, mutation)| {
+                let mut input = chunks.concat();
+                input.extend_from_slice(&last);
+                for (trailer, trailer_end) in trailers {
+                    input.extend_from_slice(trailer.as_bytes());
+                    input.extend_from_slice(trailer_end);
+                }
+                input.extend_from_slice(end);
+                input.extend_from_slice(&next);
+                match mutation {
+                    Some((at, byte, 0)) if !input.is_empty() => {
+                        let at = at.index(input.len());
+                        input[at] = byte;
+                    }
+                    Some((at, byte, 1)) => input.insert(at.index(input.len() + 1), byte),
+                    Some((at, _, _)) => input.truncate(at.index(input.len() + 1)),
+                    None => {}
+                }
+                input
+            })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+        /// A chunk-size line is read to the grammar: a terminated line whose size is `1*HEXDIG`
+        /// within 64 bits, and nothing a looser reader would also take.
+        #[test]
+        fn a_chunk_size_line_is_read_to_the_grammar(line in chunk_size_lines()) {
+            let named = line
+                .strip_suffix(b"\n")
+                .map(|text| text.strip_suffix(b"\r").unwrap_or(text))
+                .and_then(size_by_the_grammar);
+            proptest::prop_assert_eq!(parse_chunk_size(&line).ok(), named, "{:?}", line);
+        }
+
+        /// A chunked body is decoded to the grammar however its bytes arrive: whole and within
+        /// the cap, it comes back and the reader is left where the next message starts; anything
+        /// else is refused.
+        #[test]
+        fn a_chunked_body_is_decoded_to_the_grammar_in_any_pieces(
+            input in chunked_inputs(),
+            sizes in proptest::collection::vec(1usize..9, 1..4),
+            interrupts in proptest::collection::vec(proptest::prelude::any::<bool>(), 1..4),
+            buffer in 1usize..16,
+            cap in proptest::prop_oneof![
+                proptest::strategy::Just(crate::allowlist::DEFAULT_BODY_MAX),
+                0u64..40,
+            ],
+        ) {
+            let whole = chunked_by_the_grammar(&input);
+            let trickle = crate::testutil::Trickle::new(&input, sizes, interrupts);
+            let mut reader = io::BufReader::with_capacity(buffer, trickle);
+            match (read_chunked_body(&mut reader, cap), whole) {
+                (Ok(body), Some((decoded, end))) => {
+                    proptest::prop_assert_eq!(&body, &decoded);
+                    proptest::prop_assert!(body.len() as u64 <= cap, "{:?} past the cap", input);
+                    let mut next = Vec::new();
+                    reader.read_to_end(&mut next).unwrap();
+                    proptest::prop_assert_eq!(&next[..], &input[end..]);
+                }
+                (Err(e), Some((decoded, _))) => proptest::prop_assert!(
+                    decoded.len() as u64 > cap,
+                    "{:?} refused within the cap: {}", input, e
+                ),
+                (Ok(body), None) => {
+                    proptest::prop_assert!(false, "{:?} decoded as {:?}", input, body)
+                }
+                (Err(_), None) => {}
+            }
+        }
+
+        /// A chunked response is relayed to where its framing ends however its bytes arrive, and
+        /// says so: whole, exactly the message is relayed and what follows stays unread; anything
+        /// else is relayed to the end, as the close-delimited relay did, and is not reported as
+        /// framed.
+        #[test]
+        fn a_chunked_response_is_relayed_to_where_its_framing_ends_in_any_pieces(
+            input in chunked_inputs(),
+            sizes in proptest::collection::vec(1usize..9, 1..4),
+            interrupts in proptest::collection::vec(proptest::prelude::any::<bool>(), 1..4),
+            buffer in 1usize..16,
+            reads in proptest::collection::vec(1usize..9, 1..4),
+        ) {
+            let trickle = crate::testutil::Trickle::new(&input, sizes, interrupts);
+            let reader = io::BufReader::with_capacity(buffer, trickle);
+            let mut body = FramedBody::new(reader, &BodyFraming::Chunked);
+            let mut relayed = Vec::new();
+            for turn in 0.. {
+                let mut out = vec![0u8; reads[turn % reads.len()]];
+                match body.read(&mut out) {
+                    Ok(0) => break,
+                    Ok(n) => relayed.extend_from_slice(&out[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => proptest::prop_assert!(false, "{:?}: {}", input, e),
+                }
+            }
+            match chunked_by_the_grammar(&input) {
+                Some((_, end)) => {
+                    proptest::prop_assert_eq!(&relayed[..], &input[..end]);
+                    proptest::prop_assert!(body.ended_as_framed(), "{:?}", input);
+                    let mut next = Vec::new();
+                    body.inner.read_to_end(&mut next).unwrap();
+                    proptest::prop_assert_eq!(&next[..], &input[end..]);
+                }
+                None => {
+                    proptest::prop_assert_eq!(&relayed, &input);
+                    proptest::prop_assert!(!body.ended_as_framed(), "{:?}", input);
+                }
+            }
+        }
+    }
 }

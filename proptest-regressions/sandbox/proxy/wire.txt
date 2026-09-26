@@ -1,0 +1,20 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a3ea03f6121b90f5de0ba8feb52455b5960338d14a7962fa9900ee3cc07031db # shrinks to authority = "[0.0.0.0]", connection_port = 1
+cc e0c74a770fcef356ccbf1ef378784e6c3ca271c2f58e9872b846ea2bf4f081aa # shrinks to authority = "a:+443", connection_port = 1
+cc dea89e5886c48c1b6cf89193b57a526491c5c1ff69cc5758011fdfa98173d00d # shrinks to authority = "::1:0:0:1", connection_port = 1
+cc 96d01ad83d84463ca39c1fb1f3a6549ec6a80a93a91f67acfad04eec3da71c47 # shrinks to authority = "[::1:0:0]", connection_port = 1
+cc 563ead0fa469f5b53f26f7b998ea3498547aaf94b7b45de28c0b00183b827986 # shrinks to authority = "[::1:0:0]:1", connection_port = 1
+cc 02c93aa0b41ca49f8c45b7ad55cdf19162735f07184957f4f8164e91ca342a57 # shrinks to authority = "0.a_", connection_port = 1
+cc 9ab01c15b7ce6e7ffe3400439dd20a1e6c80bc566963149614426b015f0b1d24 # shrinks to authority = ".a", connection_port = 1
+cc 9562689064f7420f0b22803995cfe97ddc872bcb01d0cc7b3dbcbfdc3df87887 # shrinks to authority = "[::1:0:0]:0", connection_port = 1
+cc 37f1b0164888dc58127e82eb63dbb8e93cf7cfd124a82b4705da62c5307eda1a # shrinks to authority = "user@a", connection_port = 1
+cc 6b67ac28a881a02c88e8276f27420c604058bc046656ae3ffcc870ffcac15120 # shrinks to authority = "::1:0:0:1", connection_port = 1
+cc 61369fa601684afdbf73b7a36339f85522dfdb5b8408493f76f38ba436eadb6f # shrinks to input = [48, 52, 13, 10, 0, 0, 0, 0, 13, 10, 48, 59, 97, 61, 98, 13, 10, 97, 58, 32, 13, 10, 97, 97, 97, 97, 58, 32, 97, 97, 97, 13, 10], sizes = [1], interrupts = [false], buffer = 1, cap = 67108864
+cc e1511c20705679c3d262ffd810a8ef5bedc3750bb2e44a7c2a66262bba91a8fd # shrinks to input = [48, 13, 10, 97, 58, 32, 13, 10, 97], sizes = [1], interrupts = [false], buffer = 1, reads = [1]
+cc 9169527722f59bf3be6fed87947ce97c293abda675c01a8cce16c789951fe050 # shrinks to input = [51, 13, 10, 97, 98, 99, 88, 88, 48, 13, 10, 13, 10], sizes = [1], interrupts = [false], buffer = 1, cap = 67108864
+cc da125f481e98f6637e9a478f5e6673ad3d5c510cc78cc59b540fc47da051a502 # shrinks to input = [56, 13, 10, 0, 0, 0, 0, 0, 0, 0, 0, 13, 10, 55, 13, 10, 0, 0, 0, 0, 0, 0, 0, 13, 10, 48, 13, 10, 13, 10], sizes = [1], interrupts = [false], buffer = 1, cap = 14
