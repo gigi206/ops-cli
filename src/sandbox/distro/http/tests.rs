@@ -381,8 +381,39 @@ fn a_trailer_section_is_bounded_at_the_count_the_buffered_path_applies() {
     let err = stream_body(&mut &wire[..], chunked, &mut sink, 1024)
         .expect_err("a trailer section past the bound is refused");
     assert!(
-        err.to_string()
-            .contains("a trailer section that does not end"),
+        err.to_string().contains("trailer section too long"),
         "the refusal names the section it bounded: {err}"
     );
+}
+
+/// A blob's chunked framing is read to the grammar the buffered path reads a document's with, so a
+/// body one refuses the other refuses too. The blob path had its own reading, which took a size
+/// with a sign or with blanks around it and a body that stopped after its zero chunk.
+#[test]
+fn a_blob_and_a_document_are_read_to_one_chunked_grammar() {
+    let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let both = |wire: &[u8]| {
+        let mut sink = Vec::new();
+        let streamed = stream_body(&mut &wire[..], chunked, &mut sink, 1024).map(|_| sink);
+        let held = wire::read_chunked_body(&mut &wire[..], 1024);
+        (streamed.ok(), held.ok())
+    };
+    let whole = Some(b"abc".to_vec());
+    assert_eq!(both(b"3\r\nabc\r\n0\r\n\r\n"), (whole.clone(), whole));
+    for wire in [
+        &b"+3\r\nabc\r\n0\r\n\r\n"[..],
+        " 3\r\nabc\r\n0\r\n\r\n".as_bytes(),
+        "\u{a0}3\r\nabc\r\n0\r\n\r\n".as_bytes(),
+        b"3 ;x\r\nabc\r\n0\r\n\r\n",
+        b"3\r\nabcXX0\r\n\r\n",
+        b"3\r\nabc\r\n0\r\n",
+        b"3\r\nabc\r\n0\r\nx: y",
+    ] {
+        assert_eq!(
+            both(wire),
+            (None, None),
+            "{:?}",
+            String::from_utf8_lossy(wire)
+        );
+    }
 }

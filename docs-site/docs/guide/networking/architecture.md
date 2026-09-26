@@ -301,6 +301,9 @@ framing stated twice is an ambiguity whichever coding it names, so counting the 
 is what refuses it rather than reading the first of the two. A well-formed `chunked`
 request is not refused: it is de-chunked into a bounded buffer and re-framed with a
 synthesized `Content-Length`, so exactly one unambiguous framing reaches the upstream.
+Well-formed runs to the last line: a body that stops after its zero chunk, or inside a
+trailer line, is `bad-request:chunked`, as a registry's response that does so is refused
+by `sbx`'s image client.
 
 An inspected request is also **written out again** rather than forwarded byte for byte,
 which is what makes the proxy's own reading of it the one the upstream sees. For that to

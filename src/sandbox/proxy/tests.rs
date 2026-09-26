@@ -6915,6 +6915,12 @@ fn read_chunked_body_fails_closed_on_malformed_framing() {
     let mut br = std::io::BufReader::new(std::io::Cursor::new(b"5".to_vec()));
     let err = read_chunked_body(&mut br, 1024).unwrap_err();
     assert!(err.to_string().contains("no line terminator"), "{err}");
+    // the body ends after its zero chunk, or inside a trailer line, before its last line
+    for wire in [&b"5\r\nhello\r\n0\r\n"[..], b"5\r\nhello\r\n0\r\nx: y"] {
+        let mut br = std::io::BufReader::new(std::io::Cursor::new(wire.to_vec()));
+        let err = read_chunked_body(&mut br, 1024).unwrap_err();
+        assert!(err.to_string().contains("before its last line"), "{err}");
+    }
 }
 
 #[test]

@@ -464,9 +464,10 @@ pub(super) const CHUNK_LINE_MAX: u64 = 8 * 1024;
 /// closed here.
 const TRAILER_LINES_MAX: usize = 64;
 
-/// De-chunk a `Transfer-Encoding: chunked` request body into one buffer, fail-closed on malformed
-/// framing (a non-hex chunk size, a short data read, a missing trailing CRLF) or a body over
-/// the caller's ceiling. The caller re-frames the result with a synthesized `Content-Length`
+/// De-chunk a `Transfer-Encoding: chunked` body into one buffer, fail-closed on malformed framing
+/// (a non-hex chunk size, a short data read, a missing trailing CRLF, a body that ends before its
+/// last line) or a body over the caller's ceiling. A request's caller re-frames the result with a
+/// synthesized `Content-Length`
 /// (stripping `Transfer-Encoding`), so the upstream receives one unambiguous Content-Length and no
 /// TE — no CL/TE request-smuggling ambiguity can reach it. Trailers after the zero chunk are read
 /// and discarded (the proxy does not forward them; they are not part of any secret-tripwire path).
@@ -475,19 +476,7 @@ pub(crate) fn read_chunked_body<R: BufRead>(r: &mut R, cap: u64) -> io::Result<V
     loop {
         let size = read_chunk_size_line(r)?;
         if size == 0 {
-            // trailers (if any) end at a blank line; read until it, each trailer line bounded and
-            // their number bounded too (see `TRAILER_LINES_MAX`).
-            let mut seen = 0usize;
-            loop {
-                let t = read_line_bounded(r, CHUNK_LINE_MAX)?;
-                if t.is_empty() || strip_eol(&t).is_empty() {
-                    break;
-                }
-                seen += 1;
-                if seen > TRAILER_LINES_MAX {
-                    return Err(invalid("chunked trailer section too long"));
-                }
-            }
+            read_chunked_trailers(r)?;
             return Ok(buf);
         }
         // `checked_add` so a crafted `ffffffffffffffff` (u64::MAX) size cannot overflow the running
@@ -501,12 +490,38 @@ pub(crate) fn read_chunked_body<R: BufRead>(r: &mut R, cap: u64) -> io::Result<V
         }
         buf.resize(start + size as usize, 0);
         r.read_exact(&mut buf[start..])?;
-        let mut crlf = [0u8; 2];
-        r.read_exact(&mut crlf)?;
-        if crlf != *b"\r\n" {
-            return Err(invalid("chunk data not followed by CRLF"));
+        read_chunk_crlf(r)?;
+    }
+}
+
+/// Read the CRLF that closes a chunk's data, refusing anything else in its place.
+pub(crate) fn read_chunk_crlf<R: Read>(r: &mut R) -> io::Result<()> {
+    let mut crlf = [0u8; 2];
+    r.read_exact(&mut crlf)?;
+    if crlf != *b"\r\n" {
+        return Err(invalid("chunk data not followed by CRLF"));
+    }
+    Ok(())
+}
+
+/// Read the trailer section that follows the zero chunk, through the blank line that ends the
+/// body: each line bounded ([`CHUNK_LINE_MAX`]) and their number bounded ([`TRAILER_LINES_MAX`]).
+///
+/// The blank line is required. A body that stops after the zero chunk, or inside a trailer line,
+/// ended before its last line, and the two readers that decode a body refuse it alike, as
+/// [`FramedBody`] reports the same wire as not having ended where its framing said. Both decoders
+/// accepted it, each with its own grammar, while the relay reported it unframed.
+pub(crate) fn read_chunked_trailers<R: BufRead>(r: &mut R) -> io::Result<()> {
+    for _ in 0..=TRAILER_LINES_MAX {
+        let line = read_line_bounded(r, CHUNK_LINE_MAX)?;
+        if !line.ends_with(b"\n") {
+            return Err(invalid("chunked body ended before its last line"));
+        }
+        if strip_eol(&line).is_empty() {
+            return Ok(());
         }
     }
+    Err(invalid("chunked trailer section too long"))
 }
 
 /// Read one `\n`-terminated line, bounded to `max` bytes (a no-newline flood over the bound is a
@@ -528,7 +543,7 @@ pub(super) fn read_line_bounded<R: BufRead>(r: &mut R, max: u64) -> io::Result<V
 /// Read one chunk-size line (hex, optionally followed by `;extensions`), parse the size, and
 /// require a CRLF/LF terminator so an EOF mid-line is a malformed-body error, not a silent short
 /// read. The line is length-bounded (see [`read_line_bounded`]).
-pub(super) fn read_chunk_size_line<R: BufRead>(r: &mut R) -> io::Result<u64> {
+pub(crate) fn read_chunk_size_line<R: BufRead>(r: &mut R) -> io::Result<u64> {
     let line = read_line_bounded(r, CHUNK_LINE_MAX)?;
     if line.is_empty() {
         return Err(invalid("chunked body ended before a chunk size"));
