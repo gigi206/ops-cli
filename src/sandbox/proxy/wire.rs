@@ -320,17 +320,63 @@ pub(super) fn split_authority(authority: &str) -> Option<(String, u16)> {
     Some((h.to_string(), p.parse().ok()?))
 }
 
-/// A `Host` header value with any `:port` removed (handling a bracketed IPv6 literal).
-pub(super) fn strip_port(authority: &str) -> String {
-    if let Some(rest) = authority.strip_prefix('[')
-        && let Some((addr, _)) = rest.split_once(']')
-    {
-        return addr.to_string();
-    }
-    match authority.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h.to_string(),
-        _ => authority.to_string(),
-    }
+/// The host and port a request's `Host` header, or an HTTP/2 `:authority`, names: the host in the
+/// one spelling a verdict is taken against ([`allowlist::canonical_host`]), and the port, `None`
+/// when none is written. `None` for a value that names no request host.
+///
+/// Read to the grammar, `uri-host [ ":" port ]` (RFC 9110 §7.2, the host of RFC 3986 §3.2.2),
+/// rather than by taking off whatever looks like a port, which is what this did. The difference
+/// is the value that crosses: the header is forwarded as the client wrote it, so a reading that
+/// throws part of it away authorizes one string and relays another. `[good.com]evil.test` was
+/// read as `good.com`, and a port too large for sixteen bits was taken off as though it were one.
+/// So brackets hold an IPv6 address and nothing else, what follows them is `:port` or nothing, a
+/// port is digits that fit sixteen bits, and the host is one the supervisor accepts
+/// ([`allowlist::is_request_host`]), which leaves no room for userinfo. A port written empty
+/// (`good.com:`) is refused as well: the grammar allows it and no client sends it, and reading it
+/// as absent would be one more spelling of the same answer.
+pub(super) fn request_authority(value: &str) -> Option<(String, Option<u16>)> {
+    let (host, port) = match value.strip_prefix('[') {
+        Some(rest) => {
+            let (literal, tail) = rest.split_once(']')?;
+            literal.parse::<std::net::Ipv6Addr>().ok()?;
+            let port = match tail {
+                "" => None,
+                tail => Some(tail.strip_prefix(':')?),
+            };
+            (literal, port)
+        }
+        None => match value.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (value, None),
+        },
+    };
+    let port = match port {
+        None => None,
+        Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(digits.parse().ok()?)
+        }
+        Some(_) => return None,
+    };
+    let host = allowlist::canonical_host(host);
+    allowlist::is_request_host(&host).then_some((host, port))
+}
+
+/// Whether a request's `Host` header, or an HTTP/2 stream's `:authority`, is bound to the
+/// connection it arrived on: it names `host`, and `port` when it names a port at all.
+///
+/// One definition for every plane that asks, because the string sbx authorizes is the string it
+/// forwards: the HTTP/1.1 planes relay the header as written, and h2 re-emits the authority whole.
+/// The planes used to answer apart. The HTTP/1.1 check compared the host alone, so `good.com:8443`
+/// on a tunnel opened to port 443 passed there and was refused on HTTP/2, while the HTTP/2 check
+/// let a port too large to parse through as though none were written. A port that differs is
+/// refused because a front end that routes on `host:port` would take the request somewhere the
+/// verdict never looked; a port that is absent is not, since a client on the scheme's default
+/// port omits it. Userinfo (`victim.example@grpc.test`) names no host here: RFC 9113 §8.3.1 makes
+/// an `:authority` carrying it malformed for an intermediary to relay, and an edge that reads the
+/// segment before the `@` would route on it.
+pub(super) fn authority_bound_to(value: &str, host: &str, port: u16) -> bool {
+    request_authority(value)
+        .is_some_and(|(named, named_port)| named == host && named_port.is_none_or(|p| p == port))
 }
 
 /// A `Read` adapter that adds every byte it yields to a shared counter — the live byte total the flow
@@ -1759,13 +1805,73 @@ mod tests {
     }
 
     #[test]
-    fn strip_port_removes_a_numeric_port_but_keeps_a_non_numeric_suffix() {
-        assert_eq!(strip_port("h:443"), "h");
-        assert_eq!(strip_port("[::1]:8080"), "::1");
-        assert_eq!(strip_port("[::1]"), "::1");
-        assert_eq!(strip_port("h"), "h");
-        // a colon suffix that is not all-digits is not a port, so the value is kept verbatim.
-        assert_eq!(strip_port("h:notaport"), "h:notaport");
+    fn a_host_header_is_read_to_the_authority_grammar() {
+        let read = |value: &str| request_authority(value);
+        let named = |host: &str, port: Option<u16>| Some((host.to_string(), port));
+        assert_eq!(read("h.test"), named("h.test", None));
+        assert_eq!(read("h.test:443"), named("h.test", Some(443)));
+        assert_eq!(read("H.Test.:0443"), named("h.test", Some(443)));
+        assert_eq!(read("1.2.3.4:80"), named("1.2.3.4", Some(80)));
+        assert_eq!(read("[::1]"), named("::1", None));
+        assert_eq!(read("[0:0::1]:8080"), named("::1", Some(8080)));
+        for refused in [
+            "",
+            ":443",
+            "h.test:",
+            "h.test:+443",
+            "h.test: 443",
+            "h.test:65536",
+            "h.test:4430000000000",
+            "h.test:443:1",
+            "h.test:notaport",
+            "x@h.test",
+            "x@h.test:443",
+            "[h.test]",
+            "[h.test]:443",
+            "[h.test]evil.test",
+            "[::1]evil.test",
+            "[::1]:",
+            "[1.2.3.4]",
+            "[v1.x]:443",
+            "[::ffff:1.2.3.4]",
+            "::1",
+            "h%2etest",
+        ] {
+            assert_eq!(read(refused), None, "`{refused}` names no request host");
+        }
+    }
+
+    /// The `Host` of an HTTP/1.1 request and the `:authority` of an HTTP/2 stream are held to the
+    /// one check. It compared the host alone on HTTP/1.1, so a port the connection was not opened
+    /// to passed there and was refused on HTTP/2; and HTTP/2 let a port too large to parse through
+    /// as though none were written.
+    #[test]
+    fn a_host_is_bound_to_its_connection_by_host_and_by_any_port_it_writes() {
+        for bound in ["good.test", "GOOD.test.", "good.test:443", "good.test:0443"] {
+            assert!(
+                authority_bound_to(bound, "good.test", 443),
+                "`{bound}` names the connection"
+            );
+        }
+        for unbound in [
+            "good.test:8443",
+            "good.test:65979",
+            "good.test:4430000000000",
+            "[good.test]",
+            "[good.test]:443",
+            "[good.test]evil.test",
+            "x@good.test",
+            "evil.test",
+            "good.test.evil.test",
+        ] {
+            assert!(
+                !authority_bound_to(unbound, "good.test", 443),
+                "`{unbound}` must not pass for good.test:443"
+            );
+        }
+        assert!(authority_bound_to("[::1]:8080", "::1", 8080));
+        assert!(authority_bound_to("[::1]", "::1", 8080));
+        assert!(!authority_bound_to("[::1]:8081", "::1", 8080));
     }
 
     #[test]

@@ -7810,6 +7810,90 @@ fn a_connect_host_sni_mismatch_is_refused() {
     );
 }
 
+/// The decrypted `Host` is bound to the CONNECT by the port it writes as well as by its host,
+/// through the check the HTTP/2 plane uses (`authority_bound_to`): a port the tunnel was not
+/// opened to, one too large to be a port, and a name written inside brackets are refused before
+/// any verdict or connect.
+///
+/// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses, so
+/// a `Host` that passes the gate comes back `403 ssrf-blocked` rather than `421 host-mismatch`,
+/// and the last two cases prove the tunnel's own authority, with or without its port, still does.
+#[test]
+fn a_tunneled_host_naming_another_port_or_a_bracketed_name_is_refused() {
+    let answer = |host: &str| {
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
+                .unwrap()
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+        );
+        let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        through_proxy(
+            ctx,
+            proxy_ca_der,
+            "allowed.test",
+            "allowed.test",
+            8443,
+            request.as_bytes(),
+        )
+        .unwrap()
+    };
+    for host in [
+        "allowed.test:443",
+        "allowed.test:65979",
+        "[allowed.test]",
+        "[allowed.test]evil.test",
+    ] {
+        let resp = answer(host);
+        assert!(
+            resp.contains("421") && resp.contains("host-mismatch"),
+            "`Host: {host}` does not name allowed.test:8443: {resp:?}"
+        );
+    }
+    for host in ["allowed.test", "allowed.test:8443"] {
+        let resp = answer(host);
+        assert!(
+            resp.contains("403") && resp.contains("ssrf-blocked"),
+            "`Host: {host}` names the tunnel and must pass the gate: {resp:?}"
+        );
+    }
+}
+
+/// The same binding on an absolute-form request: the `Host` must name the URL's host, and its port
+/// when it writes one.
+#[test]
+fn an_absolute_form_host_naming_another_port_is_refused() {
+    let answer = |host: &str| {
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["http://allowed.test:80"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+        );
+        let request = format!(
+            "GET http://allowed.test/x HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        );
+        through_cleartext(ctx, request.as_bytes()).unwrap()
+    };
+    for host in ["allowed.test:8080", "[allowed.test]:80"] {
+        let resp = answer(host);
+        assert!(
+            resp.contains("421") && resp.contains("host-mismatch"),
+            "`Host: {host}` does not name allowed.test:80: {resp:?}"
+        );
+    }
+    for host in ["allowed.test", "allowed.test:80"] {
+        let resp = answer(host);
+        assert!(
+            resp.contains("403") && resp.contains("ssrf-blocked"),
+            "`Host: {host}` names the URL and must pass the gate: {resp:?}"
+        );
+    }
+}
+
 /// The SSRF guard: a host that resolves to a private address is reachable only when the
 /// deciding rule names it exactly. A `*.domain` (wildcard) match resolving to loopback is
 /// blocked; a metadata address is blocked even for an exact-host rule.
@@ -11083,6 +11167,108 @@ fn a_credential_learned_after_a_tunnel_opens_is_scanned(declared_at_open: bool) 
         !rest.windows(frame.len()).any(|w| w == frame),
         "a value learned after the tunnel opened must be watched for on it: the frame carrying \
          it reached the upstream under a `block` posture (declared at open: {declared_at_open})"
+    );
+}
+
+/// A credential learned on the service a tunnel is bound for crosses that tunnel, whichever
+/// spelling of the host the handshake's `Host` uses. The tunnel's host is read through the check
+/// that admitted the handshake (`request_authority`), so a `Host` that writes the port names the
+/// service the credential was learned on. Read off the raw header, it would name
+/// `upstream.test:<port>`, a host nothing was learned on, and under `block` the tripwire would
+/// refuse the app's own session token as a leak.
+#[test]
+fn a_learned_credential_crosses_its_own_services_websocket_when_the_host_writes_the_port() {
+    use crate::allowlist::WebsocketSecret;
+    use crate::sandbox::control::{LOG_RING_CAP, LogRing};
+    const OWN: &str = "OWN-SERVICE-TOKEN-0123456";
+
+    let (addr, upstream_ca, got) = spawn_reporting_ws_upstream();
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            proxy_ca,
+            policy(&["{WS} upstream.test:*"]).with_websocket_secret(WebsocketSecret::Block),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_events(crate::sandbox::proxy::events::for_log(
+            Arc::new(LogRing::new(LOG_RING_CAP)),
+            None,
+        ))
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    assert!(
+        ctx.credentials
+            .observe("authorization", &format!("Bearer {OWN}"), "upstream.test"),
+        "the learned needle is the premise of this test"
+    );
+
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    {
+        let ctx = Arc::clone(&ctx);
+        thread::spawn(move || {
+            let _ = serve(
+                listener,
+                ctx,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        });
+    }
+    let mut sock = UnixStream::connect(&path).unwrap();
+    write!(
+        sock,
+        "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
+        addr.port()
+    )
+    .unwrap();
+    sock.flush().unwrap();
+    let _ = read_until_blank(&mut sock).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(proxy_ca_der).unwrap();
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = ServerName::try_from("upstream.test".to_string()).unwrap();
+    let conn = ClientConnection::new(Arc::new(client_config), name).unwrap();
+    let mut tls = StreamOwned::new(conn, sock);
+    write!(
+        tls,
+        "GET /chat HTTP/1.1\r\nHost: upstream.test:{}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n",
+        addr.port()
+    )
+    .unwrap();
+    tls.flush().unwrap();
+    let head = read_head_until_blank(&mut tls).unwrap();
+    assert!(head.contains("101 Switching Protocols"), "{head:?}");
+
+    let own = format!(r#"{{"auth":"{OWN}"}}"#);
+    let frame = ws_frame(0x1, own.as_bytes(), Some(CAGE_MASK));
+    tls.write_all(&frame).unwrap();
+    tls.flush().unwrap();
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
+    drop(tls);
+
+    let mut received = Vec::new();
+    while let Ok(chunk) = got.recv_timeout(UPSTREAM_WAIT) {
+        received.extend_from_slice(&chunk);
+    }
+    assert!(
+        received.windows(frame.len()).any(|w| w == frame),
+        "the service's own credential must reach the service it was learned on: the frame \
+         carrying it was held back as a leak"
     );
 }
 

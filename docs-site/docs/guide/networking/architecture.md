@@ -510,6 +510,15 @@ refuses it: the **CONNECT authority**, the TLS **SNI**, and the decrypted HTTP
 consistent identity is checked against the policy: you cannot allow `a.example.com`
 and be fronted to `b.example.com`.
 
+The `Host` header (and, on HTTP/2, each stream's `:authority`) is held to the port as
+well: a port it writes must be the one the connection was opened to, since the header
+reaches the upstream as written and a front end that routes on `host:port` would
+otherwise take the request somewhere the verdict never looked. A port may be left out.
+The value must also be an authority as HTTP spells one: a name, an IPv4 address, or an
+IPv6 address in brackets, then `:port` or nothing. A value carrying userinfo
+(`user@host`), a name inside brackets, or a port past 65535 is refused the same way.
+The absolute-form planes apply the same rule to the host of the request URL.
+
 ### The SSRF guard
 
 Upstream connections are opened on the host, with full network reach, so an allowlisted

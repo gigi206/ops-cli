@@ -134,9 +134,9 @@ fn refuse_upgrade(
 ) -> io::Result<()> {
     ctx.push_log(
         crate::sandbox::control::Proto::Https,
-        // The name, not `host:port`: the `Host` header carries the port when the client wrote one,
-        // and the port is its own field here — the same normalization the `101` path applies.
-        &strip_port(host),
+        // The name, not `host:port`: the caller reads it out of the `Host` header through
+        // `request_authority`, and the port is its own field here, as on the `101` path.
+        host,
         port,
         // The pseudo-verb the whole exchange was judged and logged under, so this line sits beside
         // its own allow rather than under the handshake's literal `GET`.
@@ -212,7 +212,12 @@ pub(super) fn relay_upgrade(
     // whole head phase is bounded by one timeout however many interim heads arrive.
     let mut up_br = BufReader::new(upstream);
     let deadline = head_deadline(ctx);
-    let host = inner.header("host").unwrap_or_default().to_string();
+    // The name the handshake's `Host` names, read the way the check that admitted it reads it.
+    let host = inner
+        .header("host")
+        .and_then(request_authority)
+        .map(|(host, _)| host)
+        .unwrap_or_default();
     let mut interim_seen = 0usize;
     let resp_head = loop {
         // An upstream that closes, resets or runs past the head budget leaves this plane with
@@ -335,8 +340,9 @@ pub(super) fn relay_upgrade(
     // The host this tunnel is bound for, which decides which learned credential the leak tripwire
     // scans for. Read off the handshake's own `Host` rather than threaded down from the CONNECT:
     // `serve_tunneled_request` refuses the request outright unless the CONNECT target, the SNI and
-    // this header all canonicalize to the same name, so there is one host here and not two.
-    let dest = inner.header("host").map(strip_port).unwrap_or_default();
+    // this header all name the same host (`authority_bound_to`), so there is one host here and
+    // not two.
+    let dest = host;
     relay_websocket(
         client,
         &client_pending,

@@ -31,9 +31,10 @@ use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
 use super::link::{Asked, Checked};
 use super::ssrf::{ConnectRefusal, ip_refusal};
 use super::{
-    AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, carries_secret, decide_https,
-    header_name_eq, is_connection_bound_challenge, matching_injection_ids, note_final_status,
-    redact_in_place, signer_refusal_message, upstream_server_name,
+    AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, authority_bound_to,
+    carries_secret, decide_https, header_name_eq, is_connection_bound_challenge,
+    matching_injection_ids, note_final_status, redact_in_place, signer_refusal_message,
+    upstream_server_name,
 };
 use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -323,8 +324,13 @@ async fn stream(
         return;
     }
     // Per-stream domain-fronting re-check: a client may send a different `:authority` per stream
-    // over one h2 tunnel, so bind every stream to the CONNECT host (== the SNI checked above).
-    if !authority_bound_to(req.uri().authority(), connect_host, port) {
+    // over one h2 tunnel, so bind every stream to the CONNECT host (== the SNI checked above) and
+    // port, through the check the HTTP/1.1 `Host` goes through too.
+    if !req
+        .uri()
+        .authority()
+        .is_some_and(|a| authority_bound_to(a.as_str(), connect_host, port))
+    {
         ctx.outcome(
             Proto::Https,
             connect_host,
@@ -412,34 +418,6 @@ async fn stream(
         pool,
     )
     .await;
-}
-
-/// Whether a stream's `:authority` is bound to the tunnel it arrived on: the same host, the same
-/// port, and no userinfo.
-///
-/// The host comparison alone is not the check, because the string sbx *authorizes* has to be the
-/// string sbx *forwards*. The upstream request is rebuilt from the decoded `parts.uri` and h2
-/// re-emits the authority verbatim (`Pseudo::request` writes `authority.as_str()`), while
-/// `Authority::host()` drops both the userinfo and the port — so an authority of
-/// `victim.example@grpc.vendor.example` passed a host-only gate and then crossed to the origin
-/// whole, for any edge that keys on the raw bytes or reads the segment before the `@`. RFC 9113
-/// §8.3.1 settles it independently: `:authority` MUST NOT carry the deprecated userinfo, and an
-/// intermediary receiving one must treat the request as malformed. sbx is that intermediary.
-///
-/// The HTTP/1.1 twin never had the gap — `serve_tunneled_request` compares the whole `Host` value
-/// minus an all-digit `:`-suffix, so both spellings mismatch there — and the module header claims
-/// parity with it, which this restores. A port is optional in an `:authority` (a client on the
-/// scheme's default port omits it), so it is checked only when present.
-fn authority_bound_to(
-    authority: Option<&http::uri::Authority>,
-    connect_host: &str,
-    port: u16,
-) -> bool {
-    authority.is_some_and(|a| {
-        !a.as_str().contains('@')
-            && a.port_u16().is_none_or(|p| p == port)
-            && allowlist::canonical_host(a.host()) == connect_host
-    })
 }
 
 /// The URI the upstream request is rebuilt from, with `:scheme` pinned to what the transport is.
@@ -4032,8 +4010,8 @@ mod tests {
     /// `victim.example@grpc.test` passed a host-only comparison and then crossed to the origin with
     /// the userinfo still on it, for any edge that keys on the raw bytes or reads the segment before
     /// the `@` — and RFC 9113 §8.3.1 makes a `:authority` carrying userinfo malformed for an
-    /// intermediary to relay at all. The HTTP/1.1 twin compares the whole `Host` value minus an
-    /// all-digit port suffix and refuses both spellings; this is the parity the module header claims.
+    /// intermediary to relay at all. The HTTP/1.1 `Host` is read through the same check,
+    /// `authority_bound_to`, which is the parity the module header claims.
     ///
     /// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses.
     /// A stream that slips past the authority gate therefore comes back `403 ssrf-blocked` — a

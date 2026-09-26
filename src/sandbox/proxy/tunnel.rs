@@ -209,11 +209,11 @@ pub(super) fn serve_tunneled_request(
         }
     };
 
-    // CONNECT-host == Host header (== SNI, already checked): the decrypted Host must agree too.
-    if inner
+    // CONNECT-host == Host header (== SNI, already checked): the decrypted Host must agree too, and
+    // name the CONNECT port when it names one (see `authority_bound_to`).
+    if !inner
         .header("host")
-        .map(|h| allowlist::canonical_host(&strip_port(h)) != connect_host)
-        .unwrap_or(true)
+        .is_some_and(|h| authority_bound_to(h, connect_host, port))
     {
         ctx.outcome(
             crate::sandbox::control::Proto::Https,
