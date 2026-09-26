@@ -12,19 +12,15 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #
-# PACKAGING — a prebuilt `.deb`, but NOT an Electron one. Reasonix Desktop is a **Wails** shell
-# (GTK3 + WebKit2GTK 4.1) around the same static Go kernel `reasonix.toml` runs in the terminal.
-# Verified against `desktop-v1.20.0`: the `.deb`'s control block declares
-# `Depends: libgtk-3-0, libwebkit2gtk-4.1-0, pkexec` and its description reads "a Wails shell
-# around the Go kernel"; the payload is `usr/bin/reasonix-desktop` (the dynamically linked shell),
-# `usr/bin/reasonix` (the static Go CLI) and `usr/bin/reasonix-launcher`.
-#
-# That shape is why the `[deb.<name>]` table below carries a `libs` list: the `deb:` backend
-# autoPatchelfs against a library set shared by every prebuilt package, and that set covers the
-# Electron/Chromium shape — no webkitgtk, no libsoup, no javascriptcoregtk. Naming them here adds
-# them for THIS package only, so no Electron app pays for WebKitGTK's closure. The launcher is found
-# at `usr/bin/reasonix-desktop` by the package name, which is what keeps the CLI and the updater
-# beside it from being wrapped by mistake.
+# PACKAGING — a prebuilt `.deb` of an Electron app. `desktop-v1.39.0` ships Electron 44.2.0
+# (`resources/build.json`) at `usr/lib/reasonix/app/Reasonix`, with the Go service it starts,
+# `usr/bin/reasonix-desktop`, the static Go CLI `usr/bin/reasonix` and `usr/bin/reasonix-launcher`
+# beside it. Earlier releases (this profile was first written against `desktop-v1.20.0`) were a
+# Wails shell on WebKitGTK; the resolver always takes the newest release, so what the bundle used
+# to carry for WebKitGTK is gone. The command passes the Electron flags every Electron profile
+# here needs: without `--no-sandbox` the app aborts at start on Chromium's setuid sandbox helper,
+# which the nix store cannot make setuid root; bubblewrap + seccomp + the empty netns are the
+# boundary instead.
 #
 # `reasonix-launcher` is deliberately not the entry point: it resolves the shell through a writable
 # `current.json` install layout it manages itself (the vendor's own updater), while versions move
@@ -58,10 +54,10 @@
 # and substituted by the egress proxy on the wire, never in the cage. See the `[env]` note and the
 # `[secret]` block at the bottom.
 #
-# VERIFIED on this profile: the resolve command, the host-side build, the launch, and a mapped
-# Reasonix window on a Wayland session. UNVERIFIED (like every profile until run with a real key):
-# the sign-in and the model traffic through sbx's MITM. Grounded here: the packaging (control block,
-# payload layout and the ELF NEEDED list read out of the published `.deb`).
+# VERIFIED on this profile with `desktop-v1.39.0`: the resolve command, the host-side build, and a
+# launch that keeps running on a Wayland session. UNVERIFIED (like every profile until run with a
+# real key): the sign-in and the model traffic through sbx's MITM. Grounded here: the payload layout
+# and the Go service's ELF NEEDED list, read out of the built package.
 # The command hands Reasonix the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
 # which files it protects, which operations it offers) as a user instruction file: a copy at
 # `~/.reasonix/CLAUDE.md`. Reasonix loads all three of `REASONIX.md`, `AGENTS.md` and `CLAUDE.md`
@@ -87,7 +83,8 @@ if [ -r "$s" ]; then
 elif grep -qsF "$m" "$f"; then
   rm -f "$f"
 fi
-exec reasonix-desktop "$@"
+exec reasonix-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --use-system-ca \
+  --password-store=gnome-libsecret "$@"
 ''',
     # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
     "reasonix-desktop",
@@ -99,20 +96,18 @@ gpu = true
 # media. Read the trade first: that bus exposes the MICROPHONE and every `.monitor` source, i.e.
 # what the rest of your desktop is playing — drop this line if the shell has no reason to make
 # noise. `dbus = true` gives the cage its OWN private portal (a session bus + xdg-desktop-portal
-# in-cage, never the host bus) and is what makes the app FOLLOW the desktop's light/dark scheme: the
-# portal seeds the host colour scheme at launch and sbx's theme relay rewrites the in-cage GSettings
-# keyfile on every host switch, so GTK re-themes live. It also gives the shell a real file dialog.
+# in-cage, never the host bus): the portal seeds the host colour scheme at launch and sbx's theme
+# relay follows every host switch. It also gives the shell a real file dialog and the keyring the
+# `--password-store=gnome-libsecret` flag names.
 # Both are security fields, honored only because this profile lives in your trusted config dir;
 # `dbus` requires `gui = "wayland"`, which is set above.
 audio = true
 dbus = true
 
 # --- The app's requirements come from its bundle --------------------------------------------------
-# `use` pulls in the `reasonix-desktop` BUNDLE — the `.deb`, its auto-upgrade resolver AND the
-# WebKitGTK library list that makes its ELF resolve, the GDK/WebKit environment the shell needs to
-# start in a cage, its provider host and its crash-reporter mute — from one declaration shared with
-# the bundle file itself. The posture (`gui`/`gpu`/`dbus`) stays here: a bundle may never widen it,
-# and `dbus = true` is what serves this shell its light/dark scheme.
+# `use` pulls in the `reasonix-desktop` BUNDLE — the `.deb`, its auto-upgrade resolver, its provider
+# host and its crash-reporter mute — from one declaration shared with the bundle file itself. The
+# posture (`gui`/`gpu`/`dbus`) stays here: a bundle may never widen it.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/reasonix-desktop.toml
@@ -136,10 +131,9 @@ mute = [
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage. To key
-# the provider, uncomment both blocks below. This profile declares no `[env]` table of its own — the
-# `[env]` that reaches the launch is the GDK/WebKit environment the bundle carries, and it stays
-# there — so the one uncommented here is the profile's only `[env]` header; keep it that way, since
-# a duplicate table is invalid TOML and the whole profile would fail to parse.
+# the provider, uncomment both blocks below. This profile declares no `[env]` table of its own, so
+# the one uncommented here is its only `[env]` header; keep it that way, since a duplicate table is
+# invalid TOML and the whole profile would fail to parse.
 #
 #[env]
 #DEEPSEEK_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"

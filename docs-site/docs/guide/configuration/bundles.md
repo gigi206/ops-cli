@@ -358,7 +358,7 @@ The 67 shipped bundles, and what each carries:
 | `qoder` | 3 (`mise:`, `nix:`) | 7 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `qwen-code` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `reasonix` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `reasonix-desktop` | 1 (`deb:`) | 2 egress entries, 4 env vars, a `deb:` resolver | none |
+| `reasonix-desktop` | 1 (`deb:`) | 2 egress entries, a `deb:` resolver | none |
 | `rovo` | 1 (`nix:`) | 12 egress entries | none |
 | `sigit` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `snow` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |

@@ -94,7 +94,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 
 ## Desktop applications (17)
 
-GUI agents: Electron for most, a Wails/WebKit2GTK shell for `reasonix-desktop`. Each needs a [Wayland display](../configuration/gui)
+GUI agents, most of them Electron. Each needs a [Wayland display](../configuration/gui)
 (`gui = "wayland"`), and most also enable [`gpu`](../configuration/gpu) and the in-cage
 [desktop portal](../configuration/dbus) (`dbus = true`). Where the tool's sign-in opens
 an external browser, the profile wires an in-cage Chromium as the `xdg-open` handler so the
@@ -124,7 +124,7 @@ every other entry here.
 | `opencode-desktop` | `deb:github:anomalyco/opencode` | provider-dependent (BYOK) |
 | `openwork` | `appimage:resolve` (the public build, whose OpenCode engine ships inside the artifact as a sidecar) (+ `nix:chromium`) | provider-dependent (BYOK); an OpenWork Den account (`app.openworklabs.com`) is optional |
 | `orca-desktop` | `deb:github:stablyai/orca` (+ `nix:chromium`; interior pilot agent `opencode` via `mise:opencode`) | provider-dependent (BYOK); Orca hosts (`login.onorca.dev`, `relay.onorca.dev`) denied by default |
-| `reasonix-desktop` | `deb:resolve` + `[deb.…] libs` (a Wails/WebKit2GTK shell, not Electron) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
+| `reasonix-desktop` | `deb:resolve` | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
 | `t3code` | `appimage:github:pingdotgg/t3code` (+ `nix:chromium`) | provider-dependent (BYOK) |
 | `traycer-desktop` | `deb:resolve` (the `desktop-v*` release track) | `authn`/`platform.traycer.ai` (Traycer account, device login); an orchestrator, it drives whichever agent you name in `use` |
 | `vibe` | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, …) | `*.mistral.ai` (`MISTRAL_API_KEY`) |
