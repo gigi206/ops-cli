@@ -273,8 +273,26 @@ fn through_proxy(
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
     });
+    through_listening_proxy(
+        &path,
+        proxy_ca,
+        connect_host,
+        sni_host,
+        connect_port,
+        request,
+    )
+}
 
-    let mut sock = UnixStream::connect(&path).unwrap();
+/// [`through_proxy`] to a proxy already serving on `path`, for a test that sends it many tunnels.
+fn through_listening_proxy(
+    path: &std::path::Path,
+    proxy_ca: CertificateDer<'static>,
+    connect_host: &str,
+    sni_host: &str,
+    connect_port: u16,
+    request: &[u8],
+) -> io::Result<String> {
+    let mut sock = UnixStream::connect(path).unwrap();
     write!(
         sock,
         "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
@@ -7953,6 +7971,144 @@ fn a_connect_host_sni_mismatch_is_refused() {
         resp.contains("host-mismatch"),
         "the refusal must name the domain-fronting motif: {resp:?}"
     );
+}
+
+/// A DNS name under `.test`, as a CONNECT may write it and a TLS client may send it: one to three
+/// labels of letters and digits, with `-` or `_` inside a label.
+fn test_names() -> impl proptest::strategy::Strategy<Value = String> {
+    use proptest::strategy::Strategy;
+    proptest::collection::vec("[a-z0-9]([a-z0-9_-]{0,4}[a-z0-9])?", 1..=3)
+        .prop_map(|labels| format!("{}.test", labels.join(".")))
+}
+
+/// `name` with each character's case taken in turn from `upper`, then `dots` trailing dots.
+fn respelled(name: &str, upper: &[bool], dots: usize) -> String {
+    let mut out: String = name
+        .chars()
+        .zip(upper.iter().cycle())
+        .map(|(c, &up)| if up { c.to_ascii_uppercase() } else { c })
+        .collect();
+    out.extend(std::iter::repeat_n('.', dots));
+    out
+}
+
+/// A CONNECT host and the server name a TLS client sends on its tunnel: the host itself, a name
+/// beside it (a subdomain, the parent, a label or a character put before or after it, a character
+/// replaced, an unrelated name), each in any case and with trailing dots, or an IP address, which a
+/// client sends as no name at all. Only names a TLS client accepts to send are kept.
+fn connect_and_server_names() -> impl proptest::strategy::Strategy<Value = (String, String)> {
+    use proptest::prelude::any;
+    use proptest::sample::Index;
+    use proptest::strategy::Strategy;
+    let upper = || proptest::collection::vec(any::<bool>(), 1..8);
+    (
+        (
+            test_names(),
+            test_names(),
+            0..10u8,
+            any::<Index>(),
+            "[a-z0-9]",
+        ),
+        (upper(), 0..=2usize, upper(), 0..=1usize, any::<IpAddr>()),
+    )
+        .prop_map(|((host, other, kind, at, c), (cu, cdots, su, sdots, ip))| {
+            let sni = match kind {
+                0 | 1 => host.clone(),
+                2 => format!("{c}.{host}"),
+                3 => format!("{c}{host}"),
+                4 => format!("{host}.{c}"),
+                5 => format!("{host}{c}"),
+                6 => host
+                    .split_once('.')
+                    .map_or(host.clone(), |(_, parent)| parent.into()),
+                7 => {
+                    let at = at.index(host.len());
+                    format!("{}{c}{}", &host[..at], &host[at + 1..])
+                }
+                8 => other,
+                _ => return (respelled(&host, &cu, cdots), ip.to_string()),
+            };
+            (respelled(&host, &cu, cdots), respelled(&sni, &su, sdots))
+        })
+        .prop_filter("a name a TLS client sends", |(_, sni)| {
+            ServerName::try_from(sni.clone()).is_ok()
+        })
+}
+
+/// A tunnel reaches the policy only when the server name its handshake sent is the host its
+/// CONNECT named, once the case of both and their trailing dots are set aside, whatever either is.
+///
+/// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses, so
+/// a name let past the check comes back `403 ssrf-blocked` and a name held at it `421
+/// host-mismatch` under the sentence that names the server name, not the `Host` header. An IP
+/// address is sent as no name, and the handshake then has no leaf to present.
+///
+/// One proxy serves every case: [`through_proxy`] leaves its accept loop running, which a few
+/// hundred cases would each leave behind.
+#[test]
+fn a_tunnel_reaches_the_policy_only_when_its_server_name_is_the_connect_host() {
+    use proptest::test_runner::{Config, TestRunner};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let canonical = |name: &str| name.to_ascii_lowercase().trim_end_matches('.').to_string();
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["*.test:*"]))
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+    );
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let proxy = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || serve(listener, ctx, stop))
+    };
+
+    let mut runner = TestRunner::new(Config {
+        source_file: Some(file!()),
+        ..Config::with_cases(1024)
+    });
+    let verdict = runner.run(&connect_and_server_names(), |(connect, sni)| {
+        let request = format!("GET / HTTP/1.1\r\nHost: {connect}\r\nConnection: close\r\n\r\n");
+        let answer = through_listening_proxy(
+            &path,
+            proxy_ca_der.clone(),
+            &connect,
+            &sni,
+            8443,
+            request.as_bytes(),
+        );
+        if sni.parse::<IpAddr>().is_ok() {
+            proptest::prop_assert!(answer.is_err(), "an IP sends no name: {answer:?}");
+        } else if canonical(&sni) == canonical(&connect) {
+            let resp =
+                answer.map_err(|e| proptest::test_runner::TestCaseError::fail(e.to_string()))?;
+            proptest::prop_assert!(
+                resp.contains("403") && resp.contains("ssrf-blocked"),
+                "`{sni}` names `{connect}`: {resp:?}"
+            );
+        } else {
+            let resp =
+                answer.map_err(|e| proptest::test_runner::TestCaseError::fail(e.to_string()))?;
+            proptest::prop_assert!(
+                resp.contains("421")
+                    && resp.contains("host-mismatch")
+                    && resp.contains("the TLS SNI does not match the CONNECT target"),
+                "`{sni}` does not name `{connect}`: {resp:?}"
+            );
+        }
+        Ok(())
+    });
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = UnixStream::connect(&path);
+    proxy.join().unwrap().unwrap();
+    if let Err(e) = verdict {
+        panic!("{e}");
+    }
 }
 
 /// The decrypted `Host` is bound to the CONNECT by the port it writes as well as by its host,
