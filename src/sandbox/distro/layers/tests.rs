@@ -172,6 +172,92 @@ fn a_directory_made_for_a_members_path_counts_against_the_member_ceiling() {
     assert_eq!(budget.members, 2);
 }
 
+/// A tar of `count` members, each described by a PAX record of `len` bytes: to reach a member, the
+/// tar reader reads the record's header block, the record padded to a block, and the member's own
+/// header block. Each member carries one block of data, so none leaves padding for the next.
+fn tar_with_pax_records_of(len: usize, count: usize) -> Vec<u8> {
+    // One record, `<len> comment=<value>\n`, whose leading length counts its own digits.
+    let value = "c".repeat(len - len.to_string().len() - " comment=\n".len());
+    let record = format!("{len} comment={value}\n");
+    assert_eq!(record.len(), len);
+    let mut builder = tar::Builder::new(Vec::new());
+    for i in 0..count {
+        let mut pax = tar::Header::new_ustar();
+        pax.set_entry_type(tar::EntryType::XHeader);
+        pax.set_path(format!("PaxHeader/f{i}")).unwrap();
+        pax.set_size(len as u64);
+        pax.set_mode(0o644);
+        pax.set_cksum();
+        builder.append(&pax, record.as_bytes()).unwrap();
+        let mut file = tar::Header::new_ustar();
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_mode(0o644);
+        file.set_size(512);
+        builder
+            .append_data(&mut file, format!("f{i}"), &[b'x'; 512][..])
+            .unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+/// What the tar reader reads to reach a member is bounded, so a long name is refused before it is
+/// held in memory.
+///
+/// The `tar` crate reads a long name, a long link or a PAX record whole, at the size its header
+/// declares, before the member it describes reaches the budget, so a small gzip layer could make
+/// this process hold a name of any size. Records that bring what precedes each of two members to
+/// exactly [`MAX_HEADER_BYTES`] still apply, the bound being per member, and one block more is
+/// refused. So is a long name past the bound, which used to fail too, but later, on its length as a
+/// path, once held. A long name of honest length applies, and so does a member whose own data is
+/// past the bound, which is the budget's to count.
+#[test]
+fn a_long_name_or_pax_record_past_the_header_bound_is_refused_before_it_is_held() {
+    let tmp = crate::testutil::TmpDir::new();
+    let block = 512;
+    let bound = MAX_HEADER_BYTES as usize;
+
+    let root = tmp.join("at-the-bound");
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_with_pax_records_of(bound - 2 * block, 2),
+    )
+    .expect("records that bring each member to the bound apply");
+    assert!(root.join("f0").is_file() && root.join("f1").is_file());
+
+    let long = "n".repeat(bound);
+    for (what, archive) in [
+        (
+            "a PAX record",
+            tar_with_pax_records_of(bound - 2 * block + 1, 1),
+        ),
+        ("a long name", tar_of(&[(&long, Member::File("x"))])),
+    ] {
+        let err = apply_tar(tmp.path(), &tmp.join("past-the-bound"), &archive).expect_err(what);
+        assert!(
+            err.to_string().contains("member headers run past"),
+            "{what}: {err}"
+        );
+    }
+
+    // Witness: a long name of honest length, twelve components of 250 bytes, lands, and so does a
+    // member twice the bound in size.
+    let honest = vec!["h".repeat(250); 12].join("/");
+    let big = "d".repeat(2 * bound);
+    let root = tmp.join("honest");
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[(&honest, Member::File("x")), ("big", Member::File(&big))]),
+    )
+    .expect("an honest long name and a large member apply");
+    assert!(root.join(&honest).is_file());
+    assert_eq!(
+        fs::metadata(root.join("big")).unwrap().len(),
+        big.len() as u64
+    );
+}
+
 #[test]
 fn a_layer_lands_with_its_files_directories_and_links() {
     let tmp = crate::testutil::TmpDir::new();

@@ -49,9 +49,11 @@
 //! whatever the cage looks like later.
 
 use super::gzip::GzipReader;
+use std::cell::Cell;
 use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 /// The most one image's layers may unpack to on disk, and the most entries they may create: a
 /// member, or a directory made on the way to one.
@@ -119,6 +121,44 @@ impl Budget {
     }
 }
 
+/// The most the tar reader may read to reach the next member: its header block, the long name,
+/// long link or PAX record describing it, and whatever the member before left unread.
+///
+/// The `tar` crate holds a long name, a long link or a PAX record whole in memory, at the size its
+/// own header declares, while it looks for the member they describe: before that member reaches the
+/// budget, and in bytes the budget never counts. Gzip expands, so a layer small enough to fetch
+/// could declare a name of gigabytes and have this process hold it, and then copy it as a path.
+/// Nothing in an honest layer comes near the bound: a path is at most `PATH_MAX`, 4 KiB, and an
+/// extended attribute a PAX record carries at most 64 KiB.
+const MAX_HEADER_BYTES: u64 = 1024 * 1024;
+
+/// The layer as the tar reader reads it, refusing past what is left while [`unpack`] sets a limit.
+/// See [`MAX_HEADER_BYTES`].
+struct Metered<R> {
+    inner: R,
+    /// What may still be read before the next member, or `None` while a member is being read.
+    left: Rc<Cell<Option<u64>>>,
+}
+
+impl<R: io::Read> io::Read for Metered<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(left) = self.left.get() else {
+            return self.inner.read(buf);
+        };
+        if left == 0 && !buf.is_empty() {
+            return Err(io::Error::other(format!(
+                "a layer's member headers run past {MAX_HEADER_BYTES} bytes before the member they \
+                 describe (a long name, a long link or a PAX record this large is not a \
+                 userland's): refusing rather than holding them in memory"
+            )));
+        }
+        let room = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..room])?;
+        self.left.set(Some(left - n as u64));
+        Ok(n)
+    }
+}
+
 /// The prefix a deletion marker carries, and the exact name of the opaque-directory marker.
 const WHITEOUT: &str = ".wh.";
 const OPAQUE: &str = ".wh..wh..opq";
@@ -146,20 +186,28 @@ pub(super) fn apply(
         // An empty media type is the ambiguous case a hand-written manifest can produce; gzip is
         // the overwhelmingly common framing, and a tar that is not one fails at its header rather
         // than being written as garbage.
-        let mut archive = tar::Archive::new(GzipReader::new(file)?);
-        return unpack(&mut archive, root, budget);
+        return unpack(GzipReader::new(file)?, root, budget);
     }
-    let mut archive = tar::Archive::new(file);
-    unpack(&mut archive, root, budget)
+    unpack(file, root, budget)
 }
 
 /// Walk one layer's members, applying each.
-fn unpack<R: io::Read>(
-    archive: &mut tar::Archive<R>,
-    root: &Path,
-    budget: &mut Budget,
-) -> io::Result<()> {
-    for entry in archive.entries()? {
+fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result<()> {
+    let left = Rc::new(Cell::new(None));
+    let mut archive = tar::Archive::new(Metered {
+        inner: layer,
+        left: Rc::clone(&left),
+    });
+    let mut entries = archive.entries()?;
+    loop {
+        // Bounded while the tar reader looks for the next member, and only then: a member's own
+        // data is read below, under the budget.
+        left.set(Some(MAX_HEADER_BYTES));
+        let next = entries.next();
+        left.set(None);
+        let Some(entry) = next else {
+            return Ok(());
+        };
         budget.member()?;
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -216,7 +264,6 @@ fn unpack<R: io::Read>(
         let dest = safe_path(root, &path)?;
         write_member(&mut entry, &dest, root, budget)?;
     }
-    Ok(())
 }
 
 /// Resolve `rel` under `root`, refusing every shape that would leave it.

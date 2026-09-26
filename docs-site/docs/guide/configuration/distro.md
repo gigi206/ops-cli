@@ -255,6 +255,13 @@ files), so an image that meets one is not a distribution.
 The budget spans the image, not the layer, because the layers are applied over the same
 tree.
 
+What the unpack reads to reach each member is bounded too, at **1 MiB**: the member's
+header, and the long name, long link or PAX record that describes it, which the tar reader
+holds whole in memory before the member reaches the budget. Nothing honest comes near it
+(a path is at most 4 KiB, an extended attribute at most 64 KiB), so a layer past it is
+refused rather than held. A member's own data is not under this bound; the byte ceiling
+above counts it.
+
 ### What a layer may contain
 
 A layer's members are applied as the image declares them: regular files (including the
