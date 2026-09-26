@@ -749,10 +749,21 @@ impl FrameTee {
                         if keeps {
                             self.fin = fin;
                             if starts_message {
+                                if rsv1 && self.inflater.is_none() {
+                                    // A compressed message where this decoder has no compression
+                                    // to follow: the peers agreed on an encoding the upgrade
+                                    // response did not show it (RFC 6455 §5.2 has a peer fail the
+                                    // connection otherwise). Its payload is not the text it
+                                    // carries, so capturing it files noise and scanning it finds
+                                    // nothing. Stopping says so ([`Self::newly_blinded`]), where
+                                    // reading on would say nothing.
+                                    self.done = true;
+                                    break;
+                                }
                                 // A new message: whether it is compressed is decided here and
                                 // inherited by its continuation frames, and nothing carries across
                                 // the boundary for the scan.
-                                self.compressed = rsv1 && self.inflater.is_some();
+                                self.compressed = rsv1;
                                 self.pending.clear();
                                 if let Some(scan) = self.scan.as_mut() {
                                     scan.start_message();
@@ -1599,6 +1610,42 @@ mod tests {
                 .windows(10)
                 .any(|w| w == b"never-seen"),
             "nothing past an undecodable message is guessed at"
+        );
+    }
+
+    /// A message that opens compressed on a direction with no compression to follow stops the
+    /// direction, and a scan says it went blind, rather than scanning DEFLATE bytes that no needle
+    /// can match and filing them as the message's text. The peers compressed under an agreement the
+    /// upgrade response did not show this decoder, so nothing it reads past that point is text.
+    #[test]
+    fn a_compressed_message_where_none_was_negotiated_stops_the_direction() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        let mut payload = b"token=".to_vec();
+        payload.extend_from_slice(NEEDLE_VALUE);
+        let compressed = deflated_frame(&payload, &mut CompressorOxide::new(raw_deflate_flags()));
+
+        let mut scan = scanning_tee(&[needle()], None);
+        scan.push(&frame(0x1, b"plain", Some([1, 2, 3, 4])));
+        assert!(
+            !scan.newly_blinded(),
+            "a plain message is followed as before"
+        );
+        scan.push(&compressed);
+        assert!(scan.newly_blinded(), "the scan says it can no longer see");
+        assert!(!scan.newly_blinded(), "and says it once");
+
+        let (mut capture, sink) = tee(4096);
+        capture.push(&frame(0x1, b"kept", None));
+        capture.push(&compressed);
+        capture.push(&frame(0x1, b"after", None));
+        assert_eq!(
+            captured(&sink).bytes,
+            b"kept",
+            "the transcript ends at the last message it could read"
+        );
+        assert!(
+            !capture.newly_blinded(),
+            "a capture alone has no tripwire to lose"
         );
     }
 
