@@ -25,15 +25,27 @@
 # Anthropic or OpenAI for the sandboxed credential boundary.) If a request is blocked,
 # the proxy reports the host it refused — add it to `allow` (or check ahead with
 # `sbx test net <url>`).
-cmd = "pi"
-
-# No `contract`: the channel Pi offers, `--append-system-prompt`, costs you your own addition. Given
-# on the command line it makes Pi skip its `APPEND_SYSTEM.md` (the project's `.pi/` one and the one
-# in `~/.pi/agent/`) without a word; `AGENTS.md` still loads. Hand Pi the summary
-# (/opt/sbx/contract-summary.md, rewritten at every launch) yourself, and pass your own file with it
-# when you have one, since the option may be repeated:
-#     sbx app run pi -- --append-system-prompt /home/sandbox/.pi/agent/APPEND_SYSTEM.md \
-#                       --append-system-prompt /opt/sbx/contract-summary.md
+# The command hands Pi the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as a context file: a link at `/AGENTS.md`. Pi reads
+# the `AGENTS.md` (or `CLAUDE.md`) of every directory from the working directory up to `/`, plus your
+# `~/.pi/agent/AGENTS.md`, and joins them all into the system prompt, so the link reaches every
+# session and your own files still apply beside it. The cage's root is its own tmpfs: the link lives
+# for this launch only and never reaches the host. Pi's `--append-system-prompt` is not used: given
+# on the command line it makes Pi skip its `APPEND_SYSTEM.md` without a word. `--no-context-files`
+# turns the context files off, the summary with them. Arguments after `sbx app run pi --` reach Pi
+# verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+if [ -r /opt/sbx/contract-summary.md ]; then
+  ln -sf /opt/sbx/contract-summary.md /AGENTS.md
+fi
+exec pi "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "pi",
+]
 
 # Your host Pi config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged

@@ -112,6 +112,10 @@ set -e
 # shell. Put that prefix back on PATH and hand the process to the agent.
 export NPM_CONFIG_PREFIX="$HOME/.npm-global"
 export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+# The cage's summary as a context file at the root (see the note below `cmd`).
+if [ -r /opt/sbx/contract-summary.md ]; then
+  ln -sf /opt/sbx/contract-summary.md /AGENTS.md
+fi
 exec prime-agent "$@"
     ''',
     # `$0` placeholder: `sbx app run prime-agent -- <args>` appends <args> to this cmd array, so they
@@ -119,13 +123,15 @@ exec prime-agent "$@"
     "prime-agent",
 ]
 
-# No `contract`: the channel Prime Agent offers, `--append-system-prompt`, costs you your own
-# addition. Given on the command line it makes the agent skip its `APPEND_SYSTEM.md` (the
-# project's `.prime/agent/` one and the one in `~/.prime/agent/`) without a word; `AGENTS.md`
-# still loads. Hand it the summary (/opt/sbx/contract-summary.md, rewritten at every launch)
-# yourself, and pass your own file with it when you have one, since the option may be repeated:
-#     sbx app run prime-agent -- --append-system-prompt /home/sandbox/.prime/agent/APPEND_SYSTEM.md \
-#                                --append-system-prompt /opt/sbx/contract-summary.md
+# The command hands Prime Agent the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as a context file: a link at `/AGENTS.md`.
+# Prime Agent reads the `AGENTS.md` (or `CLAUDE.md`) of every directory from the working directory
+# up to `/`, plus your `~/.prime/agent/AGENTS.md`, and joins them all into the system prompt, so the
+# link reaches every session and your own files still apply beside it. The cage's root is its own
+# tmpfs: the link lives for this launch only and never reaches the host. Its
+# `--append-system-prompt` is not used: given on the command line it makes the agent skip its
+# `APPEND_SYSTEM.md` without a word. `--no-context-files` turns the context files off, the summary
+# with them.
 
 # Your host Prime Agent setup, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
