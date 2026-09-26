@@ -322,7 +322,7 @@ The 67 shipped bundles, and what each carries:
 | `crush` | 1 (`mise:`) | 4 egress entries, 2 env vars | `github-install` |
 | `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
 | `cursor-agent` | 1 (`tarball:`) | 4 egress entries, 1 env var, a `tarball:` resolver | none |
-| `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
+| `deepagents-code` | 4 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `deepseek-harness` | 5 (`mise:`, `nix:`) | 4 egress entries, 1 env var, an install step, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
 | `dirac` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |

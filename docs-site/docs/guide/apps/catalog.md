@@ -56,7 +56,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `cortex` | `mise:github:CortexLM/cortex-code` (+ `nix:alsa-lib`) | `api.cortex.foundation` (`CORTEX_API_KEY`) or BYOK |
 | `crush` | `mise:github:charmbracelet/crush` | `hyper.charm.land` (Hyper account) or multi-provider BYOK |
 | `cursor-agent` | `nix:gnutar` (+ `nix:gzip`) | `*.cursor.sh` (Cursor account / `CURSOR_API_KEY`) |
-| `deepagents-code` | `mise:pipx:deepagents-code` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Google) |
+| `deepagents-code` | `mise:pipx:deepagents-code` (+ `nix:uv`, `nix:python312`, `nix:gcc.cc`) | provider-dependent (BYOK: OpenAI / Anthropic / Google) |
 | `devin` | `tarball:resolve` (the vendor's live manifest) | `api.devin.ai` (BYOK API key) |
 | `dirac` | `nix:nodejs` (+ `mise:npm:dirac-cli`, `nix:ripgrep`) | provider-dependent (BYOK, no vendor account) |
 | `droid` | `nix:nodejs` (+ `mise:npm:droid`) | `*.factory.ai` (account) |
