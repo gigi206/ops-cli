@@ -220,8 +220,8 @@ summary on a conversation's first message, the `deepagents-code` profile with a 
 merged into the user's hooks file, and the `kimi` profile with a plugin entry merged into the
 user's plugin registry. Where the agent reads a single global instructions file, which belongs to
 the user, the command writes it only while the user has none, and stops adding the summary the day
-they write their own: the `ante`, `cortex`, `freebuff`, `freebuff-desktop`, `jcode`, `pool`, `rovo`, `sigit`, `vibe`
-and `warp` profiles work this way.
+they write their own: the `ante`, `cortex`, `freebuff`, `freebuff-desktop`, `jcode`, `pool`,
+`rovo`, `sigit`, `vibe` and `warp` profiles work this way.
 
 **What the summary says.** The network posture and the hosts the cage may reach (hosts only, never
 their paths), the destinations a credential is attached to, the files sbx protects by name and a
