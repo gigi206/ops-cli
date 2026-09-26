@@ -111,16 +111,24 @@ if [ ! -f "$OD_DATA_DIR/app-config.json" ]; then
     printf '{"agentId":"opencode"}\n' > "$OD_DATA_DIR/app-config.json"
 fi
 
+# The cage's summary as an OpenCode instruction file, through its managed config (see the note
+# below `cmd`).
+if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/opencode 2>/dev/null; then
+    printf '%s\n' '{"instructions":["/opt/sbx/contract-summary.md"]}' > /etc/opencode/opencode.json
+fi
+
 exec pnpm tools-dev run web --daemon-port 17456 --web-port 17573 "$@"
 ''',
 ]
 
-# No `contract`: the Open Design daemon starts OpenCode with an `OPENCODE_CONFIG_CONTENT` of its
-# own, layered over the environment on essentially every run, so the value the `opencode` profile
-# sets would be replaced here. Point the agent at the cage's summary yourself instead, for instance
-# with a line in your own instructions such as "When the environment variable SBX_SANDBOX is 1, read
-# the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands OpenCode the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as an instruction file, through its managed
+# config `/etc/opencode/opencode.json`. The Open Design daemon starts OpenCode with an
+# `OPENCODE_CONFIG_CONTENT` of its own, which would replace the value the `opencode` profile sets;
+# the managed file is read after it, and OpenCode joins the `instructions` lists of every layer, so
+# yours and the daemon's still apply. The file names `instructions` only: a managed value takes
+# precedence over yours for any key it sets. `/etc` is the cage's own tmpfs: the file lives for this
+# launch only and never reaches the host.
 
 # The host browser reaches the in-cage web UI.  The daemon port intentionally stays private to the
 # cage.  Do not reserve OpenCode's fixed OAuth callback port here: another sbx OpenCode session may
