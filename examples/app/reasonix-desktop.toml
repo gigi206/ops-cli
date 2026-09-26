@@ -62,14 +62,36 @@
 # Reasonix window on a Wayland session. UNVERIFIED (like every profile until run with a real key):
 # the sign-in and the model traffic through sbx's MITM. Grounded here: the packaging (control block,
 # payload layout and the ELF NEEDED list read out of the published `.deb`).
-cmd = "reasonix-desktop"
-
-# No `contract`: the desktop app runs the same Reasonix engine as the CLI, which takes no option
-# that appends to its system prompt; its instructions come from `REASONIX.md`/`AGENTS.md`. Point
-# Reasonix at the cage's summary yourself instead, for instance with a line in a `REASONIX.md` it
-# reads such as "When the environment variable SBX_SANDBOX is 1, read the file named by
-# SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
-# at every launch.
+# The command hands Reasonix the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as a user instruction file: a copy at
+# `~/.reasonix/CLAUDE.md`. Reasonix loads all three of `REASONIX.md`, `AGENTS.md` and `CLAUDE.md`
+# from its home, then the project's, so your own files still apply beside it; `CLAUDE.md` is the
+# name a Reasonix user is least likely to keep there. It is a copy, not a link: Reasonix rejects an
+# instruction file whose link leaves its directory. The copy lives in the app's isolated home, which
+# only this app's cages read: it is rewritten at every launch, removed by a launch without a summary,
+# and a `CLAUDE.md` of yours is left untouched (the summary is then not added). Measured with the
+# `reasonix` CLI, whose engine this app embeds; not measured in the desktop app. Arguments after
+# `sbx app run reasonix-desktop --` reach it verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+d="$HOME/.reasonix"
+f="$d/CLAUDE.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec reasonix-desktop "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "reasonix-desktop",
+]
 
 gui = "wayland"
 gpu = true
