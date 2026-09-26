@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use miniz_oxide::inflate::stream::{InflateState, inflate};
-use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
 use super::capture::CapBuf;
 use super::inject::SecretNeedle;
@@ -303,6 +303,12 @@ impl Inflater {
             written += res.bytes_written;
             match res.status {
                 Ok(MZStatus::Ok | MZStatus::StreamEnd) => {}
+                // Asked again with the input spent and every byte of it already out, the decoder
+                // answers `Buf`: it is waiting for the next message, so this one is whole. That is
+                // the call made after the output fills exactly as the input runs out, which a text
+                // of 16 KiB or one of its doublings does, and reading it as a broken stream stopped
+                // the direction on such a message.
+                Err(MZError::Buf) if read >= input.len() => break,
                 // A truncated or corrupt stream: refuse it rather than store a partial guess.
                 Err(_) => return None,
                 _ => {}
@@ -395,6 +401,9 @@ impl Inflater {
             let res = inflate(&mut self.state, rest, &mut scratch, MZFlush::None);
             match res.status {
                 Ok(MZStatus::Ok | MZStatus::StreamEnd) => {}
+                // The answer [`Self::message`] reads as the end: the rest is spent and all of it is
+                // out, which a tail of nothing or of a whole number of blocks leaves.
+                Err(MZError::Buf) if rest.is_empty() => return true,
                 Err(_) => return false,
                 _ => {}
             }
@@ -1593,6 +1602,53 @@ mod tests {
             got, b"decoded-and-kept",
             "the transcript must end at the last message actually decoded"
         );
+    }
+
+    /// A compressed message whose text fills the decoder's output exactly as its input runs out is
+    /// read whole: the text is 16 KiB or one of its doublings, the scan cap included, or runs past
+    /// the scan cap by one byte or by one more block, so the tail inflated for the scan ends the
+    /// same way. The value at its end is seen, the capture holds it, and the message behind it
+    /// decodes, so the window was left level, whether it carries across messages or not.
+    #[test]
+    fn a_compressed_message_that_fills_the_output_exactly_is_read_whole() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        for len in [
+            16 * 1024,
+            32 * 1024,
+            64 * 1024,
+            128 * 1024,
+            SCAN_MESSAGE_CAP,
+            SCAN_MESSAGE_CAP + 1,
+            SCAN_MESSAGE_CAP + 1 + 16 * 1024,
+        ] {
+            for no_takeover in [false, true] {
+                let mut text = vec![b'a'; len - NEEDLE_VALUE.len()];
+                text.extend_from_slice(NEEDLE_VALUE);
+                let mut c = CompressorOxide::new(raw_deflate_flags());
+                let first = deflated_message(&text, &mut c);
+                if no_takeover {
+                    c = CompressorOxide::new(raw_deflate_flags());
+                }
+                let second = deflated_message(b"after", &mut c);
+
+                let mut scan = scanning_tee(&[needle()], Some(no_takeover));
+                scan.push(&first);
+                scan.push(&second);
+                assert!(
+                    !scan.done,
+                    "{len} bytes, no_takeover {no_takeover}: still read"
+                );
+                assert_eq!(scan.sightings(), vec!["demo-token".to_string()]);
+
+                let (mut capture, sink) = deflating_tee(1 << 20, no_takeover);
+                capture.push(&first);
+                capture.push(&second);
+                assert!(
+                    captured(&sink).bytes == [&text[..], b"after"].concat(),
+                    "{len} bytes, no_takeover {no_takeover}: captured whole, then the next"
+                );
+            }
+        }
     }
 
     /// A stream that claims compression but does not decode stops the direction rather than storing
