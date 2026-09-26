@@ -53,15 +53,40 @@
 #
 # If a request is blocked, the proxy reports the host it refused — add it to `allow` (or
 # check ahead with `sbx test net <url>`).
-cmd = "agy"
-
-# No `contract`: Antigravity takes no option or environment variable that adds rules. Its rules come
-# from the workspace (`AGENTS.md`, `GEMINI.md`, `.agents/rules/`) and from your files under
-# `~/.gemini/`, and the `ANTIGRAVITY_APP_DATA_DIR`/`JETSKI_APP_DATA_DIR` variables would move your
-# whole state rather than add to it. Point Antigravity at the cage's summary yourself instead, for
-# instance with a line in your `~/.gemini/AGENTS.md` such as "When the environment variable
-# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Antigravity the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as a modular global rule: a copy at
+# `~/.gemini/config/rules/sbx-contract.md` whose frontmatter says `trigger: always_on`. Antigravity
+# combines its global rules with your `~/.gemini/AGENTS.md`/`GEMINI.md` and the workspace's rules,
+# so nothing of yours is replaced. The copy lives in the app's isolated home, which only this app's
+# cages read: it is rewritten at every launch, removed by a launch without a summary, and a file of
+# yours at that path is left untouched (the summary is then not added). No option is used: none adds
+# a rule, and `ANTIGRAVITY_APP_DATA_DIR`/`JETSKI_APP_DATA_DIR` would move your whole state.
+# Arguments after `sbx app run agy --` reach `agy` verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+d="$HOME/.gemini/config/rules"
+f="$d/sbx-contract.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && {
+      printf -- '---\ntrigger: always_on\n'
+      printf -- 'description: The sbx sandbox this agent runs in, what it may reach, which files it protects and which operations it offers.\n'
+      printf -- '---\n%s\n' "$m"
+      cat "$s"
+    } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec agy "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "agy",
+]
 
 # Your host Antigravity CLI config, mounted read-write at its real absolute path. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`

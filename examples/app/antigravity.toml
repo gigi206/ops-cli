@@ -128,17 +128,40 @@ mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/polic
 {"AutoLaunchProtocolsFromOrigins":[{"allowed_origins":["*"],"protocol":"antigravity-ide"}]}
 POLICY
 
+# The cage's summary as a global rule (see the note below `cmd`).
+s=/opt/sbx/contract-summary.md
+d="$HOME/.gemini/config/rules"
+f="$d/sbx-contract.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && {
+      printf -- '---\ntrigger: always_on\n'
+      printf -- 'description: The sbx sandbox this agent runs in, what it may reach, which files it protects and which operations it offers.\n'
+      printf -- '---\n%s\n' "$m"
+      cat "$s"
+    } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+
 exec antigravity-ide --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
     --use-system-ca --password-store=gnome-libsecret "$@"
 ''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "antigravity-ide",
 ]
 
-# No `contract`: the IDE's agent runs the same engine as the `agy` CLI, whose rules come from the
-# workspace, from your files under `~/.gemini/` and from the Rules settings, and it takes no option
-# or environment variable that adds one. Point the agent at the cage's summary yourself instead, for
-# instance with a line in a global rule such as "When the environment variable SBX_SANDBOX is 1,
-# read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands the IDE's agent the cage's summary (/opt/sbx/contract-summary.md: what it may
+# reach, which files it protects, which operations it offers) as a modular global rule: a copy at
+# `~/.gemini/config/rules/sbx-contract.md` whose frontmatter says `trigger: always_on`, the
+# directory the IDE reads for global rules. The agent combines it with your `~/.gemini/AGENTS.md`/
+# `GEMINI.md`, the Rules settings and the workspace's rules, so nothing of yours is replaced. The
+# copy lives in the app's isolated home, which only this app's cages read: it is rewritten at every
+# launch, removed by a launch without a summary, and a file of yours at that path is left untouched
+# (the summary is then not added). Measured with the `agy` CLI, which runs the same engine and
+# answers from the rule; not measured in the IDE.
 
 gui = "wayland"
 gpu = true
