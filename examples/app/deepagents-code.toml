@@ -151,9 +151,9 @@ exec dcode "$@"
 # every entry of yours, leaves a file that does not parse or still uses the legacy list shape
 # alone (the summary is then not added), and removes only its own handler when a launch has no
 # summary. The script lives in the cage's own `/etc` for this launch only; the hooks file lives in
-# the app's isolated home, which only this app's cages read. Measured with `dcode -n`; not measured
-# in the TUI. No option is used: `dcode` takes no system-prompt or instructions option, and
-# `DEEPAGENTS_HOME` would move your profile.
+# the app's isolated home, which only this app's cages read. Measured with `dcode -n` and in the TUI.
+# No option is used: `dcode` takes no system-prompt or instructions option, and `DEEPAGENTS_HOME`
+# would move your profile.
 
 # Your host Deep Agents config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
