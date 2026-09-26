@@ -91,9 +91,10 @@ cmd = "cursor-agent"
 
 # No `contract`: cursor-agent offers no way to hand it the cage's summary from outside the project.
 # It reads rules only from the workspace (`AGENTS.md`, `.cursor/rules/`), and sbx does not write into
-# your project; a rule shipped in a `--plugin-dir` plugin, the files of an `--add-dir` root and the
-# hidden `--system-prompt` (which replaces Cursor's own prompt) either never reach the model or are
-# not usable. Point the agent at the summary yourself: add a User Rule to your Cursor account
+# your project; a rule shipped in a `--plugin-dir` plugin, the files of an `--add-dir` root, a skill
+# in `~/.cursor/skills` or `~/.agents/skills` (even marked `alwaysApply`) and the hidden
+# `--system-prompt` (which replaces Cursor's own prompt) either never reach the model or are not
+# usable. Point the agent at the summary yourself: add a User Rule to your Cursor account
 # (Settings → Rules) such as "When the environment variable SBX_SANDBOX is 1, read the file named by
 # SBX_CONTRACT_SUMMARY before anything else", or say it in your first prompt. The file
 # (/opt/sbx/contract-summary.md) is rewritten at every launch, so the rule never needs editing.

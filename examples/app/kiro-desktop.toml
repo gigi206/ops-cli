@@ -129,20 +129,36 @@
 # a real Kiro account: the account LOGIN (wired below, but see the UPSTREAM GATE above) and an
 # end-to-end AI turn. If a request is blocked, the proxy names the host it refused — add it to `allow`
 # (or check ahead with `sbx test net <url>`).
+# The command hands Kiro the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as global steering: a copy at
+# `~/.kiro/steering/sbx-contract.md`, the directory the IDE shares with `kiro-cli`. Kiro includes
+# every steering file of that directory, beside the workspace's `.kiro/steering/` files, so nothing
+# of yours is replaced. The copy lives in the app's isolated home, which only this app's cages read:
+# it is rewritten at every launch, removed by a launch without a summary, and a file of yours at that
+# path is left untouched (the summary is then not added). Measured with `kiro-cli` (the `kiro`
+# profile), which lists both files in a chat; not measured in the IDE, whose extension reads the same
+# directory. Arguments after `sbx app run kiro-desktop --` reach Kiro verbatim through `"$@"`.
 cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+d="$HOME/.kiro/steering"
+f="$d/sbx-contract.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec kiro --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --use-system-ca \
+  --password-store=gnome-libsecret "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
     "kiro",
-    "--no-sandbox",
-    "--ozone-platform=wayland",
-    "--disable-dev-shm-usage",
-    "--use-system-ca",
-    "--password-store=gnome-libsecret",
 ]
-
-# No `contract`: Kiro documents no option or environment variable that adds a steering file; global
-# steering lives in `~/.kiro/steering/`, shared with the CLI. Point Kiro at the cage's summary
-# yourself instead, for instance with a line in a steering file there such as "When the environment
-# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
-# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
 
 gui = "wayland"
 gpu = true

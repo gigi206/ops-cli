@@ -90,14 +90,35 @@
 # does) — its trace goes to stdout only when enabled. Capture it without disturbing the interactive
 # method menu (which is on stderr) by redirecting just stdout:
 #     sbx app run kiro --env KIRO_LOG_LEVEL=trace --env KIRO_LOG_STDOUT=1 -- login --license free >trace.log
-cmd = ["kiro-cli"]
-
-# No `contract`: `kiro-cli` has no option for a system prompt or a steering path. `KIRO_HOME`
-# replaces the whole `~/.kiro`, and a custom `--agent` leaves global steering out unless the agent
-# names it. Global steering lives in `~/.kiro/steering/`. Point Kiro at the cage's summary yourself
-# instead, for instance with a line in a steering file there such as "When the environment variable
-# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Kiro the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as global steering: a copy at
+# `~/.kiro/steering/sbx-contract.md`. Kiro includes every steering file of that directory in each
+# chat, beside the project's `.kiro/steering/` files, so nothing of yours is replaced. The copy lives
+# in the app's isolated home, which only this app's cages read: it is rewritten at every launch,
+# removed by a launch without a summary, and a file of yours at that path is left untouched (the
+# summary is then not added). A custom agent that stops inheriting the default resources
+# (`chat.disableInheritingDefaultResources`) leaves it out, and `KIRO_HOME` moves the whole `~/.kiro`
+# away from it. Arguments after `sbx app run kiro --` reach `kiro-cli` verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+d="$HOME/.kiro/steering"
+f="$d/sbx-contract.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec kiro-cli "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "kiro-cli",
+]
 
 # DISPLAY + GPU + DBUS for the in-cage login browser. `gui = "wayland"` binds the host Wayland
 # socket (read-only) so the in-cage Chromium can map a window; `gpu = true` opens hardware-
