@@ -216,8 +216,9 @@ rewrites it at every launch, and never overwrites a file it did not write. The a
 isolated, so only that app's cages read the copy. The shipped `agy`, `antigravity`, `cline`,
 `devin`, `dirac`, `kiro`, `kiro-desktop`, `nanobot`, `omp`, `reasonix` and `reasonix-desktop`
 profiles work this way, the `snow` profile the same with a global hook file that returns the
-summary on a conversation's first message, and the `kimi` profile with a plugin entry merged into
-the user's plugin registry.
+summary on a conversation's first message, the `deepagents-code` profile with a session-start hook
+merged into the user's hooks file, and the `kimi` profile with a plugin entry merged into the
+user's plugin registry.
 
 **What the summary says.** The network posture and the hosts the cage may reach (hosts only, never
 their paths), the destinations a credential is attached to, the files sbx protects by name and a

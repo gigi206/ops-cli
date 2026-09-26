@@ -87,24 +87,73 @@ if gcc_bin="$(command -v gcc)"; then
     fi
   done
 fi
-if d="$(mise which dcode 2>/dev/null)" && py="$(sed -n '1s/^#!//p' "$d")" && [ -x "$py" ] \
-   && [ -n "${SBX_LIBSTDCXX:-}" ] \
+py=; d="$(mise which dcode 2>/dev/null)" && py="$(sed -n '1s/^#!//p' "$d")"
+if [ -x "$py" ] && [ -n "${SBX_LIBSTDCXX:-}" ] \
    && sp="$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; then
   printf '%s\n' 'import os, ctypes; p = os.environ.get("SBX_LIBSTDCXX"); p and ctypes.CDLL(p, ctypes.RTLD_GLOBAL)' \
     > "$sp/sbx-libstdcxx.pth"
 fi
+# The cage's summary as a user SessionStart hook (see the note below `cmd`).
+h=/etc/dcode/sbx-contract-hook.py
+have=; if [ -r /opt/sbx/contract-summary.md ] && [ -x "$py" ] && mkdir -p /etc/dcode 2>/dev/null; then
+  cat > "$h" <<'HOOK' && have=1
+import json
+with open("/opt/sbx/contract-summary.md", encoding="utf-8") as f:
+    text = f.read()
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
+HOOK
+fi
+[ -x "$py" ] && "$py" - "$HOME/.deepagents/hooks.json" "$py $h" "$have" <<'MERGE' || true
+import json, os, sys
+path, command, have = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+except (OSError, ValueError):
+    sys.exit(0)
+if not isinstance(data, dict) or not isinstance(data.get("hooks", {}), dict):
+    sys.exit(0)
+events = data.setdefault("hooks", {})
+groups = events.get("SessionStart", [])
+if not isinstance(groups, list):
+    sys.exit(0)
+ours = lambda g: isinstance(g, dict) and any(
+    isinstance(x, dict) and str(x.get("command", "")).endswith("/etc/dcode/sbx-contract-hook.py")
+    for x in g.get("hooks", []))
+kept = [g for g in groups if not ours(g)]
+if have:
+    kept.append({"hooks": [{"type": "command", "command": command}]})
+elif len(kept) == len(groups):
+    sys.exit(0)
+if kept:
+    events["SessionStart"] = kept
+else:
+    events.pop("SessionStart", None)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path + ".sbx.tmp", "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+os.replace(path + ".sbx.tmp", path)
+MERGE
 exec dcode "$@"
 ''',
     # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
     "dcode",
 ]
 
-# No `contract`: `dcode` takes no system-prompt or instructions option, and its memory comes only
-# from `~/.deepagents/<agent>/AGENTS.md` and the project's `AGENTS.md`; `DEEPAGENTS_HOME` would move
-# your profile rather than add to it. Point the agent at the cage's summary yourself instead, for
-# instance with a line in your `~/.deepagents/<agent>/AGENTS.md` such as "When the environment
-# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
-# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command also hands the agent the cage's summary (/opt/sbx/contract-summary.md: what it may
+# reach, which files it protects, which operations it offers) through a `SessionStart` hook: it
+# writes `/etc/dcode/sbx-contract-hook.py`, which returns the summary as `additionalContext`, and
+# merges one handler running it into `~/.deepagents/hooks.json`. `dcode` concatenates the handlers
+# of the project, of that file and of its plugins per event and appends each context to the
+# session, so your memory files, your own hooks and the project's stay in force. The merge keeps
+# every entry of yours, leaves a file that does not parse or still uses the legacy list shape
+# alone (the summary is then not added), and removes only its own handler when a launch has no
+# summary. The script lives in the cage's own `/etc` for this launch only; the hooks file lives in
+# the app's isolated home, which only this app's cages read. Measured with `dcode -n`; not measured
+# in the TUI. No option is used: `dcode` takes no system-prompt or instructions option, and
+# `DEEPAGENTS_HOME` would move your profile.
 
 # Your host Deep Agents config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
