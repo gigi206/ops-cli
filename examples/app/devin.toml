@@ -74,14 +74,37 @@
 # (read out of the shipped binary, the version-string `3000.3.27` from
 # `share/devin/docs/changelog/stable.mdx`), and the `auto_update: true` config
 # default (read out of `share/devin/docs/reference/configuration/config-file.mdx`).
-cmd = "devin"
-
-# No `contract`: the Devin CLI takes no option or environment variable that adds rules
-# (`--prompt-file` is the first user prompt, not an instruction), and its global rules live in
-# `~/.config/devin/AGENTS.md`. Point Devin at the cage's summary yourself instead, for instance with
-# a line in that file such as "When the environment variable SBX_SANDBOX is 1, read the file named
-# by SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is
-# rewritten at every launch.
+# The command hands Devin the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as a home rule: a copy at
+# `~/.devin/rules/sbx-contract.md` whose frontmatter says `trigger: always_on`. Devin loads the rule
+# files of that directory beside your `~/.config/devin/AGENTS.md` and the project's rules, so nothing
+# of yours is replaced. The copy lives in the app's isolated home, which only this app's cages read:
+# it is rewritten at every launch, removed by a launch without a summary, and a file of yours at that
+# path is left untouched (the summary is then not added). No option is used: none adds a rule, and
+# `--prompt-file` is the first user prompt. `devin rules list` shows it as an always-on rule beside
+# the project's; the model turn itself is not measured, since Devin needs a signed-in account before
+# it assembles a session. Arguments after `sbx app run devin --` reach Devin verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+d="$HOME/.devin/rules"
+f="$d/sbx-contract.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && { printf -- '---\ntrigger: always_on\n---\n%s\n' "$m"; cat "$s"; } > "$f.tmp" \
+      && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec devin "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "devin",
+]
 
 # Your host Devin config/auth, mounted read-write at their real absolute paths.
 # `binds` is a security field, honored only because this profile lives in your
