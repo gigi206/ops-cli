@@ -219,7 +219,9 @@ isolated, so only that app's cages read the copy. The shipped `agy`, `antigravit
 profiles work this way, the `snow` profile the same with a global hook file that returns the
 summary on a conversation's first message, the `deepagents-code` profile with a session-start hook
 merged into the user's hooks file, and the `kimi` profile with a plugin entry merged into the
-user's plugin registry. Where the agent reads a single global instructions file, which belongs to
+user's plugin registry. The `trae` profile, whose agent reads no instructions at all, extends
+Trae's system-prompt constant inside that one process. Where the agent reads a single global
+instructions file, which belongs to
 the user, the command writes it only while the user has none, and stops adding the summary the day
 they write their own: the `ante`, `cortex`, `freebuff`, `freebuff-desktop`, `jcode`, `muse`,
 `nova`, `pool`, `rovo`, `sigit`, `vibe` and `warp` profiles work this way.
