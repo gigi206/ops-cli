@@ -332,7 +332,7 @@ pub(crate) const CAPTURE_PARTS: usize = 7;
 /// accepts. The proxy builds it with [`Capture::mask`], which is the one place a capture is masked;
 /// the supervisor rebuilds the proxy's with [`Masked::received`] when it reads the proxy's report.
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
+#[cfg_attr(test, derive(Clone, PartialEq))]
 pub(crate) struct Masked(Capture);
 
 impl Masked {

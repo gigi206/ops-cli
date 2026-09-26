@@ -81,7 +81,7 @@ pub(super) const MAX_FLOW_COUNTS: usize = 4096;
 /// One thing the proxy did, as the supervisor learns it, with its capture as `C`: the proxy's
 /// [`Masked`], or the form it crosses in ([`wire`]).
 #[derive(serde::Serialize, serde::Deserialize)]
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 pub(crate) enum ProxyEvent<C = Masked> {
     /// A decision, counted for `sbx net stats`.
     Stat { host: String, kind: StatKind },
@@ -219,7 +219,7 @@ where
 /// One decision for the live log, as the proxy composes it. What the ring adds — its own number,
 /// the time, and the plane — is the supervisor's.
 #[derive(serde::Serialize, serde::Deserialize)]
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 pub(crate) struct LogEntry {
     /// A denial a `mute` rule keeps out of the default view.
     pub(crate) muted: bool,
@@ -824,9 +824,11 @@ impl Drop for Settle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::control::{CaptureBytes, CaptureLevel, LOG_RING_CAP};
+    use crate::sandbox::control::{CAPTURE_PARTS, CaptureBytes, CaptureLevel, LOG_RING_CAP};
     use crate::sandbox::signer_control::SIGNER_RING_CAP;
     use crate::testutil::TmpDir;
+    use proptest::prelude::{Just, Strategy, any, prop_oneof};
+    use proptest::sample::{Index, select};
 
     fn stats(dir: &TmpDir) -> Arc<EgressStats> {
         Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None))
@@ -1565,5 +1567,373 @@ mod tests {
             refused.contains("a document that does not parse"),
             "refused for another reason: {refused}"
         );
+    }
+
+    /// A number, its two ends often: a generator of `u64` alone reaches neither.
+    fn numbers() -> impl Strategy<Value = u64> {
+        prop_oneof![Just(0), Just(u64::MAX), any::<u64>()]
+    }
+
+    /// Text a field may carry, of any characters: `\0`, the ones JSON escapes and the multi-byte
+    /// ones among them.
+    fn text() -> impl Strategy<Value = String> {
+        proptest::collection::vec(any::<char>(), 0..24).prop_map(String::from_iter)
+    }
+
+    /// A transport, any of them.
+    fn protos() -> impl Strategy<Value = Proto> {
+        select(vec![
+            Proto::Https,
+            Proto::Http,
+            Proto::Tcp,
+            Proto::Other,
+            Proto::Dns,
+        ])
+    }
+
+    /// A capture as the proxy sends one: parts of any bytes, empty ones among them, each cut at its
+    /// cap or not.
+    fn masked() -> impl Strategy<Value = Masked> {
+        let part = (
+            prop_oneof![
+                Just(Vec::new()),
+                proptest::collection::vec(any::<u8>(), 1..48)
+            ],
+            any::<bool>(),
+        )
+            .prop_map(|(bytes, truncated)| CaptureBytes { bytes, truncated });
+        (
+            numbers(),
+            proptest::array::uniform::<_, CAPTURE_PARTS>(part),
+        )
+            .prop_map(|(seq, parts)| Masked::received(seq, parts))
+    }
+
+    /// A logged decision, every field drawn.
+    fn log_entries() -> impl Strategy<Value = LogEntry> {
+        (
+            any::<bool>(),
+            text(),
+            any::<u16>(),
+            proptest::option::of(text()),
+            proptest::option::of(text()),
+            select(LogVerdict::ALL.to_vec()),
+            text(),
+            protos(),
+            select(vec![HttpVer::H1, HttpVer::H2, HttpVer::Unknown]),
+            select(vec![
+                RpcKind::Grpc,
+                RpcKind::GrpcWeb,
+                RpcKind::Connect,
+                RpcKind::None,
+            ]),
+        )
+            .prop_map(
+                |(muted, host, port, method, path, verdict, reason, proto, http_ver, rpc)| {
+                    LogEntry {
+                        muted,
+                        host,
+                        port,
+                        method,
+                        path,
+                        verdict,
+                        reason,
+                        proto,
+                        http_ver,
+                        rpc,
+                    }
+                },
+            )
+    }
+
+    /// An event of any kind, every field drawn. A flow report carries from none to the most one
+    /// carries, the bound itself included.
+    fn events() -> impl Strategy<Value = ProxyEvent> {
+        let count = || (numbers(), numbers(), numbers());
+        let counts = prop_oneof![
+            proptest::collection::vec(count(), 0..8),
+            count().prop_map(|count| vec![count; MAX_FLOW_COUNTS]),
+        ];
+        prop_oneof![
+            (
+                text(),
+                select(vec![StatKind::Allow, StatKind::Deny, StatKind::Blocked])
+            )
+                .prop_map(|(host, kind)| ProxyEvent::Stat { host, kind }),
+            (
+                select(NotifyEvent::ALL.to_vec()),
+                text(),
+                text(),
+                text(),
+                text()
+            )
+                .prop_map(|(event, subject, reason, detail, fix)| {
+                    ProxyEvent::Refusal(Block {
+                        event,
+                        subject,
+                        reason,
+                        detail,
+                        fix,
+                    })
+                }),
+            (select(vec![SignerKind::Sign, SignerKind::Refuse]), text())
+                .prop_map(|(kind, detail)| ProxyEvent::Signer { kind, detail }),
+            (numbers(), log_entries()).prop_map(|(id, entry)| ProxyEvent::Logged { id, entry }),
+            (numbers(), any::<u16>()).prop_map(|(id, status)| ProxyEvent::Status { id, status }),
+            numbers().prop_map(|id| ProxyEvent::CaptureExpected { id }),
+            (numbers(), masked())
+                .prop_map(|(id, capture)| ProxyEvent::CaptureFiled { id, capture }),
+            (numbers(), masked()).prop_map(|(id, capture)| ProxyEvent::CaptureGrew { id, capture }),
+            (
+                numbers(),
+                text(),
+                select(vec![SecretWay::Out, SecretWay::Back])
+            )
+                .prop_map(|(id, name, way)| ProxyEvent::SecretSeen { id, name, way }),
+            (numbers(), text(), any::<u16>(), protos()).prop_map(|(id, host, port, proto)| {
+                ProxyEvent::FlowOpened {
+                    id,
+                    host,
+                    port,
+                    proto,
+                }
+            }),
+            counts.prop_map(ProxyEvent::FlowCounts),
+            numbers().prop_map(|id| ProxyEvent::FlowClosed { id }),
+        ]
+    }
+
+    /// A frame of either kind, mostly events.
+    fn frames() -> impl Strategy<Value = wire::Frame<Masked>> {
+        prop_oneof![
+            8 => events().prop_map(wire::Frame::Event),
+            1 => numbers().prop_map(wire::Frame::Barrier),
+        ]
+    }
+
+    /// What `frame` is, to name it in a failure without printing what it carries.
+    fn frame_kind(frame: &wire::Frame<Masked>) -> &'static str {
+        match frame {
+            wire::Frame::Event(event) => kind(event),
+            wire::Frame::Barrier(_) => "barrier",
+        }
+    }
+
+    /// `frames` as they cross, one after another, and the offset each ends at, after the stream's
+    /// start.
+    fn stream_of(frames: &[wire::Frame<Masked>]) -> (Vec<u8>, Vec<usize>) {
+        let mut stream = Vec::new();
+        let mut ends = vec![0];
+        for frame in frames.iter().cloned() {
+            stream.extend(
+                wire::encode(frame)
+                    .unwrap()
+                    .expect("a generated frame crosses"),
+            );
+            ends.push(stream.len());
+        }
+        (stream, ends)
+    }
+
+    /// A channel handing out `bytes` as a socket may: never more in one read than the next of
+    /// `sizes`, taken in turn, and a read interrupted where `interrupts` says, never twice in a
+    /// row. A read returns nothing only once every byte is out.
+    struct Trickle<'a> {
+        bytes: &'a [u8],
+        sizes: Vec<usize>,
+        interrupts: Vec<bool>,
+        reads: usize,
+        interrupted: bool,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let turn = self.reads;
+            self.reads += 1;
+            if !self.interrupted && self.interrupts[turn % self.interrupts.len()] {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.interrupted = false;
+            let n = self.sizes[turn % self.sizes.len()]
+                .min(buf.len())
+                .min(self.bytes.len());
+            let (out, rest) = self.bytes.split_at(n);
+            buf[..n].copy_from_slice(out);
+            self.bytes = rest;
+            Ok(n)
+        }
+    }
+
+    /// Where a stream whose frames end at `ends` is cut, as `how` says: where a frame ends (the
+    /// stream's start and its end among them), inside the header of one, or anywhere. A cut drawn
+    /// anywhere seldom falls where a frame ends, too seldom to find what a clean end gets wrong.
+    fn cut_at(ends: &[usize], &(how, which, within): &(u8, Index, Index)) -> usize {
+        match how {
+            0 => ends[which.index(ends.len())],
+            1 if ends.len() > 1 => ends[which.index(ends.len() - 1)] + 1 + within.index(7),
+            _ => which.index(ends[ends.len() - 1] + 1),
+        }
+    }
+
+    /// `stream`, each of `mutations` made to it in turn: a byte replaced, the document length or
+    /// the piece count of a frame starting at one of `starts` replaced, the stream cut, or bytes
+    /// inserted into it.
+    fn mutated(mut stream: Vec<u8>, starts: &[usize], mutations: &[(u8, Index, u32)]) -> Vec<u8> {
+        for &(how, at, value) in mutations {
+            let field = starts
+                .get(at.index(starts.len().max(1)))
+                .map(|start| start + if how == 1 { 0 } else { 4 })
+                .filter(|field| field + 4 <= stream.len());
+            match (how, field) {
+                (0, _) if !stream.is_empty() => {
+                    let at = at.index(stream.len());
+                    stream[at] = value.to_le_bytes()[0];
+                }
+                (1, Some(field)) => {
+                    stream[field..field + 4].copy_from_slice(&(value % 1024).to_le_bytes());
+                }
+                (2, Some(field)) => {
+                    stream[field..field + 4].copy_from_slice(&(value % 9).to_le_bytes());
+                }
+                (3, _) => stream.truncate(at.index(stream.len() + 1)),
+                _ => {
+                    let at = at.index(stream.len() + 1);
+                    stream.splice(at..at, value.to_le_bytes());
+                }
+            }
+        }
+        stream
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Frames written one after another read back as they were sent however the channel hands
+        /// out their bytes, up to where it ends: each frame whole before that point comes back
+        /// unchanged, then a clean end where the channel ends between two frames, and an early end
+        /// of file anywhere else, never a frame made of part of one.
+        #[test]
+        fn frames_read_back_unchanged_in_any_pieces_up_to_where_the_channel_ends(
+            sent in proptest::collection::vec(frames(), 0..6),
+            sizes in proptest::collection::vec(1usize..64, 1..8),
+            interrupts in proptest::collection::vec(proptest::bool::weighted(0.2), 1..8),
+            cut in (0u8..3, any::<Index>(), any::<Index>()),
+        ) {
+            let (stream, ends) = stream_of(&sent);
+            let cut = cut_at(&ends, &cut);
+            let mut channel = Trickle {
+                bytes: &stream[..cut],
+                sizes,
+                interrupts,
+                reads: 0,
+                interrupted: false,
+            };
+            for (i, expected) in sent.iter().enumerate().take_while(|&(i, _)| ends[i + 1] <= cut) {
+                let read = wire::read(&mut channel);
+                proptest::prop_assert!(
+                    matches!(&read, Ok(Some(frame)) if frame == expected),
+                    "frame {} ({}) read back as {:?}",
+                    i,
+                    frame_kind(expected),
+                    read.map(|frame| frame.as_ref().map(frame_kind))
+                );
+            }
+            let last = wire::read(&mut channel);
+            if ends.contains(&cut) {
+                proptest::prop_assert!(
+                    matches!(last, Ok(None)),
+                    "a stream ending between two frames, at {}, read as {:?}",
+                    cut,
+                    last.map(|frame| frame.as_ref().map(frame_kind))
+                );
+            } else {
+                proptest::prop_assert!(
+                    matches!(&last, Err(e) if e.kind() == io::ErrorKind::UnexpectedEof),
+                    "a stream ending inside a frame, at {}, read as {:?}",
+                    cut,
+                    last.map(|frame| frame.as_ref().map(frame_kind))
+                );
+            }
+        }
+
+        /// Whatever bytes arrive, reading them comes to an end without a panic: each read returns a
+        /// frame, a clean end or a refusal, and a frame takes at least its eight-byte header. The
+        /// bytes are frames the proxy writes, then changed: a byte, a length, a piece count, the
+        /// stream cut short or lengthened.
+        #[test]
+        fn any_bytes_are_read_to_an_end_without_a_panic(
+            sent in proptest::collection::vec(frames(), 0..4),
+            mutations in proptest::collection::vec((0u8..5, any::<Index>(), any::<u32>()), 1..5),
+        ) {
+            let (stream, ends) = stream_of(&sent);
+            let stream = mutated(stream, &ends[..ends.len() - 1], &mutations);
+            let mut channel = stream.as_slice();
+            let mut read = 0;
+            while let Ok(Some(_)) = wire::read(&mut channel) {
+                read += 1;
+                proptest::prop_assert!(
+                    read <= stream.len() / 8,
+                    "{} frames out of {} bytes",
+                    read,
+                    stream.len()
+                );
+            }
+        }
+
+        /// A frame announcing more than a frame carries is refused once the length that takes it
+        /// past the bound is read, before any byte it announces: nothing is held for them. A frame
+        /// reaching the bound exactly is not refused for its size. The length is the document's,
+        /// or that of one of a capture's parts.
+        #[test]
+        fn a_frame_announcing_more_than_the_bound_is_refused_before_its_bytes_are_read(
+            capture in masked(),
+            part in 0..=CAPTURE_PARTS,
+            over in prop_oneof![Just(0u32), Just(1), any::<u32>()],
+        ) {
+            let mut frame = wire::encode(wire::Frame::Event(ProxyEvent::CaptureFiled {
+                id: 1,
+                capture,
+            }))
+            .unwrap()
+            .unwrap();
+            let length_at = |at: usize| -> usize {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&frame[at..at + 4]);
+                u32::from_le_bytes(bytes) as usize
+            };
+            proptest::prop_assert_eq!(length_at(4), CAPTURE_PARTS, "a capture crosses as its parts");
+            // Where the length sits, how many bytes are read once it is, and the most it may say:
+            // the document's is read with the piece count, eight bytes in all.
+            let (field, read_by_then) = if part == CAPTURE_PARTS {
+                (0, 8)
+            } else {
+                let mut at = 8 + length_at(0);
+                for _ in 0..part {
+                    at += 4 + length_at(at);
+                }
+                (at, at + 4)
+            };
+            let most = wire::MAX_FRAME - read_by_then;
+            let announced = u32::try_from(most).unwrap().saturating_add(over);
+            frame[field..field + 4].copy_from_slice(&announced.to_le_bytes());
+            let mut rest = frame.as_slice();
+            let read = wire::read(&mut rest).map(|frame| frame.as_ref().map(frame_kind));
+            let consumed = frame.len() - rest.len();
+            if over == 0 {
+                proptest::prop_assert!(
+                    matches!(&read, Err(e) if e.kind() == io::ErrorKind::UnexpectedEof),
+                    "a frame at the bound read as {:?}",
+                    read
+                );
+            } else {
+                proptest::prop_assert!(
+                    matches!(&read, Err(e) if e.kind() == io::ErrorKind::InvalidData),
+                    "a frame past the bound read as {:?}",
+                    read
+                );
+                proptest::prop_assert_eq!(consumed, read_by_then, "bytes read past the length");
+            }
+        }
     }
 }

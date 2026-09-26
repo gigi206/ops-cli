@@ -2130,4 +2130,239 @@ mod tests {
             "answered by the judge, which admits no such host, rather than lost on the way"
         );
     }
+
+    /// What a message the proxy sends asks the supervisor for.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Asks {
+        Nothing,
+        Park,
+        Refresh,
+        Check,
+        Connect,
+        /// A message the supervisor cannot read, which ends the link.
+        Unreadable,
+    }
+
+    /// What the supervisor answers, as the proxy reads it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Answered {
+        Verdict,
+        Set,
+        Cleared,
+        Connection,
+        Refusal,
+        /// Something no question of the proxy's is answered with.
+        Other,
+    }
+
+    impl Asks {
+        /// Whether `answer` is one this question is answered with.
+        fn answered_by(self, answer: Answered) -> bool {
+            matches!(
+                (self, answer),
+                (Asks::Park, Answered::Verdict)
+                    | (Asks::Refresh, Answered::Set)
+                    | (Asks::Check, Answered::Cleared | Answered::Refusal)
+                    | (Asks::Connect, Answered::Connection | Answered::Refusal)
+            )
+        }
+    }
+
+    /// A message the proxy may send, as what it asks, the id it is answered under, and the
+    /// document: every kind, under ids drawn from a few so that some repeat, about hosts a request
+    /// names and text that is none, and now and then one the supervisor cannot read.
+    fn up_messages() -> impl proptest::strategy::Strategy<Value = (Asks, u64, String)> {
+        use proptest::prelude::*;
+        let id = || prop_oneof![0u64..4, Just(u64::MAX)];
+        // Each held on the heap: nested unions of these outgrow a test thread's stack otherwise.
+        let short = || {
+            proptest::collection::vec(any::<char>(), 0..24)
+                .prop_map(String::from_iter)
+                .boxed()
+        };
+        // Around what the queue keeps of a host or a path: single-byte characters up to near that
+        // length, then characters of any width, so that a cut by bytes can fall inside one.
+        let long = || {
+            let kept = crate::sandbox::SANITIZED_CHARS;
+            let wide = prop_oneof![any::<char>(), proptest::char::range('\u{80}', char::MAX)];
+            (kept - 4..kept + 4, proptest::collection::vec(wide, 1..4))
+                .prop_map(|(run, tail)| "a".repeat(run) + &String::from_iter(tail))
+                .boxed()
+        };
+        let text = move || prop_oneof![short(), long()].boxed();
+        let host = move || {
+            prop_oneof![2 => crate::allowlist::tests::host_spellings(), 1 => text()].boxed()
+        };
+        let asked = move || {
+            (host(), any::<u16>(), 0u8..3, text(), text())
+                .prop_map(|(host, port, plane, method, path)| match plane {
+                    0 => Asked::inspected(&host, port, &method, &path),
+                    1 => Asked::clear(&host, port, &method, &path),
+                    _ => Asked::splice(&host, port),
+                })
+                .boxed()
+        };
+        let doc = |message: &ToSupervisor| serde_json::to_string(message).unwrap();
+        prop_oneof![
+            any::<u64>().prop_map(move |version| {
+                (Asks::Nothing, 0, doc(&ToSupervisor::Installed { version }))
+            }),
+            any::<u64>().prop_map(move |id| (Asks::Nothing, 0, doc(&ToSupervisor::Flushed { id }))),
+            (id(), host(), any::<u16>(), text()).prop_map(move |(id, host, port, path)| {
+                let park = ToSupervisor::Park {
+                    id,
+                    host,
+                    port,
+                    path,
+                };
+                (Asks::Park, id, doc(&park))
+            }),
+            id().prop_map(move |id| (Asks::Refresh, id, doc(&ToSupervisor::Refresh { id }))),
+            (id(), asked()).prop_map(move |(id, asked)| (
+                Asks::Check,
+                id,
+                doc(&ToSupervisor::Check { id, asked })
+            )),
+            (id(), asked(), proptest::option::of(id()), any::<usize>()).prop_map(
+                move |(id, asked, check, from)| {
+                    let connect = ToSupervisor::Connect {
+                        id,
+                        asked,
+                        check,
+                        from,
+                    };
+                    (Asks::Connect, id, doc(&connect))
+                }
+            ),
+            // A park cut one byte short.
+            (id(), text()).prop_map(move |(id, path)| {
+                let mut cut = doc(&ToSupervisor::Park {
+                    id,
+                    host: "api.test".into(),
+                    port: 443,
+                    path,
+                });
+                cut.pop();
+                (Asks::Unreadable, 0, cut)
+            }),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256,
+            // A case that fails waits out its bound, and so does each step taken to reduce it.
+            max_shrink_time: 60_000,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// Whatever the proxy sends, each question it asks is answered under its own id, in the
+        /// form that question takes, and nothing else is: a park with a verdict, a refresh with a
+        /// set or none, a check or a connection with a clearance or a refusal. Past a message the
+        /// supervisor cannot read the link ends instead, whatever was left unanswered: the proxy
+        /// reads its end, the reader returns why, a push is refused, and no request stays queued
+        /// for an operator. Asked under a policy that admits by default and a resolver that
+        /// resolves nothing, so every check reaches the resolver and nothing is dialled.
+        #[test]
+        fn every_question_the_proxy_asks_is_answered_under_its_id_or_the_link_ends(
+            sent in proptest::collection::vec(up_messages(), 0..10),
+        ) {
+            let policy =
+                EgressPolicy::default().with_default(crate::allowlist::DefaultAction::Allow);
+            let judge = Judge::new(&policy.encode().unwrap()).unwrap();
+            judge.set_resolver(Arc::new(|_: &str| -> io::Result<Vec<std::net::IpAddr>> {
+                Err(io::Error::other("nothing resolves here"))
+            }));
+            let pending = Arc::new(PendingState::new());
+            // A park waits a moment for the operator nobody plays here, so that it is answered;
+            // in a case that ends the link it waits for as long as the link lasts, so that only
+            // the link's end lets it go.
+            let ends = sent.iter().any(|&(asks, ..)| asks == Asks::Unreadable);
+            let wait = (!ends).then_some(Duration::from_millis(1));
+            let (down, up) = wire::Socket::pair().unwrap();
+            let (supervisor, reader) = supervise(
+                down,
+                Arc::new(judge),
+                Some(parks(&pending, 2, wait)),
+                None,
+                named_thread,
+            )
+            .unwrap();
+            let proxy = Arc::new(up);
+            // Everything the supervisor sends, read as it comes: a proxy that stopped reading
+            // would have the link ended for it.
+            let (heard, answers) = channel();
+            {
+                let proxy = Arc::clone(&proxy);
+                std::thread::spawn(move || {
+                    while let Ok(Some((doc, fds))) = proxy.recv_down() {
+                        let answer = match ToProxy::decode(&doc, fds) {
+                            Ok(ToProxy::Answer { id, .. }) => (id, Answered::Verdict),
+                            Ok(ToProxy::Refreshed { id, .. }) => (id, Answered::Set),
+                            Ok(ToProxy::Checked { id }) => (id, Answered::Cleared),
+                            Ok(ToProxy::Connected { id, .. }) => (id, Answered::Connection),
+                            Ok(ToProxy::Refused { id, .. }) => (id, Answered::Refusal),
+                            _ => (0, Answered::Other),
+                        };
+                        if heard.send(answer).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            let mut unanswered = Vec::new();
+            let mut read_to_the_end = true;
+            for (asks, id, doc) in &sent {
+                // Sent past an unreadable message too, where nothing is read any more.
+                let _ = proxy.send_up(doc.as_bytes());
+                match asks {
+                    Asks::Unreadable => read_to_the_end = false,
+                    Asks::Nothing => {}
+                    _ if read_to_the_end => unanswered.push((*asks, *id)),
+                    _ => {}
+                }
+            }
+            let mut stray = Vec::new();
+            let mut take = |(id, answer): (u64, Answered), unanswered: &mut Vec<(Asks, u64)>| {
+                match unanswered
+                    .iter()
+                    .position(|&(asks, asked)| asked == id && asks.answered_by(answer))
+                {
+                    Some(at) => drop(unanswered.remove(at)),
+                    None => stray.push((id, answer)),
+                }
+            };
+            let deadline = Instant::now() + ANSWER_WAIT;
+            if read_to_the_end {
+                while !unanswered.is_empty() {
+                    match answers.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(answer) => take(answer, &mut unanswered),
+                        Err(_) => break,
+                    }
+                }
+                proptest::prop_assert!(unanswered.is_empty(), "unanswered: {:?}", unanswered);
+                proxy.shutdown();
+            }
+            loop {
+                match answers.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(answer) => take(answer, &mut unanswered),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        proptest::prop_assert!(false, "the proxy never read the end of the link");
+                    }
+                }
+            }
+            proptest::prop_assert!(stray.is_empty(), "answers nothing asked for: {:?}", stray);
+            let why = ended(reader);
+            proptest::prop_assert_eq!(
+                why.is_ok(),
+                read_to_the_end,
+                "the reader returned {:?}",
+                why
+            );
+            let pushed = supervisor.push(1, Overlay::default()).map_err(|e| e.kind());
+            proptest::prop_assert_eq!(pushed, Err(io::ErrorKind::BrokenPipe));
+            proptest::prop_assert!(pending.list().is_empty(), "left queued: {:?}", pending.list());
+        }
+    }
 }

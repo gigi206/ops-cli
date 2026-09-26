@@ -32,7 +32,7 @@ const HEADER: usize = 8;
 /// What crosses, with its capture as `C`: the proxy's [`Masked`], or [`CaptureDoc`] in the
 /// document.
 #[derive(serde::Serialize, serde::Deserialize)]
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 pub(super) enum Frame<C> {
     /// Something the proxy did.
     Event(ProxyEvent<C>),
