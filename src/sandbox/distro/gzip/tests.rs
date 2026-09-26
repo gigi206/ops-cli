@@ -166,3 +166,34 @@ fn gunzip(data: &[u8]) -> Vec<u8> {
     assert!(out.status.success());
     out.stdout
 }
+
+/// One gzip member around `payload`, deflated in process, for a test whose expectation is its own
+/// input rather than the host's `gzip`. The trailer is zeros: this reader does not check it.
+fn member_of(payload: &[u8]) -> Vec<u8> {
+    let mut member = vec![0x1f, 0x8b, DEFLATE, 0, 0, 0, 0, 0, 0, 3];
+    member.extend(miniz_oxide::deflate::compress_to_vec(payload, 6));
+    member.extend([0u8; 8]);
+    member
+}
+
+/// A read into an empty buffer returns nothing and costs nothing of what is already inflated.
+///
+/// The refill replaces the inflated output rather than adding to it, and an empty buffer used to
+/// fall through to it with output still unread: that output was dropped, and the refill ran again
+/// until the member ended. The payload spans several output chunks, so there is unread output when
+/// the empty read arrives and more to inflate after it.
+#[test]
+fn an_empty_read_keeps_the_output_not_yet_read() {
+    let payload: Vec<u8> = (0..200_000u32)
+        .map(|i| (i.wrapping_mul(7) % 251) as u8)
+        .collect();
+    let member = member_of(&payload);
+    let mut reader = GzipReader::new(io::BufReader::new(&member[..])).expect("a gzip header");
+    let mut first = [0u8; 5];
+    reader.read_exact(&mut first).expect("the first bytes");
+    assert_eq!(reader.read(&mut []).expect("an empty read"), 0);
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).expect("the rest");
+    assert_eq!(rest.len(), payload.len() - first.len());
+    assert!([&first[..], &rest[..]].concat() == payload);
+}

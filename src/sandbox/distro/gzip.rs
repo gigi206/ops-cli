@@ -134,15 +134,19 @@ fn skip_zero_terminated<R: BufRead>(inner: &mut R) -> io::Result<()> {
 
 impl<R: BufRead> Read for GzipReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // An empty buffer asks for nothing, and is answered here. Below, a buffer has room for at
+        // least one byte, so output not yet read is always handed back before the refill, which
+        // replaces the output rather than adding to it.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             // Hand back what is already inflated before asking for more.
             if self.at < self.out.len() {
                 let n = (self.out.len() - self.at).min(buf.len());
-                if n > 0 {
-                    buf[..n].copy_from_slice(&self.out[self.at..self.at + n]);
-                    self.at += n;
-                    return Ok(n);
-                }
+                buf[..n].copy_from_slice(&self.out[self.at..self.at + n]);
+                self.at += n;
+                return Ok(n);
             }
             if self.done {
                 return Ok(0);
