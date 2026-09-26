@@ -39,15 +39,37 @@
 #
 # omp's /collab session relay (`my.omp.sh`) stays refused unless you opt in; uncomment its allow
 # entry below to join a session.
-cmd = "omp"
-
-# No `contract`: `--append-system-prompt` exists but costs you your own addition. When it is given,
-# omp skips the `APPEND_SYSTEM.md` it would otherwise load (the project's, then yours) and the
-# append from your settings, and the option keeps a single value, so pi's workaround of passing your
-# own file beside it does not apply. Point omp at the cage's summary yourself instead, for instance
-# with a line in your `APPEND_SYSTEM.md` such as "When the environment variable SBX_SANDBOX is 1,
-# read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands omp the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as a rule: a copy at `~/.agents/rules/sbx-contract.md`
+# whose frontmatter says `alwaysApply: true`. omp loads every rule file of that directory and renders
+# the always-applied ones into its system prompt, beside your own rules and the project's context
+# files, so nothing of yours is replaced. The copy lives in the app's isolated home, which only this
+# app's cages read: it is rewritten at every launch, removed by a launch without a summary, and a file
+# of yours at that path is left untouched (the summary is then not added). Two settings drop it: the
+# rule's name in your `disabledRules`, and `--no-rules`. omp's `--append-system-prompt` is not used:
+# given on the command line it makes omp skip the `APPEND_SYSTEM.md` files and the append from your
+# settings. Arguments after `sbx app run omp --` reach omp verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+d="$HOME/.agents/rules"
+f="$d/sbx-contract.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$d" && { printf -- '---\nalwaysApply: true\n---\n%s\n' "$m"; cat "$s"; } > "$f.tmp" \
+      && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec omp "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "omp",
+]
 
 # AUDIO — omp's voice feature (speaks the assistant's output as it streams) opens the default
 # speaker through miniaudio (backends: PulseAudio/ALSA/Jack). A hermetic cage without audio has

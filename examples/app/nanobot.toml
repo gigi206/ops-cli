@@ -82,6 +82,23 @@ cmd = [
     '''
 # Bare `sbx app run nanobot` lands in the agent chat; `-- <args>` appends arrive as $1 $2 …
 # and pass through verbatim (the `$0` placeholder convention every `bash -c` profile here uses).
+# The cage's summary as an always-active skill (see the note below `cmd`).
+s=/opt/sbx/contract-summary.md
+d="$HOME/.nanobot/workspace/skills/sbx-contract"
+f="$d/SKILL.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+    if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+        mkdir -p "$d" && {
+            printf -- '---\nname: sbx-contract\n'
+            printf -- 'description: The sbx sandbox this agent runs in, what it may reach, which files it protects and which operations it offers.\n'
+            printf -- 'metadata: {"nanobot": {"always": true, "requires": {"env": ["SBX_SANDBOX"]}}}\n---\n%s\n' "$m"
+            cat "$s"
+        } > "$f.tmp" && mv -f "$f.tmp" "$f"
+    fi
+elif grep -qsF "$m" "$f"; then
+    rm -f "$f"
+fi
 if [ "$#" -eq 0 ]; then
     exec nanobot agent
 fi
@@ -92,12 +109,16 @@ exec nanobot "$@"
     "nanobot",
 ]
 
-# No `contract`: nanobot builds its system prompt from the project's `AGENTS.md` and the
-# `SOUL.md`/`USER.md` of its workspace, and no option, environment variable or config field adds to
-# it; `--workspace` and `--config` would replace yours. Point nanobot at the cage's summary yourself
-# instead, for instance with a line in the `USER.md` of its workspace such as "When the environment
-# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
-# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands nanobot the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as a skill: a copy at
+# `~/.nanobot/workspace/skills/sbx-contract/SKILL.md` whose frontmatter marks it `always` and makes
+# it require SBX_SANDBOX. nanobot inlines every always-active skill of its workspace into the system
+# prompt under "Active Skills", beside its `AGENTS.md`, `SOUL.md` and `USER.md`, so nothing of yours
+# is replaced. The copy lives in the app's isolated home, which only this app's cages read: it is
+# rewritten at every launch, removed by a launch without a summary, and a skill of yours at that path
+# is left untouched (the summary is then not added). It is written into the DEFAULT workspace: a
+# workspace moved by your config or by `--workspace` does not see it, and `sbx-contract` in your
+# `disabledSkills` drops it. `--config` stays unused, since it would replace your config.
 
 # --- The agent's requirements come from its bundle ------------------------------------------------
 # `use` pulls in the `nanobot` BUNDLE — the package(s) (uv/python312 for the pipx install), the

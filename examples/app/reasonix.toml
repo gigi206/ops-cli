@@ -60,16 +60,30 @@ if [ -n "$DEEPSEEK_API_KEY" ] && [ ! -f "$HOME/.reasonix/.env" ]; then
     umask 077
     printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY" > "$HOME/.reasonix/.env"
 fi
+# The cage's summary as a user instruction file (see the note below `cmd`).
+s=/opt/sbx/contract-summary.md
+f="$HOME/.reasonix/CLAUDE.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+    if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+        mkdir -p "$HOME/.reasonix" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+    fi
+elif grep -qsF "$m" "$f"; then
+    rm -f "$f"
+fi
 exec reasonix "$@"
 ''', "reasonix"]
 
-# No `contract`: Reasonix takes no option that appends to its system prompt
-# (`--prompt`/`--prompt-file` carry the task), `system_prompt_file` is a config key rather than an
-# option, and `REASONIX_HOME` would move your whole home. Its instructions come from
-# `REASONIX.md`/`AGENTS.md`. Point Reasonix at the cage's summary yourself instead, for instance
-# with a line in a `REASONIX.md` it reads such as "When the environment variable SBX_SANDBOX is 1,
-# read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Reasonix the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as a user instruction file: a copy at
+# `~/.reasonix/CLAUDE.md`. Reasonix loads all three of `REASONIX.md`, `AGENTS.md` and `CLAUDE.md`
+# from its home, then the project's, so your own files still apply beside it; `CLAUDE.md` is the
+# name a Reasonix user is least likely to keep there. It is a copy, not a link: Reasonix rejects an
+# instruction file whose link leaves its directory. The copy lives in the app's isolated home, which
+# only this app's cages read: it is rewritten at every launch, removed by a launch without a summary,
+# and a `CLAUDE.md` of yours is left untouched (the summary is then not added). No option is used:
+# Reasonix has none that appends to its system prompt, `system_prompt_file` replaces it, and
+# `REASONIX_HOME` would move your whole home.
 
 # Your host Reasonix home, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets

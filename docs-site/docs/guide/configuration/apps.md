@@ -208,8 +208,13 @@ writes the summary into Codex's managed requirements file, `/etc/codex/requireme
 `additional_developer_instructions`, which Codex sends as a developer message of its own beside
 yours. When an agent reads a file sbx can place in the cage's own `/etc` or `/` (both live for one
 launch and never reach the host), a command that writes it there is the way to add to the user's
-instructions rather than replace them; the shipped `amp`, `openfox`, `pi`, `prime-agent` and
-`open-design` profiles do the same.
+instructions rather than replace them; the shipped `aider`, `amp`, `claude-desktop`,
+`codex-desktop`, `hermes`, `open-design`, `openfox`, `pi` and `prime-agent` profiles do the same.
+An agent that reads its instructions from its own home only can still take the summary when it
+loads every file of a directory there: the command drops a copy of its own beside the user's files,
+rewrites it at every launch, and never overwrites a file it did not write. The app's home is
+isolated, so only that app's cages read the copy. The shipped `nanobot`, `omp` and `reasonix`
+profiles work this way.
 
 **What the summary says.** The network posture and the hosts the cage may reach (hosts only, never
 their paths), the destinations a credential is attached to, the files sbx protects by name and a
