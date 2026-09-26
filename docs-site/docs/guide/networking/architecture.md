@@ -369,7 +369,10 @@ framing bug into a truncation the tool in the cage would blame on sbx. Framing c
 shorten the wait; it never shortens a response.
 
 A chunked response reaches the cage **verbatim**, size lines and trailers included. The
-proxy learns where the body ends without rewriting a byte of it.
+proxy learns where the body ends without rewriting a byte of it. It reads the head the way
+the cage's client does: a token in `Transfer-Encoding` or `Connection` loses only the
+spaces and tabs around it, so `\u00a0chunked` is not `chunked` here either, and such a
+response is relayed to the close.
 
 ### Reusing a connection (`pool`)
 

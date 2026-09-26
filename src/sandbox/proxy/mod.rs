@@ -1070,8 +1070,7 @@ impl Head {
                 .headers
                 .iter()
                 .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
-                .flat_map(|(_, v)| v.split(','))
-                .any(|t| t.trim().eq_ignore_ascii_case("close"))
+                .any(|(_, v)| list_names(v, "close"))
     }
 }
 

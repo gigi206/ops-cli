@@ -107,6 +107,20 @@ fn trim_ows(value: &str) -> &str {
     value.trim_matches([' ', '\t'])
 }
 
+/// Whether a comma-separated field value names `token`, each element read with its `OWS` taken
+/// off ([`trim_ows`]) and nothing more: the one reading of every token list the proxy decides a
+/// message's framing or its connection by (`Transfer-Encoding`, `Connection`, `Upgrade`).
+///
+/// These lists were read with `str::trim`, which [`parse_head`] had kept off the values. So a
+/// response's `Transfer-Encoding: \u{a0}chunked` was framed as chunked and its connection kept for
+/// the next request, while the cage's client, which reads a coding it does not know, waited for
+/// the close; and `\u{a0}close`, `\u{a0}websocket` read as tokens no peer sees there.
+pub(super) fn list_names(value: &str, token: &str) -> bool {
+    value
+        .split(',')
+        .any(|element| trim_ows(element).eq_ignore_ascii_case(token))
+}
+
 /// Whether a parsed request head carries a byte another parser could frame the message by.
 ///
 /// [`parse_head`] splits on CRLF *and* on a bare LF, so no LF survives into a name or a value. A lone
@@ -182,7 +196,7 @@ pub(super) fn inspect_framing(
             detail: "the request carries a duplicated Transfer-Encoding header",
         });
     }
-    let chunked = match head.header("transfer-encoding").map(str::trim) {
+    let chunked = match head.header("transfer-encoding") {
         Some(v) if forwards_chunked && v.eq_ignore_ascii_case("chunked") => true,
         Some(_) => {
             return Err(FramingRefusal {
@@ -663,13 +677,9 @@ pub(crate) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming
         }
         let final_coding = parsed
             .header("transfer-encoding")
-            .unwrap_or("")
-            .rsplit(',')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        return if final_coding.eq_ignore_ascii_case("chunked") {
+            .and_then(|codings| codings.rsplit(',').next())
+            .unwrap_or("");
+        return if list_names(final_coding, "chunked") {
             BodyFraming::Chunked
         } else {
             BodyFraming::ToEof
@@ -708,8 +718,7 @@ pub(super) fn response_keeps_alive(head: &[u8]) -> bool {
             .headers
             .iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
-            .flat_map(|(_, v)| v.split(','))
-            .any(|t| t.trim().eq_ignore_ascii_case(tok))
+            .any(|(_, v)| list_names(v, tok))
     };
     if connection_token("close") {
         return false;
@@ -1521,6 +1530,48 @@ mod tests {
             ),
             BodyFraming::Chunked
         ));
+    }
+
+    /// A token in a list is read with its `OWS` taken off and nothing else, on every list a
+    /// message's framing or its connection is decided by: a blank a peer reads as part of the
+    /// token is part of it here too.
+    #[test]
+    fn a_framing_token_is_read_with_only_its_ows_taken_off() {
+        let response = |field: &str| format!("HTTP/1.1 200 OK\r\n{field}\r\n\r\n");
+        let request = |field: &str| {
+            parse_head(format!("POST / HTTP/1.1\r\nHost: h\r\n{field}\r\n\r\n").as_bytes()).unwrap()
+        };
+        for coding in ["chunked", " chunked\t", "gzip, chunked", "gzip,\tCHUNKED"] {
+            let head = response(&format!("Transfer-Encoding: {coding}"));
+            assert!(
+                matches!(
+                    response_framing(head.as_bytes(), "GET"),
+                    BodyFraming::Chunked
+                ),
+                "`{coding}` ends in chunked"
+            );
+        }
+        for coding in ["\u{a0}chunked", "chunked\u{a0}", "gzip,\u{3000}chunked"] {
+            let head = response(&format!("Transfer-Encoding: {coding}"));
+            assert!(
+                matches!(response_framing(head.as_bytes(), "GET"), BodyFraming::ToEof),
+                "`{coding}` does not end in chunked"
+            );
+            let refused = inspect_framing(&request(&format!("Transfer-Encoding: {coding}")), true);
+            assert!(
+                refused.is_err_and(|r| r.reason == "bad-request:transfer-encoding"),
+                "`{coding}` is not a coding this proxy forwards"
+            );
+        }
+        let keeps = |value: &str| {
+            let field = format!("Connection: {value}\r\nContent-Length: 0");
+            response_keeps_alive(response(&field).as_bytes())
+        };
+        assert!(!keeps("close") && !keeps("keep-alive,\tclose"));
+        assert!(keeps("\u{a0}close"), "`\u{a0}close` is not the close token");
+        let asks_to_keep = |value: &str| request(&format!("Connection: {value}")).keeps_alive();
+        assert!(!asks_to_keep("close") && !asks_to_keep("te,\tclose"));
+        assert!(asks_to_keep("\u{a0}close"), "nor in a request");
     }
 
     #[test]

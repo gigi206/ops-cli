@@ -29,8 +29,7 @@ use crate::sandbox::control::SecretWay;
 pub(super) fn is_websocket_upgrade(head: &Head) -> bool {
     let names_token = |header: &str, token: &str| {
         head.header(header)
-            .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
-            .unwrap_or(false)
+            .is_some_and(|value| wire::list_names(value, token))
     };
     wire::request_line_method(&head.request_line) == Some("GET")
         && names_token("upgrade", "websocket")
@@ -837,6 +836,16 @@ mod tests {
             .expect("a well-formed head")
         };
         assert!(is_websocket_upgrade(&head("GET")));
+        // The token is read with its `OWS` taken off and nothing else.
+        let upgrade = |value: &str| {
+            let text = format!(
+                "GET /socket HTTP/1.1\r\nHost: chat.example\r\nUpgrade: {value}\r\n\
+                 Connection: Upgrade\r\n\r\n"
+            );
+            is_websocket_upgrade(&wire::parse_head(text.as_bytes()).expect("a well-formed head"))
+        };
+        assert!(upgrade("h2c,\twebsocket"));
+        assert!(!upgrade("\u{a0}websocket"));
         for method in ["HEAD", "POST", "PUT", "DELETE", "OPTIONS"] {
             assert!(
                 !is_websocket_upgrade(&head(method)),
