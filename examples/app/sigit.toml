@@ -59,8 +59,8 @@
 # summary is no longer added. It is not written while a `CLAUDE.md` of yours sits in that directory
 # either, since siGit reads only the first of the two names there. The file lives in the app's
 # isolated home, which only this app's cages read, and `SIGIT_CONFIG_DIR` moves it (the command
-# follows it). Not measured: the first launch downloads the model before any session starts; the
-# loader was read in siGit's source (`src/instructions.rs`, v1.5.10).
+# follows it). Measured with `sigit -p` against an OpenAI-compatible provider (`OPENAI_BASE_URL`),
+# which answers from it beside the project's `AGENTS.md`; headless mode never loads the local model.
 cmd = [
     "bash",
     "-c",
