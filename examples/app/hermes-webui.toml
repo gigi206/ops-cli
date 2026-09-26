@@ -140,15 +140,36 @@ except Exception:
     pass
 PYINIT
 
+# The cage's summary as a WebUI prefill system message, only while you configure no prefill of your
+# own (see the note below `cmd`).
+home="${HERMES_HOME:-$HOME/.hermes}"
+if [ -r /opt/sbx/contract-summary.md ] && [ -z "${HERMES_PREFILL_MESSAGES_FILE:-}" ] \
+   && [ -z "${HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT:-}" ] \
+   && ! grep -qsE '^[[:space:]]*(prefill_messages_file|webui_prefill_messages_script|prefill_messages_script)[[:space:]]*:' \
+        "$home/config.yaml" "$home"/profiles/*/config.yaml \
+   && mkdir -p /etc/hermes-webui 2>/dev/null \
+   && "$HERMES_WEBUI_PYTHON" -c 'import json, sys
+with open("/opt/sbx/contract-summary.md", encoding="utf-8") as f:
+    json.dump([{"role": "system", "content": f.read()}], open(sys.argv[1], "w"))' /etc/hermes-webui/sbx-prefill.json; then
+    export HERMES_PREFILL_MESSAGES_FILE=/etc/hermes-webui/sbx-prefill.json
+fi
 exec hermes-webui "$@"
 ''',
 ]
 
-# No `contract`: the WebUI sets the agent's ephemeral system prompt itself, and reads no environment
-# variable that adds to it. Point Hermes at the cage's summary yourself instead, for instance with a
-# line in your own instructions such as "When the environment variable SBX_SANDBOX is 1, read the
-# file named by SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md)
-# is rewritten at every launch.
+# The command hands the WebUI's agent the cage's summary (/opt/sbx/contract-summary.md: what it may
+# reach, which files it protects, which operations it offers) as a session prefill: a JSON file in
+# the cage's own `/etc/hermes-webui` holding the summary as one `system` message, named by
+# `HERMES_PREFILL_MESSAGES_FILE`. The WebUI loads it at the start of every streamed chat, before your
+# message and beside the agent's own system prompt, its `SOUL.md` and the workspace's `AGENTS.md`,
+# so nothing of yours is replaced; the chat's `context_status` event reports it as loaded. That
+# variable replaces any prefill you configure, so the command sets it only while you have none: no
+# `HERMES_PREFILL_MESSAGES_FILE` or `HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT` in the environment, and no
+# `prefill_messages_file`, `webui_prefill_messages_script` or `prefill_messages_script` key in
+# `$HERMES_HOME/config.yaml` or a profile's. Once you configure your own prefill, the summary is no
+# longer added. The file lives in the cage's `/etc` for this launch only. The WebUI's synchronous
+# `/api/chat` route loads no prefill, so it does not receive the summary. The hook the other Hermes
+# profiles use does not apply: the WebUI never registers configured shell hooks.
 
 
 # The inbound hole: forward host 127.0.0.1:8787 into the cage at the same port, so your HOST browser
