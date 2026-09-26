@@ -74,30 +74,37 @@
 # you use is configured
 # with an API KEY instead of OAuth (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY in its own config), you
 # can drop the `[open]` table + the chromium package.
-# A plain argv, not a `bash -c`: nothing here derives a value, tests a path or writes a file, so a
-# shell would only add a process and a quoting surface. It also means `sbx app run t3code -- <args>`
-# reaches the program directly, since sbx appends the trailing arguments to this list.
+# A `bash -c` rather than a plain argv, for one reason: it writes the managed instructions file
+# described below `cmd` before starting the app. `sbx app run t3code -- <args>` still reaches the
+# program verbatim through `"$@"`.
 #
 # GPU note: on an NVIDIA/Optimus machine Chromium may pick the discrete card, which has no in-cage
 # driver (`pci id 10de:… driver (null)` -> "GPU process isn't usable. Goodbye."), an intermittent
 # crash. If the window crashes on GPU, add `--disable-gpu` below for software rendering (maps via
 # wl_shm; a UI control plane needs no acceleration).
 cmd = [
+    "bash",
+    "-c",
+    '''
+# The cage's summary as Claude Code's managed instructions file (see the note below `cmd`).
+if [ -r /opt/sbx/contract-summary.md ] && mkdir -p /etc/claude-code 2>/dev/null; then
+  ln -sf /opt/sbx/contract-summary.md /etc/claude-code/CLAUDE.md
+fi
+exec t3code --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --use-system-ca \
+  --password-store=gnome-libsecret "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
     "t3code",
-    "--no-sandbox",
-    "--ozone-platform=wayland",
-    "--disable-dev-shm-usage",
-    "--use-system-ca",
-    "--password-store=gnome-libsecret",
 ]
 
-# No `contract`: T3 Code has no model of its own; it drives CLI agents it starts itself. sbx does
-# not start them, so the `contract` of the driven agent's own profile never applies here, and Claude
-# Code, the default, takes its appended prompt from an option only. Point the driven agent at the
-# cage's summary yourself instead, for instance with a line in its own user instructions in this
-# app's home (`~/.claude/CLAUDE.md` for Claude Code) such as "When the environment variable
-# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands the Claude Code sessions T3 Code drives the cage's summary
+# (/opt/sbx/contract-summary.md: what it may reach, which files it protects, which operations it
+# offers) as Claude Code's managed instructions file, a link at `/etc/claude-code/CLAUDE.md`. T3 Code
+# starts `claude` itself, in this same cage, so the option the `claude-code` profile passes never
+# reaches it; the managed file is loaded whatever options T3 Code passes, joined to your own
+# `CLAUDE.md` files rather than replacing them. `/etc` is the cage's own tmpfs: the link lives for
+# this launch only and never reaches the host. Measured by running this cage's `claude -p`. Another
+# agent you enable in `[packages]` takes the summary its own way, as its own profile shows.
 
 gui = "wayland"
 gpu = true

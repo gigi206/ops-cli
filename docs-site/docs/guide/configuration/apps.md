@@ -209,7 +209,8 @@ writes the summary into Codex's managed requirements file, `/etc/codex/requireme
 yours. When an agent reads a file sbx can place in the cage's own `/etc` or `/` (both live for one
 launch and never reach the host), a command that writes it there is the way to add to the user's
 instructions rather than replace them; the shipped `aider`, `amp`, `claude-desktop`,
-`codex-desktop`, `hermes`, `open-design`, `openfox`, `pi` and `prime-agent` profiles do the same.
+`codex-desktop`, `hermes`, `open-design`, `openfox`, `pi`, `prime-agent` and `t3code` profiles do
+the same.
 An agent that reads its instructions from its own home only can still take the summary when it
 loads every file of a directory there: the command drops a copy of its own beside the user's files,
 rewrites it at every launch, and never overwrites a file it did not write. The app's home is
