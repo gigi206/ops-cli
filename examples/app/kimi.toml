@@ -35,15 +35,55 @@
 # talks to are confirmed at first login — a host the flow reaches that is not
 # listed returns a 403 whose body names `sbx net allow <host>`, so add any
 # missing host the proxy surfaces.
-cmd = "kimi"
-
-# No `contract`: Kimi Code's options replace rather than add. `--agent-file` loads an agent
-# definition whose body becomes that agent's whole prompt, `--skills-dir` is used instead of the
-# discovered skill directories, and `KIMI_CODE_HOME` moves its home. Its `AGENTS.md` files come from
-# `~/.kimi-code`, `~/.agents/AGENTS.md` and the project. Point Kimi at the cage's summary yourself
-# instead, for instance with a line in your `~/.agents/AGENTS.md` such as "When the environment
-# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
-# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Kimi the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) as a plugin: a copy with a `kimi.plugin.json` whose
+# `systemPromptPath` names it, placed in the cage's own `/etc/kimi/sbx-contract` for this launch
+# only, and registered as `sbx-contract` in `~/.kimi-code/plugins/installed.json`. Kimi renders every
+# enabled plugin's prompt under "Plugin Instructions" in the system prompt, beside your `AGENTS.md`
+# files and the project's, so nothing of yours is replaced. The registry is merged, never rewritten:
+# your entries are kept, a registry that does not parse is left alone (the summary is then not
+# added), a plugin of yours named `sbx-contract` is left alone too, and a launch without a summary
+# removes the entry. The registry lives in the app's isolated home, which only this app's cages
+# read, and a plugin you disable in `/plugins` stays disabled. No option is used: `--agent-file` and
+# `--skills-dir` replace rather than add, and `KIMI_CODE_HOME` moves the home (the command follows
+# it). Arguments after `sbx app run kimi --` reach Kimi verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+r=/etc/kimi/sbx-contract
+k="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+have=; [ -r "$s" ] && command -v node >/dev/null && mkdir -p "$r" 2>/dev/null \
+  && cp "$s" "$r/SUMMARY.md" \
+  && printf '%s\n' '{"name": "sbx-contract", "version": "1.0.0",' \
+    ' "description": "The sbx sandbox this agent runs in: what it may reach, which files it protects, which operations it offers.",' \
+    ' "systemPromptPath": "./SUMMARY.md"}' > "$r/kimi.plugin.json" && have=1
+node - "$k/plugins/installed.json" "$r" "$have" <<'MERGE' || true
+const fs = require("fs"), path = require("path");
+const [file, root, have] = process.argv.slice(2);
+let data = { version: 1, plugins: [] };
+try { data = JSON.parse(fs.readFileSync(file, "utf8")); }
+catch (e) { if (e.code !== "ENOENT") process.exit(0); }
+if (!data || !Array.isArray(data.plugins)) process.exit(0);
+const i = data.plugins.findIndex((p) => p && p.id === "sbx-contract");
+if (i >= 0 && data.plugins[i].root !== root) process.exit(0);
+const old = i >= 0 ? data.plugins.splice(i, 1)[0] : undefined;
+if (have) {
+  const now = new Date().toISOString();
+  data.plugins.push({ id: "sbx-contract", root, enabled: old ? old.enabled !== false : true,
+    installedAt: (old && old.installedAt) || now, updatedAt: now, originalSource: "sbx",
+    source: "local-path" });
+} else if (!old) process.exit(0);
+fs.mkdirSync(path.dirname(file), { recursive: true });
+fs.writeFileSync(file + ".sbx.tmp", JSON.stringify(data, null, 2));
+fs.renameSync(file + ".sbx.tmp", file);
+MERGE
+exec kimi "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "kimi",
+]
 
 # AUDIO — Kimi Code may add voice features in the future. If/when it does,
 # `audio = true` will provision the PulseAudio client + the ALSA→PulseAudio
