@@ -5781,6 +5781,50 @@ fn a_connect_host_the_supervisor_refuses_is_a_bad_request() {
     );
 }
 
+/// Port 0 in a CONNECT authority is malformed, as it is in a rule, a URL and a `tcp://` target. No
+/// rule can write it, yet a `:*` rule matches every port, so taken as a port it was admitted.
+///
+/// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses, so
+/// an authority the rule admits comes back `403 ssrf-blocked` rather than `400 bad-request`, and
+/// the last case proves a real port under the same rule still does.
+#[test]
+fn a_connect_to_port_zero_is_a_bad_request() {
+    let answer = |authority: &str| {
+        let ctx = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            policy(&["tcp://allowed.test:*"]),
+        )
+        .unwrap()
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])])));
+        let (mut test_end, cage_end) = UnixStream::pair().unwrap();
+        cage_end
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        test_end
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+        let _ = handle_client(cage_end, &ctx);
+        let mut answer = String::new();
+        test_end.read_to_string(&mut answer).unwrap();
+        answer
+    };
+    for authority in ["allowed.test:0", "allowed.test:00", "[::1]:0"] {
+        let resp = answer(authority);
+        assert!(
+            resp.contains("400 Bad Request")
+                && resp.contains("X-Sbx-Egress-Reason: bad-request\r\n"),
+            "`CONNECT {authority}` names no port: {resp:?}"
+        );
+    }
+    let resp = answer("allowed.test:22");
+    assert!(
+        resp.contains("403") && resp.contains("ssrf-blocked"),
+        "`CONNECT allowed.test:22` is admitted by the rule and must reach the gate: {resp:?}"
+    );
+}
+
 /// A request head *inside a tunnel* that never arrives whole is answered and recorded against the
 /// tunnel's own host, which the entrance's line has none to name. And a tunnel a client is simply
 /// finished with is not an attempt: it leaves nothing behind.

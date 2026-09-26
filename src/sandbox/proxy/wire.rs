@@ -310,14 +310,21 @@ pub(super) fn request_line_method(line: &str) -> Option<&str> {
 
 /// Split a CONNECT authority `host:port` (port required) into its parts, handling a bracketed
 /// IPv6 literal.
+///
+/// Port 0 is refused. It is not a port, and every other reader of one already says so: a rule's
+/// port, an absolute-form URL and a `tcp://` target all refuse it, so a CONNECT that took it
+/// answered the same question a fourth way, and handed the policy a port no rule can write, which
+/// a `:*` rule then admitted.
 pub(super) fn split_authority(authority: &str) -> Option<(String, u16)> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (addr, tail) = rest.split_once(']')?;
-        let port = tail.strip_prefix(':')?.parse().ok()?;
-        return Some((addr.to_string(), port));
-    }
-    let (h, p) = authority.rsplit_once(':')?;
-    Some((h.to_string(), p.parse().ok()?))
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let (addr, tail) = rest.split_once(']')?;
+            (addr, tail.strip_prefix(':')?)
+        }
+        None => authority.rsplit_once(':')?,
+    };
+    let port = port.parse().ok().filter(|&port: &u16| port != 0)?;
+    Some((host.to_string(), port))
 }
 
 /// The host and port a request's `Host` header, or an HTTP/2 `:authority`, names: the host in the
@@ -1809,6 +1816,10 @@ mod tests {
             "a missing port is refused (CONNECT requires one)"
         );
         assert_eq!(split_authority("h:notaport"), None);
+        // Port 0 is not a port, as every other reader of one already answers.
+        assert_eq!(split_authority("h:0"), None);
+        assert_eq!(split_authority("[::1]:0"), None);
+        assert_eq!(split_authority("h:65535"), Some(("h".to_string(), 65535)));
     }
 
     #[test]

@@ -269,9 +269,10 @@ allow = [
 ]
 ```
 
-Ports are `1..=65535` (port 0 is rejected); a range needs `lo <= hi`. A URL rule
-carries the same port set on its host: `github.com:443/orgs`, `example.com:*/admin`,
-`[::1]:8080/admin`.
+Ports are `1..=65535` (port 0 is rejected); a range needs `lo <= hi`. A request
+naming port 0, by CONNECT or as an absolute-form URL, is refused `400 bad-request`,
+so `:*` never admits it. A URL rule carries the same port set on its host:
+`github.com:443/orgs`, `example.com:*/admin`, `[::1]:8080/admin`.
 
 ---
 
