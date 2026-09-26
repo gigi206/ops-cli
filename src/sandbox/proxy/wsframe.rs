@@ -1654,6 +1654,43 @@ mod tests {
         }
     }
 
+    /// A capture filled exactly by one message, then an empty compressed message, then more text:
+    /// the empty message carries no byte, so it says nothing about whether the transcript was cut,
+    /// and the text behind it is what does. Such a message goes out as a payload of nothing, which
+    /// is what a compressor flushing no text leaves once the trailer is elided, or as the single
+    /// `00` byte RFC 7692 §7.2.3.6 gives; each is sent, to a capture alone and to one beside a scan.
+    #[test]
+    fn an_empty_compressed_message_at_a_full_capture_leaves_the_cut_to_what_follows() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        let flushed = deflated_message(b"", &mut CompressorOxide::new(raw_deflate_flags()));
+        let single_zero = vec![0xc1u8, 0x01, 0x00];
+        for empty in [flushed, single_zero] {
+            for needles in [Vec::new(), vec![needle()]] {
+                let sink = Arc::new(CapBuf::new(4));
+                let mut t = FrameTee::new(Some(sink.clone()), &needles, Some(false), false)
+                    .expect("a sink is a consumer");
+                t.push(&frame(0x1, b"abcd", None));
+                t.push(&empty);
+                assert!(
+                    !t.done,
+                    "a capture filled exactly still waits for the next byte"
+                );
+                assert!(
+                    !captured(&sink).truncated,
+                    "nothing has followed yet, so nothing was cut"
+                );
+                t.push(&frame(0x1, b"e", None));
+                let got = captured(&sink);
+                assert_eq!(got.bytes, b"abcd");
+                assert!(
+                    got.truncated,
+                    "text followed the empty message, so the transcript was cut ({} needles)",
+                    needles.len()
+                );
+            }
+        }
+    }
+
     /// A stream that claims compression but does not decode stops the direction rather than storing
     /// rubbish — and it must stop, since every later message shares the same window.
     #[test]

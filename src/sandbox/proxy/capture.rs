@@ -76,9 +76,10 @@ impl CapBuf {
     ///
     /// Returns whether this sink is **settled**: full *and* certain about whether anything was cut.
     /// Filling the buffer exactly is not settled — the stream may end there (nothing was cut) or
-    /// continue (something was), and only the next chunk says which. The caller keeps feeding until
-    /// this returns `true`, which is at most one extra call and is what keeps a body cut exactly at
-    /// a read boundary from being stored as if it were whole.
+    /// continue (something was), and only the next chunk carrying a byte says which: an empty one
+    /// says nothing, so it leaves the sink as unsettled as it found it. The caller keeps feeding
+    /// until this returns `true`, which is at most one extra byte-carrying call and is what keeps a
+    /// body cut exactly at a read boundary from being stored as if it were whole.
     pub(super) fn push(&self, chunk: &[u8]) -> bool {
         if self.cap == 0 {
             return true;
@@ -92,9 +93,12 @@ impl CapBuf {
         let mut g = locked(&self.inner);
         let room = self.cap.saturating_sub(g.bytes.len());
         if room == 0 {
-            // The buffer was already full and more arrived: that is the truncation.
+            // The buffer was already full and more arrived: that is the truncation. An empty chunk
+            // is not more, and settles nothing: a WebSocket's empty compressed message decodes to
+            // no bytes, and a feeder that stopped on it filed its transcript as whole with text
+            // still to come.
             g.truncated = g.truncated || !chunk.is_empty();
-            return true;
+            return g.truncated;
         }
         let take = room.min(chunk.len());
         g.bytes.extend_from_slice(&chunk[..take]);
@@ -683,6 +687,36 @@ mod tests {
         let got = buf.take();
         assert_eq!(got.bytes, b"AAAAAAAA");
         assert!(!got.truncated, "nothing followed, so nothing was cut");
+    }
+
+    /// An empty chunk at a full sink carries no byte, so it cannot say whether the stream was cut:
+    /// the sink stays unsettled, a byte after it is still the truncation, and a stream that ends
+    /// there is still whole. A WebSocket's empty compressed message is that chunk.
+    #[test]
+    fn an_empty_chunk_at_the_cap_settles_nothing() {
+        let cut = CapBuf::new(8);
+        assert!(
+            !cut.push(b"AAAAAAAA"),
+            "a sink filled exactly is not settled"
+        );
+        assert!(!cut.push(b""), "an empty chunk says nothing about a cut");
+        assert!(cut.push(b"B"), "the next byte settles it");
+        let got = cut.take();
+        assert_eq!(got.bytes, b"AAAAAAAA");
+        assert!(
+            got.truncated,
+            "a byte came after the empty chunk, so the body was cut"
+        );
+
+        let whole = CapBuf::new(8);
+        whole.push(b"AAAAAAAA");
+        whole.push(b"");
+        let got = whole.take();
+        assert_eq!(got.bytes, b"AAAAAAAA");
+        assert!(
+            !got.truncated,
+            "nothing followed the empty chunk, so nothing was cut"
+        );
     }
 
     /// A sink whose feeder is still running when the exchange is filed holds a PREFIX, and must say
