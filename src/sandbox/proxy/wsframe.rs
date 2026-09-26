@@ -88,11 +88,14 @@ pub(super) struct FrameTee {
     fin: bool,
 }
 
-/// The most plaintext the leak scan asks the decoder to produce out of one compressed message.
+/// How much plaintext of one compressed message is inflated in one piece while the leak scan runs,
+/// whatever the capture keeps of it.
 ///
-/// A bound is needed because a compressed message can inflate to far more than it cost to send. It
-/// is generous next to anything that would plausibly carry a leaked credential, and a message that
-/// inflates past it is scanned up to it — never silently claimed to have been scanned whole.
+/// The scan still sees the whole message. Past this, [`Inflater::drain`] inflates the rest block by
+/// block, hands each block to the scan and keeps none of it, up to [`RESYNC_PLAINTEXT_CAP`]; a
+/// message that runs further stops the direction rather than being claimed scanned. What this
+/// bounds is the plaintext one message holds at once and, through
+/// [`FrameTee::compressed_budget`], how many compressed bytes one message may carry.
 const SCAN_MESSAGE_CAP: usize = 256 * 1024;
 
 /// The most payload one control frame can carry, from RFC 6455 §5.5: "All control frames MUST have
