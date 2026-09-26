@@ -116,16 +116,38 @@
 # out of the shipped binary's outbound URL table), the env-var names (read
 # out of the vendor docs + the binary's API-discovery code), and the
 # proprietary license.
-cmd = "ante"
-
-# No `contract`: the channel Ante offers, `--append-system-prompt`, takes text
-# and costs you your own addition. Given on the command line it replaces the
-# `append_system_prompt` of your `~/.ante/settings.json` without a word;
-# `AGENTS.md` still loads. Point Ante at the cage's summary yourself instead,
-# for instance with a line in that `append_system_prompt` such as "When the
-# environment variable SBX_SANDBOX is 1, read the file named by
-# SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Ante the cage's summary (/opt/sbx/contract-summary.md: what
+# it may reach, which files it protects, which operations it offers) as its
+# global instructions file, `~/.ante/AGENTS.md`, which Ante loads beside the
+# project's `AGENTS.md`. That file is yours to keep, so the command writes it
+# only while you have none: a copy marked as sbx's, rewritten at every launch
+# and removed by a launch without a summary. Once you write your own there, it
+# is left untouched and the summary is no longer added. It is not written while
+# a `~/.claude/CLAUDE.md` exists either, since Ante reads that file only when
+# `~/.ante/AGENTS.md` is absent. The file lives in the app's isolated home,
+# which only this app's cages read. `--append-system-prompt` is not used: given
+# on the command line it replaces the `append_system_prompt` of your
+# `~/.ante/settings.json` without a word. Arguments after `sbx app run ante --`
+# reach Ante verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+f="$HOME/.ante/AGENTS.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ] && [ ! -e "$HOME/.claude/CLAUDE.md" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$HOME/.ante" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec ante "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "ante",
+]
 
 # Your host Ante config/models, mounted read-write at their real absolute
 # paths. `binds` is a security field, honored only because this profile lives
