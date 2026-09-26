@@ -83,7 +83,10 @@ this, since the cage could name a program there that git runs anyway, and the la
   best-effort bind), so a portable config referencing an optional path still works.
 - A leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` is expanded from your environment, so
   a portable config need not hard-code an absolute home path. **Any other `$VAR` is
-  refused**: no arbitrary environment interpolation.
+  refused**: no arbitrary environment interpolation. The expanded path is where the bind
+  appears in the cage too: `~/.x` is your host `~/.x` at that same path, not a directory
+  under the cage's `$HOME` (`/home/sandbox`), so a program that reads its settings from
+  its home does not see it there.
 
 ## Editing binds
 
