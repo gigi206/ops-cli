@@ -103,16 +103,44 @@ cmd = [
 # The install lives in the `trae` bundle and has already run by the time this does. What stays here
 # is the PATH the isolated `uv tool install` writes to, which the launch does not export on its own.
 export PATH="$HOME/.local/bin:$PATH"
+# The cage's summary appended to Trae's system prompt, in this process only (see the note below).
+s=/opt/sbx/contract-summary.md
+entry="$(command -v trae-cli || true)"
+py="$(sed -n '1s/^#!//p' "$entry" 2>/dev/null)"
+if [ -r "$s" ] && [ -x "$py" ] && grep -qs '^from trae_agent.cli import main$' "$entry"; then
+  exec "$py" -c '
+import sys
+from trae_agent.cli import main
+try:
+    import trae_agent.prompt.agent_prompt as prompt
+    with open("/opt/sbx/contract-summary.md", encoding="utf-8") as f:
+        extra = "\n\n" + f.read()
+    original = prompt.TRAE_AGENT_SYSTEM_PROMPT
+    for module in list(sys.modules.values()):
+        if getattr(module, "TRAE_AGENT_SYSTEM_PROMPT", None) is original:
+            module.TRAE_AGENT_SYSTEM_PROMPT = original + extra
+except Exception:
+    pass
+sys.argv[0] = "trae-cli"
+sys.exit(main())
+' "$@"
+fi
 exec trae-cli "$@"
     ''',
     "trae-cli",
 ]
 
-# No `contract`: Trae Agent's system prompt is a constant in its code, it reads no `AGENTS.md`, and
-# none of its options adds instructions. Point Trae Agent at the cage's summary yourself instead,
-# for instance with a line in the task you give it such as "When the environment variable
-# SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Trae the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
+# files it protects, which operations it offers) by appending it to Trae's system prompt. Trae reads
+# no instruction file and takes no option for one: its prompt is the constant
+# `trae_agent.prompt.agent_prompt.TRAE_AGENT_SYSTEM_PROMPT`. So the command starts the CLI through its
+# own interpreter, extends that constant (and every module's copy of it) with the summary, then
+# calls the CLI's own `main` with your arguments. Only this process is patched: nothing is set in
+# the environment, so a Python your project or the agent's shell runs is untouched. Trae's own prompt
+# stays whole, the summary follows it, and a `--trajectory-file` shows both in the system message.
+# It degrades safely: if the entry script no longer imports `trae_agent.cli.main`, the command starts
+# `trae-cli` as before, and if the constant is gone, the patch is skipped and Trae starts without
+# the summary.
 
 # Your host Trae config/trajectories, mounted read-write at their real absolute paths. `binds`
 # is a security field, honored only because this profile lives in your trusted config dir; `mode
