@@ -34,9 +34,9 @@ use super::{
     AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, authority_bound_to,
     carries_secret, decide_https, header_name_eq, is_connection_bound_challenge,
     matching_injection_ids, note_final_status, redact_in_place, signer_refusal_message,
-    upstream_server_name,
+    sni_bound_to, upstream_server_name,
 };
-use crate::allowlist::{self, Rule};
+use crate::allowlist::Rule;
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
 use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -161,13 +161,7 @@ async fn serve(
     }
     // Domain-fronting: the SNI (which minted the leaf) must match the CONNECT authority. The
     // per-stream `:authority` is re-checked against the same host below.
-    let sni_ok = tls
-        .get_ref()
-        .1
-        .server_name()
-        .map(|s| allowlist::canonical_host(s) == *connect_host)
-        .unwrap_or(false);
-    if !sni_ok {
+    if !sni_bound_to(tls.get_ref().1.server_name(), connect_host) {
         ctx.outcome(
             Proto::Https,
             connect_host,
@@ -4103,6 +4097,126 @@ mod tests {
             (StatusCode::FORBIDDEN, "ssrf-blocked".to_string()),
             "the tunnel's own authority must still pass the gate and reach the address guard"
         );
+    }
+
+    /// The server name the client's handshake sends is bound to the CONNECT here as on the HTTP/1.1
+    /// plane, by the one check both call (`sni_bound_to`), and read in [`serve`], past the handshake
+    /// the other tests on this plane start after. A name that is not the tunnel's host is recorded
+    /// `host-mismatch` and the connection closed before any stream is read; the host itself, in any
+    /// case and with a trailing dot, reaches the policy.
+    ///
+    /// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses,
+    /// so a stream let past the check comes back `403 ssrf-blocked` rather than no answer at all.
+    #[test]
+    fn a_server_name_other_than_the_connect_host_is_refused_before_any_stream() {
+        use crate::allowlist::classify;
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let ca = Arc::new(super::super::Ca::ephemeral().unwrap());
+        let answered = |sni: &str| {
+            let log = Arc::new(LogRing::new(LOG_RING_CAP));
+            let ctx = Arc::new(
+                ProxyCtx::new(
+                    Arc::clone(&ca),
+                    EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+                )
+                .unwrap()
+                .with_events(crate::sandbox::proxy::events::for_log(
+                    Arc::clone(&log),
+                    None,
+                ))
+                // the cloud-metadata address: refused by the address guard whatever the rule says
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+            );
+            let (client, proxied) = std::os::unix::net::UnixStream::pair().unwrap();
+            let tunnel = {
+                let ctx = Arc::clone(&ctx);
+                std::thread::spawn(move || handle(proxied, "grpc.test", 443, &ctx))
+            };
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.ca_cert_der()).unwrap();
+            let mut tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tls.alpn_protocols = vec![b"h2".to_vec()];
+            let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+            let answer = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    client.set_nonblocking(true).unwrap();
+                    let mut client = tokio::net::UnixStream::from_std(client).unwrap();
+                    let mut established = [0; b"HTTP/1.1 200 Connection established\r\n\r\n".len()];
+                    client.read_exact(&mut established).await.unwrap();
+                    let tls = tokio_rustls::TlsConnector::from(Arc::new(tls))
+                        .connect(name, client)
+                        .await
+                        .ok()?;
+                    let (mut send, conn) = h2::client::handshake(tls).await.ok()?;
+                    let driver = tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    let req = Request::builder()
+                        .method(Method::POST)
+                        .uri("https://grpc.test/pkg.Svc/Method")
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let (resp, _body) = send.send_request(req, true).ok()?;
+                    let resp = tokio::time::timeout(Duration::from_secs(30), resp)
+                        .await
+                        .expect("the tunnel answers or closes");
+                    driver.abort();
+                    let resp = resp.ok()?;
+                    let reason = resp
+                        .headers()
+                        .get("x-sbx-egress-reason")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    Some((resp.status(), reason))
+                });
+            // The client end is gone with the runtime, so the tunnel has ended and every record it
+            // queued can be waited for.
+            tunnel.join().unwrap().unwrap();
+            drop(super::super::events::Settle(ctx.events.clone()));
+            let reasons: Vec<String> = log
+                .snapshot(None, None, false)
+                .events
+                .into_iter()
+                .map(|event| event.reason)
+                .collect();
+            (answer, reasons)
+        };
+
+        for sni in [
+            "evil.test",
+            "grpc.tes",
+            "xgrpc.test",
+            "rpc.test",
+            "test",
+            "api.grpc.test",
+            "grpc.test.evil",
+        ] {
+            assert_eq!(
+                answered(sni),
+                (None, vec!["host-mismatch".to_string()]),
+                "`{sni}` is not the host this tunnel was opened to"
+            );
+        }
+        for sni in ["grpc.test", "GRPC.Test", "grpc.test."] {
+            assert_eq!(
+                answered(sni),
+                (
+                    Some((StatusCode::FORBIDDEN, "ssrf-blocked".to_string())),
+                    vec!["ssrf-blocked".to_string()]
+                ),
+                "`{sni}` names the host this tunnel was opened to"
+            );
+        }
     }
 
     /// A relayed gRPC stream appears in the live flow view while it is open, with its byte totals.

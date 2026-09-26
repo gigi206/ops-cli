@@ -515,7 +515,10 @@ Domain fronting is connecting to one host at the TCP/TLS layer while addressing 
 refuses it: the **CONNECT authority**, the TLS **SNI**, and the decrypted HTTP
 **Host** header must all name the same host, or the request is refused (`421`). One
 consistent identity is checked against the policy: you cannot allow `a.example.com`
-and be fronted to `b.example.com`.
+and be fronted to `b.example.com`. The SNI is compared as a name, its case and its
+trailing dots aside. On an HTTP/2 connection it is checked once, when the handshake
+ends: an SNI that names another host closes the connection before any stream is read,
+recorded as `host-mismatch`.
 
 The `Host` header (and, on HTTP/2, each stream's `:authority`) is held to the port as
 well: a port it writes must be the one the connection was opened to, since the header

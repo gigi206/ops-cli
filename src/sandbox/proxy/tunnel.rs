@@ -109,16 +109,11 @@ pub(super) fn serve_tunneled_request(
         Ok(bytes) => bytes,
         Err(e) => return refuse_unreadable_inner_head(&mut br, ctx, connect_host, port, &e),
     };
-    let sni = br.get_ref().conn.server_name().map(|s| s.to_string());
 
     // CONNECT-host == SNI: the leaf was minted for the SNI, so a CONNECT to a different host is a
     // domain-fronting attempt. Re-asked on every turn rather than once per tunnel: it costs a string
     // compare, and a check that runs per request cannot be the one a later request skipped.
-    if sni
-        .as_deref()
-        .map(|s| allowlist::canonical_host(s) != connect_host)
-        .unwrap_or(true)
-    {
+    if !sni_bound_to(br.get_ref().conn.server_name(), connect_host) {
         // Pre-parse: the inner request is not decoded yet, so there is no method/path to log.
         ctx.outcome(
             crate::sandbox::control::Proto::Https,

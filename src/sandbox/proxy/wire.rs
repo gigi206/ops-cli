@@ -371,6 +371,18 @@ pub(super) fn authority_bound_to(value: &str, host: &str, port: u16) -> bool {
         .is_some_and(|(named, named_port)| named == host && named_port.is_none_or(|p| p == port))
 }
 
+/// Whether the server name a client sent in its TLS handshake names `host`, the host its CONNECT
+/// opened the tunnel to, as [`connect_authority`] read it.
+///
+/// One definition for the two planes that terminate the client's TLS, HTTP/1.1 and HTTP/2. The
+/// leaf sbx presents is minted for that name, so a name that is not the tunnel's host is a
+/// certificate for one host on a tunnel authorized for another, which is domain fronting. The name
+/// is compared in the one spelling a verdict is taken against ([`allowlist::canonical_host`]), and
+/// a handshake that sent none names nothing.
+pub(super) fn sni_bound_to(sni: Option<&str>, host: &str) -> bool {
+    sni.is_some_and(|name| allowlist::canonical_host(name) == host)
+}
+
 /// A `Read` adapter that adds every byte it yields to a shared counter — the live byte total the flow
 /// registry exposes for `sbx net live`. Wrapping the *reader* (not the fd) is what lets one counter
 /// cover the inspected L7/cleartext plaintext streams and the raw L4 splice uniformly. On the splice
