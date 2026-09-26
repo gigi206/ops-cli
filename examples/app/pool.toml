@@ -60,14 +60,35 @@
 # `POOLSIDE_API_URL`). If a request is blocked, the proxy NAMES the host it refused —
 # add it to `allow` (or check ahead with `sbx test net <url>`). If your deployment uses a custom
 # API URL, pass it with `--env POOLSIDE_API_URL=…` and add that host to `allow`.
-cmd = "pool"
-
-# No `contract`: Poolside documents no option or environment variable that adds instruction files;
-# your instructions live in `~/.config/poolside/AGENTS.md`, `XDG_CONFIG_HOME` would move that
-# directory, and `--agent-config-file` replaces the agent. Point pool at the cage's summary yourself
-# instead, for instance with a line in that file such as "When the environment variable SBX_SANDBOX
-# is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Poolside the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as its global instructions file,
+# `~/.config/poolside/AGENTS.md`, which `pool` loads beside the `AGENTS.md` files from the git root
+# down to the working directory. That file is yours to keep, so the command writes it only while you
+# have none: a copy marked as sbx's, rewritten at every launch and removed by a launch without a
+# summary. Once you write your own there, it is left untouched and the summary is no longer added.
+# The file lives in the app's isolated home, which only this app's cages read, and
+# `XDG_CONFIG_HOME` moves it (the command follows it). No option is used: Poolside documents none
+# that adds instruction files, and `--agent-config-file` replaces the agent. Arguments after
+# `sbx app run pool --` reach `pool` verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+f="${XDG_CONFIG_HOME:-$HOME/.config}/poolside/AGENTS.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "${f%/*}" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec pool "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "pool",
+]
 
 # Your host Poolside config, mounted read-write at its real absolute path. `binds` is
 # a security field, honored only because this profile lives in your trusted config
