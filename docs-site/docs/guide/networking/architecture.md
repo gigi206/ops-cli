@@ -559,7 +559,10 @@ host in the URL a `re:` rule is tested against while the resolver read on into a
 another zone; a name such as `0x7f.1` is read by the resolver as the address it spells, and an
 address such as `::ffff:127.0.0.1` is dialled as the IPv4 it carries, where a rule naming that
 IPv4 would never have matched either. A request naming such a host, by CONNECT or as an
-absolute-form target, is refused `400 bad-request` before the proxy decides it. The two
+absolute-form target, is refused `400 bad-request` before the proxy decides it. An
+absolute-form target, and one given to [`sbx test net`](../cli/test), is also held to what a
+DNS name can be: no empty label, none over 63 bytes or starting or ending with `-`, 253
+bytes in all. The underscore passes there, as it does in a CONNECT. The two
 copies agree, since they are
 read from the same bytes; they can differ only for the moment a `--session` rule has
 been sent and is not yet in force, and a connection refused then carries

@@ -638,12 +638,12 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
 /// tester refusing forms the wire decides, which is the one divergence a tester exists to prevent.
 ///
 /// What the folding does not do is invent a host: a spelling that reduces to nothing, or to labels
-/// no name can carry, is still refused here. So is a name the supervisor refuses
-/// ([`is_request_host`]), one that ends in a number: the tester and the absolute-form planes then
-/// answer it as the supervisor would.
+/// no name can carry, is still refused here ([`is_valid_target_name`]). So is a name the
+/// supervisor refuses ([`is_request_host`]), one that ends in a number: the tester and the
+/// absolute-form planes then answer it as the supervisor would.
 fn canonical_target_host(host: &str) -> Option<String> {
     let canonical = canonical_host(host);
-    ((is_valid_hostname(&canonical) || canonical.parse::<IpAddr>().is_ok())
+    ((is_valid_target_name(&canonical) || canonical.parse::<IpAddr>().is_ok())
         && is_request_host(&canonical))
     .then_some(canonical)
 }
@@ -794,6 +794,22 @@ fn parse_path_rule(
 /// within length limits. Strict enough that a hostname rule can never carry a path
 /// separator, port, scheme, or shell-significant character.
 fn is_valid_hostname(h: &str) -> bool {
+    is_name_of(h, false)
+}
+
+/// A name a request target may carry: a hostname as [`is_valid_hostname`] reads one, with `_`
+/// allowed in a label as well.
+///
+/// A rule cannot write the underscore, but a TLS server name may carry one, and the supervisor
+/// keeps it in a request host for that reason ([`is_request_host`]). So a CONNECT to `h_t.test`
+/// was taken to the policy while `http://h_t.test/` was refused as malformed, and
+/// `sbx test net` refused what the tunnel took.
+fn is_valid_target_name(h: &str) -> bool {
+    is_name_of(h, true)
+}
+
+/// The name grammar [`is_valid_hostname`] describes, with `_` in a label when `underscore` holds.
+fn is_name_of(h: &str, underscore: bool) -> bool {
     !h.is_empty()
         && h.len() <= 253
         && !h.starts_with('.')
@@ -802,7 +818,9 @@ fn is_valid_hostname(h: &str) -> bool {
         && h.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
-                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || underscore && c == '_')
                 && !label.starts_with('-')
                 && !label.ends_with('-')
         })

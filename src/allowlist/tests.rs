@@ -2628,6 +2628,34 @@ fn port_zero_is_refused_wherever_a_port_is_read() {
     assert!(parse_url_target("https://api.test:8443/x").is_ok());
 }
 
+/// A target names a host with an underscore as a CONNECT does: a rule cannot write one, but a TLS
+/// server name may carry one, so `h_t.test` was taken to the policy through a tunnel and refused
+/// as malformed in a URL. What no name can carry is still refused.
+#[test]
+fn a_target_names_a_host_with_an_underscore_as_a_connect_does() {
+    assert_eq!(parse_url_target("https://h_t.test/").unwrap().0, "h_t.test");
+    assert_eq!(
+        parse_tcp_target("tcp://_srv.h.test:22").unwrap(),
+        ("_srv.h.test".to_string(), 22)
+    );
+    let long_label = format!("{}.test", "a".repeat(64));
+    let long_name = format!("{}test", "a.".repeat(125));
+    for host in ["a..b", "-h.test", "h-.test", &long_label, &long_name] {
+        assert!(
+            parse_url_target(&format!("https://{host}/")).is_err(),
+            "URL `{host}`"
+        );
+        assert!(
+            parse_tcp_target(&format!("tcp://{host}:22")).is_err(),
+            "tcp:// `{host}`"
+        );
+    }
+    assert!(
+        classify("h_t.test").is_err(),
+        "a rule still cannot write one"
+    );
+}
+
 /// A request's authority is read to one grammar wherever it is read: brackets hold an IPv6
 /// address and nothing else, a port is digits, and an IPv6 address that carries a port is
 /// bracketed. A URL and a `tcp://` target each had their own reading, and each took spellings the

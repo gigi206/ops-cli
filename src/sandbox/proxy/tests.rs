@@ -5870,6 +5870,30 @@ fn an_absolute_form_authority_outside_the_grammar_is_a_bad_request() {
     );
 }
 
+/// An absolute-form target naming a host with an underscore is decided, as a CONNECT naming it
+/// is, rather than refused as malformed.
+///
+/// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses, so
+/// a target the rule is asked about comes back `403 ssrf-blocked` rather than `400 bad-request`.
+#[test]
+fn an_absolute_form_host_with_an_underscore_is_decided() {
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            policy(&["http://*.allowed.test"]),
+        )
+        .unwrap()
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+    );
+    let request =
+        b"GET http://h_t.allowed.test/x HTTP/1.1\r\nHost: h_t.allowed.test\r\nConnection: close\r\n\r\n";
+    let resp = through_cleartext(ctx, request).unwrap();
+    assert!(
+        resp.contains("403") && resp.contains("ssrf-blocked"),
+        "`h_t.allowed.test` is a request host and must reach the gate: {resp:?}"
+    );
+}
+
 /// A request head *inside a tunnel* that never arrives whole is answered and recorded against the
 /// tunnel's own host, which the entrance's line has none to name. And a tunnel a client is simply
 /// finished with is not an attempt: it leaves nothing behind.
