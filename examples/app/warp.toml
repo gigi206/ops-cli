@@ -61,14 +61,35 @@
 # app.warp.dev), the host set and the WebSocket URLs (read out of the binary's outbound URL
 # table), the `WARP_API_KEY` env name (printed by the binary's own `--help`), and the device-code
 # flow (docs + the binary's OAuth strings).
-cmd = "warp"
-
-# No `contract`: Warp documents no option or environment variable that adds rules to the agent; its
-# rules come from the project's `AGENTS.md`/`WARP.md` and from `~/.agents/AGENTS.md`, and
-# `WARP_AGENT_CONFIG_FILE` serves `agent run` only. Point Warp at the cage's summary yourself
-# instead, for instance with a line in your `~/.agents/AGENTS.md` such as "When the environment
-# variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The
-# file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command hands Warp's agent the cage's summary (/opt/sbx/contract-summary.md: what it may
+# reach, which files it protects, which operations it offers) as its global rule file,
+# `~/.agents/AGENTS.md`, which Warp always includes beside the project's `AGENTS.md`/`WARP.md`. That
+# file is yours to keep, so the command writes it only while you have none: a copy marked as sbx's,
+# rewritten at every launch and removed by a launch without a summary. Once you write your own
+# there, it is left untouched and the summary is no longer added. The file lives in the app's
+# isolated home, which only this app's cages read. No option is used: Warp documents none that adds
+# rules, and `WARP_AGENT_CONFIG_FILE` serves `agent run` only. Not measured: Warp needs a signed-in
+# account before it assembles a conversation. Arguments after `sbx app run warp --` reach Warp
+# verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+s=/opt/sbx/contract-summary.md
+f="$HOME/.agents/AGENTS.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "$HOME/.agents" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
+exec warp "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "warp",
+]
 
 # Your host Warp CLI settings (theme, statusline, MCP config, execution profiles), mounted
 # read-write at its real absolute path. `binds` is a security field, honored only because this
