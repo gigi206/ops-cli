@@ -9771,6 +9771,58 @@ fn pump_redacting_masks_a_match_straddling_read_boundaries() {
     );
 }
 
+/// A response body crosses whole however the upstream's reads are split and interrupted, on either
+/// pump and under every framing. An interrupted read moves no byte: the pumps ended the relay on
+/// one, and the chunked framing lost the `\r` it had read of a chunk's closing CRLF when the read
+/// after it was interrupted, so retrying in the pumps alone would have turned a cut response into
+/// a corrupted one.
+#[test]
+fn an_interrupted_upstream_read_neither_ends_the_relay_nor_loses_a_byte() {
+    use crate::testutil::Trickle;
+    let needles = vec![SecretNeedle::named("test-secret", b"SECRET".to_vec())];
+    let chunked = &b"5\r\nhello\r\n3;x=1\r\nabc\r\n0\r\nT: 1\r\n\r\n"[..];
+    for (kind, wire) in [
+        (0, chunked),
+        (1, &b"hello world"[..]),
+        (2, &b"to the end"[..]),
+    ] {
+        for masks in [false, true] {
+            for every in 1..=3usize {
+                for capacity in [1, 2, 64] {
+                    let framing = match kind {
+                        0 => BodyFraming::Chunked,
+                        1 => BodyFraming::Length(wire.len() as u64),
+                        _ => BodyFraming::ToEof,
+                    };
+                    let interrupts: Vec<bool> = (0..every).map(|i| i + 1 == every).collect();
+                    let mut up = BufReader::with_capacity(
+                        capacity,
+                        Trickle::new(wire, vec![1, 2, 3], interrupts),
+                    );
+                    let mut out = Vec::new();
+                    let down = Arc::new(AtomicU64::new(0));
+                    let relayed = relay_response_body(
+                        &mut up, &mut out, &framing, &down, None, masks, &needles,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("an interrupted read ended the relay (framing {kind}): {e}")
+                    });
+                    let case = format!(
+                        "framing {kind}, masking {masks}, every {every}, buffer {capacity}"
+                    );
+                    assert_eq!(
+                        String::from_utf8_lossy(&out),
+                        String::from_utf8_lossy(wire),
+                        "{case}"
+                    );
+                    assert_eq!(relayed.ended_as_framed, kind != 2, "{case}");
+                    assert_eq!(down.load(Ordering::Relaxed), wire.len() as u64, "{case}");
+                }
+            }
+        }
+    }
+}
+
 /// A streaming response to a credential-injected host reaches the cage event by event, exactly as it
 /// would with no secret to mask.
 ///

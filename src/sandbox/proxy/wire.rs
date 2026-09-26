@@ -1019,12 +1019,19 @@ impl<R: BufRead> Read for FramedBody<R> {
 
 /// Fill `buf` as far as the reader allows, returning how many bytes arrived — a short count means
 /// the stream ended there. Unlike `read_exact`, a truncation is a fact to relay, not an error.
+///
+/// An interrupted read is retried here, as `read_exact` retries one, rather than handed back. The
+/// bytes already read are in `buf` and nowhere else, so a caller that retried would start after
+/// them: the `\r` of a chunk's closing CRLF went missing from the relay, and the CRLF check then
+/// read the bytes after it instead.
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut got = 0;
     while got < buf.len() {
-        match r.read(&mut buf[got..])? {
-            0 => break,
-            n => got += n,
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(got)

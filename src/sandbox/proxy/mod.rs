@@ -1929,6 +1929,10 @@ fn finish_tls(stream: &mut StreamOwned<ServerConnection, UnixStream>) {
 
 /// Stream `r` to `w` until end of input. A peer that drops the TLS connection without a
 /// `close_notify` surfaces as an unexpected EOF, which ends the stream normally rather than erroring.
+///
+/// An interrupted read is retried, as `io::copy` retries one: it moved no byte, and handing it back
+/// ended the relay with the response cut short. The proxy installs no signal handler, but a socket
+/// read with a timeout is interrupted all the same when the process is stopped and continued.
 fn pump_to_eof<R: Read, W: Write>(r: &mut R, w: &mut W) -> io::Result<()> {
     let mut buf = vec![0u8; RELAY_CHUNK];
     loop {
@@ -1936,6 +1940,7 @@ fn pump_to_eof<R: Read, W: Write>(r: &mut R, w: &mut W) -> io::Result<()> {
             Ok(0) => break,
             Ok(n) => w.write_all(&buf[..n])?,
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
@@ -1990,6 +1995,8 @@ fn pump_redacting<R: Read, W: Write>(
             Ok(0) => break,
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            // Retried, for the reason `pump_to_eof` gives.
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
         window.extend_from_slice(&buf[..n]);
