@@ -37,7 +37,9 @@ cmd = "openclaw"
 # No `contract`: OpenClaw offers no environment or command-line channel for instructions. Extra
 # bootstrap files are configured in `openclaw.json`, must stay inside the workspace and must be
 # named like its own (`AGENTS.md`, `SOUL.md`, …), and
-# `OPENCLAW_WORKSPACE_DIR`/`OPENCLAW_CONFIG_PATH` replace the workspace or the config. Point
+# `OPENCLAW_WORKSPACE_DIR`/`OPENCLAW_CONFIG_PATH` replace the workspace or the config. The command
+# does not write the workspace's `AGENTS.md` either: onboarding seeds OpenClaw's own operating
+# instructions there only when the file is missing, so a copy written first would replace them. Point
 # OpenClaw at the cage's summary yourself instead, for instance with a line in the `AGENTS.md` of
 # its workspace such as "When the environment variable SBX_SANDBOX is 1, read the file named by
 # SBX_CONTRACT_SUMMARY before anything else". The file (/opt/sbx/contract-summary.md) is rewritten
