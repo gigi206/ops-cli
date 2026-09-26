@@ -54,17 +54,33 @@ cmd = [
 set -eu
 alsa="$(dirname "$(dirname "$(readlink -f "$(command -v aserver)")")")/lib"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$alsa"
+# The cage's summary as Cortex's global AGENTS.md, only while you keep none (see the note below).
+s=/opt/sbx/contract-summary.md
+f="${CORTEX_HOME:-$HOME/.cortex}/AGENTS.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "${f%/*}" && { printf '%s\\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f" || true
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
 exec Cortex "$@"
 """,
     "cortex",
 ]
 
-# No `contract`: Cortex's only prompt option, `--system-prompt`, is used instead of the default
-# prompt rather than added to it, and its instructions come only from
-# `AGENTS.md`/`AGENTS.override.md` files. Point Cortex at the cage's summary yourself instead, for
-# instance with a line in an `AGENTS.md` it reads such as "When the environment variable SBX_SANDBOX
-# is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
-# (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command also hands Cortex the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as its global instructions file,
+# `~/.cortex/AGENTS.md`, which Cortex loads before the `AGENTS.md` files from the project's root
+# down to the working directory. That file is yours to keep, so the command writes it only while you
+# have none: a copy marked as sbx's, rewritten at every launch and removed by a launch without a
+# summary. Once you write your own there, it is left untouched and the summary is no longer added.
+# A project's `AGENTS.override.md` replaces everything loaded before it, the summary included. The
+# file lives in the app's isolated home, which only this app's cages read. `--system-prompt` is not
+# used: it replaces the default system prompt, and `CORTEX_HOME` moves the home (the command
+# follows it). Not measured: Cortex needs an account or a configured provider before it assembles a
+# session; `cortex debug paths` shows the home at `~/.cortex`.
 
 # Your host Cortex config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
