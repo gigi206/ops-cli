@@ -564,16 +564,29 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     Ok(())
 }
 
-/// Parse the numeric HTTP status code from a response's opening bytes (`HTTP/1.1 200 OK\r\n`): the
-/// token after the first space, if it is a plausible status (100–599). `None` for anything that is
-/// not a well-formed HTTP/1.x status line (so a non-HTTP or truncated response records no status).
+/// Parse the numeric HTTP status code from a response's opening bytes (`HTTP/1.1 200 OK\r\n`), if
+/// it is a plausible status (100–599). `None` for anything that is not a well-formed HTTP/1.x
+/// status line (so a non-HTTP or truncated response records no status).
+///
+/// Read as RFC 9112 §4 writes the line, `HTTP-version SP status-code SP [ reason-phrase ]` with a
+/// `status-code` of three digits, and as the cage's client reads it: split on one SP, never on
+/// Unicode whitespace, and the code never handed to Rust's integer parser alone. The status
+/// decides whether a response has a body at all (a `1xx`, `204` or `304` has none) and whether a
+/// head is an interim one, so `HTTP/1.1 +204`, `0204` or a U+00A0 before the code, read as `204`,
+/// ended at its head a response whose line a client reading the grammar refuses, with its
+/// `Content-Length` bytes left on the connection. The reason phrase may be missing, with or
+/// without the SP before it.
 fn parse_status_code(prefix: &[u8]) -> Option<u16> {
     let line = prefix.split(|&b| b == b'\n').next()?;
-    let text = std::str::from_utf8(line).ok()?;
-    if !text.starts_with("HTTP/") {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let (version, rest) = std::str::from_utf8(line).ok()?.split_once(' ')?;
+    let code = rest
+        .get(..3)
+        .filter(|code| code.bytes().all(|b| b.is_ascii_digit()))?;
+    if !version.starts_with("HTTP/") || !matches!(rest.as_bytes().get(3), None | Some(b' ')) {
         return None;
     }
-    let code: u16 = text.split_whitespace().nth(1)?.parse().ok()?;
+    let code: u16 = code.parse().ok()?;
     (100..=599).contains(&code).then_some(code)
 }
 

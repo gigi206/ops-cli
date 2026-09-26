@@ -2795,9 +2795,35 @@ fn parse_status_code_reads_a_well_formed_status_line_only() {
     );
     // Not HTTP, no code, or an implausible code → None (records no status).
     assert_eq!(parse_status_code(b"garbage bytes\r\n"), None);
+    assert_eq!(parse_status_code(b"ICY 200 OK\r\n"), None);
     assert_eq!(parse_status_code(b"HTTP/1.1 OK\r\n"), None);
     assert_eq!(parse_status_code(b"HTTP/1.1 999 X\r\n"), None);
     assert_eq!(parse_status_code(b""), None);
+    // The reason phrase may be missing.
+    assert_eq!(parse_status_code(b"HTTP/1.1 204\r\n"), Some(204));
+    assert_eq!(parse_status_code(b"HTTP/1.1 204 \r\n"), Some(204));
+    // The code is three digits after one SP, as a client reads it: nothing else reads as one.
+    for line in [
+        "HTTP/1.1 +204 X",
+        "HTTP/1.1 0204 X",
+        "HTTP/1.1 20 X",
+        "HTTP/1.1 2040 X",
+        "HTTP/1.1  204 X",
+        "HTTP/1.1\t204 X",
+        "HTTP/1.1\u{a0}204 X",
+        "HTTP/1.1 204\u{a0}X",
+        "HTTP/1.1 \u{a0}204 X",
+    ] {
+        let head = format!("{line}\r\nContent-Length: 5\r\n\r\n");
+        assert_eq!(parse_status_code(head.as_bytes()), None, "{line:?}");
+        assert!(
+            matches!(
+                wire::response_framing(head.as_bytes(), "GET"),
+                wire::BodyFraming::Length(5)
+            ),
+            "{line:?} is not a bodiless status"
+        );
+    }
 }
 
 #[test]
