@@ -49,3 +49,8 @@ allow = [
 deepagents-code = "mise:pipx:deepagents-code"  # the tool itself, from PyPI via uv (binary: `dcode`)
 uv = "nix:uv"                                  # mise's pipx backend runs `uv tool install`
 python = "nix:python312"                       # puts an interpreter uv can use on PATH (the project asks for `>=3.11,<4.0`)
+# The C++ runtime the agent's server links through `grpc` (`cygrpc`, imported when the langgraph
+# server starts): `libstdc++.so.6` is not on the nix interpreter's search path, and without it no
+# session opens. Declared here so it rides the same nixpkgs lock as the interpreter above; the
+# profile's `cmd` preloads it at each start.
+libstdc = "nix:gcc.cc"

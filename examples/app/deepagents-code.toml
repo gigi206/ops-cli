@@ -65,7 +65,39 @@
 # state dir), the credential env vars and their fallback order (`deepagents_code/model_config.py`,
 # `deepagents_code/config.py`), the Tavily/LangSmith opt-ins, and the PyPI update check
 # (`deepagents_code/_version.py`).
-cmd = "dcode"
+# The command preloads the C++ runtime before starting the agent. `dcode` runs its agent in a
+# langgraph server, a child interpreter whose `grpc` wheel links `libstdc++.so.6`, which the nix
+# interpreter does not search for; the server also drops `LD_LIBRARY_PATH` and `LD_PRELOAD` from
+# the environment it inherits, so the loader path cannot carry it. The command therefore writes a
+# one-line `sbx-libstdcxx.pth` into the agent's own virtualenv, which loads the library named by
+# `SBX_LIBSTDCXX` into every interpreter of that virtualenv and nothing else, and it rewrites the
+# file at each start, so a fresh virtualenv from `sbx upgrade mise` gets it again. The library
+# directory is read from the bundle's `nix:gcc.cc` store references, because the store path moves
+# on every `sbx upgrade nix`. Arguments after `sbx app run deepagents-code --` reach `dcode`
+# verbatim through `"$@"`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+if gcc_bin="$(command -v gcc)"; then
+  for ref in $(nix-store -q --references "$(dirname "$(dirname "$gcc_bin")")"); do
+    if [ -e "$ref/lib/libstdc++.so.6" ]; then
+      export SBX_LIBSTDCXX="$ref/lib/libstdc++.so.6"
+      break
+    fi
+  done
+fi
+if d="$(mise which dcode 2>/dev/null)" && py="$(sed -n '1s/^#!//p' "$d")" && [ -x "$py" ] \
+   && [ -n "${SBX_LIBSTDCXX:-}" ] \
+   && sp="$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; then
+  printf '%s\n' 'import os, ctypes; p = os.environ.get("SBX_LIBSTDCXX"); p and ctypes.CDLL(p, ctypes.RTLD_GLOBAL)' \
+    > "$sp/sbx-libstdcxx.pth"
+fi
+exec dcode "$@"
+''',
+    # `$0` placeholder: the arguments after `--` arrive as `$1 $2 …`.
+    "dcode",
+]
 
 # No `contract`: `dcode` takes no system-prompt or instructions option, and its memory comes only
 # from `~/.deepagents/<agent>/AGENTS.md` and the project's `AGENTS.md`; `DEEPAGENTS_HOME` would move
