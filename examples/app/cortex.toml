@@ -82,10 +82,11 @@ exec Cortex "$@"
 # follows it). Not measured: Cortex needs an account or a configured provider before it assembles a
 # session; `cortex debug paths` shows the home at `~/.cortex`.
 
-# Your host Cortex config, mounted read-write at its real absolute path. `binds` is a security field,
-# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
-# CLI read and write these host files. Uncomment to share your host Cortex setup with the cage
-# instead of the app's isolated home (the default), where `$CORTEX_HOME` lives.
+# Your host Cortex config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged CLI read and write these host files. Uncommented, the bind appears at that host path and not
+# under the cage's `$HOME` (`/home/sandbox`), so the app keeps its isolated home and reaches these
+# files only by their absolute path.
 #binds = [
 #    { path = "~/.cortex", mode = "rw" },
 #]

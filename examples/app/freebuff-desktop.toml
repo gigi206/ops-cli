@@ -207,10 +207,10 @@ mute = [
 # (`home_scope = "global"` → one login, shared across projects). There is no [secret] block because no HTTP
 # header key is injected host-side.
 
-# Optional: share your host Freebuff/Codebuff setup with the cage instead of the app's isolated home (the
-# default). `binds` is a security field, honored only because this profile lives in your trusted config
-# dir. The app's real config path lives under the isolated home — inspect it with
-# `sbx app show freebuff-desktop` after a first launch, then point these at the matching host paths.
+# Optional: your host Freebuff/Codebuff setup, mounted at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir. Uncommented,
+# the bind appears at that host path and not under the cage's `$HOME` (`/home/sandbox`), so the app
+# keeps its isolated home and reaches these files only by their absolute path.
 #binds = [
 #    { path = "~/.config/codebuff", mode = "rw" },
 #]

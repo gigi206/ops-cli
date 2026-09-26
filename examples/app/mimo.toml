@@ -48,8 +48,9 @@ cmd = "mimo"
 # security field, honored only because this profile lives in your trusted config dir;
 # `mode = "rw"` lets the caged `mimo` read and write these host files (login, settings,
 # history). MiMo's config lives under ~/.config/mimocode and its data (auth.json, sessions,
-# memory) under ~/.local/share/mimocode in the app's isolated home by default; uncomment to
-# share your host setup with the cage instead.
+# memory) under ~/.local/share/mimocode in the app's isolated home. Uncommented, the binds
+# appear at those host paths and not under the cage's `$HOME` (`/home/sandbox`), so MiMo keeps
+# its isolated home and reaches these files only by their absolute path.
 #binds = [
 #    { path = "~/.config/mimocode", mode = "rw" },
 #    { path = "~/.local/share/mimocode", mode = "rw" },

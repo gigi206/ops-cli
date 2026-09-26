@@ -92,12 +92,12 @@ cmd = "autohand"
 # writes its own `contract`, or has none.
 contract = { arg = "--append-system-prompt-file" }
 
-# Your host Autohand config/auth, mounted read-write at its real absolute paths.
-# `binds` is a security field, honored only because this profile lives in your
-# trusted config dir; `mode = "rw"` lets the caged `autohand` read and write
-# these host files (config, auth, history). Uncomment to share your host
-# Autohand setup with the cage instead of the app's isolated home (the default).
-# Pre-authenticate on the HOST (`autohand login` there), then bind the config
+# Your host Autohand config/auth, mounted read-write at its real absolute paths. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode =
+# "rw"` lets the caged `autohand` read and write these host files (config, auth, history).
+# Uncommented, the bind appears at that host path and not under the cage's `$HOME`
+# (`/home/sandbox`), so the app keeps its isolated home and reaches these files only by their
+# absolute path. Pre-authenticate on the HOST (`autohand login` there), then bind the config
 # directory; the headless cage has no browser for the OAuth flow.
 #binds = [
 #    { path = "~/.config/autohand", mode = "rw" },

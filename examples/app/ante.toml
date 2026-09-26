@@ -149,12 +149,12 @@ exec ante "$@"
     "ante",
 ]
 
-# Your host Ante config/models, mounted read-write at their real absolute
-# paths. `binds` is a security field, honored only because this profile lives
-# in your trusted config dir; `mode = "rw"` lets the caged `ante` read and
-# write these host files (config, sessions, history, pre-staged local
-# models). Uncomment to share your host Ante setup with the cage instead of
-# the app's isolated home (the default).
+# Your host Ante config/models, mounted read-write at their real absolute paths. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode =
+# "rw"` lets the caged `ante` read and write these host files (config, sessions, history,
+# pre-staged local models). Uncommented, the bind appears at that host path and not under the
+# cage's `$HOME` (`/home/sandbox`), so the app keeps its isolated home and reaches these files
+# only by their absolute path.
 #binds = [
 #    { path = "~/.ante", mode = "rw" },
 #]

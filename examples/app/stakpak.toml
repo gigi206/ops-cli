@@ -56,8 +56,9 @@ contract = { arg = "--system-prompt-file" }
 
 # Your host Stakpak config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
-# caged `stakpak` read and write these host files. Uncomment to share your host Stakpak setup with
-# the cage instead of the app's isolated home (the default).
+# caged `stakpak` read and write these host files. Uncommented, the bind appears at that host path
+# and not under the cage's `$HOME` (`/home/sandbox`), so the app keeps its isolated home and
+# reaches these files only by their absolute path.
 #binds = [
 #    { path = "~/.stakpak", mode = "rw" },
 #]

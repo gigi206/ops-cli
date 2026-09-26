@@ -103,9 +103,10 @@ forward = [10369]
 
 # Your host OpenFox config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
-# caged `openfox` read and write these host files. Uncomment to share your host OpenFox setup with
-# the cage instead of the app's isolated home (the default). The exact config path is UNCONFIRMED
-# (verify with a real run before relying on it).
+# caged `openfox` read and write these host files. Uncommented, the bind appears at that host path
+# and not under the cage's `$HOME` (`/home/sandbox`), so the app keeps its isolated home and
+# reaches these files only by their absolute path. The exact config path is UNCONFIRMED (verify
+# with a real run before relying on it).
 #binds = [
 #    { path = "~/.config/openfox", mode = "rw" },
 #]

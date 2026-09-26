@@ -165,9 +165,10 @@ gpu = true
 dbus = true
 
 # Your host Kiro config/auth, mounted read-write at its real absolute path (so the caged editor
-# shares your host Kiro login/settings/extensions). `binds` is a security field, honored only because
-# this profile lives in your trusted config dir. Uncomment to share your host setup with the cage
-# instead of the app's isolated home (the default). Paths UNCONFIRMED — verify before relying.
+# shares your host Kiro login/settings/extensions). `binds` is a security field, honored only
+# because this profile lives in your trusted config dir. Uncommented, the bind appears at that host
+# path and not under the cage's `$HOME` (`/home/sandbox`), so the app keeps its isolated home and
+# reaches these files only by their absolute path. Paths UNCONFIRMED — verify before relying.
 #binds = [
 #    { path = "~/.config/Kiro", mode = "rw" },     # settings, sign-in state
 #    { path = "~/.kiro", mode = "rw" },            # agent/CLI state

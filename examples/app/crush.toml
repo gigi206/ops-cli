@@ -134,13 +134,13 @@ exec crush "$@"
     "crush",
 ]
 
-# Your host Crush config/auth, mounted read-write at their real absolute paths.
-# `binds` is a security field, honored only because this profile lives in your
-# trusted config dir; `mode = "rw"` lets the caged `crush` read and write these
-# host files (config, sessions, history, MCP). Uncomment to share your host
-# Crush setup with the cage instead of the app's isolated home (the default).
-# `CRUSH_GLOBAL_CONFIG` / `CRUSH_GLOBAL_DATA` override the default XDG paths
-# if you set them in the host environment.
+# Your host Crush config/auth, mounted read-write at their real absolute paths. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode =
+# "rw"` lets the caged `crush` read and write these host files (config, sessions, history, MCP).
+# Uncommented, the bind appears at that host path and not under the cage's `$HOME`
+# (`/home/sandbox`), so the app keeps its isolated home and reaches these files only by their
+# absolute path. `CRUSH_GLOBAL_CONFIG` / `CRUSH_GLOBAL_DATA` override the default XDG paths if
+# you set them in the host environment.
 #binds = [
 #    { path = "~/.config/crush",         mode = "rw" },   # config: crushrc, crush.json, MCP/LSP/skills
 #    { path = "~/.local/share/crush",    mode = "rw" },   # data: ephemeral state, session storage

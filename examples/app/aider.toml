@@ -108,8 +108,9 @@ exec aider "$@"
 
 # Your host aider config, mounted read-write at its real absolute paths. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
-# the caged `aider` read and write these host files (config, model cache). Uncomment to share
-# your host setup instead of the app's isolated home (the default).
+# the caged `aider` read and write these host files (config, model cache). Uncommented, the bind
+# appears at that host path and not under the cage's `$HOME` (`/home/sandbox`), so the app keeps
+# its isolated home and reaches these files only by their absolute path.
 #binds = [
 #    { path = "~/.aider.conf.yml", mode = "rw" },
 #    { path = "~/.aider.model.settings.yml", mode = "rw" },

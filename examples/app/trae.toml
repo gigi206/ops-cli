@@ -114,12 +114,12 @@ exec trae-cli "$@"
 # SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY before anything else". The file
 # (/opt/sbx/contract-summary.md) is rewritten at every launch.
 
-# Your host Trae config/trajectories, mounted read-write at their real
-# absolute paths. `binds` is a security field, honored only because this
-# profile lives in your trusted config dir; `mode = "rw"` lets the caged
-# `trae-cli` read and write these host files (config, trajectories). Uncomment
-# to share your host Trae setup with the cage instead of the app's isolated
-# home (the default). The `~/.trae/.venv` is host-side, NOT seeded.
+# Your host Trae config/trajectories, mounted read-write at their real absolute paths. `binds`
+# is a security field, honored only because this profile lives in your trusted config dir; `mode
+# = "rw"` lets the caged `trae-cli` read and write these host files (config, trajectories).
+# Uncommented, the bind appears at that host path and not under the cage's `$HOME`
+# (`/home/sandbox`), so the app keeps its isolated home and reaches these files only by their
+# absolute path. The `~/.trae/.venv` is host-side, NOT seeded.
 #binds = [
 #    { path = "~/.trae", mode = "rw" },
 #]

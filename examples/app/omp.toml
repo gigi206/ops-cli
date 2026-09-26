@@ -81,9 +81,10 @@ audio = true
 
 # Your host omp config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
-# `omp` read and write these host files (agent config, models, memory bank). Uncomment to share your
-# host omp setup with the cage instead of the app's isolated home (the default). omp keeps its
-# config under ~/.omp.
+# `omp` read and write these host files (agent config, models, memory bank). Uncommented, the bind
+# appears at that host path and not under the cage's `$HOME` (`/home/sandbox`), so the app keeps its
+# isolated home and reaches these files only by their absolute path. omp keeps its config under
+# ~/.omp.
 #binds = [
 #    { path = "~/.omp", mode = "rw" },
 #]

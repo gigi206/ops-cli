@@ -98,10 +98,11 @@ exit 127
 # `JCODE_HOME` moves `~/.jcode` (the command follows it).
 
 # Your host jcode config/data, mounted read-write at their real absolute paths. `binds` is a
-# security field, honored only because this profile lives in your trusted config dir;
-# `mode = "rw"` lets the caged `jcode` read and write these host files (login, settings,
-# history). Uncomment to share your host setup with the cage instead of the app's isolated
-# home (the default).
+# security field, honored only because this profile lives in your trusted config dir; `mode =
+# "rw"` lets the caged `jcode` read and write these host files (login, settings, history).
+# Uncommented, the bind appears at that host path and not under the cage's `$HOME`
+# (`/home/sandbox`), so the app keeps its isolated home and reaches these files only by their
+# absolute path.
 #binds = [
 #    { path = "~/.jcode", mode = "rw" },
 #    { path = "~/.config/jcode", mode = "rw" },

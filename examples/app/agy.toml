@@ -90,9 +90,10 @@ exec agy "$@"
 
 # Your host Antigravity CLI config, mounted read-write at its real absolute path. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
-# lets the caged `agy` read and write these host files (login, settings). Uncomment to share your
-# host setup with the cage instead of the app's isolated home (the default). The exact config path
-# is UNCONFIRMED (verify with a real run before relying on it).
+# lets the caged `agy` read and write these host files (login, settings). Uncommented, the bind
+# appears at that host path and not under the cage's `$HOME` (`/home/sandbox`), so the app keeps
+# its isolated home and reaches these files only by their absolute path. The exact config path is
+# UNCONFIRMED (verify with a real run before relying on it).
 #binds = [
 #    { path = "~/.antigravity", mode = "rw" },
 #]

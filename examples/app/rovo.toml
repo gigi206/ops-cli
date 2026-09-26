@@ -106,12 +106,12 @@ exec acli rovodev "$@"
     "rovo",
 ]
 
-# Your host ACLI config/auth, mounted read-write at its real absolute path. `binds`
-# is a security field, honored only because this profile lives in your trusted
-# config dir; `mode = "rw"` lets the caged `acli` read and write the host's existing
-# auth state and recent sites. Uncomment to share your host ACLI setup with the cage
-# instead of the app's isolated home (the default). `$ACLI_CONFIG_DIR` is the
-# override if you want a different location.
+# Your host ACLI config/auth, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode =
+# "rw"` lets the caged `acli` read and write the host's existing auth state and recent sites.
+# Uncommented, the bind appears at that host path and not under the cage's `$HOME`
+# (`/home/sandbox`), so the app keeps its isolated home and reaches these files only by their
+# absolute path. `$ACLI_CONFIG_DIR` is the override if you want a different location.
 #binds = [
 #    { path = "~/.config/acli", mode = "rw" },
 #]

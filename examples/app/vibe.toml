@@ -96,9 +96,10 @@ gpu = true
 
 # Your host Vibe config, mounted read-write at its real absolute path. `binds` is a security field,
 # honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
-# `vibe` read and write these host files (config.toml, saved API key, history). Uncomment to share
-# your host Vibe setup with the cage instead of the app's isolated home (the default). Vibe stores
-# its config + credentials under ~/.vibe.
+# `vibe` read and write these host files (config.toml, saved API key, history). Uncommented, the
+# bind appears at that host path and not under the cage's `$HOME` (`/home/sandbox`), so the app
+# keeps its isolated home and reaches these files only by their absolute path. Vibe stores its
+# config + credentials under ~/.vibe.
 #binds = [
 #    { path = "~/.vibe", mode = "rw" },
 #]

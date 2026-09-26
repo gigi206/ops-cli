@@ -135,11 +135,12 @@ gui = "wayland"
 gpu = true
 dbus = true
 
-# Optional: share your host Kiro CLI state with the cage (read-write at its real path), instead
-# of the app's isolated home. `binds` is a security field, honored only from this trusted
-# profile. Uncomment to reuse a login you already did on the host. Must stay a top-level key
-# (before the first `[table]` header): written after a `[table]`, TOML would fold it into that
-# table (e.g. `network.binds`) and it would be silently ignored.
+# Optional: your host Kiro CLI state, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only from this trusted profile. Uncommented, the bind appears at that host
+# path and not under the cage's `$HOME` (`/home/sandbox`), so `kiro-cli` keeps its isolated home and
+# does not pick up a login made on the host. Must stay a top-level key (before the first `[table]`
+# header): written after a `[table]`, TOML would fold it into that table (e.g. `network.binds`) and
+# it would be silently ignored.
 #binds = [
 #    { path = "~/.local/share/kiro-cli", mode = "rw" },
 #    { path = "~/.aws", mode = "rw" },

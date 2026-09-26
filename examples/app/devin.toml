@@ -106,11 +106,12 @@ exec devin "$@"
     "devin",
 ]
 
-# Your host Devin config/auth, mounted read-write at their real absolute paths.
-# `binds` is a security field, honored only because this profile lives in your
-# trusted config dir; `mode = "rw"` lets the caged `devin` read and write these
-# host files (config, MCP, login). Uncomment to share your host Devin setup with
-# the cage instead of the app's isolated home (the default).
+# Your host Devin config/auth, mounted read-write at their real absolute paths. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode =
+# "rw"` lets the caged `devin` read and write these host files (config, MCP, login).
+# Uncommented, the bind appears at that host path and not under the cage's `$HOME`
+# (`/home/sandbox`), so the app keeps its isolated home and reaches these files only by their
+# absolute path.
 #binds = [
 #    { path = "~/.config/devin", mode = "rw" },     # user config, MCP, credentials
 #    { path = "~/.local/share/devin", mode = "rw" }, # installed binary, sessions

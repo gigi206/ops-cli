@@ -118,14 +118,14 @@ exec cmd "$@"
     "cmd",
 ]
 
-# Your host Command Code config/auth, mounted read-write at its real absolute path.
-# `binds` is a security field, honored only because this profile lives in your
-# trusted config dir; `mode = "rw"` lets the caged `cmd` read and write these host
-# files (auth.json, taste profile, skills, history). Uncomment to share your host
-# Command Code setup with the cage instead of the app's isolated home (the default).
-# The auth.json is the API-key file — pre-authenticate on the HOST (`cmd login`
-# there; paste the API key from `https://commandcode.ai/settings/api-keys` to skip
-# the browser), then bind.
+# Your host Command Code config/auth, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode =
+# "rw"` lets the caged `cmd` read and write these host files (auth.json, taste profile, skills,
+# history). Uncommented, the bind appears at that host path and not under the cage's `$HOME`
+# (`/home/sandbox`), so the app keeps its isolated home and reaches these files only by their
+# absolute path. The auth.json is the API-key file — pre-authenticate on the HOST (`cmd login`
+# there; paste the API key from `https://commandcode.ai/settings/api-keys` to skip the browser),
+# then bind.
 #binds = [
 #    { path = "~/.commandcode", mode = "rw" },
 #]

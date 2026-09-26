@@ -157,8 +157,9 @@ exec dcode "$@"
 
 # Your host Deep Agents config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
-# caged `dcode` write back to these host files (sessions, saved credentials, hooks). Uncomment to
-# share your host setup instead of the app's isolated home (the default).
+# caged `dcode` write back to these host files (sessions, saved credentials, hooks). Uncommented,
+# the bind appears at that host path and not under the cage's `$HOME` (`/home/sandbox`), so the app
+# keeps its isolated home and reaches these files only by their absolute path.
 #binds = [
 #    { path = "~/.deepagents", mode = "rw" },
 #]
