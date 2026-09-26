@@ -67,6 +67,17 @@
 # upstream ever publishes a bare `jcode` shim again.
 cmd = ["bash", "-lc", '''
 set -u
+# The cage's summary as jcode's global prompt overlay, only when you keep none (see the note below).
+s=/opt/sbx/contract-summary.md
+f="${JCODE_HOME:-$HOME/.jcode}/prompt-overlay.md"
+m='<!-- sbx: the cage summary, rewritten at every launch -->'
+if [ -r "$s" ]; then
+  if [ ! -e "$f" ] || grep -qsF "$m" "$f"; then
+    mkdir -p "${f%/*}" && { printf '%s\n' "$m"; cat "$s"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+  fi
+elif grep -qsF "$m" "$f"; then
+  rm -f "$f"
+fi
 for cand in "jcode-linux-$(uname -m)" "jcode"; do
   if command -v "$cand" >/dev/null 2>&1; then
     exec "$cand" "$@"
@@ -76,12 +87,15 @@ echo "jcode: no equipped binary on PATH" >&2
 exit 127
 ''', "jcode"]
 
-# No `contract`: jcode reads no environment variable or option that adds instructions; they come
-# from its built-in prompt, the project's `.jcode/` prompt files and the `AGENTS.md` files of the
-# project and your home, and `JCODE_HOME` would move `~/.jcode` rather than add to it. Point jcode
-# at the cage's summary yourself instead, for instance with a line in your `~/AGENTS.md` such as
-# "When the environment variable SBX_SANDBOX is 1, read the file named by SBX_CONTRACT_SUMMARY
-# before anything else". The file (/opt/sbx/contract-summary.md) is rewritten at every launch.
+# The command also hands jcode the cage's summary (/opt/sbx/contract-summary.md: what it may reach,
+# which files it protects, which operations it offers) as its global prompt overlay,
+# `~/.jcode/prompt-overlay.md`, which jcode adds to its built-in prompt beside the `AGENTS.md` files
+# of the project and your home. That file is yours to keep, so the command writes it only when you
+# have none: a copy marked as sbx's, rewritten at every launch and removed by a launch without a
+# summary. Once you write your own overlay there, it is left untouched and the summary is no longer
+# added; your `~/AGENTS.md` is never touched. The overlay lives in the app's isolated home, which
+# only this app's cages read. No option is used: jcode reads none that adds instructions, and
+# `JCODE_HOME` moves `~/.jcode` (the command follows it).
 
 # Your host jcode config/data, mounted read-write at their real absolute paths. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir;
