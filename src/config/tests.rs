@@ -8444,6 +8444,53 @@ fn a_malformed_deny_entry_under_the_denylist_posture_names_the_host_it_leaves_re
     );
 }
 
+/// A `deny` entry naming a host no request can name is dropped with the spelling to write, and the
+/// warning names what the drop costs. It denied nothing before it was refused: a request to
+/// `1.1.1.1` names another host, and one naming the entry's is refused as malformed.
+#[test]
+fn a_deny_entry_no_request_can_match_is_dropped_with_the_spelling_to_write() {
+    let table = RawConfig {
+        network: Some(NetworkField::Table(NetworkTable {
+            mode: Some("allow".to_string()),
+            deny: vec![
+                "1.2.3.4".into(),
+                "0x01010101".into(),
+                "::ffff:1.1.1.1".into(),
+            ],
+            ..net_table_defaults()
+        })),
+        ..RawConfig::default()
+    };
+    let r = resolve_no_plugins(table, None);
+    match &r.network {
+        NetworkPolicy::Allowlist(a) => {
+            assert_eq!(a.deny_rules().len(), 1, "the written address survives");
+            assert!(!a.permits("1.2.3.4", 443, "/"), "the kept deny wins");
+        }
+        other => panic!("expected an allowlist, got {other:?}"),
+    }
+    let dropped: Vec<&String> = r
+        .warnings
+        .iter()
+        .filter(|w| w.contains("ignoring deny entry"))
+        .collect();
+    assert_eq!(dropped.len(), 2, "{:?}", r.warnings);
+    assert!(
+        dropped
+            .iter()
+            .all(|w| w.contains("nothing is denied for it")),
+        "{dropped:?}"
+    );
+    assert!(
+        dropped.iter().any(|w| w.contains("ends in a number")),
+        "{dropped:?}"
+    );
+    assert!(
+        dropped.iter().any(|w| w.contains("write `1.1.1.1`")),
+        "{dropped:?}"
+    );
+}
+
 #[test]
 fn an_unknown_network_mode_is_dropped_with_a_warning() {
     let r = resolve_no_plugins(

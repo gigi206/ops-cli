@@ -106,6 +106,13 @@ naming a host whose last label is a number is refused `400 bad-request`, so a
 IPv4 (`::ffff:1.2.3.4`, NAT64 `64:ff9b::102:304`, 6to4 `2002:102:304::`, Teredo): a
 request naming one is refused the same way, and names the IPv4 as an IPv4.
 
+A **rule** written in one of those spellings could match no request, so it is refused
+where it is written, with the spelling to use instead (`write 1.2.3.4`, or a dotted
+IPv4 in place of a number): a config list drops it with a warning, `sbx net allow` and
+`sbx net deny` refuse it, and a task whose `network` carries one is ignored, as a task
+is for any malformed `network` entry. A `deny 0x01020304` would otherwise read as a
+protection for `1.2.3.4` and refuse nothing.
+
 Note the proxy resolves DNS host-side and never connects to a private or internal
 address for an *unnamed* host: see the [SSRF guard](architecture#the-ssrf-guard).
 An IP-literal *rule* naming an exact internal host is the deliberate exception.

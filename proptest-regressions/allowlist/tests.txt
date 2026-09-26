@@ -9,3 +9,5 @@ cc ea8c2bf86dbb844a8dae03752a16166cf906b33757290976887cfec5404fad6b # shrinks to
 cc 1c4c8548d60658ef5dc7bbb7bd25a6161680b49ad3f809e21bfee2d375bca98c # shrinks to ip = ::ffff:0.0.0.0, name = "a.a"
 cc a79b9674a8dbf3fdb4157363154c445c9fda95935cc8af63fda9c31cd5078f0a # shrinks to host = "::ffff:0.0.0.0"
 cc beeca04c7c2b817f7332f7356b44223ec47df2bf3774c8de373b0b3180c2b222 # shrinks to host = "a.A"
+cc eeb76f062da0dd323de11b3e3fd935c021c4b09540f9d336f92943d930cd9f51 # shrinks to host = "0.0.0.0", shape = 1
+cc d0d8f07786f514fc23355293925ba7fbcf1b5d5093659e925f6b5899db7b55f1 # shrinks to host = "::ffff:0.0.0.0", shape = 3

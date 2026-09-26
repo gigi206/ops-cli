@@ -130,6 +130,7 @@ pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
     // The scheme carries the default port (443 for `https`/bare, 80 for `http`); a `:port` in the
     // body overrides it. L4 requires an explicit port, so its default is inert.
     let kind = classify_kind(body.trim(), layer.default_port(), slot)?;
+    reject_a_host_no_request_names(&kind)?;
     if layer == Layer::L4 {
         if methods != Methods::Unspecified {
             return Err(format!(
@@ -159,6 +160,48 @@ pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
         group: None,
         builtin: false,
     })
+}
+
+/// Refuse a rule whose host no request can name, which would match nothing whatever it says.
+///
+/// A request host is refused as malformed when it ends in a number or is an IPv6 address carrying
+/// an IPv4 ([`is_request_host`]), because a resolver reads it as an address a rule would not have
+/// compared. A rule naming such a host, `deny 0x01020304` or `deny ::ffff:1.2.3.4`, reads as a
+/// protection for `1.2.3.4` and refuses nothing, since a request to `1.2.3.4` names another host.
+/// It is refused where it is written, with the spelling a rule does compare, rather than rewritten
+/// into it: an address rule for an exact host lifts the private-address guard, so turning
+/// `0x7f000001` into `127.0.0.1` would open the loopback without anyone having written it.
+fn reject_a_host_no_request_names(kind: &RuleKind) -> Result<(), String> {
+    let host = match kind {
+        RuleKind::Ip(ip, _) => return reject_an_address_carrying_an_ipv4(*ip),
+        RuleKind::Host(host, _) | RuleKind::Subdomain(host, _) | RuleKind::Url { host, .. } => host,
+        RuleKind::Regex { .. } => return Ok(()),
+    };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return reject_an_address_carrying_an_ipv4(ip);
+    }
+    if ends_in_a_number(host) {
+        return Err(format!(
+            "`{host}` ends in a number, which a resolver reads as an IPv4 address rather than a \
+             name, and a request naming it is refused, so this rule would match nothing; name the \
+             host by a DNS name, or an IPv4 address in dotted form (`1.2.3.4`)"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an IPv6 address that carries an IPv4 ([`embedded_v4`]), naming the IPv4 to write instead.
+fn reject_an_address_carrying_an_ipv4(ip: IpAddr) -> Result<(), String> {
+    let IpAddr::V6(v6) = ip else {
+        return Ok(());
+    };
+    match embedded_v4(v6) {
+        Some(v4) => Err(format!(
+            "`{v6}` carries the IPv4 address `{v4}`, and a request naming it is refused, so this \
+             rule would match nothing; write `{v4}`"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Split an optional scheme prefix off a rule body (the method prefix and any `re:` already handled),

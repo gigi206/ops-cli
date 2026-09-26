@@ -3145,3 +3145,85 @@ proptest::proptest! {
         proptest::prop_assert_eq!(is_request_host(&ip.to_string()), !embeds, "{}", ip);
     }
 }
+
+/// A rule whose host no request can name is refused where it is written, with the spelling a rule
+/// does compare, whatever kind of rule carries the host and on either layer.
+///
+/// `deny 0x01010101` and `deny ::ffff:1.1.1.1` read as protections for `1.1.1.1` and refused
+/// nothing: a request to `1.1.1.1` names another host, and one naming theirs is refused as
+/// malformed before any rule is read.
+#[test]
+fn a_rule_naming_a_host_no_request_names_is_refused_with_the_spelling_to_write() {
+    for entry in [
+        "0x01010101",
+        "1.1.257",
+        "16843009",
+        "a.123",
+        "*.123",
+        "tcp://0x7f000001:22",
+        "0x7f000001/path",
+        "{GET} http://127.1:8080",
+    ] {
+        let refused = classify(entry).expect_err(entry);
+        assert!(refused.contains("ends in a number"), "{entry}: {refused}");
+    }
+    for (entry, v4) in [
+        ("::ffff:1.1.1.1", "1.1.1.1"),
+        ("[64:ff9b::101:101]:443", "1.1.1.1"),
+        ("tcp://[::ffff:10.0.0.1]:22", "10.0.0.1"),
+        ("[::ffff:1.1.1.1]/x", "1.1.1.1"),
+        ("2002:101:101::1", "1.1.1.1"),
+    ] {
+        let refused = classify(entry).expect_err(entry);
+        assert!(
+            refused.contains(&format!("write `{v4}`")),
+            "{entry}: {refused}"
+        );
+    }
+    for entry in [
+        "1.1.1.1",
+        "::1",
+        "2001:db8::1",
+        "1.test",
+        "*.0x1g.test",
+        "api.test/v1",
+        "re:^https://0x7f000001/",
+    ] {
+        assert!(classify(entry).is_ok(), "{entry}");
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+    /// Every rule the classifier accepts names a host some request can name: the rule side and the
+    /// request side agree on what a host is, so no accepted rule is one that can match nothing. A
+    /// `*.domain` rule matches its apex too, so `*.1.2.3.4` still names the address `1.2.3.4`.
+    #[test]
+    fn every_accepted_rule_names_a_host_a_request_can_name(
+        host in host_spellings(),
+        shape in 0usize..5,
+    ) {
+        let entry = match shape {
+            0 => host.clone(),
+            1 => format!("*.{host}"),
+            2 => format!("[{host}]:443"),
+            3 => format!("{host}/v1"),
+            _ => format!("tcp://{host}:22"),
+        };
+        if let Ok(rule) = classify(&entry) {
+            let named = match &rule.kind {
+                RuleKind::Ip(ip, _) => vec![ip.to_string()],
+                RuleKind::Host(h, _) | RuleKind::Url { host: h, .. } => vec![h.clone()],
+                RuleKind::Subdomain(d, _) => vec![d.clone(), format!("a.{d}")],
+                RuleKind::Regex { .. } => return Ok(()),
+            };
+            proptest::prop_assert!(
+                named.iter().any(|h| is_request_host(h)),
+                "{:?} names {:?}",
+                entry,
+                named
+            );
+        }
+    }
+}
