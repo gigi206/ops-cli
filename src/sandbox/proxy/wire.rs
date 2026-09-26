@@ -630,6 +630,7 @@ pub(crate) fn read_response_head<R: BufRead>(r: &mut R, max: usize) -> (Vec<u8>,
 }
 
 /// Where an HTTP/1.1 response body ends, decided from the response head (RFC 9112 §6.3).
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum BodyFraming {
     /// The message has no body at all, whatever its head declares: a `1xx`, a `204` or a `304`, or
     /// any response to a `HEAD`. Such a head routinely carries a `Content-Length` describing the
@@ -2607,6 +2608,223 @@ mod tests {
                     proptest::prop_assert!(!body.ended_as_framed(), "{:?}", input);
                 }
             }
+        }
+    }
+
+    /// Header fields as a head may carry them, in the order written: the framing fields and their
+    /// neighbours under names of every case and one with `_` for `-`, values that frame, that do
+    /// not, and that almost do, with blanks around them, and now and then a control byte inside.
+    fn framing_fields() -> impl proptest::strategy::Strategy<Value = Vec<(String, String)>> {
+        use proptest::prelude::*;
+        let name = proptest::sample::select(vec![
+            "Transfer-Encoding",
+            "transfer-encoding",
+            "TRANSFER-ENCODING",
+            "Transfer_Encoding",
+            "Content-Length",
+            "content-length",
+            "Content_Length",
+            "Host",
+            "HOST",
+            "Connection",
+            "X-A",
+        ]);
+        let value = prop_oneof![
+            proptest::sample::select(vec![
+                "chunked",
+                "CHUNKED",
+                "gzip, chunked",
+                "chunked, gzip",
+                "gzip",
+                "chunked,",
+                ",chunked",
+                "gzip,\tchunked",
+                "\u{a0}chunked",
+                "chunked\u{a0}",
+                "identity",
+            ]),
+            proptest::sample::select(vec![
+                "0",
+                "5",
+                "005",
+                "+5",
+                "-1",
+                "\u{a0}5",
+                "5,5",
+                "0x5",
+                "",
+                "18446744073709551615",
+                "18446744073709551616",
+            ]),
+            proptest::sample::select(vec!["h.test", "close", "x"]),
+        ];
+        let blank = proptest::sample::select(vec!["", "", "", " ", "\t", " \t"]);
+        let control = proptest::option::weighted(
+            0.05,
+            (
+                any::<proptest::sample::Index>(),
+                proptest::sample::select(vec!['\0', '\r', '\u{1}', '\u{7f}']),
+            ),
+        );
+        proptest::collection::vec((name, value, blank.clone(), blank, control), 0..5).prop_map(
+            |fields| {
+                fields
+                    .into_iter()
+                    .map(|(name, value, before, after, control)| {
+                        let mut value: Vec<char> =
+                            format!("{before}{value}{after}").chars().collect();
+                        if let Some((at, byte)) = control {
+                            value.insert(at.index(value.len() + 1), byte);
+                        }
+                        (name.to_string(), value.into_iter().collect())
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// The values of the fields named `name`, compared without regard to ASCII case and nothing
+    /// else, each with its surrounding spaces and tabs taken off.
+    fn values_named<'a>(fields: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+        fields
+            .iter()
+            .filter(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim_matches([' ', '\t']))
+            .collect()
+    }
+
+    /// A `Content-Length` as the grammar has it: `1*DIGIT`, fitting 64 bits.
+    fn length_by_the_grammar(value: &str) -> Option<u64> {
+        let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+        digits.then(|| value.parse().ok()).flatten()
+    }
+
+    /// Whether the final coding of a `Transfer-Encoding` list is `chunked`.
+    fn ends_in_chunked(codings: &str) -> bool {
+        let last = codings.rsplit(',').next().unwrap_or_default();
+        last.trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case("chunked")
+    }
+
+    /// What a request's framing is, by the rules [`inspect_framing`] states, applied to the fields
+    /// as they were written rather than to a parse of them: `(chunked, length)`, or the reason the
+    /// framing is refused.
+    fn request_framing_by_the_rules(
+        fields: &[(String, String)],
+        forwards_chunked: bool,
+    ) -> Result<(bool, u64), &'static str> {
+        let control = |text: &str| text.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f);
+        if fields
+            .iter()
+            .any(|(name, value)| control(name) || control(value))
+        {
+            return Err("bad-request:control-char");
+        }
+        let codings = values_named(fields, "transfer-encoding");
+        let lengths = values_named(fields, "content-length");
+        if codings.len() > 1 {
+            return Err("bad-request:dup-transfer-encoding");
+        }
+        let chunked = match codings.first() {
+            Some(coding) if forwards_chunked && coding.eq_ignore_ascii_case("chunked") => true,
+            Some(_) => return Err("bad-request:transfer-encoding"),
+            None => false,
+        };
+        if lengths.len() > 1 {
+            return Err("bad-request:dup-content-length");
+        }
+        if values_named(fields, "host").len() > 1 {
+            return Err("bad-request:dup-host");
+        }
+        match lengths.first().filter(|_| !chunked) {
+            Some(length) => length_by_the_grammar(length)
+                .map(|length| (chunked, length))
+                .ok_or("bad-request:invalid-content-length"),
+            None => Ok((chunked, 0)),
+        }
+    }
+
+    /// Where a response's body ends, by the rules [`response_framing`] states, applied to the
+    /// status, the method and the fields as they were written.
+    fn response_framing_by_the_rules(
+        status: Option<u16>,
+        method: &str,
+        fields: &[(String, String)],
+    ) -> BodyFraming {
+        let bodiless = |code: u16| (100..200).contains(&code) || code == 204 || code == 304;
+        if method.eq_ignore_ascii_case("head") || status.is_some_and(bodiless) {
+            return BodyFraming::Empty;
+        }
+        let codings = values_named(fields, "transfer-encoding");
+        let lengths = values_named(fields, "content-length");
+        match (codings.as_slice(), lengths.as_slice()) {
+            ([coding], []) if ends_in_chunked(coding) => BodyFraming::Chunked,
+            ([], [length]) => {
+                length_by_the_grammar(length).map_or(BodyFraming::ToEof, BodyFraming::Length)
+            }
+            _ => BodyFraming::ToEof,
+        }
+    }
+
+    /// A status line and the code it carries: codes with a body and without, interim ones, and
+    /// lines that carry none although a looser reader finds a code in them.
+    fn status_lines() -> impl proptest::strategy::Strategy<Value = (String, Option<u16>)> {
+        use proptest::prelude::*;
+        let codes = vec![100u16, 101, 103, 199, 200, 204, 206, 304, 404, 599];
+        let none = vec![
+            "HTTP/1.1 +204 X",
+            "HTTP/1.1 0204 X",
+            "HTTP/1.1\u{a0}204 X",
+            "ICY 204 X",
+        ];
+        prop_oneof![
+            3 => proptest::sample::select(codes)
+                .prop_map(|code| (format!("HTTP/1.1 {code} X"), Some(code))),
+            1 => proptest::sample::select(none).prop_map(|line| (line.to_string(), None)),
+        ]
+    }
+
+    /// A head's fields, written one to a line.
+    fn written(start: &str, fields: &[(String, String)]) -> Vec<u8> {
+        let mut head = format!("{start}\r\n");
+        for (name, value) in fields {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        head.into_bytes()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+        /// A request's framing is read by the rules, whatever order, case, blanks and repeats its
+        /// fields come in: one chunked coding where one is forwarded, one length in digits, one
+        /// host, no control byte, and a refusal naming the first rule broken otherwise.
+        #[test]
+        fn a_requests_framing_is_read_by_the_rules(
+            fields in framing_fields(),
+            forwards_chunked in proptest::prelude::any::<bool>(),
+        ) {
+            let head = parse_head(&written("POST /x HTTP/1.1", &fields)).unwrap();
+            let read = inspect_framing(&head, forwards_chunked)
+                .map(|framing| (framing.chunked, framing.body_len))
+                .map_err(|refusal| refusal.reason);
+            proptest::prop_assert_eq!(read, request_framing_by_the_rules(&fields, forwards_chunked));
+        }
+
+        /// A response's body ends where the rules say, whatever its status line, the method that
+        /// asked for it, and the order, case, blanks and repeats of its fields.
+        #[test]
+        fn a_responses_framing_is_read_by_the_rules(
+            fields in framing_fields(),
+            status in status_lines(),
+            method in proptest::sample::select(vec!["GET", "HEAD", "head", "POST"]),
+        ) {
+            let (line, code) = status;
+            let head = written(&line, &fields);
+            let read = response_framing(&head, method);
+            let want = response_framing_by_the_rules(code, method, &fields);
+            proptest::prop_assert_eq!(read, want, "{:?}", head);
         }
     }
 }

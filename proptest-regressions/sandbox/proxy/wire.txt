@@ -18,3 +18,8 @@ cc 61369fa601684afdbf73b7a36339f85522dfdb5b8408493f76f38ba436eadb6f # shrinks to
 cc e1511c20705679c3d262ffd810a8ef5bedc3750bb2e44a7c2a66262bba91a8fd # shrinks to input = [48, 13, 10, 97, 58, 32, 13, 10, 97], sizes = [1], interrupts = [false], buffer = 1, reads = [1]
 cc 9169527722f59bf3be6fed87947ce97c293abda675c01a8cce16c789951fe050 # shrinks to input = [51, 13, 10, 97, 98, 99, 88, 88, 48, 13, 10, 13, 10], sizes = [1], interrupts = [false], buffer = 1, cap = 67108864
 cc da125f481e98f6637e9a478f5e6673ad3d5c510cc78cc59b540fc47da051a502 # shrinks to input = [56, 13, 10, 0, 0, 0, 0, 0, 0, 0, 0, 13, 10, 55, 13, 10, 0, 0, 0, 0, 0, 0, 0, 13, 10, 48, 13, 10, 13, 10], sizes = [1], interrupts = [false], buffer = 1, cap = 14
+cc c2897c31f7d294931a24f2b28f57740a40733b00b14c69cb423e8e13d46496f5 # shrinks to fields = [("Content-Length", "+5")], forwards_chunked = false
+cc bb8563f6b1ea6410b3e72e850aec6c47e2de52845ed291911419ba7561cf7b5a # shrinks to fields = [("Content-Length", "+5")], status = ("HTTP/1.1 200 X", Some(200)), method = "POST"
+cc a0ebc22bbec3159e6f33419acaa84189d530e5f3ad74a74e5aa8ee398e5afdaa # shrinks to fields = [("Transfer-Encoding", "chunked")], forwards_chunked = false
+cc 27e9637d7750f73b9f1b30e212790a21d4fc2ad328533b29bee4f54ae1bfe962 # shrinks to fields = [("Transfer-Encoding", ",chunked"), ("Transfer-Encoding", "chunked")], status = ("HTTP/1.1 +204 X", None), method = "GET"
+cc dd7e84f39872a4a1d9fff6709c4787f22f7bcd7a8780e669d06c907e6144fd2b # shrinks to fields = [("Transfer-Encoding", "\u{a0}chunked")], status = ("HTTP/1.1 +204 X", None), method = "POST"
