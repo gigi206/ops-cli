@@ -519,6 +519,13 @@ IPv6 address in brackets, then `:port` or nothing. A value carrying userinfo
 (`user@host`), a name inside brackets, or a port past 65535 is refused the same way.
 The absolute-form planes apply the same rule to the host of the request URL.
 
+The CONNECT line, the request URL and a `tcp://` target are read to that grammar too, a
+port being 1 to 65535 in digits: `+443`, a name or an IPv4 inside brackets, and an IPv6
+address written bare before its port (`2001:db8::1:443`, itself an address) are
+malformed wherever they appear. The proxy answers `400 bad-request`, and
+[`sbx test net`](../cli/test) and a [broker's endpoint](../configuration/broker) name
+the fault.
+
 ### The SSRF guard
 
 Upstream connections are opened on the host, with full network reach, so an allowlisted

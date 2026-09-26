@@ -510,6 +510,86 @@ fn parse_port(s: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+/// Why a request's authority is not `host [ ":" port ]`, as [`split_request_authority`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthorityFault {
+    /// A `[` with no `]` after it.
+    Unterminated,
+    /// Brackets around something other than an IPv6 address.
+    NotIpv6,
+    /// Text after the `]` that is not `:port`.
+    AfterBracket,
+    /// A second `:` outside brackets: an IPv6 address written bare, or a port written twice.
+    BareColon,
+    /// A port that is not a number from 1 to 65535 written in digits.
+    Port,
+}
+
+impl AuthorityFault {
+    /// What is wrong, worded to follow the name of the authority it is wrong with.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            AuthorityFault::Unterminated => "has an unterminated `[`",
+            AuthorityFault::NotIpv6 => "has brackets around something other than an IPv6 address",
+            AuthorityFault::AfterBracket => "has text after `]` that is not `:port`",
+            AuthorityFault::BareColon => {
+                "has a second `:` outside brackets (an IPv6 address is written `[addr]:port`)"
+            }
+            AuthorityFault::Port => "has a port that is not 1 to 65535 written in digits",
+        }
+    }
+}
+
+/// Split a request's authority into its host, as written, and its port, `None` when none is
+/// written: the one reading of `uri-host [ ":" port ]` (RFC 9110 §7.2, the host of RFC 3986
+/// §3.2.2) that every reader of a request's authority shares.
+///
+/// The CONNECT line, the `Host` header and an HTTP/2 `:authority`, an absolute-form URL, and a
+/// `tcp://` target (which `sbx test net` and a broker's endpoint read) each asked this their own
+/// way and answered it differently. `[1.2.3.4]:443` and `h:+443` passed some and not others, and
+/// `2001:db8::1:443` was cut at its last `:` into `2001:db8::1` port 443, although it is also an
+/// address with no port at all, the one a rule written the same way names.
+///
+/// So brackets hold an IPv6 address and nothing else, what follows them is `:port` or nothing,
+/// outside brackets the first `:` starts the port and no other may follow it, and a port is 1 to
+/// 65535 written in digits. Port 0 is not a port, as a rule's port says too. A port written empty
+/// (`h:`) is refused: the grammar allows it and no client sends it, and reading it as absent would
+/// be one more spelling of the same answer. The host comes back as written; whether it is one is
+/// each caller's question, since a target also asks that it be a name a rule could write.
+pub(crate) fn split_request_authority(
+    authority: &str,
+) -> Result<(&str, Option<u16>), AuthorityFault> {
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let (literal, tail) = rest.split_once(']').ok_or(AuthorityFault::Unterminated)?;
+            literal
+                .parse::<std::net::Ipv6Addr>()
+                .map_err(|_| AuthorityFault::NotIpv6)?;
+            let port = match tail {
+                "" => None,
+                tail => Some(tail.strip_prefix(':').ok_or(AuthorityFault::AfterBracket)?),
+            };
+            (literal, port)
+        }
+        None => match authority.split_once(':') {
+            Some((_, port)) if port.contains(':') => return Err(AuthorityFault::BareColon),
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    let port = port
+        .map(|digits| {
+            let written = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+            written
+                .then(|| digits.parse::<u16>().ok())
+                .flatten()
+                .filter(|&port| port != 0)
+                .ok_or(AuthorityFault::Port)
+        })
+        .transpose()?;
+    Ok((host, port))
+}
+
 /// Split an http(s) URL naming one **request** into the `(host, port, path)` the matcher
 /// tests: `host` lowercased (an IPv6 host bracketed in the URL, returned bare), `port` from an
 /// explicit `:port` or the scheme default, `path` everything after the authority (the root `/`
@@ -537,41 +617,10 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
     if authority.is_empty() {
         return Err(format!("URL `{url}` has no host"));
     }
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        // a bracketed IPv6 host, optionally `:port` after the `]`
-        let (addr, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| format!("URL `{url}` has an unterminated `[`"))?;
-        if addr.parse::<IpAddr>().is_err() {
-            return Err(format!("URL `{url}` has an invalid IP literal `[{addr}]`"));
-        }
-        let port = match tail {
-            "" => default_port,
-            t => {
-                let p = t
-                    .strip_prefix(':')
-                    .ok_or_else(|| format!("URL `{url}` has unexpected text after `]`"))?;
-                // Through `parse_port`, which is what a *rule*'s port and a `tcp://` target both
-                // go through: port 0 is not a port, and answering that differently depending on
-                // whether the value names a rule or a request is three answers to one question.
-                parse_port(p).map_err(|_| format!("URL `{url}` has an invalid port `{p}`"))?
-            }
-        };
-        (addr, port)
-    } else {
-        let (h, port_spec) = match authority.rsplit_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (authority, None),
-        };
-        reject_catch_all(h, Slot::Target)?;
-        let port = match port_spec {
-            Some(p) => {
-                parse_port(p).map_err(|_| format!("URL `{url}` has an invalid port `{p}`"))?
-            }
-            None => default_port,
-        };
-        (h, port)
-    };
+    let (host, port) = split_request_authority(authority)
+        .map_err(|fault| format!("URL `{url}` {}", fault.describe()))?;
+    reject_catch_all(host, Slot::Target)?;
+    let port = port.unwrap_or(default_port);
     let canonical = canonical_target_host(host)
         .ok_or_else(|| format!("URL `{url}` has an invalid host `{host}`"))?;
     Ok((canonical, port, path))
@@ -617,38 +666,12 @@ pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
     if authority.is_empty() {
         return Err(format!("tcp:// target `{target}` has no host"));
     }
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        // a bracketed IPv6 host, `:port` required after the `]`
-        let (addr, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| format!("tcp:// target `{target}` has an unterminated `[`"))?;
-        if addr.parse::<IpAddr>().is_err() {
-            return Err(format!(
-                "tcp:// target `{target}` has an invalid IP literal `[{addr}]`"
-            ));
-        }
-        let p = tail.strip_prefix(':').ok_or_else(|| {
-            format!("tcp:// target `{target}` needs an explicit `:port` (e.g. `tcp://[::1]:22`)")
-        })?;
-        let port = p
-            .parse::<u16>()
-            .map_err(|_| format!("tcp:// target `{target}` has an invalid port `{p}`"))?;
-        (addr, port)
-    } else {
-        let (h, p) = authority.rsplit_once(':').ok_or_else(|| {
-            format!("tcp:// target `{target}` needs an explicit `:port` (e.g. `tcp://host:22`)")
-        })?;
-        reject_catch_all(h, Slot::Target)?;
-        let port = p
-            .parse::<u16>()
-            .map_err(|_| format!("tcp:// target `{target}` has an invalid port `{p}`"))?;
-        (h, port)
-    };
-    if port == 0 {
-        return Err(format!(
-            "tcp:// target `{target}` has port 0, which is not valid"
-        ));
-    }
+    let (host, port) = split_request_authority(authority)
+        .map_err(|fault| format!("tcp:// target `{target}` {}", fault.describe()))?;
+    reject_catch_all(host, Slot::Target)?;
+    let port = port.ok_or_else(|| {
+        format!("tcp:// target `{target}` needs an explicit `:port` (e.g. `tcp://host:22`)")
+    })?;
     let canonical = canonical_target_host(host)
         .ok_or_else(|| format!("tcp:// target `{target}` has an invalid host `{host}`"))?;
     Ok((canonical, port))

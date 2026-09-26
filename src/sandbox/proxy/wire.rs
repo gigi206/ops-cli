@@ -308,62 +308,33 @@ pub(super) fn request_line_method(line: &str) -> Option<&str> {
     line.split(' ').next()
 }
 
-/// Split a CONNECT authority `host:port` (port required) into its parts, handling a bracketed
-/// IPv6 literal.
+/// The host and port a CONNECT line names, the port required: the `Host` header's reading
+/// ([`request_authority`]) of the same grammar, so the line that opens a tunnel and the header
+/// that is bound to it cannot read one string two ways.
 ///
-/// Port 0 is refused. It is not a port, and every other reader of one already says so: a rule's
-/// port, an absolute-form URL and a `tcp://` target all refuse it, so a CONNECT that took it
-/// answered the same question a fourth way, and handed the policy a port no rule can write, which
-/// a `:*` rule then admitted.
-pub(super) fn split_authority(authority: &str) -> Option<(String, u16)> {
-    let (host, port) = match authority.strip_prefix('[') {
-        Some(rest) => {
-            let (addr, tail) = rest.split_once(']')?;
-            (addr, tail.strip_prefix(':')?)
-        }
-        None => authority.rsplit_once(':')?,
-    };
-    let port = port.parse().ok().filter(|&port: &u16| port != 0)?;
-    Some((host.to_string(), port))
+/// It had its own, and took what the header refused: `[good.com]:443` as `good.com`, `+443` as
+/// 443, and `::1:443` cut at its last `:`, and port 0, which no rule can write and a `:*` rule
+/// then admitted.
+pub(super) fn connect_authority(target: &str) -> Option<(String, u16)> {
+    match request_authority(target)? {
+        (host, Some(port)) => Some((host, port)),
+        (_, None) => None,
+    }
 }
 
 /// The host and port a request's `Host` header, or an HTTP/2 `:authority`, names: the host in the
 /// one spelling a verdict is taken against ([`allowlist::canonical_host`]), and the port, `None`
 /// when none is written. `None` for a value that names no request host.
 ///
-/// Read to the grammar, `uri-host [ ":" port ]` (RFC 9110 §7.2, the host of RFC 3986 §3.2.2),
-/// rather than by taking off whatever looks like a port, which is what this did. The difference
-/// is the value that crosses: the header is forwarded as the client wrote it, so a reading that
-/// throws part of it away authorizes one string and relays another. `[good.com]evil.test` was
-/// read as `good.com`, and a port too large for sixteen bits was taken off as though it were one.
-/// So brackets hold an IPv6 address and nothing else, what follows them is `:port` or nothing, a
-/// port is digits that fit sixteen bits, and the host is one the supervisor accepts
-/// ([`allowlist::is_request_host`]), which leaves no room for userinfo. A port written empty
-/// (`good.com:`) is refused as well: the grammar allows it and no client sends it, and reading it
-/// as absent would be one more spelling of the same answer.
+/// Read to the grammar every reader of a request's authority shares
+/// ([`allowlist::split_request_authority`]), rather than by taking off whatever looks like a port,
+/// which is what this did. The difference is the value that crosses: the header is forwarded as
+/// the client wrote it, so a reading that throws part of it away authorizes one string and relays
+/// another. `[good.com]evil.test` was read as `good.com`, and a port too large for sixteen bits
+/// was taken off as though it were one. The host must be one the supervisor accepts
+/// ([`allowlist::is_request_host`]), which leaves no room for userinfo.
 pub(super) fn request_authority(value: &str) -> Option<(String, Option<u16>)> {
-    let (host, port) = match value.strip_prefix('[') {
-        Some(rest) => {
-            let (literal, tail) = rest.split_once(']')?;
-            literal.parse::<std::net::Ipv6Addr>().ok()?;
-            let port = match tail {
-                "" => None,
-                tail => Some(tail.strip_prefix(':')?),
-            };
-            (literal, port)
-        }
-        None => match value.split_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (value, None),
-        },
-    };
-    let port = match port {
-        None => None,
-        Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
-            Some(digits.parse().ok()?)
-        }
-        Some(_) => return None,
-    };
+    let (host, port) = allowlist::split_request_authority(value).ok()?;
     let host = allowlist::canonical_host(host);
     allowlist::is_request_host(&host).then_some((host, port))
 }
@@ -1803,23 +1774,30 @@ mod tests {
         );
     }
 
+    /// A CONNECT line is read to the `Host` header's grammar with its port required: what the
+    /// header refuses, the line refuses too.
     #[test]
-    fn split_authority_handles_ports_and_a_bracketed_ipv6_literal() {
-        assert_eq!(split_authority("h:443"), Some(("h".to_string(), 443)));
-        assert_eq!(
-            split_authority("[::1]:8080"),
-            Some(("::1".to_string(), 8080))
-        );
-        assert_eq!(
-            split_authority("hostonly"),
-            None,
-            "a missing port is refused (CONNECT requires one)"
-        );
-        assert_eq!(split_authority("h:notaport"), None);
-        // Port 0 is not a port, as every other reader of one already answers.
-        assert_eq!(split_authority("h:0"), None);
-        assert_eq!(split_authority("[::1]:0"), None);
-        assert_eq!(split_authority("h:65535"), Some(("h".to_string(), 65535)));
+    fn a_connect_authority_is_read_to_the_host_headers_grammar_with_its_port() {
+        let named = |host: &str, port: u16| Some((host.to_string(), port));
+        assert_eq!(connect_authority("h.test:443"), named("h.test", 443));
+        assert_eq!(connect_authority("H.Test.:0443"), named("h.test", 443));
+        assert_eq!(connect_authority("[::1]:8080"), named("::1", 8080));
+        assert_eq!(connect_authority("h.test:65535"), named("h.test", 65535));
+        for refused in [
+            "h.test",
+            "[::1]",
+            "h.test:notaport",
+            "h.test:0",
+            "[::1]:0",
+            "h.test:+443",
+            "[h.test]:443",
+            "[1.2.3.4]:443",
+            "::1:443",
+            "2001:db8::1:443",
+            "h.test:443:443",
+        ] {
+            assert_eq!(connect_authority(refused), None, "`{refused}`");
+        }
     }
 
     #[test]
@@ -1841,6 +1819,8 @@ mod tests {
             "h.test:65536",
             "h.test:4430000000000",
             "h.test:443:1",
+            "h.test:0",
+            "::1:443",
             "h.test:notaport",
             "x@h.test",
             "x@h.test:443",

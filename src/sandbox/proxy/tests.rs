@@ -5781,14 +5781,15 @@ fn a_connect_host_the_supervisor_refuses_is_a_bad_request() {
     );
 }
 
-/// Port 0 in a CONNECT authority is malformed, as it is in a rule, a URL and a `tcp://` target. No
-/// rule can write it, yet a `:*` rule matches every port, so taken as a port it was admitted.
+/// A CONNECT authority outside the grammar the `Host` header is read to is malformed: port 0, which
+/// no rule can write, a port with a sign, a name in brackets, and an IPv6 address written bare.
+/// Each was read as some host and port, and under a `:*` rule the first three were admitted.
 ///
 /// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses, so
 /// an authority the rule admits comes back `403 ssrf-blocked` rather than `400 bad-request`, and
 /// the last case proves a real port under the same rule still does.
 #[test]
-fn a_connect_to_port_zero_is_a_bad_request() {
+fn a_connect_authority_outside_the_grammar_is_a_bad_request() {
     let answer = |authority: &str| {
         let ctx = ProxyCtx::new(
             Arc::new(Ca::ephemeral().unwrap()),
@@ -5810,18 +5811,62 @@ fn a_connect_to_port_zero_is_a_bad_request() {
         test_end.read_to_string(&mut answer).unwrap();
         answer
     };
-    for authority in ["allowed.test:0", "allowed.test:00", "[::1]:0"] {
+    for authority in [
+        "allowed.test:0",
+        "allowed.test:00",
+        "[::1]:0",
+        "allowed.test:+22",
+        "[allowed.test]:22",
+        "::1:22",
+    ] {
         let resp = answer(authority);
         assert!(
             resp.contains("400 Bad Request")
                 && resp.contains("X-Sbx-Egress-Reason: bad-request\r\n"),
-            "`CONNECT {authority}` names no port: {resp:?}"
+            "`CONNECT {authority}` is outside the grammar: {resp:?}"
         );
     }
     let resp = answer("allowed.test:22");
     assert!(
         resp.contains("403") && resp.contains("ssrf-blocked"),
         "`CONNECT allowed.test:22` is admitted by the rule and must reach the gate: {resp:?}"
+    );
+}
+
+/// The same grammar on an absolute-form target: a port written with a sign, or followed by a
+/// blank, was read as the port it spells and admitted.
+///
+/// Teeth: as above, a target the rule admits comes back `403 ssrf-blocked`, and the last case
+/// proves the port written plainly still does.
+#[test]
+fn an_absolute_form_authority_outside_the_grammar_is_a_bad_request() {
+    let answer = |url: &str| {
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["http://allowed.test:80"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+        );
+        let request =
+            format!("GET {url} HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n");
+        through_cleartext(ctx, request.as_bytes()).unwrap()
+    };
+    for url in [
+        "http://allowed.test:+80/x",
+        "http://allowed.test:80\u{a0}/x",
+    ] {
+        let resp = answer(url);
+        assert!(
+            resp.contains("400") && resp.contains("bad-request"),
+            "`{url}` is outside the grammar: {resp:?}"
+        );
+    }
+    let resp = answer("http://allowed.test:80/x");
+    assert!(
+        resp.contains("403") && resp.contains("ssrf-blocked"),
+        "`http://allowed.test:80/x` is admitted by the rule and must reach the gate: {resp:?}"
     );
 }
 

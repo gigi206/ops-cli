@@ -2628,6 +2628,63 @@ fn port_zero_is_refused_wherever_a_port_is_read() {
     assert!(parse_url_target("https://api.test:8443/x").is_ok());
 }
 
+/// A request's authority is read to one grammar wherever it is read: brackets hold an IPv6
+/// address and nothing else, a port is digits, and an IPv6 address that carries a port is
+/// bracketed. A URL and a `tcp://` target each had their own reading, and each took spellings the
+/// `Host` header refused: `2001:db8::1:443` was cut at its last `:`, although a rule written the
+/// same way names the address `2001:db8::1:443`.
+#[test]
+fn a_target_authority_is_read_to_the_one_request_grammar() {
+    use AuthorityFault::*;
+    for (authority, fault) in [
+        ("[::1", Unterminated),
+        ("[1.2.3.4]:443", NotIpv6),
+        ("[h.test]:443", NotIpv6),
+        ("[::1]x", AfterBracket),
+        ("::1:443", BareColon),
+        ("2001:db8::1:443", BareColon),
+        ("h.test:443:443", BareColon),
+        ("h.test:", Port),
+        ("h.test:+443", Port),
+        ("h.test: 443", Port),
+        ("h.test:443\u{a0}", Port),
+        ("h.test:65536", Port),
+        ("h.test:0", Port),
+    ] {
+        assert_eq!(
+            split_request_authority(authority),
+            Err(fault),
+            "`{authority}`"
+        );
+        assert!(
+            parse_url_target(&format!("https://{authority}/")).is_err(),
+            "URL `{authority}`"
+        );
+        assert!(
+            parse_tcp_target(&format!("tcp://{authority}")).is_err(),
+            "tcp:// `{authority}`"
+        );
+    }
+    assert_eq!(
+        split_request_authority("[::1]:0443"),
+        Ok(("::1", Some(443)))
+    );
+    assert_eq!(split_request_authority("h.test"), Ok(("h.test", None)));
+    // The rule the refused spelling reads as: an address with no port.
+    assert_eq!(
+        rule("2001:db8::1:443").kind,
+        RuleKind::Ip("2001:db8::1:443".parse().unwrap(), Ports::default())
+    );
+    assert_eq!(
+        parse_url_target("https://[::1]:0443/").unwrap(),
+        ("::1".to_string(), 443, "/".to_string())
+    );
+    assert_eq!(
+        parse_tcp_target("tcp://[::1]:22").unwrap(),
+        ("::1".to_string(), 22)
+    );
+}
+
 /// An entry whose host still carries a colon is malformed, and is dropped as one.
 ///
 /// The `:port` split takes the rightmost colon and only before a numeric suffix. That is right for a

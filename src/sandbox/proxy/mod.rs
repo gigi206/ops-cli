@@ -450,13 +450,11 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
              bare origin-form request has no host to route",
         );
     }
-    // 2. The CONNECT authority. Its host must be one the supervisor accepts
-    //    (`allowlist::is_request_host`): a host it would refuse is malformed here, rather than
-    //    decided by this proxy and then contradicted by the supervisor.
-    let Some((connect_host, port)) = split_authority(&target)
-        .map(|(host, port)| (allowlist::canonical_host(&host), port))
-        .filter(|(host, _)| allowlist::is_request_host(host))
-    else {
+    // 2. The CONNECT authority, read to the grammar the `Host` header is (`connect_authority`).
+    //    Its host must be one the supervisor accepts (`allowlist::is_request_host`): a host it
+    //    would refuse is malformed here, rather than decided by this proxy and then contradicted
+    //    by the supervisor.
+    let Some((connect_host, port)) = connect_authority(&target) else {
         // The authority is malformed (not host:port, or its host is neither a name nor an
         // address): log the raw target the agent asked for.
         ctx.push_log(
@@ -472,8 +470,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             &mut client,
             "400 Bad Request",
             "bad-request",
-            "the CONNECT authority must be host:port, the host a DNS name or an IP address written \
-             in full, an IPv4 as an IPv4",
+            "the CONNECT authority must be host:port, the port 1 to 65535 in digits, the host a \
+             DNS name or an IP address written in full, an IPv4 as an IPv4 and an IPv6 in brackets",
         );
     };
 

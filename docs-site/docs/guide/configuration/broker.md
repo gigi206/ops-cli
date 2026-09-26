@@ -45,7 +45,8 @@ A Unix socket is a resource of this machine. A **TCP endpoint is a way out of th
 it is admitted only where [`[network]`](network) already admits it: `sbx` asks the very
 function the filtering proxy and `sbx test net` decide through, so the three cannot drift
 apart. A broker pointed at an endpoint the allowlist does not carry is not started, and the
-message names the rule to add.
+message names the rule to add. The endpoint is written as a request names one: the port in
+digits, and an IPv6 address in brackets (`tcp://[::1]:5432`).
 
 Without that rule there would be two different answers to *where may this cage go*, and the
 one a reader checks would not be the one that decides.
