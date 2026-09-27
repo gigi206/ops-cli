@@ -77,7 +77,7 @@ host ``) and in the `sbx config show --json` view, so the two spellings meet the
 | Field | Meaning |
 |---|---|
 | `name` | a logical name for the inventory, defaulting to the section key (the destination host): `1-64` characters of letters, digits, `_`, `-`, `.`; empty means omit it |
-| `description` | one line saying what the credential is for, printed beside the name; control characters become spaces and it is capped at 200 characters, never refused |
+| `description` | one line saying what the credential is for, printed beside the name; control characters and the characters that reorder a line become spaces, and it is capped at 200 characters, never refused |
 | `kind` | the broker kind; defaults to the only kind today, `"http-header"` |
 | `key` | a **terse** source name, expanded through `[secret.defaults]` (optionally pinned `key@resolver`) |
 | `from` | an **explicit** source: one `scheme://locator` ref, or an array = a fallback chain |

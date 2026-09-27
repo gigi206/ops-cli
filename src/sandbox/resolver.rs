@@ -708,33 +708,14 @@ fn one_line_detail(raw: &[u8]) -> String {
     out
 }
 
-/// A program's stderr as one line a terminal shows as written, whole.
+/// A program's stderr as one line a terminal shows as written, whole: [`crate::diag::one_line`].
 ///
-/// Control characters (a newline that would forge a second diagnostic, an escape that would drive
-/// the terminal) and the characters that reorder a line ([`crate::diag::reorders`]) become spaces,
-/// and runs of whitespace collapse. Never rejects: a diagnostic is a label, so a sloppy one is
-/// cleaned rather than dropped. Non-UTF-8 bytes are replaced, not refused, since a program that
-/// garbles its own message must still be able to name the problem. Nothing is cut here; how much
-/// of the line to keep is the caller's to decide.
+/// Never rejects: a diagnostic is a label, so a sloppy one is cleaned rather than dropped, and
+/// non-UTF-8 bytes are replaced, not refused, since a program that garbles its own message must
+/// still be able to name the problem. Nothing is cut here; how much of the line to keep is the
+/// caller's to decide.
 pub(crate) fn one_line(raw: &[u8]) -> String {
-    let cleaned: String = String::from_utf8_lossy(raw)
-        .chars()
-        .map(|c| {
-            if c.is_control() || crate::diag::reorders(c) {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let mut out = String::with_capacity(cleaned.len());
-    for word in cleaned.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    out
+    crate::diag::one_line(&String::from_utf8_lossy(raw))
 }
 
 /// The diagnostic to relay for a **successful** run, or `None` for silence. Pure, so the rule that

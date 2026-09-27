@@ -39,6 +39,32 @@ pub(crate) fn reorders(c: char) -> bool {
     )
 }
 
+/// Text sbx did not choose, folded to one line that reads as written: each control character (a
+/// newline that would forge a line of its own, an escape that would drive the terminal) and each
+/// character that [`reorders`] a line becomes a space, and runs of whitespace collapse.
+///
+/// Never rejects, and nothing is cut: how much of the line to keep is the caller's to decide.
+pub(crate) fn one_line(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| {
+            if c.is_control() || reorders(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut out = String::with_capacity(cleaned.len());
+    for word in cleaned.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
 /// Print `sbx: warning: <msg>` to stderr — the prefix in the caution hue, the message's
 /// `` `identifiers` `` in the identifier hue, when stderr is a terminal. The message must be the
 /// bare text (no `sbx: warning:` prefix — this adds it), so a slip cannot double the prefix.

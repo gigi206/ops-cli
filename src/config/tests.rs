@@ -8791,17 +8791,18 @@ fn a_name_carrying_a_placeholder_or_control_character_is_refused() {
     }
 }
 
-// A description is a label, not a document: control characters become spaces (so it can neither
-// forge a second output line nor emit an escape sequence), whitespace runs collapse, and the
-// result is capped. A sloppy description is cleaned, never a reason to drop the credential.
+// A description is a label, not a document: control characters and the characters that reorder a
+// line become spaces (so it can neither forge a second output line, nor emit an escape sequence,
+// nor lay the words after it out backwards), whitespace runs collapse, and the result is capped.
+// A sloppy description is cleaned, never a reason to drop the credential.
 #[test]
 fn a_description_is_flattened_to_one_capped_line() {
     let mut raw = raw_secret_from(vec!["env://TOKEN"]);
-    raw.description = Some("first\nsecond\t\tthird\u{1b}[31m".into());
+    raw.description = Some("first\nsecond\t\tthird\u{1b}[31m\u{202e}dlrow\u{2066}x\u{200f}".into());
     let secret = validate(raw).unwrap();
     assert_eq!(
         secret.description.as_deref(),
-        Some("first second third [31m")
+        Some("first second third [31m dlrow x")
     );
 
     let mut long = raw_secret_from(vec!["env://TOKEN"]);
@@ -12235,16 +12236,22 @@ fn a_dropped_bind_warning_names_each_path_on_one_line() {
             path: Some("/srv/data\nwarning: all clear\x1b[2K".into()),
             mode: Some("rw".into()),
         }),
+        RawBind::Path("/tmp/x\u{202e}hss./u/emoh/\u{202c}".into()),
     ];
     let w = super::dropped_binds_warning(TrustState::Changed, &binds);
     assert!(
-        w.contains("dropping 2 bind(s) (/home/u/.ssh, /srv/data"),
+        w.contains("dropping 3 bind(s) (/home/u/.ssh, /srv/data"),
         "{w}"
     );
     assert!(w.contains("(rw)"), "a writable bind says so: {w}");
     assert!(
         !w.contains('\n') && !w.contains('\x1b'),
         "one line, no escape: {w:?}"
+    );
+    // Laid out by its right-to-left override, the third path would read `/tmp/x/home/u/.ssh`.
+    assert!(
+        w.contains(", /tmp/x hss./u/emoh/)") && !w.chars().any(crate::diag::reorders),
+        "a path is shown in the order it is written: {w:?}"
     );
 }
 

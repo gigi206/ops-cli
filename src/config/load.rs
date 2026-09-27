@@ -944,33 +944,24 @@ pub(super) fn describe_raw_bind(bind: &RawBind) -> String {
     }
 }
 
-/// Reduce one report line to a single safe display line: every control character (a newline, a
-/// carriage return, an ANSI escape introducer) becomes a space and runs of whitespace collapse.
+/// Reduce one report line to a single safe display line, [`crate::diag::one_line`]: every control
+/// character (a newline, a carriage return, an ANSI escape introducer) and every character that
+/// reorders a line becomes a space, and runs of whitespace collapse.
 ///
 /// Applied to the assembled report rather than to each interpolated value, so a field added later
 /// is covered without anyone remembering to. The values come verbatim out of a profile nothing has
 /// validated at this point — the charset and shape validators run at resolution, long after the
 /// import — and the report is the only text that states what the import granted. A bind path
 /// carrying a newline forges a whole extra line that reads like a genuine one; an escape sequence
-/// moves the cursor up and erases the grants already printed. That is the same reason
+/// moves the cursor up and erases the grants already printed; a right-to-left override lays out
+/// the rest of the line backwards, so a path reads as another one. That is the same reason
 /// [`super::secrets::validate_secret_name`] narrows its charset and
 /// [`super::secrets::sanitize_description`] cleans free text.
 ///
 /// Unlike `sanitize_description`, nothing is truncated: a line is long here because the profile
 /// grants that much, and dropping its tail would conceal exactly what the report exists to show.
 pub(super) fn one_display_line(line: &str) -> String {
-    let cleaned: String = line
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let mut out = String::with_capacity(cleaned.len());
-    for word in cleaned.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    out
+    crate::diag::one_line(line)
 }
 
 /// Build the posture summary for a raw app profile: the command, the persistent-home scope, the
@@ -2607,6 +2598,33 @@ mod tests {
         assert!(
             preview.summary.iter().any(|l| l.starts_with("gpu: true")),
             "a real grant must survive the sanitiser: {:?}",
+            preview.summary
+        );
+    }
+
+    #[test]
+    fn the_import_consent_report_shows_each_path_in_the_order_it_is_written() {
+        // A right-to-left override is no control character, and it needs neither a new line nor
+        // an escape: laid out by it, this bind reads `/tmp/x/home/u/.ssh (rw)`.
+        let preview = validate_profile(
+            b"cmd = \"demo\"\n\
+              binds = [{ path = \"/tmp/x\\u202Ehss./u/emoh/\\u202C\", mode = \"rw\" }]\n",
+        )
+        .expect("the fixture profile is importable");
+
+        assert!(
+            preview
+                .summary
+                .contains(&"binds: /tmp/x hss./u/emoh/ (rw)".to_string()),
+            "the path must be shown as written, the override as a space: {:?}",
+            preview.summary
+        );
+        assert!(
+            preview
+                .summary
+                .iter()
+                .all(|l| !l.chars().any(crate::diag::reorders)),
+            "no rendered line may carry a character that reorders it: {:?}",
             preview.summary
         );
     }

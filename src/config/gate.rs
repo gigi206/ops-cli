@@ -177,7 +177,8 @@ pub(crate) fn is_trust_drop(warning: &str) -> bool {
 /// read just before the re-approval it suggests: a count tells them something was added, a path
 /// tells them what they would be granting. The paths come from a file nothing has vouched for, so
 /// the list goes through [`load::one_display_line`] — a newline or an escape sequence in one must
-/// not forge or erase the lines around it.
+/// not forge or erase the lines around it, nor a right-to-left override make it read as another
+/// path.
 pub(super) fn dropped_binds_warning(state: TrustState, binds: &[RawBind]) -> String {
     let count = binds.len();
     let named = load::one_display_line(

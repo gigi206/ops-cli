@@ -274,23 +274,15 @@ pub(super) fn validate_secret_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
-/// Reduce a free-text description to one safe display line: control characters (a newline, an
-/// escape that could drive a terminal) become spaces, runs of whitespace collapse, and the result
-/// is truncated. Never rejects — a description is a label, so a sloppy one is cleaned rather than
-/// dropping the credential it documents.
+/// Reduce a free-text description to one safe display line, [`crate::diag::one_line`] truncated:
+/// control characters (a newline, an escape that could drive a terminal) and the characters that
+/// reorder a line become spaces, and runs of whitespace collapse. Never rejects: a description is
+/// a label, so a sloppy one is cleaned rather than dropping the credential it documents.
 pub(super) fn sanitize_description(text: &str) -> String {
-    let cleaned: String = text
+    crate::diag::one_line(text)
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let mut out = String::with_capacity(cleaned.len());
-    for word in cleaned.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    out.chars().take(DESCRIPTION_MAX).collect()
+        .take(DESCRIPTION_MAX)
+        .collect()
 }
 
 /// The resolver chain for a host secret: either the explicit `from` (a single `scheme://locator`
