@@ -1,0 +1,19 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 51058ef354f7539525992bf56a5a5b4d55dba370cae15d1fdff60395f4f46420 # the search unwraps a table that is not there: a mistyped value panics
+cc 73667e731fc8981f252dba69118f2a0ef92410bc5d575588d02a1219c4f54266 # the same panic on `[app.b] gpu = "on"`
+cc 59bfffd9e588d962f473892074185d2463b15b83ef9b3b51945a184209044ebf # the emptied-table check removed: two mistakes in one table cost only the table
+cc a6e6ef1818f31e51cd4a403d5644107547b2798828dfebc795910ab67c7cd433 # the emptied-table check inverted: two mistakes cost only a table
+cc a8ff07dfd9d7fa87928743ac53a410ff089731637c15b09baff384909de6ab62 # a refusal after a removal keeps its notice: `app.a.proc.allow`, cap 2501
+cc 34cd3db0ed8c6a48de3e6906fa985eae97a7ebf84e7d478a31a65ff4da3ce61b # the first key tried is blamed: the wrong value dropped
+cc 779c0977a8094c5bb5e8a985a8f08bac438771287eae94c961ecd8a7a2db3926 # the line a notice names is one off
+cc 0ee903e6b26898dfb17970eb9bf0c99ef9e87fb1d6f311b2403d643d23510b1d # nothing counted as a restriction: a mistyped restriction dropped alone
+cc e4f78d03593e5b6635e8035aaffe19cd88dd67d421d7c8bdc6e20fe27a0543fa # nothing counted as a restriction: `fs.scan = [5]` dropped alone
+cc 67812f26f7a74a17973b02b35e3852c1c498c57ca4f8578cfe9afe58b58119e9 # `*` taken literally: `app.a.task.t.spawn = 5` dropped alone
+cc 7be21e724d0fa80ad4cc2f8a8ac419d115cc539dc6b3be149c00f516aaf7787b # `*` taken literally: a mistyped task `spawn` dropped alone
+cc 2b8adcb14c17bc9b63a106bb3772bfdc4eb7d17ef2af7901a4bdf2f61b33a636 # a budget that never runs out: the search re-reads past a cap of 0
+cc 3fb53f7e52cf5f4da97b1ae37b8a6af9cf74fb675f5ae5d99eb89e0328dc8314 # running out keeps the path found: a mistyped app task `network`, cap 1315

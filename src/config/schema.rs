@@ -2302,7 +2302,7 @@ const LOCATE_DEPTH: usize = 7;
 /// it gives up. See [`Budget`].
 const LOCATE_BUDGET: usize = 4 * 1024 * 1024;
 
-/// What is left of the re-reading one parse may spend looking for the key at fault.
+/// How much re-reading one parse may spend looking for the key at fault, and how much it has.
 ///
 /// Every candidate the search tries costs a copy of the whole document, its rendering and a typed
 /// parse of the result, so the work is the number of candidates **times** the size of the file. A
@@ -2315,14 +2315,18 @@ const LOCATE_BUDGET: usize = 4 * 1024 * 1024;
 /// with the parser's own message. Blaming the table the search had reached instead would drop the
 /// correct values written beside the mistake, which is what the search exists to keep.
 struct Budget {
-    left: usize,
+    /// The most bytes of document this parse may re-read.
+    cap: usize,
+    /// What it has re-read so far.
+    read: usize,
 }
 
 impl Budget {
     /// The budget one parse of one file starts with.
     fn full() -> Self {
         Self {
-            left: LOCATE_BUDGET,
+            cap: LOCATE_BUDGET,
+            read: 0,
         }
     }
 
@@ -2333,7 +2337,10 @@ impl Budget {
         doc: &toml_edit::DocumentMut,
     ) -> Option<Result<T, toml::de::Error>> {
         let text = doc.to_string();
-        self.left = self.left.checked_sub(text.len())?;
+        if text.len() > self.cap.saturating_sub(self.read) {
+            return None;
+        }
+        self.read += text.len();
         Some(toml::from_str::<T>(&text))
     }
 }
@@ -2505,21 +2512,29 @@ fn with_location<T: serde::de::DeserializeOwned>(
 /// One mistyped value costs the file too when it is a restriction (see [`WIDENING_DROPS`]): the
 /// rest of the file without it would allow more than the file says.
 pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<RawConfig, String> {
+    // One budget for everything this parse spends searching, the refusal's message included.
+    parse_layer_within(bytes, dropped, &mut Budget::full())
+}
+
+/// [`parse_layer`], its search held to `budget`. A file is read with [`Budget::full`]; a smaller
+/// budget is how the bound itself is exercised, on documents small enough to generate.
+fn parse_layer_within(
+    bytes: &[u8],
+    dropped: &mut Vec<String>,
+    budget: &mut Budget,
+) -> Result<RawConfig, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
     let first = match toml::from_str::<RawConfig>(text) {
         Ok(cfg) => return Ok(cfg),
         Err(e) => e.to_string(),
     };
-    // One budget for everything this parse spends searching, the refusal's message included.
-    let mut budget = Budget::full();
     // A syntax error is not recoverable by removing a key: the document does not parse as TOML at
     // all, so there is no table to take one out of.
     let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
-        return Err(with_location::<RawConfig>(text, first, &mut budget));
+        return Err(with_location::<RawConfig>(text, first, budget));
     };
     for _ in 0..MAX_RECOVERED_FIELDS {
-        let Some((steps, line)) = locate_type_error::<RawConfig>(&doc.to_string(), &mut budget)
-        else {
+        let Some((steps, line)) = locate_type_error::<RawConfig>(&doc.to_string(), budget) else {
             break;
         };
         let Some((key, parents)) = steps.split_last() else {
@@ -2553,7 +2568,7 @@ pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<Raw
         }
     }
     dropped.clear();
-    Err(with_location::<RawConfig>(text, first, &mut budget))
+    Err(with_location::<RawConfig>(text, first, budget))
 }
 
 /// How many mistyped values [`parse_layer`] will drop before giving the file up. Elimination names
@@ -3035,6 +3050,378 @@ allow = \"github.com\"
         let text = "cmd = [\"demo\"]\n\n[packages]\nx = 1\n";
         let err = parse_app(text.as_bytes()).unwrap_err();
         assert!(err.contains("`packages.x`"), "{err}");
+    }
+}
+
+/// Generated layers for [`parse_layer`], checked against what its recovery promises: over files a
+/// person could write, one mistake costs exactly that value unless it restricts, and two cost the
+/// file; over any bytes at all, nothing panics, no restriction is dropped on its own, and the search
+/// re-reads no more than its budget.
+#[cfg(test)]
+mod layer_properties {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::sample::Index;
+
+    /// A key a generated table may hold: its values written right, its values written with the
+    /// wrong type, and whether the layer without it allows more than it says. That last column is
+    /// the rule as this test reads it, written apart from [`WIDENING_DROPS`] so each checks the
+    /// other.
+    type Spec = (
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+        bool,
+    );
+
+    const TOP: &[Spec] = &[
+        ("timezone", &["\"UTC\""], &["5"], false),
+        ("gpu", &["false"], &["\"no\""], false),
+    ];
+    const PROC: &[Spec] = &[
+        (
+            "mode",
+            &["\"off\"", "\"observe\"", "\"enforce\"", "\"ask\""],
+            &["5", "true"],
+            true,
+        ),
+        (
+            "deny",
+            &["[\"sh\"]", "[]", "[\"curl\", \"/usr/bin/*\"]"],
+            &["\"sh\"", "[\"sh\", 5]"],
+            true,
+        ),
+        ("allow", &["[\"git\"]", "[]"], &["\"git\"", "[1]"], false),
+    ];
+    const NETWORK: &[Spec] = &[
+        ("mode", &["\"deny\"", "\"allow\"", "\"ask\""], &["7"], false),
+        (
+            "allow",
+            &["[\"github.com\"]", "[]"],
+            &["\"github.com\"", "[\"a.test\", 3]"],
+            false,
+        ),
+        (
+            "deny",
+            &["[\"evil.test\"]", "[]"],
+            &["\"evil.test\"", "[2]"],
+            true,
+        ),
+        ("mute", &["[\"noise.test\"]"], &["\"noise.test\""], false),
+    ];
+    const FS: &[Spec] = &[
+        (
+            "deny",
+            &["[\".env\"]", "[]"],
+            &["\".env\"", "[\".env\", 5]"],
+            true,
+        ),
+        ("readonly", &["[\"src\"]"], &["\"src\""], true),
+        (
+            "scan",
+            &["[\"AKIA[0-9A-Z]{16}\"]"],
+            &["[5]", "\"AKIA\""],
+            true,
+        ),
+        ("git_writable", &["true", "false"], &["\"yes\""], false),
+        ("scan_max_kb", &["64"], &["\"64\""], false),
+    ];
+    const SSH_AGENT: &[Spec] = &[
+        ("confirm", &["true", "false"], &["\"yes\"", "1"], true),
+        ("allow", &["[\"SHA256:x\"]"], &["\"SHA256:x\""], false),
+    ];
+    const ENV: &[Spec] = &[
+        ("A", &["\"1\""], &["1"], false),
+        ("B", &["\"x\""], &["true"], false),
+    ];
+    const TASK: &[Spec] = &[
+        ("cmd", &["[\"make\"]"], &["5"], false),
+        (
+            "spawn",
+            &["[\"git\"]", "\"git\"", "[]"],
+            &["5", "[\"git\", 5]"],
+            true,
+        ),
+        ("network", &["[\"api.test\"]"], &["\"api.test\""], false),
+        ("description", &["\"d\""], &["5"], false),
+    ];
+    const APP: &[Spec] = &[
+        ("cmd", &["[\"x\"]", "\"x\""], &["5"], false),
+        ("gpu", &["true"], &["\"on\""], false),
+    ];
+
+    /// Every table a generated layer may carry, in the order it is written. The top level comes
+    /// first, since a key written after a header belongs to that header's table.
+    const TABLES: &[(&[&str], &[Spec])] = &[
+        (&[], TOP),
+        (&["proc"], PROC),
+        (&["network"], NETWORK),
+        (&["fs"], FS),
+        (&["ssh_agent"], SSH_AGENT),
+        (&["env"], ENV),
+        (&["task", "t1"], TASK),
+        (&["task", "t2"], TASK),
+        (&["app", "a"], APP),
+        (&["app", "a", "proc"], PROC),
+        (&["app", "a", "network"], NETWORK),
+        (&["app", "a", "fs"], FS),
+        (&["app", "a", "ssh_agent"], SSH_AGENT),
+        (&["app", "a", "task", "t"], TASK),
+        (&["app", "b"], APP),
+        (&["app", "b", "proc"], PROC),
+    ];
+
+    /// One value of a generated layer.
+    #[derive(Clone, Debug)]
+    struct Leaf {
+        table: usize,
+        key: &'static str,
+        good: &'static str,
+        bad: &'static str,
+        restricts: bool,
+    }
+
+    impl Leaf {
+        /// The dotted path a notice names this value by.
+        fn path(&self) -> String {
+            let mut steps: Vec<&str> = TABLES[self.table].0.to_vec();
+            steps.push(self.key);
+            steps.join(".")
+        }
+    }
+
+    /// A layer: which tables are written, and the values in them.
+    #[derive(Clone, Debug)]
+    struct Layer {
+        tables: Vec<usize>,
+        leaves: Vec<Leaf>,
+    }
+
+    impl Layer {
+        /// The file, with the values at `bad` written with the wrong type and the one at `omit`
+        /// left out, and the line each value is written on.
+        fn render(&self, bad: &[usize], omit: Option<usize>) -> (String, Vec<usize>) {
+            let mut text = String::new();
+            let mut lines = vec![0; self.leaves.len()];
+            let mut line = 1;
+            for &t in &self.tables {
+                let header = TABLES[t].0;
+                if !header.is_empty() {
+                    text.push_str(&format!("\n[{}]\n", header.join(".")));
+                    line += 2;
+                }
+                for (i, leaf) in self.leaves.iter().enumerate() {
+                    if leaf.table != t || omit == Some(i) {
+                        continue;
+                    }
+                    let value = if bad.contains(&i) {
+                        leaf.bad
+                    } else {
+                        leaf.good
+                    };
+                    text.push_str(&format!("{} = {value}\n", leaf.key));
+                    lines[i] = line;
+                    line += 1;
+                }
+            }
+            (text, lines)
+        }
+    }
+
+    fn layers() -> impl Strategy<Value = Layer> {
+        let table = |specs: &'static [Spec]| {
+            (
+                any::<bool>(),
+                proptest::collection::vec(
+                    (any::<bool>(), any::<Index>(), any::<Index>()),
+                    specs.len(),
+                ),
+            )
+        };
+        let all: Vec<_> = TABLES.iter().map(|(_, specs)| table(specs)).collect();
+        all.prop_map(|chosen| {
+            let mut layer = Layer {
+                tables: Vec::new(),
+                leaves: Vec::new(),
+            };
+            for (t, (written, keys)) in chosen.into_iter().enumerate() {
+                // The top level is always there, if only as the place nothing is written.
+                if !written && t != 0 {
+                    continue;
+                }
+                layer.tables.push(t);
+                for ((key, goods, bads, restricts), (kept, good, bad)) in
+                    TABLES[t].1.iter().zip(keys)
+                {
+                    if kept {
+                        layer.leaves.push(Leaf {
+                            table: t,
+                            key,
+                            good: goods[good.index(goods.len())],
+                            bad: bads[bad.index(bads.len())],
+                            restricts: *restricts,
+                        });
+                    }
+                }
+            }
+            layer
+        })
+    }
+
+    /// The indices of the values written wrong: up to two, distinct.
+    fn mistakes(layer: &Layer, picks: &[Index]) -> Vec<usize> {
+        if layer.leaves.is_empty() {
+            return Vec::new();
+        }
+        let mut bad: Vec<usize> = picks.iter().map(|p| p.index(layer.leaves.len())).collect();
+        bad.sort_unstable();
+        bad.dedup();
+        bad
+    }
+
+    /// The path a drop notice names, split into its keys: a key holding a `.` is quoted.
+    fn notice_path(notice: &str) -> Vec<String> {
+        let path = notice.split('`').nth(1).unwrap_or_default();
+        let mut steps = vec![String::new()];
+        let mut quoted = false;
+        for c in path.chars() {
+            match c {
+                '"' => quoted = !quoted,
+                '.' if !quoted => steps.push(String::new()),
+                c => steps.last_mut().unwrap().push(c),
+            }
+        }
+        steps
+    }
+
+    /// Whether the value at `steps` restricts, as the specification above reads the rule.
+    fn restriction(steps: &[String]) -> bool {
+        let own = match steps {
+            [app, _, own @ ..] if app == "app" => own,
+            _ => steps,
+        };
+        let own: Vec<&str> = own.iter().map(String::as_str).collect();
+        matches!(
+            own.as_slice(),
+            ["proc"]
+                | ["proc", "mode" | "deny"]
+                | ["fs"]
+                | ["fs", "deny" | "readonly" | "scan"]
+                | ["network", "deny"]
+                | ["ssh_agent", "confirm"]
+                | ["task", _, "spawn"]
+        )
+    }
+
+    /// Bytes nobody would write: at random, or a generated layer as written, or with bytes deleted,
+    /// inserted or replaced.
+    fn any_bytes() -> impl Strategy<Value = Vec<u8>> {
+        let edited = (
+            layers(),
+            proptest::collection::vec(any::<Index>(), 0..3),
+            prop_oneof![
+                Just(Vec::new()),
+                proptest::collection::vec((any::<Index>(), 0u8..3, any::<u8>()), 1..4),
+            ],
+        )
+            .prop_map(|(layer, picks, edits)| {
+                let bad = mistakes(&layer, &picks);
+                let mut bytes = layer.render(&bad, None).0.into_bytes();
+                for (at, how, byte) in edits {
+                    let at = at.index(bytes.len() + 1);
+                    match how {
+                        0 if at < bytes.len() => {
+                            bytes.remove(at);
+                        }
+                        1 => bytes.insert(at, byte),
+                        _ if at < bytes.len() => bytes[at] = byte,
+                        _ => {}
+                    }
+                }
+                bytes
+            });
+        prop_oneof![
+            1 => proptest::collection::vec(any::<u8>(), 0..256),
+            4 => edited,
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// A layer a person could write costs exactly its mistake. With none it reads as the strict
+        /// parser reads it. One that does not restrict is dropped alone, named with its own line,
+        /// and the rest reads as the file written without it. One that restricts costs the file,
+        /// named. Two cost the file, whichever tables they sit in, a security table among them.
+        #[test]
+        fn a_layer_costs_exactly_its_mistake(
+            layer in layers(),
+            picks in proptest::collection::vec(any::<Index>(), 0..3),
+        ) {
+            let bad = mistakes(&layer, &picks);
+            let (text, lines) = layer.render(&bad, None);
+            let mut dropped = Vec::new();
+            let got = parse_layer(text.as_bytes(), &mut dropped);
+            match bad.as_slice() {
+                [] => {
+                    prop_assert_eq!(got, parse(text.as_bytes()), "{}", text);
+                    prop_assert!(dropped.is_empty(), "{:?}", dropped);
+                }
+                [one] => {
+                    let leaf = &layer.leaves[*one];
+                    let named = format!("`{}` (line {})", leaf.path(), lines[*one]);
+                    if leaf.restricts {
+                        let err = got.expect_err("a mistyped restriction costs the file");
+                        prop_assert!(dropped.is_empty(), "{:?}", dropped);
+                        prop_assert!(err.contains(&named) && err.contains("restriction"), "{}", err);
+                    } else {
+                        let without = parse(layer.render(&[], Some(*one)).0.as_bytes());
+                        prop_assert_eq!(got, without, "{}", text);
+                        prop_assert_eq!(dropped.len(), 1, "{:?}", dropped);
+                        prop_assert!(dropped[0].contains(&named), "{:?} {}", dropped, named);
+                    }
+                }
+                _ => {
+                    prop_assert!(got.is_err(), "two mistakes cost the file:\n{}", text);
+                    prop_assert!(dropped.is_empty(), "{:?}", dropped);
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// Any bytes are answered without a panic, a refusal drops nothing, and no restriction is
+        /// ever dropped on its own. The search re-reads no more than its budget, and a budget never
+        /// changes what was recovered: short of it, the file is given up whole.
+        #[test]
+        fn any_bytes_are_answered_within_the_budget(bytes in any_bytes(), cap in 0usize..8192) {
+            let mut unbounded = Budget { cap: usize::MAX, read: 0 };
+            let mut all_dropped = Vec::new();
+            let all = parse_layer_within(&bytes, &mut all_dropped, &mut unbounded);
+            let mut bounded = Budget { cap, read: 0 };
+            let mut some_dropped = Vec::new();
+            let some = parse_layer_within(&bytes, &mut some_dropped, &mut bounded);
+
+            prop_assert!(bounded.read <= cap, "{} bytes re-read under {}", bounded.read, cap);
+            for (answer, dropped) in [(&all, &all_dropped), (&some, &some_dropped)] {
+                if answer.is_err() {
+                    prop_assert!(dropped.is_empty(), "{:?}", dropped);
+                }
+                for notice in dropped {
+                    prop_assert!(!restriction(&notice_path(notice)), "{}", notice);
+                }
+            }
+            match (&all, &some) {
+                (_, Err(_)) => {}
+                (Ok(a), Ok(b)) => {
+                    prop_assert_eq!(a, b);
+                    prop_assert_eq!(&all_dropped, &some_dropped);
+                }
+                (Err(_), Ok(_)) => prop_assert!(false, "a budget turned a refusal into a recovery"),
+            }
+        }
     }
 }
 
