@@ -28,6 +28,17 @@ pub(crate) fn visible(text: &str) -> String {
     out
 }
 
+/// A parser's message as a terminal is to show it: each line written the way [`visible`] writes
+/// it, the line breaks kept.
+///
+/// Such a message spans lines on purpose, drawing the line at fault under a caret, and that line is
+/// the file's own text: a file sbx did not write can put an escape sequence or a right-to-left
+/// override in it. Only for a message whose breaks are the parser's own: a one-line message goes
+/// through [`visible`] whole, so that a newline carried by a value it quotes cannot start a line.
+pub(crate) fn visible_lines(text: &str) -> String {
+    text.lines().map(visible).collect::<Vec<_>>().join("\n")
+}
+
 /// Whether `c` changes the order a terminal lays out the characters around it: the directional
 /// marks, embeddings, overrides and isolates. None of them is a control character to
 /// [`char::is_control`], which reads the `Cc` category alone, so a filter that keeps a line to what

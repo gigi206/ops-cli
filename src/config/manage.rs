@@ -901,7 +901,7 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
     // built, so a list checked later is covered without anyone remembering to. The parser's own
     // message spans lines on purpose, drawing the line at fault, so it is escaped a line at a time.
     let raw = super::schema::parse_layer(doc.to_string().as_bytes(), &mut after_dropped)
-        .map_err(|e| visible_lines(&e))?;
+        .map_err(|e| crate::diag::visible_lines(&e))?;
     if let Some(notice) = after_dropped.iter().find(|notice| {
         !before_dropped
             .iter()
@@ -1946,20 +1946,6 @@ fn existing_parent_mut<'d>(
     Some(table)
 }
 
-/// A parser's message as a terminal is to show it: each line written the way
-/// [`crate::diag::visible`] writes it, the line breaks kept.
-///
-/// The message spans lines on purpose, drawing the line at fault under a caret, and that line is
-/// the file's own text: a project's `.sbx.toml` the cage wrote can put an escape sequence or a
-/// right-to-left override in it, and `sbx config` prints the message through `diag::error`, which
-/// filters nothing.
-fn visible_lines(text: &str) -> String {
-    text.lines()
-        .map(crate::diag::visible)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Parse the file into an editable document, treating an absent file as an empty one (so a `set`
 /// can create it and a `get`/`unset` simply finds nothing).
 ///
@@ -1981,7 +1967,12 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
         Ok(bytes) => String::from_utf8(bytes)
             .map_err(|_| ManageError::Parse(path.to_path_buf(), "not UTF-8 text".into()))?
             .parse::<DocumentMut>()
-            .map_err(|e| ManageError::Parse(path.to_path_buf(), visible_lines(&e.to_string()))),
+            .map_err(|e| {
+                ManageError::Parse(
+                    path.to_path_buf(),
+                    crate::diag::visible_lines(&e.to_string()),
+                )
+            }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
         Err(e) => Err(ManageError::Read(e.to_string())),
     }

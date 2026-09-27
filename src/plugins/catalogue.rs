@@ -90,15 +90,22 @@ impl Catalogue {
     /// because a shape refusal quotes the value it refuses — see [`validate_free_text`].
     pub(crate) fn parse(bytes: &[u8]) -> Result<Catalogue, String> {
         let text = std::str::from_utf8(bytes).map_err(|_| "catalogue.toml is not valid UTF-8")?;
-        let raw: RawCatalogue =
-            toml::from_str(text).map_err(|e| format!("invalid catalogue.toml: {e}"))?;
+        // The parser's message draws the line at fault, which is the store's own text: a raw
+        // escape byte in a string is exactly what it refuses, and it would be drawn as it is.
+        let raw: RawCatalogue = toml::from_str(text).map_err(|e| {
+            format!(
+                "invalid catalogue.toml: {}",
+                crate::diag::visible_lines(&e.to_string())
+            )
+        })?;
         let mut plugins = BTreeMap::new();
         for (name, entry) in raw.plugin {
             // Every field of an entry reaches a terminal verbatim: the free-text pair through
             // `sbx plugins store list/info`, `path` through an install error naming where the
-            // plugin was listed, and all of them through the shape refusals below, which quote the
-            // value they refuse. A TOML basic string carries a control byte through a `\uXXXX`
-            // escape, so a TOFU-pinned store can put a terminal escape in any of them.
+            // plugin was listed, `type` through the refusal naming the types that exist, and all
+            // of them through the shape refusals below, which quote the value they refuse. A TOML
+            // basic string carries a control byte through a `\uXXXX` escape, so a TOFU-pinned
+            // store can put a terminal escape in any of them.
             //
             // The serializer refuses a control character in every field uniformly; this is the
             // consuming half, and it has to be uniform too — guarding only the fields that are
@@ -109,6 +116,7 @@ impl Catalogue {
             validate_free_text("the entry name", &name)?;
             let here = |e: String| format!("catalogue entry `{name}`: {e}");
             for (field, value) in [
+                ("type", entry.plugin_type.as_deref().unwrap_or("")),
                 ("scheme", entry.scheme.as_deref().unwrap_or("")),
                 ("version", entry.version.as_str()),
                 ("description", entry.description.as_str()),
@@ -407,9 +415,10 @@ pub(crate) fn serialize_catalogue(cat: &Catalogue) -> Result<String, String> {
     Ok(out)
 }
 
-/// Refuse a control character in a catalogue free-text field (`version`/`description`), which is
-/// displayed verbatim. The serializer refuses them too, so this is symmetric: no legitimately-
-/// published store carries one, and a malicious TOFU-pinned store cannot smuggle a terminal escape.
+/// Refuse a control character in a catalogue field, which is displayed verbatim: on success for
+/// `version` and `description`, in a refusal for every field. The serializer refuses them too, so
+/// this is symmetric: no legitimately-published store carries one, and a malicious TOFU-pinned
+/// store cannot smuggle a terminal escape.
 fn validate_free_text(field: &str, s: &str) -> Result<(), String> {
     match s.chars().find(|c| c.is_control()) {
         Some(bad) => Err(format!(
@@ -742,7 +751,11 @@ mod tests {
         let mut path = "plugins/pass".to_string();
         let mut sha256 = "a".repeat(64);
         let mut description = "a credential resolver".to_string();
+        // Absent unless the test sets it, which is the shape of every entry listed before there
+        // was a second kind.
+        let mut plugin_type = String::new();
         match field {
+            "type" => plugin_type = format!("type = \"{value}\"\n"),
             "scheme" => scheme = value.to_string(),
             "version" => version = value.to_string(),
             "path" => path = value.to_string(),
@@ -751,7 +764,7 @@ mod tests {
             other => panic!("unknown field `{other}`"),
         }
         format!(
-            "[plugin.pass]\nscheme = \"{scheme}\"\nversion = \"{version}\"\n\
+            "[plugin.pass]\n{plugin_type}scheme = \"{scheme}\"\nversion = \"{version}\"\n\
              description = \"{description}\"\npath = \"{path}\"\nsha256 = \"{sha256}\"\n"
         )
     }
@@ -862,14 +875,14 @@ mod tests {
 
     /// The guard covers every field an entry carries, not the pair displayed on success.
     ///
-    /// `scheme`, `path`, `sha256` and the entry name reach a terminal mainly through a *refusal*,
-    /// and every one of those refusals quotes the value it is refusing — so leaving them unguarded
-    /// made the refusal itself the injection. For the same reason the guard runs before the shape
-    /// checks rather than beside them.
+    /// `type`, `scheme`, `path`, `sha256` and the entry name reach a terminal mainly through a
+    /// *refusal*, and every one of those refusals quotes the value it is refusing, so leaving them
+    /// unguarded made the refusal itself the injection. For the same reason the guard runs before
+    /// the shape checks rather than beside them.
     #[test]
     fn a_control_character_is_refused_in_every_catalogue_field() {
         const ESC: char = '\u{1b}';
-        for field in ["scheme", "version", "description", "path", "sha256"] {
+        for field in ["type", "scheme", "version", "description", "path", "sha256"] {
             let entry = one_entry(field, "a\\u001b]0;x");
             let err = match Catalogue::parse(entry.as_bytes()) {
                 Err(e) => e,
@@ -891,6 +904,32 @@ mod tests {
             Ok(_) => panic!("a terminal escape in the entry name must be refused"),
         };
         assert!(!err.contains(ESC), "the refusal echoes the name: {err:?}");
+    }
+
+    /// A catalogue the parser refuses is quoted back a line at a time, each line escaped: the line
+    /// the parser draws under its caret is the store's own text, and a raw escape byte in a string
+    /// is precisely what gets it refused.
+    #[test]
+    fn a_catalogue_that_is_not_toml_is_refused_in_a_form_that_drives_nothing() {
+        // A raw ESC in a basic string, which TOML forbids, and a right-to-left override after it.
+        let bytes = b"[plugin.pass]\nversion = \"1\x1b[2J\xe2\x80\xae\"\n";
+        let err = match Catalogue::parse(bytes) {
+            Err(e) => e,
+            Ok(_) => panic!("a raw control byte in a string is not TOML"),
+        };
+        assert!(err.starts_with("invalid catalogue.toml: "), "{err:?}");
+        assert!(
+            !err.contains('\u{1b}') && !err.contains('\u{202e}'),
+            "the refusal draws the line as it is: {err:?}"
+        );
+        assert!(
+            err.contains("\\x1b[2J\\u{202e}"),
+            "the line at fault is shown as written: {err:?}"
+        );
+        assert!(
+            err.contains('\n'),
+            "the parser's own lines are kept: {err:?}"
+        );
     }
 
     #[test]
