@@ -2501,6 +2501,9 @@ fn with_location<T: serde::de::DeserializeOwned>(
 /// still costs the file, with the parser's own message. That is the case this was not built for —
 /// a person makes one typo — and pretending otherwise would mean guessing. So is a search that
 /// would re-read more than [`LOCATE_BUDGET`] bytes of document, which only a large file needs.
+///
+/// One mistyped value costs the file too when it is a restriction (see [`WIDENING_DROPS`]): the
+/// rest of the file without it would allow more than the file says.
 pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<RawConfig, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
     let first = match toml::from_str::<RawConfig>(text) {
@@ -2522,6 +2525,17 @@ pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<Raw
         let Some((key, parents)) = steps.split_last() else {
             break;
         };
+        // A restriction is not dropped on its own: the file without it would allow more than it
+        // says. It costs the file instead, and the message still names it.
+        if widens(&steps) {
+            dropped.clear();
+            let path = render_path(&steps);
+            let at = line.map(|n| format!(" (line {n})")).unwrap_or_default();
+            return Err(format!(
+                "{first}\n  --> the value at `{path}`{at} is the one at fault; it is a \
+                 restriction, so the file is refused rather than applied without it"
+            ));
+        }
         if !remove_at(&mut doc, parents, key) {
             break;
         }
@@ -2546,6 +2560,52 @@ pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<Raw
 /// a culprit only when removing one key makes the document parse, so in practice the loop runs
 /// once; the bound is what keeps a pathological document from re-parsing the file all day.
 const MAX_RECOVERED_FIELDS: usize = 4;
+
+/// The values [`parse_layer`] will not drop on their own, because a layer without one of them says
+/// **less** than was written in the direction that matters: it allows more.
+///
+/// Recovery drops the mistyped value and keeps the rest, which is right for what a field *grants*
+/// (`network.allow` gone is fewer hosts) and wrong for what it *restricts*. Each field here is one
+/// whose absence is the permissive end of what it can say: `proc` and its `mode` fall back to the
+/// lens off, a `deny`, `readonly` or `scan` list to empty, `ssh_agent.confirm` to signing unasked,
+/// and a task's `spawn` to no exec supervision at all. A single mistake in `proc.deny = ["sh", 5]`
+/// launched `enforce` with nothing denied. Such a value costs the file instead, as two mistakes do:
+/// the global config then stops a launch, and a project's file is set aside, leaving the layers
+/// below in force.
+///
+/// A field whose absence falls somewhere in the middle is not listed (`websocket_secret` falls to
+/// `warn`, a limit to its built-in value), since the mistyped value does not say which side it
+/// meant. One left off this list is recovered as before, so an omission costs what it always did.
+///
+/// Each shape is a path of keys, `*` standing for any one key, and applies alike under an app's
+/// own table (`app.<name>.proc.deny`).
+const WIDENING_DROPS: &[&[&str]] = &[
+    &["proc"],
+    &["proc", "mode"],
+    &["proc", "deny"],
+    &["fs"],
+    &["fs", "deny"],
+    &["fs", "readonly"],
+    &["fs", "scan"],
+    &["network", "deny"],
+    &["ssh_agent", "confirm"],
+    &["task", "*", "spawn"],
+];
+
+/// Whether dropping the value at `steps` would widen the layer: see [`WIDENING_DROPS`].
+fn widens(steps: &[String]) -> bool {
+    let steps = match steps {
+        [app, _, own @ ..] if app == "app" => own,
+        _ => steps,
+    };
+    WIDENING_DROPS.iter().any(|shape| {
+        shape.len() == steps.len()
+            && shape
+                .iter()
+                .zip(steps)
+                .all(|(want, step)| *want == "*" || want == step)
+    })
+}
 
 /// Parse config bytes as TOML. The error is a human-readable string: the loader
 /// turns it into a warning and ignores the layer rather than aborting a command,
@@ -2885,6 +2945,80 @@ allow = \"github.com\"
         assert_eq!(proc.deny, ["sh"]);
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].contains("proc.allow"), "{dropped:?}");
+    }
+
+    /// A mistyped restriction costs the file, not the restriction. Recovery drops the value at fault
+    /// and keeps the rest, which for a `deny` list, a `mode`, a `scan` or a task's `spawn` is the
+    /// permissive direction: `proc.deny = ["sh", 5]` launched `enforce` with nothing denied. Each of
+    /// them, at the top of the file and under an app, refuses the file and names the value; a value
+    /// that grants is still dropped alone, and so is one a level below a listed shape.
+    #[test]
+    fn a_mistyped_restriction_costs_the_file_not_the_restriction() {
+        let refused = [
+            ("[proc]\nmode = 5\ndeny = [\"sh\"]\n", "proc.mode"),
+            (
+                "[proc]\nmode = \"enforce\"\ndeny = [\"sh\", 5]\n",
+                "proc.deny",
+            ),
+            ("proc = 5\n", "proc"),
+            ("[fs]\ndeny = [\".env\", 5]\n", "fs.deny"),
+            ("[fs]\nreadonly = \"src\"\n", "fs.readonly"),
+            ("[fs]\nscan = [5]\n", "fs.scan"),
+            ("fs = 5\n", "fs"),
+            (
+                "[network]\nmode = \"allow\"\ndeny = [\"evil.test\", 5]\n",
+                "network.deny",
+            ),
+            ("[ssh_agent]\nconfirm = \"yes\"\n", "ssh_agent.confirm"),
+            (
+                "[task.t]\ncmd = [\"make\"]\nspawn = [\"git\", 5]\n",
+                "task.t.spawn",
+            ),
+            (
+                "[app.a]\ncmd = [\"x\"]\n\n[app.a.proc]\nmode = \"enforce\"\ndeny = \"sh\"\n",
+                "app.a.proc.deny",
+            ),
+            (
+                "[app.a.task.t]\ncmd = [\"make\"]\nspawn = 5\n",
+                "app.a.task.t.spawn",
+            ),
+        ];
+        for (section, path) in refused {
+            let text = format!("{section}\n[env]\nKEEPME = \"yes\"\n");
+            let mut dropped = Vec::new();
+            let err = parse_layer(text.as_bytes(), &mut dropped)
+                .expect_err(&format!("a mistyped `{path}` costs the file"));
+            assert!(dropped.is_empty(), "{path}: {dropped:?}");
+            assert!(
+                err.contains(&format!("the value at `{path}`")) && err.contains("restriction"),
+                "the restriction at fault is named: {err}"
+            );
+        }
+
+        let kept = [
+            (
+                "[proc]\nmode = \"enforce\"\ndeny = [\"sh\"]\nallow = \"curl\"\n",
+                "proc.allow",
+            ),
+            (
+                "[network]\nmode = \"deny\"\nallow = \"github.com\"\n",
+                "network.allow",
+            ),
+            ("[ssh_agent]\nallow = \"SHA256:x\"\n", "ssh_agent.allow"),
+            (
+                "[task.t]\ncmd = [\"make\"]\nspawn = [\"git\"]\n\n[task.t.exec.git]\nspawn = 5\n",
+                "task.t.exec.git.spawn",
+            ),
+        ];
+        for (section, path) in kept {
+            let text = format!("{section}\n[env]\nKEEPME = \"yes\"\n");
+            let mut dropped = Vec::new();
+            let cfg = parse_layer(text.as_bytes(), &mut dropped)
+                .unwrap_or_else(|e| panic!("a mistyped `{path}` costs only itself: {e}"));
+            assert_eq!(cfg.env.get("KEEPME").map(String::as_str), Some("yes"));
+            assert_eq!(dropped.len(), 1, "{dropped:?}");
+            assert!(dropped[0].contains(&format!("`{path}`")), "{dropped:?}");
+        }
     }
 
     /// A syntax error is not a type error: nothing is located, because the document cannot even be

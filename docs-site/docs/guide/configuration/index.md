@@ -128,9 +128,13 @@ A project's mise files (`[tools]`, `.tool-versions`) are a related input: see
 
 The schema is **additive**: every field is optional, and unknown fields are ignored.
 A config written for a newer `sbx` still loads on an older one: a new field is
-skipped rather than failing the parse. A malformed TOML file (or one that fails the
-[safety gate](../concepts/trust#the-safety-gate)) is dropped with a warning, never
-a hard failure that wedges a launch.
+skipped rather than failing the parse. A project's `.sbx.toml` that is malformed (or
+fails the [safety gate](../concepts/trust#the-safety-gate)) is set aside with a
+warning, and the launch goes on under the layers below it. The global config is
+different: it carries `[proc]`, `[network]` and `[fs]`, whose built-in defaults are the
+permissive end of each, so a global config that cannot be read refuses a launch
+(exit 2) rather than letting it run under defaults nobody chose. Read-only commands
+such as `sbx config show` still work, and say why.
 
 A value of the **wrong type** costs that value, not the file. `allow = "github.com"`
 where a list belongs is named in a warning with its line and dropped, and everything
@@ -142,6 +146,16 @@ own message. The search is bounded too: every key it tries re-reads the whole fi
 and it gives up after 4 MiB re-read, so a mistake in a file too large to search within
 that is not recovered either and costs the file the same way. Nothing is ever dropped
 silently: one warning names the value, the other names the file.
+
+A value that **restricts** is not dropped on its own, because the file without it
+would allow more than it says. `proc` and its `mode`, `proc.deny`, `fs` and its
+`deny`, `readonly` and `scan`, `network.deny`, `ssh_agent.confirm` and a task's
+`spawn`, at the top of the file or under an app, would each fall back to the
+permissive end: the lens off, nothing denied, no path closed, signing without a
+prompt, a task command free to run anything. One mistyped value in any of them costs
+the file, as two mistakes do, and the message names it. The global config then refuses
+a launch until the value is fixed. A project's file is set aside, which leaves the
+global config's own posture in force, and that may be wider than the project wrote.
 
 Note the direction, if you knew the old behaviour: a file that used to vanish now
 applies. A trusted project writing `mode = "allow"` beside a mistyped `allow` list
