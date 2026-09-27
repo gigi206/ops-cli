@@ -138,8 +138,10 @@ else the file says (the `mode` beside it, `[env]`, `[packages]`, every app) stil
 applies. The limit, since it is worth knowing rather than discovering: the value at
 fault is found by removing one key and seeing whether the file then parses, so a file
 with **two** mistyped values is not recovered and is dropped whole, with the parser's
-own message. Nothing is ever dropped silently: one warning names the value, the other
-names the file.
+own message. The search is bounded too: every key it tries re-reads the whole file,
+and it gives up after 4 MiB re-read, so a mistake in a file too large to search within
+that is not recovered either and costs the file the same way. Nothing is ever dropped
+silently: one warning names the value, the other names the file.
 
 Note the direction, if you knew the old behaviour: a file that used to vanish now
 applies. A trusted project writing `mode = "allow"` beside a mistyped `allow` list

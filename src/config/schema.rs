@@ -2298,10 +2298,45 @@ pub(crate) enum NotifyEvents {
 /// `[network]` took the `mode` beside it, which is the opposite of the rule this search serves.
 const LOCATE_DEPTH: usize = 7;
 
-/// The most keys [`locate_type_error`] will test at one level. The search re-parses the document
-/// once per candidate, so this bounds the work on a large config; a document wider than this simply
-/// keeps the original message.
-const LOCATE_MAX_KEYS: usize = 128;
+/// How many bytes of document [`locate_type_error`] may re-read, over one parse of one file, before
+/// it gives up. See [`Budget`].
+const LOCATE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// What is left of the re-reading one parse may spend looking for the key at fault.
+///
+/// Every candidate the search tries costs a copy of the whole document, its rendering and a typed
+/// parse of the result, so the work is the number of candidates **times** the size of the file. A
+/// ceiling on the candidates alone left the size free: a `.sbx.toml` near the safety gate's ceiling,
+/// with one mistyped value placed behind decoys at every level, stalled every command run in its
+/// directory, and a third-party profile did the same to `sbx app import`. So the bound is on bytes
+/// re-read, and it is shared by everything one parse spends, the message included.
+///
+/// Running out gives up entirely, like the other ways the search fails: the file costs the file,
+/// with the parser's own message. Blaming the table the search had reached instead would drop the
+/// correct values written beside the mistake, which is what the search exists to keep.
+struct Budget {
+    left: usize,
+}
+
+impl Budget {
+    /// The budget one parse of one file starts with.
+    fn full() -> Self {
+        Self {
+            left: LOCATE_BUDGET,
+        }
+    }
+
+    /// `doc` parsed as `T`, when what is left still covers reading it; `None` when it does not, and
+    /// the search is over.
+    fn parse<T: serde::de::DeserializeOwned>(
+        &mut self,
+        doc: &toml_edit::DocumentMut,
+    ) -> Option<Result<T, toml::de::Error>> {
+        let text = doc.to_string();
+        self.left = self.left.checked_sub(text.len())?;
+        Some(toml::from_str::<T>(&text))
+    }
+}
 
 /// Point at the key a *type* error came from, which the parser's own span does not.
 ///
@@ -2316,9 +2351,10 @@ const LOCATE_MAX_KEYS: usize = 128;
 ///
 /// Returns the dotted path and, when the document still carries its spans, the line it is written
 /// on. Gives up quietly — a document with two errors is never fixed by removing one key, and a
-/// guess is worse than the parser's own message.
+/// guess is worse than the parser's own message. It gives up the same way when `budget` runs out.
 fn locate_type_error<T: serde::de::DeserializeOwned>(
     text: &str,
+    budget: &mut Budget,
 ) -> Option<(Vec<String>, Option<usize>)> {
     let doc: toml_edit::DocumentMut = text.parse().ok()?;
     let mut path: Vec<String> = Vec::new();
@@ -2329,16 +2365,14 @@ fn locate_type_error<T: serde::de::DeserializeOwned>(
         let Some(keys) = keys_at(&doc, &path) else {
             break;
         };
-        if keys.len() > LOCATE_MAX_KEYS {
-            break;
+        let mut culprit = None;
+        for key in &keys {
+            let mut trial = doc.clone();
+            if remove_at(&mut trial, &path, key) && budget.parse::<T>(&trial)?.is_ok() {
+                culprit = Some(key.clone());
+                break;
+            }
         }
-        let culprit = keys
-            .iter()
-            .find(|key| {
-                let mut trial = doc.clone();
-                remove_at(&mut trial, &path, key) && toml::from_str::<T>(&trial.to_string()).is_ok()
-            })
-            .cloned();
         let Some(culprit) = culprit else {
             // Nothing at this level is the mistake on its own, which is two situations and they
             // must not be answered alike.
@@ -2360,7 +2394,7 @@ fn locate_type_error<T: serde::de::DeserializeOwned>(
             // collateral; if it still does not, the table itself is.
             let mut emptied = doc.clone();
             let cleared = keys.iter().all(|key| remove_at(&mut emptied, &path, key));
-            if cleared && toml::from_str::<T>(&emptied.to_string()).is_ok() {
+            if cleared && budget.parse::<T>(&emptied)?.is_ok() {
                 return None;
             }
             break;
@@ -2427,9 +2461,13 @@ fn line_of(text: &str, path: &[String]) -> Option<usize> {
     Some(text.get(..start)?.matches('\n').count() + 1)
 }
 
-/// Append the located key to a parse error, when one can be found.
-fn with_location<T: serde::de::DeserializeOwned>(text: &str, message: String) -> String {
-    match locate_type_error::<T>(text) {
+/// Append the located key to a parse error, when one can be found within `budget`.
+fn with_location<T: serde::de::DeserializeOwned>(
+    text: &str,
+    message: String,
+    budget: &mut Budget,
+) -> String {
+    match locate_type_error::<T>(text, budget) {
         Some((path, Some(line))) => {
             let path = render_path(&path);
             format!("{message}\n  --> the value at `{path}` (line {line}) is the one at fault")
@@ -2461,20 +2499,24 @@ fn with_location<T: serde::de::DeserializeOwned>(text: &str, message: String) ->
 /// The limit is written rather than hidden: elimination can only name a culprit when removing
 /// **one** key makes the document parse. A file with two type errors is not recovered, and it
 /// still costs the file, with the parser's own message. That is the case this was not built for —
-/// a person makes one typo — and pretending otherwise would mean guessing.
+/// a person makes one typo — and pretending otherwise would mean guessing. So is a search that
+/// would re-read more than [`LOCATE_BUDGET`] bytes of document, which only a large file needs.
 pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<RawConfig, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
     let first = match toml::from_str::<RawConfig>(text) {
         Ok(cfg) => return Ok(cfg),
         Err(e) => e.to_string(),
     };
+    // One budget for everything this parse spends searching, the refusal's message included.
+    let mut budget = Budget::full();
     // A syntax error is not recoverable by removing a key: the document does not parse as TOML at
     // all, so there is no table to take one out of.
     let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
-        return Err(with_location::<RawConfig>(text, first));
+        return Err(with_location::<RawConfig>(text, first, &mut budget));
     };
     for _ in 0..MAX_RECOVERED_FIELDS {
-        let Some((steps, line)) = locate_type_error::<RawConfig>(&doc.to_string()) else {
+        let Some((steps, line)) = locate_type_error::<RawConfig>(&doc.to_string(), &mut budget)
+        else {
             break;
         };
         let Some((key, parents)) = steps.split_last() else {
@@ -2492,12 +2534,12 @@ pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<Raw
             Some(n) => format!("ignoring `{path}` (line {n}): it is not the type this field takes"),
             None => format!("ignoring `{path}`: it is not the type this field takes"),
         });
-        if let Ok(cfg) = toml::from_str::<RawConfig>(&doc.to_string()) {
+        if let Some(Ok(cfg)) = budget.parse::<RawConfig>(&doc) {
             return Ok(cfg);
         }
     }
     dropped.clear();
-    Err(with_location::<RawConfig>(text, first))
+    Err(with_location::<RawConfig>(text, first, &mut budget))
 }
 
 /// How many mistyped values [`parse_layer`] will drop before giving the file up. Elimination names
@@ -2510,7 +2552,8 @@ const MAX_RECOVERED_FIELDS: usize = 4;
 /// so a malformed config never wedges the sandbox.
 pub(crate) fn parse(bytes: &[u8]) -> Result<RawConfig, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
-    toml::from_str(text).map_err(|e| with_location::<RawConfig>(text, e.to_string()))
+    toml::from_str(text)
+        .map_err(|e| with_location::<RawConfig>(text, e.to_string(), &mut Budget::full()))
 }
 
 /// Serialize an app as a top-level profile — the inverse of [`parse_app`], producing the portable
@@ -2530,7 +2573,8 @@ pub(crate) fn serialize_app(app: &RawApp) -> Result<String, String> {
 /// that by requiring a `cmd`, so the wrong shape is refused rather than silently mis-imported.
 pub(crate) fn parse_app(bytes: &[u8]) -> Result<RawApp, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
-    toml::from_str(text).map_err(|e| with_location::<RawApp>(text, e.to_string()))
+    toml::from_str(text)
+        .map_err(|e| with_location::<RawApp>(text, e.to_string(), &mut Budget::full()))
 }
 
 /// Parse bytes as a single tool bundle — a top-level [`RawBundle`]. A bundle file *is* one bundle
@@ -2543,7 +2587,8 @@ pub(crate) fn parse_app(bytes: &[u8]) -> Result<RawApp, String> {
 /// is reported as a stray key rather than imported as an empty tool.
 pub(crate) fn parse_bundle(bytes: &[u8]) -> Result<RawBundle, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
-    toml::from_str(text).map_err(|e| with_location::<RawBundle>(text, e.to_string()))
+    toml::from_str(text)
+        .map_err(|e| with_location::<RawBundle>(text, e.to_string(), &mut Budget::full()))
 }
 
 /// Serialize a bundle as a top-level fragment — the inverse of [`parse_bundle`], producing the
@@ -2574,7 +2619,8 @@ pub(crate) struct RawGroupFile {
 /// Parse bytes as a single egress group file — a top-level [`RawGroupFile`].
 pub(crate) fn parse_group(bytes: &[u8]) -> Result<RawGroupFile, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
-    toml::from_str(text).map_err(|e| with_location::<RawGroupFile>(text, e.to_string()))
+    toml::from_str(text)
+        .map_err(|e| with_location::<RawGroupFile>(text, e.to_string(), &mut Budget::full()))
 }
 
 /// Serialize a group's entries as its own file — the inverse of [`parse_group`].
@@ -2782,6 +2828,63 @@ allow = \"github.com\"
             dropped[0].contains("task.deploy.packages"),
             "and named: {dropped:?}"
         );
+    }
+
+    /// The search re-reads the whole document once per key it tries, so its work is the keys tried
+    /// times the size of the file; it is bounded in bytes re-read. A search that would need more
+    /// gives up entirely: the file costs the file, nothing is dropped behind the reader's back, and
+    /// the table the search had reached is not blamed, since dropping it would take the `mode`
+    /// written correctly beside the mistake.
+    #[test]
+    fn a_search_that_would_re_read_more_than_its_budget_gives_up_whole() {
+        let file = |pad: usize| {
+            format!(
+                "[env]\nKEEPME = \"yes\"\n\n[network]\nmode = \"deny\"\nx0 = \"{}\"\nx1 = 1\n\
+                 x2 = 1\nx3 = 1\nx4 = 1\nx5 = 1\nallow = \"github.com\"\n",
+                "a".repeat(pad)
+            )
+        };
+        let wide = file(LOCATE_BUDGET / 6);
+        let mut dropped = Vec::new();
+        let err = parse_layer(wide.as_bytes(), &mut dropped)
+            .expect_err("a search past its budget gives the file up");
+        assert!(dropped.is_empty(), "nothing is dropped: {dropped:?}");
+        assert!(
+            !err.contains("is the one at fault"),
+            "the parser's own message stands: {err}"
+        );
+
+        // Witness: the same mistake in a file of ordinary size is found and costs only itself.
+        let mut dropped = Vec::new();
+        let cfg = parse_layer(file(8).as_bytes(), &mut dropped).expect("recovered");
+        assert!(
+            matches!(cfg.network, Some(NetworkField::Table(t)) if t.mode.as_deref() == Some("deny")),
+            "the mode beside the mistake survives it"
+        );
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].contains("network.allow"), "{dropped:?}");
+    }
+
+    /// A table is searched however many keys it holds. A ceiling on the keys tried at one level
+    /// stopped the search on a wide table and blamed the table itself, so a `[proc]` carrying many
+    /// unknown keys lost its `mode = "enforce"` over one mistyped `allow` and launched with the lens
+    /// off.
+    #[test]
+    fn a_wide_table_costs_only_its_mistyped_value() {
+        let mut text = String::from("[proc]\nmode = \"enforce\"\ndeny = [\"sh\"]\n");
+        for i in 0..200 {
+            text.push_str(&format!("unknown{i} = 1\n"));
+        }
+        text.push_str("allow = \"curl\"\n");
+        let mut dropped = Vec::new();
+        let cfg = parse_layer(text.as_bytes(), &mut dropped).expect("recovered");
+        let Some(ProcField::Table(proc)) = cfg.proc else {
+            panic!("the table survives: {:?}", cfg.proc);
+        };
+        assert_eq!(proc.mode.as_deref(), Some("enforce"));
+        assert_eq!(proc.deny, ["sh"]);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].contains("proc.allow"), "{dropped:?}");
     }
 
     /// A syntax error is not a type error: nothing is located, because the document cannot even be
