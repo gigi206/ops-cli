@@ -387,8 +387,9 @@ Nothing here says which entries are disposable, because nothing can: an app's ow
 package manager's downloads sit side by side under one parent, and their names do not tell them
 apart. Reading them is the reader's, and so is deciding.
 
-The agent names what its home holds, so a name is printed with each control character replaced
-by a space, here, in `--json`, and in what [`--reset`](#resetting-an-app) reports it took. A
+The agent names what its home holds, so a name is printed with each control character, and
+each character that reorders a line (a bidirectional mark, override or isolate), replaced by a
+space, here, in `--json`, and in what [`--reset`](#resetting-an-app) reports it took. A
 name shown that way is not the name on disk, so [`--drop`](#taking-a-named-entry) cannot be
 given it; `--reset` still takes it.
 

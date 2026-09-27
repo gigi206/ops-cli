@@ -158,12 +158,12 @@ impl PendingState {
         //
         // The stored form is also what [`PendingState::answer_like`] groups a destination by,
         // and that is a real widening to state: two requests whose raw host or path differ only
-        // in control characters — or past this filter's 512-character cap — collapse into one
-        // `×2` row that a single answer frees. They are one row precisely because they are one
-        // row *to the operator*: nothing on screen could tell them apart, so grouping on the raw
-        // values would show one line and mean two. Keeping both forms is the alternative, and it
-        // puts the unfiltered values back in a struct every reader of this queue reports from,
-        // which is the arrangement this door exists to remove.
+        // in control or reordering characters, or past this filter's 512-character cap, collapse
+        // into one `×2` row that a single answer frees. They are one row precisely because they
+        // are one row *to the operator*: nothing on screen could tell them apart, so grouping on
+        // the raw values would show one line and mean two. Keeping both forms is the alternative,
+        // and it puts the unfiltered values back in a struct every reader of this queue reports
+        // from, which is the arrangement this door exists to remove.
         let (host, path) = (super::sanitize(host), super::sanitize(path));
         inner.entries.insert(
             seq,

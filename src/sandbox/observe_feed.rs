@@ -103,7 +103,9 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 
 /// Replace ASCII/Unicode control characters with a space and cap the length (on a char boundary), so
 /// the value is safe on the line-based control wire, the stderr feed, and any terminal reading
-/// either. A Linux filename may carry a newline exactly as a hostile argv can.
+/// either. A Linux filename may carry a newline exactly as a hostile argv can. The characters that
+/// reorder a line ([`crate::diag::reorders`]) become spaces too: none is a control character, and
+/// each would let a name the cage chose turn around the words a reader sees beside it.
 ///
 /// # What now depends on this, and why it must not be narrowed
 ///
@@ -131,7 +133,13 @@ pub(crate) fn sanitize(s: &str) -> String {
     const MAX: usize = SANITIZED_CHARS;
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || crate::diag::reorders(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     if cleaned.chars().count() <= MAX {
         cleaned
@@ -472,6 +480,17 @@ mod tests {
         let out = command_of(&info(1, "sh", &["sh", "-c", "a\nevil cmd=x\tb\rc"]));
         assert!(!out.contains('\n') && !out.contains('\r') && !out.contains('\t'));
         assert_eq!(out, "sh -c a evil cmd=x b c");
+    }
+
+    /// A name the cage chose cannot reorder the line it is shown on: a right-to-left override in a
+    /// path would otherwise show `/api/` followed by its tail reversed, and the operator approving
+    /// it reads a destination the request does not name. The letters of a right-to-left script are
+    /// text, and stay.
+    #[test]
+    fn sanitize_leaves_no_character_that_reorders_the_line() {
+        let out = sanitize("/api/\u{202e}gnp.x\u{202c} \u{2067}a\u{2069}\u{200e} \u{05d0}");
+        assert!(!out.chars().any(crate::diag::reorders), "{out:?}");
+        assert_eq!(out, "/api/ gnp.x   a   \u{05d0}");
     }
 
     #[test]
