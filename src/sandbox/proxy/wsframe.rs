@@ -1104,6 +1104,26 @@ mod tests {
         )
     }
 
+    /// The payload a `permessage-deflate` sender puts on the wire for `text`: raw DEFLATE against
+    /// `c`'s running window, with the trailing empty block elided.
+    fn deflated(text: &[u8], c: &mut miniz_oxide::deflate::core::CompressorOxide) -> Vec<u8> {
+        use miniz_oxide::deflate::core::{TDEFLFlush, compress};
+        let mut body = vec![0u8; text.len() * 2 + 4096];
+        let (status, consumed, n) = compress(c, text, &mut body, TDEFLFlush::Sync);
+        // Asserted, not assumed: a short write would silently compress a *prefix* of the payload,
+        // and a test whose big message turned out not to be big proves nothing.
+        assert_eq!(
+            consumed,
+            text.len(),
+            "the whole payload must compress in one call (status {status:?})"
+        );
+        body.truncate(n);
+        if body.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+            body.truncate(body.len() - 4);
+        }
+        body
+    }
+
     /// One `permessage-deflate` message, compressed against `c`'s running window and framed with
     /// whichever of the three length forms fits — the two-byte and eight-byte forms included, since
     /// the message this exists for is far past the 125 bytes the short form carries.
@@ -1111,32 +1131,8 @@ mod tests {
         payload: &[u8],
         c: &mut miniz_oxide::deflate::core::CompressorOxide,
     ) -> Vec<u8> {
-        use miniz_oxide::deflate::core::{TDEFLFlush, compress};
-        let mut body = vec![0u8; payload.len() * 2 + 4096];
-        let (status, consumed, n) = compress(c, payload, &mut body, TDEFLFlush::Sync);
-        // Asserted, not assumed: a short write would silently compress a *prefix* of the payload,
-        // and a test whose big message turned out not to be big proves nothing.
-        assert_eq!(
-            consumed,
-            payload.len(),
-            "the whole payload must compress in one call (status {status:?})"
-        );
-        body.truncate(n);
-        if body.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
-            body.truncate(body.len() - 4);
-        }
-        let mut framed = vec![0xc1u8]; // FIN | RSV1 | text
-        let n = body.len();
-        if n < 126 {
-            framed.push(n as u8);
-        } else if n <= u16::MAX as usize {
-            framed.push(126);
-            framed.extend_from_slice(&(n as u16).to_be_bytes());
-        } else {
-            framed.push(127);
-            framed.extend_from_slice(&(n as u64).to_be_bytes());
-        }
-        framed.extend_from_slice(&body);
+        let mut framed = frame(0x1, &deflated(payload, c), None);
+        framed[0] |= 0x40; // RSV1: the message is compressed
         framed
     }
 
@@ -2192,5 +2188,288 @@ mod tests {
             "a direction the posture was holding open for a scan cannot stop in silence"
         );
         assert!(!blind.newly_blinded(), "once, not on every later read");
+    }
+
+    // Generated conversations, against the messages as they were written.
+
+    /// A second declared value, shorter than [`NEEDLE_VALUE`], so the carry the scan keeps is sized
+    /// by the longer of two needles and each is looked for on its own.
+    const SHORT_VALUE: &[u8] = b"TOKEN-abcdef0123";
+
+    fn two_needles() -> Vec<SecretNeedle> {
+        vec![
+            needle(),
+            SecretNeedle::named("short-token", SHORT_VALUE.to_vec()),
+        ]
+    }
+
+    /// One message of a generated conversation, as its sender wrote it.
+    #[derive(Debug, Clone)]
+    struct Sent {
+        binary: bool,
+        text: Vec<u8>,
+        /// Sent compressed, which only a direction that negotiated compression does.
+        compressed: bool,
+        /// Where the payload on the wire is cut into frames.
+        cuts: Vec<proptest::sample::Index>,
+        /// Each frame's mask key, in turn.
+        masks: Vec<Option<[u8; 4]>>,
+        /// Control frames sent after one of its frames: after which, the opcode, the payload.
+        controls: Vec<(proptest::sample::Index, u8, Vec<u8>)>,
+    }
+
+    /// A direction's negotiated compression as the tee is told it (`Some(no_context_takeover)`),
+    /// and the messages sent down it.
+    #[derive(Debug, Clone)]
+    struct Conversation {
+        deflate: Option<bool>,
+        sent: Vec<Sent>,
+    }
+
+    /// Text made of pieces: arbitrary bytes, the two declared values, and the halves of one, so a
+    /// value may be whole, cut by a frame boundary, or absent.
+    fn texts() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::{Just, any, prop_oneof};
+        use proptest::strategy::Strategy;
+        proptest::collection::vec(
+            prop_oneof![
+                3 => proptest::collection::vec(any::<u8>(), 0..24),
+                1 => Just(NEEDLE_VALUE.to_vec()),
+                1 => Just(SHORT_VALUE.to_vec()),
+                1 => Just(NEEDLE_VALUE[..9].to_vec()),
+                1 => Just(NEEDLE_VALUE[9..].to_vec()),
+            ],
+            0..5,
+        )
+        .prop_map(|pieces| pieces.concat())
+    }
+
+    /// Conversations of up to four messages, each in one to three frames, masked or not, with
+    /// control frames between or after them. A compressed message is now and then preceded by
+    /// [`SCAN_MESSAGE_CAP`] bytes of padding, which puts what follows past the plaintext cap.
+    fn conversations() -> impl proptest::strategy::Strategy<Value = Conversation> {
+        use proptest::prelude::{Just, any, prop_oneof};
+        use proptest::sample::Index;
+        use proptest::strategy::Strategy;
+        let control = (prop_oneof![Just(0x8u8), Just(0x9), Just(0xa)], texts()).prop_map(
+            |(opcode, mut payload)| {
+                payload.truncate(CONTROL_MAX);
+                (opcode, payload)
+            },
+        );
+        let sent = (
+            (
+                any::<bool>(),
+                texts(),
+                any::<bool>(),
+                proptest::bool::weighted(0.05),
+            ),
+            proptest::collection::vec(any::<Index>(), 0..3),
+            proptest::collection::vec(proptest::option::of(any::<[u8; 4]>()), 1..3),
+            proptest::collection::vec((any::<Index>(), control), 0..3),
+        )
+            .prop_map(
+                |((binary, text, compressed, padded), cuts, masks, controls)| {
+                    let controls = controls
+                        .into_iter()
+                        .map(|(after, (opcode, payload))| (after, opcode, payload))
+                        .collect();
+                    (
+                        padded,
+                        Sent {
+                            binary,
+                            text,
+                            compressed,
+                            cuts,
+                            masks,
+                            controls,
+                        },
+                    )
+                },
+            );
+        (
+            proptest::option::of(any::<bool>()),
+            proptest::collection::vec(sent, 0..5),
+        )
+            .prop_map(|(deflate, sent)| Conversation {
+                deflate,
+                sent: sent
+                    .into_iter()
+                    .map(|(padded, mut sent)| {
+                        sent.compressed &= deflate.is_some();
+                        if padded && sent.compressed {
+                            let mut text = vec![b'a'; SCAN_MESSAGE_CAP];
+                            text.append(&mut sent.text);
+                            sent.text = text;
+                        }
+                        sent
+                    })
+                    .collect(),
+            })
+    }
+
+    /// The bytes a conversation puts on the wire.
+    fn wire(talk: &Conversation) -> Vec<u8> {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        let mut window = CompressorOxide::new(raw_deflate_flags());
+        let mut out = Vec::new();
+        for sent in &talk.sent {
+            let payload = match (sent.compressed, talk.deflate) {
+                (true, Some(true)) => {
+                    deflated(&sent.text, &mut CompressorOxide::new(raw_deflate_flags()))
+                }
+                (true, _) => deflated(&sent.text, &mut window),
+                (false, _) => sent.text.clone(),
+            };
+            let mut bounds: Vec<usize> = sent
+                .cuts
+                .iter()
+                .map(|at| at.index(payload.len() + 1))
+                .collect();
+            bounds.extend([0, payload.len()]);
+            bounds.sort_unstable();
+            bounds.dedup();
+            if bounds.len() == 1 {
+                bounds.push(0);
+            }
+            let frames = bounds.len() - 1;
+            for (i, span) in bounds.windows(2).enumerate() {
+                let opcode = match (i, sent.binary) {
+                    (0, true) => 0x2,
+                    (0, false) => 0x1,
+                    _ => 0x0,
+                };
+                let mask = sent.masks[i % sent.masks.len()];
+                let mut bytes =
+                    frame_with_fin(opcode, &payload[span[0]..span[1]], mask, i + 1 == frames);
+                if sent.compressed && i == 0 {
+                    bytes[0] |= 0x40;
+                }
+                out.extend(bytes);
+                for (after, opcode, control) in &sent.controls {
+                    if after.index(frames) == i {
+                        out.extend(frame(*opcode, control, mask));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Push `wire` through `tee` in pieces of `sizes`, taken in turn, and gather what it names.
+    fn fed(tee: &mut FrameTee, wire: &[u8], sizes: &[usize]) -> Vec<String> {
+        let mut named = Vec::new();
+        let (mut at, mut turn) = (0, 0);
+        while at < wire.len() {
+            let n = sizes[turn % sizes.len()].min(wire.len() - at);
+            tee.push(&wire[at..at + n]);
+            named.extend(tee.sightings());
+            at += n;
+            turn += 1;
+        }
+        named.sort();
+        named
+    }
+
+    /// The consumers a direction may have: a capture of one of a few sizes, the scan, or both.
+    fn consumers() -> impl proptest::strategy::Strategy<Value = (Option<usize>, bool)> {
+        use proptest::prelude::any;
+        use proptest::strategy::Strategy;
+        (
+            proptest::option::of(proptest::sample::select(vec![1usize, 7, 40, 4096])),
+            any::<bool>(),
+        )
+            .prop_map(|(cap, scan)| (cap, scan || cap.is_none()))
+    }
+
+    fn tee_for(
+        cap: Option<usize>,
+        scan: bool,
+        deflate: Option<bool>,
+    ) -> (FrameTee, Option<Arc<CapBuf>>) {
+        let sink = cap.map(|cap| Arc::new(CapBuf::new(cap)));
+        let needles = if scan { two_needles() } else { Vec::new() };
+        let tee = FrameTee::new(sink.clone(), &needles, deflate, false).expect("a consumer");
+        (tee, sink)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+        /// Whatever pieces a conversation arrives in, the capture holds its messages' text, cut at
+        /// the capture's size and marked cut when it was, and the scan names every declared value
+        /// that one message or one control frame carried, reading on to the end. The expectation
+        /// is read off the messages as they were written, not off the bytes.
+        #[test]
+        fn a_conversation_is_captured_and_scanned_as_it_was_written_in_any_pieces(
+            talk in conversations(),
+            (cap, scan) in consumers(),
+            sizes in proptest::collection::vec(1usize..40, 1..6),
+        ) {
+            let (mut tee, sink) = tee_for(cap, scan, talk.deflate);
+            let named = fed(&mut tee, &wire(&talk), &sizes);
+            let carried = |value: &[u8]| {
+                let within = |text: &[u8]| text.windows(value.len()).any(|w| w == value);
+                talk.sent.iter().any(|sent| {
+                    within(&sent.text) || sent.controls.iter().any(|(_, _, c)| within(c))
+                })
+            };
+            if scan {
+                let mut expected: Vec<String> = two_needles()
+                    .iter()
+                    .filter(|n| carried(n.as_bytes()))
+                    .map(|n| n.name().to_string())
+                    .collect();
+                expected.sort();
+                proptest::prop_assert_eq!(named, expected);
+                proptest::prop_assert!(!tee.done, "a scan reads a well-formed conversation to its end");
+            }
+            if let (Some(cap), Some(sink)) = (cap, sink) {
+                let text: Vec<u8> = talk.sent.iter().flat_map(|s| s.text.iter().copied()).collect();
+                let got = captured(&sink);
+                proptest::prop_assert_eq!(&got.bytes[..], &text[..text.len().min(cap)]);
+                proptest::prop_assert_eq!(got.truncated, text.len() > cap);
+            }
+        }
+
+        /// Any bytes, a conversation's with bytes replaced, put in or taken out and more bytes
+        /// behind it, are decoded alike whole and in pieces: the same capture, the same names,
+        /// the same stop and the same report of going blind, and no panic.
+        #[test]
+        fn any_bytes_are_decoded_alike_whole_and_in_pieces(
+            talk in conversations(),
+            (cap, scan) in consumers(),
+            edits in proptest::collection::vec(
+                (proptest::prelude::any::<proptest::sample::Index>(), proptest::prelude::any::<u8>(), 0u8..3),
+                0..4,
+            ),
+            tail in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            sizes in proptest::collection::vec(1usize..40, 1..6),
+        ) {
+            let mut bytes = wire(&talk);
+            bytes.extend(tail);
+            for (at, byte, edit) in edits {
+                if bytes.is_empty() {
+                    break;
+                }
+                let at = at.index(bytes.len());
+                match edit {
+                    0 => bytes[at] = byte,
+                    1 => bytes.insert(at, byte),
+                    _ => {
+                        bytes.remove(at);
+                    }
+                }
+            }
+            let (mut whole, whole_sink) = tee_for(cap, scan, talk.deflate);
+            let (mut split, split_sink) = tee_for(cap, scan, talk.deflate);
+            let whole_named = fed(&mut whole, &bytes, &[bytes.len().max(1)]);
+            proptest::prop_assert_eq!(fed(&mut split, &bytes, &sizes), whole_named);
+            proptest::prop_assert_eq!(split.done, whole.done);
+            proptest::prop_assert_eq!(split.newly_blinded(), whole.newly_blinded());
+            if let (Some(split), Some(whole)) = (split_sink, whole_sink) {
+                proptest::prop_assert_eq!(captured(&split), captured(&whole));
+            }
+        }
     }
 }
