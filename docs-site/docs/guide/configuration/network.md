@@ -528,7 +528,10 @@ Notes:
   explicit.)
 - **`http2` selects the transport, not the verdict.** A host must still be permitted by an `allow`
   rule; `http2` only decides HTTP/2-vs-HTTP/1.1. It is `host` or `host:port` (a bare host matches any
-  port). HTTP/2 is negotiated per `host:port` at the TLS handshake, so it is always whole-endpoint: there is no per-path HTTP/2.
+  port). An entry whose host no request can carry is dropped with a warning, and that host keeps
+  HTTP/1.1: a host is an IPv4 address, or a name of ASCII letters, digits, `-`, `_` and `.` whose
+  last label is not a number. HTTP/2 is negotiated per `host:port` at the TLS handshake, so it is
+  always whole-endpoint: there is no per-path HTTP/2.
 - **Designated hosts are HTTP/2-only.** The proxy offers only `h2` to an `http2` host, so an
   HTTP/1.1-only client reaching it fails the handshake (deliberate: designate only gRPC endpoints).
   The same holds on the far side: a host designated here that turns out not to speak HTTP/2 is

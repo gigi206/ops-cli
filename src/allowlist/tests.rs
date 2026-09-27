@@ -2735,6 +2735,31 @@ fn an_http2_entry_whose_host_keeps_a_colon_is_malformed() {
     assert!(Http2Host::parse("*.example.com:443").is_some());
 }
 
+/// A host no request can carry is malformed too, by the same contract: the proxy hands on only a
+/// host [`is_request_host`] accepts, so an entry outside it matches nothing, and `sbx config show`
+/// would print it back as written, escape sequence or right-to-left override included.
+#[test]
+fn an_http2_entry_whose_host_no_request_can_carry_is_malformed() {
+    for entry in [
+        "h\u{202e}moc.elpmaxe",
+        "a\u{1b}[2Jb.example.com",
+        "grpc\nsbx: note: example.com",
+        "b\u{fc}cher.example",
+        "a b.example.com",
+        "*.exa\u{2066}mple.com:443",
+    ] {
+        assert!(
+            Http2Host::parse(entry).is_none(),
+            "`{}` names no request host and must be dropped",
+            entry.escape_debug()
+        );
+    }
+    // A TLS server name may carry an underscore, and an address is a host too.
+    assert!(Http2Host::parse("h_t.example.com").is_some());
+    assert!(Http2Host::parse("10.0.0.7:50051").is_some());
+    assert!(Http2Host::parse("GRPC.Example.COM.").is_some());
+}
+
 #[test]
 fn http2_host_parses_bare_host_and_host_port() {
     // A bare host matches any port; a `host:port` pins that port. The host is canonicalized (the

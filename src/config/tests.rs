@@ -8196,6 +8196,36 @@ fn an_unmatchable_ssh_agent_entry_is_dropped_and_the_rest_kept() {
     assert!(r.warnings.iter().any(|w| w.contains("no wildcard")));
 }
 
+/// A comment is matched as written and printed as written, so one that would drive the terminal
+/// or lay its line out backwards is dropped, naming the fingerprint as the way to reach the key.
+/// A comment in a right-to-left script is text, and stays.
+#[test]
+fn an_ssh_agent_comment_that_would_drive_the_terminal_is_dropped() {
+    let r = resolve_no_plugins(
+        raw_ssh_agent(&[
+            "deploy\u{1b}[2Kkey",
+            "x\u{202e}yek-yolped\u{202c}",
+            "line\nsbx: note: none",
+            "\u{5de}\u{5e4}\u{5ea}\u{5d7} deploy",
+        ]),
+        None,
+    );
+    assert_eq!(
+        r.ssh_agent,
+        vec!["\u{5de}\u{5e4}\u{5ea}\u{5d7} deploy".to_string()]
+    );
+    let dropped: Vec<&String> = r
+        .warnings
+        .iter()
+        .filter(|w| w.contains("[ssh_agent] allow"))
+        .collect();
+    assert_eq!(dropped.len(), 3, "{dropped:?}");
+    assert!(
+        dropped.iter().all(|w| w.contains("`SHA256:` fingerprint")),
+        "{dropped:?}"
+    );
+}
+
 #[test]
 fn a_malformed_device_entry_is_dropped_and_the_rest_kept() {
     // A bad entry is dropped (warned), the valid ones kept — a collection, not all-or-nothing.

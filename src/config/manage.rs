@@ -3036,6 +3036,8 @@ mod tests {
             "[network]\nmode = \"deny\"\nallow = [\"exa\\u202Emple.com\"]\n",
             "[network]\nmode = \"deny\"\nallow = [\"a\\u001B[2Jb.com\"]\n",
             "[network]\nmode = \"deny\"\ndeny = [\"x\\u202E.com\"]\n",
+            "[network]\nhttp2 = [\"h\\u202Eost\\u001B[2J\"]\n",
+            "[ssh_agent]\nallow = [\"key\\u202E\\u001B[2J\"]\n",
             "[network]\nshared_credential = [[\"a\\u202E.com\"]]\n",
             "[proc]\nmode = \"enforce\"\ndeny = [\"cu\\u202Erl\\u001B[2J\"]\n",
             "[proc]\nmode = \"enforce\"\ndeny = [\"curl\\nsbx: warning: none\"]\n",

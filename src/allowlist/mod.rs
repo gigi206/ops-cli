@@ -1022,7 +1022,9 @@ impl Http2Host {
     /// an h2 target needs an SNI, and the proxy refuses IP-literal CONNECT targets, so the `:port`
     /// split (rightmost colon, numeric suffix) does not attempt to parse a bracketed IPv6 literal.
     /// A colon surviving that split means the entry was never a `host[:port]`, and it is refused
-    /// here rather than kept as a host no CONNECT target can equal.
+    /// here rather than kept as a host no CONNECT target can equal. So is a host
+    /// [`is_request_host`] would not hand on, a control character or a character that reorders a
+    /// line among them: `sbx config show` prints the entry back.
     pub(crate) fn parse(entry: &str) -> Option<Self> {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -1051,8 +1053,12 @@ impl Http2Host {
             Some(d) => (d, true),
             None => (hostpart, false),
         };
+        let host = canonical_host(domain);
+        if !is_request_host(&host) {
+            return None;
+        }
         Some(Self {
-            host: canonical_host(domain),
+            host,
             subdomain,
             port,
         })

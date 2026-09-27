@@ -3522,6 +3522,18 @@ fn apply_ssh_agent(
             let base64ish = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/';
             (digest.len() != 43 || !digest.chars().all(base64ish))
                 .then_some("not a whole `SHA256:` fingerprint (43 base64 characters, unpadded)")
+        } else if key
+            .chars()
+            .any(|c| c.is_control() || crate::diag::reorders(c))
+        {
+            // The grant is printed back as it is written (`config show`, the launch notes), so a
+            // comment that would drive the terminal or reorder the line is refused. The key it
+            // names is still reachable: by its fingerprint, which is plain base64.
+            Some(
+                "a comment with a control character or a character that reorders a line would be \
+                 shown as it is wherever the grant is named; name the key by its `SHA256:` \
+                 fingerprint",
+            )
         } else {
             None
         };

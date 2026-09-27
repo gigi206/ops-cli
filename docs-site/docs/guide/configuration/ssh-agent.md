@@ -41,7 +41,9 @@ $ ssh-add -l
 Both are matched by exact equality. There is **no wildcard**: a `"*"` entry is dropped with
 a warning, as is a `SHA256:` fingerprint that lost its tail to a copy-paste (a real one is
 43 characters). A grant you could not read off a listing would not be a grant anyone could
-audit.
+audit. For the same reason a comment carrying a control character, or a character that reorders
+a line, is dropped: the grant is printed back as it is written, and such a character would
+rewrite what the terminal shows. Name that key by its fingerprint instead.
 
 The keys the grant resolves to are settled **at launch**, against what your agent is
 actually holding then:
