@@ -8,7 +8,7 @@ use crate::style::Palette;
 use std::io::IsTerminal;
 
 /// Text sbx did not choose, as a terminal is to show it: a line of a file under review in the
-/// project, or a name the cage gave to something sbx reports.
+/// project, a name the cage gave to something sbx reports, or the traffic a session captured.
 ///
 /// A character that would move the cursor, erase a line, recolour the text or reorder it is written
 /// as an escape (`\x1b`, `\x0d`, `\u{202e}`): the reader sees that it is there instead of what it

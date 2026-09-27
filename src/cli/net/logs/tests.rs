@@ -295,6 +295,28 @@ fn a_binary_body_is_summarized_rather_than_printed_as_noise() {
     );
 }
 
+/// Captured text reaches the terminal with nothing in it that drives the terminal or turns the line
+/// around: an escape, a C1 control, a delete and a character that reorders the line are each
+/// written out, a carriage return is dropped and a tab widened.
+#[test]
+fn a_captured_line_cannot_drive_the_terminal_or_reorder_itself() {
+    let captured =
+        "GET /a\tb HTTP/1.1\r\nx-y: \u{1b}[2J\u{85}\u{7f}\u{9b}é\r\n\r\n\u{1b}]0;t\u{7}body\n";
+    assert_eq!(
+        render_bytes(captured.as_bytes()),
+        vec![
+            "GET /a    b HTTP/1.1",
+            "x-y: \\x1b[2J\\x85\\x7f\\x9bé",
+            "",
+            "\\x1b]0;t\\x07body"
+        ]
+    );
+    assert_eq!(
+        render_bytes("x-name: \u{202e}gnp.exe\u{202c} \u{2067}a\u{2069}\u{200e}".as_bytes()),
+        vec!["x-name: \\u{202e}gnp.exe\\u{202c} \\u{2067}a\\u{2069}\\u{200e}"]
+    );
+}
+
 #[test]
 fn capture_json_encodes_bodies_base64_so_binary_survives_the_round_trip() {
     let view = LogView {

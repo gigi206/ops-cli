@@ -36,11 +36,13 @@
 //! the ring, which is what stops one event from writing a second one.
 
 /// The longest free-text detail an event carries. Long enough for a key comment or a command
-/// line, short enough that one event cannot fill a reader's screen.
+/// line, short enough that one event cannot fill a reader's screen. Shorter than
+/// [`super::SANITIZED_CHARS`], the cap of the filter [`sanitize_detail`] cuts it from.
 pub(crate) const DETAIL_MAX: usize = 200;
+const _: () = assert!(DETAIL_MAX < super::SANITIZED_CHARS);
 
-/// Strip a detail of anything that could forge a second wire line or a terminal escape, and cap
-/// its length.
+/// Strip a detail of anything that could forge a second wire line, drive a terminal or reorder the
+/// line it is shown on, and cap its length.
 ///
 /// Every lens has one field of free text, and none of them can vouch for it: a key comment comes
 /// from the user's own agent, a path from the cage, a broker plugin's label from third-party code.
@@ -48,11 +50,12 @@ pub(crate) const DETAIL_MAX: usize = 200;
 /// an event line whose `detail` could contain a newline would let one entry write another. The
 /// same treatment serves a detail on its way to a *terminal*, which is why this lives here rather
 /// than inside any one lens.
+///
+/// The characters it replaces are [`super::sanitize`]'s, the filter for every value the cage
+/// chooses, so the record of a lens and the exec feed cannot drift apart on what a line may
+/// carry; only the cap is shorter.
 pub(crate) fn sanitize_detail(s: &str) -> String {
-    let mut out: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let mut out = super::sanitize(s);
     if out.chars().count() > DETAIL_MAX {
         out = out.chars().take(DETAIL_MAX - 1).collect::<String>() + "…";
     }
@@ -1018,6 +1021,28 @@ mod tests {
             at_epoch_ms,
             tail: String::new(),
         })
+    }
+
+    /// A detail keeps no character that reorders its line, and is cut to [`DETAIL_MAX`] whether it
+    /// is longer than that alone or longer than the filter it is cut from.
+    #[test]
+    fn a_detail_cannot_reorder_its_line_and_is_cut_to_the_detail_cap() {
+        assert_eq!(
+            sanitize_detail("a\u{1b}[1A\r\nb\u{85}c\u{202e}d\u{2066}e\u{200f}"),
+            "a [1A  b c d e "
+        );
+        assert_eq!(
+            sanitize_detail(&"x".repeat(DETAIL_MAX)),
+            "x".repeat(DETAIL_MAX)
+        );
+        let over_the_filter = crate::sandbox::SANITIZED_CHARS + 1;
+        for n in [DETAIL_MAX + 1, over_the_filter, 600] {
+            assert_eq!(
+                sanitize_detail(&"x".repeat(n)),
+                "x".repeat(DETAIL_MAX - 1) + "…",
+                "{n}"
+            );
+        }
     }
 
     #[test]

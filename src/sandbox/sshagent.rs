@@ -622,19 +622,15 @@ fn refused_message_name(kind: u8, payload: &[u8]) -> String {
 
 /// The words a confirmation prompt puts in front of the user. Short, and specific about the two
 /// things that decide the answer: which key, and — when the client bound one — which server. The
-/// key's comment comes from the user's own agent and is free-form, so control characters are
-/// stripped: a prompt is the one place a forged newline could rewrite what is being asked.
+/// key's comment comes from the user's own agent and is free-form, so it goes through
+/// [`super::lens::sanitize_detail`], as it does on its way to the record: a prompt is the one place
+/// a forged newline could rewrite what is being asked, and a character that reorders the line
+/// could turn around the name of the key it asks about.
 fn confirm_prompt(label: &str, toward: &str) -> String {
-    let clean = |s: &str| -> String {
-        s.chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .take(200)
-            .collect()
-    };
     format!(
         "sbx: the sandbox is asking to sign with {}{}.\n\nAllow it?",
-        clean(label),
-        clean(toward)
+        super::lens::sanitize_detail(label),
+        super::lens::sanitize_detail(toward)
     )
 }
 
@@ -813,13 +809,19 @@ pub(crate) struct Admission {
 
 /// Resolve the allowlist against the host agent's current identities.
 pub(crate) fn admission(host_sock: &Path, filter: &Filter) -> io::Result<Admission> {
-    let mut host = UnixStream::connect(host_sock)?;
-    let ids = host_identities(&mut host)?;
+    admit(&mut UnixStream::connect(host_sock)?, filter)
+}
+
+/// [`admission`] over an agent already reached. A key's label is printed on the launch terminal,
+/// so it goes through [`super::lens::sanitize_detail`] as it does on its way to the record, and
+/// reads the same in both.
+fn admit<S: Read + Write>(host: &mut S, filter: &Filter) -> io::Result<Admission> {
+    let ids = host_identities(host)?;
     let mut admitted = Vec::new();
     let mut withheld = 0usize;
     for id in &ids {
         if filter.admits(id) {
-            admitted.push(id.label());
+            admitted.push(super::lens::sanitize_detail(&id.label()));
         } else {
             withheld += 1;
         }
@@ -1586,6 +1588,42 @@ mod tests {
         ]);
         respond(&sign_request(b"blob-one"), &mut host, &mut conn).unwrap();
         assert_eq!(ring.snapshot(None).events[0].detail, "work-key");
+    }
+
+    /// A key's comment reaches the prompt as one line nothing can turn around: the template's own
+    /// line breaks are its only ones, and a long comment is cut where the record cuts it.
+    #[test]
+    fn a_key_comment_cannot_rewrite_or_reorder_the_prompt_that_names_it() {
+        let prompt = confirm_prompt(
+            "work\u{202e}yek-yolped\u{1b}[2J\nAllow it? yes",
+            " toward the server holding SHA256:x",
+        );
+        assert_eq!(
+            prompt,
+            "sbx: the sandbox is asking to sign with work yek-yolped [2J Allow it? yes toward the \
+             server holding SHA256:x.\n\nAllow it?"
+        );
+        let long = confirm_prompt(&"k".repeat(300), "");
+        assert!(
+            long.contains(&format!(" {}….\n", "k".repeat(199))),
+            "{long:?}"
+        );
+    }
+
+    /// The launch note names an admitted key in the form the record gives it: a comment that would
+    /// drive the terminal or reorder the note is one plain line, and the key is still the one the
+    /// allowlist matched on.
+    #[test]
+    fn an_admitted_key_is_named_at_launch_in_the_form_the_record_gives_it() {
+        let hostile = "work\u{202e}yek\u{1b}[2J\nwithheld: none";
+        let filter = Filter::new(&[hostile.to_string()]);
+        let mut host = FakeAgent::new(vec![answer(&[
+            id(b"blob-one", hostile),
+            id(b"blob-two", "other-key"),
+        ])]);
+        let admission = admit(&mut host, &filter).unwrap();
+        assert_eq!(admission.admitted, vec!["work yek [2J withheld: none"]);
+        assert_eq!(admission.withheld, 1);
     }
 
     /// A script standing in for an askpass helper: it records that it ran, and exits with the code

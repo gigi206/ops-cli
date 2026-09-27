@@ -491,7 +491,11 @@ Under `--json` the same fact rides on every event as `secrets_seen`, a possibly-
   refusal itself is the log line.
 
 A body is printed as text when it is text, and summarized as
-`<N byte(s) of binary data>` when it is not. A `Content-Encoding: gzip` body is
+`<N byte(s) of binary data>` when it is not. In a head or a body printed as text, a line
+break starts a new line, a carriage return is dropped and a tab is widened to spaces; any
+other control character, and each character that reorders a line, is written as an escape
+(`\x1b`, `\u{202e}`): what the cage sent or a server answered cannot drive the terminal
+that reads it. A `Content-Encoding: gzip` body is
 captured **compressed** and reads that way: sbx does not decompress it. Under
 `--json` every part is base64-encoded, so a binary body survives the round trip
 intact.

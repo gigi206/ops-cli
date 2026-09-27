@@ -110,7 +110,7 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 /// # What now depends on this, and why it must not be narrowed
 ///
 /// It began as the exec lens's own and is now the crate's one answer to a value the cage chooses.
-/// Seven sinks reach it, and on each one it is the only filter between a name the cage picked and a
+/// Eight sinks reach it, and on each one it is the only filter between a name the cage picked and a
 /// line somebody reads:
 ///
 /// - [`command_of`], for the exec feed's inline stderr echo;
@@ -121,6 +121,9 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 /// - [`super::notify_sink`], where the stderr fallback composes one line per announcement, the lines
 ///   a detached session leaves in the log `sbx logs` reads;
 /// - [`super::egress_stats`], for a destination host in a tab-delimited row;
+/// - [`super::lens::sanitize_detail`], which cuts it shorter for the free-text field of every lens
+///   event, a plugin manifest's text on `sbx plugins`, and an ssh key's comment at launch and in
+///   the confirmation prompt;
 /// - `crate::observe`, outside this module through the [`super::sanitize`] re-export, for the
 ///   `sbx proc ls` tree;
 /// - and the relay of the caged egress proxy's standard error (`proxy::child`), the one process of a

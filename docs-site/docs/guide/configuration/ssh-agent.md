@@ -147,6 +147,10 @@ sbx: the sandbox is asking to sign with deploy@example toward the server
 Allow it?
 ```
 
+A key's comment is free-form, so the prompt, the launch note and the record show it the
+same way: control characters and the characters that reorder a line become spaces, and no
+more than 200 characters of it are shown.
+
 This is the sandbox-scoped counterpart of `ssh-add -c`: it asks for what the **cage**
 requests and nothing else, so your own `git push` outside the sandbox is untouched. The two
 compose: a key loaded with `ssh-add -c` prompts for both.

@@ -815,10 +815,11 @@ fn render_capture(cap: &sandbox::control::Capture, view: &LogView, pal: &style::
     o
 }
 
-/// The lines to print for one captured part: its text, split on newlines with control characters
-/// escaped, or a single summary line when the bytes are not text at all (a compressed or binary
-/// body, which would otherwise print as noise). Trailing blank lines are dropped — an HTTP head's
-/// terminator would render as one.
+/// The lines to print for one captured part: its text, split on newlines and shown through
+/// [`crate::diag::visible`] (control characters and the characters that reorder a line written as
+/// escapes, a carriage return dropped, a tab widened to four spaces), or a single summary line when
+/// the bytes are not text at all (a compressed or binary body, which would otherwise print as
+/// noise). Trailing blank lines are dropped: an HTTP head's terminator would render as one.
 fn render_bytes(bytes: &[u8]) -> Vec<String> {
     if bytes.is_empty() {
         return Vec::new();
@@ -829,16 +830,7 @@ fn render_bytes(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
     let mut lines: Vec<String> = text
         .split('\n')
-        .map(|l| {
-            l.chars()
-                .map(|c| match c {
-                    '\r' => String::new(),
-                    '\t' => "    ".to_string(),
-                    c if c.is_control() => format!("\\x{:02x}", c as u32),
-                    c => c.to_string(),
-                })
-                .collect()
-        })
+        .map(|l| crate::diag::visible(&l.replace('\r', "").replace('\t', "    ")))
         .collect();
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
