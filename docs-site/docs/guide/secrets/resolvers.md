@@ -97,6 +97,12 @@ A relative sops file named only by the global config or an app profile is in the
 project too, and is refused until the project's `.sbx.toml` names it and is
 trusted; give such a file an absolute path outside the project instead.
 
+A decryption that fails is a hard error carrying `sops`'s own account of why: the
+key group, each key in it and the reason that key failed. That text is not
+`sbx`'s, so it is shown on one line, with each line break, escape sequence or
+character that reorders text replaced by a space. It is not cut to a short line
+the way a plugin's is; like a plugin's, it is read to 256 KiB at most.
+
 ## Two ways to name a source
 
 Every secret entry names its source in exactly one of two ways: `from` or

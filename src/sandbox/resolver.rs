@@ -25,7 +25,8 @@
 //! The plaintext lives only in sbx's own memory (host-side, in the trusted computing base) and is
 //! never logged: neither the error nor the warning ever carries the plugin's stdout. What is
 //! relayed is reduced to one bounded line first — a plugin is third-party code, and a diagnostic
-//! is the wrong place to let it drive the user's terminal with escape sequences.
+//! is the wrong place to let it drive the user's terminal with escape sequences or reorder the
+//! line it is shown on.
 //!
 //! The cage is built from the audited [`SandboxSpec`]/[`to_argv`](super::argv::to_argv) keystone, so every cage gets
 //! the unconditional hardening (all namespaces, dropped capabilities, a cleared environment, a
@@ -575,9 +576,9 @@ fn output_within_armed_by(
     // second half is the pipe that never closed — the answer was not read in time, whoever is
     // still holding the descriptor.
     // What the process said is the value, so an answer past the ceiling is refused rather than
-    // truncated: half a secret is not a smaller secret. An over-long *stderr* is not a failure —
-    // it is a diagnostic, already cut to one bounded line before anything sees it — so it stops at
-    // the ceiling and the run carries on.
+    // truncated: half a secret is not a smaller secret. An over-long *stderr* is not a failure: it
+    // is a diagnostic, not the answer, so it stops at the ceiling and the run carries on. Showing
+    // it is each caller's to do, and [`one_line`] is the form a terminal can be given.
     if stdout.len() > MAX_RESOLUTION_BYTES {
         return Err(io::Error::other(format!(
             "{what} answered with more than {MAX_RESOLUTION_BYTES} bytes"
@@ -697,15 +698,34 @@ fn run_within(
 /// bound how much of it can reach a terminal or a log line.
 const DETAIL_MAX: usize = 200;
 
-/// Reduce a plugin's stderr to one safe display line: control characters (a newline that would
-/// forge a second diagnostic, an escape that would drive the terminal) become spaces, runs of
-/// whitespace collapse, and the result is truncated. Never rejects — a diagnostic is a label, so a
-/// sloppy one is cleaned rather than dropped. Non-UTF-8 bytes are replaced, not refused: a plugin
-/// that garbles its own message must still be able to name the problem.
+/// Reduce a plugin's stderr to one safe display line, [`one_line`] cut to [`DETAIL_MAX`]
+/// characters.
 fn one_line_detail(raw: &[u8]) -> String {
+    let mut out = one_line(raw);
+    if out.chars().count() > DETAIL_MAX {
+        out = out.chars().take(DETAIL_MAX - 1).collect::<String>() + "…";
+    }
+    out
+}
+
+/// A program's stderr as one line a terminal shows as written, whole.
+///
+/// Control characters (a newline that would forge a second diagnostic, an escape that would drive
+/// the terminal) and the characters that reorder a line ([`crate::diag::reorders`]) become spaces,
+/// and runs of whitespace collapse. Never rejects: a diagnostic is a label, so a sloppy one is
+/// cleaned rather than dropped. Non-UTF-8 bytes are replaced, not refused, since a program that
+/// garbles its own message must still be able to name the problem. Nothing is cut here; how much
+/// of the line to keep is the caller's to decide.
+pub(crate) fn one_line(raw: &[u8]) -> String {
     let cleaned: String = String::from_utf8_lossy(raw)
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || crate::diag::reorders(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let mut out = String::with_capacity(cleaned.len());
     for word in cleaned.split_whitespace() {
@@ -713,9 +733,6 @@ fn one_line_detail(raw: &[u8]) -> String {
             out.push(' ');
         }
         out.push_str(word);
-    }
-    if out.chars().count() > DETAIL_MAX {
-        out = out.chars().take(DETAIL_MAX - 1).collect::<String>() + "…";
     }
     out
 }
@@ -2932,6 +2949,21 @@ printf 'run-%s' "$n""#,
         let long = one_line_detail(&b"a".repeat(DETAIL_MAX * 2));
         assert_eq!(long.chars().count(), DETAIL_MAX);
         assert!(long.ends_with('…'), "{long}");
+    }
+
+    /// A character that reorders the line it sits in is not a control character, so the fold names
+    /// it apart: a relayed diagnostic may not turn the words after it around. The fold alone keeps
+    /// the whole text, which is what a caller that needs the end of it relies on.
+    #[test]
+    fn a_relayed_diagnostic_cannot_reorder_its_line_and_is_cut_only_by_the_detail() {
+        let raw = "key \u{202e}deliberate\u{202c} and \u{2066}isolated\u{2069} \u{200f}mark";
+        for out in [one_line(raw.as_bytes()), one_line_detail(raw.as_bytes())] {
+            assert!(!out.chars().any(crate::diag::reorders), "{out:?}");
+            assert_eq!(out, "key deliberate and isolated mark");
+        }
+
+        let long = one_line(&b"a ".repeat(DETAIL_MAX * 2));
+        assert_eq!(long.chars().count(), DETAIL_MAX * 4 - 1, "{long}");
     }
 
     #[test]

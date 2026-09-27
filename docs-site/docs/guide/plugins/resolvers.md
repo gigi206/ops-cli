@@ -68,8 +68,9 @@ when a run resolves *nothing*: so a plugin can explain a misspelled locator or
 an empty field without turning a fall-through into a hard failure. A run that
 returns a value stays silent, so a plugin that logs to stderr cannot echo a
 plaintext back at you. What is relayed is first reduced to a single bounded line
-with control characters removed, since a plugin's own text must not be able to
-drive your terminal.
+with control characters removed, and the characters that reorder a line
+(bidirectional marks, overrides and isolates) with them, since a plugin's own text
+must not be able to drive your terminal or turn the words around it.
 
 ## The reference plugins
 

@@ -1876,6 +1876,8 @@ fn sops_extract_expr(key: &str) -> String {
 /// which, being multi-line, [`classify_value`] turns into a hard error (it cannot be a single header
 /// value), the correct fail-closed outcome. Every failure is a hard error that names the source and
 /// folds in sops's own stderr diagnostic (the plaintext is on stdout, never stderr), never the value.
+/// That diagnostic is text sbx did not write, so it is shown through [`super::resolver::one_line`],
+/// as one line with no escape or reordering character.
 ///
 /// `deadline` bounds the decryption the same way the resolver runner bounds a plugin, and through
 /// the same helper: sops reaches a key it may have to fetch, or an agent that may stop to ask a
@@ -1933,8 +1935,9 @@ fn run_sops_as(
         }
     };
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        let detail = detail.trim();
+        // Folded like a plugin's, and not cut: sops states the failure, then names each key group
+        // and why each key in it failed, and the reason a user can act on is in that second part.
+        let detail = super::resolver::one_line(&output.stderr);
         return Err(io::Error::other(format!(
             "the secret for `{header}` failed to decrypt {} with sops{}",
             file.display(),
@@ -3562,6 +3565,37 @@ mod tests {
         assert!(
             err.contains("failed to decrypt") && err.contains("no key could decrypt"),
             "a sops failure must be a hard error folding in its stderr: {err}"
+        );
+    }
+
+    /// sops's stderr reaches the terminal inside the error, and a key service or a file sbx did not
+    /// write may have put an escape, a carriage return or a reordering character in it. What sops
+    /// says after its first line is kept: that is where it names the key that failed and why.
+    #[test]
+    fn a_sops_failure_is_shown_as_one_line_that_drives_nothing_and_keeps_its_reason() {
+        let dir = TmpDir::new();
+        let pad = "x".repeat(300);
+        let sops = fake_sops(
+            &dir,
+            &format!(
+                "printf 'Failed to get the data key\\n\\033[2Jerased\\rover \\342\\200\\256gnirts\\n\
+                 {pad}\\n  age: no identity matched\\n' >&2\nexit 1"
+            ),
+        );
+        let file = dir.join("prod.enc.yaml");
+        std::fs::write(&file, "anything").unwrap();
+        let err = run_sops_retrying_spawn(&sops, &file, Some("k"), "Authorization")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.chars()
+                .any(|c| c.is_control() || crate::diag::reorders(c)),
+            "{err:?}"
+        );
+        assert!(
+            err.contains("Failed to get the data key [2Jerased over gnirts")
+                && err.ends_with(&format!("{pad} age: no identity matched")),
+            "{err:?}"
         );
     }
 

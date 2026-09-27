@@ -21,13 +21,22 @@ pub(crate) fn visible(text: &str) -> String {
         match c {
             '\t' => out.push(c),
             c if c.is_control() => out.push_str(&format!("\\x{:02x}", u32::from(c))),
-            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
-                out.push_str(&format!("\\u{{{:04x}}}", u32::from(c)));
-            }
+            c if reorders(c) => out.push_str(&format!("\\u{{{:04x}}}", u32::from(c))),
             c => out.push(c),
         }
     }
     out
+}
+
+/// Whether `c` changes the order a terminal lays out the characters around it: the directional
+/// marks, embeddings, overrides and isolates. None of them is a control character to
+/// [`char::is_control`], which reads the `Cc` category alone, so a filter that keeps a line to what
+/// it says tests this beside it.
+pub(crate) fn reorders(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Print `sbx: warning: <msg>` to stderr — the prefix in the caution hue, the message's
@@ -230,6 +239,28 @@ mod tests {
         let out = highlight("a `real` span then a lone ` tick", &p);
         assert!(out.contains(&format!("{}real{}", p.name, p.reset)));
         assert!(out.contains("` tick"));
+    }
+
+    /// The directional formatting characters are the ones a control-character test lets through,
+    /// which is why [`reorders`] exists beside it; [`visible`] writes each of them out. A letter of
+    /// a right-to-left script is not one: it is text, and it stays.
+    #[test]
+    fn a_character_that_reorders_a_line_is_one_no_control_test_catches() {
+        let formatting = ['\u{200e}', '\u{200f}']
+            .into_iter()
+            .chain('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}');
+        for c in formatting {
+            assert!(reorders(c) && !c.is_control(), "{c:?}");
+            assert_eq!(
+                visible(&c.to_string()),
+                format!("\\u{{{:04x}}}", u32::from(c))
+            );
+        }
+        for c in ['\u{05d0}', '\u{0627}', '\u{200d}', 'a'] {
+            assert!(!reorders(c), "{c:?}");
+            assert_eq!(visible(&c.to_string()), c.to_string());
+        }
     }
 
     #[test]
