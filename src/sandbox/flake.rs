@@ -137,6 +137,23 @@ fn write_pins(
 /// for as long as it cares to.
 pub(crate) const FLAKE_METADATA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The error for a `nix flake metadata` that exited non-zero, for both calls that run one: this
+/// module's [`resolve`] and the nixpkgs channel's revision in `crate::store::channel`. nix spreads
+/// its message over several lines and quotes the reference it was fetching, text a config chose,
+/// so the message goes through [`super::resolver::one_line`]: whole, on the one line a terminal
+/// shows as written.
+pub(crate) fn metadata_failed(reference: &str, stderr: &[u8]) -> io::Error {
+    let detail = super::resolver::one_line(stderr);
+    io::Error::other(format!(
+        "`nix flake metadata {reference}` failed{}",
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    ))
+}
+
 /// Resolve a declared `flake:` reference to its current immutable pin via `nix flake metadata`.
 /// The flake (the part before `#`) is locked to a revision and an immutable URL; the output
 /// attribute is reattached, so the result is the exact reference a launch builds. Uses sbx's
@@ -153,10 +170,7 @@ fn resolve(nix: &Path, layout: &Layout, reference: &str) -> io::Result<FlakePin>
         &format!("`nix flake metadata {base}`"),
     )?;
     if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "`nix flake metadata {base}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        return Err(metadata_failed(base, &out.stderr));
     }
     let value: serde_json::Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| io::Error::other(format!("parsing flake metadata for {base}: {e}")))?;
@@ -344,6 +358,29 @@ mod tests {
     use crate::testutil::{TmpDir, app_with, resolved};
 
     const REV: &str = "11707dc2f618dd54ca8739b309ec4fc024de578b";
+
+    /// A `nix flake metadata` that fails is reported with all of nix's message, on one line
+    /// nothing in it can drive or reorder, and a message that folds to nothing adds nothing.
+    #[test]
+    fn a_failed_flake_metadata_is_reported_as_one_line_that_drives_nothing() {
+        use crate::testutil::{HOSTILE_STDERR, HOSTILE_STDERR_SHOWN, failing_with, write_script};
+        let data = TmpDir::new();
+        let nix = data.path().join("nix");
+        write_script(&nix, &failing_with(HOSTILE_STDERR));
+        let layout = Layout::under(data.path());
+        let err = crate::testutil::result_past_etxtbsy("nix", || {
+            resolve(&nix, &layout, "path:/nowhere#hello")
+        })
+        .expect_err("a nix that exits 1 fails the resolution");
+        assert_eq!(
+            err.to_string(),
+            format!("`nix flake metadata path:/nowhere` failed: {HOSTILE_STDERR_SHOWN}")
+        );
+        assert_eq!(
+            metadata_failed("path:/nowhere", b" \n\x1b\n").to_string(),
+            "`nix flake metadata path:/nowhere` failed"
+        );
+    }
 
     #[test]
     fn split_attr_separates_the_output_fragment() {

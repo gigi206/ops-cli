@@ -1124,15 +1124,19 @@ fn clone(git: &Path, url: &str, dest: &Path) -> Result<(), String> {
     if out.status.success() {
         return Ok(());
     }
-    // git's own diagnosis is the useful part; trim it to the last non-empty lines so a
-    // verbose transport error stays legible.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let detail = stderr
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .unwrap_or("git clone failed");
-    Err(format!("could not fetch the store: {detail}"))
+    // git's own diagnosis is the useful part, and all of it: a clone of a path that holds no
+    // repository ends on a hint ("and the repository exists."), and the cause is the first
+    // `fatal:` line. That line quotes the URL it was given, text a user or a store recorded, so
+    // the diagnostic goes through `one_line`, as one line a terminal shows as written.
+    let detail = crate::sandbox::resolver::one_line(&out.stderr);
+    Err(format!(
+        "could not fetch the store: {}",
+        if detail.is_empty() {
+            "git clone failed"
+        } else {
+            &detail
+        }
+    ))
 }
 
 /// A `git` command with its configuration and credential surface neutralized. Host-side git
@@ -2812,6 +2816,34 @@ mod tests {
             .unwrap()
             .flatten()
             .any(|e| e.file_name().to_string_lossy().starts_with(".store-stage-"))
+    }
+
+    /// A failed clone is reported with all of git's diagnosis, on one line nothing in it can drive
+    /// or reorder: git relays what the far end said, and its last line can be a hint rather than
+    /// the cause.
+    #[test]
+    fn a_failed_clone_names_its_whole_cause_on_one_line_that_drives_nothing() {
+        use crate::testutil::{HOSTILE_STDERR, HOSTILE_STDERR_SHOWN, failing_with, write_script};
+        let base = crate::testutil::TmpDir::new();
+        let git = base.path().join("git");
+        write_script(&git, &failing_with(HOSTILE_STDERR));
+        let dest = base.path().join("store");
+        // `clone` reports a spawn failure as a message, so the `ETXTBSY` of a stand-in written
+        // this instant is waited out on that message (see `testutil::result_past_etxtbsy`).
+        let err = (0..100)
+            .find_map(|_| match super::clone(&git, "file:///nowhere", &dest) {
+                Err(e) if e.starts_with("could not run git:") => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+                other => Some(other),
+            })
+            .expect("the stand-in stayed held open for writing by another thread")
+            .expect_err("a git that exits 1 fails the clone");
+        assert_eq!(
+            err,
+            format!("could not fetch the store: {HOSTILE_STDERR_SHOWN}")
+        );
     }
 
     /// A `git` that never answers ends the fetch, rather than the fetch waiting on it.

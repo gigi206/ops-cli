@@ -112,19 +112,56 @@ impl Drop for TmpDir {
 /// which is why waiting is the whole fix. Nothing a session does has this shape, so the retry
 /// belongs to the tests rather than to what they exercise.
 ///
-/// The `sops` tests in [`crate::sandbox::egress`] wait the same race out on their own, because they
-/// retry a call that returns the spawn failure as a message rather than an `io::Error` of its own.
-/// That one is not routed through here.
-fn past_etxtbsy<T>(what: &str, mut attempt: impl FnMut() -> std::io::Result<T>) -> T {
+/// The `sops` tests in [`crate::sandbox::egress`] and the store clone's in `plugins::stores` wait
+/// the same race out on their own, because the call they retry returns the spawn failure as a
+/// message rather than an `io::Error` of its own. Those are not routed through here.
+fn past_etxtbsy<T>(what: &str, attempt: impl FnMut() -> std::io::Result<T>) -> T {
+    result_past_etxtbsy(what, attempt).unwrap_or_else(|e| panic!("{what}: {e}"))
+}
+
+/// Run `attempt` until it stops failing with `ETXTBSY`, and hand back what it then returned, a
+/// failure included: for a test whose subject is how a program's failure is reported.
+pub(crate) fn result_past_etxtbsy<T>(
+    what: &str,
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     for _ in 0..100 {
         match attempt() {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            other => return other.unwrap_or_else(|e| panic!("{what}: {e}")),
+            other => return other,
         }
     }
     panic!("{what}: the file stayed held open for writing by another thread");
+}
+
+/// Write `body` as an executable `/bin/sh` script at `path`, a stand-in for a program sbx runs.
+/// Run it past the `ETXTBSY` [`past_etxtbsy`] describes.
+pub(crate) fn write_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("the stand-in is writable");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("the stand-in is executable");
+}
+
+/// A program's standard error that tries each thing a relayed diagnostic can do to the line it is
+/// shown on: break it, return over it, drive the terminal with an escape and a title-setting
+/// sequence, and reorder it with a right-to-left override.
+pub(crate) const HOSTILE_STDERR: &[u8] =
+    b"error:\n\t\xe2\x80\xa6 while fetching \x1b[2J\x1b]0;x\x07 it\r\n\n\
+      error: \xe2\x80\xaegnp.x the cause\n";
+
+/// [`HOSTILE_STDERR`] as [`crate::sandbox::resolver::one_line`] shows it: one line, and whole.
+pub(crate) const HOSTILE_STDERR_SHOWN: &str =
+    "error: \u{2026} while fetching [2J ]0;x it error: gnp.x the cause";
+
+/// The body of a stand-in that writes `stderr` and exits 1. Every byte goes through `printf` as an
+/// octal escape, and nothing but shell builtins runs, so no quoting and no narrowed `PATH` can
+/// change what it writes.
+pub(crate) fn failing_with(stderr: &[u8]) -> String {
+    let octal: String = stderr.iter().map(|b| format!("\\{b:03o}")).collect();
+    format!("printf '{octal}' >&2\nexit 1")
 }
 
 /// Spawn `cmd`, waiting out the `ETXTBSY` [`past_etxtbsy`] describes.

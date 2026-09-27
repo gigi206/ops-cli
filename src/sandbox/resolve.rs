@@ -213,10 +213,11 @@ fn resolve_cage_spec(
 }
 
 /// Run a `resolve` command in its hermetic cage and return the validated download URL it prints. Fails
-/// closed: a non-zero exit folds the command's **stderr** (never its stdout); empty output, non-UTF-8
-/// output, or output that `validate` rejects is a hard error. `validate` is the backend's URL check
-/// (so an arbitrary command still cannot point sbx at a non-`https` or shell/nix-injecting source) and
-/// `kind` names the expected shape (e.g. `` `.tar.gz` `` / `` `.deb` ``) in the error message.
+/// closed: a non-zero exit reports the command's **stderr** as one line ([`command_failed`]) and
+/// never its stdout; empty output, non-UTF-8 output, or output that `validate` rejects is a hard
+/// error. `validate` is the backend's URL check (so an arbitrary command still cannot point sbx at
+/// a non-`https` or shell/nix-injecting source) and `kind` names the expected shape (e.g.
+/// `` `.tar.gz` `` / `` `.deb` ``) in the error message.
 ///
 /// `allow_insecure_http` is the launch's resolved posture, handed to `validate` so this URL — which
 /// the command chose, and which therefore never passed through config validation — is judged by the
@@ -266,18 +267,24 @@ pub(crate) fn resolve_url(
         }
     };
     if !out.status.success() {
-        let detail = String::from_utf8_lossy(&out.stderr);
-        let detail = detail.trim();
-        return Err(io::Error::other(format!(
-            "the `{name}` resolve command failed{}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        )));
+        return Err(command_failed(name, &out.stderr));
     }
     validate_download_url(name, out.stdout, validate, allow_insecure_http, kind)
+}
+
+/// The error for a `resolve` command that exited non-zero. Its stderr is a profile's command
+/// talking about a vendor's answer, so it goes through [`super::resolver::one_line`]: whole, on
+/// the one line a terminal shows as written. Pure, so it is testable without bubblewrap.
+fn command_failed(name: &str, stderr: &[u8]) -> io::Error {
+    let detail = super::resolver::one_line(stderr);
+    io::Error::other(format!(
+        "the `{name}` resolve command failed{}",
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    ))
 }
 
 /// Validate a resolve command's captured stdout as a download URL: valid UTF-8, non-empty after
@@ -314,6 +321,21 @@ fn validate_download_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed `resolve` command is reported with all of its stderr, on one line nothing in it
+    /// can drive or reorder, and a stderr that folds to nothing adds nothing.
+    #[test]
+    fn a_failed_resolve_command_is_reported_as_one_line_that_drives_nothing() {
+        use crate::testutil::{HOSTILE_STDERR, HOSTILE_STDERR_SHOWN};
+        assert_eq!(
+            command_failed("tool", HOSTILE_STDERR).to_string(),
+            format!("the `tool` resolve command failed: {HOSTILE_STDERR_SHOWN}")
+        );
+        assert_eq!(
+            command_failed("tool", b" \n\x1b\n").to_string(),
+            "the `tool` resolve command failed"
+        );
+    }
 
     fn a_cage(store: &Path, shell: &Path, ca: &Path, bins: &[&str]) -> ResolveCage<'static> {
         // A leaked `bwrap` path so the returned cage can be `'static` in a unit test — the spec is

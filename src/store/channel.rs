@@ -619,10 +619,7 @@ fn resolve_channel_rev(nix: &Path, channel: &str) -> io::Result<String> {
         &format!("`nix flake metadata {channel}`"),
     )?;
     if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "nix flake metadata {channel} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        return Err(crate::sandbox::flake::metadata_failed(channel, &out.stderr));
     }
     revision_from_metadata(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
         io::Error::new(
@@ -770,6 +767,24 @@ mod tests {
     use super::*;
     use crate::store::resolve_nix;
     use crate::testutil::TmpDir;
+
+    /// The nixpkgs channel's revision, when `nix flake metadata` fails, is reported with all of
+    /// nix's message on one line nothing in it can drive or reorder, spelled as a declared flake's.
+    #[test]
+    fn a_failed_channel_resolution_is_reported_as_one_line_that_drives_nothing() {
+        use crate::testutil::{HOSTILE_STDERR, HOSTILE_STDERR_SHOWN, failing_with, write_script};
+        let tmp = TmpDir::new();
+        let nix = tmp.path().join("nix");
+        write_script(&nix, &failing_with(HOSTILE_STDERR));
+        let channel = "github:NixOS/nixpkgs/nixos-unstable";
+        let err =
+            crate::testutil::result_past_etxtbsy("nix", || resolve_channel_rev(&nix, channel))
+                .expect_err("a nix that exits 1 fails the resolution");
+        assert_eq!(
+            err.to_string(),
+            format!("`nix flake metadata {channel}` failed: {HOSTILE_STDERR_SHOWN}")
+        );
+    }
 
     /// Both spellings of a pinned revision are written by hand, and only the bare one reached the
     /// witness. `github:NixOS/nixpkgs/<rev>` attests nothing the bare form does not: GitHub keeps
