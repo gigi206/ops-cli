@@ -277,6 +277,7 @@ enum Encoding {
 }
 
 /// One generated gzip member: what it inflates to, how it is deflated, and its header fields.
+///
 /// `fixed` is the modification time, the extra flags and the system byte, which the reader skips.
 /// The trailer is arbitrary because the reader does not check it.
 #[derive(Clone, Debug)]

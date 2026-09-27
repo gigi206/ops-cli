@@ -1203,6 +1203,7 @@ proptest::proptest! {
     /// earlier layer planted, a hard link, or a deletion marker, and no file around it linked into
     /// the tree. Whatever it lands under the root carries no set-user-ID, set-group-ID or sticky
     /// bit, and its owner can read and write it.
+    ///
     /// Each layer is applied over whatever the ones before left, refused or not, so the root is
     /// in states a real image's unpack, which stops at the first refusal, never leaves it in.
     #[test]
