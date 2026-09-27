@@ -129,10 +129,18 @@ mod tests {
                 "memfd::write(",
                 "memfds(",
                 "argv::compose(",
+                "selfcage::command(",
             ]
             .iter()
             .any(|needle| crate::testutil::calls_function(text, needle))
         }
+        // Builds the command and hands its descriptors back beside it, starting nothing: each
+        // caller prepares the exec, and is held to that by `selfcage::command(` above.
+        const HANDS_THEM_BACK: &[&str] = &["src/sandbox/selfcage.rs"];
+        // Stages a descriptor as a file to probe the proxy's filters with, in this process, and
+        // starts no process at all.
+        const EXECS_NOTHING: &[&str] = &["src/sandbox/seccomp/proxy.rs"];
+        let listed = |path: &std::path::Path, list: &[&str]| list.iter().any(|l| path.ends_with(l));
 
         let files = crate::testutil::crate_sources();
 
@@ -144,6 +152,17 @@ mod tests {
                 continue;
             }
             callers += 1;
+            // A listed file owes no preparation only while it starts nothing its way.
+            if listed(path, HANDS_THEM_BACK) || listed(path, EXECS_NOTHING) {
+                let starts = match listed(path, HANDS_THEM_BACK) {
+                    true => text.contains(".spawn("),
+                    false => text.contains("Command::new("),
+                };
+                if starts {
+                    offenders.push(path.display().to_string());
+                }
+                continue;
+            }
             // `spawn_launcher` counts: it is the one launch helper that prepares on its caller's
             // behalf, so a file handing it a command has already answered for its descriptors.
             let prepares = ["inherit_across_exec", "clear_cloexec", "spawn_launcher("]

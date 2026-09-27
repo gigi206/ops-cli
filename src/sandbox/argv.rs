@@ -1113,22 +1113,20 @@ mod tests {
         // Spawns bubblewrap itself rather than through the launch command, and the list it hands it
         // is the composed one. `doctor`'s probe is sbx's own, fixed, and reports on the host rather
         // than running anything for a project, so it owes no scope; the session launcher and the
-        // task pool each run a project's own code and take the scope with the composed list. The
-        // egress proxy runs sbx's own binary, which bounds its own memory (`[network] body_max_mb`,
-        // `max_connections`), and takes no scope.
+        // task pool each run a project's own code and take the scope with the composed list.
+        // `selfcage` builds the cage sbx's own binary runs in, the egress proxy's and the capture
+        // tap's; that binary bounds its own memory (`[network] body_max_mb`, `max_connections`), and
+        // takes no scope.
         const SPAWNS_THE_COMPOSED_LIST: &[&str] = &[
             "src/sandbox/launch/cage.rs",
-            "src/sandbox/proxy/child.rs",
+            "src/sandbox/selfcage.rs",
             "src/sandbox/smoke.rs",
             "src/sandbox/taskpool.rs",
         ];
-        // Holds a `bwrap` path to hand on and starts no cage with it. The processes these do spawn
-        // are host-side tools of their own — `sops` decrypting a secret, the capture tap and the
-        // `nft` that points traffic at it — so what they owe is that the path travels and nothing
-        // here starts a cage beside the ones above. The netns holder is the sharpest case: it
-        // *becomes* bubblewrap through `execv`, having assembled no list of its own — the list it
-        // execs is the composed one, handed to it whole by the launcher.
-        const HANDS_THE_PATH_ON: &[&str] = &["src/sandbox/egress.rs", "src/sandbox/netns.rs"];
+        // Holds a `bwrap` path to hand on and starts no cage with it. The process it does spawn is
+        // a host-side tool of its own, `sops` decrypting a secret, so what it owes is that the path
+        // travels and nothing here starts a cage beside the ones above.
+        const HANDS_THE_PATH_ON: &[&str] = &["src/sandbox/egress.rs"];
         // These read the pure list to assert something about what it contains, and run nothing.
         const READS_THE_LIST: &[&str] = &[];
         // The definitions themselves: this module, the one that compiles a filter into a descriptor
