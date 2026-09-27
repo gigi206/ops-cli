@@ -1251,15 +1251,20 @@ fn read_file(path: &Path) -> Result<Vec<u8>, String> {
     )
 }
 
-/// A store URL: non-empty and free of control characters. The latter keeps the URL a single
-/// well-formed line in `store.toml` (a newline would otherwise produce a file that fails to
-/// parse on the next read) and rejects a terminal-escape smuggled through a git error message.
+/// A store URL: non-empty and free of control characters and of the characters that reorder a
+/// line. A control character would break the single well-formed line the URL is in `store.toml`
+/// (a newline produces a file that fails to parse on the next read), and either kind rewrites
+/// what names the store: `plugins store info`, and the message that asks for its trust anchor,
+/// where an override lays the URL out as another one.
 fn validate_url(url: &str) -> Result<(), String> {
     if url.is_empty() {
         return Err("the store URL is empty".to_string());
     }
     if url.chars().any(|c| c.is_control()) {
         return Err("the store URL contains a control character".to_string());
+    }
+    if url.chars().any(crate::diag::reorders) {
+        return Err("the store URL contains a character that reorders a line".to_string());
     }
     Ok(())
 }
@@ -1810,6 +1815,19 @@ mod tests {
         assert!(validate_url("file:///tmp/x").is_ok());
         assert!(validate_url("").is_err());
         assert!(validate_url("https://example.com/\nhooksPath=/evil").is_err());
+    }
+
+    /// Laid out by its override, this URL reads `https://github.com/evil/org/store.git`, a path it
+    /// does not hold, and a URL is printed in the commands that pin the store's key.
+    #[test]
+    fn a_url_with_a_character_that_reorders_its_line_is_refused() {
+        let why = validate_url("https://github.com/evil/\u{202e}tig.erots/gro\u{202c}")
+            .expect_err("an override is not part of a URL");
+        assert!(why.contains("reorders a line"), "{why}");
+        for c in ['\u{200f}', '\u{2066}', '\u{202a}'] {
+            assert!(validate_url(&format!("https://example.com/{c}s.git")).is_err());
+        }
+        assert!(validate_url("https://example.com/\u{5d0}.git").is_ok());
     }
 
     #[test]

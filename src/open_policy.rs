@@ -99,18 +99,23 @@ pub(crate) fn validate_pattern(pattern: &str) -> Result<(), String> {
     if pattern.is_empty() {
         return Err("an empty pattern matches every file, so it names no shape".to_string());
     }
-    // No control byte, for the reason `[fs] deny` refuses one in an entry: an accepted pattern is
-    // named back — `config show` lists it in the grants block, a refusal names it — and a newline
-    // or an escape sequence there rewrites what a terminal shows, forging lines about masks that
-    // are not in force. `[fs]` is honored from an untrusted project, so the value reaching those
-    // surfaces is one nobody approved. Refused here, once, rather than filtered at each of the
-    // places a pattern is printed. Nothing is lost: a shape that really carries a control byte is
-    // spelled with the regex escape (`\n`, `\t`, `\x1b`), which is printable ASCII.
-    if let Some(bad) = pattern.chars().find(|c| c.is_control()) {
+    // No control byte and no character that reorders a line, for the reason `[fs] deny` refuses
+    // one in an entry: an accepted pattern is named back (`config show` lists it in the grants
+    // block, a refusal names it), and a newline or an escape sequence there rewrites what a
+    // terminal shows, forging lines about masks that are not in force, while an override lays the
+    // pattern out as another one. `[fs]` is honored from an untrusted project, so the value
+    // reaching those surfaces is one nobody approved. Refused here, once, rather than filtered at
+    // each of the places a pattern is printed. Nothing is lost: a shape that really carries such a
+    // character is spelled with the regex escape (`\n`, `\t`, `\x1b`, `\x{202e}`), which is
+    // printable ASCII.
+    if let Some(bad) = pattern
+        .chars()
+        .find(|&c| c.is_control() || crate::diag::reorders(c))
+    {
         return Err(format!(
-            "must not contain a control character (found {}) — a pattern is named back in \
-             diagnostics and in `config show`, and a control byte there rewrites what a terminal \
-             shows; spell it as a regex escape instead",
+            "must not contain a control character or a character that reorders a line (found \
+             {}): a pattern is named back in diagnostics and in `config show`, where such a \
+             character rewrites what a terminal shows; spell it as a regex escape instead",
             bad.escape_debug()
         ));
     }
@@ -266,6 +271,33 @@ mod tests {
         // The witness: the escape spelling matches the same content and stays accepted, so no
         // shape becomes unexpressible.
         assert!(validate_pattern(r"sk-\n[0-9]+").is_ok());
+    }
+
+    /// A character that reorders a line is refused for the same reason, and named in a form that
+    /// prints as itself. The regex escape spells it in ASCII, stays accepted, and still finds the
+    /// content that carries it: a shape holding one is not made unexpressible.
+    #[test]
+    fn a_pattern_carrying_a_character_that_reorders_its_line_is_refused() {
+        for (raw, named) in [
+            ("sk-\u{202e}[0-9]+", r"\u{202e}"),
+            ("\u{2067}tok", r"\u{2067}"),
+            ("a\u{200e}b", r"\u{200e}"),
+        ] {
+            let reason = validate_pattern(raw).expect_err("an override is not part of a shape");
+            assert!(reason.contains("reorders a line"), "{reason}");
+            assert!(reason.contains(named), "{reason}");
+            assert!(!reason.chars().any(crate::diag::reorders), "{reason:?}");
+            assert!(
+                OpenPolicy::compile(&[raw.to_string()], MAX_SCAN_DEFAULT).is_err(),
+                "the set builder must refuse it too, or the two validators disagree"
+            );
+        }
+
+        let escaped = OpenPolicy::compile(&[r"sk-\x{202E}[0-9]+".to_string()], MAX_SCAN_DEFAULT)
+            .expect("the escape spelling compiles")
+            .expect("one pattern is a policy");
+        assert!(escaped.verdict("key sk-\u{202e}42".as_bytes()).matched);
+        assert!(!escaped.verdict(b"key sk-42").matched);
     }
 
     #[test]

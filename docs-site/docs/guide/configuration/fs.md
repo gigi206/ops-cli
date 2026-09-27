@@ -349,6 +349,10 @@ The rules, and why each one is there:
   letting it name a path outside the project would make it a second way to reach one.
 - **A `..` component is refused**, and so is a path that resolves outside the project through
   a symlink.
+- **A control character, or a character that reorders a line, is refused.** An entry is printed
+  back by `sbx config show` and by the launch warnings, and such a character there rewrites what
+  the terminal shows: a newline forges a line, an escape sequence erases one, and a right-to-left
+  override lays the entry out as another path.
 - **A trailing `/` means "this is a directory"**, and an entry that ends in one but names a
   file is refused rather than guessed at.
 - **An entry matching nothing is a warning**, never a failed launch: a profile may name a
@@ -424,12 +428,14 @@ shapes beside it stopped deciding anything. A pattern that does not compile is r
 way, for its own reason. In both cases the remaining patterns still apply, so one bad line does
 not cost you the list.
 
-A pattern carrying a **control character** is refused for a reason about the terminal rather than
-about the scan. `[fs]` is honoured from an untrusted project, and an accepted pattern is printed
-back: `sbx config show` lists it under `fs scan`, and the launch warnings name it. A newline in one
-forges a line that reads like a mask which is not in force, and an escape sequence rewrites what the
-screen already shows. Nothing is lost by the refusal, since content that really holds such a byte is
-matched by spelling it as a regex escape (`\n`, `\t`, `\x1b`), which is plain text on the way back.
+A pattern carrying a **control character**, or a character that reorders a line, is refused for a
+reason about the terminal rather than about the scan. `[fs]` is honoured from an untrusted project,
+and an accepted pattern is printed back: `sbx config show` lists it under `fs scan`, and the launch
+warnings name it. A newline in one forges a line that reads like a mask which is not in force, an
+escape sequence rewrites what the screen already shows, and a right-to-left override lays the
+pattern out as another one. Nothing is lost by the refusal, since content that really holds such a
+character is matched by spelling it as a regex escape (`\n`, `\t`, `\x1b`, `\x{202e}`), which is
+plain text on the way back.
 
 This is the one key in the table that a trust gate holds. The rest of `[fs]` is honoured from an
 untrusted project because nothing in it can widen what another layer closed; a ceiling can, by

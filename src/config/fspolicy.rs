@@ -156,15 +156,20 @@ pub(crate) fn validate_entry(entry: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("is empty".to_string());
     }
-    // No control byte. Every refusal an entry earns is printed, and an entry is a config-chosen
-    // value: a newline or an escape sequence in one reaches a terminal through whichever warning
-    // names it, and the surfaces that filter their own output cannot help a value that was never
-    // supposed to carry one. Refused here, once, rather than filtered at each of the places an
-    // entry is named.
-    if let Some(bad) = trimmed.chars().find(|c| c.is_control()) {
+    // No control byte, and no character that reorders a line. Every refusal an entry earns is
+    // printed, and an entry is a config-chosen value: a newline or an escape sequence in one
+    // reaches a terminal through whichever warning names it, a right-to-left override makes it
+    // read as another path, and the surfaces that filter their own output cannot help a value
+    // that was never supposed to carry one. Refused here, once, rather than filtered at each of
+    // the places an entry is named.
+    if let Some(bad) = trimmed
+        .chars()
+        .find(|&c| c.is_control() || crate::diag::reorders(c))
+    {
         return Err(format!(
-            "must not contain a control character (found {}) — an entry is named back in \
-             diagnostics, and a control byte there rewrites what a terminal shows",
+            "must not contain a control character or a character that reorders a line (found \
+             {}): an entry is named back in diagnostics, where such a character rewrites what a \
+             terminal shows",
             bad.escape_debug()
         ));
     }
@@ -529,6 +534,29 @@ mod tests {
             assert!(why.contains("control character"), "{why}");
         }
         for entry in [".env", "secrets/", "sub/*.env", "./config/prod.key"] {
+            validate_entry(entry).unwrap_or_else(|e| panic!("`{entry}` is an ordinary entry: {e}"));
+        }
+    }
+
+    /// A character that reorders a line is no control character, and it needs neither a new line
+    /// nor an escape: laid out by its override, `x\u{202e}vne.\u{202c}` reads `x.env` wherever it
+    /// is printed. The refusal names it in a form that prints as itself. A letter of a
+    /// right-to-left script is text, and stays accepted.
+    #[test]
+    fn an_entry_carrying_a_character_that_reorders_its_line_is_refused() {
+        for (entry, named) in [
+            ("x\u{202e}vne.\u{202c}", r"\u{202e}"),
+            ("secrets/\u{2066}a\u{2069}", r"\u{2066}"),
+            ("\u{200f}.env", r"\u{200f}"),
+        ] {
+            let why = validate_entry(entry)
+                .err()
+                .unwrap_or_else(|| panic!("`{}` must be refused", entry.escape_debug()));
+            assert!(why.contains("reorders a line"), "{why}");
+            assert!(why.contains(named), "{why}");
+            assert!(!why.chars().any(crate::diag::reorders), "{why:?}");
+        }
+        for entry in ["\u{5e1}\u{5d5}\u{5d3}.env", "docs/\u{627}\u{644}.md"] {
             validate_entry(entry).unwrap_or_else(|e| panic!("`{entry}` is an ordinary entry: {e}"));
         }
     }

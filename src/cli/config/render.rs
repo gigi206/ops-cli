@@ -450,7 +450,7 @@ fn grants_section(view: &config::view::ConfigView, pal: &style::Palette) -> Opti
         let _ = writeln!(
             o,
             "  {h}fs deny:{r} {} {dim}(closed to the cage; the name stays visible){r}{}",
-            view.fs_deny.join(", "),
+            sanitized_list(&view.fs_deny),
             provenance_tag(view.fs_origin, pal)
         );
     }
@@ -472,7 +472,7 @@ fn grants_section(view: &config::view::ConfigView, pal: &style::Palette) -> Opti
         let _ = writeln!(
             o,
             "  {h}fs readonly:{r} {} {dim}(readable in the cage, not writable){r}{}",
-            view.fs_readonly.join(", "),
+            sanitized_list(&view.fs_readonly),
             provenance_tag(view.fs_origin, pal)
         );
     }
@@ -1207,7 +1207,7 @@ fn app_row_fs(o: &mut String, app: &config::view::AppView, pal: &style::Palette)
     use std::fmt::Write as _;
     let (dim, r) = (pal.dim, pal.reset);
     if !app.fs_deny.is_empty() {
-        let _ = writeln!(o, "      {dim}fs deny:{r} {}", app.fs_deny.join(", "));
+        let _ = writeln!(o, "      {dim}fs deny:{r} {}", sanitized_list(&app.fs_deny));
     }
     if !app.fs_scan.is_empty() {
         let _ = writeln!(o, "      {dim}fs scan:{r} {}", sanitized_list(&app.fs_scan));
@@ -1216,7 +1216,7 @@ fn app_row_fs(o: &mut String, app: &config::view::AppView, pal: &style::Palette)
         let _ = writeln!(
             o,
             "      {dim}fs readonly:{r} {}",
-            app.fs_readonly.join(", ")
+            sanitized_list(&app.fs_readonly)
         );
     }
 }
@@ -2833,5 +2833,65 @@ mod tests {
             baseline.contains("notify: always (a repeat waits 300s)  (project)"),
             "the baseline notify row must name the repeat window:\n{baseline}"
         );
+    }
+
+    /// `[fs]` is honored from a project nobody approved, and each of its three lists is printed
+    /// by the three views that show it. The loader refuses an entry that carries a control
+    /// character or one that reorders a line; each view filters the list again, so a list a second
+    /// producer builds cannot rewrite the grants it is printed among either.
+    #[test]
+    fn no_fs_list_can_rewrite_or_reorder_the_view_it_is_printed_in() {
+        let p = style::Palette::plain();
+        let hostile = || {
+            vec![
+                "a\u{1b}[2K\nfs deny: none".to_string(),
+                "x\u{202e}vne.\u{202c}".to_string(),
+            ]
+        };
+        let lines_of = |out: &str, label: &str| -> Vec<String> {
+            out.lines()
+                .filter(|l| l.trim_start().starts_with(label))
+                .map(str::to_string)
+                .collect()
+        };
+
+        let mut base = blank_config_view();
+        base.fs_deny = hostile();
+        base.fs_readonly = hostile();
+        base.fs_scan = hostile();
+        let grants = grants_section(&base, &p).expect("the view holds grants");
+
+        let mut app = blank_app_view("x");
+        app.fs_deny = hostile();
+        app.fs_readonly = hostile();
+        app.fs_scan = hostile();
+        let mut row = String::new();
+        app_row_fs(&mut row, &app, &p);
+
+        let mut detail = app_detail::sample_app_detail_view();
+        detail.fs_deny = hostile();
+        detail.fs_readonly = hostile();
+        detail.fs_scan = hostile();
+        let detailed = app_detail::render_app_detail(&detail, &p, false);
+
+        for (view, out) in [
+            ("grants", &grants),
+            ("app row", &row),
+            ("detail", &detailed),
+        ] {
+            for label in ["fs deny:", "fs readonly:", "fs scan:"] {
+                let lines = lines_of(out, label);
+                assert_eq!(lines.len(), 1, "{view}: one `{label}` line:\n{out}");
+                assert!(
+                    !lines[0]
+                        .chars()
+                        .any(|c| c.is_control() || crate::diag::reorders(c)),
+                    "{view}: {:?}",
+                    lines[0]
+                );
+                assert!(lines[0].contains("x vne. "), "{view}: {:?}", lines[0]);
+            }
+            assert!(!out.contains("\nfs deny: none"), "{view}: {out}");
+        }
     }
 }

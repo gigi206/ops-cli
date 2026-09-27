@@ -405,7 +405,7 @@ fn app_detail_fs(o: &mut String, view: &config::view::AppDetailView, pal: &style
         let _ = writeln!(
             o,
             "  {h}fs deny:{r} {} {dim}(closed to the cage){r}{fs_tag}",
-            view.fs_deny.join(", ")
+            sanitized_list(&view.fs_deny)
         );
     }
     if !view.fs_scan.is_empty() {
@@ -423,7 +423,7 @@ fn app_detail_fs(o: &mut String, view: &config::view::AppDetailView, pal: &style
         let _ = writeln!(
             o,
             "  {h}fs readonly:{r} {} {dim}(readable, not writable){r}{fs_tag}",
-            view.fs_readonly.join(", ")
+            sanitized_list(&view.fs_readonly)
         );
     }
     if view.fs_git_writable {

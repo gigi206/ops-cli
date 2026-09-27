@@ -1015,11 +1015,16 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
     }
     // The baseline `[fs]` and every app's, since an app's table is loaded through the same
     // `apply_fs` and dropped by it on the same grounds.
+    // The refusal quotes the value it refuses, and the value is often refused for what it would do
+    // to a terminal: it is written the way `diag::visible` writes it, since this text is printed as
+    // it is. The walk covers every entry in the file, so the value may be one the cage wrote into a
+    // project's `.sbx.toml` rather than the one this edit adds.
     let app_fs = raw.app.values().filter_map(|a| a.fs.as_ref());
     for fs in raw.fs.iter().chain(app_fs) {
         for (field, entries) in [("deny", &fs.deny), ("readonly", &fs.readonly)] {
             for entry in entries {
                 if let Err(reason) = super::fspolicy::validate_entry(entry) {
+                    let entry = crate::diag::visible(entry);
                     return Err(format!(
                         "`[fs] {field}` entry `{entry}` {reason} — it would be dropped at load, \
                          leaving that path open to the cage"
@@ -1029,6 +1034,7 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
         }
         for pattern in &fs.scan {
             if let Err(reason) = crate::open_policy::validate_pattern(pattern) {
+                let pattern = crate::diag::visible(pattern);
                 return Err(format!(
                     "`[fs] scan` pattern `{pattern}` is not usable as a shape ({reason}) — it \
                      would be dropped at load, and no file closed for carrying that shape"
@@ -2963,6 +2969,31 @@ mod tests {
             Err(ManageError::InvalidValue(_, _))
         ));
         assert!(add(&p, "app.demo.fs.deny", ".env").unwrap().outcome);
+    }
+
+    /// The refusal quotes the entry it refuses, and the entry may be one the cage wrote into the
+    /// project's file, carrying the very character it is refused for. `sbx config` prints the
+    /// refusal through `diag::error`, which filters nothing, so the entry is written the way
+    /// `diag::visible` writes it: the character is named, not obeyed.
+    #[test]
+    fn a_refused_fs_entry_is_quoted_in_a_form_that_drives_nothing() {
+        let tmp = crate::testutil::TmpDir::new();
+        for (layer, named) in [
+            ("[fs]\ndeny = [\"x\\u202Evne.\\u202C\"]\n", r"\u{202e}"),
+            ("[fs]\nreadonly = [\"a\\u001B[2Kb\"]\n", r"a\x1b[2Kb"),
+            ("[fs]\nscan = [\"sk-\\u2067[0-9]+\"]\n", r"\u{2067}"),
+        ] {
+            let p = doc_at(tmp.path(), layer);
+            let err = add(&p, "fs.deny", ".env")
+                .expect_err("the layer already holds an entry the resolver drops")
+                .to_string();
+            assert!(err.contains(named), "{err}");
+            assert!(
+                !err.chars()
+                    .any(|c| c.is_control() || crate::diag::reorders(c)),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
