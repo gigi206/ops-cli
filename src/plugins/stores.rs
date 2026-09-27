@@ -2740,6 +2740,34 @@ mod tests {
         assert!(!key.exists());
     }
 
+    /// A manifest's description is display-only and loads whatever it holds, but a store is read
+    /// by others: one carrying a character that reorders a line is refused at the source, naming
+    /// the plugin and the field, never by the round-trip guard's "internal error".
+    #[test]
+    fn publish_refuses_a_description_that_reorders_its_line() {
+        let repo = crate::testutil::TmpDir::new();
+        let plugin = repo.path().join("plugins/pass");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("plugin.toml"),
+            "type = \"resolver\"\nscheme = \"secret-store\"\nexec = \"resolve\"\n\
+             description = \"reads \\u202ethe store\"\n",
+        )
+        .unwrap();
+        let exec = plugin.join("resolve");
+        std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = repo.path().join("store.key");
+
+        let err = publish(repo.path(), &key, Some(1)).unwrap_err();
+        assert!(
+            err.contains("catalogue entry `pass`: `description` contains")
+                && !err.contains("internal error"),
+            "{err}"
+        );
+        assert!(!key.exists());
+    }
+
     /// A catalogue is keyed by the manifest `name`, and the map that builds it would take the last
     /// of two claimants while the publish confirmation listed both: two plugins reported shipped, one
     /// in the store, nothing saying which was lost. It never gets that far — the loader's

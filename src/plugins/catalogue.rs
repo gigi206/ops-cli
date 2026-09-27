@@ -86,8 +86,9 @@ impl Catalogue {
     /// [`verify_catalogue`], and the two are composed by [`verified_catalogue`] so
     /// verification always runs on the exact bytes parsed.
     ///
-    /// Every field is first refused for control characters, uniformly and before the shape checks,
-    /// because a shape refusal quotes the value it refuses — see [`validate_free_text`].
+    /// Every field is first refused for a control character or a character that reorders a line,
+    /// uniformly and before the shape checks, because a shape refusal quotes the value it refuses:
+    /// see [`validate_entry_text`].
     pub(crate) fn parse(bytes: &[u8]) -> Result<Catalogue, String> {
         let text = std::str::from_utf8(bytes).map_err(|_| "catalogue.toml is not valid UTF-8")?;
         // The parser's message draws the line at fault, which is the store's own text: a raw
@@ -107,24 +108,20 @@ impl Catalogue {
             // basic string carries a control byte through a `\uXXXX` escape, so a TOFU-pinned
             // store can put a terminal escape in any of them.
             //
-            // The serializer refuses a control character in every field uniformly; this is the
-            // consuming half, and it has to be uniform too — guarding only the fields that are
+            // The serializer refuses the same characters in every field uniformly; this is the
+            // consuming half, and it has to be uniform too: guarding only the fields that are
             // *displayed on success* left the ones that are only displayed on *failure*, where a
             // refusal quoting the value is itself the injection. It runs first for the same reason.
-            // The entry name is checked before `here` exists, because `here` quotes it into every
-            // message below, including the name's own.
-            validate_free_text("the entry name", &name)?;
+            validate_entry_text(
+                &name,
+                entry.plugin_type.as_deref().unwrap_or(""),
+                entry.scheme.as_deref(),
+                &entry.version,
+                &entry.description,
+                &entry.path,
+                &entry.sha256,
+            )?;
             let here = |e: String| format!("catalogue entry `{name}`: {e}");
-            for (field, value) in [
-                ("type", entry.plugin_type.as_deref().unwrap_or("")),
-                ("scheme", entry.scheme.as_deref().unwrap_or("")),
-                ("version", entry.version.as_str()),
-                ("description", entry.description.as_str()),
-                ("path", entry.path.as_str()),
-                ("sha256", entry.sha256.as_str()),
-            ] {
-                validate_free_text(field, value).map_err(here)?;
-            }
             crate::plugins::validate_install_name(&name).map_err(here)?;
             let kind = match entry.plugin_type.as_deref() {
                 Some(raw) => crate::plugins::PluginKind::parse(raw).map_err(here)?,
@@ -383,9 +380,21 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 /// plugin's manifest — is refused fail-closed rather than escaped, so a manifest cannot smuggle a
 /// second key/value into the signed catalogue. The constrained fields (`scheme`/`path`/`sha256`)
 /// carry no such characters, but pass through the same guard uniformly.
+///
+/// Each entry is first held to [`validate_entry_text`], the check the parser applies, so a publish
+/// is refused naming the entry and the field rather than signing a listing no consumer would read.
 pub(crate) fn serialize_catalogue(cat: &Catalogue) -> Result<String, String> {
     let mut out = format!("rev = {}\n", cat.rev);
     for (name, entry) in &cat.plugins {
+        validate_entry_text(
+            name,
+            entry.kind.token(),
+            entry.scheme.as_deref(),
+            &entry.version,
+            &entry.description,
+            &entry.path,
+            &entry.sha256,
+        )?;
         out.push('\n');
         out.push_str(&format!("[plugin.{}]\n", super::toml_quoted(name)?));
         // The type is always written, even for a resolver: a signed listing should say what it
@@ -415,14 +424,46 @@ pub(crate) fn serialize_catalogue(cat: &Catalogue) -> Result<String, String> {
     Ok(out)
 }
 
-/// Refuse a control character in a catalogue field, which is displayed verbatim: on success for
-/// `version` and `description`, in a refusal for every field. The serializer refuses them too, so
-/// this is symmetric: no legitimately-published store carries one, and a malicious TOFU-pinned
-/// store cannot smuggle a terminal escape.
+/// The text of one entry, field by field, as both directions hold it: [`Catalogue::parse`] on a
+/// store's bytes and [`serialize_catalogue`] on what a publish is about to sign. One list for
+/// both, so a field added to it is checked in both directions or in neither, and one gate,
+/// [`validate_free_text`]. The name is checked first, because every other refusal quotes it.
+fn validate_entry_text(
+    name: &str,
+    plugin_type: &str,
+    scheme: Option<&str>,
+    version: &str,
+    description: &str,
+    path: &str,
+    sha256: &str,
+) -> Result<(), String> {
+    validate_free_text("the entry name", name)?;
+    for (field, value) in [
+        ("type", plugin_type),
+        ("scheme", scheme.unwrap_or("")),
+        ("version", version),
+        ("description", description),
+        ("path", path),
+        ("sha256", sha256),
+    ] {
+        validate_free_text(field, value).map_err(|e| format!("catalogue entry `{name}`: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Refuse a control character, or a character that reorders a line, in a catalogue field, which
+/// is displayed verbatim: on success for `version` and `description`, in a refusal for every
+/// field. The serializer refuses them too, so this is symmetric: no store published by this
+/// version carries one, and a malicious TOFU-pinned store cannot smuggle a terminal escape or
+/// rearrange the line it is shown on. Text in a right-to-left script is not refused.
 fn validate_free_text(field: &str, s: &str) -> Result<(), String> {
-    match s.chars().find(|c| c.is_control()) {
+    match s
+        .chars()
+        .find(|&c| c.is_control() || crate::diag::reorders(c))
+    {
         Some(bad) => Err(format!(
-            "`{field}` contains a control character (U+{:04X})",
+            "`{field}` contains a control character or a character that reorders a line \
+             (U+{:04X})",
             bad as u32
         )),
         None => Ok(()),
@@ -745,6 +786,43 @@ mod tests {
         assert!(err.contains("control character"), "{err}");
     }
 
+    /// The serializer refuses what the parser would, field by field and naming the entry, so a
+    /// publish never signs a listing its consumers would refuse whole, and is told what to fix.
+    #[test]
+    fn serializing_a_character_that_reorders_a_line_is_refused_by_field() {
+        let clean = || CatalogueEntry {
+            kind: crate::plugins::PluginKind::Resolver,
+            scheme: Some("pass".into()),
+            version: "0.1.0".into(),
+            description: "d".into(),
+            path: "plugins/pass".into(),
+            sha256: "a".repeat(64),
+        };
+        let hostile = || "a\u{202e}b".to_string();
+        for field in ["scheme", "version", "description", "path", "sha256"] {
+            let mut entry = clean();
+            match field {
+                "scheme" => entry.scheme = Some(hostile()),
+                "version" => entry.version = hostile(),
+                "description" => entry.description = hostile(),
+                "path" => entry.path = hostile(),
+                _ => entry.sha256 = hostile(),
+            }
+            let plugins = BTreeMap::from([("pass".to_string(), entry)]);
+            let err = match serialize_catalogue(&Catalogue { rev: 1, plugins }) {
+                Err(e) => e,
+                Ok(_) => panic!("`{field}` carrying an override must not be serialized"),
+            };
+            assert!(
+                err.starts_with(&format!("catalogue entry `pass`: `{field}` contains")),
+                "{err}"
+            );
+        }
+        let plugins = BTreeMap::from([(hostile(), clean())]);
+        let err = serialize_catalogue(&Catalogue { rev: 1, plugins }).unwrap_err();
+        assert!(err.starts_with("`the entry name` contains"), "{err}");
+    }
+
     fn one_entry(field: &str, value: &str) -> String {
         let mut scheme = "pass".to_string();
         let mut version = "0.1.0".to_string();
@@ -904,6 +982,40 @@ mod tests {
             Ok(_) => panic!("a terminal escape in the entry name must be refused"),
         };
         assert!(!err.contains(ESC), "the refusal echoes the name: {err:?}");
+    }
+
+    /// A character that reorders a line is refused where a control character is, in every field
+    /// and in the entry name, and the refusal names it rather than carrying it. Text written in a
+    /// right-to-left script is not such a character, and a store may list it.
+    #[test]
+    fn a_character_that_reorders_a_line_is_refused_in_every_catalogue_field() {
+        for mark in ["\\u202e", "\\u2066", "\\u200f"] {
+            for field in ["type", "scheme", "version", "description", "path", "sha256"] {
+                let entry = one_entry(field, &format!("a{mark}b"));
+                let err = match Catalogue::parse(entry.as_bytes()) {
+                    Err(e) => e,
+                    Ok(_) => panic!("`{field}` carrying {mark} must be refused"),
+                };
+                assert!(err.contains("reorders a line"), "{err}");
+                assert!(
+                    !err.chars().any(crate::diag::reorders),
+                    "the refusal for `{field}` carries what it refuses: {err:?}"
+                );
+            }
+            let named = format!(
+                "[plugin.\"a{mark}b\"]\nscheme = \"pass\"\nversion = \"0\"\n\
+                 description = \"d\"\npath = \"p\"\nsha256 = \"{}\"\n",
+                "a".repeat(64)
+            );
+            let err = match Catalogue::parse(named.as_bytes()) {
+                Err(e) => e,
+                Ok(_) => panic!("{mark} in the entry name must be refused"),
+            };
+            assert!(!err.chars().any(crate::diag::reorders), "{err:?}");
+        }
+        let cat = Catalogue::parse(one_entry("description", "קורא סיסמאות من المخزن").as_bytes())
+            .expect("a right-to-left script is text");
+        assert_eq!(cat.plugins["pass"].description, "קורא סיסמאות من المخزن");
     }
 
     /// A catalogue the parser refuses is quoted back a line at a time, each line escaped: the line

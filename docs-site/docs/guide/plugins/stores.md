@@ -41,11 +41,13 @@ revision is recorded, and a re-fetch **refuses a rollback**: a store cannot be
 downgraded to an older, superseded catalogue (anti-rollback). The two bookkeeping
 files degrade oppositely: an unreadable `store.toml` (the pinned key) is a hard
 failure, while an unreadable `catalogue.lock` (the rollback floor) degrades to `0`.
-A control character in any field of any entry refuses the whole catalogue, so no
-store can smuggle a terminal escape into a display. The clone itself is bounded at
-five minutes: it runs quietly, so a server that accepts the connection and then
-never answers would otherwise leave `store add` waiting with nothing on screen to
-read.
+A control character, or a character that reorders a line (a directional mark, an
+embedding, an override or an isolate), in any field of any entry refuses the whole
+catalogue, the cached copy included, since every read parses it again: no store can
+smuggle a terminal escape into a display or rearrange the line it is shown on. Text
+in a right-to-left script is not refused. The clone itself is bounded at five
+minutes: it runs quietly, so a server that accepts the connection and then never
+answers would otherwise leave `store add` waiting with nothing on screen to read.
 A store is a catalogue repository fetched at depth 1, so the bound is far past any
 honest fetch; a slow link is not what it stops.
 
@@ -235,19 +237,20 @@ key pinned, but silently, which is why `rekey` exists.
 **`store install`** uses only the cached, verified catalogue: it re-verifies the
 plugin's pinned hash and places it exactly as a local install would: no network.
 A catalogue entry's `path` is a plain repo-relative path (no `..`, no absolute parts)
-and its `sha256` exactly 64 lowercase hex characters; a control character anywhere in
-the catalogue refuses the entry. A symlink at any level of a catalogued path refuses
-the install: it is never followed.
+and its `sha256` exactly 64 lowercase hex characters; a character refused above,
+anywhere in the catalogue, refuses the whole catalogue. A symlink at any level of a
+catalogued path refuses the install: it is never followed.
 
 **`store publish`** is the **operator/signer** counterpart of `add`, never
 reachable from a cage. It walks a directory of plugins, pins each by its
 `dir_digest`, and builds and signs `catalogue.toml` with `--rev` (monotonic, so
 consumers refuse a rollback). A publish refuses an empty tree, a subdirectory without
-a `plugin.toml`, and two plugins sharing one name; an omitted `--rev` continues the
-sequence (`1`, then `+1`). It writes `.gitattributes` (`* -text`) so the signed bytes
-survive a clone verbatim. The **signing key is the store's secret and never
-leaves the operator's host**; the public key it prints is what consumers pin with
-`add --key`.
+a `plugin.toml`, two plugins sharing one name, and a field a consumer would refuse
+(such as a description carrying one of the characters above), named by plugin and
+field; an omitted `--rev` continues the sequence (`1`, then `+1`). It writes
+`.gitattributes` (`* -text`) so the signed bytes survive a clone verbatim. The
+**signing key is the store's secret and never leaves the operator's host**; the
+public key it prints is what consumers pin with `add --key`.
 
 ## An honest residual: the default store is not registered yet
 
