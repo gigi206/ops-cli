@@ -1164,8 +1164,9 @@ fn prepare_engines(
         ) {
             Ok(root) => userland.distro = Some(root),
             Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx: cannot provision the `{locator}` root filesystem: {e}"
+                crate::diag::error(&super::distro::failure(
+                    &format!("provision the `{locator}` root filesystem"),
+                    &e,
                 ));
                 return Err(ExitCode::FAILURE);
             }

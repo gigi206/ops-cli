@@ -274,6 +274,13 @@ image declares and the cage never sees is a difference between the published ima
 the tree it runs on, and it would surface much later as a missing file nobody can
 account for.
 
+A refusal names what the image or its registry chose: a member's path, a media type, the
+registry's challenge or its token service's answer. A character in it that acts on a
+terminal (an escape sequence, a carriage return, one that reorders text) is printed as an
+escape such as `\x1b`, both when a launch provisions the image and when
+[`sbx upgrade distro`](../cli/upgrade) rolls it, so the message shows what the image
+carries instead of rewriting the lines around it.
+
 ## Where the project can live
 
 `/home` and `/opt` are covered with a private tmpfs, which is where the cage's home and, for

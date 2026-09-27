@@ -938,7 +938,10 @@ fn upgrade_distro(
     ) {
         Ok(r) => r,
         Err(e) => {
-            diag::error(&format!("sbx: cannot upgrade the `{locator}` image: {e}"));
+            diag::error(&sandbox::distro::failure(
+                &format!("upgrade the `{locator}` image"),
+                &e,
+            ));
             return false;
         }
     };
