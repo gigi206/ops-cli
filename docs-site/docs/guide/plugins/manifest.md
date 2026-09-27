@@ -35,12 +35,18 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   wins, and a plugin claiming one is dropped. It holds lowercase letters, digits,
   `+`, `-` and `.`, starting with a lowercase letter.
 - `exec` is resolved against the plugin directory and must be traversal-free.
-- `name` defaults to the directory name: letters, digits, `.`, `_` or `-`, never
-  starting with a dot.
+- `name` defaults to the directory name. An install holds it to letters, digits,
+  `.`, `_` or `-`, never starting with a dot.
+- `name` and `version` are printed as written wherever the plugin is listed, so a
+  control character or a character that reorders a line (a directional mark, an
+  embedding, an override or an isolate) in either refuses the plugin with a
+  warning, and refuses its install; the directory name standing in for a missing
+  `name` is held to the same rule. Text in a right-to-left script is not refused.
 - An unknown key anywhere in `plugin.toml` or `[sandbox]` refuses the plugin with a
   warning: a misspelled grant must never read as granted. `version`/`description`
-  are display-only: `sbx` never compares or acts on the
-  version.
+  are display-only: `sbx` never acts on the version, which it compares only to
+  word a store listing's markers and an upgrade's report; what a store installs is
+  decided by the digest.
 - `[sandbox]` declares only the resolver-specific extra; the runner supplies the
   structural environment (a minimal `PATH`, a read-only host userland, `HOME`,
   and, under `network`, DNS/TLS files) on top of it.

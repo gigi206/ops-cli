@@ -1027,7 +1027,8 @@ impl Plugin {
 
 /// Load and validate one plugin directory. `Ok(None)` when the directory holds no
 /// `plugin.toml` (skip it); `Ok(Some)` for a valid plugin; `Err` (with a reason) for a
-/// present-but-invalid manifest, which the caller turns into a warning.
+/// present-but-invalid manifest, which the registry turns into a warning and an install into a
+/// refusal.
 fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
     let manifest_path = dir.join("plugin.toml");
     let bytes = match std::fs::read(&manifest_path) {
@@ -1036,10 +1037,49 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
         Err(e) => return Err(format!("cannot read plugin.toml: {e}")),
     };
     let text = std::str::from_utf8(&bytes).map_err(|_| "plugin.toml is not valid UTF-8")?;
-    let raw: RawManifest = toml::from_str(text).map_err(|e| format!("invalid plugin.toml: {e}"))?;
+    // A refusal quotes the value it refuses, and a manifest is text sbx did not write: a store's
+    // plugin carries the publisher's. An install prints the refusal through `diag::error`, which
+    // filters nothing, so it is written the way `diag::visible` writes it, here rather than where
+    // each is built, so a check added later is covered without anyone remembering to. The
+    // parser's message spans lines on purpose, drawing the line at fault, so it is escaped a line
+    // at a time.
+    let raw: RawManifest = toml::from_str(text).map_err(|e| {
+        format!(
+            "invalid plugin.toml: {}",
+            crate::diag::visible_lines(&e.to_string())
+        )
+    })?;
+    admit_manifest(dir, raw, exp)
+        .map(Some)
+        .map_err(|e| crate::diag::visible(&e))
+}
 
+/// A parsed manifest held to the rules of its type: the plugin it declares, or the reason it is
+/// refused, quoting the value at fault as it is written.
+fn admit_manifest(dir: &Path, raw: RawManifest, exp: &Expansion) -> Result<Plugin, String> {
     let dir_name = dir.file_name().and_then(OsStr::to_str).unwrap_or("?");
     let name = raw.name.unwrap_or_else(|| dir_name.to_string());
+
+    // The name and the version are printed as they are wherever the plugin is listed (`plugins
+    // list`, a store's markers, an upgrade), and a manifest is not held to a charset for either
+    // until an install checks the name. A character that would drive the terminal or reorder the
+    // line is refused here, once, rather than filtered at each place that prints them. The
+    // message names the character rather than quoting the value.
+    for (field, value) in [
+        ("name", name.as_str()),
+        ("version", raw.version.as_deref().unwrap_or("")),
+    ] {
+        if let Some(bad) = value
+            .chars()
+            .find(|&c| c.is_control() || crate::diag::reorders(c))
+        {
+            return Err(format!(
+                "`{field}` contains a control character or a character that reorders a line \
+                 (U+{:04X}): it is printed as written wherever the plugin is listed",
+                u32::from(bad)
+            ));
+        }
+    }
 
     // The discriminator is what makes a second type possible without widening the first: each
     // arm below validates the fields its own type reads, and refuses the other type's.
@@ -1186,7 +1226,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
                 is_valid_env_key,
                 crate::config::is_reserved_env_key,
             )?;
-            Ok(Some(Plugin::Broker(Box::new(broker::BrokerPlugin {
+            Ok(Plugin::Broker(Box::new(broker::BrokerPlugin {
                 name,
                 dir: dir.to_path_buf(),
                 exec,
@@ -1195,7 +1235,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
                 version: raw.version,
                 description: raw.description,
                 host: HostConfig::default(),
-            }))))
+            })))
         }
         PluginKind::Signer => {
             let raw_signer = raw
@@ -1203,7 +1243,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
                 .ok_or("missing the `[signer]` table, which a signer plugin is defined by")?;
             check_kind_sandbox(PluginKind::Signer, &sandbox)?;
             let spec = signer::validate(raw_signer, &name)?;
-            Ok(Some(Plugin::Signer(Box::new(signer::SignerPlugin {
+            Ok(Plugin::Signer(Box::new(signer::SignerPlugin {
                 name,
                 dir: dir.to_path_buf(),
                 exec,
@@ -1212,9 +1252,9 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
                 version: raw.version,
                 description: raw.description,
                 host: HostConfig::default(),
-            }))))
+            })))
         }
-        PluginKind::Resolver => Ok(Some(Plugin::Resolver(Box::new(ResolverPlugin {
+        PluginKind::Resolver => Ok(Plugin::Resolver(Box::new(ResolverPlugin {
             name,
             #[expect(
                 clippy::expect_used,
@@ -1228,7 +1268,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
             version: raw.version,
             description: raw.description,
             host: HostConfig::default(),
-        })))),
+        }))),
     }
 }
 
@@ -3319,6 +3359,113 @@ mod tests {
         assert_eq!(schemes, vec!["pass"]);
         // the reserved namespace is what a plugin can never claim
         assert_eq!(builtin_schemes(), &["env", "file", "sops"]);
+    }
+
+    /// A manifest's `name` and `version` are printed as they are wherever the plugin is listed, so
+    /// a character that would drive the terminal or reorder the line refuses the plugin, the
+    /// directory name standing in for a missing `name` included. A version written in a
+    /// right-to-left script is text, and loads.
+    #[test]
+    fn a_manifest_name_or_version_that_would_drive_the_terminal_is_refused() {
+        let base = "type=\"resolver\"\nexec=\"resolve\"\n";
+        for (dir, extra) in [
+            ("esc-version", "scheme=\"a\"\nversion=\"1\\u001b[2J\"\n"),
+            ("rlo-version", "scheme=\"b\"\nversion=\"1\\u202e0\"\n"),
+            ("lrm-version", "scheme=\"c\"\nversion=\"1\\u200e\"\n"),
+            ("esc-name", "scheme=\"d\"\nname=\"x\\u001b]0;t\"\n"),
+            ("lri-name", "scheme=\"e\"\nname=\"x\\u2066y\"\n"),
+            ("dir\u{202e}name", "scheme=\"f\"\n"),
+        ] {
+            let root = crate::testutil::TmpDir::new();
+            write_plugin(root.path(), dir, &format!("{base}{extra}"));
+            let (reg, warnings) = load(root.path());
+            assert!(reg.is_empty(), "`{dir}` must be refused");
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("reorders a line"), "{warnings:?}");
+        }
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "hebrew",
+            &format!("{base}scheme=\"h\"\nversion=\"גרסה 1\"\n"),
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            reg.resolver("h").and_then(|p| p.version.as_deref()),
+            Some("גרסה 1")
+        );
+    }
+
+    /// An install prints its refusal through `diag::error`, which filters nothing, and a refusal
+    /// quotes the manifest value it refuses: each comes back escaped and on one line, while the
+    /// parser's own message keeps its lines.
+    #[test]
+    fn every_refusal_of_a_manifest_is_quoted_in_a_form_that_drives_nothing() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        // An escape sequence, a right-to-left override and a newline, as a TOML string spells them.
+        const HOSTILE: &str = "a\\u001b[2J\\u202eb\\nc";
+        const SHOWN: &str = "a\\x1b[2J\\u{202e}b\\x0ac";
+        let top = "name=\"p\"\nexec=\"resolve\"\n";
+        let resolver = "type=\"resolver\"\nscheme=\"s\"\n";
+        let cases = [
+            ("type", format!("{top}type=\"{HOSTILE}\"\n")),
+            (
+                "scheme",
+                format!("{top}type=\"resolver\"\nscheme=\"{HOSTILE}\"\n"),
+            ),
+            (
+                "allow_env",
+                format!("{top}{resolver}[sandbox]\nallow_env=[\"{HOSTILE}\"]\n"),
+            ),
+            (
+                "programs",
+                format!("{top}{resolver}[sandbox]\nprograms=[\"{HOSTILE}\"]\n"),
+            ),
+            (
+                "brokers",
+                format!("{top}{resolver}[sandbox]\nbrokers=[\"{HOSTILE}\"]\n"),
+            ),
+        ];
+        for (field, manifest) in cases {
+            let source = source_plugin(src_root.path(), field, &manifest, 0o755);
+            let err = match install(&layout, &source) {
+                Err(e) => e,
+                Ok(_) => panic!("a hostile `{field}` must be refused"),
+            };
+            assert!(
+                !err.chars()
+                    .any(|c| c.is_control() || crate::diag::reorders(c)),
+                "the refusal for `{field}` carries what it refuses: {err:?}"
+            );
+            assert!(
+                err.contains(SHOWN),
+                "the refusal for `{field}` shows the value as written: {err:?}"
+            );
+        }
+
+        // A raw escape byte in a string is not TOML, and the parser draws the line it is on.
+        let raw = format!("{top}{resolver}version=\"1\u{1b}[2J\u{202e}\"\n");
+        let source = source_plugin(src_root.path(), "not-toml", &raw, 0o755);
+        let err = match install(&layout, &source) {
+            Err(e) => e,
+            Ok(_) => panic!("a raw control byte in a string is not TOML"),
+        };
+        assert!(err.contains("invalid plugin.toml: "), "{err:?}");
+        assert!(
+            !err.contains('\u{1b}') && !err.contains('\u{202e}'),
+            "the refusal draws the line as it is: {err:?}"
+        );
+        assert!(
+            err.contains("\\x1b[2J\\u{202e}"),
+            "the line at fault is shown as written: {err:?}"
+        );
+        assert!(
+            err.contains('\n'),
+            "the parser's own lines are kept: {err:?}"
+        );
     }
 
     #[test]
