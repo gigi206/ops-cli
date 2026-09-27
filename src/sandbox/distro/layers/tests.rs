@@ -6,6 +6,12 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 
+/// Apply the layer written at `blob`: [`super::apply`] reads a layer from whatever holds it, and
+/// these tests hold theirs in files.
+fn apply(blob: &Path, media_type: &str, root: &Path, budget: &mut Budget) -> io::Result<()> {
+    super::apply(fs::File::open(blob)?, media_type, root, budget)
+}
+
 /// Build a tar in memory from `(path, kind, payload)` triples, so a test states the archive it
 /// means rather than shipping a fixture nobody can read.
 enum Member<'a> {

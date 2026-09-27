@@ -153,6 +153,7 @@ pub(crate) use deb::{
     DebUpgrade, pinned_hashes as deb_pinned_hashes, upgrade_project as upgrade_deb,
     withheld as withheld_deb_packages,
 };
+pub(crate) use distro::unpack::main as run_unpack;
 pub(crate) use flake::{
     FlakeUpgrade, pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,
     withheld as withheld_flake_packages,

@@ -203,7 +203,7 @@ flowchart LR
     SEED --> CAGE["<b>read-write as /nix in the cage</b><br/><i>the agent self-equips here</i>"]
     M --> CAGE
     IN --> CAGE
-    OCI --> UNPACK["<b>fetched and unpacked host-side</b><br/><i>under the data directory, keyed by content</i>"]
+    OCI --> UNPACK["<b>fetched host-side, each layer unpacked in a cage of its own</b><br/><i>under the data directory, keyed by content</i>"]
     UNPACK --> ROOT["<b>read-only as / in the cage</b><br/><i>the userland everything else lands inside</i>"]
 
     classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
@@ -221,8 +221,9 @@ being able to corrupt what other projects consume. Versions move only when
 
 A declared userland travels the same host-side road and ends somewhere else. The image is
 resolved to a digest, fetched, checked against it, and unpacked into a tree under the data
-directory named by its content; nothing about it is built by nix, and no layer is ever
-applied from inside a cage. A `run` list derives a userland of the project's own by running
+directory named by its content. Each layer is unpacked by sbx's own binary in a cage of its
+own, with no network and no writable path but that tree; nothing about it is built by nix,
+and no layer is ever applied from inside the agent's cage. A `run` list derives a userland of the project's own by running
 each command on a copy of that tree, in a cage of its own, before the launch it is for
 exists. Its egress is the project's allowlist and its proxy is its own, on a plane the
 [network learning](../networking/rules) never reads: a build runs commands the project wrote,
@@ -542,11 +543,14 @@ made; and `sops`, over a private copy of the bytes `sbx trust` approved.
 | a broker or signer plugin | `src/sandbox/broker.rs`, `src/sandbox/signer.rs` | the frames or requests it judges | what its manifest grants |
 | the mise helper | `src/sandbox/mise.rs` | the project's approved mise files | nothing past its run |
 | a task's cage | `src/sandbox/task.rs` | its parameters | the credentials declared for it |
+| a layer's unpack | `src/sandbox/distro/unpack.rs`, `src/sandbox/distro/layers.rs`, `src/sandbox/distro/gzip.rs` | one layer of a [`distro`](../configuration/distro) image, as its registry served it | the tree being assembled, the one path it may write |
 
-The proxy and the tap are sbx's own binary, started the same way (`src/sandbox/selfcage.rs`):
-of the host, the binary, `/usr` and the loader's cache, read-only, and for the tap the two
-sockets it dials; no capability; and a system-call filter that lists what their work calls,
-where every other cage gets a list of what it may not.
+The proxy, the tap and a layer's unpack are sbx's own binary, started the same way
+(`src/sandbox/selfcage.rs`): of the host, the binary, `/usr` and the loader's cache,
+read-only, for the tap the two sockets it dials, and for the unpack the tree it writes; and
+no capability. The proxy and the tap also run under
+a system-call filter that lists what their work calls; the unpack, like every other cage,
+gets a list of what it may not.
 
 Some bytes reach your terminal with no parser of sbx's in between: the agent's own output, in
 a foreground session, through a terminal or in `sbx session logs`. Your terminal reads those

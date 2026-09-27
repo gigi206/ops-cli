@@ -17,6 +17,7 @@ pub(crate) mod layers;
 pub(crate) mod reference;
 pub(crate) mod registry;
 pub(crate) mod store;
+pub(crate) mod unpack;
 
 /// Resolve the credential a `[distro] auth` reference names, host-side.
 ///

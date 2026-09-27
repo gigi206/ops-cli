@@ -747,6 +747,12 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // the launch for every upstream connection over the link it is handed. Never invoked by a
         // user directly, so it carries no page of its own. `rest` is `[<link descriptor>]`.
         "__proxy" => crate::sandbox::run_proxy(&rest),
+        // Internal: one layer of a `distro` image, applied in a cage of its own (no network, and
+        // nothing of the host but the read-only userland and the tree being assembled). Started by
+        // a provision, once per layer, with the layer on its standard input. Never invoked by a
+        // user directly, so it carries no page of its own. `rest` is
+        // `[<media type>, <bytes spent>, <entries spent>]`.
+        "__unpack" => crate::sandbox::run_unpack(&rest),
         // Internal: `doctor`'s transparent-capture probe. Creates a throwaway user+network
         // namespace and tries to install the redirect rules in it, so the answer is a measurement
         // rather than an inference about the kernel. A subcommand because `doctor` cannot unshare

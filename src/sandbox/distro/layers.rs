@@ -72,7 +72,7 @@ use std::rc::Rc;
 /// as many directories as its path has components, and a path of a few kilobytes is close to two
 /// thousand of them, each an inode and a block the byte ceiling does not see.
 const MAX_UNPACKED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const MAX_MEMBERS: u64 = 1_000_000;
+pub(super) const MAX_MEMBERS: u64 = 1_000_000;
 
 /// What one image's unpack has spent, carried across its layers. See [`MAX_UNPACKED_BYTES`].
 pub(super) struct Budget {
@@ -89,9 +89,21 @@ impl Budget {
         }
     }
 
+    /// The budget of an image whose earlier layers spent `bytes` and `members`: how a layer
+    /// applied by a process of its own ([`super::unpack`]) takes up where the one before stopped.
+    pub(super) fn resumed(bytes: u64, members: u64) -> Self {
+        Self { bytes, members }
+    }
+
+    /// What the image has spent so far, in bytes written and entries created.
+    pub(super) fn spent(&self) -> (u64, u64) {
+        (self.bytes, self.members)
+    }
+
     /// Count one entry, a member or a directory made for one, refusing past [`MAX_MEMBERS`].
     fn member(&mut self) -> io::Result<()> {
-        self.members += 1;
+        // Saturating, because a resumed count is a number another process handed over.
+        self.members = self.members.saturating_add(1);
         if self.members > MAX_MEMBERS {
             return Err(io::Error::other(format!(
                 "this image's layers create more than {MAX_MEMBERS} entries (members, and the \
@@ -163,20 +175,20 @@ impl<R: io::Read> io::Read for Metered<R> {
 const WHITEOUT: &str = ".wh.";
 const OPAQUE: &str = ".wh..wh..opq";
 
-/// Apply `blob` over `root`, creating `root` if it is not there yet.
+/// Apply the layer `blob` reads over `root`, creating `root` if it is not there yet.
 ///
 /// `media_type` decides the framing: the gzip layer types are inflated, an uncompressed one is read
 /// as a tar, and anything else is refused by name rather than guessed at. `zstd` layers are the
 /// refusal that will be met in practice, and naming it is the point: an image pushed that way is
 /// not unpacked wrongly, it is not unpacked at all.
 pub(super) fn apply(
-    blob: &Path,
+    blob: impl io::Read,
     media_type: &str,
     root: &Path,
     budget: &mut Budget,
 ) -> io::Result<()> {
     fs::create_dir_all(root)?;
-    let file = BufReader::new(fs::File::open(blob)?);
+    let file = BufReader::new(blob);
     if media_type.ends_with("+zstd") {
         return Err(io::Error::other(format!(
             "layer media type `{media_type}` is not supported (only tar and tar+gzip layers are)"

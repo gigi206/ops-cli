@@ -94,6 +94,8 @@ pub(crate) const ROOTS_DIR: &str = "roots";
 /// declaration, the shared one otherwise. It is written on every call, not only when it changes, so
 /// that a tree provisioned before the lock existed still ends up pinned.
 ///
+/// `bwrap` starts the cage each layer is unpacked in ([`super::unpack`]).
+///
 /// `holder` is the runtime id of the project this launch is for, recorded as an empty file under
 /// [`ROOTS_DIR`]. It is a garbage-collection root, in the sense nix uses the word: a lock says which
 /// tree the *next* launch wants, and that is not the same question as which tree a *running* cage is
@@ -106,6 +108,7 @@ pub(crate) const ROOTS_DIR: &str = "roots";
 /// [`crate::sandbox::gc::sweep_distro_trees`] removes it when it sweeps.
 pub(crate) fn provision(
     layout: &Layout,
+    bwrap: &Path,
     locator: &str,
     lock_path: &Path,
     holder: &str,
@@ -141,6 +144,7 @@ pub(crate) fn provision(
     let rootfs = dir.join("rootfs");
     if !rootfs.is_dir() {
         unpack_into(
+            bwrap,
             &image.pinned(&digest),
             &digest,
             &dir,
@@ -288,6 +292,9 @@ pub(crate) fn partial_staging_name(final_name: &str, pid: u32, seq: u64) -> Stri
 
 /// Fetch every layer of `image` and apply it, then move the result into place.
 ///
+/// Each layer is applied by [`super::unpack::apply`], in a cage `bwrap` starts whose only writable
+/// path is the tree being assembled: the fetch happens here, the parsing of the layer there.
+///
 /// The tree is assembled under a sibling name and renamed at the end, so the directory a launch
 /// binds at `/` exists only once every layer has landed: an interrupted unpack leaves a partial
 /// directory that no launch will ever name, rather than a root filesystem missing half its files.
@@ -299,6 +306,7 @@ pub(crate) fn partial_staging_name(final_name: &str, pid: u32, seq: u64) -> Stri
 /// the staging directory is cleared on the way in. The sequence number is what makes the name this
 /// *call's* rather than this process's.
 fn unpack_into(
+    bwrap: &Path,
     image: &ImageRef,
     digest: &str,
     dir: &Path,
@@ -326,7 +334,7 @@ fn unpack_into(
         let mut budget = layers::Budget::new();
         for layer in &manifest.layers {
             let blob = registry::fetch_layer(image, layer, &blobs, credential)?;
-            layers::apply(&blob, &layer.media_type, &rootfs, &mut budget)?;
+            super::unpack::apply(bwrap, &blob, &layer.media_type, &rootfs, &mut budget)?;
             // Freed as soon as it is applied: the layers of one image can outweigh the tree they
             // produce, and keeping them all would double the cost of every provision for a set of
             // files nothing reads again.

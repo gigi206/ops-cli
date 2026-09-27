@@ -113,7 +113,7 @@ fn the_commands_run_in_order_on_the_tree_and_a_failure_names_the_one_that_failed
             return;
         };
         crate::sandbox::distro::layers::apply(
-            &blob,
+            std::fs::File::open(&blob).unwrap(),
             &layer.media_type,
             &rootfs,
             &mut crate::sandbox::distro::layers::Budget::new(),

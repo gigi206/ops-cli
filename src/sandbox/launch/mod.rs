@@ -1156,6 +1156,7 @@ fn prepare_engines(
         });
         match super::distro::store::provision(
             &layout,
+            &bwrap,
             &locator,
             &lock,
             &holder,

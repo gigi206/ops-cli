@@ -56,7 +56,7 @@ fn engine_on(
         let lock = data.path().join("distro.lock");
         userland.distro = Some(
             crate::sandbox::distro::store::provision(
-                &layout, locator, &lock, "smoke000", None, None,
+                &layout, &bwrap, locator, &lock, "smoke000", None, None,
             )
             .ok()?,
         );

@@ -274,6 +274,15 @@ image declares and the cage never sees is a difference between the published ima
 the tree it runs on, and it would surface much later as a missing file nobody can
 account for.
 
+### Where a layer is unpacked
+
+Each layer is unpacked by `sbx`'s own binary in a cage of its own, started once per layer:
+no network, no capability, and nothing of the host but `/usr`, the loader's cache and the
+`sbx` binary, read-only, and the tree being assembled, which is the one path it may write. The checks above decide where every member
+lands; the cage is what stands behind them, so a flaw in one would write inside that tree
+and nowhere else. The ceilings are still counted by the unpack itself, carried from one
+layer's process to the next: the cage bounds where a layer writes, not how much.
+
 A refusal names what the image or its registry chose: a member's path, a media type, the
 registry's challenge or its token service's answer. A character in it that acts on a
 terminal (an escape sequence, a carriage return, one that reorders text) is printed as an
