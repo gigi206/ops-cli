@@ -313,6 +313,7 @@ pub(crate) fn wrap_command(
     let mkdir = env_bin.with_file_name("mkdir");
     let cat = env_bin.with_file_name("cat");
     let sleep = env_bin.with_file_name("sleep");
+    let dbus_send = provision.dbus_daemon.with_file_name("dbus-send");
     let Provision {
         dbus_daemon,
         xdp_root,
@@ -356,20 +357,32 @@ pub(crate) fn wrap_command(
         udd = update_desktop_db.display(),
         sleep = sleep.display(),
     );
-    // The Secret Service, started AFTER the bus it registers on. `--daemonize` makes this
-    // synchronous the way `dbus-daemon --fork` is: the foreground process reads the passphrase,
-    // opens the keyring, claims `org.freedesktop.secrets`, and only then exits — so the app that
-    // `exec "$@"` runs next cannot race it. The passphrase arrives on stdin (never in the argv a
-    // `[proc]` lens would record), and `--components=secrets` starts only the Secret Service: no
-    // ssh-agent (sbx brokers that one), no PKCS#11. The keyring file lands in the app's isolated
-    // home, so a login stored on one launch is still there on the next. Best-effort like the rest of
-    // the preamble: a cage whose keyring will not open still launches, with the app back on whatever
+    // The Secret Service, started AFTER the bus it registers on. `--daemonize` returns once the
+    // daemon has read the passphrase and forked, but before it claims `org.freedesktop.secrets`,
+    // which it does from its main loop: the name is not on the bus when the foreground process
+    // exits. So the preamble then waits for the name to have an owner, asking the bus through the
+    // `dbus-send` beside the daemon, for at most five seconds, and the app that `exec "$@"` runs
+    // next finds the service there. The passphrase arrives on stdin (never in the argv a `[proc]`
+    // lens would record), and `--components=secrets` starts only the Secret Service: no ssh-agent
+    // (sbx brokers that one), no PKCS#11. The keyring file lands in the app's isolated home, so a
+    // login stored on one launch is still there on the next. Best-effort like the rest of the
+    // preamble: a cage whose keyring will not open still launches, with the app back on whatever
     // fallback it chooses.
     let keyring = format!(
-        "printf %s '{pass}' | \"{kr}\" --unlock --components=secrets --daemonize \
-         >/dev/null 2>&1 || true\n",
+        "if printf %s '{pass}' | \"{kr}\" --unlock --components=secrets --daemonize \
+         >/dev/null 2>&1; then\n\
+         for _ in {{1..50}}; do\n\
+         case \"$(\"{send}\" --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+         org.freedesktop.DBus.NameHasOwner string:{SECRETS_NAME} 2>/dev/null)\" in\n\
+         *'boolean true'*) break ;;\n\
+         esac\n\
+         '{sleep}' 0.1\n\
+         done\n\
+         fi\n",
         pass = KEYRING_PASSPHRASE,
         kr = keyring_daemon.display(),
+        send = dbus_send.display(),
+        sleep = sleep.display(),
     );
     let preamble = format!(
         "'{mkdir}' -p {dir}/xdg-desktop-portal 2>/dev/null\n\
@@ -387,6 +400,9 @@ pub(crate) fn wrap_command(
     );
     super::egress::wrap_background(bash, &preamble, "sbx-incage-portal", cmd)
 }
+
+/// The bus name the in-cage Secret Service claims, which the preamble waits on.
+const SECRETS_NAME: &str = "org.freedesktop.secrets";
 
 /// The passphrase the in-cage keyring is unlocked with. A fixed literal on purpose: the keyring
 /// file lives in the app's isolated cage home and must reopen on every later launch, so the
@@ -525,8 +541,8 @@ mod tests {
     }
 
     /// The Secret Service is what several Electron apps now consult before they finish rendering, so
-    /// the preamble must start it — after the bus that carries it, and synchronously, so the app
-    /// `exec "$@"` runs next cannot beat it to the name.
+    /// the preamble must start it — after the bus that carries it — and wait until it owns its name,
+    /// so the app `exec "$@"` runs next cannot beat it there.
     #[test]
     fn the_preamble_starts_the_keyring_after_the_bus_and_waits_for_it() {
         let argv = wrap_command(
@@ -547,16 +563,30 @@ mod tests {
             bus < keyring,
             "the keyring registers ON the bus, so it must start after it: {script}"
         );
-        // `--daemonize` is the synchronization: the foreground process claims the name and only
-        // then exits, the way `dbus-daemon --fork` blocks until its socket is ready. Backgrounding
-        // it with `&` instead would let the app read `isEncryptionAvailable` before the name lands.
         assert!(
             script.contains("--unlock --components=secrets --daemonize"),
-            "the keyring must be started synchronously and with only the Secret Service: {script}"
+            "the keyring must be started with only the Secret Service: {script}"
         );
         assert!(
             !script.contains("gnome-keyring-daemon --unlock --components=secrets --daemonize &"),
-            "backgrounding it would reintroduce the race --daemonize exists to close: {script}"
+            "backgrounding it would let the app run before the daemon has even forked: {script}"
+        );
+        // `--daemonize` returns before the daemon claims its name, so the wait on the name is the
+        // synchronization, and it asks the bus the daemon started through the `dbus-send` beside it.
+        let wait = script
+            .find(&format!("NameHasOwner string:{SECRETS_NAME}"))
+            .expect("the preamble waits for the Secret Service's name");
+        assert!(
+            keyring < wait,
+            "the wait follows the keyring's start: {script}"
+        );
+        assert!(
+            script.contains("/nix/store/ddd-dbus/bin/dbus-send\" --session"),
+            "the name is asked of the private bus by the store's own dbus-send: {script}"
+        );
+        assert!(
+            script.contains("for _ in {1..50}; do"),
+            "the wait is bounded: {script}"
         );
     }
 
