@@ -3535,13 +3535,16 @@ mod tests {
 
     /// A project with a git repository made by the host's own git and one commit, or `None` where
     /// there is no git to make it. The identity is passed on the command line and hooks are not
-    /// run, so the developer's own configuration writes nothing into the fixture.
+    /// run, so the developer's own configuration writes nothing into the fixture. Automatic
+    /// maintenance is off: from git 2.54 its default strategy prunes the worktree entries a test
+    /// writes by hand, from a process the commit leaves running in the background.
     fn git_project(tmp: &TmpDir) -> Option<(PathBuf, impl Fn(&[&str]) -> bool)> {
         let root = project(tmp);
         let dir = root.clone();
         let git = move |args: &[&str]| {
             std::process::Command::new("git")
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "maintenance.auto=false"])
                 .args(args)
                 .current_dir(&dir)
                 .output()
