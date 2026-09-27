@@ -894,14 +894,28 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
     let mut before_dropped = Vec::new();
     let _ = super::schema::parse_layer(before.as_bytes(), &mut before_dropped);
     let mut after_dropped = Vec::new();
-    let raw = super::schema::parse_layer(doc.to_string().as_bytes(), &mut after_dropped)?;
+    // A refusal quotes the value it refuses, and `sbx config` prints it through `diag::error`,
+    // which filters nothing. The walk covers every entry in the file, so the value may be one the
+    // cage wrote into a project's `.sbx.toml`, carrying the very character it is refused for. Each
+    // refusal is therefore written the way `diag::visible` writes it, here rather than where it is
+    // built, so a list checked later is covered without anyone remembering to. The parser's own
+    // message spans lines on purpose, drawing the line at fault, so it is escaped a line at a time.
+    let raw = super::schema::parse_layer(doc.to_string().as_bytes(), &mut after_dropped)
+        .map_err(|e| visible_lines(&e))?;
     if let Some(notice) = after_dropped.iter().find(|notice| {
         !before_dropped
             .iter()
             .any(|had| dropped_path(had) == dropped_path(notice))
     }) {
-        return refuse_dropped_entry(vec![notice.clone()]);
+        return refuse_dropped_entry(vec![notice.clone()]).map_err(|e| crate::diag::visible(&e));
     }
+    admit_entries(&raw).map_err(|e| crate::diag::visible(&e))
+}
+
+/// Each entry of a parsed layer held to the rule the resolver reads it by, the half of
+/// [`validate_layer`] that walks the lists. It builds its refusals as they read; the caller escapes
+/// what they quote.
+fn admit_entries(raw: &super::schema::RawConfig) -> Result<(), String> {
     // The rule lists, baseline and per app. `sbx net allow` and `sbx proc allow` admit a rule
     // against the resolver's own grammar before writing it; `sbx config set network.allow '[…]'`
     // writes the same list in one go and went through neither, so `"*"`, an uncompilable `re:[`
@@ -955,7 +969,8 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
             for token in entry.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                 crate::sandbox::seccomp::resolve_allow(token).map_err(|why| {
                     format!(
-                        "`[seccomp] allow` entry `{token}`: {why} — it would be dropped at load,                          and the syscall never reopened"
+                        "`[seccomp] allow` entry `{token}`: {why} — it would be dropped at load, \
+                         and the syscall never reopened"
                     )
                 })?;
             }
@@ -1015,16 +1030,11 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
     }
     // The baseline `[fs]` and every app's, since an app's table is loaded through the same
     // `apply_fs` and dropped by it on the same grounds.
-    // The refusal quotes the value it refuses, and the value is often refused for what it would do
-    // to a terminal: it is written the way `diag::visible` writes it, since this text is printed as
-    // it is. The walk covers every entry in the file, so the value may be one the cage wrote into a
-    // project's `.sbx.toml` rather than the one this edit adds.
     let app_fs = raw.app.values().filter_map(|a| a.fs.as_ref());
     for fs in raw.fs.iter().chain(app_fs) {
         for (field, entries) in [("deny", &fs.deny), ("readonly", &fs.readonly)] {
             for entry in entries {
                 if let Err(reason) = super::fspolicy::validate_entry(entry) {
-                    let entry = crate::diag::visible(entry);
                     return Err(format!(
                         "`[fs] {field}` entry `{entry}` {reason} — it would be dropped at load, \
                          leaving that path open to the cage"
@@ -1034,7 +1044,6 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
         }
         for pattern in &fs.scan {
             if let Err(reason) = crate::open_policy::validate_pattern(pattern) {
-                let pattern = crate::diag::visible(pattern);
                 return Err(format!(
                     "`[fs] scan` pattern `{pattern}` is not usable as a shape ({reason}) — it \
                      would be dropped at load, and no file closed for carrying that shape"
@@ -1937,6 +1946,20 @@ fn existing_parent_mut<'d>(
     Some(table)
 }
 
+/// A parser's message as a terminal is to show it: each line written the way
+/// [`crate::diag::visible`] writes it, the line breaks kept.
+///
+/// The message spans lines on purpose, drawing the line at fault under a caret, and that line is
+/// the file's own text: a project's `.sbx.toml` the cage wrote can put an escape sequence or a
+/// right-to-left override in it, and `sbx config` prints the message through `diag::error`, which
+/// filters nothing.
+fn visible_lines(text: &str) -> String {
+    text.lines()
+        .map(crate::diag::visible)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Parse the file into an editable document, treating an absent file as an empty one (so a `set`
 /// can create it and a `get`/`unset` simply finds nothing).
 ///
@@ -1958,7 +1981,7 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
         Ok(bytes) => String::from_utf8(bytes)
             .map_err(|_| ManageError::Parse(path.to_path_buf(), "not UTF-8 text".into()))?
             .parse::<DocumentMut>()
-            .map_err(|e| ManageError::Parse(path.to_path_buf(), e.to_string())),
+            .map_err(|e| ManageError::Parse(path.to_path_buf(), visible_lines(&e.to_string()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
         Err(e) => Err(ManageError::Read(e.to_string())),
     }
@@ -2969,6 +2992,80 @@ mod tests {
             Err(ManageError::InvalidValue(_, _))
         ));
         assert!(add(&p, "app.demo.fs.deny", ".env").unwrap().outcome);
+    }
+
+    /// A file that is not TOML is refused before any entry is looked at, with the parser's message,
+    /// which draws the line at fault as the file holds it. The file may be a project's `.sbx.toml`
+    /// the cage wrote, so the bytes are written out: the message keeps its lines and nothing else.
+    #[test]
+    fn a_file_that_is_not_toml_is_refused_in_a_form_that_drives_nothing() {
+        let tmp = crate::testutil::TmpDir::new();
+        for (body, named) in [
+            (&b"[fs]\ndeny = [\"x\x1b[2Jy\"]\n"[..], r"\x1b"),
+            ("a\u{202e}b = 1\n".as_bytes(), r"\u{202e}"),
+        ] {
+            let p = tmp.path().join(".sbx.toml");
+            std::fs::write(&p, body).unwrap();
+            let err = match add(&p, "fs.deny", ".env") {
+                Ok(_) => panic!("{body:?} must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("is not valid TOML"), "{err}");
+            assert!(err.contains(named), "{err}");
+            assert!(
+                err.contains("\n  |"),
+                "the caret drawing keeps its lines: {err:?}"
+            );
+            assert!(
+                !err.chars()
+                    .any(|c| (c.is_control() && c != '\n') || crate::diag::reorders(c)),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// Every list the write checks, each holding a value the cage could have written into a
+    /// project's `.sbx.toml`, and each refused. The refusal is printed as it is, so it carries no
+    /// control character and no character that reorders a line: the ones a value held are written
+    /// out, and a value's newline cannot start a line of its own. The parser's message is the one
+    /// that spans lines, on purpose, and every line of it is escaped the same way.
+    #[test]
+    fn every_refusal_of_a_layer_quotes_its_value_in_a_form_that_drives_nothing() {
+        let tmp = crate::testutil::TmpDir::new();
+        let one_line = [
+            "[network]\nmode = \"deny\"\nallow = [\"exa\\u202Emple.com\"]\n",
+            "[network]\nmode = \"deny\"\nallow = [\"a\\u001B[2Jb.com\"]\n",
+            "[network]\nmode = \"deny\"\ndeny = [\"x\\u202E.com\"]\n",
+            "[network]\nshared_credential = [[\"a\\u202E.com\"]]\n",
+            "[proc]\nmode = \"enforce\"\ndeny = [\"cu\\u202Erl\\u001B[2J\"]\n",
+            "[proc]\nmode = \"enforce\"\ndeny = [\"curl\\nsbx: warning: none\"]\n",
+            "[seccomp]\nallow = [\"user\\u202Efaultfd\"]\n",
+            "[devices]\nallow = [\"/etc/\\u202Ex\\u001B[2J\"]\n",
+            "forward = [\"80\\u202E80\"]\n",
+            "binds = [\"/data\\u202E\\u001B[2J:rw\"]\n",
+        ];
+        let spanning = [
+            "[fs]\nreadonly = \"x\u{202e}vne.\u{202c}\"\n",
+            "[proc]\nmode = \"x\u{202e}vne.\u{202c}\"\ndeny = 5\n",
+        ];
+        for (layer, lines) in one_line
+            .iter()
+            .map(|l| (l, false))
+            .chain(spanning.iter().map(|l| (l, true)))
+        {
+            let p = doc_at(tmp.path(), layer);
+            let err = match add(&p, "fs.deny", ".env") {
+                Ok(_) => panic!("{layer:?} must be refused"),
+                Err(e) => e.to_string(),
+            };
+            let drives =
+                |c: char| (c.is_control() && !(lines && c == '\n')) || crate::diag::reorders(c);
+            assert!(!err.chars().any(drives), "{layer:?}: {err:?}");
+            assert_eq!(err.contains('\n'), lines, "{layer:?}: {err:?}");
+            // A one-line refusal is prose, so a run of spaces in it is a string continuation that
+            // lost its `\` and carried the source's indentation into the message.
+            assert!(lines || !err.contains("   "), "{layer:?}: {err:?}");
+        }
     }
 
     /// The refusal quotes the entry it refuses, and the entry may be one the cage wrote into the
