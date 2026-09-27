@@ -916,16 +916,30 @@ mod tests {
         let dir = TmpDir::new();
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
         let (_launched, _) = started(&dir, &log);
-        let mut accepting = Vec::new();
-        for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
-            // A thread's name as the kernel keeps it, cut to fifteen bytes.
-            let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
-            if comm.trim_end() == "sbx-proxy-accep"
-                && let Some(n) = filters(&task.path().join("status"))
-            {
-                accepting.push(n);
+        let accepting_now = || {
+            let mut accepting = Vec::new();
+            for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+                // A thread's name as the kernel keeps it, cut to fifteen bytes.
+                let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+                if comm.trim_end() == "sbx-proxy-accep"
+                    && let Some(n) = filters(&task.path().join("status"))
+                {
+                    accepting.push(n);
+                }
             }
-        }
+            accepting
+        };
+        // Waited for rather than read once: a thread names itself when it first runs, so for a
+        // moment after the proxy says it is ready its accepting thread can still carry the name of
+        // the thread that started it.
+        let deadline = std::time::Instant::now() + STOP_WAIT;
+        let accepting = loop {
+            let accepting = accepting_now();
+            if !accepting.is_empty() || std::time::Instant::now() >= deadline {
+                break accepting;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
         assert!(
             !accepting.is_empty(),
             "no thread accepts the cage's connections"
