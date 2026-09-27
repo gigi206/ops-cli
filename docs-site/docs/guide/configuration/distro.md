@@ -269,10 +269,10 @@ contiguous and GNU sparse spellings), directories, symlinks, hard links, and the
 whiteout markers that delete a path a lower layer created. A device node, block or
 character, and a fifo are skipped: the cage mounts its own `/dev` over whatever the
 image carries, and creating either unprivileged would fail anyway. Any **other** member
-type stops the unpack and is named, rather than being dropped in silence: a member the
-image declares and the cage never sees is a difference between the published image and
-the tree it runs on, and it would surface much later as a missing file nobody can
-account for.
+type stops the unpack and is named, by the type flag its header carries (a `Z`, say),
+rather than being dropped in silence: a member the image declares and the cage never sees
+is a difference between the published image and the tree it runs on, and it would surface
+much later as a missing file nobody can account for.
 
 ### Where a layer is unpacked
 

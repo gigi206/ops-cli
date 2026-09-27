@@ -695,15 +695,22 @@ fn a_contiguous_or_sparse_member_lands_like_the_regular_file_it_is() {
 /// skip: the cage mounts its own `/dev`, and unprivileged creation would fail anyway.
 #[test]
 fn a_member_of_an_unwritable_type_is_named_rather_than_skipped() {
-    let tmp = crate::testutil::TmpDir::new();
-    let root = tmp.join("root");
-    let err = apply_tar(
-        tmp.path(),
-        &root,
-        &tar_of(&[("weird", Member::Typed(tar::EntryType::new(b'Z'), ""))]),
-    )
-    .expect_err("an unknown member type is refused");
-    assert!(err.to_string().contains("does not write"), "{err}");
+    for (flag, shown) in [(b'Z', "(type flag `Z`)"), (0x01, "(type flag `\\x01`)")] {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.join("root");
+        let err = apply_tar(
+            tmp.path(),
+            &root,
+            &tar_of(&[("weird", Member::Typed(tar::EntryType::new(flag), ""))]),
+        )
+        .expect_err("an unknown member type is refused");
+        let said = err.to_string();
+        assert!(said.contains("does not write"), "{said}");
+        assert!(
+            said.ends_with(shown),
+            "the type named by its flag: {said:?}"
+        );
+    }
 
     // The witness: a device node is still skipped, and the layer applies.
     let tmp = crate::testutil::TmpDir::new();

@@ -480,11 +480,12 @@ fn write_member<R: io::Read>(
     }
     // Anything else is a type this does not know how to write, and dropping it is how a member the
     // image declares goes missing in silence. Named and refused, the way every other shape this
-    // cannot honour is.
+    // cannot honour is: by the type flag its header carries, the name the tar format gives it, and
+    // escaped, since the archive chose that byte.
     Err(io::Error::other(format!(
-        "layer member `{}` is of a type this unpacker does not write ({:?})",
+        "layer member `{}` is of a type this unpacker does not write (type flag `{}`)",
         dest.display(),
-        kind
+        std::ascii::escape_default(kind.as_byte())
     )))
 }
 
