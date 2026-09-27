@@ -213,6 +213,9 @@ struct Candidate {
     /// Whether this process is in the session's *own* cage rather than a sibling plugin fence —
     /// see [`in_session_cage`].
     in_session_cage: bool,
+    /// Whether this process shares the host's mount namespace, which no process of a cage does —
+    /// see [`choose_cage_pid`].
+    host_mounts: bool,
 }
 
 /// What a session's descendants hold: an agent to enter, or only the cage's own monitor.
@@ -239,8 +242,8 @@ struct Candidate {
 pub(super) enum CageTarget {
     /// The cage's payload: the process whose `environ` is the cage's.
     Agent(u32),
-    /// The cage's own `bwrap`, with no payload beside it — the launch is still provisioning, or
-    /// the agent has exited. Still distinguished from a plugin fence, so the caller reports *this*
+    /// The cage's own `bwrap`, or the launch's process that is still to become it, with no payload
+    /// beside it — the launch is still provisioning, or the agent has exited. Still distinguished from a plugin fence, so the caller reports *this*
     /// session rather than mistaking a fence for it.
     MonitorOnly(u32),
 }
@@ -254,15 +257,17 @@ pub(super) enum CageTarget {
 /// if the cage has no live in-namespace process (it just exited, or the host lacks user
 /// namespaces).
 pub(super) fn find_cage_target(session_pid: u32, project: &Path) -> Option<CageTarget> {
-    let host = userns_link(std::process::id())?;
+    let host = ns_link(std::process::id(), "user")?;
+    let host_mounts = ns_link(std::process::id(), "mnt");
     let parents = parent_map();
     let candidates: Vec<Candidate> = descendants(session_pid, &parents)
         .into_iter()
         .map(|pid| Candidate {
             pid,
-            userns: userns_link(pid),
+            userns: ns_link(pid, "user"),
             comm: comm(pid),
             in_session_cage: in_session_cage(pid, project),
+            host_mounts: host_mounts.is_some() && ns_link(pid, "mnt") == host_mounts,
         })
         .collect();
     choose_cage_pid(&candidates, &host)
@@ -305,9 +310,16 @@ fn in_session_cage(pid: u32, project: &Path) -> bool {
 }
 
 /// Pick the cage process from the candidates: skip any in the host user namespace (`host_userns`)
-/// and any that is not in this session's own cage ([`in_session_cage`]), take the first non-`bwrap`
-/// process left as the payload, and report a child-namespace `bwrap` as a monitor — never as a
-/// payload — if that is all there is. Pure.
+/// and any that is not in this session's own cage ([`in_session_cage`]), take the first process
+/// left that is neither `bwrap` nor on the host's mounts as the payload, and report one of those as
+/// a monitor — never as a payload — if that is all there is. Pure.
+///
+/// A process in a child user namespace that still shares the host's mount namespace is the launch
+/// on its way into the cage, not the cage. The network-namespace holder ([`super::netns`]) unshares
+/// a user and a network namespace, stands the capture tap up and waits for it, and only then
+/// becomes the cage's `bwrap`. Until it does, it is root of its own user namespace looking at the
+/// host's files, so it carries the project the way the cage does, and its `environ` is the
+/// launching one: entered, it would give a shell on the host's filesystem under the host's `HOME`.
 fn choose_cage_pid(candidates: &[Candidate], host_userns: &str) -> Option<CageTarget> {
     let mut monitor = None;
     for candidate in candidates {
@@ -317,7 +329,7 @@ fn choose_cage_pid(candidates: &[Candidate], host_userns: &str) -> Option<CageTa
         if userns == host_userns || !candidate.in_session_cage {
             continue;
         }
-        if candidate.comm.as_deref() != Some("bwrap") {
+        if candidate.comm.as_deref() != Some("bwrap") && !candidate.host_mounts {
             return Some(CageTarget::Agent(candidate.pid));
         }
         monitor.get_or_insert(candidate.pid);
@@ -325,10 +337,11 @@ fn choose_cage_pid(candidates: &[Candidate], host_userns: &str) -> Option<CageTa
     monitor.map(CageTarget::MonitorOnly)
 }
 
-/// The `user:[<inode>]` link string of `/proc/<pid>/ns/user`, used to tell a cage's
-/// child user namespace apart from the host's. `None` if the process is gone.
-fn userns_link(pid: u32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/ns/user"))
+/// The `<kind>:[<inode>]` link string of `/proc/<pid>/ns/<kind>`, used to tell a cage's child
+/// user namespace, and its own mount namespace, apart from the host's. `None` if the process is
+/// gone.
+fn ns_link(pid: u32, kind: &str) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/ns/{kind}"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }
@@ -619,6 +632,7 @@ mod tests {
             userns: userns.map(str::to_string),
             comm: comm.map(str::to_string),
             in_session_cage: mine,
+            host_mounts: false,
         }
     }
 
@@ -726,6 +740,37 @@ mod tests {
             candidate(201, Some(fence), Some("sbx-broker-ssh"), false),
         ];
         assert_eq!(choose_cage_pid(&candidates, host), None);
+    }
+
+    /// The launch's network-namespace holder is never entered as the agent.
+    ///
+    /// It has left the host's user namespace and not yet the host's mount namespace: it waits for
+    /// the capture tap before it becomes the cage's `bwrap`, and in that window it carries the
+    /// project and is not a `bwrap`. Entering it gave a shell as root of its user namespace, on the
+    /// host's files and under the host's `HOME`.
+    #[test]
+    fn a_process_on_the_hosts_mounts_is_never_the_agent() {
+        let host = "user:[4026531837]";
+        let holder = "user:[4026533808]";
+        let holding = || Candidate {
+            host_mounts: true,
+            ..candidate(100, Some(holder), Some("sbx"), true)
+        };
+        assert_eq!(
+            choose_cage_pid(&[holding()], host),
+            Some(CageTarget::MonitorOnly(100)),
+            "the holder is the launch still starting, never a payload"
+        );
+
+        // Once the cage's payload is up beside it, that is what is entered.
+        let candidates = vec![
+            holding(),
+            candidate(102, Some("user:[4026533809]"), Some("sleep"), true),
+        ];
+        assert_eq!(
+            choose_cage_pid(&candidates, host),
+            Some(CageTarget::Agent(102))
+        );
     }
 
     #[test]

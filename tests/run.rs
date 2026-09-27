@@ -8430,26 +8430,39 @@ fn cage_scope_tasks_max(launcher: u32) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-/// True once `session_pid` has a descendant process in a *child* user namespace — i.e. the cage's
-/// bubblewrap has created its namespaces, so `sbx session attach` will find a live process to enter. Used to
-/// wait deterministically for the background cage to come up, rather than sleeping a fixed guess.
-fn cage_userns_ready(session_pid: u32) -> bool {
-    cage_inside_pid(session_pid).is_some()
-}
-
-/// The first descendant of `session_pid` living in a *child* user namespace — a process whose
-/// `/proc/<pid>/root` is the cage's own filesystem view, so the host can read what the cage sees.
+/// The session's payload once it runs: the first descendant of `session_pid` that
+/// `sbx session attach` would enter, in a child user namespace and a mount namespace of its own,
+/// not a `bwrap`, and carrying `project` at its own path. Its `/proc/<pid>/root` is the cage's
+/// filesystem view, so the host can read what the cage sees.
 ///
-/// The namespaces exist before the payload's first command runs, which is why a caller that needs
-/// the payload's own work cannot stop at [`cage_userns_ready`]: it has to wait on the thing it is
-/// about to assert. Returning the pid is what makes that wait possible.
-fn cage_inside_pid(session_pid: u32) -> Option<u32> {
-    let host = std::fs::read_link("/proc/self/ns/user").ok();
+/// What comes up before it is not it. The launch starts the egress proxy's cage before it registers
+/// the session, then the network-namespace holder and bubblewrap before the payload, each in a user
+/// namespace of its own: a wait that stops at the first child user namespace attaches where `sbx
+/// session attach` answers that there is no such session, or nothing in it to enter. The payload's
+/// own work comes later still, so a caller that needs it waits on the thing it is about to assert.
+fn cage_payload_pid(session_pid: u32, project: &Path) -> Option<u32> {
+    let project = project.canonicalize().ok()?;
+    let host_user = std::fs::read_link("/proc/self/ns/user").ok();
+    let host_mnt = std::fs::read_link("/proc/self/ns/mnt").ok();
     let children = proc_children();
     let mut queue = children.get(&session_pid).cloned().unwrap_or_default();
     while let Some(pid) = queue.pop() {
-        let ns = std::fs::read_link(format!("/proc/{pid}/ns/user")).ok();
-        if ns.is_some() && ns != host {
+        let ns = |kind: &str| std::fs::read_link(format!("/proc/{pid}/ns/{kind}")).ok();
+        let (user, mnt) = (ns("user"), ns("mnt"));
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        let mut root = PathBuf::from(format!("/proc/{pid}/root"));
+        root.extend(
+            project
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_))),
+        );
+        if user.is_some()
+            && user != host_user
+            && mnt.is_some()
+            && mnt != host_mnt
+            && comm.trim_end() != "bwrap"
+            && root.is_dir()
+        {
             return Some(pid);
         }
         if let Some(kids) = children.get(&pid) {
@@ -8582,7 +8595,7 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut inside = None;
     while Instant::now() < deadline {
-        inside = cage_inside_pid(session_pid);
+        inside = cage_payload_pid(session_pid, project.path());
         // `metadata` rather than a read: the file exists before its bytes land, and what this wait
         // needs to know is that the payload has started writing, not what it wrote. The joined
         // shell's own `cat` is what reads it, and `echo` is one write.
@@ -8728,20 +8741,24 @@ fn sbx_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
         .expect("spawn the background sbx run");
     let session_pid = agent.id();
 
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while !cage_userns_ready(session_pid) && Instant::now() < deadline {
+    // Wait for the marker in the payload's own /tmp, which the payload writes before `exec sleep`.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut inside = None;
+    while Instant::now() < deadline {
+        inside = cage_payload_pid(session_pid, project.path());
+        if inside.is_some_and(|pid| {
+            std::fs::metadata(format!("/proc/{pid}/root/tmp/attach-cmd-marker")).is_ok()
+        }) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(150));
     }
-    if !cage_userns_ready(session_pid) {
+    if inside.is_none() {
         let _ = agent.kill();
         let _ = agent.wait();
-        skip_incapable!(
-            "skipping attach-cmd e2e: the background cage never came up (userns not created)"
-        );
+        skip_incapable!("skipping attach-cmd e2e: the background cage's payload never came up");
         return;
     }
-    // The marker command runs before `exec sleep`; give it a beat to land in the cage /tmp.
-    std::thread::sleep(Duration::from_millis(400));
 
     // Every attach below sets stdin to a non-terminal (`Stdio::null()`), so all take the direct
     // inherited-stdio path — the one an interactive shell could not reach.
@@ -8854,14 +8871,14 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
         .expect("spawn the background sbx run");
     let session_pid = agent.id();
 
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while !cage_userns_ready(session_pid) && Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while cage_payload_pid(session_pid, project.path()).is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(150));
     }
-    if !cage_userns_ready(session_pid) {
+    if cage_payload_pid(session_pid, project.path()).is_none() {
         let _ = agent.kill();
         let _ = agent.wait();
-        skip_incapable!("skipping attach-kill e2e: the background cage never came up");
+        skip_incapable!("skipping attach-kill e2e: the background cage's payload never came up");
         return;
     }
 
@@ -8913,9 +8930,9 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
                 out.extend_from_slice(&buf[..n as usize]);
             }
         }
-        // `attach` refuses a session whose agent it cannot enter yet, and the wait above watches the
-        // cage's user namespace, which comes up before the agent inside it does. That refusal is the
-        // "not yet" this loop waits out: attach again. Any other exit is the failure it looks for.
+        // `attach` refuses a session whose agent it cannot enter yet, one caught between its fork
+        // and its exec, whose environment cannot be read. That refusal is the "not yet" this loop
+        // waits out: attach again. Any other exit is the failure it looks for.
         if matches!(attach.try_wait(), Ok(Some(_))) {
             if !String::from_utf8_lossy(&out).contains("has no live process to enter") {
                 break;
