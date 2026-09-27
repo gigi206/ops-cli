@@ -206,14 +206,76 @@ fn the_unpacks_cage_holds_its_binary_the_userland_and_the_tree_alone() {
     }
 }
 
+/// A layer that takes every path of the applier the unpack's filters have to let through: a
+/// directory, a file, a symlink, a hard link, a whiteout, an opaque marker, a file replaced by a
+/// directory and a directory by a file, and a mode that shuts its owner out.
+fn every_kind_of_member() -> Vec<u8> {
+    use tar::EntryType::{Directory, Link, Regular, Symlink};
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut add = |path: &str, kind: tar::EntryType, body: &str, mode: u32, link: Option<&str>| {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_mode(mode);
+        header.set_size(body.len() as u64);
+        match link {
+            Some(target) => builder.append_link(&mut header, path, target).unwrap(),
+            None => builder
+                .append_data(&mut header, path, body.as_bytes())
+                .unwrap(),
+        }
+    };
+    add("etc", Directory, "", 0o755, None);
+    add("etc/os-release", Regular, "ID=caged\n", 0o644, None);
+    add("etc/link", Symlink, "", 0o777, Some("os-release"));
+    add("etc/hard", Link, "", 0o644, Some("etc/os-release"));
+    add("gone", Regular, "g", 0o644, None);
+    add(".wh.gone", Regular, "", 0o644, None);
+    add("opq/x", Regular, "x", 0o644, None);
+    add("opq/.wh..wh..opq", Regular, "", 0o644, None);
+    add("was", Regular, "w", 0o644, None);
+    add("was", Directory, "", 0o755, None);
+    add("dir2/y", Regular, "y", 0o644, None);
+    add("dir2", Regular, "now a file", 0o644, None);
+    add("locked", Regular, "l", 0o000, None);
+    builder.into_inner().unwrap()
+}
+
+/// What [`every_kind_of_member`] leaves in `root` once applied.
+fn assert_every_kind_of_member_landed(root: &Path) {
+    let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+    assert_eq!(read("etc/os-release"), "ID=caged\n");
+    assert_eq!(
+        std::fs::read_link(root.join("etc/link")).unwrap(),
+        Path::new("os-release")
+    );
+    assert_eq!(read("etc/hard"), "ID=caged\n", "the hard link");
+    assert!(
+        root.join("gone").symlink_metadata().is_err(),
+        "the whiteout removed it"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.join("opq")).unwrap().count(),
+        0,
+        "the opaque marker emptied it"
+    );
+    assert!(root.join("was").is_dir(), "a file replaced by a directory");
+    assert_eq!(read("dir2"), "now a file", "a directory replaced by a file");
+    assert_eq!(read("locked"), "l");
+}
+
 /// The variable that tells [`probe_in_the_unpacks_cage`] it runs in the unpack's cage, and names
 /// the file of the host it must not find there.
 const PROBE_HOST_FILE: &str = "SBX_UNPACK_CAGE_PROBE";
 
 /// What a process in the unpack's cage reaches, one line `sbx-probe: <what> <errno>` each, `0` for
-/// what succeeded, then the unpack of the layer on its standard input over [`ROOT`]. Run in the
-/// cage by [`a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else`]; anywhere
-/// else it does nothing.
+/// what succeeded: before its filters, a file and a route of the host; then the unpack as the child
+/// runs it ([`run`], filters first) of the layer on its standard input over [`ROOT`]; then, under
+/// those filters, a socket and a program. Run in the cage by
+/// [`a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else`]; anywhere else it
+/// does nothing.
+///
+/// It ends its process itself: libtest runs it on a thread of its own, and nothing on the unpack's
+/// list ends a thread.
 #[test]
 #[ignore = "run in the unpack's cage by the test that reads what it prints"]
 fn probe_in_the_unpacks_cage() {
@@ -230,16 +292,26 @@ fn probe_in_the_unpacks_cage() {
     let to = (std::net::Ipv4Addr::new(192, 0, 2, 1), 443).into();
     let connect = std::net::TcpStream::connect_timeout(&to, std::time::Duration::from_secs(1));
     say("connect", errno(connect.map(drop)));
-    let layer = File::from(io::stdin().as_fd().try_clone_to_owned().unwrap());
     let args = [TAR, "0", "0"].map(OsString::from);
-    let code = serve(
-        &args,
-        layer,
-        Path::new(ROOT),
-        &mut io::stdout().lock(),
-        &mut io::stderr().lock(),
-    );
+    let code = run(&args, &mut io::stdout().lock(), &mut io::stderr().lock());
     say("unpack", i32::from(code));
+    say(
+        "socket",
+        errno(std::os::unix::net::UnixDatagram::unbound().map(drop)),
+    );
+    let program = [c"/nonexistent".as_ptr(), std::ptr::null()];
+    let environment = [std::ptr::null()];
+    // SAFETY: NUL-terminated strings in null-terminated lists that outlive the call. The path does
+    // not exist, so a call the kernel reaches fails and returns: `ENOENT`, where the filter answers
+    // `EPERM`.
+    unsafe { libc::execve(program[0], program.as_ptr(), environment.as_ptr()) };
+    say(
+        "exec",
+        io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+    );
+    let _ = io::stdout().flush();
+    // SAFETY: ends the process without running anything more of it.
+    unsafe { libc::_exit(0) };
 }
 
 /// A layer unpacked in the unpack's own cage lands in the tree on the host, while the process
@@ -258,11 +330,7 @@ fn a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else() {
     std::fs::write(&host_file, b"x").unwrap();
     let rootfs = tmp.join("rootfs");
     std::fs::create_dir_all(&rootfs).unwrap();
-    let layer = blob(
-        &tmp,
-        "layer",
-        &layer_of(&[("etc/os-release", "ID=caged\n")]),
-    );
+    let layer = blob(&tmp, "layer", &every_kind_of_member());
 
     let binary = File::open("/proc/self/exe").unwrap();
     let mut spec = cage(
@@ -301,6 +369,8 @@ fn a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else() {
         format!("host-write {}", libc::ENOENT),
         format!("connect {}", libc::ENETUNREACH),
         "unpack 0".to_string(),
+        format!("socket {}", libc::EPERM),
+        format!("exec {}", libc::EPERM),
     ];
     assert_eq!(
         seen,
@@ -309,14 +379,10 @@ fn a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.lines().any(|l| l == "spent 9 2"),
+        stdout.lines().any(|l| l.starts_with("spent ")),
         "the unpack said what it spent: {stdout}"
     );
-    assert_eq!(
-        std::fs::read_to_string(rootfs.join("etc/os-release")).unwrap(),
-        "ID=caged\n",
-        "the member landed in the tree on the host"
-    );
+    assert_every_kind_of_member_landed(&rootfs);
     assert_eq!(
         std::fs::read(&host_file).unwrap(),
         b"x",

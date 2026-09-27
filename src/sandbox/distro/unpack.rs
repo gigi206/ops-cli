@@ -23,10 +23,12 @@
 //!
 //! ## What the cage holds against
 //!
-//! A bug that would place a member outside the tree: the cage has nothing else to write to. The
-//! budget is still enforced by the code in the child, so it holds against what it held against
-//! before, and not against a child made to lie about what it spent. The cage bounds where the
-//! child writes, not how much.
+//! A bug that would place a member outside the tree: the cage has nothing else to write to. A flaw
+//! that hands someone the child's execution: the child runs under a list of the calls its work
+//! makes ([`crate::sandbox::seccomp::unpack`]), installed before it reads the layer, so it opens no
+//! socket, runs no program and starts no process. The budget is still enforced by the code in the
+//! child, so it holds against what it held against before, and not against a child made to lie
+//! about what it spent. The cage bounds where the child writes, not how much.
 
 use super::layers::{self, Budget};
 use crate::sandbox::selfcage;
@@ -75,23 +77,35 @@ pub(super) fn apply(
     Ok(())
 }
 
-/// `sbx __unpack <media type> <bytes spent> <entries spent>`: apply the layer on standard input over
-/// [`ROOT`], and say what the image has spent with it. Started by [`apply`], in its cage.
+/// `sbx __unpack <media type> <bytes spent> <entries spent>`: apply the layer on standard input
+/// over [`ROOT`], and say what the image has spent with it. Started by [`apply`], in its cage.
 pub(crate) fn main(argv: &[OsString]) -> ExitCode {
-    let layer = match io::stdin().as_fd().try_clone_to_owned() {
-        Ok(fd) => File::from(fd),
-        Err(e) => {
-            eprintln!("sbx: __unpack: cannot read the layer on standard input: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    ExitCode::from(serve(
+    ExitCode::from(run(
         argv,
-        layer,
-        Path::new(ROOT),
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     ))
+}
+
+/// What [`main`] does, answering on `out` and `err`: put this process under the unpack's own
+/// filters ([`crate::sandbox::seccomp::unpack`]) before anything of the layer is read, then apply
+/// the layer on standard input over [`ROOT`]. Returns the exit code.
+fn run(argv: &[OsString], out: &mut impl Write, err: &mut impl Write) -> u8 {
+    if let Err(e) = crate::sandbox::seccomp::unpack::confine() {
+        let _ = writeln!(err, "sbx: __unpack: {e}");
+        return 1;
+    }
+    let layer = match io::stdin().as_fd().try_clone_to_owned() {
+        Ok(fd) => File::from(fd),
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "sbx: __unpack: cannot read the layer on standard input: {e}"
+            );
+            return 1;
+        }
+    };
+    serve(argv, layer, Path::new(ROOT), out, err)
 }
 
 /// The unpack of one layer over `root`, as [`main`] runs it in the cage, answering on `out` and

@@ -543,14 +543,13 @@ made; and `sops`, over a private copy of the bytes `sbx trust` approved.
 | a broker or signer plugin | `src/sandbox/broker.rs`, `src/sandbox/signer.rs` | the frames or requests it judges | what its manifest grants |
 | the mise helper | `src/sandbox/mise.rs` | the project's approved mise files | nothing past its run |
 | a task's cage | `src/sandbox/task.rs` | its parameters | the credentials declared for it |
-| a layer's unpack | `src/sandbox/distro/unpack.rs`, `src/sandbox/distro/layers.rs`, `src/sandbox/distro/gzip.rs` | one layer of a [`distro`](../configuration/distro) image, as its registry served it | the tree being assembled, the one path it may write |
+| a layer's unpack | `src/sandbox/distro/unpack.rs`, `src/sandbox/distro/layers.rs`, `src/sandbox/distro/gzip.rs`, filter `src/sandbox/seccomp/unpack.rs` | one layer of a [`distro`](../configuration/distro) image, as its registry served it | the tree being assembled, the one path it may write |
 
 The proxy, the tap and a layer's unpack are sbx's own binary, started the same way
 (`src/sandbox/selfcage.rs`): of the host, the binary, `/usr` and the loader's cache,
-read-only, for the tap the two sockets it dials, and for the unpack the tree it writes; and
-no capability. The proxy and the tap also run under
-a system-call filter that lists what their work calls; the unpack, like every other cage,
-gets a list of what it may not.
+read-only, for the tap the two sockets it dials, and for the unpack the tree it writes; no
+capability; and a system-call filter that lists what their work calls, where every other
+cage gets a list of what it may not.
 
 Some bytes reach your terminal with no parser of sbx's in between: the agent's own output, in
 a foreground session, through a terminal or in `sbx session logs`. Your terminal reads those

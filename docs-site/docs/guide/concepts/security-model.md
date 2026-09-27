@@ -222,6 +222,10 @@ them unable to open a file or start a program. The proxy still holds the credent
 so a proxy the agent subverted could send one to another host the policy allows, and not only
 to the one it was declared for.
 
+A layer of a [`distro`](../configuration/distro) image is chosen by its registry rather than by
+the agent, and it is parsed the same way: in a cage of its own, with no network and no writable
+path but the tree it assembles, under a filter of the calls its work makes.
+
 What still runs uncaged and reads what a cage chose is named module by module in
 [the trusted computing base](architecture#the-trusted-computing-base).
 

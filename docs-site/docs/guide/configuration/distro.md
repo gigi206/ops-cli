@@ -278,7 +278,9 @@ account for.
 
 Each layer is unpacked by `sbx`'s own binary in a cage of its own, started once per layer:
 no network, no capability, and nothing of the host but `/usr`, the loader's cache and the
-`sbx` binary, read-only, and the tree being assembled, which is the one path it may write. The checks above decide where every member
+`sbx` binary, read-only, and the tree being assembled, which is the one path it may write.
+It runs under a system-call filter that lists the calls its work makes, so it opens no
+socket, runs no program and starts no process. The checks above decide where every member
 lands; the cage is what stands behind them, so a flaw in one would write inside that tree
 and nowhere else. The ceilings are still counted by the unpack itself, carried from one
 layer's process to the next: the cage bounds where a layer writes, not how much.

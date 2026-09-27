@@ -81,6 +81,7 @@ use std::os::fd::AsRawFd;
 mod allowlist;
 pub(crate) mod proxy;
 pub(crate) mod tap;
+pub(crate) mod unpack;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("sbx's seccomp denylist is implemented only for x86_64 and aarch64");
