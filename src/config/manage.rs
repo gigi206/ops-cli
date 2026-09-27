@@ -846,7 +846,9 @@ fn dropped_path(notice: &str) -> &str {
 /// loader loads and `sbx config show` prints — had every write verb refuse, naming the key just
 /// typed rather than the pre-existing one. So what is refused here is a document that no longer
 /// parses at all, or a key the edit itself newly costs; a drop the layer already carried is the
-/// loader's to warn about, not this gate's to block on.
+/// loader's to warn about, not this gate's to block on. A mistyped restriction is not such a drop:
+/// the loader refuses the whole layer over it (see [`super::schema::parse_layer`]), so this gate
+/// refuses every edit to that file but the one that repairs it, and the message names the value.
 ///
 /// Parsing alone is not the whole gate. A field whose schema type is broad enough to hold a
 /// malformed value — `forward`, where a `"host:cage"` remap is a string and so any string parses —
