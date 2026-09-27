@@ -1,8 +1,16 @@
 //! Styled stderr diagnostics — the single chokepoint for the `sbx: warning:` / `sbx: note:`
 //! family. Each call decides its palette from stderr, so a captured stream is plain text; the
 //! prefix carries the severity hue (yellow `warning:`, bold `note:`) and any `` `identifier` ``
-//! span in the message is lifted to the identifier hue (cyan). A plain stream is byte-for-byte the
-//! bare message with its backticks intact, so existing captured-output assertions are unaffected.
+//! span in the message is lifted to the identifier hue (cyan). A plain stream is sbx's own text
+//! byte for byte, backticks intact, so existing captured-output assertions are unaffected.
+//!
+//! Every message is written the way [`visible_lines`] writes it before any hue is added: a control
+//! character or a character that reorders a line comes out as an escape (`\x1b`, `\u{202e}`),
+//! while a line break and a tab are kept. A message quotes values sbx did not write (a path the
+//! cage chose, a program's stderr, a project's file name), and this is the one place they all
+//! reach the terminal, so a value is escaped whatever route it took. The hues sbx adds are the only
+//! escape sequences a diagnostic carries. What stays: a line break inside a value still starts a
+//! line, which can read as sbx's own, and only [`warn_config`] folds that away.
 
 use crate::style::Palette;
 use std::io::IsTerminal;
@@ -28,15 +36,17 @@ pub(crate) fn visible(text: &str) -> String {
     out
 }
 
-/// A parser's message as a terminal is to show it: each line written the way [`visible`] writes
-/// it, the line breaks kept.
+/// A message as a terminal is to show it: each line written the way [`visible`] writes it, the
+/// line breaks kept. Text whose only control characters are line breaks and tabs, and that holds no
+/// character that reorders a line, comes back byte for byte, and escaping twice changes nothing.
 ///
-/// Such a message spans lines on purpose, drawing the line at fault under a caret, and that line is
-/// the file's own text: a file sbx did not write can put an escape sequence or a right-to-left
-/// override in it. Only for a message whose breaks are the parser's own: a one-line message goes
-/// through [`visible`] whole, so that a newline carried by a value it quotes cannot start a line.
+/// For a message that spans lines on purpose, such as a parser's drawing the line at fault under a
+/// caret, whose line is the file's own text: a file sbx did not write can put an escape sequence or
+/// a right-to-left override in it. A carriage return is not a line break here, so one before a
+/// newline is shown rather than dropped. A one-line message goes through [`visible`] whole
+/// instead, so that a newline carried by a value it quotes cannot start a line.
 pub(crate) fn visible_lines(text: &str) -> String {
-    text.lines().map(visible).collect::<Vec<_>>().join("\n")
+    text.split('\n').map(visible).collect::<Vec<_>>().join("\n")
 }
 
 /// Whether `c` changes the order a terminal lays out the characters around it: the directional
@@ -88,12 +98,13 @@ pub(crate) fn warn(msg: &str) {
 
 /// Print a warning whose text a **config file chose** part of, with that part filtered.
 ///
-/// [`warn`]'s text is sbx's own from end to end, so it needs no filter. A configuration warning is
-/// not: it names the key or value it is complaining about, and for an untrusted project's
-/// `.sbx.toml` that name is the project's to spell — including control bytes and escape sequences,
-/// which reach the launching terminal exactly when sbx is telling the user what it refused. That is
-/// the one moment the user is reading, so it is the one worth forging: an escape run can erase the
-/// trust warnings printed above it.
+/// [`warn`] escapes what would drive the terminal but keeps line breaks, since sbx writes some of
+/// its own. A configuration warning names the key or value it is complaining about, and for an
+/// untrusted project's `.sbx.toml` that name is the project's to spell, including control bytes,
+/// escape sequences and line breaks, which reach the launching terminal exactly when sbx is telling
+/// the user what it refused. That is the one moment the user is reading, so it is the one worth
+/// forging: a line break can start a line that reads as sbx's own. This folds the warning to one
+/// bounded line first.
 ///
 /// The same reasoning already produced `mise_token_display` for the `[tools]` table, with a
 /// regression test beside it (`sandbox::launch::equip`, not linked here: it is `pub(super)` in a
@@ -126,13 +137,47 @@ pub(crate) fn hint(line: &str) {
 }
 
 /// Print a bare stderr error line (a usage error, a refusal) with its `` `identifiers` ``
-/// highlighted. The message carries its own `sbx: …` prefix verbatim — unlike [`warn`]/[`note`],
-/// nothing is added — so converting a plain `eprintln!` here changes no byte of a captured
-/// stream, only lifts the spans when stderr is a terminal.
+/// highlighted. The message carries its own `sbx: …` prefix verbatim (unlike [`warn`]/[`note`],
+/// nothing is added), so converting a plain `eprintln!` here changes no byte of sbx's own text in
+/// a captured stream, only lifts the spans when stderr is a terminal.
 pub(crate) fn error(msg: &str) {
     eprintln!(
         "{}",
         highlight(msg, &Palette::for_stream(std::io::stderr().is_terminal()))
+    );
+}
+
+/// The hue a whole diagnostic line is written in, for the few lines that are more than a message:
+/// a verdict that stops sbx, a failure worth catching the eye, a change sbx made, an aside.
+#[derive(Clone, Copy)]
+pub(crate) enum Hue {
+    Ok,
+    Warn,
+    Err,
+    Dim,
+}
+
+impl Hue {
+    fn of(self, pal: &Palette) -> &'static str {
+        match self {
+            Hue::Ok => pal.ok,
+            Hue::Warn => pal.warn,
+            Hue::Err => pal.err,
+            Hue::Dim => pal.dim,
+        }
+    }
+}
+
+/// [`error`], the whole line in `hue`. The message is escaped as every diagnostic is, so the hue
+/// is the only escape sequence the line carries: a caller never colours the text it passes.
+pub(crate) fn error_in(hue: Hue, msg: &str) {
+    eprintln!(
+        "{}",
+        hued_line(
+            msg,
+            hue,
+            &Palette::for_stream(std::io::stderr().is_terminal())
+        )
     );
 }
 
@@ -157,12 +202,25 @@ fn note_line(msg: &str, pal: &Palette) -> String {
     )
 }
 
-/// Lift each `` `…` `` span in `msg` to the identifier hue — the diagnostic family's view over
-/// the shared span scanner ([`crate::style::paint_spans`]). A plain palette returns the message
-/// verbatim — backticks kept — so a captured stream is byte-identical and every existing substring
-/// assertion (including ones that match a backtick-delimited token) still holds.
+/// The [`error_in`] line: the escaped message in `hue`, its spans lifted and the hue resumed after
+/// each. Pure (see [`warning_line`]).
+fn hued_line(msg: &str, hue: Hue, pal: &Palette) -> String {
+    let hue = hue.of(pal);
+    format!(
+        "{hue}{}{}",
+        crate::style::paint_spans(&visible_lines(msg), pal.name, hue, pal),
+        pal.reset
+    )
+}
+
+/// Write `msg` the way [`visible_lines`] does, then lift each `` `…` `` span to the identifier hue:
+/// the diagnostic family's view over the shared span scanner ([`crate::style::paint_spans`]). The
+/// escaping comes first, so the hue is added to text that can no longer carry one of its own. A
+/// plain palette returns sbx's own text verbatim, backticks kept, so a captured stream is
+/// byte-identical and every existing substring assertion (including ones that match a
+/// backtick-delimited token) still holds.
 fn highlight(msg: &str, pal: &Palette) -> String {
-    crate::style::paint_spans(msg, pal.name, "", pal)
+    crate::style::paint_spans(&visible_lines(msg), pal.name, "", pal)
 }
 
 #[cfg(test)]
@@ -298,6 +356,75 @@ mod tests {
             assert!(!reorders(c), "{c:?}");
             assert_eq!(visible(&c.to_string()), c.to_string());
         }
+    }
+
+    /// Every line the family prints is the message as [`visible_lines`] writes it: an escape
+    /// sequence, a carriage return or a character that reorders a line comes out written, while
+    /// the line breaks and tabs sbx puts in a message are kept. The only escape sequences in a
+    /// coloured line are the palette's own.
+    #[test]
+    fn every_diagnostic_line_writes_what_would_drive_the_terminal() {
+        let msg = "a\u{1b}[2J b\r c\u{202e}d\u{2066}\n\te `x`\u{7}";
+        let shown = visible_lines(msg);
+        assert_eq!(shown, "a\\x1b[2J b\\x0d c\\u{202e}d\\u{2066}\n\te `x`\\x07");
+        // A carriage return before a line break is shown, not dropped, and a final break is kept.
+        assert_eq!(visible_lines("a\r\nb\n"), "a\\x0d\nb\n");
+        let plain = Palette::plain();
+        assert_eq!(highlight(msg, &plain), shown);
+        assert_eq!(warning_line(msg, &plain), format!("sbx: warning: {shown}"));
+        assert_eq!(note_line(msg, &plain), format!("sbx: note: {shown}"));
+        assert_eq!(hued_line(msg, Hue::Err, &plain), shown);
+
+        let p = Palette::colored();
+        for line in [
+            highlight(msg, &p),
+            warning_line(msg, &p),
+            note_line(msg, &p),
+            hued_line(msg, Hue::Warn, &p),
+        ] {
+            let mut rest = line.clone();
+            for code in [p.name, p.warn, p.head, p.reset] {
+                rest = rest.replace(code, "");
+            }
+            assert!(
+                !rest.contains('\u{1b}') && !rest.contains('\r') && !rest.contains('\u{202e}'),
+                "an escape sequence other than the palette's reached the line: {line:?}"
+            );
+            assert!(
+                line.contains(&format!("{}x{}", p.name, p.reset)),
+                "{line:?}"
+            );
+            assert!(line.contains("\n\te "), "{line:?}");
+        }
+    }
+
+    /// sbx's own text is untouched, so a captured stream reads as before; and a message a producer
+    /// already escaped comes through the family unchanged rather than escaped twice.
+    #[test]
+    fn clean_or_already_escaped_text_is_left_as_it_is() {
+        let own =
+            "sbx: cannot trust `/p/.sbx.toml`: it is world-writable\n       run `sbx trust /p`\t.";
+        assert_eq!(visible_lines(own), own);
+        assert_eq!(highlight(own, &Palette::plain()), own);
+        for hostile in ["a\u{1b}]0;t\u{7}b", "x\ny\r\nz\u{202e}", "\u{200f}"] {
+            let once = visible_lines(hostile);
+            assert_eq!(visible_lines(&once), once);
+            assert_eq!(visible_lines(&visible(hostile)), visible(hostile));
+        }
+    }
+
+    /// A whole line in a hue keeps that hue around the spans it lifts, so an identifier inside it
+    /// does not end the colour for the rest of the line.
+    #[test]
+    fn a_hued_line_resumes_its_hue_after_each_span() {
+        let p = Palette::colored();
+        let line = hued_line("sbx: now using `/v` for data", Hue::Ok, &p);
+        assert!(line.starts_with(p.ok), "{line:?}");
+        assert!(line.ends_with(p.reset), "{line:?}");
+        assert!(
+            line.contains(&format!("{}/v{}{}", p.name, p.reset, p.ok)),
+            "{line:?}"
+        );
     }
 
     #[test]

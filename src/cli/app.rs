@@ -1369,19 +1369,14 @@ fn app_rm_purge_one(
             sandbox::human_bytes(home.bytes)
         );
     }
-    // Coloured for **stderr**, which is where `diag::error` writes — `pal` was chosen from stdout,
-    // so with one stream redirected and the other a terminal this wrote escape codes into a file.
-    // The stderr-derived palette is the idiom the rest of this module already uses.
-    {
-        let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
-        for (path, e) in &report.failed {
-            diag::error(&format!(
-                "{}sbx: could not remove {}: {e}{}",
-                epal.warn,
-                path.display(),
-                epal.reset
-            ));
-        }
+    // In the warning hue, which `diag` picks from **stderr**, where the line goes: `pal` was chosen
+    // from stdout, so with one stream redirected and the other a terminal a hue taken from it wrote
+    // escape codes into a file.
+    for (path, e) in &report.failed {
+        diag::error_in(
+            diag::Hue::Warn,
+            &format!("sbx: could not remove {}: {e}", path.display()),
+        );
     }
 
     // 3. Nothing found across either source → a no-op (likely a typo); do not report success.

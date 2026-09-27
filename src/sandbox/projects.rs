@@ -787,7 +787,7 @@ pub(crate) fn projects_rm(
         // exact id would delete the store and home of this very directory. `--force` is the opt-in.
         if rm_refuses_current(id, current.as_deref(), force) {
             crate::diag::error(&format!(
-                "sbx projects rm: {n}{id}{r} is the current project — refusing without {n}--force{r}."
+                "sbx projects rm: `{id}` is the current project — refusing without `--force`."
             ));
             had_error = true;
             continue;
@@ -804,7 +804,7 @@ pub(crate) fn projects_rm(
             }
             super::gc::ReapOneOutcome::Live => {
                 crate::diag::error(&format!(
-                    "sbx projects rm: project tree {n}{id}{r} is held by a live session — \
+                    "sbx projects rm: project tree `{id}` is held by a live session — \
                      stop it first with `sbx session stop` (`sbx session ls` names the pid), \
                      then `sbx projects rm {id}`."
                 ));
@@ -841,7 +841,7 @@ pub(crate) fn projects_rm(
             // it reclaimed on every run.
             super::gc::ReapOneOutcome::Failed { dir, error } => {
                 crate::diag::error(&format!(
-                    "sbx projects rm: could not remove {n}{}{r}: {error}. \
+                    "sbx projects rm: could not remove `{}`: {error}. \
                      What is left is neither the whole tree nor nothing — inspect it before \
                      retrying.",
                     dir.display()
@@ -859,10 +859,11 @@ pub(crate) fn projects_rm(
         if apply {
             super::launch::shared_store_gc(&layout, true, false, pal);
         } else {
-            crate::diag::error(&format!(
-                "sbx projects rm: {dim}--gc runs the shared-store collection only when the removal \
-                 is applied (add --yes, or drop --dry-run).{r}"
-            ));
+            crate::diag::error_in(
+                crate::diag::Hue::Dim,
+                "sbx projects rm: --gc runs the shared-store collection only when the removal \
+                 is applied (add --yes, or drop --dry-run).",
+            );
         }
     }
 

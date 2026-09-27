@@ -1039,10 +1039,11 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
     let text = std::str::from_utf8(&bytes).map_err(|_| "plugin.toml is not valid UTF-8")?;
     // A refusal quotes the value it refuses, and a manifest is text sbx did not write: a store's
     // plugin carries the publisher's. An install prints the refusal through `diag::error`, which
-    // filters nothing, so it is written the way `diag::visible` writes it, here rather than where
-    // each is built, so a check added later is covered without anyone remembering to. The
-    // parser's message spans lines on purpose, drawing the line at fault, so it is escaped a line
-    // at a time.
+    // escapes what would drive the terminal but keeps line breaks, so the refusal is written the
+    // way `diag::visible` writes it, whole: a line break in a value cannot start a line. That is
+    // done here rather than where each is built, so a check added later is covered without anyone
+    // remembering to. The parser's message spans lines on purpose, drawing the line at fault, so
+    // it is escaped a line at a time.
     let raw: RawManifest = toml::from_str(text).map_err(|e| {
         format!(
             "invalid plugin.toml: {}",
@@ -3397,7 +3398,7 @@ mod tests {
         );
     }
 
-    /// An install prints its refusal through `diag::error`, which filters nothing, and a refusal
+    /// An install prints its refusal through `diag::error`, which keeps line breaks, and a refusal
     /// quotes the manifest value it refuses: each comes back escaped and on one line, while the
     /// parser's own message keeps its lines.
     #[test]

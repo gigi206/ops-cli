@@ -556,7 +556,11 @@ a foreground session, through a terminal or in `sbx session logs`. Your terminal
 bytes, not sbx. What the egress proxy writes to its standard error is not among them: the
 supervisor relays it a line at a time, with control characters and the characters that
 reorder a line replaced, to the terminal of a foreground session or to the log of a detached
-one.
+one. sbx's own diagnostics (the `sbx: …` lines on standard error) quote values sbx did not
+write, such as a path the cage chose, a program's error output or a file a project names; each
+is printed with its control characters and its characters that reorder a line written as
+escapes such as `\x1b`. A line break is kept, so a value that carries one can still start a
+line of plain text.
 
 ## Where each decision is made
 

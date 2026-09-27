@@ -1137,15 +1137,13 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
     if !occupied_subtrees(default_dir).is_empty() {
         storage::mark_offered(default_dir);
         diag::error(&format!(
-            "{}sbx:{} your data directory is on {fs}. A compressed btrfs volume would cut its \
-             inode use to one and roughly halve its size.",
-            pal.head, pal.reset
+            "sbx: your data directory is on {fs}. A compressed btrfs volume would cut its \
+             inode use to one and roughly halve its size."
         ));
-        diag::hint(&format!(
-            "     migrate into one when convenient: {}sbx storage migrate{} \
+        diag::hint(
+            "     migrate into one when convenient: `sbx storage migrate` \
              (shown once; `sbx doctor` repeats the suggestion).",
-            pal.head, pal.reset
-        ));
+        );
         return;
     }
 
@@ -1172,12 +1170,10 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
     }
     match adopt_empty(default_dir) {
         Ok(mount_point) => {
-            diag::error(&format!(
-                "{}sbx: now using the volume at {}{}",
-                pal.ok,
-                mount_point.display(),
-                pal.reset
-            ));
+            diag::error_in(
+                diag::Hue::Ok,
+                &format!("sbx: now using the volume at {}", mount_point.display()),
+            );
             // The pointer-following path is memoised once per process and may already have been
             // consulted — and cached as "no volume" — while provisioning btrfs-progs into the
             // host store just above. So this process is steered onto the volume by the override,

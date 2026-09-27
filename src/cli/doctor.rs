@@ -322,13 +322,12 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
         println!("sbx: prerequisites OK.");
         ExitCode::SUCCESS
     } else {
-        let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
-        crate::diag::error(&format!(
-            "{}sbx: missing prerequisite(s) — sbx CANNOT run until these are resolved:{}",
-            epal.err, epal.reset
-        ));
+        crate::diag::error_in(
+            crate::diag::Hue::Err,
+            "sbx: missing prerequisite(s) — sbx CANNOT run until these are resolved:",
+        );
         for hint in remediation {
-            crate::diag::hint(&format!("       {}•{} {hint}", epal.err, epal.reset));
+            crate::diag::hint(&format!("       • {hint}"));
         }
         ExitCode::FAILURE
     }

@@ -249,6 +249,41 @@ fn trust_refuses_a_world_writable_mise_file() {
     assert_eq!(marker_count(state.path()), 0, "nothing trusted");
 }
 
+/// A refusal quotes the path a project's `.sbx.toml` names, and the project chose every byte of
+/// it. `sbx trust` prints that refusal before any review, so a name carrying an escape sequence or
+/// a right-to-left override must reach the terminal written out rather than obeyed.
+#[test]
+fn a_refusal_prints_the_path_a_project_names_in_a_form_that_drives_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
+    let cfg = proj.path().join(".sbx.toml");
+    std::fs::write(&cfg, "[env]\nX = \"sops://evil\\u001b[2J\\u202e.yaml\"\n").unwrap();
+    let sops = proj.path().join("evil\u{1b}[2J\u{202e}.yaml");
+    std::fs::write(&sops, b"a: 1\n").unwrap();
+    std::fs::set_permissions(&sops, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let out = sbx()
+        .arg("trust")
+        .arg("--yes")
+        .arg(&cfg)
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("spawn sbx trust");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("world-writable"), "{stderr}");
+    assert!(
+        stderr.contains("evil\\x1b[2J\\u{202e}.yaml"),
+        "the path is shown as written: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}') && !stderr.contains('\u{202e}'),
+        "the refusal carries what the project wrote into it: {stderr:?}"
+    );
+    assert_eq!(marker_count(state.path()), 0, "nothing trusted");
+}
+
 #[test]
 fn trust_refuses_a_world_writable_config() {
     use std::os::unix::fs::PermissionsExt;

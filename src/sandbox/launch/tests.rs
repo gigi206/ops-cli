@@ -356,9 +356,10 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
 /// A diagnostic sbx prints itself carries no interpolation: it goes through
 /// [`crate::diag::error`], which styles the identifiers in it.
 ///
-/// `diag::error` is `eprintln!` plus [`crate::style::paint_spans`] over the backticked spans, and
-/// it adds no prefix, so routing a line through it changes the bytes only where a backtick already
-/// stood. That is what makes this rule cheap to hold: no message is reworded to satisfy it.
+/// `diag::error` is `eprintln!` plus [`crate::style::paint_spans`] over the backticked spans of the
+/// escaped message, and it adds no prefix, so routing a line through it changes sbx's own bytes
+/// only where a backtick already stood. That is what makes this rule cheap to hold: no message is
+/// reworded to satisfy it.
 ///
 /// **The rule this replaced could not be checked.** It read the format string and refused a
 /// literal backtick, on the reasoning that a message with no identifier renders the same either

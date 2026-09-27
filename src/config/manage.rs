@@ -895,11 +895,12 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
     let _ = super::schema::parse_layer(before.as_bytes(), &mut before_dropped);
     let mut after_dropped = Vec::new();
     // A refusal quotes the value it refuses, and `sbx config` prints it through `diag::error`,
-    // which filters nothing. The walk covers every entry in the file, so the value may be one the
+    // which keeps line breaks. The walk covers every entry in the file, so the value may be one the
     // cage wrote into a project's `.sbx.toml`, carrying the very character it is refused for. Each
-    // refusal is therefore written the way `diag::visible` writes it, here rather than where it is
-    // built, so a list checked later is covered without anyone remembering to. The parser's own
-    // message spans lines on purpose, drawing the line at fault, so it is escaped a line at a time.
+    // refusal is therefore written the way `diag::visible` writes it, whole, so that a line break
+    // in the value cannot start a line; here rather than where it is built, so a list checked later
+    // is covered without anyone remembering to. The parser's own message spans lines on purpose,
+    // drawing the line at fault, so it is escaped a line at a time.
     let raw = super::schema::parse_layer(doc.to_string().as_bytes(), &mut after_dropped)
         .map_err(|e| crate::diag::visible_lines(&e))?;
     if let Some(notice) = after_dropped.iter().find(|notice| {
@@ -3062,9 +3063,9 @@ mod tests {
     }
 
     /// The refusal quotes the entry it refuses, and the entry may be one the cage wrote into the
-    /// project's file, carrying the very character it is refused for. `sbx config` prints the
-    /// refusal through `diag::error`, which filters nothing, so the entry is written the way
-    /// `diag::visible` writes it: the character is named, not obeyed.
+    /// project's file, carrying the very character it is refused for. The entry is written the way
+    /// `diag::visible` writes it before the refusal reaches `diag::error`, so the character is
+    /// named, not obeyed, and a line break in it cannot start a line.
     #[test]
     fn a_refused_fs_entry_is_quoted_in_a_form_that_drives_nothing() {
         let tmp = crate::testutil::TmpDir::new();
