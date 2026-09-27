@@ -3759,9 +3759,15 @@ mod tests {
         for i in 0..=MASK_MAX {
             std::fs::create_dir_all(root.join(format!(".git/worktrees/w{i}"))).unwrap();
         }
-        let why = expand(&root, &FsPolicy::default(), &[], None)
-            .refused
-            .expect("past the ceiling");
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        // What the expansion did find, so a run that refuses nothing says how far it read.
+        let why = e.refused.unwrap_or_else(|| {
+            panic!(
+                "past the ceiling, nothing refused; warnings {:?}, read-only {:?}",
+                e.warnings,
+                e.readonly.iter().map(|m| &m.path).collect::<Vec<_>>()
+            )
+        });
         assert!(why.contains("more than"), "{why}");
     }
 
