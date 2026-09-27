@@ -3416,22 +3416,30 @@ mod tests {
     /// the invocation's args in `$@`), so a test can exercise [`run_sops`] hermetically without the
     /// real sops or any decryption key — and without reading PATH (the binary path is passed in).
     ///
-    /// The interpreter is named **absolutely**, and that is the whole point. A
-    /// `#!/usr/bin/env <interp>` shebang resolves its interpreter through the *process*
-    /// environment, which the tests below deliberately narrow: the one that proves only an absolute
-    /// PATH entry may name a program sets `PATH` to a relative entry while it runs. Rust's harness
-    /// runs tests as threads of one process, so the shared `env_lock` serialises those
-    /// writers against each other but cannot stop a spawner that does not take it — and a fixture
-    /// launched in that window failed with `env: 'bash': No such file or directory`, at about one
-    /// run in twenty-five. Resolving the interpreter through PATH at write time would only narrow
-    /// that window; naming it absolutely removes it, and leaves no way for a later test to
-    /// reintroduce the coupling by forgetting a lock.
+    /// The interpreter is named **absolutely**, and the script sets its own `PATH` to the one the
+    /// process had under `env_lock`, and that is the whole point. A script looks up its interpreter
+    /// and every program its body runs through the *process* environment, which the tests below
+    /// deliberately narrow: the one that proves only an absolute PATH entry may name a program sets
+    /// `PATH` to a relative entry while it runs. Rust's harness runs tests as threads of one
+    /// process, so the shared `env_lock` serialises those writers against each other but cannot
+    /// stop a spawner that does not take it, and a fixture launched in that window failed: with
+    /// `env: 'bash': No such file or directory`, at about one run in twenty-five, while the
+    /// shebang went through `env`; then with `sleep: not found` once the shebang was absolute and
+    /// the body still looked `sleep` up. Every writer puts `PATH` back before it lets the lock
+    /// go, so the value read under it is the host's, and a body written later is covered without
+    /// naming its programs. A test that holds the lock writes its fixture before taking it: the
+    /// lock is not reentrant.
     ///
     /// `/bin/sh` rather than a bash found somewhere: the bodies below are POSIX, so the one
     /// interpreter every host is required to have at a fixed path is enough.
     fn fake_sops(dir: &TmpDir, body: &str) -> PathBuf {
         let path = dir.join("sops");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let host = {
+            let _lock = env_lock();
+            std::env::var_os("PATH").unwrap_or_default()
+        };
+        let host = host.to_string_lossy().replace('\'', r"'\''");
+        std::fs::write(&path, format!("#!/bin/sh\nPATH='{host}'\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -3447,8 +3455,8 @@ mod tests {
     /// still fails the test.
     ///
     /// The deadline is generous on purpose: these tests are about what sops answered, so a bound
-    /// that could bite would make them measure the machine's load instead. The tests that are
-    /// about the bound call [`run_sops`] directly with one short enough to observe.
+    /// that could bite would make them measure the machine's load instead. The test that is about
+    /// the bound gives one short enough to observe, through [`run_sops_retrying_spawn_within`].
     fn run_sops_retrying_spawn(
         sops: &Path,
         file: &Path,
@@ -3456,6 +3464,19 @@ mod tests {
         header: &str,
     ) -> io::Result<Option<String>> {
         let deadline = std::time::Duration::from_secs(60);
+        run_sops_retrying_spawn_within(sops, file, key, header, deadline)
+    }
+
+    /// [`run_sops_retrying_spawn`] under `deadline`. A retried spawn is one that failed before
+    /// sops ran, so it cannot stand for a run the deadline ended: that error says `did not
+    /// answer`, never `could not run sops`.
+    fn run_sops_retrying_spawn_within(
+        sops: &Path,
+        file: &Path,
+        key: Option<&str>,
+        header: &str,
+        deadline: std::time::Duration,
+    ) -> io::Result<Option<String>> {
         let mut attempt = run_sops(sops, file, key, header, deadline);
         for _ in 0..100 {
             match &attempt {
@@ -3491,10 +3512,10 @@ mod tests {
 
     /// sops that never answers is killed rather than waited on, and the failure names the file.
     ///
-    /// Called without the retry harness on purpose: a transient ETXTBSY would surface here as a
-    /// spawn error rather than a timeout, which is exactly what the assertion distinguishes. The
-    /// elapsed bound is the real measurement — the sleep ends on its own, so without it the test
-    /// would pass on a kill that never happened.
+    /// Through the retry harness, like the tests beside it: the fake sops is written then run, and
+    /// a spawn the parallel runner made busy is not what this test is about. The elapsed bound is
+    /// the real measurement, since the sleep ends on its own and without it the test would pass on
+    /// a kill that never happened; the few retried spawns fit well inside it.
     #[test]
     fn a_sops_that_never_answers_is_killed_rather_than_waited_on() {
         let dir = TmpDir::new();
@@ -3503,7 +3524,7 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
 
         let started = std::time::Instant::now();
-        let err = run_sops(
+        let err = run_sops_retrying_spawn_within(
             &sops,
             &file,
             None,
@@ -3831,12 +3852,13 @@ mod tests {
     /// directory belongs to the same class, since every non-absolute entry is dropped together.
     #[test]
     fn the_sops_that_decrypts_comes_from_an_absolute_path_entry() {
-        let _lock = env_lock();
         let dir = TmpDir::new();
+        // Written before the lock is taken, since writing one takes it.
+        fake_sops(&dir, "echo decrypted-by-the-planted-binary");
+        let _lock = env_lock();
         // The encrypted file sits outside the project, so this is about the lookup alone: one in
         // the project is refused before any lookup unless its trust covers it.
         let project = TmpDir::new();
-        fake_sops(&dir, "echo decrypted-by-the-planted-binary");
         let file = dir.join("prod.enc.yaml");
         std::fs::write(&file, "a: b\n").unwrap();
         let source = SecretSource::Sops { file, key: None };
