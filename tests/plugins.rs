@@ -1235,3 +1235,79 @@ fn a_signer_installs_under_its_name_and_states_the_auth_point_it_holds() {
         "a contested name resolves to nothing, so nothing lists as a signer:\n{listing}"
     );
 }
+
+/// What a plugin's manifest and the host's config chose is shown by `plugins info` and
+/// `plugins verify` as text that drives nothing, as `sbx config show` shows the same config.
+///
+/// A manifest's `exec`, `allow_paths` and `mask_paths` are held to no charset, and neither are a
+/// `[broker.<name>] allow` entry or a `[plugin.<name>] env` value. A tree changed after the install
+/// is reported with the name of what changed, which the tree's author or whoever changed it chose.
+#[test]
+fn plugins_info_writes_what_a_manifest_or_a_config_chose_as_text_that_drives_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
+
+    let dir = src.path().join("odd");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name=\"odd\"\ntype=\"resolver\"\nscheme=\"odd\"\nexec=\"R01\\u001b[7m\\u202eX\"\n\
+         [sandbox]\nallow_paths=[\"/nonexistent/P02\\u202eX\"]\n\
+         mask_paths=[\"/nonexistent/P02\\u202eX/M03\\u001b[7m\"]\n",
+    )
+    .unwrap();
+    let exec = dir.join("R01\u{1b}[7m\u{202e}X");
+    std::fs::write(&exec, "#!/bin/sh\necho secret\n").unwrap();
+    std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let broker = local_broker(src.path(), "demo-broker", "");
+    for source in [&dir, &broker] {
+        run(
+            &["plugins", "install", source.to_str().unwrap()],
+            home.path(),
+        );
+    }
+    std::fs::write(
+        home.path().join("sbx").join("sbx.toml"),
+        "[broker.demo-broker]\nsocket = \"/dev/null\"\nallow = [\"B04\\u202eX\"]\n\n\
+         [plugin.odd]\nenv = { ODD = \"V05\\u001b[7m\\u202eX\" }\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "/",
+        home.path()
+            .join("sbx")
+            .join("plugins")
+            .join("odd")
+            .join("L06\u{1b}[7m\u{202e}X"),
+    )
+    .unwrap();
+
+    let odd = run(&["plugins", "info", "odd"], home.path());
+    let broker = run(&["plugins", "info", "demo-broker"], home.path());
+    // Drift is a failure, so read the page whatever the status.
+    let (_, verify, _) = run_both(&["plugins", "verify"], home.path());
+    for (page, text, tags) in [
+        ("info odd", &odd, &["R01", "P02", "M03", "V05", "L06"][..]),
+        ("info demo-broker", &broker, &["B04"][..]),
+        ("verify", &verify, &["L06"][..]),
+    ] {
+        assert!(
+            !text
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || is_reordering(c)),
+            "`plugins {page}` wrote a character that drives the terminal:\n{text:?}"
+        );
+        for tag in tags {
+            assert!(text.contains(tag), "`plugins {page}` names {tag}:\n{text}");
+        }
+    }
+}
+
+/// A character that changes the order a terminal lays out the line around it.
+fn is_reordering(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}

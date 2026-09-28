@@ -2230,7 +2230,9 @@ fn plugins_verify(name: Option<&str>) -> ExitCode {
             ),
             plugins::Integrity::Unreadable(why) => {
                 changed += 1;
-                format!("{err}cannot be hashed{r} {dim}({why}){r}")
+                // The error quotes names inside the installed tree, which its author chose, or
+                // whoever changed it since: written as text, as every value on these pages is.
+                format!("{err}cannot be hashed{r} {dim}({}){r}", diag::visible(why))
             }
         };
         println!("  {n}{dir_name}{r}  {line}");
@@ -2451,10 +2453,17 @@ fn print_about(
             plugins::Integrity::Unrecorded =>
                 "no digest recorded (installed before sbx recorded one, or placed by hand)"
                     .to_string(),
-            plugins::Integrity::Unreadable(why) => format!("{err}cannot be hashed{r} ({why})"),
+            plugins::Integrity::Unreadable(why) => {
+                format!("{err}cannot be hashed{r} ({})", diag::visible(&why))
+            }
         }
     );
-    print!("  exec:        {}", about.exec.display());
+    // The manifest names the program by a relative path held to no charset, so it is written as
+    // text: below the integrity and origin lines, an escape in it could otherwise rewrite them.
+    print!(
+        "  exec:        {}",
+        diag::visible(&about.exec.display().to_string())
+    );
     match runnable {
         Ok(()) => println!(),
         Err(why) => println!("  {err}[not runnable: {why}]{r}"),
@@ -2594,11 +2603,7 @@ fn print_grant_paths(label: &str, paths: &[PathBuf]) {
     if paths.is_empty() {
         println!("    {label}:  (none)");
     } else {
-        let joined = paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let joined = visible_paths(paths);
         println!("    {label}:  {joined}");
     }
 }
@@ -2614,12 +2619,19 @@ fn print_grant_masks(paths: &[PathBuf]) {
         println!("    mask_paths:   (none)");
         return;
     }
-    let joined = paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let joined = visible_paths(paths);
     println!("    mask_paths:   {joined} (hidden inside the grant above)");
+}
+
+/// A manifest's path list for a grant line, joined, each path written as text by
+/// [`diag::visible`]: `allow_paths` and `mask_paths` are held to where they point, not to what
+/// they spell.
+fn visible_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| diag::visible(&p.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One `sbx plugins info` grant line listing passed-through environment variables, or `(none)`.
@@ -2704,7 +2716,13 @@ fn info_broker(
                 "    allow:       {}",
                 match allow.is_empty() {
                     true => "(none — the plugin is handed an empty grant)".to_string(),
-                    false => allow.join(", "),
+                    // The policy is handed to the plugin verbatim and held to no charset: shown
+                    // as text, as `sbx config show` shows the same list.
+                    false => allow
+                        .iter()
+                        .map(|a| diag::visible(a))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 }
             );
         }
@@ -2813,6 +2831,8 @@ fn print_plugin_host_config(name: &str, grant: &plugins::SandboxGrant, err: &str
     for (k, v) in &raw.env {
         let declared =
             grant.allow_env.iter().any(|d| d == k) || grant.allow_env_paths.iter().any(|d| d == k);
+        // A config's key and value, held to no charset: shown as text, as `sbx config show` does.
+        let (k, v) = (diag::visible(k), diag::visible(v));
         match declared {
             true => println!("    {k}={v}"),
             false => println!("    {k}={v}  {err}[ignored: the manifest does not declare it]{r}"),

@@ -31,6 +31,12 @@ See also: [Plugins](../plugins/) · [Signed plugin stores](../plugins/stores) ·
 `install` is a deliberate user act (an agent in the cage cannot run it); the staged
 copy is validated exactly as the launcher will and refused, fail-closed, on any flaw.
 
+`info` and `verify` write what a manifest and the host's config chose as text, as
+[`sbx config show`](config) writes a config: a control character or a character that reorders a
+line, in the `exec` path, a grant path, a `[broker.<name>] allow` entry, a `[plugin.<name>] env`
+value or a file name an integrity error quotes, is written out as an escape (`\x1b`, `\u{202e}`,
+a line break as `\x0a`).
+
 `--json` on `list`, `info` and `store list` emits a document instead of the listing. `list` keeps
 one array per kind rather than flattening them, because the distinction is load-bearing: a
 `scheme://` reaches a resolver and never a broker. `info` carries the sandbox grant whole, which is
