@@ -146,6 +146,11 @@ The log's bytes go to **stdout** unchanged, so redirecting captures the agent's 
 wrote it; the context line goes to stderr. `--follow` on a session that has already exited prints
 what is there and returns rather than waiting for output that will never come.
 
+Unchanged means unescaped. The colours, cursor moves and redraws an agent's interface is made of
+replay as it drew them, and so does any other control sequence the agent printed: your terminal
+acts on it exactly as it would have in a foreground session, where the agent writes to it directly.
+`sbx session logs <id> | cat -v` shows those sequences as text.
+
 Logs are keyed by PID and appended to, so a PID the kernel later reuses writes into the same
 file. A header line separates the sessions and only the most recent one is shown; pass `--all`
 for the whole file.

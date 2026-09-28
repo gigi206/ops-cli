@@ -1172,6 +1172,11 @@ pub(super) const PAGES: &[Page] = &[
             reported, and it is the trustworthy signal — a `${NAME}` in the text could have been\n\
             printed by the command.\n\
             \n\
+            Apart from that substitution the streams are the command's bytes, written out\n\
+            unescaped: a redirect captures exactly what it printed, and a control sequence in its\n\
+            output reaches your terminal as it would if you had run the program there. Pipe the\n\
+            output through `cat -v` to read it as text.\n\
+            \n\
             With `--json` everything above becomes fields of one document on stdout — the two streams\n\
             among them, so nothing interleaves with it, and the warnings printed as prose otherwise\n\
             (`timed_out`, `stopped`, `truncated`, `redacted`, `refused`, `output`) are values rather\n\
@@ -1389,7 +1394,9 @@ pub(super) const PAGES: &[Page] = &[
             for output that will never come.\n\
             \n\
             The log's bytes go to stdout unchanged, so redirecting captures the agent's output as\n\
-            it wrote it; the context line goes to stderr. Two lines are sbx's own, both marked\n\
+            it wrote it; the context line goes to stderr. Unchanged means unescaped: a control\n\
+            sequence the agent printed reaches your terminal as it would have in the foreground,\n\
+            and `| cat -v` shows it as text. Two lines are sbx's own, both marked\n\
             `=== … ===` and both written before the agent's first byte: a header naming the\n\
             session, and one `=== sbx trust-drop: … ===` per security field the trust gate dropped\n\
             from this launch. That note is here because a detached session states its dropped\n\

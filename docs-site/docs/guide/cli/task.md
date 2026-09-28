@@ -238,6 +238,12 @@ truncated at `max_output`, when the timeout fired, when [`stop`](#stop) ended it
 were substituted, that count is host-side, which is what makes it trustworthy (a `${NAME}` in the
 text could have been printed by the command itself).
 
+Apart from that substitution, the streams are the command's own bytes, written out unescaped: a
+redirect (`sbx task run dump > dump.bin`) captures exactly what the command printed, and its colours
+and progress lines show as it drew them. The same holds for a control sequence in the output, one
+stored in a database row a query returns for instance: your terminal acts on it, as it would if you
+had run the program there yourself. Pipe the output through `cat -v` to read it as text.
+
 **`--json`.** One document on stdout and nothing else: the streams travel *inside* it, so a command
 that writes to stdout cannot interleave with it, and everything sbx says as prose otherwise becomes a
 field:
