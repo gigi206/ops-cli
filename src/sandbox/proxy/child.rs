@@ -38,16 +38,13 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-#[cfg(not(test))]
 pub(crate) use process::Proxy;
-#[cfg(test)]
-pub(crate) use stand_in::Proxy;
 
 /// How long the supervisor waits for a proxy it started to say it serves. Far above what a start
 /// costs, its cage included: a proxy that has not answered by then is not going to.
@@ -113,7 +110,7 @@ pub(crate) fn launch(
     let not_started =
         |e: io::Error| io::Error::new(e.kind(), format!("the egress proxy did not start: {e}"));
     let (down, up) = wire::Socket::pair()?;
-    let proxy = Proxy::start(start.bwrap, up, &start.listener).map_err(not_started)?;
+    let proxy = Proxy::start(start.bwrap, up).map_err(not_started)?;
     let served = hand_over(&down, start, START_WAIT)
         .and_then(|ca| Ok((ca, super::link::supervising(down, judge, parks, refresh)?)));
     match served {
@@ -198,9 +195,9 @@ pub(crate) fn main(argv: &[OsString]) -> ExitCode {
         crate::diag::error("sbx: __proxy: expects the descriptor of its link, and nothing else");
         return ExitCode::from(2);
     };
-    match wire::Socket::adopt(fd).and_then(|link| run(link, &Arc::new(AtomicBool::new(false)))) {
+    match wire::Socket::adopt(fd).and_then(run) {
         // Returning ends the process, and every thread the proxy still had with it.
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             crate::diag::error(&format!("sbx: egress proxy: {e}"));
             ExitCode::FAILURE
@@ -210,9 +207,8 @@ pub(crate) fn main(argv: &[OsString]) -> ExitCode {
 
 /// Serve as the proxy at the other end of `link` until the link ends: go under the proxy's seccomp
 /// filters, read the start, mint the certificate authority, stand everything up, say so, and serve.
-/// Returns the thread accepting the cage's connections, which `stop` ends once it is set and the
-/// accept it waits in returns; a process ends it by exiting.
-fn run(link: wire::Socket, stop: &Arc<AtomicBool>) -> io::Result<JoinHandle<()>> {
+/// Returns once the link has ended, and the process, ending, takes the accepting with it.
+fn run(link: wire::Socket) -> io::Result<()> {
     // First, on the thread every other one of the proxy's is started from, before it reads a byte.
     crate::sandbox::seccomp::proxy::confine()?;
     let (doc, fds) = link.recv_down()?.ok_or_else(|| {
@@ -228,21 +224,20 @@ fn run(link: wire::Socket, stop: &Arc<AtomicBool>) -> io::Result<JoinHandle<()>>
         ca: ctx.ca_cert_pem().to_string(),
     })
     .map_err(|_| wire::invalid("an answer that does not encode"))?;
-    let serving = {
-        let (ctx, stop) = (Arc::clone(&ctx), Arc::clone(stop));
+    {
+        let ctx = Arc::clone(&ctx);
         std::thread::Builder::new()
             .name("sbx-proxy-accept".into())
             .spawn(move || {
                 // A serve error ends the accepting, and the cage loses egress: fail-closed.
-                let _ = super::serve(listener, ctx, stop);
-            })?
-    };
+                let _ = super::serve(listener, ctx, Arc::new(AtomicBool::new(false)));
+            })?;
+    }
     // Last, once everything it serves with stands: the supervisor starts the cage on this.
     ctx.link.announce(&ready)?;
     drop(ctx);
     let _ = reader.join();
-    stop.store(true, Ordering::SeqCst);
-    Ok(serving)
+    Ok(())
 }
 
 /// What a proxy serves with, from its `start` and the descriptors handed over beside it: the context
@@ -293,10 +288,29 @@ fn command(bwrap: &Path, link: wire::Socket) -> io::Result<(Command, Vec<File>)>
     Ok((command, files))
 }
 
+/// What a test binary starts as the proxy, holding `link`: `sbx __proxy` as the test binary runs it
+/// ([`tests::the_stand_in_proxys_process`]), out of any cage. A test binary is not sbx and cannot be
+/// started as `sbx __proxy`, and a host without user namespaces (the hosted CI) has no cage to
+/// start. The process, the start, the bytes and everything the proxy stands up are its own; the cage
+/// is not.
+#[cfg(test)]
+fn stand_in(_bwrap: &Path, link: wire::Socket) -> (Command, Vec<File>) {
+    let fd = std::os::fd::AsFd::as_fd(&link).as_raw_fd();
+    let mut command = crate::testutil::alone(
+        concat!(module_path!(), "::tests::the_stand_in_proxys_process"),
+        fd.to_string(),
+    );
+    // Its streams as [`command`] sets the caged proxy's.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    (command, vec![File::from(OwnedFd::from(link))])
+}
+
 /// How long stopping a proxy waits for the relay to write what the proxy wrote last. The relay ends
 /// when every writer of the pipe has closed it, the proxy and anything left in its cage, so the
 /// wait is bounded rather than joined.
-#[cfg(not(test))]
 const RELAY_DRAIN_WAIT: Duration = Duration::from_secs(1);
 
 /// Relay the caged proxy's standard error to this process's standard error, on a thread of its own
@@ -309,7 +323,6 @@ const RELAY_DRAIN_WAIT: Duration = Duration::from_secs(1);
 /// Stopping the proxy waits on it, because the error a proxy dies with is what the supervisor's
 /// own message then points at ("its own error, if any, is above"). `None` when the thread could
 /// not start, and there is nothing to wait for.
-#[cfg(not(test))]
 fn relay_stderr(stderr: std::process::ChildStderr) -> Option<std::sync::mpsc::Receiver<()>> {
     let (done, finished) = channel::<()>();
     let started = std::thread::Builder::new()
@@ -401,12 +414,11 @@ fn spawn_lasting(command: Command, files: Vec<File>) -> io::Result<Child> {
     outcome.recv().map_err(|_| gone())?
 }
 
-/// The proxy as a process in its cage.
-#[cfg(not(test))]
+/// The proxy as a process: in its cage, or out of any in a test binary (`stand_in`).
 mod process {
     use super::*;
 
-    /// A proxy running in its cage, stopped when this is dropped.
+    /// A proxy's process, stopped when this is dropped.
     pub(crate) struct Proxy {
         child: Option<Child>,
         /// Disconnected once the relay of the proxy's standard error has written its last line.
@@ -414,19 +426,33 @@ mod process {
     }
 
     impl Proxy {
-        /// Start a proxy caged by `bwrap`, holding `link`.
-        pub(super) fn start(
-            bwrap: &Path,
-            link: wire::Socket,
-            _listener: &UnixListener,
-        ) -> io::Result<Proxy> {
+        /// Start a proxy caged by `bwrap`, holding `link`; in a test binary, one out of any cage.
+        pub(super) fn start(bwrap: &Path, link: wire::Socket) -> io::Result<Proxy> {
+            #[cfg(not(test))]
             let (command, files) = command(bwrap, link)?;
+            #[cfg(test)]
+            let (command, files) = stand_in(bwrap, link);
             let mut child = spawn_lasting(command, files)?;
             let relayed = child.stderr.take().and_then(relay_stderr);
             Ok(Proxy {
                 child: Some(child),
                 relayed,
             })
+        }
+
+        /// No proxy at all: what a test of the guard alone holds.
+        #[cfg(test)]
+        pub(crate) fn none() -> Proxy {
+            Proxy {
+                child: None,
+                relayed: None,
+            }
+        }
+
+        /// The proxy's process, while this holds one.
+        #[cfg(test)]
+        pub(crate) fn pid(&self) -> Option<u32> {
+            self.child.as_ref().map(Child::id)
         }
 
         /// Give the proxy up to `wait` to exit, its link closed, then kill it; and reap it. A proxy
@@ -457,84 +483,6 @@ mod process {
             }
             if let Some(relayed) = self.relayed.take() {
                 let _ = relayed.recv_timeout(RELAY_DRAIN_WAIT);
-            }
-        }
-    }
-
-    impl Drop for Proxy {
-        fn drop(&mut self) {
-            self.stop(Duration::ZERO);
-        }
-    }
-}
-
-/// The proxy on a thread of the test process.
-#[cfg(test)]
-mod stand_in {
-    use super::*;
-
-    /// A proxy that runs [`run`] on a thread of this process instead of in a cage: a test binary is
-    /// not sbx and cannot be started as `sbx __proxy`, and a host without user namespaces (the hosted
-    /// CI) has no cage to start. The start, the bytes and everything the proxy stands up are its
-    /// own; the process and the cage are not.
-    pub(crate) struct Proxy {
-        stop: Arc<AtomicBool>,
-        /// The cage's socket, which a stop connects to once to unpark the accept its loop waits in.
-        poke: Option<std::path::PathBuf>,
-        running: Option<JoinHandle<io::Result<JoinHandle<()>>>>,
-    }
-
-    impl Proxy {
-        pub(super) fn start(
-            _bwrap: &Path,
-            link: wire::Socket,
-            listener: &UnixListener,
-        ) -> io::Result<Proxy> {
-            let stop = Arc::new(AtomicBool::new(false));
-            let poke = listener.local_addr()?.as_pathname().map(Path::to_path_buf);
-            let running = {
-                let stop = Arc::clone(&stop);
-                std::thread::Builder::new()
-                    .name("sbx-proxy".into())
-                    .spawn(move || run(link, &stop))?
-            };
-            Ok(Proxy {
-                stop,
-                poke,
-                running: Some(running),
-            })
-        }
-
-        /// No proxy at all: what a test of the guard alone holds.
-        pub(crate) fn none() -> Proxy {
-            Proxy {
-                stop: Arc::new(AtomicBool::new(true)),
-                poke: None,
-                running: None,
-            }
-        }
-
-        /// Give the proxy up to `wait` to see its link end, as a proxy in its cage does, and only
-        /// then end its accepting, as that proxy's exit would: the flag first, then one connection
-        /// to unpark the accept, which reads the flag as it returns. Ended first, the accepting
-        /// would drop the proxy's end of the link and end the link itself, and a stop that never
-        /// closed the link would pass for one that did.
-        pub(crate) fn stop(&mut self, wait: Duration) {
-            let Some(running) = self.running.take() else {
-                return;
-            };
-            let deadline = std::time::Instant::now() + wait;
-            while !running.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            self.stop.store(true, Ordering::SeqCst);
-            if let Some(poke) = &self.poke {
-                let _ = UnixStream::connect(poke);
-            }
-            if running.is_finished()
-                && let Ok(Ok(serving)) = running.join()
-            {
-                let _ = serving.join();
             }
         }
     }
@@ -793,21 +741,38 @@ mod tests {
             .ok()
     }
 
+    /// The stand-in proxy's process ([`stand_in`]): `sbx __proxy` over the link it was handed,
+    /// until the link ends; anywhere else it does nothing.
+    #[test]
+    #[ignore = "run alone as the stand-in proxy"]
+    fn the_stand_in_proxys_process() {
+        crate::testutil::when_run_alone(|link| {
+            if main(&[link.to_owned()]) == ExitCode::SUCCESS {
+                Ok(())
+            } else {
+                Err(io::Error::other("the proxy ended with a failure"))
+            }
+        });
+    }
+
     /// A started proxy runs under its seccomp filters, and so does every thread it starts: the one
-    /// accepting the cage's connections carries exactly two filters more than the test that started
-    /// the proxy, which are the proxy's own.
+    /// accepting the cage's connections carries exactly two filters more than the first thread of
+    /// the proxy's process, which never goes under them: those two are the proxy's own.
     #[test]
     fn every_thread_a_proxy_starts_runs_under_its_filters() {
-        let Some(own) = filters(Path::new("/proc/thread-self/status")) else {
+        if filters(Path::new("/proc/thread-self/status")).is_none() {
             skip_incapable!("skipping: this kernel does not count a thread's seccomp filters");
             return;
-        };
+        }
         let dir = TmpDir::new();
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
-        let (_launched, _) = started(&dir, &log);
+        let (launched, _) = started(&dir, &log);
+        let process =
+            Path::new("/proc").join(launched.proxy.pid().expect("a proxy running").to_string());
+        let own = filters(&process.join("status")).expect("the proxy's first thread");
         let accepting_now = || {
             let mut accepting = Vec::new();
-            for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+            for task in std::fs::read_dir(process.join("task")).unwrap().flatten() {
                 // A thread's name as the kernel keeps it, cut to fifteen bytes.
                 let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
                 if comm.trim_end() == "sbx-proxy-accep"
@@ -835,7 +800,7 @@ mod tests {
         );
         assert!(
             accepting.iter().all(|&n| n == own + 2),
-            "{own} filters on this test's thread, {accepting:?} on the accepting ones"
+            "{own} filters on the proxy's first thread, {accepting:?} on the accepting ones"
         );
     }
 
