@@ -32,7 +32,10 @@ Reports **ALLOWED / DENIED / WOULD ASK** and the rule that decides it, against t
 effective [egress policy](../networking/modes) a launch would serve. The built-in
 self-equip allow-set is included, and a declared [credential injection](../secrets/injection)
 is noted (by header and source, never the value, and not resolved). Reflects the
-[trust gate](../concepts/trust): an untrusted project's policy is dropped.
+[trust gate](../concepts/trust): an untrusted project's policy is dropped. The rule and the
+credential are written as text, as [`sbx config show`](config) writes them: a control
+character or a character that reorders a line is written out as an escape (`\x1b`,
+`\u{202e}`, a line break as `\x0a`).
 
 | Option | Meaning |
 |---|---|

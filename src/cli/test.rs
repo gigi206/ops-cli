@@ -266,7 +266,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
                         "{}",
                         render_addr_refusal(
                             target,
-                            &format!("a tcp:// rule allows the splice ({rule})"),
+                            &format!("a tcp:// rule allows the splice ({})", shown_rule(rule)),
                             &refusal,
                             &pal
                         )
@@ -374,7 +374,7 @@ fn render_url_verdict(
     );
     if allowed && let Some(refusal) = literal_addr_refusal(&host, deciding) {
         let by = match deciding {
-            Some(rule) => format!("the policy allows it (allow rule: {rule})"),
+            Some(rule) => format!("the policy allows it (allow rule: {})", shown_rule(rule)),
             None => "the policy allows it (allow-by-default)".to_string(),
         };
         o.push_str(&render_addr_refusal(url, &by, &refusal, pal));
@@ -427,9 +427,13 @@ fn render_net_decision(
             // Name the source when the allow came from the built-in self-equip set rather than a
             // user rule, so a pass the config did not declare is explained, not surprising.
             if builtin {
-                let _ = writeln!(o, "  {dim}by allow rule (built-in):{r} {n}{rule}{r}");
+                let _ = writeln!(
+                    o,
+                    "  {dim}by allow rule (built-in):{r} {n}{}{r}",
+                    shown_rule(rule)
+                );
             } else {
-                let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
+                let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{}{r}", shown_rule(rule));
             }
             // Testing one URL against a catch-all proves nothing about *this* URL: the rule admits
             // every host, so the pass would look identical for a destination the author never meant
@@ -444,7 +448,11 @@ fn render_net_decision(
         }
         allowlist::Decision::DeniedBy(rule) => {
             let _ = writeln!(o, "{err}DENIED{r}   {n}{url}{r}");
-            let _ = writeln!(o, "  {dim}by deny rule (deny wins):{r} {n}{rule}{r}");
+            let _ = writeln!(
+                o,
+                "  {dim}by deny rule (deny wins):{r} {n}{}{r}",
+                shown_rule(rule)
+            );
         }
         allowlist::Decision::DeniedDefault => {
             let _ = writeln!(o, "{err}DENIED{r}   {n}{url}{r}");
@@ -487,7 +495,7 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
                 o,
                 "{ok}SPLICED{r}  {n}{target}{r} {dim}(raw L4 — uninspected){r}"
             );
-            let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
+            let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{}{r}", shown_rule(rule));
         }
         allowlist::L4Decision::Suppressed(rule) => {
             let _ = writeln!(o, "{err}NOT SPLICED{r} {n}{target}{r}");
@@ -497,7 +505,7 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
                  inspected L7 path, where it is denied (or, for a non-TLS protocol, the handshake \
                  fails closed). To allow raw access, drop or narrow the deny.{r}"
             );
-            let _ = writeln!(o, "  {dim}by deny rule:{r} {n}{rule}{r}");
+            let _ = writeln!(o, "  {dim}by deny rule:{r} {n}{}{r}", shown_rule(rule));
         }
         allowlist::L4Decision::NoMatch => {
             let _ = writeln!(o, "{err}NOT SPLICED{r} {n}{target}{r}");
@@ -693,9 +701,16 @@ fn render_injection_note(secret: &config::HeaderSecret, pal: &style::Palette) ->
     let (dim, n, r) = (pal.dim, pal.name, pal.reset);
     format!(
         "  {dim}+ a credential would be injected:{r} {n}{}{r} {dim}(from {}){r}\n",
-        secret.headers().join(", "),
-        secret.describe_sources()
+        diag::visible(&secret.headers().join(", ")),
+        diag::visible(&secret.describe_sources())
     )
+}
+
+/// A rule as a verdict names it, written as text by [`diag::visible`]: a rule's URL path and a
+/// `re:` pattern are held by `allowlist::classify` to no control character, not to the characters
+/// that reorder a line, and `sbx config show` writes the same rules escaped.
+fn shown_rule(rule: &allowlist::Rule) -> String {
+    diag::visible(&rule.to_string())
 }
 
 /// The parsed form of `sbx test proc`: which app's overlay to fold in, the caller chain to decide
@@ -1269,6 +1284,55 @@ mod tests {
             allowed,
             "DENIED   https://x/y\n  no allow rule matches (deny-by-default)\n"
         );
+    }
+
+    /// The rule a verdict names and the credential it would inject are the config's: a rule's URL
+    /// path is held to no control character, not to the characters that reorder a line, a header
+    /// name likewise, and a `file://` path to neither. The lines write them as text, as
+    /// `sbx config show` writes the same values.
+    #[test]
+    fn a_verdict_names_its_rule_and_credential_as_text_that_drives_nothing() {
+        let p = style::Palette::plain();
+        let rule = allowlist::classify("api.test/T01\u{202e}X").expect("a rule the grammar admits");
+        let allowed = render_net_decision(
+            "https://api.test/T01",
+            &allowlist::Decision::AllowedBy(&rule),
+            false,
+            &p,
+        );
+        let denied = render_net_decision(
+            "https://api.test/T01",
+            &allowlist::Decision::DeniedBy(&rule),
+            false,
+            &p,
+        );
+        let secret = config::HeaderSecret {
+            name: "api.test".into(),
+            description: None,
+            sources: vec![config::SecretSource::File(
+                "/S02\u{1b}[7m\nforged\u{202e}X".into(),
+            )],
+            to: rule.clone(),
+            header: "X-H03\u{202e}X".into(),
+            shape: config::HeaderShape::new("Bearer ", false),
+            signer: None,
+            optional: false,
+        };
+        let note = render_injection_note(&secret, &p);
+        for text in [&allowed, &denied, &note] {
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| (c.is_control() && c != '\n') || crate::diag::reorders(c)),
+                "{text:?}"
+            );
+        }
+        assert!(
+            allowed.contains("T01") && denied.contains("T01"),
+            "{allowed}{denied}"
+        );
+        assert_eq!(note.lines().count(), 1, "the note stays one line: {note:?}");
+        assert!(note.contains("S02") && note.contains("X-H03"), "{note}");
     }
 
     #[test]
