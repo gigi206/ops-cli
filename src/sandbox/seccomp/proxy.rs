@@ -131,23 +131,24 @@ pub(crate) fn confine() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::allowlist::probe::{Outcome, call, opening, outcome};
+    use super::super::allowlist::probe::{
+        Probes, as_the_probes_process, call, done, in_a_process, opening, outcome,
+    };
     use super::*;
-    use std::collections::BTreeMap;
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    /// What the probes found: each call's outcome under the proxy's filters, by name, and the
-    /// process a `clone` let through, if one did, for the caller to reap.
-    struct Probed {
-        outcomes: BTreeMap<&'static str, Outcome>,
-        started: Option<libc::pid_t>,
+    /// The probes' process ([`in_a_process`]), run by
+    /// [`the_proxys_filters_refuse_what_its_work_does_not_make`]; anywhere else it does nothing.
+    #[test]
+    #[ignore = "run alone by the test that reads its report"]
+    fn the_probes_process() {
+        as_the_probes_process(|_| probes());
     }
 
-    /// Every probe, made on a thread of this process under the proxy's filters, the calls that need
-    /// a descriptor making them on ones opened before it. Only that thread is confined, and the
-    /// outcomes are judged by the caller, outside it.
-    fn under_the_filters() -> Probed {
+    /// Confine the process under the proxy's filters, and make every probe, the calls that need a
+    /// descriptor making them on ones opened before.
+    fn probes() -> Probes {
         let mut pipe = [-1; 2];
         // SAFETY: `pipe2` writes two descriptors into the two-element array.
         assert_eq!(
@@ -160,219 +161,197 @@ mod tests {
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut file = crate::sandbox::memfd::write(c"sbx-probe", b"handed over").unwrap();
         // The size `read_to_end` asks for first is refused under the filters, which it survives.
-        // Asked once out here, so a choice the standard library makes once per process, whether
-        // `statx` works, is made where it does: made first under the filters, it would be the wrong
-        // one for every other test in the process.
+        // Asked once out here, before them, so a choice the standard library makes once per
+        // process, whether `statx` works, is settled outside the filters on every run.
         let _ = file.metadata();
 
-        let probing = std::thread::spawn(move || {
-            let mut out = BTreeMap::new();
-            out.insert(
-                "confine",
-                confine()
-                    .map(|()| 0)
-                    .map_err(|e| e.raw_os_error().unwrap_or(0)),
-            );
-            let (r, w, s) = (
-                pipe_r.as_raw_fd() as libc::c_long,
-                pipe_w.as_raw_fd() as libc::c_long,
-                socket.as_raw_fd() as libc::c_long,
-            );
-            let path = c"/dev/null".as_ptr() as libc::c_long;
+        let mut out = Vec::new();
+        out.push(("confine", done(confine())));
+        let (r, w, s) = (
+            pipe_r.as_raw_fd() as libc::c_long,
+            pipe_w.as_raw_fd() as libc::c_long,
+            socket.as_raw_fd() as libc::c_long,
+        );
+        let path = c"/dev/null".as_ptr() as libc::c_long;
 
-            // Refused.
-            out.insert(
-                "openat",
-                opening(
-                    libc::SYS_openat,
-                    &[libc::AT_FDCWD as _, path, libc::O_RDONLY as _],
-                ),
-            );
-            #[cfg(target_arch = "x86_64")]
-            out.insert(
-                "open",
-                opening(libc::SYS_open, &[path, libc::O_RDONLY as _]),
-            );
-            out.insert(
-                "socket inet",
-                opening(
-                    libc::SYS_socket,
-                    &[libc::AF_INET as _, libc::SOCK_STREAM as _],
-                ),
-            );
-            out.insert(
-                "socket unix",
-                opening(
-                    libc::SYS_socket,
-                    &[libc::AF_UNIX as _, libc::SOCK_STREAM as _],
-                ),
-            );
-            out.insert("connect", call(libc::SYS_connect, &[-1, 0, 0]));
-            let nowhere = c"/nonexistent/sbx-probe".as_ptr() as libc::c_long;
-            let empty: [*const libc::c_char; 1] = [std::ptr::null()];
-            let empty = empty.as_ptr() as libc::c_long;
-            out.insert("execve", call(libc::SYS_execve, &[nowhere, empty, empty]));
-            // A process `clone` let through runs on here as a copy of this thread, and leaves at
-            // once.
-            let process = call(libc::SYS_clone, &[libc::SIGCHLD as _, 0, 0, 0, 0]);
-            if process == Ok(0) {
-                // SAFETY: `_exit` ends the copy without running anything of the process it copied.
-                unsafe { libc::_exit(0) };
-            }
-            out.insert("clone process", process);
-            out.insert(
-                "ioctl TCGETS",
-                call(libc::SYS_ioctl, &[w, libc::TCGETS as _, 0]),
-            );
-            out.insert(
-                "prctl PR_GET_DUMPABLE",
-                call(libc::SYS_prctl, &[libc::PR_GET_DUMPABLE as _]),
-            );
-            let (prot_rx, anon) = (
-                (libc::PROT_READ | libc::PROT_EXEC) as libc::c_long,
-                (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as libc::c_long,
-            );
-            let page = 4096;
-            out.insert(
-                "mmap PROT_EXEC",
-                call(libc::SYS_mmap, &[0, page, prot_rx, anon, -1, 0]),
-            );
-            let flags = call(libc::SYS_fcntl, &[w, libc::F_GETFL as _]);
-            out.insert("fcntl F_GETFL", flags);
-            out.insert(
-                "fcntl F_SETFL",
-                call(
-                    libc::SYS_fcntl,
-                    &[w, libc::F_SETFL as _, flags.unwrap_or(0)],
-                ),
-            );
-            let one: libc::c_int = 1;
-            let one_at = (&raw const one) as libc::c_long;
-            let int = size_of::<libc::c_int>() as libc::c_long;
-            out.insert(
-                "setsockopt SO_KEEPALIVE",
-                call(
-                    libc::SYS_setsockopt,
-                    &[
-                        s,
-                        libc::SOL_SOCKET as _,
-                        libc::SO_KEEPALIVE as _,
-                        one_at,
-                        int,
-                    ],
-                ),
-            );
-            // SAFETY: `getpid` reads nothing and cannot fail.
-            let me = unsafe { libc::getpid() } as libc::c_long;
-            out.insert("kill", call(libc::SYS_kill, &[me, 0]));
+        // Refused.
+        out.push((
+            "openat",
+            opening(
+                libc::SYS_openat,
+                &[libc::AT_FDCWD as _, path, libc::O_RDONLY as _],
+            ),
+        ));
+        #[cfg(target_arch = "x86_64")]
+        out.push((
+            "open",
+            opening(libc::SYS_open, &[path, libc::O_RDONLY as _]),
+        ));
+        out.push((
+            "socket inet",
+            opening(
+                libc::SYS_socket,
+                &[libc::AF_INET as _, libc::SOCK_STREAM as _],
+            ),
+        ));
+        out.push((
+            "socket unix",
+            opening(
+                libc::SYS_socket,
+                &[libc::AF_UNIX as _, libc::SOCK_STREAM as _],
+            ),
+        ));
+        out.push(("connect", call(libc::SYS_connect, &[-1, 0, 0])));
+        let nowhere = c"/nonexistent/sbx-probe".as_ptr() as libc::c_long;
+        let empty: [*const libc::c_char; 1] = [std::ptr::null()];
+        let empty = empty.as_ptr() as libc::c_long;
+        out.push(("execve", call(libc::SYS_execve, &[nowhere, empty, empty])));
+        // A process `clone` let through runs on here as a copy of this thread, and leaves at
+        // once.
+        let process = call(libc::SYS_clone, &[libc::SIGCHLD as _, 0, 0, 0, 0]);
+        if process == Ok(0) {
+            // SAFETY: `_exit` ends the copy without running anything of the process it copied.
+            unsafe { libc::_exit(0) };
+        }
+        out.push(("clone process", process));
+        out.push((
+            "ioctl TCGETS",
+            call(libc::SYS_ioctl, &[w, libc::TCGETS as _, 0]),
+        ));
+        out.push((
+            "prctl PR_GET_DUMPABLE",
+            call(libc::SYS_prctl, &[libc::PR_GET_DUMPABLE as _]),
+        ));
+        let (prot_rx, anon) = (
+            (libc::PROT_READ | libc::PROT_EXEC) as libc::c_long,
+            (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as libc::c_long,
+        );
+        let page = 4096;
+        out.push((
+            "mmap PROT_EXEC",
+            call(libc::SYS_mmap, &[0, page, prot_rx, anon, -1, 0]),
+        ));
+        let flags = call(libc::SYS_fcntl, &[w, libc::F_GETFL as _]);
+        out.push(("fcntl F_GETFL", flags));
+        out.push((
+            "fcntl F_SETFL",
+            call(
+                libc::SYS_fcntl,
+                &[w, libc::F_SETFL as _, flags.unwrap_or(0)],
+            ),
+        ));
+        let one: libc::c_int = 1;
+        let one_at = (&raw const one) as libc::c_long;
+        let int = size_of::<libc::c_int>() as libc::c_long;
+        out.push((
+            "setsockopt SO_KEEPALIVE",
+            call(
+                libc::SYS_setsockopt,
+                &[
+                    s,
+                    libc::SOL_SOCKET as _,
+                    libc::SO_KEEPALIVE as _,
+                    one_at,
+                    int,
+                ],
+            ),
+        ));
+        // SAFETY: `getpid` reads nothing and cannot fail.
+        let me = unsafe { libc::getpid() } as libc::c_long;
+        out.push(("kill", call(libc::SYS_kill, &[me, 0])));
 
-            // Answered `ENOSYS`.
-            out.insert("clone3", call(libc::SYS_clone3, &[0, 0]));
-            #[cfg(target_arch = "x86_64")]
-            out.insert(
-                "x32",
-                call(
-                    libc::SYS_getpid | super::super::X32_SYSCALL_BIT as libc::c_long,
-                    &[],
-                ),
-            );
+        // Answered `ENOSYS`.
+        out.push(("clone3", call(libc::SYS_clone3, &[0, 0])));
+        #[cfg(target_arch = "x86_64")]
+        out.push((
+            "x32",
+            call(
+                libc::SYS_getpid | super::super::X32_SYSCALL_BIT as libc::c_long,
+                &[],
+            ),
+        ));
 
-            // Allowed.
-            let mut random = [0u8; 16];
-            out.insert(
-                "getrandom",
-                call(
-                    libc::SYS_getrandom,
-                    &[random.as_mut_ptr() as _, random.len() as _, 0],
-                ),
-            );
-            out.insert("write", call(libc::SYS_write, &[w, c"x".as_ptr() as _, 1]));
-            out.insert(
-                "ioctl FIONBIO",
-                call(libc::SYS_ioctl, &[w, libc::FIONBIO as _, one_at]),
-            );
-            let name = c"sbx-probe".as_ptr() as libc::c_long;
-            out.insert(
-                "prctl PR_SET_NAME",
-                call(libc::SYS_prctl, &[libc::PR_SET_NAME as _, name]),
-            );
-            let (prot_rw, prot_r) = (
-                (libc::PROT_READ | libc::PROT_WRITE) as libc::c_long,
-                libc::PROT_READ as libc::c_long,
-            );
-            let mapped = call(libc::SYS_mmap, &[0, page, prot_rw, anon, -1, 0]);
-            out.insert("mmap", mapped.map(|_| 0));
-            if let Ok(at) = mapped {
-                out.insert(
-                    "mprotect PROT_EXEC",
-                    call(libc::SYS_mprotect, &[at, page, prot_rx]),
-                );
-                out.insert("mprotect", call(libc::SYS_mprotect, &[at, page, prot_r]));
-                out.insert("munmap", call(libc::SYS_munmap, &[at, page]));
-            }
-            // SAFETY: an empty set of descriptors, with its count, and no wait.
-            out.insert(
-                "poll",
-                outcome(unsafe { libc::poll(std::ptr::null_mut(), 0, 0) } as _),
-            );
-            out.insert(
-                "fcntl F_DUPFD_CLOEXEC",
-                opening(libc::SYS_fcntl, &[r, libc::F_DUPFD_CLOEXEC as _, 0]),
-            );
-            let timeout = libc::timeval {
-                tv_sec: 1,
-                tv_usec: 0,
-            };
-            out.insert(
-                "setsockopt SO_SNDTIMEO",
-                call(
-                    libc::SYS_setsockopt,
-                    &[
-                        s,
-                        libc::SOL_SOCKET as _,
-                        libc::SO_SNDTIMEO as _,
-                        (&raw const timeout) as _,
-                        size_of::<libc::timeval>() as _,
-                    ],
-                ),
-            );
-            out.insert("thread", std::thread::spawn(|| 7_i64).join().map_err(|_| 0));
-            let mut read = Vec::new();
-            out.insert(
-                "read_to_end",
-                file.read_to_end(&mut read)
-                    .map(|n| n as i64)
-                    .map_err(|e| e.raw_os_error().unwrap_or(0)),
-            );
-            drop((pipe_r, pipe_w, socket));
-            Probed {
-                started: process
-                    .ok()
-                    .filter(|&pid| pid > 0)
-                    .map(|pid| pid as libc::pid_t),
-                outcomes: out,
-            }
-        });
-        probing.join().unwrap()
+        // Allowed.
+        let mut random = [0u8; 16];
+        out.push((
+            "getrandom",
+            call(
+                libc::SYS_getrandom,
+                &[random.as_mut_ptr() as _, random.len() as _, 0],
+            ),
+        ));
+        out.push(("write", call(libc::SYS_write, &[w, c"x".as_ptr() as _, 1])));
+        out.push((
+            "ioctl FIONBIO",
+            call(libc::SYS_ioctl, &[w, libc::FIONBIO as _, one_at]),
+        ));
+        let name = c"sbx-probe".as_ptr() as libc::c_long;
+        out.push((
+            "prctl PR_SET_NAME",
+            call(libc::SYS_prctl, &[libc::PR_SET_NAME as _, name]),
+        ));
+        let (prot_rw, prot_r) = (
+            (libc::PROT_READ | libc::PROT_WRITE) as libc::c_long,
+            libc::PROT_READ as libc::c_long,
+        );
+        let mapped = call(libc::SYS_mmap, &[0, page, prot_rw, anon, -1, 0]);
+        out.push(("mmap", mapped.map(|_| 0)));
+        if let Ok(at) = mapped {
+            out.push((
+                "mprotect PROT_EXEC",
+                call(libc::SYS_mprotect, &[at, page, prot_rx]),
+            ));
+            out.push(("mprotect", call(libc::SYS_mprotect, &[at, page, prot_r])));
+            out.push(("munmap", call(libc::SYS_munmap, &[at, page])));
+        }
+        // SAFETY: an empty set of descriptors, with its count, and no wait.
+        out.push((
+            "poll",
+            outcome(unsafe { libc::poll(std::ptr::null_mut(), 0, 0) } as _),
+        ));
+        out.push((
+            "fcntl F_DUPFD_CLOEXEC",
+            opening(libc::SYS_fcntl, &[r, libc::F_DUPFD_CLOEXEC as _, 0]),
+        ));
+        let timeout = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        out.push((
+            "setsockopt SO_SNDTIMEO",
+            call(
+                libc::SYS_setsockopt,
+                &[
+                    s,
+                    libc::SOL_SOCKET as _,
+                    libc::SO_SNDTIMEO as _,
+                    (&raw const timeout) as _,
+                    size_of::<libc::timeval>() as _,
+                ],
+            ),
+        ));
+        out.push(("thread", std::thread::spawn(|| 7_i64).join().map_err(|_| 0)));
+        let mut read = Vec::new();
+        out.push((
+            "read_to_end",
+            file.read_to_end(&mut read)
+                .map(|n| n as i64)
+                .map_err(|e| e.raw_os_error().unwrap_or(0)),
+        ));
+        out
     }
 
-    /// The proxy's filters, on a thread of the test process: the calls that would reach past its
-    /// cage are refused, `clone3` and the x32 ABI are answered `ENOSYS` so a fallback is taken, and
-    /// the calls the proxy makes still work, starting a thread and reading a document handed over
-    /// in a file among them. Only the probing thread is confined.
+    /// The proxy's filters, in a process of their own: the calls that would reach past its cage
+    /// are refused, `clone3` and the x32 ABI are answered `ENOSYS` so a fallback is taken, and the
+    /// calls the proxy makes still work, starting a thread and reading a document handed over in a
+    /// file among them.
     #[test]
     fn the_proxys_filters_refuse_what_its_work_does_not_make() {
-        let probed = under_the_filters();
-        if let Some(pid) = probed.started {
-            let mut status = 0;
-            // SAFETY: `pid` is a child of this process that has exited or is about to.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-        }
+        let outcomes = in_a_process(concat!(module_path!(), "::the_probes_process"));
         let got = |name: &str| {
-            *probed
-                .outcomes
+            *outcomes
                 .get(name)
-                .unwrap_or_else(|| panic!("no probe {name}"))
+                .unwrap_or_else(|| panic!("no probe {name}: {outcomes:?}"))
         };
         assert_eq!(got("confine"), Ok(0), "the filters install");
 
