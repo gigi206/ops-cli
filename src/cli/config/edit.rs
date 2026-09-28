@@ -39,6 +39,20 @@ fn app_prefixed_key(name: &str, key: &str) -> Result<String, String> {
     Ok(format!("app.{name}.{key}"))
 }
 
+/// What `config get` prints for `value`: to a terminal, the text [`diag::visible`] makes of it; to
+/// anything else, the value as the file holds it.
+///
+/// The target is by default the project's `.sbx.toml`, read whether or not it is trusted, and a TOML
+/// string carries any character through its escapes: printed as it is, a value could drive the
+/// terminal of the person reading it. A script reading `$(sbx config get <key>)` is handed the
+/// value itself, which is what the verb is for.
+fn get_output(value: &str, to_terminal: bool) -> std::borrow::Cow<'_, str> {
+    match to_terminal {
+        true => std::borrow::Cow::Owned(diag::visible(value)),
+        false => std::borrow::Cow::Borrowed(value),
+    }
+}
+
 /// `sbx config get <key>`: print the value declared at a dotted key in the target layer file
 /// (`--local` by default). This reads the *raw declared* value in that one file; for the
 /// *effective resolved* value across layers, use `sbx config show` / `sbx config show --json`. An
@@ -75,7 +89,7 @@ pub(super) fn config_get(args: &[OsString]) -> ExitCode {
         };
     match config::manage::get(&path, &key) {
         Ok(Some(v)) => {
-            println!("{v}");
+            println!("{}", get_output(&v, std::io::stdout().is_terminal()));
             ExitCode::SUCCESS
         }
         Ok(None) => {
@@ -1375,5 +1389,17 @@ mod tests {
         // that would need escaping can reach the quoted form.
         assert!(app_prefixed_key("bad name", "cmd").is_err());
         assert!(app_prefixed_key("bad\"name", "cmd").is_err());
+    }
+
+    /// `config get` hands a program the value as the file holds it, and a person the text
+    /// `diag::visible` makes of it: the target is by default the project's `.sbx.toml`, read whether
+    /// or not it is trusted, and a TOML string carries any character through its escapes.
+    #[test]
+    fn a_value_is_shown_to_a_person_as_text_and_handed_to_a_program_as_written() {
+        let value = "G01\u{1b}[7m\nforged\u{202e}X";
+        assert_eq!(get_output(value, false), value);
+        let shown = get_output(value, true);
+        assert_eq!(shown, "G01\\x1b[7m\\x0aforged\\u{202e}X");
+        assert_eq!(get_output("plain value", true), "plain value");
     }
 }

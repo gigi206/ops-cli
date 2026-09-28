@@ -1515,6 +1515,10 @@ pub(super) const PAGES: &[Page] = &[
             show` (or `sbx config show --json`). An unset key exits 1; an array or table value is\n\
             edited with `sbx config edit`, not read as a single value.\n\
             \n\
+            A program reading the output gets the value as the file holds it. On a terminal, a\n\
+            control character or a character that reorders a line is written out as an escape\n\
+            (\\x1b, \\u{202e}, a line break as \\x0a).\n\
+            \n\
             --app <name> addresses an app's config: inline (a project .sbx.toml) it reads\n\
             app.<name>.<key>; with -g it reads the top-level key from the app's profile file\n\
             (apps/<name>.toml). An app name containing a `.` is edited with `sbx config edit`\n\

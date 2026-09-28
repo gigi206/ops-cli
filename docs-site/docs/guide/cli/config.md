@@ -143,7 +143,11 @@ sbx config unset <key> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
 These edit **one layer file**, preserving its other keys, its comments and its
 formatting. `get` reads the raw declared value in that file (an unset key exits 1);
 for the effective value
-across layers, use [`show`](#sbx-config-show).
+across layers, use [`show`](#sbx-config-show). Its output goes to a program as the file
+holds it, so `$(sbx config get <key>)` reads the value itself; on a terminal, a control
+character or a character that reorders a line is written out as an escape (`\x1b`,
+`\u{202e}`, a line break as `\x0a`), since the file read by default is the project's
+`.sbx.toml`, trusted or not.
 
 | Verb | What it edits |
 |---|---|
