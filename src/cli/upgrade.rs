@@ -1082,6 +1082,10 @@ fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade], pal: &style::Palette
                 token,
                 mise_managed,
             } => {
+                // A `[tools]` key, which the mise file spells in full, a quoted TOML key being any
+                // string: each control and reordering character becomes a space, the rule the
+                // launch applies when it names the same tokens.
+                let token = crate::sandbox::sanitize(token);
                 if *mise_managed {
                     format!("  {n}{token}{r}: {dim}equipped in-cage by mise — not rolled here.{r}")
                 } else {
@@ -2990,5 +2994,46 @@ mod tests {
                 "{failure:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_token_the_summary_does_not_roll_is_named_as_text_that_drives_nothing() {
+        // A `[tools]` key is a quoted TOML string, so the mise file spells every character of it:
+        // one that mise equips, and one written as `nix:` that sbx cannot resolve.
+        let lines = upgrade_tools_summary(
+            &[
+                sandbox::ToolUpgrade::Ignored {
+                    token: "x\u{1b}[2K\rsbx: trusted\u{202e}".into(),
+                    mise_managed: true,
+                },
+                sandbox::ToolUpgrade::Ignored {
+                    token: "nix:jq\n  nix:fd: 1.0 → 9.9 — rolled forward.".into(),
+                    mise_managed: false,
+                },
+            ],
+            &style::Palette::plain(),
+        );
+        assert_eq!(
+            lines.len(),
+            3,
+            "a heading and one line per token: {lines:?}"
+        );
+        for line in &lines[1..] {
+            assert!(
+                !line
+                    .chars()
+                    .any(|c| c.is_control() || crate::diag::reorders(c)),
+                "the file's text drives nothing and forges no line: {line:?}"
+            );
+        }
+        // Each character replaced by a space, as the launch names the same tokens.
+        assert_eq!(
+            lines[1],
+            "  x [2K sbx: trusted : equipped in-cage by mise — not rolled here."
+        );
+        assert_eq!(
+            lines[2],
+            "  nix:jq   nix:fd: 1.0 → 9.9 — rolled forward.: malformed nix: token — cannot resolve."
+        );
     }
 }
