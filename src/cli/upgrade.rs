@@ -1064,12 +1064,17 @@ fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade], pal: &style::Palette
             }
             Failed {
                 pkg, error, kept, ..
-            } => match kept {
-                Some(v) => format!(
-                    "  {n}nix:{pkg}{r}: {err}re-resolve failed{r}, kept {n}{v}{r} — {error}"
-                ),
-                None => format!("  {n}nix:{pkg}{r}: {err}re-resolve failed{r} — {error}"),
-            },
+            } => {
+                // nix's own report, and past its `error:` line the endpoint's response body: one
+                // line, with nothing in it that drives the terminal.
+                let error = diag::one_line(error);
+                match kept {
+                    Some(v) => format!(
+                        "  {n}nix:{pkg}{r}: {err}re-resolve failed{r}, kept {n}{v}{r} — {error}"
+                    ),
+                    None => format!("  {n}nix:{pkg}{r}: {err}re-resolve failed{r} — {error}"),
+                }
+            }
             Pruned { pkg, request } => format!(
                 "  {n}nix:{pkg}{r} ({request}): {dim}removed from the lock (no longer declared).{r}"
             ),
@@ -1182,15 +1187,21 @@ fn flake_upgrade_summary(
                 reference,
                 error,
                 kept,
-            } => match kept {
-                Some(rev) => format!(
-                    "  {n}flake:{reference}{r}: {err}re-resolve failed{r}, kept {n}{}{r} — {error}",
-                    short_rev(rev)
-                ),
-                None => {
-                    format!("  {n}flake:{reference}{r}: {err}re-resolve failed{r} — {error}")
+            } => {
+                // Whichever step failed, and whether or not it folded its own report: one line,
+                // with nothing in it that drives the terminal.
+                let error = diag::one_line(error);
+                match kept {
+                    Some(rev) => format!(
+                        "  {n}flake:{reference}{r}: {err}re-resolve failed{r}, kept {n}{}{r} — \
+                         {error}",
+                        short_rev(rev)
+                    ),
+                    None => {
+                        format!("  {n}flake:{reference}{r}: {err}re-resolve failed{r} — {error}")
+                    }
                 }
-            },
+            }
         });
     }
     if withheld > 0 {
@@ -1292,6 +1303,9 @@ fn prebuilt_upgrade_summary(
                 format!("  {n}{kind}:{url}{r}: {dim}removed from the lock (no longer declared).{r}")
             }
             Failed { url, error } => {
+                // A resolve command's or nix's report, the latter carrying the endpoint's response
+                // body: one line, with nothing in it that drives the terminal.
+                let error = diag::one_line(error);
                 format!("  {n}{kind}:{url}{r}: {err}re-resolve failed{r} — {error}")
             }
         });
@@ -2919,5 +2933,62 @@ mod tests {
         .join("\n");
         assert!(trailing.contains("tarball:https://e/c.tar.gz: XH0ykkcZ — newly pinned"));
         assert!(trailing.contains("2 tarball: package(s) withheld (untrusted)"));
+    }
+
+    #[test]
+    fn a_failure_the_summary_quotes_stays_on_its_line_and_drives_nothing() {
+        // The shape nix gives a failed fetch: the endpoint's response body follows its `error:`
+        // line, so the server chooses the rest. Here it forges a line of its own and carries an
+        // escape, a right-to-left override and a carriage return.
+        let error = "unable to download 'https://e/x': HTTP error 404\n\n       \
+                     response body:\n\n       \u{1b}[31mevil\u{202e}txt\r\n  \
+                     nix:jq: 1.7.1 → 9.9.9 — rolled forward.";
+        let summaries = [
+            upgrade_tools_summary(
+                &[sandbox::ToolUpgrade::Failed {
+                    pkg: "fd".into(),
+                    request: "latest".into(),
+                    error: error.into(),
+                    kept: None,
+                }],
+                &style::Palette::plain(),
+            ),
+            flake_upgrade_summary(
+                &[sandbox::FlakeUpgrade::Failed {
+                    reference: "github:o/d#default".into(),
+                    error: error.into(),
+                    kept: None,
+                }],
+                0,
+                &style::Palette::plain(),
+            ),
+            prebuilt_upgrade_summary(
+                "tarball",
+                &[sandbox::PrebuiltUpgrade::Failed {
+                    url: "https://e/d.tar.gz".into(),
+                    error: error.into(),
+                }],
+                0,
+                &style::Palette::plain(),
+            ),
+        ];
+        for lines in summaries {
+            assert_eq!(lines.len(), 2, "a heading and the one failure: {lines:?}");
+            let failure = &lines[1];
+            assert!(
+                !failure
+                    .chars()
+                    .any(|c| c.is_control() || crate::diag::reorders(c)),
+                "the endpoint's text drives nothing and forges no line: {failure:?}"
+            );
+            // Folded, not dropped: the cause is still there to read.
+            assert!(
+                failure.contains(
+                    "re-resolve failed — unable to download 'https://e/x': HTTP error 404 \
+                     response body: [31mevil txt nix:jq: 1.7.1 → 9.9.9 — rolled forward."
+                ),
+                "{failure:?}"
+            );
+        }
     }
 }
