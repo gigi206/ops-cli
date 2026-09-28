@@ -35,6 +35,11 @@ sbx secret list [-a|--app <name>] [--sources] [--json]
 constraint. It is still the chain's **description** (a variable name, a file path, a plugin
 locator), never a resolved value. Nothing here reads a secret.
 
+Every value is printed as text, as [`sbx config show`](config) prints it: a control character or a
+character that reorders a line, in a header name, a locator or a file path, is written out as an
+escape (`\x1b`, `\u{202e}`, a line break as `\x0a`). `--json` keeps the bytes the configuration
+holds.
+
 ```
 $ sbx secret list
 gh_token    wire -> api.github.com (Authorization)  — read-only GitHub API token

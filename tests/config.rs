@@ -3162,6 +3162,61 @@ description = "the task's own token"
 }
 
 #[test]
+fn the_secret_inventory_writes_what_a_config_chose_as_text_that_drives_nothing() {
+    // A header name passes a gate that refuses control characters but not one that reorders a
+    // line, and a `file://` or `sops://` path passes no gate at all: each is the config's to spell,
+    // for a launch-wide credential, a task's environment and a task's injection alike.
+    let fx = Project::new("cfg");
+    fx.write_global(
+        &r#"[secret."api.example.com"]
+from   = "file:///S01\u001b[7m\nforgedRLO"
+header = "X-S02RLO"
+type   = "bearer"
+
+[task.probe]
+cmd     = ["true"]
+network = ["api.github.com"]
+
+[task.probe.secret]
+PROBE_TOKEN = "sops:///S03RLO.yaml"
+
+[task.probe.inject."api.github.com"]
+from   = "env://GH_TOKEN"
+header = "X-S04RLO"
+type   = "bearer"
+"#
+        .replace("RLO", "\\u202eX"),
+    );
+
+    let out = fx.run(&["secret", "list", "--sources"]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).expect("the inventory is UTF-8");
+    assert_eq!(
+        stdout.lines().count(),
+        3,
+        "one line per credential:\n{stdout}"
+    );
+    assert!(
+        !stdout
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || reorders(c)),
+        "the inventory wrote a character that drives the terminal:\n{stdout:?}"
+    );
+    // Escaped, not dropped, as `config show` writes the same values.
+    for tag in ["S01\\x1b[7m\\x0aforged", "S02", "S03", "S04"] {
+        assert!(
+            stdout.contains(&format!("{tag}\\u{{202e}}X")),
+            "`{tag}` is not shown escaped:\n{stdout}"
+        );
+    }
+
+    // The machine document is not a terminal: it keeps the bytes the config holds.
+    let out = fx.run(&["secret", "list", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(doc["credentials"][0]["headers"][0], "X-S02\u{202e}X");
+}
+
+#[test]
 fn setting_a_key_to_the_value_it_already_holds_leaves_the_trust_gate_alone() {
     // The mirror of the warning above. The trust marker hashes the file's contents, so a `set` that
     // writes nothing new re-arms nothing — and saying it did would tell someone their security

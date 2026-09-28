@@ -158,16 +158,9 @@ fn secret_list(args: &[OsString]) -> ExitCode {
     for task in &resolved.tasks {
         for secret in &task.secrets {
             any = true;
-            let mut line = format!(
-                "{}{}{}  env of task `{}` ({})",
-                palette.name,
-                secret.var,
-                palette.reset,
-                task.name,
-                secret.encode.as_str()
-            );
+            let mut rest = format!("  env of task `{}` ({})", task.name, secret.encode.as_str());
             if sources {
-                line.push_str(&format!(
+                rest.push_str(&format!(
                     "  from {}",
                     secret
                         .sources
@@ -178,9 +171,9 @@ fn secret_list(args: &[OsString]) -> ExitCode {
                 ));
             }
             if let Some(desc) = &secret.description {
-                line.push_str(&format!("  — {desc}"));
+                rest.push_str(&format!("  — {desc}"));
             }
-            println!("{line}");
+            println!("{}", inventory_line(&secret.var, &rest, &palette));
         }
         for injection in &task.injections {
             any = true;
@@ -208,19 +201,33 @@ fn wire_line(
     sources: bool,
     palette: &style::Palette,
 ) -> String {
-    let mut line = format!(
-        "{}{}{}  {scope} -> {} ({})",
-        palette.name,
-        secret.name,
-        palette.reset,
+    let mut rest = format!(
+        "  {scope} -> {} ({})",
         secret.to,
         secret.headers().join(", ")
     );
     if sources {
-        line.push_str(&format!("  from {}", secret.describe_sources()));
+        rest.push_str(&format!("  from {}", secret.describe_sources()));
     }
     if let Some(desc) = &secret.description {
-        line.push_str(&format!("  — {desc}"));
+        rest.push_str(&format!("  — {desc}"));
     }
-    line
+    inventory_line(&secret.name, &rest, palette)
+}
+
+/// One inventory line: the credential's name in the identifier hue, then what `rest` says of it.
+///
+/// Both halves are written through [`diag::visible`], as `sbx config show` writes the same values.
+/// They are the configuration's to spell: a header name and a plugin's locator pass a gate that
+/// refuses control characters only, and a `file://` or `sops://` path passes none, so a line break
+/// or an escape sequence would reach the terminal as written, and a character that reorders a line
+/// through every one of those gates. Escaped, a value still reads as what the file holds.
+fn inventory_line(name: &str, rest: &str, palette: &style::Palette) -> String {
+    format!(
+        "{}{}{}{}",
+        palette.name,
+        diag::visible(name),
+        palette.reset,
+        diag::visible(rest)
+    )
 }
