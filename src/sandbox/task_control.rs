@@ -852,11 +852,13 @@ fn serve_cage(
             // A task whose declared tools are not in the pool will fail at exec. Say so here, where
             // a caller is choosing what to invoke, rather than let it discover a "not found" later:
             // the pool is filled best-effort, so this is the field that carries that consequence.
+            // Folded like the description: a mise token is held to no whitespace and no control
+            // character, which lets a character that reorders the line through.
             let missing = engine.missing_packages(task);
             let missing = if missing.is_empty() {
                 String::new()
             } else {
-                format!("\tmissing-tools={}", missing.join(","))
+                format!("\tmissing-tools={}", sanitize(&missing.join(",")))
             };
             // Where this operation's artifacts will be, when it declares `output`. Listed rather
             // than only reported afterwards: the path is one per task, so a caller can know it
@@ -900,11 +902,15 @@ fn serve_cage(
                     sanitize(secret.description.as_deref().unwrap_or("")),
                 )?;
             }
+            // The destination folded like the description: `allowlist::classify` refuses control
+            // characters in a `to` path, not the characters that reorder a line.
             for injection in &task.injections {
                 writeln!(
                     writer,
                     "secret {}\ttask={}\twire-injected for {}",
-                    injection.name, task.name, injection.to,
+                    injection.name,
+                    task.name,
+                    sanitize(&injection.to.to_string()),
                 )?;
             }
         }

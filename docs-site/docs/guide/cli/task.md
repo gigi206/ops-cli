@@ -126,6 +126,10 @@ unreadable. `MISSING TOOLS` appears when an operation declares
 [`packages`](../tasks/execution#the-task-tool-pool) the pool does not hold: that operation will
 fail at exec, and the pool is filled best-effort, so this is where you find out before invoking it.
 
+What a declaration chose is written as text, here as in [`secrets`](#secrets) and [`show`](#show):
+a control character, or a character that reorders a line, in a tool token, a destination path or a
+description, is written as a space.
+
 **`DECLARED IN` says which config holds each operation's `[task.<name>]` block**, and appears by the
 same rule, only when they do not all agree. One session can be offered operations by four different
 places at once: your global `sbx.toml`, the project's `.sbx.toml`, the app profile you launched, and

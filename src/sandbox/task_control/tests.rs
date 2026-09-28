@@ -1469,6 +1469,44 @@ fn the_listing_says_where_an_operation_writes() {
     );
 }
 
+// What a declaration chose reaches the inventory as text that drives nothing. A mise token is held
+// to no whitespace and no control character, and a `to` path to what `allowlist::classify`
+// refuses, which is control characters: a character that reorders a line passes both. The client
+// in the cage prints the plane's reply as it arrives, and `sbx task ls` and `sbx task secrets`
+// print it through a table that escapes nothing. With no pool, every declared tool is missing.
+#[test]
+fn the_inventory_writes_what_a_declaration_chose_as_text_that_drives_nothing() {
+    let mut task = probe_task();
+    task.packages = vec!["T01\u{202e}X".into()];
+    task.injections = vec![crate::config::HeaderSecret {
+        name: "api.test".into(),
+        description: None,
+        sources: vec![crate::config::SecretSource::Env("TOKEN".into())],
+        to: crate::allowlist::classify("api.test/T02\u{202e}X").expect("a `to` the grammar admits"),
+        header: "Authorization".into(),
+        shape: crate::config::HeaderShape::new("Bearer ", false),
+        signer: None,
+        optional: false,
+    }];
+    let Some((_data, _plane, script)) = plane_and_client(vec![task]) else {
+        skip_incapable!("skipping: bash, socat or head is not on PATH");
+        return;
+    };
+    for (verb, tag) in [("list", "T01"), ("secrets", "T02")] {
+        let out = run_client(&script, &["task", verb]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            text.contains(tag),
+            "`task {verb}` must still name the value: {text}"
+        );
+        assert!(
+            !text.chars().any(crate::diag::reorders),
+            "`task {verb}` wrote a character that reorders the line: {text:?}"
+        );
+    }
+}
+
 // The response half, against the real writer: bytes produced by `write_outcome` are what the
 // client parses. Streams go to their own descriptors, the exit code is the command's, and a
 // payload containing the protocol's own keywords is copied rather than re-read as headers.
