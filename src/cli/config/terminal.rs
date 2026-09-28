@@ -264,18 +264,23 @@ pub(super) fn app_detail_view(view: &AppDetailView) -> AppDetailView {
     }
 }
 
+/// One string as a terminal is to show it: escaped by [`crate::diag::visible`], nothing cut.
 fn text(value: &str) -> String {
     crate::diag::visible(value)
 }
 
+/// [`text`] over a value the view may not carry.
 fn optional(value: &Option<String>) -> Option<String> {
     value.as_deref().map(text)
 }
 
+/// [`text`] over every string of a list.
 fn texts(values: &[String]) -> Vec<String> {
     values.iter().map(|v| text(v)).collect()
 }
 
+/// A baseline environment variable, left as it is: the renderer folds its key and value where it
+/// prints them.
 fn env_var(var: &EnvVar) -> EnvVar {
     let EnvVar { key, value, layer } = var;
     EnvVar {
@@ -285,6 +290,7 @@ fn env_var(var: &EnvVar) -> EnvVar {
     }
 }
 
+/// An app's environment variable, left as it is for the reason [`env_var`] gives.
 fn app_env_var(var: &AppEnvVar) -> AppEnvVar {
     let AppEnvVar { key, value } = var;
     AppEnvVar {
@@ -293,6 +299,7 @@ fn app_env_var(var: &AppEnvVar) -> AppEnvVar {
     }
 }
 
+/// A bind: its path, beside whether it is writable and which layer declared it.
 fn bind(bind: &BindView) -> BindView {
     let BindView {
         path,
@@ -306,6 +313,7 @@ fn bind(bind: &BindView) -> BindView {
     }
 }
 
+/// An `[open]` handler: the scheme it routes, the command and the mode.
 fn open_handler(handler: &OpenView) -> OpenView {
     let OpenView { scheme, cmd, mode } = handler;
     OpenView {
@@ -315,6 +323,8 @@ fn open_handler(handler: &OpenView) -> OpenView {
     }
 }
 
+/// A `[service]` entry: its name, its command and the conditions it starts under. Its readiness
+/// gate is a port and a timeout, numbers only.
 fn service_entry(service: &ServiceView) -> ServiceView {
     let ServiceView {
         name,
@@ -330,6 +340,8 @@ fn service_entry(service: &ServiceView) -> ServiceView {
     }
 }
 
+/// A declared package: its name, backend and locator, how it is realised, and why it was
+/// withheld or which revision it is pinned at.
 fn package(package: &PackageView) -> PackageView {
     let PackageView {
         name,
@@ -351,6 +363,7 @@ fn package(package: &PackageView) -> PackageView {
     }
 }
 
+/// The project's mise file: its name, and why it is withheld when it is.
 fn mise_file(mise: &MiseView) -> MiseView {
     let MiseView {
         name,
@@ -364,6 +377,8 @@ fn mise_file(mise: &MiseView) -> MiseView {
     }
 }
 
+/// The `[tools]` table: each `nix:` tool, each tool mise equips in the cage, and each token
+/// neither of them reads.
 fn tools_view(tools: &ToolsView) -> ToolsView {
     let ToolsView {
         nix,
@@ -407,6 +422,8 @@ fn tools_view(tools: &ToolsView) -> ToolsView {
     }
 }
 
+/// A nixpkgs or engine channel: its source, where that was chosen, and the revision it is locked
+/// at.
 fn channel(channel: &ChannelView) -> ChannelView {
     let ChannelView {
         source,
@@ -420,6 +437,7 @@ fn channel(channel: &ChannelView) -> ChannelView {
     }
 }
 
+/// The baseline network posture, and under an allowlist every rule list and label it carries.
 fn network_view(network: &NetworkView) -> NetworkView {
     match network {
         NetworkView::Shared => NetworkView::Shared,
@@ -466,6 +484,7 @@ fn network_view(network: &NetworkView) -> NetworkView {
     }
 }
 
+/// An app's own network posture, the narrower shape of [`network_view`]'s.
 fn app_network_view(network: &AppNetworkView) -> AppNetworkView {
     match network {
         AppNetworkView::Shared => AppNetworkView::Shared,
@@ -488,6 +507,8 @@ fn app_network_view(network: &AppNetworkView) -> AppNetworkView {
     }
 }
 
+/// The GUI posture. It carries no text; it is rebuilt variant by variant so that a variant added
+/// later has to be placed here.
 fn gui_view(gui: &GuiView) -> GuiView {
     match gui {
         GuiView::None => GuiView::None,
@@ -496,6 +517,7 @@ fn gui_view(gui: &GuiView) -> GuiView {
     }
 }
 
+/// The `[proc]` posture: its mode and both rule lists.
 fn proc_view(proc: &ProcView) -> ProcView {
     let ProcView { mode, allow, deny } = proc;
     ProcView {
@@ -505,6 +527,7 @@ fn proc_view(proc: &ProcView) -> ProcView {
     }
 }
 
+/// The `[notify]` table: each event with its mode, and how long before a notice repeats.
 fn notify_view(notify: &NotifyView) -> NotifyView {
     let NotifyView {
         events,
@@ -519,6 +542,7 @@ fn notify_view(notify: &NotifyView) -> NotifyView {
     }
 }
 
+/// The baseline resource limits, each through [`limit`].
 fn limits_view(limits: &LimitsView) -> LimitsView {
     let LimitsView {
         memory_high,
@@ -532,6 +556,7 @@ fn limits_view(limits: &LimitsView) -> LimitsView {
     }
 }
 
+/// One resource limit's value, beside the layer that set it.
 fn limit(limit: &LimitView) -> LimitView {
     let LimitView { value, origin } = limit;
     LimitView {
@@ -540,6 +565,7 @@ fn limit(limit: &LimitView) -> LimitView {
     }
 }
 
+/// An app's own resource limits, each present only when the app sets it.
 fn app_limits_view(limits: &AppLimitsView) -> AppLimitsView {
     let AppLimitsView {
         memory_high,
@@ -553,6 +579,8 @@ fn app_limits_view(limits: &AppLimitsView) -> AppLimitsView {
     }
 }
 
+/// A `[broker.<name>]` binding: its name, the socket it exposes, what it allows, and the locators
+/// its credential is read from.
 fn broker(broker: &BrokerView) -> BrokerView {
     let BrokerView {
         name,
@@ -570,6 +598,7 @@ fn broker(broker: &BrokerView) -> BrokerView {
     }
 }
 
+/// A declared operation: its name, its description and the layer that declared it.
 fn task(task: &TaskView) -> TaskView {
     let TaskView {
         name,
@@ -583,6 +612,7 @@ fn task(task: &TaskView) -> TaskView {
     }
 }
 
+/// A wire-injected credential: its header, destination, shape and sources, by locator.
 fn secret(secret: &SecretView) -> SecretView {
     let SecretView {
         header,
@@ -600,6 +630,7 @@ fn secret(secret: &SecretView) -> SecretView {
     }
 }
 
+/// A plugin: its name, the environment it is handed and the programs it may run.
 fn plugin(plugin: &PluginView) -> PluginView {
     let PluginView {
         name,
@@ -613,6 +644,7 @@ fn plugin(plugin: &PluginView) -> PluginView {
     }
 }
 
+/// One install step an app runs: the bundle that declared it and its command.
 fn provision(step: &AppProvisionView) -> AppProvisionView {
     let AppProvisionView { bundle, cmd } = step;
     AppProvisionView {
@@ -621,6 +653,8 @@ fn provision(step: &AppProvisionView) -> AppProvisionView {
     }
 }
 
+/// One declared app as the baseline listing shows it: every string it carries, its environment
+/// and `[fs]` lists left as the module note says.
 fn app(app: &AppView) -> AppView {
     let AppView {
         name,
