@@ -7,7 +7,7 @@
 //! bytes rather than asserted about in prose.
 
 use super::*;
-use crate::testutil::TmpDir;
+use crate::testutil::{TmpDir, run_alone, when_run_alone};
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
@@ -830,15 +830,41 @@ fn the_taps_arguments_are_parsed_strictly() {
     );
 }
 
-/// The tap's work, under its filter: on a thread of this process confined as the tap confines
-/// itself, the destination of an accepted connection is asked for and answered (the local address,
-/// or `ENOENT` where no connection tracking follows loopback, and never `EPERM`), a name is answered
-/// and reported from a thread the filter holds as well, and the captured connection reaches the
-/// proxy and is pumped both ways. What the filter
-/// refuses is pinned beside it ([`crate::sandbox::seccomp::tap`]); this pins what it must not.
+/// The tap's work, under its filter: on a thread confined as the tap confines itself, the
+/// destination of an accepted connection is asked for and answered (the local address, or `ENOENT`
+/// where no connection tracking follows loopback, and never `EPERM`), a name is answered and
+/// reported from a thread the filter holds as well, and the captured connection reaches the proxy
+/// and is pumped both ways. What the filter refuses is pinned beside it
+/// ([`crate::sandbox::seccomp::tap`]); this pins what it must not.
+///
+/// In a process of its own, as the tap is, for the reason [`run_alone`] gives: the stand-in proxy,
+/// the report socket and the client run there too, on threads started before the filter and out
+/// of it.
 #[test]
 fn the_taps_work_runs_under_its_filter() {
-    let dir = TmpDir::new();
+    let ran = run_alone(concat!(module_path!(), "::the_taps_process"));
+    assert!(
+        ran.ended_well(),
+        "the tap's process ended with {}: {}{}",
+        ran.status,
+        ran.stdout,
+        ran.stderr
+    );
+}
+
+/// The tap's process, run alone by [`the_taps_work_runs_under_its_filter`]; anywhere else it does
+/// nothing.
+#[test]
+#[ignore = "run alone by the test that reads how it ended"]
+fn the_taps_process() {
+    when_run_alone(|dir| {
+        the_taps_work_under_its_filter(Path::new(dir));
+        Ok(())
+    });
+}
+
+/// The tap's work under its filter, with its sockets in `dir`, asserted as it goes.
+fn the_taps_work_under_its_filter(dir: &Path) {
     let uds = dir.join("egress.sock");
     let heads = stand_in_proxy(&uds, "HTTP/1.1 200 Connection established\r\n\r\n");
     let report = dir.join("report.sock");
