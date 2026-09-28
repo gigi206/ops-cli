@@ -126,8 +126,9 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 ///   the confirmation prompt;
 /// - `crate::observe`, outside this module through the [`super::sanitize`] re-export, for the
 ///   `sbx proc ls` tree;
-/// - and the relay of the caged egress proxy's standard error (`proxy::child`), the one process of a
-///   session that writes to the supervisor's terminal or session log without a parser in between.
+/// - and [`relay_lines`], for the caged egress proxy's standard error (`proxy::child`) and the task
+///   tool pool's install cage (`taskpool`), which write to the supervisor's terminal or session log
+///   without a parser in between.
 ///
 /// Each of those was, at some point, a place a caged process could write a line of its own. Narrowing
 /// what this replaces, or moving it somewhere a caller stops finding it, reopens all of them at once
@@ -150,6 +151,50 @@ pub(crate) fn sanitize(s: &str) -> String {
         let mut out: String = cleaned.chars().take(MAX - 1).collect();
         out.push('…');
         out
+    }
+}
+
+/// The most bytes of one line [`relay_lines`] reads at a time; a longer line is relayed in pieces,
+/// so a writer that never ends a line holds no more than this in the reader. It is the length
+/// [`sanitize`] keeps whole, in bytes, which are never fewer than the characters they spell: no
+/// piece is cut short on its way out.
+pub(crate) const RELAY_LINE_MAX: u64 = SANITIZED_CHARS as u64;
+
+/// Copy `input` to `out` a line at a time until `input` ends, each line through [`sanitize`].
+///
+/// For a process less trusted than the one reading it, whose output reaches a terminal or a session
+/// log with no parser in between: the caged egress proxy's standard error (`proxy::child`), and the
+/// task tool pool's install cage (`taskpool`), where mise and the registries it fetches from write.
+/// What such a process writes is treated as a value the cage chose: control characters and the
+/// characters that reorder a line cannot reach a terminal, and a line is read in pieces of at most
+/// [`RELAY_LINE_MAX`] bytes, so a writer that never ends one holds no more than that in the reader.
+/// Each piece is written whole, as a line of its own; a character whose bytes a piece boundary
+/// splits is written as U+FFFD. A write that fails (the invoker gone) is dropped and reading goes
+/// on: a relay that stopped reading would fill the pipe and stall the writer on its next line.
+pub(crate) fn relay_lines(input: impl std::io::Read, mut out: impl std::io::Write) {
+    use std::io::{BufRead as _, Read as _};
+    let mut reader = std::io::BufReader::new(input);
+    let mut line = Vec::new();
+    // Whether the last piece filled the bound without ending its line: the end that then arrives
+    // alone belongs to it, and is not a line of its own.
+    let mut cut = false;
+    loop {
+        line.clear();
+        match (&mut reader)
+            .take(RELAY_LINE_MAX)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) => return,
+            Ok(_) if cut && line == b"\n" => cut = false,
+            Ok(_) => {
+                cut = !line.ends_with(b"\n");
+                let text = String::from_utf8_lossy(&line);
+                let text = text.strip_suffix('\n').unwrap_or(&text);
+                let _ = writeln!(out, "{}", sanitize(text));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
     }
 }
 
@@ -502,5 +547,74 @@ mod tests {
         let out = sanitize(&long);
         assert_eq!(out.chars().count(), 512);
         assert!(out.ends_with('…'));
+    }
+
+    /// The relay writes each line with its control characters neutralised, so an escape sequence
+    /// the writer sends never reaches a terminal as one.
+    #[test]
+    fn the_relay_writes_each_line_with_its_controls_neutralised() {
+        let mut out = Vec::new();
+        relay_lines(&b"first\n\x1b[2Jcleared\rover\nlast"[..], &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "first\n [2Jcleared over\nlast\n"
+        );
+    }
+
+    /// A line longer than the relay reads at once is relayed in pieces, none cut short: joined, they
+    /// give the line back, so a long diagnostic loses nothing on its way to the terminal.
+    #[test]
+    fn a_long_line_is_relayed_in_pieces_that_lose_nothing() {
+        let line = format!("LONG{}END", "0".repeat(1000));
+        let mut out = Vec::new();
+        relay_lines(format!("{line}\n").as_bytes(), &mut out);
+        let text = String::from_utf8(out).unwrap();
+        let pieces: Vec<&str> = text.lines().collect();
+        assert!(pieces.len() > 1, "{pieces:?}");
+        assert!(
+            pieces
+                .iter()
+                .all(|p| p.len() <= RELAY_LINE_MAX as usize && !p.ends_with('…'))
+        );
+        assert_eq!(pieces.concat(), line);
+    }
+
+    /// A line exactly as long as one piece, then its end, is one line: the end that arrives alone
+    /// in the next read is not relayed as an empty line of its own. A line the writer leaves empty
+    /// still is.
+    #[test]
+    fn a_line_of_exactly_one_piece_is_not_followed_by_an_empty_one() {
+        let line = "x".repeat(RELAY_LINE_MAX as usize);
+        let mut out = Vec::new();
+        relay_lines(format!("{line}\n\nafter\n").as_bytes(), &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{line}\n\nafter\n")
+        );
+    }
+
+    /// A write that fails does not stop the relay: it keeps reading, so the writer is never left
+    /// writing into a full pipe once its invoker has gone.
+    #[test]
+    fn a_failed_write_does_not_stop_the_relay_reading() {
+        use std::io::{self, Write};
+        /// Refuses its first write, then keeps what it is given.
+        struct FailsOnce(bool, Vec<u8>);
+        impl Write for FailsOnce {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
+                self.1.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = FailsOnce(false, Vec::new());
+        relay_lines(&b"lost\nkept\n"[..], &mut out);
+        assert_eq!(String::from_utf8(out.1).unwrap(), "kept\n");
     }
 }

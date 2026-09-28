@@ -293,12 +293,6 @@ fn command(bwrap: &Path, link: wire::Socket) -> io::Result<(Command, Vec<File>)>
     Ok((command, files))
 }
 
-/// The most bytes of one line of the proxy's standard error read at a time; a longer line is
-/// relayed in pieces, so a proxy that never ends a line holds no more than this in the supervisor.
-/// It is the length [`crate::sandbox::observe_feed::sanitize`] keeps whole, in bytes, which are
-/// never fewer than the characters they spell: no piece is cut short on its way out.
-const RELAY_LINE_MAX: u64 = crate::sandbox::observe_feed::SANITIZED_CHARS as u64;
-
 /// How long stopping a proxy waits for the relay to write what the proxy wrote last. The relay ends
 /// when every writer of the pipe has closed it, the proxy and anything left in its cage, so the
 /// wait is bounded rather than joined.
@@ -306,7 +300,7 @@ const RELAY_LINE_MAX: u64 = crate::sandbox::observe_feed::SANITIZED_CHARS as u64
 const RELAY_DRAIN_WAIT: Duration = Duration::from_secs(1);
 
 /// Relay the caged proxy's standard error to this process's standard error, on a thread of its own
-/// that ends when the proxy closes it ([`relay_lines`]).
+/// that ends when the proxy closes it ([`crate::sandbox::observe_feed::relay_lines`]).
 ///
 /// Each line goes to descriptor 2 as it is at the moment of writing, which is the terminal for an
 /// inline session and the session log once a detached one has moved its output there.
@@ -321,7 +315,7 @@ fn relay_stderr(stderr: std::process::ChildStderr) -> Option<std::sync::mpsc::Re
     let started = std::thread::Builder::new()
         .name("sbx-proxy-stderr".into())
         .spawn(move || {
-            relay_lines(stderr, io::stderr());
+            crate::sandbox::observe_feed::relay_lines(stderr, io::stderr());
             drop(done);
         });
     match started {
@@ -331,43 +325,6 @@ fn relay_stderr(stderr: std::process::ChildStderr) -> Option<std::sync::mpsc::Re
                 "the egress proxy's diagnostics cannot be relayed: {e}"
             ));
             None
-        }
-    }
-}
-
-/// Copy `input` to `out` a line at a time until `input` ends, each line through
-/// [`crate::sandbox::observe_feed::sanitize`].
-///
-/// The proxy is the least trusted process of a session, so what it writes is treated as a value the
-/// cage chose: control characters cannot reach a terminal, and a line is read in pieces of at most
-/// [`RELAY_LINE_MAX`] bytes, so a proxy that never ends one holds no more than that in the
-/// supervisor. Each piece is written whole, as a line of its own; a character whose bytes a piece
-/// boundary splits is written as U+FFFD. A write that fails (the invoker gone) is dropped and
-/// reading goes on: a relay that stopped reading would fill the pipe and stall the proxy on its next
-/// diagnostic.
-fn relay_lines(input: impl io::Read, mut out: impl io::Write) {
-    use std::io::{BufRead as _, Read as _};
-    let mut reader = io::BufReader::new(input);
-    let mut line = Vec::new();
-    // Whether the last piece filled the bound without ending its line: the end that then arrives
-    // alone belongs to it, and is not a line of its own.
-    let mut cut = false;
-    loop {
-        line.clear();
-        match (&mut reader)
-            .take(RELAY_LINE_MAX)
-            .read_until(b'\n', &mut line)
-        {
-            Ok(0) => return,
-            Ok(_) if cut && line == b"\n" => cut = false,
-            Ok(_) => {
-                cut = !line.ends_with(b"\n");
-                let text = String::from_utf8_lossy(&line);
-                let text = text.strip_suffix('\n').unwrap_or(&text);
-                let _ = writeln!(out, "{}", crate::sandbox::observe_feed::sanitize(text));
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
         }
     }
 }
@@ -597,74 +554,6 @@ mod tests {
     use crate::sandbox::selfcage::BINARY;
     use crate::testutil::TmpDir;
     use std::io::{BufRead, BufReader, Write};
-
-    /// The relay writes each line of the proxy's standard error with its control characters
-    /// neutralised, so an escape sequence the proxy writes never reaches a terminal as one.
-    #[test]
-    fn the_relay_writes_each_line_with_its_controls_neutralised() {
-        let mut out = Vec::new();
-        relay_lines(&b"first\n\x1b[2Jcleared\rover\nlast"[..], &mut out);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "first\n [2Jcleared over\nlast\n"
-        );
-    }
-
-    /// A line longer than the relay reads at once is relayed in pieces, none cut short: joined, they
-    /// give the line back, so a long diagnostic loses nothing on its way to the terminal.
-    #[test]
-    fn a_long_line_is_relayed_in_pieces_that_lose_nothing() {
-        let line = format!("LONG{}END", "0".repeat(1000));
-        let mut out = Vec::new();
-        relay_lines(format!("{line}\n").as_bytes(), &mut out);
-        let text = String::from_utf8(out).unwrap();
-        let pieces: Vec<&str> = text.lines().collect();
-        assert!(pieces.len() > 1, "{pieces:?}");
-        assert!(
-            pieces
-                .iter()
-                .all(|p| p.len() <= RELAY_LINE_MAX as usize && !p.ends_with('…'))
-        );
-        assert_eq!(pieces.concat(), line);
-    }
-
-    /// A line exactly as long as one piece, then its end, is one line: the end that arrives alone
-    /// in the next read is not relayed as an empty line of its own. A line the proxy leaves empty
-    /// still is.
-    #[test]
-    fn a_line_of_exactly_one_piece_is_not_followed_by_an_empty_one() {
-        let line = "x".repeat(RELAY_LINE_MAX as usize);
-        let mut out = Vec::new();
-        relay_lines(format!("{line}\n\nafter\n").as_bytes(), &mut out);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            format!("{line}\n\nafter\n")
-        );
-    }
-
-    /// A write that fails does not stop the relay: it keeps reading, so the proxy is never left
-    /// writing into a full pipe once its invoker has gone.
-    #[test]
-    fn a_failed_write_does_not_stop_the_relay_reading() {
-        /// Refuses its first write, then keeps what it is given.
-        struct FailsOnce(bool, Vec<u8>);
-        impl Write for FailsOnce {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                if !self.0 {
-                    self.0 = true;
-                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
-                }
-                self.1.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut out = FailsOnce(false, Vec::new());
-        relay_lines(&b"lost\nkept\n"[..], &mut out);
-        assert_eq!(String::from_utf8(out.1).unwrap(), "kept\n");
-    }
 
     /// No credential to inject.
     fn nothing_to_inject() -> Credentials {

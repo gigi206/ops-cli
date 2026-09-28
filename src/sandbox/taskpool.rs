@@ -387,7 +387,7 @@ pub(crate) fn ensure(
     }
     // Say what is happening before it takes minutes. A cold install is the one launch step that can
     // stall visibly, and an unannounced stall reads as a hang.
-    eprintln!("sbx: installing task tools: {}", missing.join(", "));
+    eprintln!("{}", installing_line(&missing));
     let spec = install_spec(base_mounts, base_env, mise_bin, pool, &missing)?;
     let output = run(bwrap, &spec, limits, slug)?;
     // mise's own diagnostics are the only way to tell a registry outage from a typo'd token, so a
@@ -632,6 +632,14 @@ impl InstallRun {
     }
 }
 
+/// The line a cold install announces itself with, each tool folded by [`super::sanitize`] as the
+/// launch folds a mise token it names: a `mise:` token is held to no whitespace and no control
+/// character, not to the characters that reorder a line.
+fn installing_line(missing: &[String]) -> String {
+    let tools: Vec<String> = missing.iter().map(|t| super::sanitize(t)).collect();
+    format!("sbx: installing task tools: {}", tools.join(", "))
+}
+
 /// How much of the install's own output is kept for the failure message. Only a tail: the useful
 /// part of a mise failure is its last lines, and everything was already streamed live anyway.
 const DIAGNOSTIC_TAIL: usize = 8 * 1024;
@@ -695,24 +703,38 @@ fn run(
 /// install visibly alive; keeping only a tail is what stops a chatty backend from turning a warning
 /// into a wall of text.
 fn tee_to_stderr(pipe: &mut impl std::io::Read) -> Vec<u8> {
-    use std::io::Write as _;
-    let mut kept: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match pipe.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let _ = std::io::stderr().write_all(&buf[..n]);
-                kept.extend_from_slice(&buf[..n]);
-                if kept.len() > DIAGNOSTIC_TAIL {
-                    kept.drain(..kept.len() - DIAGNOSTIC_TAIL);
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+    tee(pipe, std::io::stderr())
+}
+
+/// [`tee_to_stderr`] onto `out`, a line at a time through
+/// [`super::observe_feed::relay_lines`]: mise, the registries it fetches from and the backends'
+/// install scripts write on these pipes, and `sbx upgrade` and a detached launch show them on a
+/// terminal the cage does not own. The tail is kept as written, since it reaches the terminal
+/// through `diag`, which escapes it.
+fn tee(pipe: &mut impl std::io::Read, out: impl std::io::Write) -> Vec<u8> {
+    let mut tail = Tail {
+        pipe,
+        kept: Vec::new(),
+    };
+    super::observe_feed::relay_lines(&mut tail, out);
+    tail.kept
+}
+
+/// A reader that keeps the last [`DIAGNOSTIC_TAIL`] bytes it reads.
+struct Tail<'a, R> {
+    pipe: &'a mut R,
+    kept: Vec<u8>,
+}
+
+impl<R: std::io::Read> std::io::Read for Tail<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.pipe.read(buf)?;
+        self.kept.extend_from_slice(&buf[..n]);
+        if self.kept.len() > DIAGNOSTIC_TAIL {
+            self.kept.drain(..self.kept.len() - DIAGNOSTIC_TAIL);
         }
+        Ok(n)
     }
-    kept
 }
 
 #[cfg(test)]
@@ -1290,5 +1312,43 @@ mod tests {
         let pool = base.join("task-mise");
         realize(&pool, "node", Some("node"), &["22.3.0"]);
         assert!(bins_for(&pool, &["node".to_string()]).bins[0].starts_with(&install_dest));
+    }
+
+    /// What the install cage writes is forwarded as text that drives nothing: mise, the registries
+    /// it fetches from and the backends' install scripts write there, and `sbx upgrade` shows it on
+    /// a terminal the cage does not own. The tail kept for the failure message stays as written; it
+    /// reaches the terminal through `diag`, which escapes it.
+    #[test]
+    fn an_install_is_forwarded_as_text_that_drives_nothing_and_its_tail_kept_as_written() {
+        let written = "fetching\n\u{1b}[2K\u{1b}[1Aforged\u{202e}X\rdone";
+        let mut out = Vec::new();
+        let kept = tee(&mut written.as_bytes(), &mut out);
+        let shown = String::from_utf8(out).unwrap();
+        assert!(
+            !shown
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || crate::diag::reorders(c)),
+            "{shown:?}"
+        );
+        assert_eq!(
+            shown.lines().count(),
+            2,
+            "one line per line written: {shown:?}"
+        );
+        assert!(
+            shown.contains("forged") && shown.contains("done"),
+            "{shown:?}"
+        );
+        assert_eq!(kept, written.as_bytes(), "the tail is the bytes as written");
+    }
+
+    /// The announcement names the tools a task declared: a `mise:` token is held to no whitespace
+    /// and no control character, which lets a character that reorders the line through, so each is
+    /// written as text, as the diagnostics around it are.
+    #[test]
+    fn the_install_announces_the_declared_tools_as_text_that_drives_nothing() {
+        let line = installing_line(&["npm:T01\u{202e}X".to_string(), "jq".to_string()]);
+        assert!(!line.chars().any(crate::diag::reorders), "{line:?}");
+        assert!(line.contains("T01") && line.ends_with(", jq"), "{line:?}");
     }
 }
