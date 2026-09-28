@@ -324,4 +324,51 @@ mod tests {
             assert_eq!(got(name), Ok(0), "{name} is allowed");
         }
     }
+
+    /// An abort under the unpack's filters ends its process by `SIGABRT`, the signal a reader
+    /// takes for one. The C library signals the thread it is on, and asks the kernel which that is
+    /// first; refused that, it has no signal to send, and ends the process by a fault of its own.
+    /// In a process of its own, for the reason [`under_the_filters`] gives, and one that dumps no
+    /// core.
+    #[test]
+    fn an_abort_under_the_filters_still_reads_as_one() {
+        // SAFETY: the child confines itself and aborts, never returning into the harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: plain integer arguments, a flag of the calling process.
+            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+            if confine().is_err() {
+                // SAFETY: `_exit` ends the child without running anything of the process it copied.
+                unsafe { libc::_exit(2) };
+            }
+            // SAFETY: ends the child, which is what is under test.
+            unsafe { libc::abort() };
+        }
+        let status = reaped_within(pid);
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGABRT,
+            "the abort ended with wait status {status:#x}"
+        );
+    }
+
+    /// The wait status of the child `pid`, once it has ended. One that has not ended within
+    /// [`REPORT_WITHIN`] is killed, and the test fails rather than waits: a fault the process has
+    /// a handler for, and cannot take the handler off under the filters, is raised again forever.
+    fn reaped_within(pid: libc::pid_t) -> i32 {
+        let pidfd = crate::session::open_pidfd(u32::try_from(pid).expect("a child's pid"))
+            .expect("a pidfd for the child");
+        let ended = crate::session::wait_for_exit(pidfd, REPORT_WITHIN);
+        // SAFETY: `pidfd` was opened above and is closed once.
+        unsafe { libc::close(pidfd) };
+        if !ended {
+            // SAFETY: `pid` is a child of this process, not yet reaped.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is a child of this process that has ended or has just been killed.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(ended, "the child did not end within {REPORT_WITHIN:?}");
+        status
+    }
 }

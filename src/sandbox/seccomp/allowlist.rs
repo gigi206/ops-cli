@@ -34,8 +34,10 @@ fn floor() -> Vec<i64> {
         libc::SYS_rt_sigreturn,
         libc::SYS_restart_syscall,
         // An abort, which signals its own process: refused, it would end in some other fault and
-        // no longer read as one.
+        // no longer read as one. glibc asks the kernel which thread it is on before signalling it,
+        // where musl reads it from its own record.
         libc::SYS_getpid,
+        libc::SYS_gettid,
         libc::SYS_tgkill,
         libc::SYS_tkill,
     ]
