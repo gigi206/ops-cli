@@ -853,6 +853,9 @@ mod tests {
     /// What a process in the proxy's cage reaches, before and after the proxy's own filters: a line
     /// `sbx-probe: <call> <errno>` per call, `0` for one that succeeded. Run in the cage by
     /// [`the_proxys_cage_and_its_filters_hold_what_runs_in_them`]; anywhere else it does nothing.
+    ///
+    /// It ends its process itself, never handing back to libtest: the harness's thread waits for
+    /// the test's end on a lock the filters may leave it unwoken on.
     #[test]
     #[ignore = "run in the proxy's cage by the test that reads what it prints"]
     fn probe_in_the_proxys_cage() {
@@ -888,6 +891,9 @@ mod tests {
         say("inet", inet());
         say("unix", unix());
         say("exec", exec());
+        let _ = io::stdout().flush();
+        // SAFETY: ends the process without running anything more of it.
+        unsafe { libc::_exit(0) };
     }
 
     /// A process in the proxy's cage finds no file of the host and no network, and once under the
