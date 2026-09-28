@@ -268,6 +268,15 @@ fn report_missing(
     Some(ExitCode::from(2))
 }
 
+/// Append one line of a bundle's listing: `line` written as text by [`diag::visible`], then its
+/// own break. What a bundle declares is the bytes of a file `sbx bundle import` copied verbatim,
+/// held to no charset, and this listing is where the import warning sends a reader to inspect it;
+/// a line break inside a value is written as `\x0a`, on the line it belongs to.
+fn push_line(out: &mut String, line: &str) {
+    out.push_str(&diag::visible(line));
+    out.push('\n');
+}
+
 /// Render the listing: one summary line per bundle when listing them all, the full contents when
 /// named. Pure over its inputs so the shape is unit-testable without a config on disk.
 fn render_bundles(
@@ -308,54 +317,64 @@ fn render_bundles(
         }
         let _ = writeln!(out, "{n}{name}{r}");
         for (k, v) in &b.packages {
-            out.push_str(&format!("  package  {k} = {v}\n"));
+            push_line(&mut out, &format!("  package  {k} = {v}"));
         }
         // Values are not printed: an env entry may carry a token placeholder, and the listing is
         // about what using the bundle *brings in*, not about its contents.
         for k in b.env.keys() {
-            out.push_str(&format!("  env      {k}\n"));
+            push_line(&mut out, &format!("  env      {k}"));
         }
         for e in &b.allow {
-            out.push_str(&format!("  allow    {e}\n"));
+            push_line(&mut out, &format!("  allow    {e}"));
         }
         for e in &b.deny {
-            out.push_str(&format!("  deny     {e}\n"));
+            push_line(&mut out, &format!("  deny     {e}"));
         }
         for e in &b.mute {
-            out.push_str(&format!("  mute     {e}\n"));
+            push_line(&mut out, &format!("  mute     {e}"));
         }
         // Named with the egress rules it rides beside, though it is not one: a group grants no
         // reach, it widens where a credential the cage signed in for may travel. The hosts are
         // printed in full — which names a group covers IS the grant.
         for group in &b.shared_credential {
-            out.push_str(&format!(
-                "  shared   {} (one service for a credential the app signs in for)\n",
-                group.join(", ")
-            ));
+            push_line(
+                &mut out,
+                &format!(
+                    "  shared   {} (one service for a credential the app signs in for)",
+                    group.join(", ")
+                ),
+            );
         }
         if let Some(secret) = &b.secret {
             for host in secret.hosts.keys() {
-                out.push_str(&format!("  secret   {host} (injected host-side)\n"));
+                push_line(&mut out, &format!("  secret   {host} (injected host-side)"));
             }
         }
         // Printed in full, unlike an env value: this one is a command that will run in the cage,
         // and a reader deciding whether to name this bundle is deciding about exactly these words.
         if let Some(provision) = &b.provision {
-            out.push_str(&format!(
-                "  install  {} (runs once, before the app's own command)\n",
-                provision.clone().into_argv().join(" ")
-            ));
+            push_line(
+                &mut out,
+                &format!(
+                    "  install  {} (runs once, before the app's own command)",
+                    provision.clone().into_argv().join(" ")
+                ),
+            );
         }
         // The rest of what a consuming app folds in. It was absent here as well as from the
         // summary, so the remedy the import warning names — "inspect with `sbx bundle <name>`" —
         // could not show the largest grant a fragment can carry.
         for name in &b.accepts_fresh_releases {
-            out.push_str(&format!(
-                "  fresh    {name} (accepted with no cooling-off period)\n"
-            ));
+            push_line(
+                &mut out,
+                &format!("  fresh    {name} (accepted with no cooling-off period)"),
+            );
         }
         for name in b.flakes.keys() {
-            out.push_str(&format!("  flake    {name} (inline flake source)\n"));
+            push_line(
+                &mut out,
+                &format!("  flake    {name} (inline flake source)"),
+            );
         }
         for (table, entries) in [
             ("tarball", &b.tarball),
@@ -368,49 +387,62 @@ fn render_bundles(
                 // is an upgrade path: a table carrying `libs` alone rolls nothing, and calling it a
                 // resolver would promise a release lookup that does not exist.
                 if !entry.resolve.is_empty() {
-                    out.push_str(&format!(
-                        "  resolve  {name} ({table}: where an upgrade looks for a new release)\n"
-                    ));
+                    push_line(
+                        &mut out,
+                        &format!(
+                            "  resolve  {name} ({table}: where an upgrade looks for a new release)"
+                        ),
+                    );
                 }
                 if !entry.libs.is_empty() {
-                    out.push_str(&format!(
-                        "  libs     {name} ({table}: {} extra nixpkgs attribute(s) the build \
-                         patches against)\n",
-                        entry.libs.len()
-                    ));
+                    push_line(
+                        &mut out,
+                        &format!(
+                            "  libs     {name} ({table}: {} extra nixpkgs attribute(s) the build \
+                         patches against)",
+                            entry.libs.len()
+                        ),
+                    );
                 }
                 // Named on its own line, because it decides which file in the artefact the launch
                 // runs: a reader deciding whether to fold this bundle in is owed that, not just the
                 // fact that a table exists.
                 if !entry.main.is_empty() {
-                    out.push_str(&format!(
-                        "  main     {name} ({table}: `{}` is the program inside the artefact)\n",
-                        entry.main
-                    ));
+                    push_line(
+                        &mut out,
+                        &format!(
+                            "  main     {name} ({table}: `{}` is the program inside the artefact)",
+                            entry.main
+                        ),
+                    );
                 }
             }
         }
         for scheme in b.open.keys() {
-            out.push_str(&format!(
-                "  open     {scheme}: (URI handler, run in the cage)\n"
-            ));
+            push_line(
+                &mut out,
+                &format!("  open     {scheme}: (URI handler, run in the cage)"),
+            );
         }
         for name in b.service.keys() {
-            out.push_str(&format!(
-                "  service  {name} (started with the cage and kept running)\n"
-            ));
+            push_line(
+                &mut out,
+                &format!("  service  {name} (started with the cage and kept running)"),
+            );
         }
         if let Some(task) = &b.task {
             for name in task.tasks.keys() {
-                out.push_str(&format!(
-                    "  task     {name} (a declared operation the caged agent can invoke)\n"
-                ));
+                push_line(
+                    &mut out,
+                    &format!("  task     {name} (a declared operation the caged agent can invoke)"),
+                );
             }
         }
         for key in undescribed_sections(b) {
-            out.push_str(&format!(
-                "  section  [{key}] — read it in the fragment before importing\n"
-            ));
+            push_line(
+                &mut out,
+                &format!("  section  [{key}] — read it in the fragment before importing"),
+            );
         }
     }
     out
@@ -1259,5 +1291,37 @@ mod tests {
             "{as_json}"
         );
         assert!(!as_json.contains("\"undescribed\":[\""), "{as_json}");
+    }
+
+    /// A bundle brought in by `sbx bundle import` is the bytes of a file someone else wrote, copied
+    /// verbatim, and nothing it declares is held to a charset. `sbx bundle <name>` is where the
+    /// import warning sends a reader to inspect it, so what it declares is written there as text,
+    /// a line break inside a value included.
+    #[test]
+    fn a_bundles_contents_are_listed_as_text_that_drives_nothing() {
+        let b: config::RawBundle = toml::from_str(concat!(
+            "packages = { \"K01\\u202eX\" = \"nix:V02\\u001b[7m\" }\n",
+            "allow = [\"A03\\u001b[7m\\nforged\\u202eX\"]\n",
+            "provision = [\"sh\", \"-c\", \"P04\\u001b[2K\\u202eX\"]\n",
+        ))
+        .expect("the fragment parses");
+        let name = "odd".to_string();
+        let pal = style::Palette::plain();
+        let shown = render_bundles(&[(&name, &b)], false, &pal);
+        assert!(
+            !shown
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || crate::diag::reorders(c)),
+            "{shown:?}"
+        );
+        for tag in ["K01", "V02", "P04"] {
+            assert!(shown.contains(tag), "{tag} is still listed: {shown:?}");
+        }
+        assert!(
+            shown
+                .lines()
+                .any(|l| l.contains("A03") && l.contains("forged")),
+            "a value's line break stays inside its line: {shown:?}"
+        );
     }
 }

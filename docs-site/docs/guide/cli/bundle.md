@@ -44,7 +44,10 @@ environment entries, egress rules, credentials: so the listing answers "how much
 this bring?" without printing everything.
 
 With names, each bundle's contents print in full: its packages, the **keys** of its
-environment, each egress rule, and each credential's destination host.
+environment, each egress rule, and each credential's destination host. They print as
+text: an imported bundle is a file someone else wrote, so a control character or a
+character that reorders a line, in any value, is written out as an escape (`\x1b`,
+`\u{202e}`, a line break as `\x0a`) on the line it belongs to. `--json` keeps the bytes.
 
 Environment **values** are not printed here: the listing answers "what does using this
 bring in?", not "what is in it". That is not redaction: `sbx bundle export` writes the
