@@ -1403,8 +1403,8 @@ pub(super) const PAGES: &[Page] = &[
             fields on the terminal it is about to lose — this is the only record that outlives it.\n\
             Logs are keyed by PID and appended to, so a PID the kernel later reuses writes into\n\
             the same file — the header line separates them and only the most recent session is\n\
-            shown unless you pass --all. Host-side: reads a file, launches nothing. Nothing prunes\n\
-            `<data>/logs` yet.",
+            shown unless you pass --all. Host-side: reads a file, launches nothing. The hundred\n\
+            most recent logs are kept, and a running session's log is never removed.",
     },
     Page {
         path: &["session", "attach"],

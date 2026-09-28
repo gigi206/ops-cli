@@ -180,9 +180,9 @@ The honest limit: the agent writes into this same file and can print a line that
 either marker. That hides its own earlier output from the default view, which `--all` still
 shows; it is not a boundary the agent can cross.
 
-> **Note.** Nothing prunes `<data>/logs` yet: neither [`sbx gc`](gc) nor session teardown.
-> A long-lived install accumulates one small file per detached launch; remove them by hand if
-> they add up.
+> **Note.** The hundred-log ceiling is the only pruning: neither [`sbx gc`](gc) nor session
+> teardown removes a log. The ceiling never counts out the log of a session still running, so
+> the directory holds more than a hundred while more sessions than that run at once.
 
 If you lose the id, the launch message is the only place it is reported: `sbx session ls` can
 only show sessions that are still alive. Failing that, list the directory:
