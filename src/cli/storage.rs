@@ -259,7 +259,7 @@ fn up(args: Vec<OsString>) -> ExitCode {
         Err(e) => return fail(e),
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!("mounted at {}", mount_point.display());
+    println!("mounted at {}", shown_path(&mount_point));
     // Mounting is not adopting. Say what the remaining step is, unless it is already done —
     // in which case `up` was only a manual nudge and there is nothing to suggest.
     let adopted = default_dir()
@@ -395,7 +395,7 @@ fn use_volume(args: Vec<OsString>) -> ExitCode {
         "{}sbx now uses{} {}",
         pal.ok,
         pal.reset,
-        mount_point.display()
+        shown_path(&mount_point)
     );
     println!("it is mounted automatically from now on — no environment variable needed.");
     ExitCode::SUCCESS
@@ -478,7 +478,7 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(format!("cannot read {}: {e}", dir.display())),
     };
-    println!("migrating {} → {}", dir.display(), mount_point.display());
+    println!("migrating {} → {}", dir.display(), shown_path(&mount_point));
     println!(
         "  {} files ({} distinct), {} dirs, {} symlinks, {}",
         before.files,
@@ -561,7 +561,7 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
                 "\n{}sbx now uses{} {}",
                 pal.ok,
                 pal.reset,
-                mount_point.display()
+                shown_path(&mount_point)
             );
             println!(
                 "the previous data is kept at {} — delete it when you are satisfied:\n  rm -rf {}",
@@ -573,14 +573,14 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
             "\n{}sbx now uses{} {}",
             pal.ok,
             pal.reset,
-            mount_point.display()
+            shown_path(&mount_point)
         ),
         Err(e) => {
             println!(
                 "\n{}sbx now uses{} {}",
                 pal.ok,
                 pal.reset,
-                mount_point.display()
+                shown_path(&mount_point)
             );
             diag::error(&format!(
                 "sbx storage: could not set the previous data aside: {e}"
@@ -916,6 +916,13 @@ enum StatusHint {
     StartUse,
 }
 
+/// A mount point as these pages print it: as text, by [`diag::visible`]. For an image adopted with
+/// `--image`, udisks names the mount point after the filesystem's label, which whoever made the
+/// image chose, and a path is held to no charset on its way here.
+fn shown_path(path: &Path) -> String {
+    diag::visible(&path.display().to_string())
+}
+
 fn status_next_step(mounted: bool, adopted: bool) -> StatusHint {
     match (mounted, adopted) {
         (true, true) => StatusHint::InUse,
@@ -949,10 +956,11 @@ fn render(v: &StatusView) {
         println!("  device      {l}");
     }
     if let Some(mp) = &v.mount_point {
-        println!("  mounted at  {}", mp.display());
+        println!("  mounted at  {}", shown_path(mp));
+        // Read from the image's own root, as its maker left it.
         println!(
             "  compression {}",
-            v.compression.as_deref().unwrap_or("off")
+            diag::visible(v.compression.as_deref().unwrap_or("off"))
         );
         if let (Some(a), Some(u)) = (v.allocated_bytes, v.used_bytes) {
             println!(
@@ -999,7 +1007,7 @@ fn render(v: &StatusView) {
             if let Some(mp) = &v.mount_point {
                 println!(
                     "    {dim}(or, for a one-off, export SBX_DATA_DIR={}){r}",
-                    mp.display()
+                    shown_path(mp)
                 );
             }
         }
@@ -1033,7 +1041,7 @@ fn render(v: &StatusView) {
                 &format!(
                     "return it now with `sudo fstrim {}`; left alone, only the part already \
                      on the way back goes home.",
-                    mp.display()
+                    shown_path(mp)
                 ),
                 &pal
             )
@@ -1483,5 +1491,23 @@ mod tests {
             kept.contains("still in the volume") && kept.contains("clear it"),
             "the leftovers are named, with what to do about them: {kept}"
         );
+    }
+
+    /// A mount point is printed as text that drives nothing: for an image adopted with `--image`,
+    /// udisks names it after the filesystem's label, which whoever made the image chose.
+    #[test]
+    fn a_mount_point_is_shown_as_text_that_drives_nothing() {
+        let shown = shown_path(Path::new("/media/u/L01\u{1b}[7m\nforged\u{202e}X"));
+        assert!(
+            !shown
+                .chars()
+                .any(|c| c.is_control() || crate::diag::reorders(c)),
+            "{shown:?}"
+        );
+        assert!(
+            shown.starts_with("/media/u/L01") && shown.contains("forged"),
+            "{shown:?}"
+        );
+        assert_eq!(shown_path(Path::new("/media/u/sbx")), "/media/u/sbx");
     }
 }
