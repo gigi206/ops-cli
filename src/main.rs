@@ -1586,10 +1586,7 @@ fn persist_learned_proc_rules(
     // The posture, whenever this write is what put the cage on it. Said before the re-trust line
     // because it is the part that changes what the next launch does with a program nobody named.
     if previous_mode.as_deref() != Some("ask") {
-        let from = match &previous_mode {
-            Some(m) => format!("`{m}`"),
-            None => "no declared posture".to_string(),
-        };
+        let from = previous_posture(previous_mode.as_deref());
         msg.push_str(&format!(
             "\nset proc mode `ask` (was {from}) — an exec no rule names now waits for \
              `sbx proc allow`/`deny` instead of running"
@@ -1599,6 +1596,16 @@ fn persist_learned_proc_rules(
         msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
     }
     Ok(msg)
+}
+
+/// How the summary of a `--proc-learn` write names the `[proc]` mode it replaced: as text by
+/// [`diag::visible`], since the mode is read from the target file as written and nothing on this
+/// path checks what it says.
+fn previous_posture(previous: Option<&str>) -> String {
+    match previous {
+        Some(m) => format!("`{}`", diag::visible(m)),
+        None => "no declared posture".to_string(),
+    }
 }
 
 /// Remove a rule from the scoped config file, trust-gating a project write and re-trusting it after
@@ -2355,5 +2362,24 @@ mod tests {
         let parsed = split_scope(&osv(&["-c", "/tmp/x.toml", "k"])).unwrap();
         assert!(matches!(parsed.scope, Scope::File(_)));
         assert!(split_scope(&osv(&["-a"])).is_err());
+    }
+
+    /// The mode a `--proc-learn` write replaced is read from the target file as written, with no
+    /// check of what it says on this path, so the summary names it as text that drives nothing.
+    #[test]
+    fn the_replaced_proc_mode_is_named_as_text_that_drives_nothing() {
+        let named = previous_posture(Some("enforce\u{1b}[2K\nforged\u{202e}X"));
+        assert!(
+            !named
+                .chars()
+                .any(|c| c.is_control() || crate::diag::reorders(c)),
+            "{named:?}"
+        );
+        assert!(
+            named.contains("enforce") && named.contains("forged"),
+            "{named:?}"
+        );
+        assert_eq!(previous_posture(Some("enforce")), "`enforce`");
+        assert_eq!(previous_posture(None), "no declared posture");
     }
 }
