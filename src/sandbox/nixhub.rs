@@ -791,7 +791,7 @@ fn fetch_expr(url: &str) -> String {
 /// version match wins, falling back to the newest whose version extends the request at
 /// a component boundary (so `20` selects the newest `20.x`, `1.6` selects `1.6-bin`).
 ///
-/// The commit and attribute are validated before they can flow into a flake reference.
+/// The chosen release is read through [`release_pin`], so a release it refuses is not pinned.
 ///
 /// Pure, so selection is testable against captured metadata.
 fn select_release(metadata: &serde_json::Value, version_req: &str, system: &str) -> Option<Pin> {
@@ -808,7 +808,16 @@ fn select_release(metadata: &serde_json::Value, version_req: &str, system: &str)
         "" | "latest" | "stable" => *compatible.first()?,
         req => pick_by_version(&compatible, req)?,
     };
-    let platform = platform_for(chosen, system)?;
+    release_pin(chosen, system)
+}
+
+/// The pin `release` offers `system`, or `None` when it ships no build for it or carries a value
+/// sbx refuses. The commit and attribute are validated before they can flow into a flake
+/// reference, and the version because it is stored tab-separated in the resolution lock, so it
+/// must carry no separator or control character. None of the three can then carry a character
+/// that drives a terminal either, which is why `sbx search` offers its pins through this too.
+pub(crate) fn release_pin(release: &serde_json::Value, system: &str) -> Option<Pin> {
+    let platform = platform_for(release, system)?;
     let commit = platform
         .get("commit_hash")?
         .as_str()
@@ -817,9 +826,7 @@ fn select_release(metadata: &serde_json::Value, version_req: &str, system: &str)
         .get("attribute_path")?
         .as_str()
         .filter(|a| crate::config::is_valid_attr(a))?;
-    // validate the resolved version too: it is stored tab-separated in the resolution
-    // lock, so it must carry no separator or control character.
-    let version = chosen
+    let version = release
         .get("version")?
         .as_str()
         .filter(|v| is_valid_version(v))?;
@@ -857,12 +864,8 @@ fn pick_by_version<'a>(
 }
 
 /// The platform entry of `release` whose `system` matches, or `None` when the release
-/// ships no build for it. Exposed so `sbx search` reads a release's per-system commit
-/// and attribute through the same accessor the resolver uses (no shape drift).
-pub(crate) fn platform_for<'a>(
-    release: &'a serde_json::Value,
-    system: &str,
-) -> Option<&'a serde_json::Value> {
+/// ships no build for it.
+fn platform_for<'a>(release: &'a serde_json::Value, system: &str) -> Option<&'a serde_json::Value> {
     release
         .get("platforms")?
         .as_array()?
@@ -873,7 +876,7 @@ pub(crate) fn platform_for<'a>(
 /// A nixhub/nixpkgs package name: non-empty and built only from characters a real
 /// package name uses, so a declared value cannot smuggle URL- or shell-significant
 /// characters into the metadata fetch.
-fn is_valid_pkg(s: &str) -> bool {
+pub(crate) fn is_valid_pkg(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))

@@ -133,6 +133,10 @@ pub(crate) fn percent_encode(query: &str) -> String {
 /// Extract the `(name, summary)` hits from a nixhub `v2/search` response. A result with
 /// no name is skipped; a missing summary renders empty. Pure, so it is tested against
 /// captured JSON.
+///
+/// Both fields are nixhub's text on its way to a terminal. A name the resolver would refuse
+/// ([`super::nixhub::is_valid_pkg`]) is skipped, since no `nix:` declaration could name it, and
+/// the summary is folded to one line through [`crate::diag::one_line`].
 fn parse_matches(json: &serde_json::Value) -> Vec<Match> {
     let Some(results) = json.get("results").and_then(|r| r.as_array()) else {
         return Vec::new();
@@ -140,12 +144,13 @@ fn parse_matches(json: &serde_json::Value) -> Vec<Match> {
     results
         .iter()
         .filter_map(|r| {
-            let name = r.get("name")?.as_str()?.to_string();
-            let summary = r
-                .get("summary")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
+            let name = r
+                .get("name")?
+                .as_str()
+                .filter(|n| super::nixhub::is_valid_pkg(n))?
                 .to_string();
+            let summary =
+                crate::diag::one_line(r.get("summary").and_then(|s| s.as_str()).unwrap_or(""));
             Some(Match { name, summary })
         })
         .collect()
@@ -153,24 +158,20 @@ fn parse_matches(json: &serde_json::Value) -> Vec<Match> {
 
 /// Build the version list for an exact-match package from its nixhub metadata, newest
 /// first, keeping only releases that ship a build for `system` (so a pin the host could
-/// not realise is never suggested). Reuses the resolver's platform accessor so the JSON
-/// shape is read in exactly one place.
+/// not realise is never suggested). Each release is read through the resolver's own
+/// [`super::nixhub::release_pin`], so the JSON shape is read in exactly one place and a
+/// release the resolver would refuse to pin is not offered here either.
 fn parse_versions(metadata: &serde_json::Value, system: &str) -> Vec<VersionRow> {
     let Some(releases) = metadata.get("releases").and_then(|r| r.as_array()) else {
         return Vec::new();
     };
     releases
         .iter()
-        .filter_map(|release| {
-            let version = release.get("version")?.as_str()?.to_string();
-            let platform = super::nixhub::platform_for(release, system)?;
-            let commit = platform.get("commit_hash")?.as_str()?.to_string();
-            let attr = platform.get("attribute_path")?.as_str()?.to_string();
-            Some(VersionRow {
-                version,
-                commit,
-                attr,
-            })
+        .filter_map(|release| super::nixhub::release_pin(release, system))
+        .map(|pin| VersionRow {
+            version: pin.version,
+            commit: pin.commit,
+            attr: pin.attr,
         })
         .collect()
 }
@@ -400,6 +401,67 @@ mod tests {
         );
         assert_eq!(rows[0].commit, "a".repeat(40));
         assert_eq!(rows[0].attr, "jq");
+    }
+
+    #[test]
+    fn nixhubs_answer_reaches_the_report_as_text_that_drives_nothing() {
+        // A JSON string carries any character: an escape sequence, a right-to-left override, a
+        // line break that would forge a line of the report.
+        let json = serde_json::json!({
+            "results": [
+                { "name": "jq", "summary": "JSON \u{1b}[2Jprocessor\u{202e}\n  gojq  forged" },
+                { "name": "evil\u{1b}]0;title\u{7}", "summary": "a name no `nix:` can declare" },
+                { "name": "jq\nforged", "summary": "a name no `nix:` can declare" }
+            ]
+        });
+        let matches = parse_matches(&json);
+        assert_eq!(
+            matches,
+            vec![Match {
+                name: "jq".into(),
+                summary: "JSON [2Jprocessor gojq forged".into()
+            }]
+        );
+
+        // A release the resolver would refuse to pin is not offered as a pin either.
+        let release = |version: &str, commit: String, attr: &str| {
+            serde_json::json!({ "version": version, "platforms": [
+                { "system": "x86_64-linux", "commit_hash": commit, "attribute_path": attr }
+            ]})
+        };
+        let metadata = serde_json::json!({ "releases": [
+            release("1.8.1\u{1b}[31m", "a".repeat(40), "jq"),
+            release("1.8.0", "a".repeat(39) + "\u{1b}", "jq"),
+            release("1.7.1", "b".repeat(40), "jq\u{202e}"),
+            release("1.6", "c".repeat(40), "jq"),
+        ]});
+        let versions = parse_versions(&metadata, "x86_64-linux");
+        assert_eq!(
+            versions
+                .iter()
+                .map(|r| r.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.6"]
+        );
+
+        let exact = Exact::Resolved {
+            pkg: matches[0].name.clone(),
+            summary: matches[0].summary.clone(),
+            versions,
+        };
+        let report = render(
+            "jq",
+            &matches,
+            Some(&exact),
+            "x86_64-linux",
+            &Palette::plain(),
+        );
+        assert!(
+            !report
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || crate::diag::reorders(c)),
+            "{report:?}"
+        );
     }
 
     #[test]

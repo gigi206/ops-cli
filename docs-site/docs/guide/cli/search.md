@@ -22,6 +22,10 @@ See also: [`packages`](../configuration/packages) · [`[tools]`](../configuratio
   [`[tools]`](../configuration/tools) or [`[packages]`](../configuration/packages),
   with a `related:` footer.
 
+Either way, what nixhub answers is checked as the resolver checks it: a name a `nix:`
+declaration could not carry, or a release sbx would refuse to pin, is left out, and each
+summary is shown on one line, its control and text-reordering characters turned into spaces.
+
 ## Examples
 
 ```sh
