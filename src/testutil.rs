@@ -204,8 +204,8 @@ pub(crate) fn returns_within<T: Send + 'static>(
         .unwrap_or_else(|_| panic!("{what} did not return within {limit:?}"))
 }
 
-/// How long a test run alone ([`run_alone`]) has to end before it is killed and the test that ran
-/// it fails.
+/// How long a process [`run_within`] runs has to end before it is killed and the test that ran it
+/// fails.
 const END_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The variable that tells a test it is run alone ([`alone`]), and carries what it was handed.
@@ -233,7 +233,7 @@ pub(crate) fn alone(entry: &str, with: impl AsRef<OsStr>) -> std::process::Comma
     command
 }
 
-/// How a test run alone ended, and what it wrote.
+/// How a process [`run_within`] ran ended, and what it wrote.
 pub(crate) struct Ran {
     pub(crate) status: std::process::ExitStatus,
     pub(crate) stdout: String,
@@ -265,34 +265,44 @@ impl Ran {
 /// one it takes to record a thread it starts, and a thread started in the copy waits on it for good
 /// whenever another test was starting a thread at that instant.
 ///
-/// The directory is removed once the test has ended. A test that has not ended within
-/// [`END_WITHIN`] is killed, and the test that ran it fails rather than waits: a fault the process
-/// has a handler for, and cannot take the handler off under the filters, is raised again forever.
-/// What it wrote is read once it has ended, and not to the end of the stream: a process another
-/// test forks meanwhile holds a copy of every descriptor this one has open, the pipes' among them,
-/// and a stream some other process holds does not end with the test. What it writes is far smaller
-/// than a pipe's buffer, so it is all there.
+/// The directory is removed once the test has ended; how long it has, and how what it wrote is
+/// read, [`run_within`] says.
 pub(crate) fn run_alone(entry: &str) -> Ran {
-    use std::process::Stdio;
     let dir = TmpDir::new();
-    let mut child = alone(entry, dir.path())
-        .stdin(Stdio::null())
+    run_within(
+        alone(entry, dir.path()).stdin(std::process::Stdio::null()),
+        entry,
+    )
+}
+
+/// Run `command`, its output and errors piped, and say how it ended; `what` names it in a failure.
+///
+/// A process that has not ended within [`END_WITHIN`] is killed, and the test that ran it fails
+/// rather than waits: a fault a process has a handler for, and cannot take the handler off under a
+/// helper's filters, is raised again forever, and a thread of the harness a filter left unwoken
+/// waits for good. What it wrote is read once it has ended, and not to the end of the stream: a
+/// process another test forks meanwhile holds a copy of every descriptor this one has open, the
+/// pipes' among them, and a stream some other process holds does not end with the process. What
+/// the processes run here write is far smaller than a pipe's buffer, so it is all there.
+pub(crate) fn run_within(command: &mut std::process::Command, what: &str) -> Ran {
+    use std::process::Stdio;
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("the test binary runs again");
-    let pidfd = crate::session::open_pidfd(child.id()).expect("a pidfd for the test run alone");
+        .unwrap_or_else(|e| panic!("{what} does not start: {e}"));
+    let pidfd = crate::session::open_pidfd(child.id()).expect("a pidfd for the process run");
     let ended = crate::session::wait_for_exit(pidfd, END_WITHIN);
     crate::session::close_fd(pidfd);
     if !ended {
         let _ = child.kill();
     }
-    let status = child.wait().expect("the test run alone is reaped");
+    let status = child.wait().expect("the process run is reaped");
     let stdout = queued(child.stdout.take().expect("its output"));
     let stderr = queued(child.stderr.take().expect("its errors"));
     assert!(
         ended,
-        "{entry} did not end within {END_WITHIN:?}: {stdout}{stderr}"
+        "{what} did not end within {END_WITHIN:?}: {stdout}{stderr}"
     );
     Ran {
         status,

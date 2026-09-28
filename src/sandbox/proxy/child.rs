@@ -928,9 +928,9 @@ mod tests {
         )];
         let (mut command, files) = selfcage::command(&bwrap, &spec, binary).unwrap();
         crate::sandbox::memfd::inherit_across_exec(&mut command, &files);
-        let out = command.output().unwrap();
+        let ran = crate::testutil::run_within(&mut command, "the probe in the proxy's cage");
         drop(files);
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout = &ran.stdout;
         let seen: Vec<&str> = stdout
             .lines()
             .filter_map(|l| l.split_once("sbx-probe: ").map(|(_, said)| said))
@@ -946,12 +946,7 @@ mod tests {
             format!("unix {}", libc::EPERM),
             format!("exec {}", libc::EPERM),
         ];
-        assert_eq!(
-            seen,
-            expected,
-            "{stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert_eq!(seen, expected, "{stdout}{}", ran.stderr);
     }
 
     /// Every descriptor the cage's argv names is one the command hands bwrap: its filters, the

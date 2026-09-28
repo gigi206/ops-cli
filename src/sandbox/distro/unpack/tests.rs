@@ -357,9 +357,9 @@ fn a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else() {
     let (mut command, files) = selfcage::command(&bwrap, &spec, binary).unwrap();
     command.stdin(File::open(&layer).unwrap());
     crate::sandbox::memfd::inherit_across_exec(&mut command, &files);
-    let out = command.output().unwrap();
+    let ran = crate::testutil::run_within(&mut command, "the probe in the unpack's cage");
     drop(files);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = &ran.stdout;
     let seen: Vec<&str> = stdout
         .lines()
         .filter_map(|l| l.split_once("sbx-probe: ").map(|(_, said)| said))
@@ -372,12 +372,7 @@ fn a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else() {
         format!("socket {}", libc::EPERM),
         format!("exec {}", libc::EPERM),
     ];
-    assert_eq!(
-        seen,
-        expected,
-        "{stdout}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_eq!(seen, expected, "{stdout}{}", ran.stderr);
     assert!(
         stdout.lines().any(|l| l.starts_with("spent ")),
         "the unpack said what it spent: {stdout}"
