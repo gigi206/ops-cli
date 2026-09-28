@@ -5653,8 +5653,9 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
     // `sbx mise install` and no `sbx trust` (the open self-equip posture). Teeth: `rg` runs
     // on a plain `sbx run` of an UNtrusted project, so the launcher fetched it through mise,
     // installed it into the project's own store, and resolved it through the shims dir — the
-    // whole auto-equip chain. Skips (never fails) when the host cannot sandbox or the network
-    // is unreachable (the tool is fetched from upstream on first launch).
+    // whole auto-equip chain. Skips (never fails) when the host cannot sandbox, the network
+    // is unreachable (the tool is fetched from upstream on first launch), or github's api quota
+    // is spent (the release is resolved through it).
     let project = TmpDir::prefixed("r", "equip-proj");
     let data = TmpDir::prefixed("r", "equip-data");
     // anchored on an (empty) .sbx.toml; the tool is fresh-from-upstream via mise's aqua backend
@@ -5673,6 +5674,11 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
     need_reachable!(
         cache_reachable(),
         "skipping auto-equip e2e: the network is unreachable"
+    );
+    need_reachable!(
+        github_api_has_quota(),
+        "skipping auto-equip e2e: github's api quota is spent, and the `aqua:` tool resolves its \
+         release through it"
     );
 
     // untrusted project, plain `sbx run` — the tool must still equip and run (open posture).
@@ -5702,7 +5708,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
     // the built-in allow-set), a TLS path nix:'s libcurl never exercises. Teeth: rg
     // runs, so mise's reqwest trusted the proxy's per-session CA and the forwarder bridged the
     // empty netns. Short tags keep the egress socket path under `SUN_LEN`. Skips (never fails)
-    // when the host cannot sandbox or the cache is unreachable.
+    // when the host cannot sandbox, the cache is unreachable, or github's api quota is spent.
     let project = TmpDir::prefixed("r", "aql-proj");
     let data = TmpDir::prefixed("r", "aql-data");
     let state = TmpDir::prefixed("r", "aql-state");
@@ -5725,6 +5731,11 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
     need_reachable!(
         cache_reachable(),
         "skipping auto-equip allowlist e2e: the network is unreachable"
+    );
+    need_reachable!(
+        github_api_has_quota(),
+        "skipping auto-equip allowlist e2e: github's api quota is spent, and the `aqua:` tool \
+         resolves its release through it"
     );
 
     // trust so the allowlist posture is honored (otherwise it degrades to shared and the MITM
