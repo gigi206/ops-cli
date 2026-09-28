@@ -78,9 +78,13 @@ rather than seeded:
 - when the project directory still exists, the project's declared packages/tools that are
   **not built yet**, an untrusted declaration is flagged `withheld` (a launch would not
   provision it), distinct from a trusted one simply not equipped yet. A dead tree shows
-  realized state only.
+  realized state only. What the project's files declare is written as text, as
+  [`sbx config show`](config) writes it: a control character or a character that reorders a
+  line, in a mise tool's name or version, is written out as an escape (`\x1b`, `\u{202e}`, a line
+  break as `\x0a`).
 
-Read-only (no sandbox, no nix, no network). `--json` emits the same model. For an app rather
+Read-only (no sandbox, no nix, no network). `--json` emits the same model, with the bytes the
+files hold. For an app rather
 than a tree, see [`sbx app show`](app).
 
 ## `rm`

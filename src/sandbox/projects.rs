@@ -624,7 +624,15 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
             } else {
                 ("not built yet", dim)
             };
-            let _ = writeln!(s, "    {n}{}{r} {}  {hue}{tag}{r}", u.kind, u.locator);
+            // The locator of a mise tool is the project's `[tools]` key and version, read whether
+            // or not the project is trusted and held to no charset: written as `config show` writes
+            // a value, escaped and not cut. `--json` keeps the bytes.
+            let _ = writeln!(
+                s,
+                "    {n}{}{r} {}  {hue}{tag}{r}",
+                u.kind,
+                crate::diag::visible(&u.locator)
+            );
         }
     }
     s
@@ -902,5 +910,61 @@ mod projects_rm_tests {
         // A different tree, or an unresolvable cwd, never guards.
         assert!(!rm_refuses_current("abc", Some("def"), false));
         assert!(!rm_refuses_current("abc", None, false));
+    }
+}
+
+#[cfg(test)]
+mod projects_show_tests {
+    use super::*;
+
+    // A project's mise file names its non-`nix:` tools, and `sbx projects show` lists the ones not
+    // built yet whether or not the project is trusted. A `[tools]` key is a quoted TOML key, any
+    // string, so it reaches the view carrying whatever the project wrote; the listing writes it as
+    // text that drives nothing, as `sbx config show` writes a config's values.
+    #[test]
+    fn a_tool_the_project_names_is_listed_as_text_that_drives_nothing() {
+        let view = ProjectShowView {
+            id: "p1".into(),
+            state: "live",
+            project: None,
+            last_used: "2026-09-28".into(),
+            total_bytes: 0,
+            store_bytes: 0,
+            home_bytes: 0,
+            pools_bytes: 0,
+            other_bytes: 0,
+            store_built_here_bytes: 0,
+            own_bytes: 0,
+            nixpkgs: None,
+            store_roots: StoreRootsView {
+                nix: vec![],
+                deb: vec![],
+                appimage: vec![],
+                tarball: vec![],
+                binary: vec![],
+            },
+            mise_tools: vec![],
+            unbuilt: vec![UnbuiltView {
+                kind: "mise tool".into(),
+                locator: "npm:P01\u{1b}[7m\nforged\u{202e}X = 1.0".into(),
+                withheld: false,
+            }],
+            config_available: true,
+        };
+        let text = render_project_show(&view, &crate::style::Palette::plain());
+        assert!(
+            !text
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || crate::diag::reorders(c)),
+            "{text:?}"
+        );
+        let line = text
+            .lines()
+            .find(|l| l.contains("P01"))
+            .unwrap_or_else(|| panic!("the tool is still listed: {text:?}"));
+        assert!(
+            line.contains("forged") && line.contains("= 1.0"),
+            "the whole value stays on its own line: {text:?}"
+        );
     }
 }
