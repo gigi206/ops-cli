@@ -405,6 +405,42 @@ fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
 }
 
 #[test]
+fn a_malformed_override_file_is_quoted_as_text_that_drives_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    // The TOML parser quotes the offending line of a `--config @<file>` in its error. That line
+    // is the file's to spell, not the invoker's, so an escape sequence or a character that
+    // reorders the line must reach the terminal as text. Parse-time, so this needs no capable host.
+    let project = TmpDir::prefixed("r", "ov-esc-proj");
+    let data = TmpDir::prefixed("r", "ov-esc-data");
+    let file = project.path().join("override.toml");
+    std::fs::write(&file, "x = \"a\x1b[31mred\u{202e}evil\"\n").expect("write the override file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict the override file");
+    let out = sbx()
+        .args(["run", "--config"])
+        .arg(format!("@{}", file.display()))
+        .args(["--", "true"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a malformed override file must exit 2: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\x1b') && !stderr.contains('\u{202e}'),
+        "the quoted line must not drive the terminal: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("\\x1b[31mred\\u{202e}evil"),
+        "the offending line should still be shown, escaped: {stderr:?}"
+    );
+}
+
+#[test]
 fn a_one_shot_override_beats_an_app_overlay_through_the_real_dispatch() {
     // The flagship, end to end through the real binary: `sbx app <name> --env` must beat the app's
     // own `env` overlay — proving the dispatch applies the override *after* `merge_app`, the load-

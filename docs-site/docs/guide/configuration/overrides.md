@@ -51,6 +51,11 @@ a FIFO, a directory or a loose-permission file is refused by name rather than la
 The distinction matters most for `SBX_CONFIG=@…`, which can reach `sbx` from an ambient
 environment nobody re-read.
 
+A file that is not valid TOML is a usage error (exit 2), and the error quotes the line it
+stopped at. That line is printed as text: a control character or a character that reorders
+a line is written out as an escape (`\x1b`, `\u{202e}`), so the quote shows what the file
+holds without driving the terminal.
+
 ### Typed flags: one field each
 
 Ergonomic shorthands for a single field, each with an `SBX_*` environment equivalent:

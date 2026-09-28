@@ -788,7 +788,7 @@ fn build_override(cli: &config::CliOverrides) -> Result<config::Override, ExitCo
             Ok(ov)
         }
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             Err(ExitCode::from(2))
         }
     }
