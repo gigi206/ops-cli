@@ -2454,7 +2454,7 @@ fn serve_under_supervisor(
 /// is under test is *when the sweep is reached*, not what it decides once it is.
 #[test]
 fn a_parked_decision_times_out_while_the_cage_keeps_the_receive_loop_busy() {
-    need_host_programs!("/bin/nope", "/bin/sh", "/bin/true");
+    need_host_programs!("/bin/sh", "/bin/true");
     let dir = TmpDir::new();
     let shim = materialized_shim(&dir);
     let sock_path = dir.join("notif.sock");
@@ -2742,7 +2742,7 @@ fn own_dynamic_loader() -> Option<PathBuf> {
 /// policy denying something else must run to completion and return its own exit code.
 #[test]
 fn the_interpreter_a_shebang_names_is_decided_too() {
-    need_host_programs!("/bin/nonexistent", "/bin/sh");
+    need_host_programs!("/bin/sh");
     use std::os::unix::fs::PermissionsExt;
     let dir = TmpDir::new();
     let path = dir.join("s.sh");
@@ -2789,7 +2789,7 @@ fn the_interpreter_a_shebang_names_is_decided_too() {
 /// under a policy denying something else must run to completion and return its own exit code.
 #[test]
 fn a_shebang_chain_is_followed_to_the_program_the_kernel_runs() {
-    need_host_programs!("/bin/nonexistent", "/bin/sh");
+    need_host_programs!("/bin/sh");
     use std::os::unix::fs::PermissionsExt;
     let dir = TmpDir::new();
     let inner = dir.join("b.sh");
@@ -2843,7 +2843,7 @@ fn a_shebang_chain_is_followed_to_the_program_the_kernel_runs() {
 /// with no handler in force must run.
 #[test]
 fn an_interpreter_binfmt_misc_would_run_is_decided() {
-    need_host_programs!("/bin/nonexistent", "/bin/true");
+    need_host_programs!("/bin/true");
     let handler = crate::proc_policy::parse_binfmt_rule(
         "enabled\ninterpreter /opt/vm/run\nflags: \noffset 0\nmagic 7f454c46\n",
     )
@@ -2920,7 +2920,7 @@ fn an_interpreter_binfmt_misc_would_run_is_decided() {
 /// so, where the interpreter is not on this host.
 #[test]
 fn a_shebang_run_from_a_descriptor_is_decided_too() {
-    need_host_programs!("/bin/nonexistent", "/bin/python3", "/bin/sh");
+    need_host_programs!("/bin/python3", "/bin/sh");
     let Some(python) = ["/usr/bin/python3", "/bin/python3"]
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
@@ -2986,7 +2986,7 @@ fn a_shebang_run_from_a_descriptor_is_decided_too() {
 /// interpreter run behind a file the cage made unreadable on purpose.
 #[test]
 fn a_target_that_can_be_reached_and_not_read_is_refused() {
-    need_host_programs!("/bin/nonexistent", "/bin/sh");
+    need_host_programs!("/bin/sh");
     use std::os::unix::fs::PermissionsExt;
     let dir = TmpDir::new();
     let path = dir.join("x.sh");
@@ -3065,7 +3065,7 @@ fn a_target_that_can_be_reached_and_not_read_is_refused() {
 /// the loader alone under the denying policy must still be allowed.
 #[test]
 fn a_program_a_loader_is_asked_to_run_is_decided_by_its_own_name() {
-    need_host_programs!("/bin/nonexistent", "/bin/sh", "/bin/true");
+    need_host_programs!("/bin/sh", "/bin/true");
     let Some(loader) = own_dynamic_loader() else {
         return;
     };
@@ -3154,7 +3154,7 @@ fn a_program_a_loader_is_asked_to_run_is_decided_by_its_own_name() {
 /// the payload and the payload's own exit code is what comes back.
 #[test]
 fn an_allowed_execve_runs_the_payload() {
-    need_host_programs!("/bin/nonexistent", "/bin/true");
+    need_host_programs!("/bin/true");
     // A denylist that denies something else entirely: `/bin/true` is unmatched, which under
     // `enforce` means allowed.
     let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
@@ -3592,7 +3592,7 @@ fn run_in_cage(
 /// then the link and not the cage failing to launch anything at all.
 #[test]
 fn a_head_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_given_up_on() {
-    need_host_programs!("/bin/nonexistent", "/bin/sh");
+    need_host_programs!("/bin/sh");
     let setup = "printf '#!/bin/sh\\nexit 7\\n' > '{cage}/payload'\n\
                  chmod 755 '{cage}/payload'\n\
                  ln -s '{cage}/payload' '{cage}/l'\n";
@@ -3637,7 +3637,7 @@ fn a_head_behind_an_absolute_link_is_asked_of_the_cage_before_it_is_given_up_on(
 /// cage, and only one of them is the one the `execve` runs.
 #[test]
 fn a_head_spelled_under_proc_self_is_read_from_the_cage_and_not_from_the_host() {
-    need_host_programs!("/bin/bash", "/bin/nonexistent", "/bin/sh");
+    need_host_programs!("/bin/bash", "/bin/sh");
     use std::os::unix::fs::PermissionsExt;
     // The host side, planted before the tmpfs covers it: the file this supervisor's own walk lands
     // on when it leaves the cage, naming an interpreter no rule here speaks about.
