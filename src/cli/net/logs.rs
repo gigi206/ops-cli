@@ -793,7 +793,10 @@ fn render_capture(cap: &sandbox::control::Capture, view: &LogView, pal: &style::
         if part == CapturePart::Injected {
             // The names of the credentials sbx added for the upstream. Their values are never
             // captured, so name them rather than let the head read as the whole of what was sent.
+            // Shown as text like every captured line: the proxy reports them, and a header name a
+            // config chose is held to no control character, not to the ones that reorder a line.
             for name in String::from_utf8_lossy(&bytes.bytes).lines() {
+                let name = crate::diag::visible(name);
                 let _ = writeln!(
                     o,
                     "      {dim}{arrow}{r} {n}{name}{r}{dim}: <injected by sbx>{r}"

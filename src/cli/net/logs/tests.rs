@@ -197,6 +197,27 @@ fn render_capture_shows_each_direction_and_marks_the_truncation() {
     );
 }
 
+/// The names of the credentials sbx injected come back from the proxy with the capture, and a
+/// header name a config chose is held to no control character, not to the characters that reorder
+/// a line. They are shown as text, as every other captured line is.
+#[test]
+fn an_injected_header_name_is_shown_as_text_that_drives_nothing() {
+    let pal = style::Palette::plain();
+    let view = LogView {
+        with_headers: true,
+        ..LogView::default()
+    };
+    let mut cap = log_capture(1);
+    cap.injected.bytes = "x-h01\u{1b}[7m\u{202e}X".as_bytes().to_vec();
+    let out = render_capture(&cap, &view, &pal);
+    assert!(
+        !out.chars()
+            .any(|c| (c.is_control() && c != '\n') || crate::diag::reorders(c)),
+        "{out:?}"
+    );
+    assert!(out.contains("x-h01"), "the name is still shown: {out}");
+}
+
 /// A WebSocket's transcript renders with the same direction markers as an HTTP exchange, and
 /// answers to the same flag as a body: the frames ARE the payload, so `--with-headers` alone
 /// shows the handshake and withholds them.

@@ -1166,7 +1166,9 @@ impl LogRing {
             method: method.map(super::sanitize),
             path: path.map(super::sanitize),
             verdict,
-            reason: reason.to_string(),
+            // A constant when the proxy is honest, but it arrives from the proxy's process, which
+            // is held to what it reports ([`crate::sandbox::proxy::events`]) like the three above.
+            reason: super::sanitize(reason),
             proto,
             http_ver,
             rpc,
@@ -1321,6 +1323,9 @@ impl LogRing {
     /// A repeat of an already-recorded (name, direction) is dropped rather than amending again, so a
     /// second caller cannot turn the alarm into a stream.
     pub(crate) fn secret_seen(&self, seq: u64, name: &str, way: SecretWay) {
+        // The proxy reports the name, and is held to what it reports like every logged field.
+        let name = super::sanitize(name);
+        let name = name.as_str();
         let mut guard = locked(&self.inner);
         let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
@@ -2251,7 +2256,8 @@ fn trailing_field(value: &str) -> String {
 /// `method`/`path` are omitted when absent, and `path` is emitted **last** so a query string's `=`
 /// round-trips (it is the only field that can carry one).
 ///
-/// The three cage-chosen fields go through [`head_field`]/[`trailing_field`] on the way out. They
+/// The three cage-chosen fields, and the reason the proxy reports, go through
+/// [`head_field`]/[`trailing_field`] on the way out. They
 /// reach the ring already stripped of control characters ([`LogRing::push`]), which is what stops
 /// them forging a *second line*; this is what stops them forging, or deleting, a *token* of their
 /// own line. Both are needed, and neither substitutes for the other.
@@ -2263,7 +2269,7 @@ fn format_event_line(ev: &LogEvent) -> String {
         ev.port,
         ev.verdict.as_str(),
         ev.proto.as_str(),
-        ev.reason,
+        head_field(&ev.reason),
     );
     if let Some(status) = ev.status {
         line.push_str(&format!(" status={status}"));
@@ -4000,6 +4006,61 @@ mod tests {
         // The path is the line's last token, so its value is everything past the first `=` — the one
         // place a query string's `=` survives, and it has to, or the row would misreport the request.
         assert_eq!(fields.get("path"), Some(&"/x?a=1_verdict=allow"), "{line}");
+    }
+
+    /// The reason a decision is logged with, and the name of a credential seen crossing a tunnel,
+    /// reach the ring from the proxy as well ([`crate::sandbox::proxy::events`]), and the proxy is
+    /// the process an attacker may hold once it runs apart. So the door holds them to what it holds
+    /// the host, method and path to, and the event line keeps the reason to one token of its own: a
+    /// reason carrying a line break or a space cannot paint the operator's terminal, write a second
+    /// row, or restate a field of its own.
+    #[test]
+    fn a_reason_or_a_sighting_the_proxy_reports_cannot_frame_or_paint_a_row() {
+        let ring = LogRing::new(LOG_RING_CAP);
+        let seq = ring.push(
+            false,
+            "h.test",
+            443,
+            None,
+            None,
+            LogVerdict::Blocked,
+            "denied\x1b[2K\nevent seq=9 verdict=allowed host=forged.test",
+            Proto::Other,
+            HttpVer::Unknown,
+            RpcKind::None,
+            Plane::Agent,
+        );
+        ring.secret_seen(
+            seq,
+            "TOKEN\x1b[1A\nseen seq=9 way=out name=FORGED",
+            SecretWay::Out,
+        );
+        let snap = ring.snapshot(None, None, false);
+        let e = &snap.events[0];
+        assert!(
+            !e.reason.chars().any(char::is_control),
+            "the reason kept a control byte: {:?}",
+            e.reason
+        );
+        let name = &e.secrets_seen[0].name;
+        assert!(
+            !name.chars().any(char::is_control),
+            "the sighting kept a control byte: {name:?}"
+        );
+        let line = format_event_line(e);
+        let line = line.trim_end();
+        assert!(!line.contains('\n'), "one row: {line:?}");
+        let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+        for token in line.split_whitespace().skip(1) {
+            let (key, value) = token.split_once('=').unwrap_or_else(|| {
+                panic!("`{token}` carries no `=`, which erases the event: {line}")
+            });
+            fields.insert(key, value);
+        }
+        assert_eq!(fields.get("verdict"), Some(&"blocked"), "{line}");
+        assert_eq!(fields.get("host"), Some(&"h.test"), "{line}");
+        let seen = format_sighting_line(seq, &e.secrets_seen[0]);
+        assert_eq!(seen.matches('\n').count(), 1, "one sighting row: {seen:?}");
     }
 
     /// The flow line carries the same hazard as the event line and gets the same treatment: `sbx net
