@@ -93,9 +93,10 @@ pub(crate) fn confine() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::allowlist::probe::{
-        Probes, as_run_alone, as_the_probes_process, call, done, in_a_process, opening, run_alone,
+        Probes, as_the_probes_process, call, done, in_a_process, opening,
     };
     use super::*;
+    use crate::testutil::{run_alone, when_run_alone};
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
 
@@ -249,15 +250,11 @@ mod tests {
     #[test]
     #[ignore = "run alone by the test that reads how it ended"]
     fn an_abort_under_the_filters() {
-        if as_run_alone().is_none() {
-            return;
-        }
-        if confine().is_err() {
-            // SAFETY: `_exit` ends the process without running anything more of it.
-            unsafe { libc::_exit(2) };
-        }
-        // SAFETY: ends the process, which is what is under test.
-        unsafe { libc::abort() };
+        when_run_alone(|_| {
+            confine()?;
+            // SAFETY: ends the process, which is what is under test.
+            unsafe { libc::abort() }
+        });
     }
 
     /// An abort under the unpack's filters ends its process by `SIGABRT`, the signal a reader

@@ -204,6 +204,154 @@ pub(crate) fn returns_within<T: Send + 'static>(
         .unwrap_or_else(|_| panic!("{what} did not return within {limit:?}"))
 }
 
+/// How long a test run alone ([`run_alone`]) has to end before it is killed and the test that ran
+/// it fails.
+const END_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The variable that tells a test it is run alone ([`alone`]), and carries what it was handed.
+const RUN_ALONE_WITH: &str = "SBX_TEST_RUN_ALONE_WITH";
+
+/// The line a test run alone writes last when its body returned, which nothing else writes.
+const ENDED_WELL: &str = "sbx-alone: ended well";
+
+/// The test binary, set to run the ignored test `entry` alone, in a process of its own, and to hand
+/// it `with` ([`when_run_alone`]). `entry` is the test's path, its module as `module_path!` spells
+/// it; the test is an ignored one that does nothing unless run this way.
+pub(crate) fn alone(entry: &str, with: impl AsRef<OsStr>) -> std::process::Command {
+    // libtest names a test by its path in the crate, without the crate's own name.
+    let (_, name) = entry.split_once("::").expect("a path in the crate");
+    let mut command = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+    command
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(RUN_ALONE_WITH, with);
+    command
+}
+
+/// How a test run alone ended, and what it wrote.
+pub(crate) struct Ran {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+impl Ran {
+    /// Whether the test's body returned and its process ended there ([`when_run_alone`]): not by a
+    /// failure or a signal, and not through the harness, as a test that was not run alone does.
+    pub(crate) fn ended_well(&self) -> bool {
+        self.status.success() && self.stdout.lines().any(|line| line == ENDED_WELL)
+    }
+}
+
+/// Run the test `entry` alone ([`alone`]), handed a directory of its own, and say how it ended.
+///
+/// A process, rather than a thread of the test process, for a test that does to its process what
+/// the rest of the test process must not see: a seccomp filter above all, which each of sbx's
+/// helpers installs on a process of its own ([`crate::sandbox::seccomp`]). A filter that refuses a
+/// call the rest of the process needs stops more than the thread it is on: without `futex`, a lock
+/// that thread releases while another waits on it is never handed over, and a wait of the C
+/// library's own that is refused ends the whole process, every other test with it and none of them
+/// named. A filter also holds for as long as its thread does, and a choice the standard library
+/// makes once per process, made first under it, would be the wrong one for every test after.
+///
+/// And a process started afresh, the test binary run again for that one test, rather than a copy
+/// of this one by `fork`: a copy of a threaded process holds every lock another thread held at the
+/// fork. The C library resets its allocator's there, but the standard library does not reset the
+/// one it takes to record a thread it starts, and a thread started in the copy waits on it for good
+/// whenever another test was starting a thread at that instant.
+///
+/// The directory is removed once the test has ended. A test that has not ended within
+/// [`END_WITHIN`] is killed, and the test that ran it fails rather than waits: a fault the process
+/// has a handler for, and cannot take the handler off under the filters, is raised again forever.
+/// What it wrote is read once it has ended, and not to the end of the stream: a process another
+/// test forks meanwhile holds a copy of every descriptor this one has open, the pipes' among them,
+/// and a stream some other process holds does not end with the test. What it writes is far smaller
+/// than a pipe's buffer, so it is all there.
+pub(crate) fn run_alone(entry: &str) -> Ran {
+    use std::process::Stdio;
+    let dir = TmpDir::new();
+    let mut child = alone(entry, dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the test binary runs again");
+    let pidfd = crate::session::open_pidfd(child.id()).expect("a pidfd for the test run alone");
+    let ended = crate::session::wait_for_exit(pidfd, END_WITHIN);
+    crate::session::close_fd(pidfd);
+    if !ended {
+        let _ = child.kill();
+    }
+    let status = child.wait().expect("the test run alone is reaped");
+    let stdout = queued(child.stdout.take().expect("its output"));
+    let stderr = queued(child.stderr.take().expect("its errors"));
+    assert!(
+        ended,
+        "{entry} did not end within {END_WITHIN:?}: {stdout}{stderr}"
+    );
+    Ran {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+/// What is already queued on `pipe`, read without waiting for more.
+fn queued(mut pipe: impl std::io::Read + std::os::fd::AsRawFd) -> String {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: plain integer arguments on a descriptor this process holds.
+    unsafe {
+        libc::fcntl(
+            fd,
+            libc::F_SETFL,
+            libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+        )
+    };
+    let mut bytes = Vec::new();
+    match pipe.read_to_end(&mut bytes) {
+        Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => panic!("a pipe that fails: {e}"),
+        _ => String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+/// When this process is a test run alone ([`alone`]): run `body`, handed what the test was handed,
+/// and end the process there, never handing back to the harness, whose thread waiting for the
+/// test's end a filter `body` installed may leave unwoken. The process ends with 0, having written
+/// [`ENDED_WELL`], when `body` returned; with 2 when it failed, or the line could not be written;
+/// with 3 when it panicked. It is marked as one that leaves no core behind, should it end by a
+/// signal. Anywhere else, nothing.
+pub(crate) fn when_run_alone(body: impl FnOnce(&OsStr) -> std::io::Result<()>) {
+    let Some(with) = std::env::var_os(RUN_ALONE_WITH) else {
+        return;
+    };
+    // SAFETY: plain integer arguments, a flag of the calling process.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&with)));
+    let code = match ran.map(|ran| ran.and_then(|()| written(&format!("\n{ENDED_WELL}\n")))) {
+        Ok(Ok(())) => 0,
+        Ok(Err(_)) => 2,
+        Err(_) => 3,
+    };
+    // SAFETY: `_exit` ends the process without running anything more of it.
+    unsafe { libc::_exit(code) };
+}
+
+/// Write `text` on the standard output by `write` on the descriptor itself, which every helper's
+/// filters allow, with no lock or buffer of the standard library's in between.
+pub(crate) fn written(text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: the standard output is open for the whole process, and is left open.
+    let mut out =
+        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(libc::STDOUT_FILENO) });
+    out.write_all(text.as_bytes())
+}
+
 /// A reader handing out `bytes` in pieces, as a socket or a slow filesystem may: never more in one
 /// read than the next of `sizes`, taken in turn, and a read interrupted where `interrupts` says,
 /// never twice in a row. A read returns nothing only once every byte is out.
