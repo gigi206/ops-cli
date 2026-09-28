@@ -632,12 +632,15 @@ fn app_detail_notes(o: &mut String, view: &config::view::AppDetailView, pal: &st
 /// [`config::view::AppDetailView`]; every span empties under a non-terminal.
 ///
 /// The document is one block per section, each written by a helper below and called in reading
-/// order from here, so this body is the table of contents of what `config show --app` prints.
+/// order from here, so this body is the table of contents of what `config show --app` prints. It
+/// prints from [`super::terminal::app_detail_view`]'s copy, so no value a config chose reaches the
+/// terminal as anything but text.
 pub(super) fn render_app_detail(
     view: &config::view::AppDetailView,
     pal: &style::Palette,
     details: bool,
 ) -> String {
+    let view = &super::terminal::app_detail_view(view);
     let mut o = String::new();
     // The postures nobody configured, in the order they would have been printed. Filled as the
     // helpers below skip them, and spelled out once after them by `app_detail_folded`.

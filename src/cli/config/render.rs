@@ -1320,12 +1320,16 @@ fn apps_section(
 /// adds only color and layout, so the management core stays presentation-agnostic and a future
 /// front-end can render the same model differently. Every color span is empty under a
 /// non-terminal, so captured output is byte-for-byte the plain text the integration tests pin.
+///
+/// It prints from [`super::terminal::config_view`]'s copy, so no value a config chose reaches the
+/// terminal as anything but text.
 pub(super) fn render_config(
     view: &config::view::ConfigView,
     pal: &style::Palette,
     details: bool,
 ) -> String {
     use std::fmt::Write as _;
+    let view = &super::terminal::config_view(view);
     let (h, n, r) = (pal.head, pal.name, pal.reset);
     let mut o = String::new();
 

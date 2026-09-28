@@ -38,6 +38,11 @@ untrusted project may not set. Each value is tagged with where it
 came from, `(default)`, `(global)`, or `(project)`, colored by level. Warnings
 explain what was dropped and why. No launch, no nix, no network.
 
+Every value is printed as text, so a file nobody has approved yet cannot drive the terminal it is
+read in. A control character or a character that reorders a line is written out as an escape
+(`\x1b`, `\u{202e}`, a line break as `\x0a`), or replaced by a space in an environment value, a
+`[fs]` entry and an operation's description. `--json` keeps the bytes the file holds.
+
 The declared operations are the **static** view of `[task.<name>]`, and the one place to
 confirm a block survived validation without launching anything:
 

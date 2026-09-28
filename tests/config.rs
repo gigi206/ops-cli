@@ -115,6 +115,121 @@ fn config_json_is_a_valid_document_carrying_the_resolved_model() {
     assert_eq!(doc["network"]["Allowlist"]["pool"], true);
 }
 
+/// Whether `c` changes the order a terminal lays out a line: the set `diag::reorders` names.
+fn reorders(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+#[test]
+fn config_show_writes_what_a_config_chose_as_text_that_drives_nothing() {
+    // `config show` is how a project's file is read before anyone approves it, so each value below
+    // carries its own tag and a right-to-left override, and the ones no gate refuses an escape
+    // sequence and a line break as well. The app comes from the untrusted project, the rest from
+    // the global config, where the gates that let a reordering character through are the ones
+    // that decide.
+    let fx = Project::new("cfg");
+    let bound = fx.bind_target("F11\u{202e}X");
+    let r = "\\u202eX";
+    fx.write_global(
+        &r#"binds = ["BOUND"]
+
+[env]
+F08 = "F08RLO"
+
+[proc]
+mode  = "ask"
+allow = ["F03\u001b[7m\nRLO"]
+deny  = ["F04RLO"]
+
+[network]
+mode  = "deny"
+allow = ["https://api.github.com/F07RLO"]
+
+[secret."api.github.com"]
+from   = "env://GH_TOKEN"
+header = "X-F12RLO"
+type   = "bearer"
+prefix = "F13RLO "
+
+[service.probe]
+cmd = ["F06RLO"]
+
+[task.probe]
+description = "F09RLO"
+cmd = ["echo", "{x}"]
+params = { x = "^[a-z]{1,10}$" }
+
+[open]
+probe = ["F05RLO"]
+"#
+        .replace("BOUND", &bound.display().to_string())
+        .replace("RLO", r),
+    );
+    fx.write_project(
+        &r#"[app.probe]
+cmd = ["F01\u001b[7m\nforgedRLO"]
+contract = { arg = "--F02RLO" }
+
+[app.probe.env]
+F10 = "F10RLO"
+"#
+        .replace("RLO", r),
+    );
+
+    let mut shown = String::new();
+    for args in [
+        &["config", "show"][..],
+        &["config", "show", "--details"],
+        &["config", "show", "--app", "probe"],
+        &["config", "show", "--app", "probe", "--details"],
+    ] {
+        let out = fx.run(args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let stdout = String::from_utf8(out.stdout).expect("the document is UTF-8");
+        assert!(
+            !stdout
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || reorders(c)),
+            "{args:?} wrote a character that drives the terminal:\n{stdout:?}"
+        );
+        shown.push_str(&stdout);
+    }
+    // Escaped, not dropped: every tag is still there to read, its override written out.
+    for tag in [
+        "F01\\x1b[7m\\x0aforged",
+        "F02",
+        "F03\\x1b[7m\\x0a",
+        "F04",
+        "F05",
+        "F06",
+        "F07",
+        "F11",
+        "F12",
+        "F13",
+    ] {
+        assert!(
+            shown.contains(&format!("{tag}\\u{{202e}}X")),
+            "`{tag}` is not shown escaped:\n{shown}"
+        );
+    }
+    // Folded instead: a task's description where it is read, before any view holds it, and an
+    // environment variable where it is printed.
+    for folded in ["F08 X", "F09 X", "F10 X"] {
+        assert!(
+            shown.contains(folded),
+            "`{folded}` is not shown folded:\n{shown}"
+        );
+    }
+
+    // The machine document is not a terminal: it keeps the bytes the config holds.
+    let out = fx.run(&["config", "show", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(doc["env"][0]["value"], "F08\u{202e}X");
+}
+
 #[test]
 fn config_show_reflects_and_tags_an_ambient_override() {
     // `sbx config show` must reflect an ambient `SBX_CONFIG` — otherwise it would lie about what a

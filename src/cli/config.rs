@@ -8,6 +8,7 @@
 //! * [`mod@render`] — the baseline `sbx config show` document, section by section.
 //! * [`mod@app_detail`] — the per-app effective view behind `config show --app <name>`.
 //! * [`mod@format`] — the line-level formatters and the posture preamble those two share.
+//! * [`mod@terminal`] — the copy of a view both renderers print from, its text escaped.
 //! * [`mod@edit`] — the key-editing verbs and the trust admission behind them.
 //!
 //! Cross-cutting plumbing that other command families also use — `split_scope`/`ScopeArgs`,
@@ -18,6 +19,7 @@ mod app_detail;
 mod edit;
 mod format;
 mod render;
+mod terminal;
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
