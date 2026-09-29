@@ -273,10 +273,12 @@ that declares none, or that writes its posture as a string (`network = "allow"`)
 table to take them, so they are left out.
 
 What that costs depends on the entry. An `allow` or `mute` entry left out only narrows
-the app or logs more, and an app with no table is told so. A `deny` entry left out would
-open the host its bundle closed wherever the app's posture filters: under `allow`, and
-under `deny` or `ask` too, where it carved an exception out of an `allow` rule. There it
-**stops the app's launch**, naming the entry and what to write instead:
+the app or logs more, and a `shared_credential` group left out refuses a credential it
+would have let travel: the app still launches, and is told so. A `deny` entry left out
+would open the host its bundle closed wherever the app's posture filters: under `allow`,
+and under `deny` or `ask` too, where it carved an exception out of an `allow` rule. There
+it **stops the app's launch**, naming the entry. Either way, sbx names what to write
+instead:
 
 - for a string posture, the table of the same mode, which changes nothing else:
 
@@ -294,7 +296,10 @@ back to `deny`. Writing one would move the app's posture behind your back, and a
 must never move a posture in either direction.
 
 Under an app that runs `shared` or `none`, a `deny` entry changes nothing: that posture
-is already wider, or admits nothing at all.
+is already wider, or admits nothing at all. An app that writes either as a string is told
+nothing, since no entry of a bundle changes what it reaches, and neither is one whose
+string a project's `[app.<name>.network]` table with a `mode` replaces: that table drops
+the entries of a table the profile wrote as well.
 
 ## The shipped bundles
 

@@ -4431,6 +4431,47 @@ fn a_bundle_deny_entry_with_no_table_refuses_its_app_where_the_posture_filters()
 }
 
 #[test]
+fn a_bundle_allow_entry_a_string_posture_leaves_out_is_said_and_the_app_still_answers() {
+    // An `allow` entry left out only narrows, so the app is not refused: it answers under the
+    // posture it wrote, and is told the entry was left out and which table applies it. The fix,
+    // written as the note says, lets the host through and says nothing more.
+    let fx = Project::new("cfg");
+    fx.write_bundle("reach", "allow = [\"api.example.com\"]\n");
+    fx.write_profile(
+        "strict",
+        "cmd = \"x\"\nuse = [\"reach\"]\nnetwork = \"deny\"\n",
+    );
+    let ask = || {
+        let out = fx.run(&["test", "net", "--app", "strict", "https://api.example.com"]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+    let note = "`[network] mode = \"deny\"`";
+
+    let (code, text) = ask();
+    assert_eq!(code, Some(0), "answered, not refused:\n{text}");
+    assert!(
+        text.contains("`network = \"deny\"`") && text.contains(note) && text.contains("DENIED"),
+        "the entry is left out, and said, with the table that applies it:\n{text}"
+    );
+
+    fx.write_profile(
+        "strict",
+        "cmd = \"x\"\nuse = [\"reach\"]\n[network]\nmode = \"deny\"\n",
+    );
+    let (code, text) = ask();
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("ALLOWED") && !text.contains(note),
+        "written as the note says, the entry applies and nothing is said:\n{text}"
+    );
+}
+
+#[test]
 fn an_untrusted_project_cannot_use_a_bundle_to_graft_trusted_egress_onto_its_app() {
     // The flagship property, on the `use` axis: a bundle is declared in the *global* config and
     // carries egress rules and credentials, so an untrusted project naming one would be choosing

@@ -1517,10 +1517,11 @@ fn merge_config_dirs(
 /// table, and an app that declares none, or writes its posture as a string, has no table to take
 /// them. Synthesizing one looks tempting, but a table replaces the policy the app runs under and a
 /// mode-less one falls back to `deny` under an `allow` parent (`mode_from_parent`), and a bundle
-/// must never move a posture in either direction. So the entries are left out, and a `deny` entry
-/// left out would open the host its bundle closed wherever the app's posture filters: that one is
-/// kept in `fold` and weighed by [`settle_bundles`], once the resolution says what the posture is.
-/// An `allow` or `mute` entry left out only narrows or logs more; the app without a table is told.
+/// must never move a posture in either direction. So the entries are left out. A `deny` entry left
+/// out would open the host its bundle closed wherever the app's posture filters, while an `allow`,
+/// `mute` or `shared_credential` entry only narrows or logs more: both are kept in `fold` and
+/// weighed by [`settle_bundles`] once the resolution says what the posture is, except an app with
+/// no table and no `deny` entry to lose, which is told here.
 fn expand_bundles(
     apps: &mut BTreeMap<String, RawApp>,
     bundles: &BTreeMap<String, RawBundle>,
@@ -1577,7 +1578,7 @@ fn expand_bundles(
             absorb_bundle(&mut acc, bundle, notes);
         }
         if let Some(lost) = fold_bundle_into_app(app, acc, notes, layer) {
-            fold.lost_deny
+            fold.lost_egress
                 .entry(app_name.clone())
                 .or_default()
                 .push(lost);
@@ -1610,16 +1611,16 @@ fn resolve_use<'a>(
 }
 
 /// What folding the bundles leaves each app to answer for, keyed by app name. Settled on the
-/// resolved apps by [`settle_bundles`], since whether a lost `deny` entry opens anything depends on
-/// the posture the app runs under, which only the resolution knows.
+/// resolved apps by [`settle_bundles`], since what a lost egress entry costs depends on the posture
+/// the app runs under, which only the resolution knows.
 #[derive(Default)]
 struct BundleFold {
     /// Said on the app, wherever its own notes are.
     notes: BTreeMap<String, Vec<String>>,
     /// Why the app may not launch: a `use` entry naming no bundle sbx can read.
     refusals: BTreeMap<String, Vec<String>>,
-    /// The `deny` entries a bundle carried that found no table to land in.
-    lost_deny: BTreeMap<String, Vec<LostDeny>>,
+    /// The egress entries a bundle carried that found no table to land in.
+    lost_egress: BTreeMap<String, Vec<LostEgress>>,
 }
 
 /// The layer an app's `use` was folded in, which is where its `[network]` table would be written.
@@ -1631,16 +1632,17 @@ enum FoldLayer {
     Project,
 }
 
-/// A bundle's `deny` entries an app could not take in, and the shape of what it wrote instead.
-struct LostDeny {
-    entries: Vec<String>,
+/// A bundle's egress entries an app could not take in, and the shape of what it wrote instead.
+struct LostEgress {
+    /// The `deny` entries among them, which are what can open a host.
+    deny: Vec<String>,
     /// The posture the app wrote as a string in place of a table, or `None` when it wrote neither.
     posture: Option<String>,
     layer: FoldLayer,
 }
 
 /// Attach what [`expand_bundles`] left to each resolved app: its notes, its refusals, and a verdict
-/// on each lost `deny` entry.
+/// on each set of lost egress entries.
 ///
 /// A `deny` entry left out opens the host its bundle closed under every posture that filters, a
 /// default-`deny` or `ask` one included, where it carved an exception out of an `allow` rule. So
@@ -1649,6 +1651,12 @@ struct LostDeny {
 /// own that carries the rules it relies on, since a table replaces the policy it inherits. Under
 /// `shared` or `none` the entry changes nothing; without a table the app is told the entries were
 /// left out, as an app with only `allow` or `mute` entries is.
+///
+/// An `allow`, `mute` or `shared_credential` entry left out only narrows, logs more, or refuses a
+/// credential it would have let travel. Under a string posture that filters the app is told, with
+/// the same table to write, and still launches. A string whose mode is not the one the app runs
+/// under is not told: a layer above replaced it, and would drop a table's entries as well, so that
+/// string is not what to fix.
 fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
     for (name, notes) in fold.notes {
         if let Some(app) = resolved.apps.get_mut(&name) {
@@ -1660,7 +1668,7 @@ fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
             app.refusals.extend(refusals);
         }
     }
-    for (name, lost) in fold.lost_deny {
+    for (name, lost) in fold.lost_egress {
         let Some(app) = resolved.apps.get_mut(&name) else {
             continue;
         };
@@ -1679,11 +1687,9 @@ fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
                 }
                 continue;
             };
-            let entries: Vec<String> = lost
-                .entries
-                .iter()
-                .map(|e| format!("`{}`", crate::diag::visible(e)))
-                .collect();
+            if lost.deny.is_empty() && lost.posture.as_deref() != Some(mode) {
+                continue;
+            }
             let place = match lost.layer {
                 FoldLayer::Profile => format!("its profile, `apps/{name}.toml`"),
                 FoldLayer::Project => format!("`[app.{name}]` in {PROJECT_CONFIG}"),
@@ -1704,6 +1710,18 @@ fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
                     ),
                 ),
             };
+            if lost.deny.is_empty() {
+                app.warnings.push(format!(
+                    "uses a bundle with egress rules or a shared-credential group, but {shape}, so \
+                     they are left out. To apply them, {fix}"
+                ));
+                continue;
+            }
+            let entries: Vec<String> = lost
+                .deny
+                .iter()
+                .map(|e| format!("`{}`", crate::diag::visible(e)))
+                .collect();
             let said = format!(
                 "uses a bundle whose `deny` entries ({}) have no table to land in: {shape}, so \
                  they are left out, and a launch of this app stops rather than run under `{mode}` \
@@ -1785,14 +1803,14 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>
 }
 
 /// Fold the accumulated bundle *under* one app: every entry the app does not already declare is
-/// added, and everything the app declares itself stands. Returns the bundle's `deny` entries when
-/// the app has no table to take them, for [`settle_bundles`] to weigh.
+/// added, and everything the app declares itself stands. Returns the egress entries the app has no
+/// table to take, when what they cost waits on its posture, for [`settle_bundles`] to weigh.
 fn fold_bundle_into_app(
     app: &mut RawApp,
     acc: RawBundle,
     notes: &mut Vec<String>,
     layer: FoldLayer,
-) -> Option<LostDeny> {
+) -> Option<LostEgress> {
     for (k, v) in acc.packages {
         app.packages.entry(k).or_insert(v);
     }
@@ -1870,8 +1888,8 @@ fn fold_bundle_into_app(
     if !egress {
         return None;
     }
-    let lost = |posture: Option<String>| LostDeny {
-        entries: acc.deny.clone(),
+    let lost = |posture: Option<String>| LostEgress {
+        deny: acc.deny.clone(),
         posture,
         layer,
     };
@@ -1885,13 +1903,9 @@ fn fold_bundle_into_app(
             extend_deduped(&mut table.shared_credential, acc.shared_credential);
             None
         }
-        // A string posture has no rules to add to. Under `shared` or `none` the entries change
-        // nothing; under a filtering one an `allow` or `mute` entry left out only narrows or logs
-        // more, while a `deny` entry would open its host: that one is weighed once the posture the
-        // app runs under is resolved.
-        Some(NetworkField::Posture(posture)) => {
-            (!acc.deny.is_empty()).then(|| lost(Some(posture.clone())))
-        }
+        // A string posture has no rules to add to. What the entries left out cost depends on the
+        // posture the app runs under, which is weighed once it is resolved.
+        Some(NetworkField::Posture(posture)) => Some(lost(Some(posture.clone()))),
         None if acc.deny.is_empty() => {
             notes.push(NO_TABLE_NOTE.to_string());
             None
@@ -2350,6 +2364,107 @@ mod tests {
             "{:?}",
             shared.warnings
         );
+    }
+
+    /// An app that writes a filtering posture as a string has no table for its bundle's egress
+    /// entries either. An `allow`, `mute` or `shared_credential` entry left out only narrows or
+    /// logs more, so the app is told, with the table that applies them, and still launches; a
+    /// `deny` entry beside them stops it, said once. Under `shared` the entries change nothing.
+    #[test]
+    fn a_bundle_entry_a_string_posture_leaves_out_is_said_on_the_app() {
+        let settle = |posture: &str, carried: &RawBundle| {
+            let profile = format!("cmd = \"demo\"\nnetwork = \"{posture}\"\n");
+            let mut app = schema::parse_app(profile.as_bytes()).expect("the profile parses");
+            app.uses = vec!["b".to_string()];
+            let (app, fold) = fold_one(app, &[("b", carried.clone())]);
+            let mut global = schema::parse(b"").expect("the config parses");
+            global.app.insert("demo".to_string(), app);
+            let mut resolved = resolve(global, None, &PluginRegistry::default());
+            settle_bundles(&mut resolved, fold);
+            resolved.apps.remove("demo").expect("the app resolves")
+        };
+        let allow = RawBundle {
+            allow: vec!["api.example.com".to_string()],
+            ..RawBundle::default()
+        };
+        let mute = RawBundle {
+            mute: vec!["noise.example.com".to_string()],
+            ..RawBundle::default()
+        };
+        let shared_credential = RawBundle {
+            shared_credential: vec![vec![
+                "a.example.com".to_string(),
+                "b.example.com".to_string(),
+            ]],
+            ..RawBundle::default()
+        };
+
+        for posture in ["deny", "ask", "allow"] {
+            for carried in [&allow, &mute, &shared_credential] {
+                let app = settle(posture, carried);
+                assert!(app.refusals.is_empty(), "{posture}: {:?}", app.refusals);
+                assert!(
+                    app.warnings.len() == 1
+                        && app.warnings[0].contains(&format!("`network = \"{posture}\"`"))
+                        && app.warnings[0].contains(&format!("`[network] mode = \"{posture}\"`"))
+                        && app.warnings[0].contains("`apps/demo.toml`"),
+                    "{posture}, {carried:?}: {:?}",
+                    app.warnings
+                );
+            }
+        }
+
+        let both = RawBundle {
+            deny: vec!["tracker.example.com".to_string()],
+            ..allow.clone()
+        };
+        let denied = settle("deny", &both);
+        assert_eq!(denied.refusals.len(), 1, "{:?}", denied.refusals);
+        assert_eq!(
+            denied.warnings, denied.refusals,
+            "the refusal is the one thing said"
+        );
+
+        let shared = settle("shared", &allow);
+        assert!(
+            shared.refusals.is_empty() && shared.warnings.is_empty(),
+            "{:?} {:?}",
+            shared.refusals,
+            shared.warnings
+        );
+
+        // A project table that replaces the posture filters, but it is what drops the entries,
+        // as it would drop those of a table the profile wrote: the string is not what to fix.
+        use crate::allowlist::DefaultAction;
+        for (written, above, action) in [
+            ("shared", "deny", DefaultAction::Deny),
+            ("deny", "allow", DefaultAction::Allow),
+        ] {
+            let profile = format!("cmd = \"demo\"\nnetwork = \"{written}\"\n");
+            let mut app = schema::parse_app(profile.as_bytes()).expect("the profile parses");
+            app.uses = vec!["b".to_string()];
+            let (app, fold) = fold_one(app, &[("b", allow.clone())]);
+            let mut global = schema::parse(b"").expect("the config parses");
+            global.app.insert("demo".to_string(), app);
+            let project = format!("[app.demo.network]\nmode = \"{above}\"\n");
+            let project = schema::parse(project.as_bytes()).expect("the project parses");
+            let project = Some((project, crate::trust::TrustState::Trusted));
+            let mut resolved = resolve(global, project, &PluginRegistry::default());
+            settle_bundles(&mut resolved, fold);
+            let replaced = resolved.apps.remove("demo").expect("the app resolves");
+            assert!(
+                matches!(&replaced.network,
+                    Some(NetworkPolicy::Allowlist(p)) if p.default_action() == action),
+                "{written} under {above}: the project's table is in force: {:?}",
+                replaced.network
+            );
+            assert!(
+                replaced.refusals.is_empty() && replaced.warnings.is_empty(),
+                "{written} under {above}: {:?} {:?}",
+                replaced.refusals,
+                replaced.warnings
+            );
+        }
     }
 
     #[test]
