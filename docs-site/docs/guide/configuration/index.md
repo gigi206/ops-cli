@@ -167,7 +167,8 @@ that filters, and a `use` that names no bundle. Each is named, and each stops a 
 than letting it run without the restriction; one under `[app.<name>]` stops that app alone. An
 `allow` entry sbx cannot read only narrows, so it stays a warning. A trusted project that writes
 a posture of its own for the app replaces the profile's network whole, rules included, so what
-the profile's bundle could not take no longer counts there: the bundle page says how.
+the profile's bundle could not take no longer stops it there, and each `deny` it drops is named
+instead: the bundle page says how.
 
 Note the direction, if you knew the old behaviour: a file that used to vanish now
 applies. A trusted project writing `mode = "allow"` beside a mistyped `allow` list

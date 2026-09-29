@@ -4476,8 +4476,10 @@ fn a_bundle_loss_a_trusted_project_posture_replaces_does_not_stop_the_app() {
     // A trusted project whose `[app.demo.network]` names a `mode` rebuilds the app's network from
     // that table alone, so a bundle `deny` entry the profile's string posture could not take is
     // dropped as one in a profile table would be: the app answers under the project's posture,
-    // with no refusal naming a profile table that would change nothing. A mode-less project table
-    // amends the profile's posture instead, and the entry lost below it still stops the app.
+    // with no refusal naming a profile table that would change nothing. The host it closed is
+    // open there, so the entry is named against the project, in `test net` and `config show`. A
+    // mode-less project table amends the profile's posture instead, and the entry lost below it
+    // still stops the app.
     let fx = Project::new("cfg");
     fx.write_bundle("block", "deny = [\"tracker.example.com\"]\n");
     let ask = || {
@@ -4498,10 +4500,11 @@ fn a_bundle_loss_a_trusted_project_posture_replaces_does_not_stop_the_app() {
 
     fx.write_profile(
         "demo",
-        "cmd = \"x\"\nuse = [\"block\"]\nnetwork = \"shared\"\n",
+        "cmd = \"x\"\nuse = [\"block\"]\nnetwork = \"deny\"\n",
     );
-    fx.write_project("[app.demo.network]\nmode = \"deny\"\n");
+    fx.write_project("[app.demo.network]\nmode = \"allow\"\n");
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    let note = ".sbx.toml [app.demo]: this `network` posture replaces the one below it";
     let (code, text) = ask();
     assert_eq!(
         code,
@@ -4509,8 +4512,22 @@ fn a_bundle_loss_a_trusted_project_posture_replaces_does_not_stop_the_app() {
         "answered under the project's posture:\n{text}"
     );
     assert!(
-        text.contains("network (app demo): deny ") && !text.contains("bundle"),
-        "{text}"
+        text.contains("network (app demo): allow ")
+            && text.contains("ALLOWED")
+            && text.contains(note)
+            && text.contains("`tracker.example.com`")
+            && !text.contains("no table to land in"),
+        "the host is open, and the entry is named against the project:\n{text}"
+    );
+    let shown = fx.run(&["config", "show", "--app", "demo"]);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&shown.stdout),
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(
+        shown.contains(note) && shown.contains("`tracker.example.com`"),
+        "`config show` names it too:\n{shown}"
     );
 
     fx.write_profile(
@@ -4528,6 +4545,61 @@ fn a_bundle_loss_a_trusted_project_posture_replaces_does_not_stop_the_app() {
     assert!(
         text.contains("`tracker.example.com`") && text.contains("run under `allow`"),
         "{text}"
+    );
+}
+
+#[test]
+fn a_profile_deny_rule_a_trusted_project_posture_replaces_is_named_on_the_app() {
+    // The profile closes a host inside its own table; a trusted project writes `mode = "allow"` for
+    // the app, which replaces that table whole and opens the host. The app still runs as the
+    // project wrote it, and the rule it dropped is named, in `config show` and `test net`. Written
+    // as the note says, in the project's table, the rule applies again and nothing is said.
+    let fx = Project::new("cfg");
+    fx.write_profile(
+        "demo",
+        "cmd = \"x\"\n[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n\
+         deny = [\"tracker.example.com\"]\n",
+    );
+    let both = |args: &[&str]| {
+        let out = fx.run(args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+    let net = [
+        "test",
+        "net",
+        "--app",
+        "demo",
+        "https://tracker.example.com",
+    ];
+    let show = ["config", "show", "--app", "demo"];
+    let note = ".sbx.toml [app.demo]: this `network` posture replaces the one below it rather \
+                than adding to it, so `deny` rules the layer below carried do not apply to this \
+                app: `https://tracker.example.com`";
+
+    fx.write_project("[app.demo.network]\nmode = \"allow\"\n");
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    let (code, text) = both(&net);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("ALLOWED") && text.contains(note),
+        "the host is open, and the rule is named:\n{text}"
+    );
+    let (code, shown) = both(&show);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(shown.contains(note), "`config show` names it too:\n{shown}");
+
+    fx.write_project("[app.demo.network]\nmode = \"allow\"\ndeny = [\"tracker.example.com\"]\n");
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    let (code, text) = both(&net);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("DENIED") && !text.contains("do not apply to this app"),
+        "re-declared as the note says, the rule applies and nothing is said:\n{text}"
     );
 }
 

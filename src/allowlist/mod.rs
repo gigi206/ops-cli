@@ -1305,6 +1305,10 @@ impl EgressPolicy {
             // resolved view shows the result. `capture_body_kb` rides `capture` — it is refused
             // where it is read without one — so naming `capture` names both. The posture is not a
             // setting either, but it is read below: it bounds where two of them mean anything.
+            //
+            // One rule is named all the same: a `deny` rule a trusted project's posture for an app
+            // drops opens a host, so that overlay names it on its own
+            // (`config::validate::replaced_deny_note`).
             allow: _,
             deny: _,
             capture_body_kb: _,
@@ -1330,8 +1334,8 @@ impl EgressPolicy {
             }
         };
         // In the order the fields are declared in the config table, so the message reads the way the
-        // file does. `Rule` carries no `PartialEq`, so `mute` compares by the only thing that can be
-        // neutral for it: an empty list.
+        // file does. `mute` compares by the only thing that can be neutral for a rule list: being
+        // empty.
         lost("mute", !parent.mute.is_empty(), mute.is_empty());
         lost(
             "shared_credential",

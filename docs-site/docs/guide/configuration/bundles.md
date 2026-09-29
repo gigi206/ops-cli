@@ -302,8 +302,11 @@ nothing, since no entry of a bundle changes what it reaches.
 A trusted project that writes a posture of its own for the app, a `network` string in its
 `[app.<name>]` or an `[app.<name>.network]` table with a `mode`, replaces the network the
 profile declared, and drops the entries of a table the profile wrote as well. What the
-profile could not take then costs nothing more: the app runs under the project's posture,
-and sbx neither stops it nor asks for a profile table that would change nothing. A
+profile could not take is then the project's to answer for: the app runs under the
+project's posture, sbx does not ask for a profile table that would change nothing, and a
+`deny` entry among it is named against the project, since the host it closed may now be
+reached. A `deny` rule of the profile's own table is named the same way, as
+[the network page](network#the-one-table-that-amends-a-mode-less-app-overlay) shows. A
 project table with no `mode` adds to the profile's posture instead, so what the profile
 could not take still counts there.
 

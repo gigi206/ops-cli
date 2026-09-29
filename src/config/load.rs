@@ -115,7 +115,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         // inspecting that app (`sbx config show --app <name>`) will actually see it.
         if *state == TrustState::Trusted {
             expand_bundles(&mut raw.app, &bundles, &mut fold, FoldLayer::Project);
-            forget_replaced(&mut fold, &raw.app);
+            set_aside_replaced(&mut fold, &raw.app);
         }
     }
 
@@ -1521,8 +1521,9 @@ fn merge_config_dirs(
 /// must never move a posture in either direction. So the entries are left out. A `deny` entry left
 /// out would open the host its bundle closed wherever the app's posture filters, while an `allow`,
 /// `mute` or `shared_credential` entry only narrows or logs more. Both are kept in `fold`: a layer
-/// above may replace the app's network and make the loss moot ([`forget_replaced`]), and what
-/// stands is weighed by [`settle_bundles`] once the resolution says what the posture is.
+/// above may replace the app's network and take the loss out of the profile's hands
+/// ([`set_aside_replaced`]), and what stands is weighed by [`settle_bundles`] once the resolution
+/// says what the posture is.
 fn expand_bundles(
     apps: &mut BTreeMap<String, RawApp>,
     bundles: &BTreeMap<String, RawBundle>,
@@ -1622,6 +1623,9 @@ struct BundleFold {
     refusals: BTreeMap<String, Vec<String>>,
     /// The egress entries a bundle carried that found no table to land in.
     lost_egress: BTreeMap<String, Vec<LostEgress>>,
+    /// The `deny` entries among them that a trusted project's posture replaced, set aside by
+    /// [`set_aside_replaced`]: named against the project rather than weighed against the profile.
+    replaced_deny: BTreeMap<String, Vec<String>>,
 }
 
 /// The layer an app's `use` was folded in, which is where its `[network]` table would be written.
@@ -1633,22 +1637,35 @@ enum FoldLayer {
     Project,
 }
 
-/// Forget what the profile layer's fold lost for each app whose network the trusted project layer
-/// `project_apps` replaces.
+/// Take what the profile layer's fold lost out of the profile's hands, for each app whose network
+/// the trusted project layer `project_apps` replaces.
 ///
 /// A posture string, or a table that names a `mode`, in a project's `[app.<name>]` is a policy of
 /// its own: the resolution rebuilds the app's network from it alone, and would drop the entries of
 /// a table the profile wrote as well. So the profile's shape is not what cost the bundle's entries,
-/// and a table written there, the fix a refusal or a note would name, changes nothing. A mode-less
-/// table amends the profile's policy instead ([`amends_the_layer_below`]), and those losses stand.
-fn forget_replaced(fold: &mut BundleFold, project_apps: &BTreeMap<String, RawApp>) {
+/// and a table written there, the fix a refusal or a note would name, changes nothing. The `deny`
+/// entries among them are set aside, to be named against the project as the rules a table of the
+/// profile loses are (`replaced_deny_note`); the rest only narrowed. A mode-less table amends the
+/// profile's policy instead ([`amends_the_layer_below`]), and those losses stand.
+fn set_aside_replaced(fold: &mut BundleFold, project_apps: &BTreeMap<String, RawApp>) {
     for (name, app) in project_apps {
         let replaces = app
             .network
             .as_ref()
             .is_some_and(|field| !amends_the_layer_below(field));
-        if let (true, Some(lost)) = (replaces, fold.lost_egress.get_mut(name)) {
-            lost.retain(|lost| matches!(lost.layer, FoldLayer::Project));
+        let Some(lost) = fold.lost_egress.get_mut(name).filter(|_| replaces) else {
+            continue;
+        };
+        let (profile, project): (Vec<_>, Vec<_>) = std::mem::take(lost)
+            .into_iter()
+            .partition(|lost| matches!(lost.layer, FoldLayer::Profile));
+        *lost = project;
+        let deny: Vec<String> = profile.into_iter().flat_map(|lost| lost.deny).collect();
+        if !deny.is_empty() {
+            fold.replaced_deny
+                .entry(name.clone())
+                .or_default()
+                .extend(deny);
         }
     }
 }
@@ -1678,8 +1695,10 @@ struct LostEgress {
 /// when it has no table, and under one that filters when it wrote its posture as a string, with
 /// the same table to write.
 ///
-/// What a layer above made moot is no longer here: [`forget_replaced`] took it out, so the posture
-/// weighed is the one the app wrote, or one a mode-less table amended.
+/// What a trusted project's posture replaced is no longer weighed here: [`set_aside_replaced`] took
+/// it out, so the posture weighed is the one the app wrote, or one a mode-less table amended. The
+/// `deny` entries it set aside are named against the project instead, unless the app admits
+/// nothing, where no host they closed can be reached.
 fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
     for (name, notes) in fold.notes {
         if let Some(app) = resolved.apps.get_mut(&name) {
@@ -1689,6 +1708,19 @@ fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
     for (name, refusals) in fold.refusals {
         if let Some(app) = resolved.apps.get_mut(&name) {
             app.refusals.extend(refusals);
+        }
+    }
+    for (name, deny) in fold.replaced_deny {
+        let Some(app) = resolved.apps.get_mut(&name) else {
+            continue;
+        };
+        let network = app.network.as_ref().unwrap_or(&resolved.network);
+        if !matches!(network, NetworkPolicy::Isolated) {
+            app.warnings.push(replaced_deny_note(
+                &project_app_source(&name),
+                "entries of a bundle its profile uses",
+                &deny,
+            ));
         }
     }
     for (name, lost) in fold.lost_egress {
@@ -2448,15 +2480,25 @@ mod tests {
     /// bundle `b`: the profile's fold, a trusted project laid over it when one is given, the
     /// resolution, and the settling.
     fn settle_under(network: &str, carried: &RawBundle, project: Option<&str>) -> ResolvedApp {
+        settle_in("", network, carried, project)
+    }
+
+    /// [`settle_under`], under the global config `global`.
+    fn settle_in(
+        global: &str,
+        network: &str,
+        carried: &RawBundle,
+        project: Option<&str>,
+    ) -> ResolvedApp {
         let profile = format!("cmd = \"demo\"\n{network}");
         let mut app = schema::parse_app(profile.as_bytes()).expect("the profile parses");
         app.uses = vec!["b".to_string()];
         let (app, mut fold) = fold_one(app, &[("b", carried.clone())]);
-        let mut global = schema::parse(b"").expect("the config parses");
+        let mut global = schema::parse(global.as_bytes()).expect("the config parses");
         global.app.insert("demo".to_string(), app);
         let project = project.map(|text| {
             let raw = schema::parse(text.as_bytes()).expect("the project parses");
-            forget_replaced(&mut fold, &raw.app);
+            set_aside_replaced(&mut fold, &raw.app);
             (raw, TrustState::Trusted)
         });
         let mut resolved = resolve(global, project, &PluginRegistry::default());
@@ -2464,11 +2506,17 @@ mod tests {
         resolved.apps.remove("demo").expect("the app resolves")
     }
 
+    /// What a note on a `deny` a project's posture replaced says, from each of its two sources.
+    const REPLACED_RULES: &str = "`deny` rules the layer below carried do not apply to this app";
+    const REPLACED_BUNDLE: &str =
+        "`deny` entries of a bundle its profile uses do not apply to this app";
+
     /// A trusted project whose `[app.<name>]` writes a posture of its own replaces the profile's
     /// network, and would drop the entries of a table the profile wrote as well. So what the
     /// profile's fold lost, whatever its shape, is not the profile's to answer for: it neither
-    /// stops the app nor names a fix there. A project table with no `mode` amends the profile's
-    /// posture instead, and a `deny` entry lost below it still stops the app.
+    /// stops the app nor names a fix there, and a `deny` entry among it is named against the
+    /// project, whose posture is where to keep it. A project table with no `mode` amends the
+    /// profile's posture instead, and a `deny` entry lost below it still stops the app.
     #[test]
     fn a_loss_a_project_posture_replaces_is_not_the_profiles_to_answer_for() {
         use crate::allowlist::DefaultAction;
@@ -2501,9 +2549,21 @@ mod tests {
                 app.network
             );
             assert!(
-                app.refusals.is_empty() && !app.warnings.iter().any(|w| w.contains("bundle")),
-                "{network:?} under {project:?}: {:?} {:?}",
-                app.refusals,
+                app.refusals.is_empty(),
+                "{network:?} under {project:?}: {:?}",
+                app.refusals
+            );
+            let said: Vec<&String> = app
+                .warnings
+                .iter()
+                .filter(|w| w.contains("bundle"))
+                .collect();
+            assert!(
+                said.len() == 1
+                    && said[0].starts_with(".sbx.toml [app.demo]: ")
+                    && said[0].contains(REPLACED_BUNDLE)
+                    && said[0].contains("`tracker.example.com`"),
+                "{network:?} under {project:?}: named against the project, once: {:?}",
                 app.warnings
             );
         }
@@ -2530,6 +2590,103 @@ mod tests {
                 && amended.refusals[0].contains("run under `allow`"),
             "an amending table keeps the loss below it: {:?}",
             amended.refusals
+        );
+
+        // Under `none` nothing reaches, so nothing a `deny` closed is opened: nothing is said.
+        let none = settle_under("network = \"deny\"\n", &block, Some(&table("none")));
+        assert!(
+            none.refusals.is_empty() && !none.warnings.iter().any(|w| w.contains("bundle")),
+            "{:?} {:?}",
+            none.refusals,
+            none.warnings
+        );
+    }
+
+    /// A `deny` rule the profile's own table carries is dropped by a trusted project's posture as a
+    /// bundle's is, and opens its host as surely: it is named on the app too, against the project,
+    /// unless the project keeps it or admits nothing. A table with no `mode` amends, and the rule
+    /// still applies. A replacement that drops rules from both sources names each, once.
+    #[test]
+    fn a_deny_rule_a_project_posture_replaces_is_named_on_the_app() {
+        let own = "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n\
+                   deny = [\"tracker.example.com\"]\n";
+        let nothing = RawBundle::default();
+        let named = |app: &ResolvedApp| -> Vec<String> {
+            app.warnings
+                .iter()
+                .filter(|w| w.contains("do not apply to this app"))
+                .cloned()
+                .collect()
+        };
+
+        for project in [
+            "[app.demo.network]\nmode = \"allow\"\n",
+            "[app.demo]\nnetwork = \"shared\"\n",
+        ] {
+            let app = settle_under(own, &nothing, Some(project));
+            let said = named(&app);
+            assert!(
+                said.len() == 1
+                    && said[0].starts_with(".sbx.toml [app.demo]: ")
+                    && said[0].contains(REPLACED_RULES)
+                    && said[0].contains("`https://tracker.example.com`"),
+                "{project:?}: {:?}",
+                app.warnings
+            );
+            assert!(app.refusals.is_empty(), "{:?}", app.refusals);
+        }
+
+        for project in [
+            "[app.demo.network]\nmode = \"allow\"\ndeny = [\"tracker.example.com\"]\n",
+            "[app.demo.network]\nmode = \"none\"\n",
+        ] {
+            let app = settle_under(own, &nothing, Some(project));
+            assert!(named(&app).is_empty(), "{project:?}: {:?}", app.warnings);
+        }
+
+        let amended = settle_under(
+            own,
+            &nothing,
+            Some("[app.demo.network]\nallow = [\"other.test\"]\n"),
+        );
+        assert!(named(&amended).is_empty(), "{:?}", amended.warnings);
+        let Some(NetworkPolicy::Allowlist(policy)) = &amended.network else {
+            panic!("the amended posture filters: {:?}", amended.network);
+        };
+        assert!(
+            policy
+                .deny_rules()
+                .iter()
+                .any(|r| r.to_string() == "https://tracker.example.com"),
+            "and the rule still applies: {:?}",
+            policy.deny_rules()
+        );
+
+        // Both sources at once: a global `deny` the app with no table inherits, and a bundle's that
+        // found no table. Each is named where it comes from, in a note of its own.
+        let block = RawBundle {
+            deny: vec!["ads.example.com".to_string()],
+            ..RawBundle::default()
+        };
+        let global = "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n\
+                      deny = [\"global.example.com\"]\n";
+        let app = settle_in(
+            global,
+            "",
+            &block,
+            Some("[app.demo.network]\nmode = \"allow\"\n"),
+        );
+        let said = named(&app);
+        assert!(
+            said.len() == 2
+                && said.iter().any(|w| w.contains(REPLACED_RULES)
+                    && w.contains("`https://global.example.com`")
+                    && !w.contains("ads.example.com"))
+                && said.iter().any(|w| w.contains(REPLACED_BUNDLE)
+                    && w.contains("`ads.example.com`")
+                    && !w.contains("global.example.com")),
+            "{:?}",
+            app.warnings
         );
     }
 

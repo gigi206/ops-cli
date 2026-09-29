@@ -606,7 +606,7 @@ the layer below rather than adding to it, so anything else that layer set revert
 built-in value: `mute`, `http2`, `dns_cache_ttl`, `pool`, `idle_timeout`, `max_connections`,
 `body_max_mb`, `ca_roots`, `capture` (with its `capture_max_kb`), `websocket_secret`,
 `ask_timeout` and `ask_notice`. The `allow`/`deny` rules are replaced too, which is what declaring a table is
-for.
+for; a project's posture for an app names the `deny` rules it drops, as shown below.
 
 This is easy to reach without meaning to, because [`sbx net allow --local`](../cli/net)
 writes a `[network]` table into the project: a `capture` or a `ca_roots = false` set once in
@@ -644,6 +644,17 @@ allow = ["x.test"]
 The app then runs under `ask`, still with `ask_timeout = "45s"`, and with **four** allow rules.
 Name a `mode` in that overlay and it replaces the profile's table like any other, which is what
 declaring a posture means.
+
+A `deny` rule the replacement drops is named, unlike the other rules: it opens a host the
+layer below closed. Say the profile above also wrote `deny = ["tracker.example.com"]` and the
+overlay wrote `mode = "allow"`:
+
+```text
+sbx: warning: .sbx.toml [app.demo]: this `network` posture replaces the one below it rather than adding to it, so `deny` rules the layer below carried do not apply to this app: `https://tracker.example.com`. To keep them, re-declare them under `deny` in a `[network]` table here
+```
+
+The app still runs as the project wrote it. A `deny` entry of a bundle the profile uses is
+named the same way, and nothing is said under `none`, where nothing reaches.
 
 The posture it keeps is the profile's, whichever it is: an app on a denylist (`mode = "allow"`)
 stays on it. A table that *replaces* inherits differently, falling back to `deny` when the layer

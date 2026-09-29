@@ -800,6 +800,17 @@ fn resolve_app(
                         net_groups,
                         parent,
                     )?;
+                    // A posture of the project's own drops the `deny` rules below it, the profile's
+                    // or the baseline's, and each opens a host: named, see `replaced_deny_note`. An
+                    // amending table keeps them all, so nothing is named there.
+                    let dropped = deny_rules_replaced(parent, &policy);
+                    if !dropped.is_empty() {
+                        w.push(replaced_deny_note(
+                            &source,
+                            "rules the layer below carried",
+                            &dropped,
+                        ));
+                    }
                     // Only once the policy stands: the verb posture belongs to a policy that exists.
                     if let Some(m) = resolve_app_default_methods(w, &source, raw_dm) {
                         default_methods = m;
@@ -1177,6 +1188,6 @@ fn global_app_source(name: &str) -> String {
 /// The warning source label for a field of a **project** app — e.g. `".sbx.toml [app.demo-app]"` —
 /// so a dropped app field reads as clearly as a baseline one. A project app is inline by
 /// construction: the profile directory is a sibling of the global config, never of a project's.
-fn project_app_source(name: &str) -> String {
+pub(super) fn project_app_source(name: &str) -> String {
     format!("{PROJECT_CONFIG} [app.{name}]")
 }
