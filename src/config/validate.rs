@@ -740,6 +740,9 @@ fn validate_network_layered(
     parent: &NetworkPolicy,
     layering: Layering,
 ) -> Option<NetworkPolicy> {
+    // Decided here, on the field, because the posture the table inherits follows from it: see the
+    // `None` arm of `validate_network_table`.
+    let amends_below = layering == Layering::Amend && amends_the_layer_below(&field);
     match field {
         NetworkField::Posture(value) => match value.as_str() {
             "none" => Some(NetworkPolicy::Isolated),
@@ -779,9 +782,16 @@ fn validate_network_layered(
             table,
             groups,
             parent,
-            layering,
+            amends_below,
         ),
     }
+}
+
+/// Whether a `network` field adds to the policy of the layer below rather than replacing it, where
+/// its layering lets it ([`Layering::Amend`]): only a table with no `mode` of its own does. A
+/// posture string, or a table that names a mode, is a policy of its own.
+pub(super) fn amends_the_layer_below(field: &NetworkField) -> bool {
+    matches!(field, NetworkField::Table(table) if table.mode.is_none())
 }
 
 /// Name every `[network]` field a non-filtering posture leaves inert, so a table that reads like a
@@ -847,6 +857,9 @@ fn warn_inert_under_posture(
 /// it named **reachable**, so that one stops a launch too, see [`classify_entries`]); and an
 /// **omitted** `mode` inherits the filtering mode from `parent` while keeping this table's own
 /// rules.
+///
+/// `amends_below` says the table is an addition to the layer below rather than a policy of its
+/// own, as [`amends_the_layer_below`] decides it under [`Layering::Amend`].
 pub(super) fn validate_network_table(
     warnings: &mut Vec<String>,
     refusals: &mut Vec<String>,
@@ -854,7 +867,7 @@ pub(super) fn validate_network_table(
     table: NetworkTable,
     groups: &NetGroups,
     parent: &NetworkPolicy,
-    layering: Layering,
+    amends_below: bool,
 ) -> Option<NetworkPolicy> {
     use crate::allowlist::DefaultAction;
     // Report what this table carries and sbx will not apply, before any posture is decided: the
@@ -873,9 +886,6 @@ pub(super) fn validate_network_table(
              this field (check the spelling; a newer sbx's fields are ignored here on purpose)"
         ));
     }
-    // An amending table with no `mode` of its own is an addition to the layer below, not a policy
-    // of its own. Decided here because the posture it inherits follows from it: see the `None` arm.
-    let amends_below = layering == Layering::Amend && table.mode.is_none();
     // The default action: from an explicit `mode`, or — when omitted — inherited from the parent
     // layer. `none`/`shared` are non-filtering postures that carry no rules, so they return early.
     let action = match table.mode.as_deref() {

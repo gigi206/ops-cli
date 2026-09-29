@@ -95,10 +95,10 @@ pub(crate) use secrets::sops_ref_file;
 #[cfg(test)]
 use secrets::{validate_header_shape, validate_host_secret, validate_secret_target};
 use validate::{
-    validate_contract, validate_device_path, validate_distro, validate_forward, validate_gui,
-    validate_home_scope, validate_limits, validate_mise_engine, validate_network,
-    validate_network_amending, validate_nixpkgs, validate_notify, validate_open, validate_proc,
-    validate_redact_min_len, validate_service, validate_timezone,
+    amends_the_layer_below, validate_contract, validate_device_path, validate_distro,
+    validate_forward, validate_gui, validate_home_scope, validate_limits, validate_mise_engine,
+    validate_network, validate_network_amending, validate_nixpkgs, validate_notify, validate_open,
+    validate_proc, validate_redact_min_len, validate_service, validate_timezone,
 };
 // Exercised by a cross-cutting config unit test (profile merge + the shared `raw_app` builders).
 #[cfg(test)]

@@ -4472,6 +4472,66 @@ fn a_bundle_allow_entry_a_string_posture_leaves_out_is_said_and_the_app_still_an
 }
 
 #[test]
+fn a_bundle_loss_a_trusted_project_posture_replaces_does_not_stop_the_app() {
+    // A trusted project whose `[app.demo.network]` names a `mode` rebuilds the app's network from
+    // that table alone, so a bundle `deny` entry the profile's string posture could not take is
+    // dropped as one in a profile table would be: the app answers under the project's posture,
+    // with no refusal naming a profile table that would change nothing. A mode-less project table
+    // amends the profile's posture instead, and the entry lost below it still stops the app.
+    let fx = Project::new("cfg");
+    fx.write_bundle("block", "deny = [\"tracker.example.com\"]\n");
+    let ask = || {
+        let out = fx.run(&[
+            "test",
+            "net",
+            "--app",
+            "demo",
+            "https://tracker.example.com",
+        ]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+
+    fx.write_profile(
+        "demo",
+        "cmd = \"x\"\nuse = [\"block\"]\nnetwork = \"shared\"\n",
+    );
+    fx.write_project("[app.demo.network]\nmode = \"deny\"\n");
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    let (code, text) = ask();
+    assert_eq!(
+        code,
+        Some(0),
+        "answered under the project's posture:\n{text}"
+    );
+    assert!(
+        text.contains("network (app demo): deny ") && !text.contains("bundle"),
+        "{text}"
+    );
+
+    fx.write_profile(
+        "demo",
+        "cmd = \"x\"\nuse = [\"block\"]\nnetwork = \"allow\"\n",
+    );
+    fx.write_project("[app.demo.network]\nallow = [\"other.test\"]\n");
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    let (code, text) = ask();
+    assert_eq!(
+        code,
+        Some(2),
+        "an amending table keeps the loss below it:\n{text}"
+    );
+    assert!(
+        text.contains("`tracker.example.com`") && text.contains("run under `allow`"),
+        "{text}"
+    );
+}
+
+#[test]
 fn an_untrusted_project_cannot_use_a_bundle_to_graft_trusted_egress_onto_its_app() {
     // The flagship property, on the `use` axis: a bundle is declared in the *global* config and
     // carries egress rules and credentials, so an untrusted project naming one would be choosing

@@ -297,9 +297,15 @@ must never move a posture in either direction.
 
 Under an app that runs `shared` or `none`, a `deny` entry changes nothing: that posture
 is already wider, or admits nothing at all. An app that writes either as a string is told
-nothing, since no entry of a bundle changes what it reaches, and neither is one whose
-string a project's `[app.<name>.network]` table with a `mode` replaces: that table drops
-the entries of a table the profile wrote as well.
+nothing, since no entry of a bundle changes what it reaches.
+
+A trusted project that writes a posture of its own for the app, a `network` string in its
+`[app.<name>]` or an `[app.<name>.network]` table with a `mode`, replaces the network the
+profile declared, and drops the entries of a table the profile wrote as well. What the
+profile could not take then costs nothing more: the app runs under the project's posture,
+and sbx neither stops it nor asks for a profile table that would change nothing. A
+project table with no `mode` adds to the profile's posture instead, so what the profile
+could not take still counts there.
 
 ## The shipped bundles
 
