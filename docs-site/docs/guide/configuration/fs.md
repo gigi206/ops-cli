@@ -371,6 +371,11 @@ A refused entry **stops the launch**, naming it: left out, it would leave the pa
 `sbx config show` still lists the entries beside it and names the refused one. An entry an
 app declares stops that app's launch alone.
 
+So does a key `[fs]` does not know, such as a misspelled `denny`. Elsewhere in a config an
+unknown key is named and ignored, so that a file written for a newer sbx still loads; here
+the table only closes paths, and whatever the key meant is a restriction this sbx cannot
+apply.
+
 ## Prefer a directory
 
 A denied *directory* is the only shape that stays closed for the whole session. Mounts are

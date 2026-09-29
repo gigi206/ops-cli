@@ -3330,6 +3330,10 @@ fn apply_devices(
 /// is close its own files. An entry left out fails *open*, leaving the file exposed, so it is not a
 /// note a launch can go past: the same sentence goes to `warnings`, for the verbs that show the
 /// configuration, and to `refusals`, which a launch stops on.
+///
+/// A key the table does not know is one of those entries. Everywhere else an unknown key is named
+/// and ignored, so that a file written for a newer sbx loads on an older one; here whatever the key
+/// meant, a misspelled `deny` or a newer sbx's field, closes something this sbx cannot close.
 fn apply_fs(
     warnings: &mut Vec<String>,
     refusals: &mut Vec<String>,
@@ -3344,6 +3348,14 @@ fn apply_fs(
         warnings.push(said.clone());
         refusals.push(said);
     };
+    for key in raw.rest.keys() {
+        unapplied(format!(
+            "{source}: cannot apply unknown key `{}` under `[fs]` (check the spelling; `[fs]` only \
+             closes paths, so a newer sbx's key is a restriction this one cannot apply either), \
+             and a launch stops rather than run without it",
+            crate::diag::visible(key)
+        ));
+    }
     for (field, entries, out) in [
         ("deny", &raw.deny, &mut policy.deny),
         ("readonly", &raw.readonly, &mut policy.readonly),
@@ -3451,6 +3463,9 @@ fn union_forward(base: &mut Vec<ForwardPort>, extra: Vec<ForwardPort>) {
 /// nothing anywhere to say so. So the key is named, the layer loads on regardless, and the reader
 /// decides which it was.
 ///
+/// The one exception is `[fs]`, which only closes paths: whatever a key there meant is a
+/// restriction this sbx cannot apply, so [`apply_fs`] names it and a launch stops on it.
+///
 /// Covers the top level and the tables where the silence costs the most: a limit that is not in
 /// effect, and a grant that is not granted. A `[task.<name>]`/`[app.<name>]` entry's own fields are
 /// reported by [`warn_unknown_task_keys`] and [`apps::warn_unknown_app_keys`] instead, each called
@@ -3483,9 +3498,7 @@ pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &
     if let Some(observe) = &raw.observe {
         report(" under `[observe]`", &observe.rest);
     }
-    if let Some(fs) = &raw.fs {
-        report(" under `[fs]`", &fs.rest);
-    }
+    // `[fs]` is named where it is applied, by `apply_fs`: there an unknown key stops a launch.
     if let Some(mise) = &raw.mise {
         report(" under `[mise]`", &mise.rest);
     }

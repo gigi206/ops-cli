@@ -57,9 +57,10 @@ a line is written out as an escape (`\x1b`, `\u{202e}`), so the quote shows what
 holds without driving the terminal.
 
 A blob is also refused (exit 2), before it changes anything, when it carries a restriction sbx
-cannot apply: an `[fs]` entry or `scan` pattern the grammar refuses, a `network.deny` entry it
-cannot classify or that names a group nobody defined, a `network` or `proc` mode it does not
-know. An override must be exact, and the launch would otherwise run without that restriction.
+cannot apply: an `[fs]` entry or `scan` pattern the grammar refuses or an `[fs]` key it does
+not know, a `network.deny` entry it cannot classify or that names a group nobody defined, a
+`network` or `proc` mode or a `gui` posture it does not know. An override must be exact, and
+the launch would otherwise run without that restriction.
 
 ### Typed flags: one field each
 

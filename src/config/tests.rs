@@ -8321,6 +8321,61 @@ fn a_gui_posture_that_cannot_be_read_refuses_a_launch() {
     assert!(r.refusals.is_empty(), "{:?}", r.refusals);
 }
 
+/// A key `[fs]` does not know refuses a launch from every layer that applies `[fs]`. The table only
+/// closes paths, so whatever the key meant (a misspelled `deny`, a newer sbx's field) is a
+/// restriction this one cannot apply. Named once, quoted on one line, and fatal to an override.
+#[test]
+fn an_unknown_fs_key_refuses_a_launch_from_every_layer_that_applies_fs() {
+    let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
+    let project =
+        |text: &str, state| resolve_no_plugins(RawConfig::default(), Some((parse(text), state)));
+    let refused_over =
+        |refusals: &[String], what: &str| refusals.len() == 1 && refusals[0].contains(what);
+    let fs = "[fs]\ndenny = [\"secret.key\"]\n";
+
+    let r = resolve_no_plugins(parse(fs), None);
+    assert!(refused_over(&r.refusals, "`denny`"), "{:?}", r.refusals);
+    let named: Vec<_> = r.warnings.iter().filter(|w| w.contains("denny")).collect();
+    assert_eq!(named.len(), 1, "named once: {:?}", r.warnings);
+    for state in [TrustState::Trusted, TrustState::Untrusted] {
+        let r = project(fs, state);
+        assert!(refused_over(&r.refusals, "`denny`"), "{:?}", r.refusals);
+    }
+
+    let app = "[app.demo]\ncmd = [\"true\"]\n\n[app.demo.fs]\ndenny = [\"secret.key\"]\n";
+    for r in [
+        resolve_no_plugins(parse(app), None),
+        project(app, TrustState::Trusted),
+    ] {
+        assert!(
+            refused_over(&r.apps["demo"].refusals, "`denny`"),
+            "{:?}",
+            r.apps["demo"].refusals
+        );
+        assert!(
+            r.refusals.is_empty(),
+            "the app's table stops that app alone: {:?}",
+            r.refusals
+        );
+    }
+
+    let mut r = resolve_no_plugins(RawConfig::default(), None);
+    let errs = r
+        .apply_override(Override::for_test(parse(fs)), None)
+        .expect_err("an override must be exact");
+    assert!(errs.iter().any(|e| e.contains("denny")), "{errs:?}");
+
+    let r = resolve_no_plugins(parse("[fs]\n\"no\\nsbx: all good\" = 1\n"), None);
+    assert!(
+        refused_over(&r.refusals, "no\\x0asbx: all good") && !r.refusals[0].contains('\n'),
+        "{:?}",
+        r.refusals
+    );
+
+    let r = resolve_no_plugins(parse("[fs]\ndeny = [\"secret.key\"]\n"), None);
+    assert!(r.refusals.is_empty(), "{:?}", r.refusals);
+}
+
 /// A one-shot override carrying a restriction that cannot be applied is refused before it changes
 /// anything, like a bad scalar: a `deny` entry sbx cannot read, and an `[fs]` entry it refuses. The
 /// override must be exact, and one entry left out would leave its host or its path open.
