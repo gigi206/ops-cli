@@ -183,3 +183,32 @@ runs:
           --features bundled-nix,bundled-bwrap
         cp "target/$TARGET/release/sbx" "$ASSET"
         sha256sum "$ASSET" | cut -d' ' -f1 > "$ASSET.sha256"
+
+    # The binary just built is the one a release publishes and `install.sh` hands to a machine of
+    # this architecture, and nothing above runs it: the unit gate runs the host's own build, not
+    # this static one with its engines inside. So it is run here, on a runner of its architecture,
+    # the way the installer runs it: `--version`, then `doctor`, which unpacks the bundled engines,
+    # launches a hardened process through them and exits non-zero on a missing prerequisite. The
+    # engines must be the bundled ones, read back from the report, so a `bwrap` or `nix` the runner
+    # happens to carry cannot stand in for them. The AppArmor knob is lifted as the unpack step
+    # lifts it, and the data directory is short, since sbx binds sockets under it.
+    - name: Run the built binary (--version, doctor)
+      shell: bash
+      env:
+        ASSET: ${{ inputs.asset }}
+      run: |
+        set -euo pipefail
+        knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        if [ -e "$knob" ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        "./$ASSET" --version
+        data="$(mktemp -d /tmp/sbx.XXXXXX)"
+        log="$RUNNER_TEMP/doctor.log"
+        SBX_DATA_DIR="$data" "./$ASSET" doctor </dev/null | tee "$log"
+        for engine in nix bubblewrap; do
+          grep -Eq "^[[:space:]]*\[ ok \] $engine[[:space:]]+$data/engine/" "$log" \
+            || { echo "doctor did not use the bundled $engine" >&2; exit 1; }
+        done
+        grep -Eq '^[[:space:]]*\[ ok \] sandbox[[:space:]]' "$log" \
+          || { echo "doctor did not launch a hardened process" >&2; exit 1; }
