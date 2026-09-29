@@ -325,6 +325,129 @@ jobs:
               echo "None: every selected test ran."
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
+  # A host that restricts unprivileged user namespaces, kept that way. Ubuntu 24.04 and later ship
+  # `kernel.apparmor_restrict_unprivileged_userns=1`: the host's `bwrap` carries an AppArmor
+  # profile that lets it create one, and the `sbx` binary carries none. Every other job here lifts
+  # the knob, so that shape -- the one a stock Ubuntu desktop has -- was never launched by any run,
+  # and on 2026-09-29 it turned out that no cage started there at all while `doctor` reported
+  # "prerequisites OK": the launch gate asked a user namespace of sbx's own, and the netns holder
+  # after it stopped the launch with rc 125.
+  #
+  # So this job keeps the knob at 1 and asserts both sides of it. Without a profile, a filtered
+  # launch runs in bwrap's own empty namespace, reaches the proxy and warns, and a proxy-blind
+  # client fails; `doctor` names the restriction and prints the profile that lifts it. With that
+  # profile loaded, exactly as printed, the holder is back: `dummy0` in the cage and a proxy-blind
+  # client routed. The second half is also the only place the printed profile meets the older
+  # `apparmor_parser` of 24.04.
+  restricted-userns:
+    name: launch under the userns restriction (${{ matrix.image }})
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install the engine from the distribution, with its AppArmor profile
+        # The distribution's `bubblewrap` is the one the restriction lets through: its profile is
+        # attached to `/usr/bin/bwrap`. `nftables` brings `nft`, without which no launch wires the
+        # capture tap and the holder half below would have nothing to show.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap nftables
+
+      - name: Keep the restriction on
+        # Set rather than assumed: an image that ships the knob at 0 would otherwise make this job
+        # measure the host every other job already measures. An image without the knob cannot
+        # show the shape at all, and that is a failure here, not a pass.
+        run: |
+          set -euo pipefail
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          [ -e "$knob" ] || { echo "::error::no $knob on this image: the restriction cannot be measured"; exit 1; }
+          echo "shipped: $(cat "$knob")"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          ls -l /etc/apparmor.d/bwrap-userns-restrict || echo "::warning::no bwrap-userns-restrict profile file"
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build sbx
+        run: cargo build --bin sbx
+
+      - name: Without a profile, a filtered launch runs proxy-only and doctor names the cause
+        run: |
+          set -euo pipefail
+          sbx="$GITHUB_WORKSPACE/target/debug/sbx"
+          fail() { echo "::error::$*"; exit 1; }
+          out="$RUNNER_TEMP/unprofiled"
+          mkdir -p "$out"
+          # doctor stays green: the boundary is proven through the host's bwrap, and the refused
+          # namespace is a warning that names its cause and prints the profile.
+          "$sbx" doctor </dev/null | tee "$out/doctor.txt" || fail "doctor failed under the restriction"
+          grep -Eq '\[warn\] capture +sbx cannot create the cage.s network namespace' "$out/doctor.txt" \
+            || fail "doctor did not report the refused namespace"
+          grep -q 'cause: AppArmor restricts unprivileged user namespaces' "$out/doctor.txt" \
+            || fail "doctor did not name the restriction"
+          grep -Fq "profile sbx \"$sbx\" flags=(unconfined) {" "$out/doctor.txt" \
+            || fail "doctor did not print a profile for $sbx"
+          # The namespace alone, refused with its own status.
+          rc=0; "$sbx" __net-probe 2>"$out/probe.txt" || rc=$?
+          [ "$rc" = 3 ] || fail "__net-probe exited $rc, expected 3: $(cat "$out/probe.txt")"
+          # A filtered launch, the default posture of an untrusted project: it runs, in an empty
+          # namespace of bwrap's own, through the proxy, and says what it lost.
+          work="$(mktemp -d)"
+          probe='printf "interfaces: "; tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " " | sort | paste -sd, -
+          printf "proxied: "; curl -sS -o /dev/null -w "%{http_code}\n" -I https://cache.nixos.org/nix-cache-info || true
+          printf "direct: "; curl -sS --noproxy "*" -m 10 -o /dev/null -w "%{http_code}\n" -I https://cache.nixos.org/nix-cache-info || true'
+          rc=0
+          (cd "$work" && "$sbx" run -- sh -c "$probe") >"$out/launch.txt" 2>"$out/launch.err" || rc=$?
+          cat "$out/launch.txt" "$out/launch.err"
+          [ "$rc" = 0 ] || fail "the filtered launch exited $rc"
+          grep -q 'a private network namespace could not be created' "$out/launch.err" \
+            || fail "the launch did not warn about the namespace it lost"
+          grep -qx 'interfaces: lo' "$out/launch.txt" || fail "the cage's namespace is not bwrap's empty one"
+          grep -qx 'proxied: 200' "$out/launch.txt" || fail "the proxy did not carry the request"
+          grep -q '^direct: 200' "$out/launch.txt" && fail "a proxy-blind client reached the network"
+          echo "proxy-only launch: as expected"
+
+      - name: With the profile doctor prints, the holder is back
+        run: |
+          set -euo pipefail
+          sbx="$GITHUB_WORKSPACE/target/debug/sbx"
+          fail() { echo "::error::$*"; exit 1; }
+          out="$RUNNER_TEMP/profiled"
+          mkdir -p "$out"
+          # The profile exactly as doctor printed it: its lines sit under the note, indented.
+          sed -n '/^ *abi <abi\/4.0>,$/,/^ *}$/p' "$RUNNER_TEMP/unprofiled/doctor.txt" \
+            | sed 's/^             //' > "$out/sbx.apparmor"
+          cat "$out/sbx.apparmor"
+          sudo install -m 0644 "$out/sbx.apparmor" /etc/apparmor.d/sbx
+          sudo apparmor_parser -r /etc/apparmor.d/sbx || fail "apparmor_parser refused the printed profile"
+          "$sbx" doctor </dev/null | tee "$out/doctor.txt" || fail "doctor failed with the profile"
+          grep -Eq '\[ ok \] capture ' "$out/doctor.txt" || fail "capture is not ok with the profile loaded"
+          "$sbx" __net-probe || fail "the namespace is still refused with the profile loaded"
+          work="$(mktemp -d)"
+          probe='printf "interfaces: "; tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " " | sort | paste -sd, -
+          printf "direct: "; curl -sS --noproxy "*" -m 10 -o /dev/null -w "%{http_code}\n" -I https://cache.nixos.org/nix-cache-info || true'
+          rc=0
+          (cd "$work" && "$sbx" run -- sh -c "$probe") >"$out/launch.txt" 2>"$out/launch.err" || rc=$?
+          cat "$out/launch.txt" "$out/launch.err"
+          [ "$rc" = 0 ] || fail "the launch exited $rc with the profile loaded"
+          grep -q 'a private network namespace could not be created' "$out/launch.err" \
+            && fail "the launch still lost its namespace with the profile loaded"
+          grep -qx 'interfaces: dummy0,lo' "$out/launch.txt" || fail "the holder's namespace is missing"
+          grep -qx 'direct: 200' "$out/launch.txt" || fail "a proxy-blind client was not routed"
+          echo "holder launch with the printed profile: as expected"
+
   # The `bundled-nix` / `bundled-bwrap` feature paths, which no other workflow compiles: the
   # default CI builds without them, so a change that breaks one is found at release time, by the
   # one build that has to work.
