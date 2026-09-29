@@ -12,6 +12,7 @@
 # Test selection is change-driven:
 #   - a core change (Cargo.toml/Cargo.lock/build.rs/src/**)  -> full suite
 #   - only tests/*.rs changed                               -> those files
+#   - install.sh changed                                    -> tests/install.rs
 #   - otherwise                                             -> unit tests only
 
 # ACTIONS ARE PINNED BY COMMIT, HERE AND IN EVERY OTHER WORKFLOW. A tag is a mutable pointer: the
@@ -197,8 +198,17 @@ jobs:
                 stem="${stem%.rs}"
                 TESTS_CHANGED+=("$stem")
                 ;;
+              install.sh)
+                # Nothing in the crate reads the installer: its own suite is what runs it, and a
+                # change to the script alone selects nothing else.
+                TESTS_CHANGED+=("install")
+                ;;
             esac
           done
+          # A suite named twice, by its own file and by the script it tests, runs once.
+          if [ "${#TESTS_CHANGED[@]}" -gt 0 ]; then
+            mapfile -t TESTS_CHANGED < <(printf '%s\n' "${TESTS_CHANGED[@]}" | sort -u)
+          fi
 
           # The scope goes in the run summary, not only in a `::notice::`. A green whose scope is
           # buried in the log reads the same as a green over everything, and reading it as the

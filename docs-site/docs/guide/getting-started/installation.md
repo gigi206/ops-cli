@@ -1,5 +1,5 @@
 ---
-description: "Build or fetch the single static binary, or a dev build, and what the install script places where."
+description: "Install the released static binary with one command, and what the install script places where, or build it yourself."
 ---
 
 # Installation
@@ -9,6 +9,52 @@ runtime dependency on a system libc; a normal `cargo build` also works for
 development.
 
 See also: [`sbx doctor` and prerequisites](doctor) · [Quick start](quickstart).
+
+## Install a released binary
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gigi206/ops-cli/HEAD/install.sh | sh
+```
+
+The script runs as you, never as root, and does this:
+
+1. Picks the asset for the machine, `sbx-linux-x86_64` or `sbx-linux-aarch64`, and stops on
+   any other system or architecture.
+2. Looks up the newest **stable** release through the GitHub API. A pre-release is never
+   chosen on its own.
+3. Downloads the binary and the `.sha256` published beside it, and stops without installing
+   anything when they do not match.
+4. Places the binary at `~/.local/bin/sbx`, writing it beside its destination and renaming
+   it over the old one, so an `sbx` already running keeps its file.
+5. Says so when that directory is not on your `PATH`, with the line to add to your shell's
+   startup file, and when another `sbx` comes first on it. No startup file is edited.
+6. Runs [`sbx doctor`](doctor), which checks the host and unpacks the `nix` and `bwrap`
+   engines the release carries into `~/.local/share/sbx/engine/` (about 40 MB). The store
+   itself is created on the first launch. A problem `doctor` reports does not undo the
+   install.
+
+Each step can be steered by a variable, set on the `sh` side of the pipe: set before `curl`,
+it would reach `curl` and not the script.
+
+| Variable | Meaning |
+|---|---|
+| `SBX_VERSION` | the release tag to install; `latest` is the rolling pre-release built from the development branch (default: the newest stable release) |
+| `SBX_INSTALL_DIR` | the absolute directory the binary goes in (default: `~/.local/bin`) |
+| `SBX_REPO` | the GitHub repository to install from, `owner/name` (default: `gigi206/ops-cli`) |
+| `SBX_DOWNLOAD_BASE` | where the assets are fetched from (default: that repository's releases) |
+| `SBX_RELEASES_API` | where the newest stable release is looked up (default: that repository's API) |
+
+No stable release is published yet, so for now the default stops and names the way out,
+which is the pre-release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gigi206/ops-cli/HEAD/install.sh | SBX_VERSION=latest sh
+```
+
+The checksum comes from the same release as the binary. It catches a download that was
+corrupted or cut short, not a release that was tampered with: that one would carry a
+matching checksum. The script is also written so that a download of it cut short runs
+nothing, since everything it does is one function called on its last line.
 
 ## Runtime prerequisites
 

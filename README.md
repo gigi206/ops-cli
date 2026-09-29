@@ -65,6 +65,20 @@ and why it is one process rather than a daemon, bubblewrap rather than raw names
 decrypting proxy by default. The threat analysis lives beside the model it belongs to, in
 [Security model](docs-site/docs/guide/concepts/security-model.md).
 
+## Install
+
+On Linux, x86_64 or aarch64:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gigi206/ops-cli/HEAD/install.sh | sh
+```
+
+The script installs the newest stable release into `~/.local/bin`, after checking it against
+its published SHA-256, then runs `sbx doctor`. No stable release is published yet: until one
+is, `| SBX_VERSION=latest sh` installs the rolling pre-release built from the development
+branch. What it does, its variables and its limits are on the
+[installation page](docs-site/docs/guide/getting-started/installation.md).
+
 ## Build
 
 The shipping artifact is a **static musl binary**. Some dependencies carry
