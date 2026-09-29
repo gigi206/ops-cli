@@ -234,7 +234,10 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
         rep.note(&format!("kernel.unprivileged_userns_clone = {v}"));
     }
     report_resource_limits(&mut rep, &config::global_limits());
-    report_transparent_capture(&mut rep);
+    // Read before anything later adds to it: what is recorded so far is the engine and the
+    // boundary, and either one missing means no launch runs at all.
+    let launches_run = remediation.is_empty();
+    report_transparent_capture(&mut rep, launches_run);
 
     // The nix that drives the store. Its absence is load-bearing too — without
     // nix, sbx cannot provision a project's tools. Resolution follows override,
@@ -369,7 +372,11 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
 /// The answer comes from actually installing the rules in a throwaway namespace. Reading kernel
 /// configuration instead would be inference: whether an unprivileged namespace may autoload the nat
 /// modules is not stated in any single file, and it is the question that decides this.
-fn report_transparent_capture(rep: &mut Report<'_>) {
+///
+/// `launches_run` is false when the engine or the boundary above failed. What a refused namespace
+/// costs a launch is then left unsaid: no launch runs, so a line saying one still filters through
+/// the proxy would contradict the failure printed above it.
+fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool) {
     // Recorded as the `capture` check rather than as a note: a note lands under whichever check
     // was recorded last, which would file this verdict under a neighbouring probe and leave a
     // consumer keyed on check names with no capture answer at all.
@@ -408,10 +415,13 @@ fn report_transparent_capture(rep: &mut Report<'_>) {
     {
         rep.note(&format!("the kernel refused: {why}"));
     }
-    if let Some(hint) = support.remediation() {
+    let refused_namespace = matches!(support, sandbox::CaptureSupport::NoNamespace(_));
+    if let Some(hint) = support.remediation()
+        && (launches_run || !refused_namespace)
+    {
         rep.note(hint);
     }
-    if matches!(support, sandbox::CaptureSupport::NoNamespace(_)) {
+    if refused_namespace {
         report_namespace_remedies(rep, &exe);
     }
 }

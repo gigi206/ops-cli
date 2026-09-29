@@ -98,10 +98,10 @@ differently, and the store moves into it:
   the boundary, so a host that cannot take the rules gets a warning naming what is
   missing, never a failure: egress still works, and a proxy-blind client fails to connect
   instead of being routed. The probe first creates the namespace itself. A host that
-  restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) refuses sbx that
-  while its `bwrap` keeps its own profile, so the sandbox still launches; the warning then
-  names the restriction and the two ways to lift it: an AppArmor profile that grants
-  `userns` to the `sbx` binary alone, or the sysctl, for every program. See
+  restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) refuses sbx that.
+  Where the host's `bwrap` carries a profile of its own, the sandbox still launches; the
+  warning then names the restriction and the two ways to lift it: an AppArmor profile that
+  grants `userns` to the `sbx` binary alone, or the sysctl, for every program. See
   [Clients that ignore the proxy variables](../configuration/network#clients-that-ignore-the-proxy-variables).
 
 - **The store location and channel revision.** Where `sbx`'s user-owned store lives
@@ -152,7 +152,7 @@ If `doctor` reports that user namespaces are missing or non-capability-bearing:
   path-profiled `/usr/bin/bwrap` works there; a bwrap materialized elsewhere would
   match no profile. See [Provisioning](../concepts/provisioning) for how `sbx`
   chooses its bwrap engine on such a host. The `sbx` binary matches none either,
-  so a launch there proves the boundary through that `bwrap`, and the network
+  so where that `bwrap` exists a launch proves the boundary through it, and the network
   namespace `sbx` prepares for the capture tap and for graphical apps is refused:
   the `capture` line says so and prints what lifts it (see
   [Troubleshooting](troubleshooting#a-launch-warns-about-its-network-namespace)).

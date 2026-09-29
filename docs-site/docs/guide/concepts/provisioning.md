@@ -190,7 +190,8 @@ The two engines differ in how complete the independence is:
 - **bwrap: partial.** On a host where
   `kernel.apparmor_restrict_unprivileged_userns` is set, only a binary carrying an
   AppArmor profile that allows `userns` may create an unprivileged user namespace,
-  and that profile is attached by path to the host's `/usr/bin/bwrap`. So on a
+  and where the release ships one for bubblewrap, that profile is attached by path to
+  the host's `/usr/bin/bwrap`. So on a
   restricted host `sbx` keeps the host `/usr/bin/bwrap` (the only bwrap that can
   create the namespace); on an unrestricted host the bundled engine leads. This
   choice is non-regressive by construction. The `sbx` binary itself carries no

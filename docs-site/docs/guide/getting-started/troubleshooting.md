@@ -41,9 +41,9 @@ The cage still runs, and it is still filtered: its network namespace is the empt
 creates, and its egress goes through the proxy as usual. What is missing is the namespace `sbx`
 prepares itself, which carries the
 [capture tap](../configuration/network#clients-that-ignore-the-proxy-variables) and the interface
-that tells a graphical app it is online. The host's `bwrap` carries an AppArmor profile that lets
-it create user namespaces; the `sbx` binary carries none. `sbx doctor` names the cause and prints
-what lifts it:
+that tells a graphical app it is online. This is a host whose `bwrap` carries an AppArmor profile
+that lets it create user namespaces while the `sbx` binary carries none. `sbx doctor` names the
+cause and prints what lifts it:
 
 ```text
   [warn] capture           sbx cannot create the cage's network namespace, so a launch runs without capture
@@ -60,7 +60,7 @@ what lifts it:
 ```
 
 The profile is the narrow fix: it lets that one binary create user namespaces and confines it no
-further, while the cage's own processes stay under the confinement Ubuntu gives `bwrap`. It is
+further, while the cage's own processes stay under the profile the host gives `bwrap`. It is
 attached to the path `doctor` printed, which is the file a link leads to, so a binary that moves
 needs its path updated. The sysctl lifts the restriction for every program on the host.
 
