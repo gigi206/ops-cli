@@ -398,12 +398,13 @@ pub(super) fn validate_mise_engine(
     }
 }
 
-/// Validate a `gui` posture string into [`GuiPolicy`], warning on anything unrecognized. A
-/// typo must never silently leave the GUI in the wrong posture; returning `None` keeps the
-/// prior (default or global) posture rather than guessing. There is intentionally no `x11`
-/// value — X is never offered.
+/// Validate a `gui` posture string into [`GuiPolicy`]. An unknown posture returns `None`, which
+/// leaves the layer below in force, so the note naming it goes to `refusals` too and a launch stops
+/// on it: a misspelled `none` must never open the compositor a layer below granted. There is
+/// intentionally no `x11` value: X is never offered.
 pub(super) fn validate_gui(
     warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
     source_label: &str,
     value: &str,
 ) -> Option<GuiPolicy> {
@@ -412,10 +413,14 @@ pub(super) fn validate_gui(
         "offscreen" => Some(GuiPolicy::Offscreen),
         "wayland" => Some(GuiPolicy::Wayland),
         other => {
-            warnings.push(format!(
-                "{source_label}: ignoring unknown gui posture `{other}` \
-                 (expected \"none\", \"offscreen\" or \"wayland\")"
-            ));
+            let said = format!(
+                "{source_label}: ignoring unknown gui posture `{}` (expected \"none\", \
+                 \"offscreen\" or \"wayland\"), and a launch stops rather than run under the \
+                 posture below",
+                crate::diag::visible(other)
+            );
+            refusals.push(said.clone());
+            warnings.push(said);
             None
         }
     }

@@ -1612,7 +1612,8 @@ fn build_override_scalars(
         }
     }
     if let Some(value) = gui {
-        match validate_gui(notes, OVERRIDE_SOURCE, &value) {
+        // The refusal sentence is not kept: `None` is already fatal here, and the note says why.
+        match validate_gui(notes, &mut Vec::new(), OVERRIDE_SOURCE, &value) {
             Some(policy) => scalars.gui = Some(policy),
             None => fatal.push("gui".to_string()),
         }
@@ -2242,7 +2243,7 @@ fn resolve(
     let mut gui_origin = Provenance::Default;
     let mut gui = match global
         .gui
-        .and_then(|v| validate_gui(&mut warnings, GLOBAL_CONFIG, &v))
+        .and_then(|v| validate_gui(&mut warnings, &mut refusals, GLOBAL_CONFIG, &v))
     {
         Some(policy) => {
             gui_origin = Provenance::Global;
@@ -2678,7 +2679,7 @@ fn resolve(
                 &mut gui_origin,
                 "`gui` posture",
                 &mut warnings,
-                |w, _| validate_gui(w, PROJECT_CONFIG, &value),
+                |w, _| validate_gui(w, &mut refusals, PROJECT_CONFIG, &value),
             );
         }
         // `timezone` is **not** a security field, so it applies whatever the project's verdict —

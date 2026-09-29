@@ -8269,6 +8269,58 @@ fn a_proc_mode_that_cannot_be_read_refuses_a_launch() {
     assert!(r.refusals.is_empty(), "{:?}", r.refusals);
 }
 
+/// A `gui` posture sbx does not know refuses a launch, as a `network` or `proc` mode does: the
+/// value is left out, so the posture below it stands, and a misspelled `none` over a global
+/// `wayland` opens the compositor. From the global config, a trusted project, and an app of either,
+/// whose refusal stops that app alone; an untrusted project's `gui` is never applied. The value is
+/// quoted on one line, whatever it holds.
+#[test]
+fn a_gui_posture_that_cannot_be_read_refuses_a_launch() {
+    let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
+    let project =
+        |text: &str, state| resolve_no_plugins(RawConfig::default(), Some((parse(text), state)));
+    let refused_over =
+        |refusals: &[String], what: &str| refusals.len() == 1 && refusals[0].contains(what);
+
+    let r = resolve_no_plugins(parse("gui = \"nnone\"\n"), None);
+    assert!(refused_over(&r.refusals, "nnone"), "{:?}", r.refusals);
+    let r = project("gui = \"nnone\"\n", TrustState::Trusted);
+    assert!(refused_over(&r.refusals, "nnone"), "{:?}", r.refusals);
+
+    let app = "[app.demo]\ncmd = [\"true\"]\ngui = \"nnone\"\n";
+    for r in [
+        resolve_no_plugins(parse(app), None),
+        project(app, TrustState::Trusted),
+    ] {
+        assert!(
+            refused_over(&r.apps["demo"].refusals, "nnone"),
+            "{:?}",
+            r.apps["demo"].refusals
+        );
+        assert!(
+            r.refusals.is_empty(),
+            "the app's posture stops that app alone: {:?}",
+            r.refusals
+        );
+    }
+
+    let r = resolve_no_plugins(parse("gui = \"no\\nsbx: all good\"\n"), None);
+    assert!(
+        refused_over(&r.refusals, "no\\x0asbx: all good") && !r.refusals[0].contains('\n'),
+        "{:?}",
+        r.refusals
+    );
+
+    let r = project("gui = \"nnone\"\n", TrustState::Untrusted);
+    assert!(
+        r.refusals.is_empty(),
+        "an untrusted project's gui is inert: {:?}",
+        r.refusals
+    );
+    let r = resolve_no_plugins(parse("gui = \"none\"\n"), None);
+    assert!(r.refusals.is_empty(), "{:?}", r.refusals);
+}
+
 /// A one-shot override carrying a restriction that cannot be applied is refused before it changes
 /// anything, like a bad scalar: a `deny` entry sbx cannot read, and an `[fs]` entry it refuses. The
 /// override must be exact, and one entry left out would leave its host or its path open.
