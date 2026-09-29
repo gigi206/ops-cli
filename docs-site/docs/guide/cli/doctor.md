@@ -18,8 +18,9 @@ remediation hint**: never a silent fallback to a weaker engine. `SBX_NIX_BIN` an
 `SBX_BWRAP_BIN` pin the two binaries explicitly (owned by you or root, not
 world-writable); unset them to let sbx resolve both itself. Also reports
 best-effort resource limiting, whether a filtering launch can transparently capture a
-client that ignores the proxy variables, the store location and channel revision, and the
-**storage posture**: whether the data directory lives in an encapsulated
+client that ignores the proxy variables (and, where the host refuses `sbx` the network
+namespace that takes, the cause and what lifts it), the store location and channel
+revision, and the **storage posture**: whether the data directory lives in an encapsulated
 [volume](storage), or, when it does not, whether one is worth adopting on this host
 (the filesystem it sits on, and whether btrfs, loop devices and udisks2 are present).
 That line is always informational, never a failure: a volume is opt-in. It does flag one
