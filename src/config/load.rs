@@ -101,6 +101,23 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     } else {
         None
     };
+    // A project approved once and changed since, its `.sbx.toml` or a file its trust covers. Its
+    // security fields are held back until it is re-approved, and what would run in their place is
+    // the layers below, which are not what it wrote: it may be what closed its paths or narrowed
+    // its network, the reason a file that cannot be read stops a launch. A covered file the cage
+    // can create (a mise file absent at launch) makes it changed as well, so running on would let
+    // a session widen the next one. A launch stops instead; the read-only verbs still answer, and
+    // the warning is what tells them a launch would not.
+    if let Some((_, TrustState::Changed, _)) = &project {
+        warnings.push(format!(
+            "{PROJECT_CONFIG}, or a file its trust covers, changed since it was trusted: a launch \
+             stops until it is re-approved, and `sbx trust` shows what changed"
+        ));
+        refusals.push(format!(
+            "{PROJECT_CONFIG}, or a file its trust covers, changed since it was trusted, so its \
+             security fields are held back: review what changed and re-approve it with `sbx trust`"
+        ));
+    }
 
     // Fold each app's `use = [<bundle>, …]` before resolution, so a bundle's contribution is
     // indistinguishable downstream from an entry the app wrote itself — `resolve_app` then gates

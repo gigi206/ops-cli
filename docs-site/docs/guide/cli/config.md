@@ -286,12 +286,13 @@ read whole than assemble field by field.
 | `-c, --config <file>` | an explicit config file |
 | `-a, --app <name>` | address the key under that app (`app.<name>.<key>` inline, or `-g` its profile) |
 
-Writing a trusted project file re-arms its [trust gate](../concepts/trust); pass
-`--trust` to re-trust in one step. A command that changes nothing writes nothing, and so
-re-arms nothing: setting a key to the value it already holds, adding an entry a list
-already carries, removing one it does not, or unsetting a key that was never set all
-report `no change` and leave the file (and its trust) exactly as it was. The global config and app profiles are trusted by
-location, so a write there needs no trust; a free `env` or `timezone` value needs none either.
+Writing a trusted project file re-arms its [trust gate](../concepts/trust), and a launch
+stops until it is re-approved; pass `--trust` to re-trust in one step. A command that
+changes nothing writes nothing, and so re-arms nothing: setting a key to the value it
+already holds, adding an entry a list already carries, removing one it does not, or
+unsetting a key that was never set all report `no change` and leave the file (and its
+trust) exactly as it was. The global config and app profiles are trusted by location, so
+a write there needs no trust; a free `env` or `timezone` value needs none either.
 
 `--trust` blesses the **whole current file**, which is why these four verbs refuse it on
 a file that was never trusted, or that changed since you trusted it. Blessing it would
@@ -350,11 +351,11 @@ on your whole home) stays read-write with those directories pinned read-only in 
 and the rest of the tree is writable, but the agent still cannot alter what sbx runs or
 trusts.
 
-An edit that changes a trusted file re-arms its trust gate; `--trust` re-trusts as
-the editor closes. That is about a gated file. The global config is trusted by
-location, exactly as it is for the writing verbs above: it carries no marker, so
-there is none to re-arm and none to write, and `--trust` there answers that it is not
-needed rather than storing something nothing reads back.
+An edit that changes a trusted file re-arms its trust gate, and a launch stops until it
+is re-approved; `--trust` re-trusts as the editor closes. That is about a gated file.
+The global config is trusted by location, exactly as it is for the writing verbs above:
+it carries no marker, so there is none to re-arm and none to write, and `--trust` there
+answers that it is not needed rather than storing something nothing reads back.
 
 This is also the one verb whose `--trust` blesses a file that was never trusted, where
 `set`, `add`, `rm` and `unset` refuse. The difference is what you saw: the editor put the

@@ -1474,9 +1474,11 @@ pub(super) const PAGES: &[Page] = &[
         ],
         details: "Vouches for a config's current contents, so its security-relevant fields are\n\
             honored until the file changes again. Trust is bound to the file's contents, so\n\
-            any edit re-arms the gate. `[fs]` is the one table this does not govern: it can only\n\
-            close project paths off inside the cage, so it applies whether or not the file is\n\
-            trusted, except its two keys that widen instead (`scan_max_kb`, `git_writable`).\n\
+            any edit re-arms the gate, and a project changed since it was trusted stops a launch\n\
+            until it is re-approved (`sbx config show` still answers, and says so). `[fs]` is the\n\
+            one table this does not govern: it can only close project paths off inside the cage,\n\
+            so it applies whether or not the file is trusted, except its two keys that widen\n\
+            instead (`scan_max_kb`, `git_writable`).\n\
             \n\
             The trust also covers the mise files beside the config and every sops file it names\n\
             in the project: a `sops://` source there is decrypted only as the bytes approved here.\n\
@@ -1574,9 +1576,9 @@ pub(super) const PAGES: &[Page] = &[
             app name containing a `.` is edited with `sbx config edit` instead.\n\
             \n\
             The trust gate hashes the whole file, so any edit re-arms it: after writing a project\n\
-            file you had trusted, its security fields stop applying until you run `sbx trust`. Pass\n\
-            --trust to re-trust in one step (this blesses the whole current file). Which is why\n\
-            --trust is refused on a file that was never trusted, or was changed since: sbx blesses\n\
+            file you had trusted, a launch stops until you run `sbx trust`. Pass --trust to\n\
+            re-trust in one step (this blesses the whole current file). Which is why --trust is\n\
+            refused on a file that was never trusted, or was changed since: sbx blesses\n\
             the delta it wrote, never bytes you have not read. Review it and run `sbx trust`, or use\n\
             `sbx config edit --trust`, where the editor shows you the file first. The global config\n\
             and app profiles are trusted by location, so a write to either needs no trust. A free\n\

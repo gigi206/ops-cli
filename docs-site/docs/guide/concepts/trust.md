@@ -20,11 +20,21 @@ The config schema is split by the trust gate, not by two schemas:
 | From an untrusted project | applied (minus a reserved-key denylist) | applied | **dropped**, with a warning |
 | From the global config | applied | applied | applied (trusted by location) |
 | From a trusted project | applied | applied | applied¹ |
+| From a project changed since it was trusted | a launch **stops** until it is re-approved² | | |
 
 ¹ Two are **global-only** rather than merely trusted-only: egress groups and tool
 bundles are ignored from *any* project, trusted or not. Each is declared once in a file
 of its own beside the global config, where the user owns it, and referenced (`@group`,
 `use`) from anywhere.
+
+² A project you approved and that changed since, its `.sbx.toml` or a mise or sops file
+its trust covers, is not treated as one never approved. Its security fields are held
+back, and what would run in their place is the layers below, which are not what it
+wrote: it may be what closed its paths or narrowed its network. A launch stops instead,
+naming `sbx trust`, which shows what changed before re-approving it. `sbx config show`
+and the other read-only verbs still answer, with the fields held back and a line saying
+a launch would stop. A project you never approved, or revoked with `sbx untrust`, keeps
+the row above: its security fields are dropped and the launch goes on.
 
 The two *free* fields are free for the same reason: neither reads anything from the host,
 and neither reaches past the cage the project declares. [`timezone`](../configuration/timezone)
@@ -102,8 +112,8 @@ to another project's config therefore never inherits that project's trust: the d
 stays the property of one directory.
 
 Because the hash covers the *whole file*, any edit, even to a free field, re-arms
-the gate. This is deliberate: after editing a trusted file, its security fields stop
-applying until you run `sbx trust` again.
+the gate. This is deliberate: after editing a trusted file, a launch stops until you run
+`sbx trust` again.
 
 ## What a re-approval shows
 
@@ -114,11 +124,14 @@ it names, and
 It prints the lines that differ, per file, and asks for confirmation; with no copy on
 record (a first approval) every line is shown, since all of it is being granted.
 
-This closes the loop the project tree opens. The tree is writable from the cage, so an
-agent can add a line to `.sbx.toml` (a bind to a directory of your home, say). The next
-launch drops that bind and names its path in the warning; `sbx trust`, run to make the
-warning go away, shows the added line before granting it. Without the review, the one
-command the warning suggests would also be the one that grants the addition unseen.
+This closes the loop the project tree opens. The tree is writable from the cage. A
+`.sbx.toml` and the mise files present at launch are mounted read-only inside it, but a
+covered file absent at launch is not, so an agent can create one (a `.tool-versions`, a
+`.sbx.toml` in a project that had none), and your own edits change the file too. The
+next launch stops and says why, `sbx config show` names what is held back (a bind's path,
+say), and `sbx trust`, run to lift the stop, shows the changed lines before granting
+them. Without the review, the one command the stop suggests would also be the one that
+grants the change unseen.
 
 The copy is a display input, never a verdict: whether a project is trusted is the hash
 alone. A copy that was tampered with could mislead the diff, but cannot make anything

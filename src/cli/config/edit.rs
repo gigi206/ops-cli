@@ -310,7 +310,7 @@ fn resolve_key_target(
 /// `sbx config set <key> <value>`: write a string value at a dotted key in the target layer file
 /// (`--local` by default), preserving the rest of the file's comments and formatting. Because the
 /// trust gate hashes the whole file, any edit re-arms it — so a write to a trusted file warns that
-/// its security fields will not apply until `sbx trust`, and `--trust` re-trusts in one step.
+/// a launch stops until `sbx trust`, and `--trust` re-trusts in one step.
 pub(super) fn config_set(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,
@@ -881,7 +881,7 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
                 path.display()
             ));
             diag::hint(&format!(
-                "       run `sbx trust {}` to re-apply its security fields",
+                "       a launch stops until you run `sbx trust {}`, which shows what changed",
                 path.display()
             ));
         }
@@ -891,9 +891,9 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
 
 /// Report the trust consequence of a write, the load-bearing UX of `set`/`unset`: the whole-file
 /// trust hash means any edit re-arms the gate. `--trust` re-trusts in one step (blessing the whole
-/// current file); otherwise a write to a previously-trusted file warns that its security fields
-/// will not apply until `sbx trust`, and a write of a security field to an untrusted file notes it
-/// needs trust to take effect. A free `env` write to an untrusted file needs neither.
+/// current file); otherwise a write to a previously-trusted file warns that a launch stops until
+/// `sbx trust`, and a write of a security field to an untrusted file notes it needs trust to take
+/// effect. A free `env` write to an untrusted file needs neither.
 fn report_write_trust(
     path: &Path,
     key: &str,
@@ -933,7 +933,7 @@ fn report_write_trust(
             path.display()
         ));
         diag::hint(&format!(
-            "       its security fields will not apply until you run `sbx trust {}`",
+            "       a launch stops until you run `sbx trust {}`, which shows what changed",
             path.display()
         ));
     } else if is_security_key(key) {

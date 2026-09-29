@@ -11,7 +11,8 @@ sbx trust --show [path]
 
 Vouch for a project config's current contents, so its security-relevant fields are
 honored until the file changes again. Trust is bound to the file's contents, so any
-edit re-arms the gate.
+edit re-arms the gate, and a project changed since it was trusted stops a launch until
+it is re-approved: see [the trust gate](../concepts/trust#free-fields-vs-security-fields).
 
 | Option | Meaning |
 |---|---|

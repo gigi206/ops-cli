@@ -636,13 +636,15 @@ never-trusted one):
 | Project config state | What `[packages]` does | The launch message |
 |---|---|---|
 | `Trusted` | the package is honoured (built / installed) | nothing: the pin was recorded |
-| `Changed` (trusted before, edited since) | **the package is dropped, with a warning** | ``.sbx.toml: withholding package `<name>` (changed since it was trusted — re-run `sbx trust`)`` |
+| `Changed` (trusted before, edited since) | **the launch stops** until the project is re-approved | ``.sbx.toml, or a file its trust covers, changed since it was trusted, so its security fields are held back: review what changed and re-approve it with `sbx trust` `` |
 | `Untrusted` (never trusted) | the package is dropped, with a warning | ``.sbx.toml: withholding package `<name>` (untrusted — run `sbx trust`)`` |
 
 The `Changed` row is the one that surprises operators: a previously-trusted project's security
-fields **stop applying** on the first byte-edit (the gate is the direnv model: the whole file is
-hashed), so a `[packages]` declared there is silently absent from the next launch until you
-re-trust. A `config set`/`unset`/`edit` call with `--trust` re-blesses the file in one step:
+fields are held back on the first byte-edit (the gate is the direnv model: the whole file is
+hashed), and rather than launch without the `[packages]` declared there, and without whatever
+else the file closed, the next launch stops until you re-trust. `sbx config show` still shows
+the package withheld. A `config set`/`unset`/`edit` call with `--trust` re-blesses the file in
+one step:
 
 ```sh
 sbx config set packages.jq '"nix:jq"' --trust

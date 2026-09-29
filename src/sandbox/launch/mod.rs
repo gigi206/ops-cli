@@ -999,7 +999,8 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
     let layout = crate::layout_or_fail()?;
     let mut cfg = crate::config::load(&cwd);
     // Before anything is stood up: a config file that exists and cannot be read is refused rather
-    // than defaulted through. The global layer is where `[proc]`, `[network]` and `[fs]` are
+    // than defaulted through, and so is a project changed since it was trusted, whose security
+    // fields are held back. The global layer is where `[proc]`, `[network]` and `[fs]` are
     // trusted by location, and the built-in default of each is the permissive end; a project's
     // file may be what closed its paths or narrowed its network. Falling back would run the cage
     // under a posture nobody chose, announced by one warning among many. Only a launch refuses;
@@ -1010,8 +1011,8 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
             crate::diag::error(&format!("sbx: {why}"));
         }
         crate::diag::hint(
-            "       a launch is refused rather than run without what could not be read; \
-             fix the file or move it aside.",
+            "       a launch is refused rather than run without what the configuration says: fix \
+             or move aside a file that cannot be read, re-approve one that changed.",
         );
         return Err(ExitCode::from(2));
     }

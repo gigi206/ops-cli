@@ -1318,6 +1318,73 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
 }
 
 #[test]
+fn a_project_changed_since_it_was_trusted_stops_a_launch_until_it_is_re_approved() {
+    // A project approved with `network = "none"` under a global `allow`, then changed: its security
+    // fields are held back, and what would run in their place is the global's `allow`. `test net`
+    // predicts the launch, so it stops with it, while `config show` still answers and says a launch
+    // would stop. A covered mise file created after the approval, which the cage can do, changes
+    // the project the same way. A re-approval lifts the stop; a project never approved has none.
+    let fx = Project::new("cfg");
+    fx.write_global("network = \"allow\"\n");
+    let ask = || {
+        let out = fx.run(&["test", "net", "https://example.test/x"]);
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let trust = || assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    let stop = "changed since it was trusted, so its security fields are held back";
+
+    fx.write_project("network = \"none\"\n");
+    let (code, text) = ask();
+    assert!(
+        code == Some(0) && !text.contains(stop),
+        "a project never approved is not stopped:\n{text}"
+    );
+
+    trust();
+    let (code, text) = ask();
+    assert!(
+        code == Some(0) && text.contains("none (isolated)"),
+        "the approved project runs as it wrote:\n{text}"
+    );
+
+    fx.write_project("network = \"none\"\n[env]\nFOO = \"1\"\n");
+    let (code, text) = ask();
+    assert!(
+        code == Some(2) && text.contains(stop) && !text.contains("ALLOWED"),
+        "an edit stops the launch rather than run it under the global's `allow`:\n{text}"
+    );
+    let show = fx.run(&["config", "show"]);
+    assert!(
+        show.status.success()
+            && String::from_utf8_lossy(&show.stderr)
+                .contains("a launch stops until it is re-approved"),
+        "the view still answers, and says a launch would stop:\n{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+
+    trust();
+    let (code, text) = ask();
+    assert!(
+        code == Some(0) && text.contains("none (isolated)"),
+        "a re-approval lifts the stop:\n{text}"
+    );
+
+    fx.write_mise("[tools]\nnode = \"22\"\n");
+    let (code, text) = ask();
+    assert!(
+        code == Some(2) && text.contains(stop),
+        "a covered mise file created after the approval stops it too:\n{text}"
+    );
+}
+
+#[test]
 fn editing_a_trusted_project_re_arms_the_gate() {
     let fx = Project::new("cfg");
     fx.write_project("binds = [\"/etc/ssh\"]\n");

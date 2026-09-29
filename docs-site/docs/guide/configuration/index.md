@@ -130,12 +130,14 @@ The schema is **additive**: every field is optional, and unknown fields are igno
 A config written for a newer `sbx` still loads on an older one: a new field is
 skipped rather than failing the parse. A config file that is malformed (or fails the
 [safety gate](../concepts/trust#the-safety-gate)) refuses a launch (exit 2) rather
-than letting it run without what the file says. The global config carries `[proc]`,
-`[network]` and `[fs]`, whose built-in defaults are the permissive end of each; a
-project's `.sbx.toml` may be what closed its paths or narrowed its network, and the
-layers below it are not what it wrote. That holds for a project you have not trusted
-too, since its `[fs]` applies without trust. Read-only commands such as
-`sbx config show` still work, set the file aside, and say why.
+than letting it run without what the file says, and so does a project changed since you
+[trusted](../concepts/trust) it, whose security fields are held back until it is
+re-approved. The global config carries `[proc]`, `[network]` and `[fs]`, whose built-in
+defaults are the permissive end of each; a project's `.sbx.toml` may be what closed its
+paths or narrowed its network, and the layers below it are not what it wrote. That holds
+for a project you have not trusted too, since its `[fs]` applies without trust.
+Read-only commands such as `sbx config show` still work, set the file aside, and say
+why.
 
 A value of the **wrong type** costs that value, not the file. `allow = "github.com"`
 where a list belongs is named in a warning with its line and dropped, and everything
@@ -214,5 +216,5 @@ sbx app run review        # launch the agent with its own posture
 - [`sbx config edit`](../cli/config): open the file for array/table fields.
 - [`sbx config path`](../cli/config): where the files are.
 
-Editing a trusted project file re-arms its [trust gate](../concepts/trust); pass
-`--trust` to re-trust in one step.
+Editing a trusted project file re-arms its [trust gate](../concepts/trust), and a launch
+stops until it is re-approved; pass `--trust` to re-trust in one step.
