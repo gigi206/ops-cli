@@ -2584,9 +2584,8 @@ const MAX_RECOVERED_FIELDS: usize = 4;
 /// whose absence is the permissive end of what it can say: `proc` and its `mode` fall back to the
 /// lens off, a `deny`, `readonly` or `scan` list to empty, `ssh_agent.confirm` to signing unasked,
 /// and a task's `spawn` to no exec supervision at all. A single mistake in `proc.deny = ["sh", 5]`
-/// launched `enforce` with nothing denied. Such a value costs the file instead, as two mistakes do:
-/// the global config then stops a launch, and a project's file is set aside, leaving the layers
-/// below in force.
+/// launched `enforce` with nothing denied. Such a value costs the file instead, as two mistakes do,
+/// and a file that cannot be read stops a launch, the global config's and a project's alike.
 ///
 /// A field whose absence falls somewhere in the middle is not listed (`websocket_secret` falls to
 /// `warn`, a limit to its built-in value), since the mistyped value does not say which side it
@@ -2622,9 +2621,9 @@ fn widens(steps: &[String]) -> bool {
     })
 }
 
-/// Parse config bytes as TOML. The error is a human-readable string: the loader
-/// turns it into a warning and ignores the layer rather than aborting a command,
-/// so a malformed config never wedges the sandbox.
+/// Parse config bytes as TOML, with no recovery. The error is a human-readable string for the
+/// caller to report; the one-shot override refuses its invocation on it. A config file on disk
+/// goes through [`parse_layer`] instead.
 pub(crate) fn parse(bytes: &[u8]) -> Result<RawConfig, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
     toml::from_str(text)

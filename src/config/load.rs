@@ -35,8 +35,10 @@ impl Source {
 
 /// Load and resolve the configuration for a project rooted at `cwd`. Infallible by
 /// design: every failure mode (absent, unsafe, unparseable, no trust store)
-/// degrades to a warning and a dropped layer, so a command is never blocked by a
-/// bad config — least of all an attacker-controlled project one.
+/// degrades to a warning and a dropped layer, so a read-only verb always has an answer
+/// to show. A launch is not one of them: a file that exists and could not be read is
+/// also recorded in [`Resolved::refusals`], and a launch refuses on it rather than run
+/// without what the file said.
 pub(crate) fn load(cwd: &Path) -> Resolved {
     load_scoped(cwd, Source::All)
 }
@@ -52,12 +54,16 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // join the global app layer before resolution — `resolve_app`/`resolve_apps` then gate and
     // layer them exactly like an inline global app, with no special casing. They ride the global
     // layer, so a `--local` (project-only) view omits them just as it omits the global config.
-    // Carried out of the branch: a global layer that exists and cannot be read is the one fact a
-    // launch must weigh before standing anything up, and `--local` never reads that layer at all.
-    let mut refused = None;
+    // Carried out of the branches: a layer that exists and cannot be read is the one fact a launch
+    // must weigh before standing anything up, and a single-source view never reads the other layer.
+    let mut refusals = Vec::new();
     let mut global = if source.includes_global() {
         let (mut global, why) = read_global(&mut warnings);
-        refused = why;
+        if let Some(why) = why {
+            refusals.push(format!(
+                "the global config exists but cannot be read: {why}"
+            ));
+        }
         let profiles = read_profile_apps(&mut warnings);
         merge_profile_apps(&mut global, profiles, &mut warnings);
         global
@@ -65,7 +71,13 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         RawConfig::default()
     };
     let mut project = if source.includes_project() {
-        read_project(cwd, &mut warnings)
+        read_project(cwd, &mut warnings).unwrap_or_else(|why| {
+            warnings.push(format!("ignoring {why}"));
+            refusals.push(format!(
+                "the project config exists but cannot be read: {why}"
+            ));
+            None
+        })
     } else {
         None
     };
@@ -181,7 +193,8 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.
     warnings.extend(std::mem::take(&mut resolved.warnings));
     resolved.warnings = warnings;
-    resolved.refused = refused;
+    refusals.append(&mut resolved.refusals);
+    resolved.refusals = refusals;
     resolved
 }
 
@@ -659,8 +672,9 @@ fn read_named_config(path: &Path, kind: &FileKind) -> Result<(String, Vec<u8>), 
 
 /// Read the project config and decide its trust on the *same bytes* it parses, so
 /// the verdict and the applied content cannot belong to two different files. An
-/// absent file is simply no project layer; an unsafe or unparseable one is dropped
-/// with a warning. A config that cannot be trust-checked (no store) is treated as
+/// absent file is simply no project layer, `Ok(None)`; an unsafe or unparseable one is
+/// `Err`, naming it, for the caller to set aside and weigh as [`read_global`]'s refusal
+/// is weighed. A config that cannot be trust-checked (no store) is treated as
 /// untrusted — fail closed.
 ///
 /// Returns the parsed config, its trust verdict, and the validated `(filename,
@@ -671,15 +685,12 @@ fn read_named_config(path: &Path, kind: &FileKind) -> Result<(String, Vec<u8>), 
 fn read_project(
     cwd: &Path,
     warnings: &mut Vec<String>,
-) -> Option<(RawConfig, TrustState, trust::MiseInputs)> {
+) -> Result<Option<(RawConfig, TrustState, trust::MiseInputs)>, String> {
     let path = cwd.join(PROJECT_CONFIG);
     let bytes = match safety::read_safe_bytes(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            warnings.push(format!("ignoring {e}"));
-            return None;
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
     };
 
     // Fold the sibling mise files and the sops files the config names into the verdict —
@@ -722,13 +733,9 @@ fn read_project(
     for d in dropped {
         warnings.push(format!("{}: {d}", path.display()));
     }
-    match parsed {
-        Ok(cfg) => Some((cfg, state, mise_inputs)),
-        Err(e) => {
-            warnings.push(format!("ignoring {}: {e}", path.display()));
-            None
-        }
-    }
+    parsed
+        .map(|cfg| Some((cfg, state, mise_inputs)))
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The project's mise file, the verdict gating it, and its validated bytes, for
@@ -1834,7 +1841,7 @@ pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> 
     // 2. An inline app: serialize its raw definition. The project layer is preferred over the
     //    global (the local definition is the one being packaged for sharing).
     let mut warnings = Vec::new();
-    if let Some((mut project, _, _)) = read_project(cwd, &mut warnings)
+    if let Ok(Some((mut project, _, _))) = read_project(cwd, &mut warnings)
         && let Some(app) = project.app.remove(name)
     {
         return schema::serialize_app(&app).map(String::into_bytes);

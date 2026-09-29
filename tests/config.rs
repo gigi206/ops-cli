@@ -6058,3 +6058,59 @@ fn an_unreadable_global_config_refuses_a_launch_but_not_the_verb_that_shows_it()
         String::from_utf8_lossy(&readable.stderr)
     );
 }
+
+/// A project config that is there and cannot be read refuses a launch, as the global one does,
+/// rather than leaving the layers below it in force: the file may be what closed the project's
+/// paths or narrowed its network, and the global config is not what the project wrote.
+///
+/// Both ways a file is unreadable are staged: a parse the loader cannot recover, and the safety
+/// gate's refusal of a world-writable file. The launch is `sbx app run` on an app nobody declared,
+/// which stops right after the configuration is read: with a readable project config it reports
+/// the missing app, so the refusal is told apart from any other stop without standing up a cage.
+#[test]
+fn a_project_config_that_cannot_be_read_refuses_a_launch_but_not_the_verb_that_shows_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Project::new("cfg");
+    let launch = || {
+        let out = fx.run(&["app", "run", "nope"]);
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    fx.write_project("[fs]\ndeny = [\"secrets/\"\n");
+    let (ok, stderr) = launch();
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains(".sbx.toml") && stderr.contains("cannot be read"),
+        "an unparseable project config refuses the launch, named: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no app named"),
+        "the refusal comes before anything the launch would go on to say: {stderr}"
+    );
+    let shown = fx.run(&["config", "show"]);
+    assert!(
+        shown.status.success(),
+        "the verb that shows the config keeps answering: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+
+    fx.write_project("[fs]\ndeny = [\"secrets/\"]\n");
+    let (ok, stderr) = launch();
+    assert!(!ok);
+    assert!(
+        stderr.contains("no app named") && !stderr.contains("cannot be read"),
+        "a readable project config is not refused: {stderr}"
+    );
+
+    let path = fx.proj.path().join(".sbx.toml");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let (ok, stderr) = launch();
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("world-writable") && stderr.contains("cannot be read"),
+        "a project config the safety gate refuses refuses the launch too: {stderr}"
+    );
+}

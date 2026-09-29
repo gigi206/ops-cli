@@ -200,8 +200,9 @@ needs no re-trust. See [`sbx config`](../cli/config).
 
 Before its bytes are read and hashed, a config file must pass a **safety gate**: it
 must be a plain, owner-owned, non-world-writable regular file. A file that fails this
-is unverifiable and treated fail-closed: `sbx trust` refuses it, and a launch drops
-that layer entirely with a warning on stderr rather than applying it. The same gate
+is unverifiable and treated fail-closed: `sbx trust` refuses it, and a launch refuses to
+go on, naming it, rather than applying it or running without it. `sbx config show` sets
+the layer aside and says why. The same gate
 protects the open file descriptor whose bytes are then hashed, so the validated
 metadata and the consumed bytes are one inode (no time-of-check/time-of-use window).
 

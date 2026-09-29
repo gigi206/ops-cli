@@ -776,15 +776,18 @@ pub(crate) struct Resolved {
     pub(crate) apps: BTreeMap<String, ResolvedApp>,
     /// Human-readable notes about what was dropped or ignored and why.
     pub(crate) warnings: Vec<String>,
-    /// Why the global layer could not be read, when it exists and could not be.
+    /// Why a launch may not go on with this configuration: a config file that exists and could not
+    /// be read, global or project. Each is a whole sentence naming the file.
     ///
-    /// A launch is refused on this, rather than proceeding: the global config is where `[proc]`,
-    /// `[network]` and `[fs]` are trusted by location, and the built-in default of each is the
-    /// permissive end — an unreadable layer would silently turn `mode = "enforce"` back into
-    /// `off`. A read-only verb keeps working and shows what it has, because the command that
-    /// diagnoses the problem must not be the one the problem disables. `None` when the file is
-    /// merely absent, which is a configured state and not a failure.
-    pub(crate) refused: Option<String>,
+    /// A launch is refused on any of them, rather than proceeding without what could not be read:
+    /// the global config is where `[proc]`, `[network]` and `[fs]` are trusted by location, and the
+    /// built-in default of each is the permissive end, so an unreadable layer would silently turn
+    /// `mode = "enforce"` back into `off`; a project's file may be what closed its paths or
+    /// narrowed its network, and the layers below it are not what it wrote. A read-only verb keeps
+    /// working and shows what it has, because the command that diagnoses the problem must not be
+    /// the one the problem disables. Empty when every file is readable or merely absent, which is
+    /// a configured state and not a failure.
+    pub(crate) refusals: Vec<String>,
 }
 
 /// One bundle's install step, as the fold hands it to a launch: the step itself and the bundle
@@ -3051,7 +3054,7 @@ fn resolve(
         tasks,
         apps,
         warnings,
-        refused: None,
+        refusals: Vec::new(),
     };
     #[cfg(debug_assertions)]
     debug_dump_resolved(&resolved);

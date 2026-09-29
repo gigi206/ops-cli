@@ -2670,7 +2670,7 @@ mod tests {
             declared_secrets: vec![a_header_secret()],
             apps: Default::default(),
             warnings: vec![],
-            refused: None,
+            refusals: Vec::new(),
         };
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
