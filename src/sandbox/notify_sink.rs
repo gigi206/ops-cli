@@ -18,7 +18,8 @@
 //! **Everything it emits is redacted.** A block carries agent-chosen text — the host it asked for, the
 //! path it ran — which can carry an injected credential, and a desktop daemon may journal a
 //! notification body. So both the summary and the body pass through [`crate::sandbox::redact`] before
-//! they leave the process, exactly like every other text sink.
+//! they leave the process, exactly like every other text sink, and then through
+//! [`crate::sandbox::sanitize`], because the same text is laid out by whatever shows it.
 //!
 //! Best-effort throughout, in the shape the other host-side relays use: no session bus (ssh, cron,
 //! a headless host) falls back to stderr with one warning, never a repeated one, and never a failure
@@ -54,11 +55,15 @@ const APP_NAME: &str = "sbx";
 /// application a line of its own and shows it whole, while it truncates the summary. With two or
 /// three sandboxes running at once, "which one was that?" is the first question a toast has to
 /// answer, and answering it in the summary meant the answer was the first thing cut.
+///
+/// The label goes through [`crate::sandbox::sanitize`], as the summary and the body do: its project
+/// half is the launch directory's name, which the project chose, and the daemon lays it out as it
+/// does them.
 fn app_name(context: &str) -> String {
     if context.is_empty() {
         APP_NAME.to_string()
     } else {
-        format!("{APP_NAME} · {context}")
+        format!("{APP_NAME} · {}", crate::sandbox::sanitize(context))
     }
 }
 
@@ -199,8 +204,9 @@ pub(crate) trait Sink: Send {
 /// cage chose — an exec target read out of a process's memory, a destination host off the wire, a
 /// task name — and this is the sink that puts it on a line, in a terminal or in the log a detached
 /// session leaves behind for `sbx logs`. A newline in a subject would add a line of the cage's
-/// writing there, and an escape would drive the terminal. The desktop sink needs none of this: D-Bus
-/// carries its fields with their lengths, so nothing there is delimited by what it contains.
+/// writing there, and an escape would drive the terminal. The delivery loop has sanitized the
+/// summary and the body already, for every sink; doing it again here changes nothing on them, and
+/// keeps the line one line whoever composes it.
 ///
 /// All three parts, the session label included. It reads like sbx's own text and is not: its
 /// project half is the launch directory's *name*, which the project chose and which Linux lets
@@ -844,6 +850,15 @@ impl Notifier {
                     // text that may carry a credential.
                     Err(_) => continue,
                 };
+                // For every sink, the desktop's included. D-Bus frames the two strings by their
+                // length, but the daemon lays them out: a right-to-left override turns around the
+                // words beside it, and a line break splits a title a daemon may show on two lines.
+                // After redaction, never before: the length cap could cut a credential in two, and
+                // the half left before the cut matches no needle.
+                let (summary, body) = (
+                    crate::sandbox::sanitize(&summary),
+                    crate::sandbox::sanitize(&body),
+                );
                 match sink.deliver(&summary, &body, replaces) {
                     Ok(Some(id)) => coalescer.record_id(&block, id),
                     Ok(None) => {}
@@ -1219,6 +1234,88 @@ mod tests {
             body.contains("${gh_token}"),
             "the withheld value must be named, not merely removed: {body:?}"
         );
+    }
+
+    /// Whether `text` holds a character that breaks a line or turns around the words beside it.
+    fn breaks_or_reorders(text: &str) -> bool {
+        text.chars()
+            .any(|c| c.is_control() || crate::diag::reorders(c))
+    }
+
+    /// A toast's text is laid out by the notification daemon, under the bidirectional algorithm: a
+    /// right-to-left override in a subject turns around what follows it.
+    /// The subjects here are the two a cage or a project writes: a program's path, read out of the
+    /// calling process's memory, and the name of a `[plugin.*]` table an untrusted project
+    /// declared, quoted by the warning that drops it.
+    #[test]
+    fn a_toast_carries_no_character_that_breaks_or_turns_around_its_line() {
+        let out = deliveries(
+            NotifyPolicy::uniform(NotifyMode::Once),
+            Vec::new(),
+            true,
+            vec![
+                Block {
+                    event: NotifyEvent::Trust,
+                    subject: ".sbx.toml: ignoring `[plugin.*]` (ab\u{202e}cd\u{1b}[31mef\nsbx: \
+                              trusted) — run `sbx trust`"
+                        .to_string(),
+                    reason: "not-trusted".to_string(),
+                    detail: String::new(),
+                    fix: "sbx trust".to_string(),
+                },
+                Block {
+                    event: NotifyEvent::Proc,
+                    subject: "/tmp/\u{202e}hs.lc\nsbx: allowed".to_string(),
+                    reason: "denied-by-policy".to_string(),
+                    detail: "the exec policy\u{1b}[2J does not allow this program".to_string(),
+                    fix: String::new(),
+                },
+            ],
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        for (summary, body, _) in &out {
+            assert!(!breaks_or_reorders(summary), "{summary:?}");
+            assert!(!breaks_or_reorders(body), "{body:?}");
+        }
+        assert!(
+            out[0].0.contains("(ab cd [31mef sbx: trusted)"),
+            "replaced rather than dropped, so the name is still legible: {:?}",
+            out[0].0
+        );
+    }
+
+    /// The length cap applies after redaction, never before: a credential the cap cut in two would
+    /// leave its first half in the toast, and that half matches no needle.
+    #[test]
+    fn a_credential_the_length_cap_would_cut_is_withheld_whole() {
+        let token = "super-secret-token-value";
+        let needles = vec![SecretNeedle::named("gh_token", token.as_bytes().to_vec())];
+        let subject = format!(
+            "{}{token}:443",
+            "h".repeat(crate::sandbox::SANITIZED_CHARS - 30)
+        );
+        let out = deliveries(
+            NotifyPolicy::uniform(NotifyMode::Once),
+            needles,
+            true,
+            vec![net_block(&subject, "denied-default")],
+        );
+        assert_eq!(out.len(), 1);
+        let summary = &out[0].0;
+        assert!(
+            !summary.contains("super-secret"),
+            "no part of the credential reaches the toast: {summary:?}"
+        );
+        assert!(summary.contains("${gh_token}"), "{summary:?}");
+    }
+
+    /// The session label rides the application name, which a desktop shows on a line of its own,
+    /// and its project half is the launch directory's name: the project's to choose.
+    #[test]
+    fn the_session_label_on_a_toast_carries_no_character_that_breaks_or_turns_around_it() {
+        let name = app_name("demo@pro\u{202e}j\u{1b}[2J\nsbx[4242]");
+        assert!(!breaks_or_reorders(&name), "{name:?}");
+        assert_eq!(name, "sbx · demo@pro j [2J sbx[4242]");
     }
 
     #[test]

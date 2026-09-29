@@ -235,7 +235,9 @@ impl NotifyPolicy {
 ///
 /// Every field can carry text the agent chose (a host it asked for, a path it ran), and a notification
 /// body may be journaled by the desktop daemon — so a block is redacted at the sink, before it leaves
-/// the process, exactly like every other outward-facing sink.
+/// the process, exactly like every other outward-facing sink. It is sanitized there too, after the
+/// redaction: the daemon lays out what it is handed, and a subject can carry a line break or a
+/// right-to-left override.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Block {
     /// Which lens refused.
@@ -271,7 +273,8 @@ impl Block {
     }
 
     /// The notification's `(summary, body)`. Pure, so both forms are pinned by tests without a
-    /// notification daemon; the sink adds nothing to what this returns beyond redaction.
+    /// notification daemon; the sink adds nothing to what this returns beyond redaction and
+    /// [`crate::sandbox::sanitize`].
     ///
     /// The summary is `verb: subject`, and the subject leads because a desktop **truncates the
     /// summary to one line**. Everything placed before the subject is something a reader is made to

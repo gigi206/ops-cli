@@ -118,8 +118,9 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 /// - [`super::proc_control::ExecRing::push_verdict`], the door every exec event enters by —
 ///   including the seccomp supervisor's, whose target path is read out of the calling process's own
 ///   memory and whose caller is a `/proc/<pid>/exe` link;
-/// - [`super::notify_sink`], where the stderr fallback composes one line per announcement, the lines
-///   a detached session leaves in the log `sbx logs` reads;
+/// - [`super::notify_sink`], for every announcement on its way to any sink: the summary and the
+///   body a desktop's daemon lays out, the session label it shows beside them, and the stderr
+///   fallback's line, which a detached session leaves in the log `sbx logs` reads;
 /// - [`super::egress_stats`], for a destination host in a tab-delimited row;
 /// - [`super::lens::sanitize_detail`], which cuts it shorter for the free-text field of every lens
 ///   event, a plugin manifest's text on `sbx plugins`, and an ssh key's comment at launch and in
