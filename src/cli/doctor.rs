@@ -374,8 +374,9 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
 /// modules is not stated in any single file, and it is the question that decides this.
 ///
 /// `launches_run` is false when the engine or the boundary above failed. What a refused namespace
-/// costs a launch is then left unsaid: no launch runs, so a line saying one still filters through
-/// the proxy would contradict the failure printed above it.
+/// costs a launch is then left unsaid, in the verdict as in the notes: no launch runs, so a line
+/// saying one runs without capture, or still filters through the proxy, would contradict the
+/// failure printed above it.
 fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool) {
     // Recorded as the `capture` check rather than as a note: a note lands under whichever check
     // was recorded last, which would file this verdict under a neighbouring probe and leave a
@@ -388,8 +389,18 @@ fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool) {
         );
         return;
     };
-    let support = sandbox::probe_capture(&exe);
-    match &support {
+    report_capture(rep, &sandbox::probe_capture(&exe), launches_run, &exe);
+}
+
+/// Record the `capture` check for what the probe of the binary at `exe` answered, with the context
+/// and remedies that answer calls for.
+fn report_capture(
+    rep: &mut Report<'_>,
+    support: &sandbox::CaptureSupport,
+    launches_run: bool,
+    exe: &Path,
+) {
+    match support {
         sandbox::CaptureSupport::Ready => {
             rep.check(
                 "ok",
@@ -402,7 +413,11 @@ fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool) {
         sandbox::CaptureSupport::NoNamespace(_) => rep.check(
             "warn",
             "capture",
-            "sbx cannot create the cage's network namespace, so a launch runs without capture",
+            if launches_run {
+                "sbx cannot create the cage's network namespace, so a launch runs without capture"
+            } else {
+                "sbx cannot create the cage's network namespace"
+            },
         ),
         sandbox::CaptureSupport::NoNft | sandbox::CaptureSupport::Refused(_) => rep.check(
             "warn",
@@ -411,7 +426,7 @@ fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool) {
         ),
     }
     if let sandbox::CaptureSupport::NoNamespace(why) | sandbox::CaptureSupport::Refused(why) =
-        &support
+        support
     {
         rep.note(&format!("the kernel refused: {why}"));
     }
@@ -422,7 +437,7 @@ fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool) {
         rep.note(hint);
     }
     if refused_namespace {
-        report_namespace_remedies(rep, &exe);
+        report_namespace_remedies(rep, exe);
     }
 }
 
@@ -738,4 +753,61 @@ fn classify_namespace_failure(
     };
     rep.check("fail", "user namespaces", detail);
     remediation.push(USERNS_REMEDIATION);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `capture` check `doctor` records for a namespace the kernel refused, beside a boundary
+    /// that held (`launches_run`) or one that failed.
+    fn refused_namespace_capture(launches_run: bool) -> Check {
+        let pal = style::Palette::plain();
+        let mut rep = Report::new(true, &pal);
+        let refused = sandbox::CaptureSupport::NoNamespace("Operation not permitted".to_string());
+        report_capture(
+            &mut rep,
+            &refused,
+            launches_run,
+            Path::new("/usr/local/bin/sbx"),
+        );
+        assert_eq!(rep.checks.len(), 1, "one check, the capture one");
+        rep.checks.remove(0)
+    }
+
+    #[test]
+    fn a_refused_namespace_beside_a_failed_boundary_says_nothing_of_a_launch() {
+        let check = refused_namespace_capture(false);
+        assert_eq!((check.name.as_str(), check.status), ("capture", "warn"));
+        assert!(
+            !check.detail.contains("launch"),
+            "no launch runs on this host: {}",
+            check.detail
+        );
+        for note in &check.notes {
+            assert!(
+                !note.contains("launch"),
+                "no launch runs on this host: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_namespace_beside_a_working_boundary_says_what_a_launch_loses() {
+        let check = refused_namespace_capture(true);
+        assert_eq!((check.name.as_str(), check.status), ("capture", "warn"));
+        assert!(
+            check.detail.contains("a launch runs without capture"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .notes
+                .iter()
+                .any(|n| n.contains("a launch still filters")),
+            "{:?}",
+            check.notes
+        );
+    }
 }

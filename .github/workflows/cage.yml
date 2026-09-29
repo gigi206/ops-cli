@@ -448,7 +448,8 @@ jobs:
             [ "$rc" = 1 ] || fail "doctor exited $rc, expected 1 with no profiled bwrap"
             grep -Eq '\[FAIL\] user namespaces' "$out/doctor.txt" \
               || fail "doctor did not fail the boundary"
-            grep -q 'a launch still filters' "$out/doctor.txt" && fail "doctor claims a launch runs"
+            grep -Eq 'a launch (still filters|runs without capture)' "$out/doctor.txt" \
+              && fail "doctor claims a launch runs"
             [ "$rc_run" = 1 ] || fail "the launch exited $rc_run, expected a refusal (1)"
             grep -q 'no capability-bearing user namespace' "$out/launch.err" \
               || fail "the launch was not refused for the boundary"
