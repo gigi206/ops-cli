@@ -558,7 +558,14 @@ fn resolve_app(
             // own rules are kept). At the global app layer nothing has overridden it yet, so the
             // parent is the baseline.
             let parent = network.as_ref().unwrap_or(baseline_network);
-            let resolved = validate_network(&mut warnings, &source, field, net_groups, parent);
+            let resolved = validate_network(
+                &mut warnings,
+                &mut refusals,
+                &source,
+                field,
+                net_groups,
+                parent,
+            );
             if let Some(policy) = resolved {
                 network = Some(policy);
                 network_origin = Provenance::Global;
@@ -783,7 +790,14 @@ fn resolve_app(
                     // A table that does name a `mode` still replaces, which is the shape the
                     // repository intends: declaring a posture is declaring a policy of one's own.
                     let parent = current.as_ref().unwrap_or(baseline_network);
-                    let policy = validate_network_amending(w, &source, field, net_groups, parent)?;
+                    let policy = validate_network_amending(
+                        w,
+                        &mut refusals,
+                        &source,
+                        field,
+                        net_groups,
+                        parent,
+                    )?;
                     // Only once the policy stands: the verb posture belongs to a policy that exists.
                     if let Some(m) = resolve_app_default_methods(w, &source, raw_dm) {
                         default_methods = m;

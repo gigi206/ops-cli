@@ -68,12 +68,13 @@ splice carries no HTTP request, so a `deny` is matched on `host:port` alone ther
 [what a `deny` reaches on a spliced host](../networking/modes#what-a-deny-reaches-on-a-spliced-host)
 for that detail.
 
-An entry sbx cannot parse is dropped with a warning naming what the drop costs, because
-that cost is not the same in both lists. A dropped `allow` entry leaves its host
-unreachable. A dropped `deny` entry under `mode = "allow"` leaves its host **reachable**,
-since the deny list is the whole restriction there: the entries beside it still apply, but
-the host its author believed blocked is not. sbx cannot guess that host from an entry it
-could not read, so read those warnings before trusting a denylist.
+An entry sbx cannot parse costs what its list is for, and the two lists do not cost the
+same. An `allow` entry left out leaves its host unreachable, so a warning names it and the
+launch goes on. A `deny` entry left out would leave its host **reachable**, the one host its
+author meant to block (under `mode = "allow"` the deny list is the whole restriction), and
+sbx cannot guess that host from an entry it could not read: so the launch **stops**, naming
+the entry. A `mode` sbx does not know stops it too, since the layer below would stay in
+force. `sbx config show` still answers, lists the rest, and names what it could not read.
 
 `none` and `shared` stand up no egress proxy, so every other field of the table is
 addressed to something that is not there. A table that pairs one of them with `allow`,

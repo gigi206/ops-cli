@@ -671,6 +671,7 @@ pub(super) enum Layering {
 /// inherits its mode from `parent` (see [`mode_from_parent`]).
 pub(super) fn validate_network(
     warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
     source_label: &str,
     field: NetworkField,
     groups: &NetGroups,
@@ -678,6 +679,7 @@ pub(super) fn validate_network(
 ) -> Option<NetworkPolicy> {
     validate_network_layered(
         warnings,
+        refusals,
         source_label,
         field,
         groups,
@@ -690,6 +692,7 @@ pub(super) fn validate_network(
 /// `[app.<name>.network]` over the app's own profile. See [`Layering`].
 pub(super) fn validate_network_amending(
     warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
     source_label: &str,
     field: NetworkField,
     groups: &NetGroups,
@@ -697,6 +700,7 @@ pub(super) fn validate_network_amending(
 ) -> Option<NetworkPolicy> {
     validate_network_layered(
         warnings,
+        refusals,
         source_label,
         field,
         groups,
@@ -710,6 +714,7 @@ pub(super) fn validate_network_amending(
 /// decision and a second copy could drift from it.
 fn validate_network_layered(
     warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
     source_label: &str,
     field: NetworkField,
     groups: &NetGroups,
@@ -734,17 +739,29 @@ fn validate_network_layered(
                 crate::allowlist::EgressPolicy::default()
                     .with_default(crate::allowlist::DefaultAction::Ask),
             ))),
+            // A posture sbx does not know leaves the layer below in force, whatever it was: a
+            // `none` misspelled reaches the network. So a launch stops on it.
             other => {
-                warnings.push(format!(
-                    "{source_label}: ignoring unknown network policy `{other}` (expected \
-                     \"none\", \"shared\", \"deny\", \"allow\", \"ask\", or an `[network]` table)"
-                ));
+                let said = format!(
+                    "{source_label}: ignoring unknown network policy `{}` (expected \"none\", \
+                     \"shared\", \"deny\", \"allow\", \"ask\", or an `[network]` table), and a \
+                     launch stops rather than run under the layer below",
+                    crate::diag::visible(other)
+                );
+                refusals.push(said.clone());
+                warnings.push(said);
                 None
             }
         },
-        NetworkField::Table(table) => {
-            validate_network_table(warnings, source_label, table, groups, parent, layering)
-        }
+        NetworkField::Table(table) => validate_network_table(
+            warnings,
+            refusals,
+            source_label,
+            table,
+            groups,
+            parent,
+            layering,
+        ),
     }
 }
 
@@ -813,6 +830,7 @@ fn warn_inert_under_posture(
 /// from `parent` while keeping this table's own rules.
 pub(super) fn validate_network_table(
     warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
     source_label: &str,
     table: NetworkTable,
     groups: &NetGroups,
@@ -856,11 +874,17 @@ pub(super) fn validate_network_table(
         Some("deny") => DefaultAction::Deny,
         Some("allow") => DefaultAction::Allow,
         Some("ask") => DefaultAction::Ask,
+        // The table is left out whole, so the layer below stays in force: a launch stops on it, as
+        // on an unknown posture above.
         Some(other) => {
-            warnings.push(format!(
-                "{source_label}: ignoring unknown network mode `{other}` (expected \"none\", \
-                 \"shared\", \"deny\", \"allow\", or \"ask\")"
-            ));
+            let said = format!(
+                "{source_label}: ignoring unknown network mode `{}` (expected \"none\", \
+                 \"shared\", \"deny\", \"allow\", or \"ask\"), and a launch stops rather than run \
+                 under the layer below",
+                crate::diag::visible(other)
+            );
+            refusals.push(said.clone());
+            warnings.push(said);
             return None;
         }
         // An addition to the layer below keeps that layer's posture, whatever it is. The fallback
@@ -876,12 +900,33 @@ pub(super) fn validate_network_table(
         },
         None => mode_from_parent(parent),
     };
-    let allow = classify_entries(warnings, source_label, Slot::Allow, table.allow, groups);
-    let deny = classify_entries(warnings, source_label, Slot::Deny, table.deny, groups);
+    let allow = classify_entries(
+        warnings,
+        refusals,
+        source_label,
+        Slot::Allow,
+        table.allow,
+        groups,
+    );
+    let deny = classify_entries(
+        warnings,
+        refusals,
+        source_label,
+        Slot::Deny,
+        table.deny,
+        groups,
+    );
     // `mute` (SELinux `dontaudit`) suppresses a *denied* request's log line — never a verdict — so
     // it classifies with the same grammar as `allow`/`deny` (including `@group` expansion) and is
     // carried on the policy for the proxy to consult at logging time.
-    let mute = classify_entries(warnings, source_label, Slot::Mute, table.mute, groups);
+    let mute = classify_entries(
+        warnings,
+        refusals,
+        source_label,
+        Slot::Mute,
+        table.mute,
+        groups,
+    );
     // `http2` names the hosts the proxy speaks HTTP/2 to (ALPN `h2`, for gRPC). It is not an egress
     // rule (no path/method/verdict) — just a host[:port] the proxy MITMs as h2 — so it parses on its
     // own, dropping a malformed entry with a warning (fail-closed: that host keeps HTTP/1.1).
@@ -1421,6 +1466,7 @@ mod tests {
         let mut warnings = Vec::new();
         validate_network(
             &mut warnings,
+            &mut Vec::new(),
             "t",
             NetworkField::Table(table),
             &NetGroups::new(),
@@ -1457,6 +1503,7 @@ mod tests {
             let mut warnings = Vec::new();
             validate_network(
                 &mut warnings,
+                &mut Vec::new(),
                 "t",
                 NetworkField::Table(table),
                 &NetGroups::new(),

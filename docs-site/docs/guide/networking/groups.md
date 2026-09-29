@@ -78,16 +78,15 @@ global group with `@name` instead.
 
 ## Undefined and nested references fail loudly
 
-An `@name` reference to a group that does not exist is **dropped with a loud
-warning**. The direction of the failure depends on the list:
+An `@name` reference to a group that does not exist is left out, and named. What
+that costs depends on the list:
 
-- In an **`allow`** list, dropping the reference means those hosts are **not
-  allowed**: the safe (fail-closed) direction.
-- In a **`deny`** list, dropping the reference means a carve-out is **lost**: the
-  host is no longer blocked. A typo fails open *in intent* here, which is exactly
-  why the warning is loud and un-ignorable: an undefined reference must never pass
-  unnoticed. A plain entry sbx cannot parse is dropped on the same terms and costs
-  the same thing, so its warning names that cost too.
+- In an **`allow`** list, the hosts are **not allowed**: the safe (fail-closed)
+  direction, so a warning says so and the launch goes on.
+- In a **`deny`** list, a carve-out would be **lost**: the host would no longer be
+  blocked. A typo fails open *in intent* here, so the launch **stops** instead,
+  naming the reference, until it is fixed. A plain `deny` entry sbx cannot parse
+  stops the launch on the same terms.
 
 Always check `sbx config` (or [`sbx net rules`](observability)) after editing
 groups so an undefined reference is caught before a launch.

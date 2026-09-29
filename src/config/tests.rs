@@ -73,6 +73,7 @@ fn validate_network(
 ) -> Option<NetworkPolicy> {
     super::validate_network(
         warnings,
+        &mut Vec::new(),
         source_label,
         field,
         &NetGroups::new(),
@@ -224,6 +225,7 @@ fn an_amending_overlay_keeps_the_posture_of_the_layer_below_it() {
         let mut w = Vec::new();
         let policy = super::validate_network_amending(
             &mut w,
+            &mut Vec::new(),
             "app `demo`",
             field,
             &NetGroups::new(),
@@ -300,6 +302,7 @@ fn a_capture_ceiling_alone_in_an_overlay_bounds_the_capture_it_amends() {
         let mut w = Vec::new();
         let policy = super::validate_network_amending(
             &mut w,
+            &mut Vec::new(),
             "app `demo`",
             field,
             &NetGroups::new(),
@@ -336,6 +339,7 @@ fn a_shared_credential_group_reaches_the_policy() {
     });
     let policy = super::validate_network(
         &mut w,
+        &mut Vec::new(),
         GLOBAL_CONFIG,
         field,
         &NetGroups::default(),
@@ -377,6 +381,7 @@ fn a_lone_wildcard_is_a_group_and_a_lone_host_is_not() {
         });
         let policy = super::validate_network(
             &mut w,
+            &mut Vec::new(),
             GLOBAL_CONFIG,
             field,
             &NetGroups::default(),
@@ -409,6 +414,7 @@ fn a_wildcard_shared_credential_entry_survives_resolution() {
     });
     let policy = super::validate_network(
         &mut w,
+        &mut Vec::new(),
         GLOBAL_CONFIG,
         field,
         &NetGroups::default(),
@@ -472,6 +478,7 @@ fn an_ambiguous_shared_credential_group_is_refused() {
         });
         let policy = super::validate_network(
             &mut w,
+            &mut Vec::new(),
             GLOBAL_CONFIG,
             field,
             &NetGroups::default(),
@@ -505,6 +512,7 @@ fn a_group_reference_expands_in_an_allow_list() {
     let mut w = Vec::new();
     let policy = super::validate_network(
         &mut w,
+        &mut Vec::new(),
         GLOBAL_CONFIG,
         net_field("deny", &["@mcp", "c.example.com:443"], &[]),
         &g,
@@ -525,6 +533,7 @@ fn a_group_reference_expands_in_a_deny_list_too() {
     let mut w = Vec::new();
     let policy = super::validate_network(
         &mut w,
+        &mut Vec::new(),
         GLOBAL_CONFIG,
         net_field("allow", &[], &["@telemetry"]),
         &g,
@@ -566,9 +575,15 @@ fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
         body_max_mb: None,
         ca_roots: None,
     });
-    let policy =
-        super::validate_network(&mut w, GLOBAL_CONFIG, field, &g, &NetworkPolicy::default())
-            .unwrap();
+    let policy = super::validate_network(
+        &mut w,
+        &mut Vec::new(),
+        GLOBAL_CONFIG,
+        field,
+        &g,
+        &NetworkPolicy::default(),
+    )
+    .unwrap();
     let NetworkPolicy::Allowlist(p) = policy else {
         panic!("expected an allowlist policy");
     };
@@ -586,6 +601,7 @@ fn an_undefined_group_reference_is_dropped_with_a_loud_warning() {
     // would fail open in intent (the host would no longer be blocked).
     let policy = super::validate_network(
         &mut w,
+        &mut Vec::new(),
         GLOBAL_CONFIG,
         net_field("allow", &[], &["@telemetr"]),
         &g,
@@ -606,7 +622,7 @@ fn an_undefined_group_reference_is_dropped_with_a_loud_warning() {
         w[0]
     );
     assert!(
-        w[0].contains("nothing is denied"),
+        w[0].contains("deny nothing for it"),
         "the warning spells out the deny-list consequence: {}",
         w[0]
     );
@@ -625,7 +641,15 @@ fn an_undefined_group_in_a_mute_list_says_nothing_is_muted() {
         panic!("net_field builds a table");
     };
     t.mute = vec!["@noisy".into()];
-    super::validate_network(&mut w, GLOBAL_CONFIG, field, &g, &NetworkPolicy::default()).unwrap();
+    super::validate_network(
+        &mut w,
+        &mut Vec::new(),
+        GLOBAL_CONFIG,
+        field,
+        &g,
+        &NetworkPolicy::default(),
+    )
+    .unwrap();
     assert_eq!(w.len(), 1, "exactly one warning: {w:?}");
     assert!(
         w[0].contains("undefined group `@noisy`") && w[0].contains("nothing is muted"),
@@ -690,6 +714,7 @@ fn an_at_sign_inside_an_entry_is_not_a_group_reference() {
     let mut w = Vec::new();
     let policy = super::validate_network(
         &mut w,
+        &mut Vec::new(),
         GLOBAL_CONFIG,
         net_field("deny", &["example.com:443/@handle"], &[]),
         &g,
@@ -1674,9 +1699,15 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
     // and that the table's own allow rule survives (inheritance is of the mode only).
     let effective = |parent: &NetworkPolicy| {
         let mut w = Vec::new();
-        let p =
-            super::validate_network(&mut w, GLOBAL_CONFIG, no_mode(), &NetGroups::new(), parent)
-                .unwrap();
+        let p = super::validate_network(
+            &mut w,
+            &mut Vec::new(),
+            GLOBAL_CONFIG,
+            no_mode(),
+            &NetGroups::new(),
+            parent,
+        )
+        .unwrap();
         let NetworkPolicy::Allowlist(pol) = p else {
             panic!("a mode-less table always resolves to a filtering policy")
         };
@@ -1746,6 +1777,7 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
         let mut w = Vec::new();
         super::validate_network(
             &mut w,
+            &mut Vec::new(),
             PROJECT_CONFIG,
             one_rule(),
             &NetGroups::new(),
@@ -2360,9 +2392,15 @@ fn an_unknown_capture_level_closes_the_capture_an_overlay_amends() {
         ..net_table_defaults()
     });
     let mut w = Vec::new();
-    let policy =
-        super::validate_network_amending(&mut w, "app `demo`", field, &NetGroups::new(), &parent)
-            .expect("the overlay validates");
+    let policy = super::validate_network_amending(
+        &mut w,
+        &mut Vec::new(),
+        "app `demo`",
+        field,
+        &NetGroups::new(),
+        &parent,
+    )
+    .expect("the overlay validates");
     let NetworkPolicy::Allowlist(p) = &policy else {
         panic!("an amending overlay stays a filtering policy");
     };
@@ -8129,6 +8167,89 @@ fn an_fs_entry_that_cannot_be_applied_refuses_a_launch_from_every_layer_that_app
     assert!(clean.refusals.is_empty(), "{:?}", clean.refusals);
 }
 
+/// A `[network]` restriction that cannot be read refuses a launch: a `deny` entry sbx cannot
+/// classify, a `deny` reference to a group nobody defined, and a posture or mode sbx does not know,
+/// which would leave the layer below in force. From the global config, a trusted project and an
+/// app, whose refusal stops that app alone. An `allow` entry that cannot be read only narrows, and
+/// stays a warning; an untrusted project's `[network]` is never applied, so it refuses nothing.
+#[test]
+fn a_network_restriction_that_cannot_be_read_refuses_a_launch() {
+    let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
+    let global = |text: &str| resolve_no_plugins(parse(text), None);
+    let project =
+        |text: &str, state| resolve_no_plugins(RawConfig::default(), Some((parse(text), state)));
+    let refused_over =
+        |r: &Resolved, what: &str| r.refusals.len() == 1 && r.refusals[0].contains(what);
+
+    let r = global("[network]\nmode = \"allow\"\ndeny = [\"evil.test\", \"exa mple.com\"]\n");
+    assert!(refused_over(&r, "exa mple.com"), "{:?}", r.refusals);
+    let r = global("[network]\nmode = \"allow\"\ndeny = [\"@nowhere\"]\n");
+    assert!(refused_over(&r, "@nowhere"), "{:?}", r.refusals);
+    let r = global("network = \"nnoe\"\n");
+    assert!(refused_over(&r, "nnoe"), "{:?}", r.refusals);
+    let r = project("[network]\nmode = \"dney\"\n", TrustState::Trusted);
+    assert!(refused_over(&r, "dney"), "{:?}", r.refusals);
+
+    let r = project(
+        "[app.demo]\ncmd = [\"true\"]\n\n[app.demo.network]\nmode = \"allow\"\n\
+         deny = [\"exa mple.com\"]\n",
+        TrustState::Trusted,
+    );
+    let own = &r.apps["demo"].refusals;
+    assert!(own.len() == 1 && own[0].contains("exa mple.com"), "{own:?}");
+    assert!(
+        r.refusals.is_empty(),
+        "the app's entry stops that app alone: {:?}",
+        r.refusals
+    );
+
+    let r = global("[network]\nmode = \"deny\"\nallow = [\"exa mple.com\"]\n");
+    assert!(
+        r.refusals.is_empty(),
+        "an unreadable allow entry only narrows: {:?}",
+        r.refusals
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("exa mple.com")),
+        "{:?}",
+        r.warnings
+    );
+    let r = project(
+        "[network]\nmode = \"allow\"\ndeny = [\"exa mple.com\"]\n",
+        TrustState::Untrusted,
+    );
+    assert!(
+        r.refusals.is_empty(),
+        "an untrusted project's network is inert: {:?}",
+        r.refusals
+    );
+}
+
+/// A one-shot override carrying a restriction that cannot be applied is refused before it changes
+/// anything, like a bad scalar: a `deny` entry sbx cannot read, and an `[fs]` entry it refuses. The
+/// override must be exact, and one entry left out would leave its host or its path open.
+#[test]
+fn a_one_shot_override_with_a_restriction_that_cannot_be_applied_is_fatal() {
+    for (blob, named) in [
+        (
+            "[network]\nmode = \"allow\"\ndeny = [\"exa mple.com\"]\n",
+            "exa mple.com",
+        ),
+        ("[fs]\ndeny = [\"ok.key\", \"../up.key\"]\n", "../up.key"),
+    ] {
+        let mut r = resolve_no_plugins(RawConfig::default(), None);
+        let over = Override::for_test(schema::parse(blob.as_bytes()).expect("the blob parses"));
+        let errs = r.apply_override(over, None).expect_err(blob);
+        assert!(errs.iter().any(|e| e.contains(named)), "{blob}: {errs:?}");
+        assert!(r.fs.declares_nothing(), "{blob}: nothing of it applied");
+        assert_eq!(
+            r.network_origin,
+            Provenance::Default,
+            "{blob}: nothing of it applied"
+        );
+    }
+}
+
 #[test]
 fn an_apps_fs_masks_union_onto_the_baseline() {
     // An app closes more of the project for its own cage, and can never reopen what the baseline
@@ -8544,8 +8665,13 @@ fn a_malformed_deny_entry_under_the_denylist_posture_names_the_host_it_leaves_re
         .find(|w| w.contains("ignoring deny entry"))
         .unwrap_or_else(|| panic!("the drop is named: {:?}", r.warnings));
     assert!(
-        dropped.contains("nothing is denied for it"),
+        dropped.contains("a launch stops rather than deny nothing for it"),
         "the drop names what it costs, not only that it happened: {dropped}"
+    );
+    assert_eq!(
+        r.refusals,
+        vec![dropped.clone()],
+        "and a launch stops on it"
     );
 }
 
@@ -8583,8 +8709,14 @@ fn a_deny_entry_no_request_can_match_is_dropped_with_the_spelling_to_write() {
     assert!(
         dropped
             .iter()
-            .all(|w| w.contains("nothing is denied for it")),
+            .all(|w| w.contains("a launch stops rather than deny nothing for it")),
         "{dropped:?}"
+    );
+    assert_eq!(
+        r.refusals.len(),
+        2,
+        "and a launch stops on each: {:?}",
+        r.refusals
     );
     assert!(
         dropped.iter().any(|w| w.contains("ends in a number")),

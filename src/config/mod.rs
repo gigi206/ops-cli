@@ -1594,9 +1594,19 @@ fn build_override_scalars(
         // `groups` table is dropped where the override is collected). A mode-less table inherits
         // from `baseline`, and an `@ref` naming no group is dropped with a warning like anywhere
         // else — fail-closed in an `allow` list, which is where a one-shot reference belongs.
-        match validate_network(notes, OVERRIDE_SOURCE, field, groups, baseline) {
-            Some(policy) => scalars.network = Some((policy, stats)),
-            None => fatal.push("network".to_string()),
+        // A `deny` entry that cannot be read is fatal here like an unknown mode: a one-shot
+        // override must be exact, and one entry left out would leave its host reachable.
+        let mut unapplied = Vec::new();
+        match validate_network(
+            notes,
+            &mut unapplied,
+            OVERRIDE_SOURCE,
+            field,
+            groups,
+            baseline,
+        ) {
+            Some(policy) if unapplied.is_empty() => scalars.network = Some((policy, stats)),
+            _ => fatal.push("network".to_string()),
         }
     }
     if let Some(value) = gui {
@@ -2168,6 +2178,7 @@ fn resolve(
     let mut network = match global.network.and_then(|v| {
         validate_network(
             &mut warnings,
+            &mut refusals,
             GLOBAL_CONFIG,
             v,
             &net_groups,
@@ -2598,7 +2609,14 @@ fn resolve(
                 // `[network]` table without a `mode` inherits it.
                 |w, parent| {
                     warn_if_baseline_sets_default_methods(w, PROJECT_CONFIG, &value);
-                    let policy = validate_network(w, PROJECT_CONFIG, value, &net_groups, parent);
+                    let policy = validate_network(
+                        w,
+                        &mut refusals,
+                        PROJECT_CONFIG,
+                        value,
+                        &net_groups,
+                        parent,
+                    );
                     accepted = policy.is_some();
                     policy
                 },
@@ -4231,22 +4249,40 @@ pub(crate) fn group_refs<'a>(entries: impl Iterator<Item = &'a String>) -> Vec<S
 }
 
 /// Classify the entries of one egress list (`allow`, `deny`, or `mute`), expanding a leading
-/// `@<name>` into the rules of that named group (from `[network.groups]`). A malformed entry is dropped
-/// with a warning that names which list it was in, and it is classified *as* that list, so a
+/// `@<name>` into the rules of that named group (from `[network.groups]`). A malformed entry is
+/// left out with a note that names which list it was in, and it is classified *as* that list, so a
 /// refusal that offers a way out (the bare `*` catch-all) offers the one this list's author wanted.
-/// An unknown `@<name>` reference is dropped with a *loud* warning — a miss in a `deny` list
-/// silently drops a carve-out (the host would no longer be blocked), the one case where a typo fails
-/// open in intent, so an unresolved reference must never pass unnoticed. Only a leading `@` is a
-/// reference: a `@` anywhere else (a URL path like `host/@user`, a `re:` pattern) is a legitimate
-/// part of the entry and is classified as written.
+/// An unknown `@<name>` reference is left out the same way. Only a leading `@` is a reference: a
+/// `@` anywhere else (a URL path like `host/@user`, a `re:` pattern) is a legitimate part of the
+/// entry and is classified as written.
+///
+/// What leaving an entry out costs depends on the list. An `allow` entry left out leaves its host
+/// unreachable, a `mute` entry leaves a denial logged: the note is enough. A `deny` entry left out
+/// leaves reachable the host its author meant to block, the one case where a typo fails open, so
+/// the note goes to `refusals` too, and a launch stops on it.
 fn classify_entries(
     warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
     source_label: &str,
     slot: Slot,
     entries: Vec<String>,
     groups: &NetGroups,
 ) -> Vec<crate::allowlist::Rule> {
     let list = slot.label();
+    let restricts = slot == Slot::Deny;
+    let cost = match restricts {
+        true => "a launch stops rather than deny nothing for it".to_string(),
+        false => format!(
+            "the entry is ignored, so nothing is {} for it",
+            slot.consequence()
+        ),
+    };
+    let mut left_out = |said: String| {
+        if restricts {
+            refusals.push(said.clone());
+        }
+        warnings.push(said);
+    };
     let mut rules = Vec::new();
     for entry in entries {
         if let Some(name) = group_ref(&entry) {
@@ -4256,27 +4292,19 @@ fn classify_entries(
                 // (`sbx net groups import`), and pointing only at hand-editing sends the reader to
                 // write by hand what a verb already imports — the same defect as a message that
                 // names a remedy the product does not offer, inverted.
-                None => warnings.push(format!(
-                    "{source_label}: {list} references undefined group `@{name}` — import it \
+                None => left_out(format!(
+                    "{source_label}: {list} references undefined group `@{}` — import it \
                      (`sbx net groups import <file>`) or define it under `[network.groups]` in the \
-                     global config, or remove the reference (the entry is ignored, so nothing is \
-                     {} for it)",
-                    slot.consequence()
+                     global config, or remove the reference ({cost})",
+                    crate::diag::visible(name)
                 )),
             }
             continue;
         }
         match crate::allowlist::classify_in(&entry, slot) {
             Ok(rule) => rules.push(rule),
-            // The consequence is spelled out for the same reason the undefined-group arm above
-            // spells it out: a dropped entry is not uniformly a narrowing. A malformed `allow`
-            // leaves its host unreachable, but a malformed `deny` under an allow-by-default
-            // posture leaves the host its author meant to block reachable, and the drop is the
-            // only place that can say so.
-            Err(e) => warnings.push(format!(
-                "{source_label}: ignoring {list} entry — {e} (the entry is ignored, so nothing is \
-                 {} for it)",
-                slot.consequence()
+            Err(e) => left_out(format!(
+                "{source_label}: ignoring {list} entry — {e} ({cost})"
             )),
         }
     }
