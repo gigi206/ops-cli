@@ -41,8 +41,9 @@ pub(crate) fn bundle_cmd(args: &[OsString]) -> ExitCode {
 /// `sbx gc`, never by this.
 ///
 /// An app still naming the bundle in `use` is reported rather than refused, because the removal is
-/// the user's stated intent and the config it leaves is valid: the next launch warns about the
-/// dangling `use` on its own. Saying it here is saying it while they can still change their mind.
+/// the user's stated intent: that app's launch refuses from then on, naming the dangling `use`, so
+/// nothing runs short of what it named. Saying it here is saying it while they can still change
+/// their mind.
 fn bundle_rm(args: &[OsString]) -> ExitCode {
     let mut names: Vec<&str> = Vec::new();
     for arg in args {
@@ -97,9 +98,9 @@ fn bundle_rm(args: &[OsString]) -> ExitCode {
                 );
                 if !users.is_empty() {
                     diag::warn(&format!(
-                        "app profile(s) still name `{name}` in `use`: {} — each will warn at its \
-                         next launch that the bundle is not declared. A project's own \
-                         `[app.<name>] use` is not searched here.",
+                        "app profile(s) still name `{name}` in `use`: {} — none of them launches \
+                         until the bundle is imported again or dropped from its `use`. A \
+                         project's own `[app.<name>] use` is not searched here.",
                         users.join(", ")
                     ));
                 }

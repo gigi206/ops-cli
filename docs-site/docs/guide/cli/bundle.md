@@ -143,13 +143,15 @@ bundle owns none: it is a declaration that contributes packages, environment and
 that name it. Whatever those apps provisioned belongs to **them**, and is reclaimed with
 [`sbx app rm --purge`](app#removing-an-app) or [`sbx gc`](gc).
 
-An app profile that still names the bundle in `use` is **reported, not refused**. The config left
-behind is valid, and a launch already warns about a `use` naming a bundle that is not declared;
-saying it at the moment of removal says it while the decision can still be changed:
+An app profile that still names the bundle in `use` is **reported, not refused**. The removal is
+what you asked for, and that app's launch refuses from then on, naming the `use` that names
+nothing; saying it at the moment of removal says it while the decision can still be changed:
 
 ```
 removed bundle 'demo'
-sbx: warning: app profile(s) still name `demo` in `use`: claude-code
+sbx: warning: app profile(s) still name `demo` in `use`: claude-code — none of them launches
+  until the bundle is imported again or dropped from its `use`. A project's own
+  `[app.<name>] use` is not searched here.
 ```
 
 Only the global app profiles are searched. A project's own `[app.<name>] use` is not, since there

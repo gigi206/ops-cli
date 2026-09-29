@@ -2670,11 +2670,11 @@ pub(super) const PAGES: &[Page] = &[
             that name it in `use`. Whatever those apps provisioned belongs to them, and is reclaimed\n\
             with `sbx app rm --purge` or `sbx gc`.\n\
             \n\
-            An app profile still naming the bundle is reported, not refused: the config left behind\n\
-            is valid, and a launch already warns about a `use` naming a bundle that is not declared.\n\
-            Saying it here says it while the decision can still be changed. Only the global profiles\n\
-            are searched — a project's own `[app.<name>] use` is not, since there is no register of\n\
-            every project on the machine.",
+            An app profile still naming the bundle is reported, not refused: the removal is what\n\
+            you asked for, and that app's launch refuses from then on, naming the `use` that\n\
+            names nothing. Saying it here says it while the decision can still be changed. Only\n\
+            the global profiles are searched — a project's own `[app.<name>] use` is not, since\n\
+            there is no register of every project on the machine.",
     },
     Page {
         path: &["bundle", "import"],

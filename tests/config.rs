@@ -6000,8 +6000,8 @@ fn bundle_rm_deletes_the_file_and_is_the_inverse_of_import() {
 
 #[test]
 fn bundle_rm_names_the_app_profiles_that_still_use_it() {
-    // The removal is allowed — the config it leaves is valid and a launch warns about the dangling
-    // `use` on its own — but it is said here, while the user can still change their mind.
+    // The removal is allowed, since it is what the user asked for, and the app's launch refuses on
+    // the dangling `use` from then on; it is said here, while the user can still change their mind.
     let p = Project::new("brm");
     p.write_bundle("demo", "[packages]\njq = \"nix:jq\"\n");
     p.write_profile("user", "cmd = [\"true\"]\nuse = [\"demo\"]\n");
@@ -6012,10 +6012,21 @@ fn bundle_rm_names_the_app_profiles_that_still_use_it() {
     assert_eq!(out.status.code(), Some(0), "the removal is not refused");
     assert!(stderr.contains("user"), "it names the user: {stderr}");
     assert!(
+        stderr.contains("none of them launches"),
+        "and what the removal costs it: {stderr}"
+    );
+    assert!(
         !stderr.contains("other"),
         "and only the ones that name it: {stderr}"
     );
     assert!(!p.bundle_path("demo").exists());
+    let out = p.run(&["test", "net", "--app", "user", "https://example.com"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "which is what a launch then does: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

@@ -868,7 +868,7 @@ fn report_missing_refs(name: &str, bundles: &[super::MissingRef], groups: &[supe
         let remedy = import_remedy("bundle import", bundles);
         diag::warn(&format!(
             "'{name}' names {} not declared here: {} — import {} too ({remedy}, or re-run with \
-             --with-deps), or the app launches without the tool and egress it names",
+             --with-deps), or the app does not launch: sbx refuses to run it without what it names",
             if bundles.len() == 1 {
                 "a bundle"
             } else {

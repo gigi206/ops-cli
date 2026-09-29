@@ -882,8 +882,7 @@ pub(crate) struct ProfilePreview {
     pub(crate) summary: Vec<String>,
     /// The bundles the profile names in `use`. Surfaced so the importer can say which of them are
     /// not declared yet: a profile that names a bundle is not self-contained, and a missing one
-    /// leaves the app short of a tool and its egress — a gap that would otherwise show up only as
-    /// an app that mysteriously does nothing.
+    /// stops the app's launch until it is imported, which the import is the moment to say.
     pub(crate) uses: Vec<String>,
     /// The egress groups the profile references with `@<name>` in its own `allow`/`deny`/`mute`.
     /// A bundle is not the only second file an app can be short of: a group is global-only, so a
@@ -1246,9 +1245,9 @@ fn read_profile_apps(warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
 /// The imported app profiles that name `bundle` in their `use`, sorted.
 ///
 /// Asked by `sbx bundle rm`, so a removal can say which apps it is about to leave naming a bundle
-/// that no longer exists. The load already warns about such a `use` ("uses bundle `x`, which is not
-/// declared"), but it warns at the *next launch*: this answers the same question at the moment the
-/// file goes away, which is when the user can still decide otherwise.
+/// that no longer exists. The load already refuses such an app's launch ("uses bundle `x`, which
+/// is not declared"), but only at the *next launch*: this answers the same question at the moment
+/// the file goes away, which is when the user can still decide otherwise.
 ///
 /// Only the global profiles are read, and that is the honest limit: a bundle is global, but a
 /// project's own `.sbx.toml` may name one in an `[app.<name>] use` too, and there is no register of

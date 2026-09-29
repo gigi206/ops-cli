@@ -233,7 +233,7 @@ you are holding the file and can act on it:
 ```
 sbx: warning: 'claude-code' names a bundle not declared here: claude-code — import it too
   (`sbx bundle import examples/bundle/claude-code.toml`, or re-run with --with-deps), or the
-  app launches without the tool and egress it names
+  app does not launch: sbx refuses to run it without what it names
 ```
 
 The remedy **names the file** when one can be found: the shipped catalogue lays `app/`,
