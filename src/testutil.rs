@@ -711,6 +711,7 @@ pub(crate) fn app_with(packages: Vec<crate::config::Package>) -> crate::config::
         proc_origin: Default::default(),
         home_scope_origin: None,
         warnings: vec![],
+        refusals: Vec::new(),
     }
 }
 

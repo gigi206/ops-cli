@@ -179,6 +179,7 @@ fn app_overlay(
         proc_origin: Default::default(),
         home_scope_origin: None,
         warnings: vec![],
+        refusals: Vec::new(),
     }
 }
 
@@ -298,6 +299,41 @@ fn the_install_roll_recap_names_what_ran_and_tallies_the_rest() {
         provision_roll_recap(&[], 2, 1, false),
         "no install step ran · 2 skipped · 1 failed"
     );
+}
+
+/// An app whose launch is refused yields no group in either roll: its cage would equip or install
+/// without the restriction that could not be applied. The same app without the refusal yields one
+/// in each, so the omission is the refusal's and not the fixture's.
+#[test]
+fn an_app_whose_launch_is_refused_is_left_out_of_both_rolls() {
+    use crate::config::{AppHomeScope, BundleProvision};
+    let mut cfg = crate::testutil::resolved_channels(None, None);
+    let mut app = app_overlay(
+        &["alpha"],
+        AppHomeScope::Global,
+        vec![mise_pkg("foo", "aqua:foo", true)],
+    );
+    app.provisions = vec![BundleProvision {
+        bundle: "alpha-bundle".into(),
+        argv: vec!["true".into()],
+    }];
+    cfg.apps.insert("alpha".to_string(), app);
+    let app_groups = |cfg: &crate::config::Resolved| {
+        let mise = mise_package_groups(cfg, None)
+            .iter()
+            .filter(|g| matches!(&g.home, GroupHome::GlobalApp(n) if n == "alpha"))
+            .count();
+        (mise, provision_groups(cfg, None).len())
+    };
+    assert_eq!(
+        app_groups(&cfg),
+        (1, 1),
+        "a launchable app is rolled by both"
+    );
+
+    cfg.apps.get_mut("alpha").unwrap().refusals =
+        vec!["cannot apply `[fs] deny` entry `../x`".into()];
+    assert_eq!(app_groups(&cfg), (0, 0), "a refused one by neither");
 }
 
 #[test]

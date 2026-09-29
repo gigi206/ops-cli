@@ -574,6 +574,19 @@ pub(crate) fn app(
         ));
         return AppOutcome::plain(ExitCode::from(2));
     };
+    // The app's own counterpart of the refusal `prepare_config` made for the whole configuration:
+    // a restriction one of its layers wrote could not be applied, and the app would run without
+    // it. Only this app stops; the others and `sbx run` launch as they did.
+    if !app.refusals.is_empty() {
+        for why in &app.refusals {
+            crate::diag::error(&format!("sbx: app `{name}`: {why}"));
+        }
+        crate::diag::hint(
+            "       a launch is refused rather than run without what could not be applied; \
+             fix the entry named.",
+        );
+        return AppOutcome::plain(ExitCode::from(2));
+    }
     if app.cmd.is_empty() {
         // Both declaration shapes are named, because only one of them is a table. A hand-written
         // profile file reaches here (`sbx app import` refuses a `cmd`-less one, a file dropped into

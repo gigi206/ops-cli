@@ -2480,6 +2480,7 @@ mod tests {
             devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
+            refusals: Vec::new(),
         };
         let view = app_view("demo-app", &app, &NetworkPolicy::Shared, &pins);
         assert_eq!(view.packages[0].name, "pinned-tool");
@@ -2738,6 +2739,7 @@ mod tests {
             devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
+            refusals: Vec::new(),
         };
 
         let mut merged = baseline.clone();

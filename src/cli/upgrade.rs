@@ -233,6 +233,16 @@ fn run_upgrade(
     for warning in &cfg.warnings {
         diag::warn_config(warning);
     }
+    // An app whose launch is refused is left out of the roll, whose groups skip it without a word:
+    // said here, or a roll of every app would report success over one it never touched. Under
+    // `--app` the selector check below refuses that app outright instead.
+    if app_arg.is_none() {
+        for (name, app) in &cfg.apps {
+            for why in &app.refusals {
+                diag::warn_config(&format!("app `{name}` is left out of the roll: {why}"));
+            }
+        }
+    }
 
     // `--app <name>` is checked against the resolved config before any roll starts: a name that
     // selects no work must say which of the three ways it selects none, since each has a different
@@ -440,10 +450,11 @@ fn closing_note(what: &str, moved: Moved) -> ClosingNote {
 
 /// Resolve `<name>` to an app that can actually be rolled, or the refusal that says why it cannot.
 ///
-/// Two refusals, and neither is about a channel: the name matches no app, or it matches one that
-/// never launches. Split out because **two commands ask this same question** — `sbx upgrade
-/// <target> --app <name>` and `sbx app upgrade <name>` — and a sentence written twice is a sentence
-/// that drifts. `verb` is what precedes the colon, so each command names itself.
+/// Three refusals, and none is about a channel: the name matches no app, it matches one that never
+/// launches, or one whose launch is refused. Split out because **two commands ask this same
+/// question** — `sbx upgrade <target> --app <name>` and `sbx app upgrade <name>` — and a sentence
+/// written twice is a sentence that drifts. `verb` is what precedes the colon, so each command
+/// names itself.
 ///
 /// What deliberately stays with the caller is the per-target half. It is a refusal only for
 /// `sbx upgrade <target> --app`, where the user named a channel and the app does not ride it; for
@@ -466,6 +477,15 @@ fn launchable_app<'a>(
         return Err(format!(
             "sbx: {verb}: app `{name}` declares no command, so it never launches — there is \
              nothing in its cage to roll."
+        ));
+    }
+    // An app whose launch is refused is not rolled either: its cage would run the installers
+    // without the restriction that could not be applied.
+    if !app.refusals.is_empty() {
+        return Err(format!(
+            "sbx: {verb}: app `{name}` cannot launch until this is fixed, so its cage is not \
+             rolled: {}",
+            app.refusals.join("; ")
         ));
     }
     Ok(app)
@@ -2062,6 +2082,29 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// An app whose launch is refused is refused by the selector too, quoting why: rolling it would
+    /// run its installers without the restriction that could not be applied.
+    #[test]
+    fn the_app_selector_refuses_an_app_whose_launch_is_refused() {
+        let mut cfg = crate::testutil::resolved(vec![], vec![]);
+        let mut installs = crate::testutil::app_with(vec![]);
+        installs.provisions = vec![config::BundleProvision {
+            bundle: "trae".into(),
+            argv: vec!["true".into()],
+        }];
+        cfg.apps.insert("trae".into(), installs.clone());
+        assert!(app_selector_refusal(&cfg, "trae", "provision", "upgrade").is_none());
+
+        installs.refusals = vec!["cannot apply `[fs] deny` entry `../x`".into()];
+        cfg.apps.insert("trae".into(), installs);
+        let refused = app_selector_refusal(&cfg, "trae", "provision", "upgrade")
+            .expect("a refused app is not rolled");
+        assert!(
+            refused.contains("cannot launch") && refused.contains("../x"),
+            "{refused}"
+        );
     }
 
     /// An app name that selects no work gets the reason it selects none — the three cases have

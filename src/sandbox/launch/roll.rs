@@ -75,8 +75,9 @@ struct MiseGroup {
 /// The `mise:` `[packages]` groups to roll forward — generic over every declared group: the
 /// project baseline (equipped in its default home by `sbx run`) and each app
 /// (equipped in its own home, keyed by `home_scope`), each with its merged trusted `mise:`
-/// token set. A group with no trusted `mise:` token — and an app with no command — is omitted,
-/// so a project or app without any produces no cage, and no app is special-cased. Trusted-only
+/// token set. A group with no trusted `mise:` token is omitted, and so is an app with no command
+/// or whose launch is refused, so a project or app without any produces no cage, and no app is
+/// special-cased. Trusted-only
 /// by construction, since [`crate::sandbox::packages::mise_packages`] keeps only trusted tokens. Pure
 /// over the resolved config (it clones to merge each app), so the grouping is unit-tested
 /// without launching a cage.
@@ -100,8 +101,10 @@ fn mise_package_groups(cfg: &crate::config::Resolved, only: Option<&str>) -> Vec
         if only.is_some_and(|want| want != name) {
             continue;
         }
-        if app.cmd.is_empty() {
-            continue; // an unlaunchable app never equips anything
+        // An unlaunchable app never equips anything, and one whose launch is refused would equip
+        // in a cage without the restriction that could not be applied.
+        if app.cmd.is_empty() || !app.refusals.is_empty() {
+            continue;
         }
         let home = match app.home_scope {
             crate::config::AppHomeScope::Global => GroupHome::GlobalApp(name.clone()),
@@ -489,16 +492,17 @@ struct ProvisionGroup {
 /// The apps whose `use`d bundles carry an install step. Only apps: a `provision` is a bundle's
 /// field, and a bundle only ever folds into an app, so there is no project-baseline group here —
 /// the shape [`mise_package_groups`] needs. An app with no command is omitted (it can never
-/// launch, so nothing installs for it), and the fold has already dropped the steps of an untrusted
-/// layer, so this is trusted-only by construction. Pure over the resolved config, so the grouping
-/// is unit-tested without launching a cage.
+/// launch, so nothing installs for it), so is one whose launch is refused (its cage would install
+/// without the restriction that could not be applied), and the fold has already dropped the steps
+/// of an untrusted layer, so this is trusted-only by construction. Pure over the resolved config,
+/// so the grouping is unit-tested without launching a cage.
 fn provision_groups(cfg: &crate::config::Resolved, only: Option<&str>) -> Vec<ProvisionGroup> {
     let mut groups = Vec::new();
     for (name, app) in &cfg.apps {
         if only.is_some_and(|want| want != name) {
             continue;
         }
-        if app.cmd.is_empty() || app.provisions.is_empty() {
+        if app.cmd.is_empty() || app.provisions.is_empty() || !app.refusals.is_empty() {
             continue;
         }
         let home = match app.home_scope {

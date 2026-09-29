@@ -1173,6 +1173,17 @@ impl Resolved {
         if !fatal.is_empty() {
             return Err(override_fatal_error(&fatal, notes));
         }
+        // `[fs]` is read here too, before anything is mutated: an entry that cannot be applied is
+        // fatal like a bad scalar, because a one-shot override must be exact and a launch that went
+        // on would leave open the path it names. Its notes join the others where the table is
+        // folded in, below.
+        let (mut fs_notes, mut unapplied) = (Vec::new(), Vec::new());
+        let over_fs =
+            fs.map(|raw| apply_fs(&mut fs_notes, &mut unapplied, OVERRIDE_SOURCE, Some(raw)));
+        if !unapplied.is_empty() {
+            unapplied.extend(notes);
+            return Err(unapplied);
+        }
         let OverrideScalars {
             network: new_network,
             gui: new_gui,
@@ -1401,8 +1412,8 @@ impl Resolved {
         // `[fs]` — additive like the two above, and the one field where "trusted by invocation"
         // carries no weight either way: an override can only close more of the project for this
         // launch, never reopen what a config layer closed.
-        if fs.is_some() {
-            let over = apply_fs(&mut self.warnings, OVERRIDE_SOURCE, fs);
+        if let Some(over) = over_fs {
+            self.warnings.append(&mut fs_notes);
             // `declares_nothing`, not `is_empty`: the latter asks whether there are mounts to lay
             // down, and a `scan`-only table lays down none — asking it here dropped the override
             // entirely, so `--config '[fs] scan = [...]'` protected nothing.
@@ -1953,6 +1964,7 @@ fn resolve(
         .map(|(proj, state)| (std::mem::take(&mut proj.app), *state));
 
     let mut warnings = Vec::new();
+    let mut refusals = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
     let mut env_layer: BTreeMap<String, Provenance> = BTreeMap::new();
     let mut binds: Vec<Bind> = Vec::new();
@@ -2309,7 +2321,7 @@ fn resolve(
     };
     // The `[fs]` masks from the global layer. Ungated (they only close paths), and layered like the
     // device grant: a project's set unions onto this, so a layer can close more and never less.
-    let mut fs = apply_fs(&mut warnings, GLOBAL_CONFIG, global.fs);
+    let mut fs = apply_fs(&mut warnings, &mut refusals, GLOBAL_CONFIG, global.fs);
     let mut fs_origin = if fs.declares_nothing() {
         Provenance::Default
     } else {
@@ -2792,7 +2804,7 @@ fn resolve(
         // a layer whose only key was one of these contributes nothing and does not move the
         // provenance.
         if let Some(raw) = proj.fs {
-            let mut project_fs = apply_fs(&mut warnings, PROJECT_CONFIG, Some(raw));
+            let mut project_fs = apply_fs(&mut warnings, &mut refusals, PROJECT_CONFIG, Some(raw));
             if !gate.trusted && project_fs.scan_max_kb.take().is_some() {
                 gate.refuse("`[fs] scan_max_kb`", &mut warnings);
             }
@@ -3054,7 +3066,7 @@ fn resolve(
         tasks,
         apps,
         warnings,
-        refusals: Vec::new(),
+        refusals,
     };
     #[cfg(debug_assertions)]
     debug_dump_resolved(&resolved);
@@ -3281,17 +3293,27 @@ fn apply_devices(
     devices
 }
 
-/// Read one layer's `[fs]` table into the resolved policy, dropping each entry the grammar refuses
-/// with a warning that says why.
+/// Read one layer's `[fs]` table into the resolved policy, leaving out each entry the grammar
+/// refuses, and recording in `refusals` why a launch may not go on without it.
 ///
 /// No trust gate anywhere near this: unlike every other table here, `[fs]` cannot grant. Each entry
 /// takes something away from the cage it declares, so the worst an untrusted project can do with it
-/// is close its own files — and a dropped entry fails closed by leaving the file *exposed*, which
-/// is why the warning matters more here than the drop.
-fn apply_fs(warnings: &mut Vec<String>, source: &str, raw: Option<schema::RawFs>) -> FsPolicy {
+/// is close its own files. An entry left out fails *open*, leaving the file exposed, so it is not a
+/// note a launch can go past: the same sentence goes to `warnings`, for the verbs that show the
+/// configuration, and to `refusals`, which a launch stops on.
+fn apply_fs(
+    warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
+    source: &str,
+    raw: Option<schema::RawFs>,
+) -> FsPolicy {
     let mut policy = FsPolicy::default();
     let Some(raw) = raw else {
         return policy;
+    };
+    let mut unapplied = |said: String| {
+        warnings.push(said.clone());
+        refusals.push(said);
     };
     for (field, entries, out) in [
         ("deny", &raw.deny, &mut policy.deny),
@@ -3303,9 +3325,10 @@ fn apply_fs(warnings: &mut Vec<String>, source: &str, raw: Option<schema::RawFs>
             match fspolicy::validate_entry(&entry) {
                 Ok(ok) if out.contains(&ok) => {}
                 Ok(ok) => out.push(ok),
-                Err(reason) => warnings.push(format!(
-                    "{source}: ignoring `[fs] {field}` entry `{entry}` ({reason}) — that path stays \
-                     open to the cage"
+                Err(reason) => unapplied(format!(
+                    "{source}: cannot apply `[fs] {field}` entry `{}` ({reason}), and a launch \
+                     stops rather than leave that path open to the cage",
+                    crate::diag::visible(&entry)
                 )),
             }
         }
@@ -3314,29 +3337,29 @@ fn apply_fs(warnings: &mut Vec<String>, source: &str, raw: Option<schema::RawFs>
         match crate::open_policy::validate_pattern(&entry) {
             Ok(()) if policy.scan.contains(&entry) => {}
             Ok(()) => policy.scan.push(entry),
-            Err(reason) => warnings.push(format!(
-                "{source}: ignoring `[fs] scan` pattern `{entry}` ({reason}) — no file is closed \
-                 for carrying that shape"
+            Err(reason) => unapplied(format!(
+                "{source}: cannot apply `[fs] scan` pattern `{}` ({reason}), and a launch stops \
+                 rather than let a file of that shape through",
+                crate::diag::visible(&entry)
             )),
         }
     }
     // Each pattern compiles on its own above; the *set* has its own ceiling, and only building it
-    // answers whether this layer's list clears it. It is built here, per layer, because the launch
-    // refuses outright when the scanner will not compile — and `[fs]` is the one table an untrusted
-    // project may fill, so a cloned repo's `.sbx.toml` carrying a few thousand patterns could
-    // otherwise abort every launch in its own directory instead of losing its own scan. Dropping
-    // just this layer's entries is the same fail-closed drop every other bad `[fs]` entry gets, and
-    // it leaves the shapes a trusted layer declared compiling as before. What is bounded here is
-    // one layer's contribution: the launch compiles the union of the accepted layers, and a union
-    // that does not fit is still refused there.
+    // answers whether this layer's list clears it. It is built here, per layer, so the refusal
+    // names the layer whose list does not fit. `[fs]` is the one table an untrusted project may
+    // fill, so a cloned repo's `.sbx.toml` carrying a few thousand patterns stops every launch in
+    // its own directory until the file is fixed: the scan it asks for would otherwise not run.
+    // What is bounded here is one layer's contribution: the launch compiles the union of the
+    // layers, and a union that does not fit is refused there.
     //
     // The scan ceiling passed here is the built-in one: it bounds how many bytes a scan *reads* and
     // has no bearing on whether the set compiles, which is the only question asked.
     if let Err(reason) =
         crate::open_policy::OpenPolicy::compile(&policy.scan, crate::open_policy::MAX_SCAN_DEFAULT)
     {
-        warnings.push(format!(
-            "{source}: ignoring `[fs] scan` ({reason}) — no file is scanned for those shapes"
+        unapplied(format!(
+            "{source}: cannot apply `[fs] scan` ({reason}), and a launch stops rather than scan \
+             no file for those shapes"
         ));
         policy.scan.clear();
     }

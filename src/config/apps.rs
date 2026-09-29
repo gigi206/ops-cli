@@ -193,6 +193,10 @@ pub(crate) struct ResolvedApp {
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
     /// launched, not on every `sbx run`.
     pub(crate) warnings: Vec<String>,
+    /// Why this app's launch may not go on: a restriction one of its layers wrote that could not
+    /// be applied, each a whole sentence naming it. The app counterpart of
+    /// [`Resolved::refusals`], and like its notes it stops this app alone, not every `sbx run`.
+    pub(crate) refusals: Vec<String>,
 }
 
 /// The shells whose `-c` binds the *next* argv element to `$0`. All four are POSIX-family and
@@ -396,6 +400,7 @@ fn resolve_app(
     plugins: &PluginRegistry,
 ) -> ResolvedApp {
     let mut warnings = Vec::new();
+    let mut refusals = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
     let mut binds: Vec<Bind> = Vec::new();
     let mut packages: Vec<Package> = Vec::new();
@@ -622,7 +627,7 @@ fn resolve_app(
             devices_origin = Provenance::Global;
         }
         union_devices(&mut devices, global_devices);
-        let global_fs = apply_fs(&mut warnings, &source, app.fs);
+        let global_fs = apply_fs(&mut warnings, &mut refusals, &source, app.fs);
         if !global_fs.declares_nothing() {
             fs_origin = Provenance::Global;
         }
@@ -921,7 +926,7 @@ fn resolve_app(
         // a layer whose only key was one of these contributes nothing and does not move the
         // provenance.
         if let Some(raw) = app.fs {
-            let mut project_fs = apply_fs(&mut warnings, &source, Some(raw));
+            let mut project_fs = apply_fs(&mut warnings, &mut refusals, &source, Some(raw));
             if !gate.trusted && project_fs.scan_max_kb.take().is_some() {
                 gate.refuse("`[fs] scan_max_kb`", &mut warnings);
             }
@@ -1118,6 +1123,7 @@ fn resolve_app(
         limits_origin,
         home_scope_origin,
         warnings,
+        refusals,
     }
 }
 

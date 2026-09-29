@@ -4304,6 +4304,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
         proc_origin: Default::default(),
         home_scope_origin: None,
         warnings: vec![],
+        refusals: Vec::new(),
     };
     base.merge_app(app);
     // The app's device grant unions onto the baseline's (sorted), never replacing it.
@@ -4388,6 +4389,7 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
         proc_origin: Default::default(),
         home_scope_origin: None,
         warnings: vec![],
+        refusals: Vec::new(),
     };
     base.merge_app(app);
     assert!(base.secrets.is_empty());
@@ -4449,6 +4451,7 @@ fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
         proc_origin: Default::default(),
         home_scope_origin: None,
         warnings: vec![],
+        refusals: Vec::new(),
     };
     base.merge_app(app);
     assert_eq!(base.secrets.len(), 1);
@@ -4505,6 +4508,7 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
         proc_origin: Default::default(),
         home_scope_origin: None,
         warnings: vec![],
+        refusals: Vec::new(),
     };
 
     // (a) the app declares its own allowlist: an unscoped rule inherits the app's read-by-default
@@ -4668,6 +4672,7 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
         proc_origin: Default::default(),
         home_scope_origin: None,
         warnings: vec![],
+        refusals: Vec::new(),
     };
     base.merge_app(app);
     assert_eq!(
@@ -4736,6 +4741,7 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         proc_origin: Default::default(),
         home_scope_origin: None,
         warnings: vec![],
+        refusals: Vec::new(),
     };
     base.merge_app(app);
     assert_eq!(
@@ -7843,7 +7849,7 @@ fn a_scan_pattern_that_is_not_a_regex_is_dropped_and_says_what_is_lost() {
         .find(|w| w.contains("(unclosed"))
         .unwrap_or_else(|| panic!("no warning names the broken pattern: {:?}", r.warnings));
     assert!(
-        w.contains("no file is closed"),
+        w.contains("a file of that shape through"),
         "the warning must say what protection is lost, not merely that a line was ignored: {w}"
     );
 }
@@ -8049,9 +8055,78 @@ fn a_refused_fs_entry_is_dropped_with_a_warning_that_says_the_path_stays_open() 
     let warned: Vec<&String> = r.warnings.iter().filter(|w| w.contains("[fs]")).collect();
     assert_eq!(warned.len(), 3, "one warning per refused entry: {warned:?}");
     assert!(
-        warned.iter().all(|w| w.contains("stays open to the cage")),
+        warned
+            .iter()
+            .all(|w| w.contains("leave that path open to the cage")),
         "each warning says what the drop costs: {warned:?}"
     );
+    assert_eq!(
+        r.refusals.len(),
+        3,
+        "and each stops a launch: {:?}",
+        r.refusals
+    );
+}
+
+/// An `[fs]` entry that cannot be applied refuses a launch, from every layer that applies `[fs]`:
+/// the global config, a project whether it is trusted or not (its masks apply without trust), and
+/// an app, whose refusal stops that app's launch alone. The entries beside it still read, and the
+/// refusal names the one at fault.
+#[test]
+fn an_fs_entry_that_cannot_be_applied_refuses_a_launch_from_every_layer_that_applies_fs() {
+    let named = |refusals: &[String], entry: &str| {
+        refusals.len() == 1 && refusals[0].contains(entry) && refusals[0].contains("[fs]")
+    };
+    let global = resolve_no_plugins(raw_fs(&["ok.key", "../up.key"], &[]), None);
+    assert!(
+        named(&global.refusals, "../up.key"),
+        "{:?}",
+        global.refusals
+    );
+    assert_eq!(
+        global.fs.deny,
+        vec!["ok.key".to_string()],
+        "its neighbour still reads"
+    );
+
+    for state in [TrustState::Trusted, TrustState::Untrusted] {
+        let project = resolve_no_plugins(
+            RawConfig::default(),
+            Some((raw_fs(&[], &["/etc/shadow"]), state)),
+        );
+        assert!(
+            named(&project.refusals, "/etc/shadow"),
+            "{state:?}: {:?}",
+            project.refusals
+        );
+    }
+
+    let scan = resolve_no_plugins(raw_fs_scan(&["(unclosed"], None), None);
+    assert!(named(&scan.refusals, "(unclosed"), "{:?}", scan.refusals);
+
+    let app = resolve_no_plugins(
+        raw_with_app(
+            "demo-app",
+            RawApp {
+                fs: Some(schema::RawFs {
+                    deny: vec!["../app.key".into()],
+                    ..Default::default()
+                }),
+                ..raw_app(&["demo-app"], &[], &[], &[], None)
+            },
+        ),
+        None,
+    );
+    let own = &app.apps["demo-app"].refusals;
+    assert!(named(own, "../app.key"), "{own:?}");
+    assert!(
+        app.refusals.is_empty(),
+        "an app's entry stops that app, not every launch: {:?}",
+        app.refusals
+    );
+
+    let clean = resolve_no_plugins(raw_fs(&["ok.key"], &["Cargo.lock"]), None);
+    assert!(clean.refusals.is_empty(), "{:?}", clean.refusals);
 }
 
 #[test]

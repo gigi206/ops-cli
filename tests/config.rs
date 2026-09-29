@@ -5504,7 +5504,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
     let out = fx.run(&["config", "show"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no file is closed"),
+        stderr.contains("a file of that shape through"),
         "a dropped pattern fails open, so the warning has to say so:\n{stderr}"
     );
     assert!(
@@ -5535,7 +5535,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no file is closed") && stderr.contains("control character"),
+        stderr.contains("a file of that shape through") && stderr.contains("control character"),
         "the drop has to be named, and for its own reason:\n{stderr}"
     );
 }
@@ -5570,13 +5570,14 @@ fn fs_masks_are_honored_untrusted_and_surfaced_in_config_show() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("fs deny: prod.key"), "{stdout}");
 
-    // A refused entry is dropped with a warning that says what the drop costs: the path stays open.
+    // A refused entry is named with what leaving it out would cost: the path would stay open, so a
+    // launch stops over it.
     let fx = Project::new("cfg");
     fx.write_project("[fs]\ndeny = [\"**/*.pem\"]\n");
     let out = fx.run(&["config", "show"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("stays open to the cage"),
+        stderr.contains("leave that path open to the cage"),
         "a dropped mask fails open, so the warning has to say so:\n{stderr}"
     );
     assert!(
@@ -6112,5 +6113,33 @@ fn a_project_config_that_cannot_be_read_refuses_a_launch_but_not_the_verb_that_s
     assert!(
         stderr.contains("world-writable") && stderr.contains("cannot be read"),
         "a project config the safety gate refuses refuses the launch too: {stderr}"
+    );
+}
+
+/// An app whose `[fs]` entry cannot be applied refuses that app's launch, naming the entry, and
+/// leaves every other launch alone: the entry is the app's, so the baseline is not refused over
+/// it. The other launch is `sbx app run` on an app nobody declared, which stops right after the
+/// configuration is read, so neither side stands up a cage.
+#[test]
+fn an_apps_fs_entry_that_cannot_be_applied_refuses_that_app_alone() {
+    let fx = Project::new("cfg");
+    fx.write_profile(
+        "demo",
+        "cmd = [\"true\"]\n\n[fs]\ndeny = [\"ok.key\", \"../up.key\"]\n",
+    );
+
+    let out = fx.run(&["app", "run", "demo"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("app `demo`") && stderr.contains("../up.key"),
+        "the refusal names the app and the entry: {stderr}"
+    );
+
+    let other = fx.run(&["app", "run", "nope"]);
+    let stderr = String::from_utf8_lossy(&other.stderr);
+    assert!(
+        stderr.contains("no app named") && !stderr.contains("../up.key"),
+        "another launch goes on past the configuration: {stderr}"
     );
 }

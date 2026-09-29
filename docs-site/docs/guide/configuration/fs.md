@@ -367,8 +367,9 @@ The rules, and why each one is there:
 - **A `*` also matches a name starting with a dot**, unlike a shell glob. `secrets/*` covers
   `secrets/.env`. The difference is deliberate: for a mask, covering more is the safe direction.
 
-A refused entry is dropped with a warning that says the path **stays open**, because that
-is what the drop costs.
+A refused entry **stops the launch**, naming it: left out, it would leave the path open.
+`sbx config show` still lists the entries beside it and names the refused one. An entry an
+app declares stops that app's launch alone.
 
 ## Prefer a directory
 
@@ -421,12 +422,12 @@ would pass everything while still looking like a scan, and so is a negative numb
 ceiling at all. Where two layers both set it, the **larger** window is the one that applies: a
 bigger number closes more files.
 
-An **empty** pattern is refused for the mirror-image reason, and named in the launch warnings
-with the rest of the line kept: it is a valid regex that every file matches, so a list holding
-one would close everything under `enforce` and report every open under `observe`, while the
-shapes beside it stopped deciding anything. A pattern that does not compile is refused the same
-way, for its own reason. In both cases the remaining patterns still apply, so one bad line does
-not cost you the list.
+An **empty** pattern is refused for the mirror-image reason: it is a valid regex that every
+file matches, so a list holding one would close everything under `enforce` and report every open
+under `observe`, while the shapes beside it stopped deciding anything. A pattern that does not
+compile is refused the same way, for its own reason. In both cases the launch stops and names the
+pattern, rather than run without the shape it was written to catch; `sbx config show` still lists
+the patterns beside it.
 
 A pattern carrying a **control character**, or a character that reorders a line, is refused for a
 reason about the terminal rather than about the scan. `[fs]` is honoured from an untrusted project,
@@ -445,9 +446,10 @@ trusted project sets the ceiling as before.
 
 **One scanner per layer.** Every pattern a layer lists is compiled into a single scanner, so the
 cost of a scan does not grow with the length of the list; that scanner has a size ceiling, though,
-and a list too large to fit it compiles into nothing. Such a list is dropped at config time, named,
-and only for the layer that wrote it: the shapes another layer declared keep scanning, and a project
-that piles on patterns loses its own scan rather than the launch.
+and a list too large to fit it compiles into nothing. Such a list stops the launch, named with the
+layer that wrote it, since a scan that compiled into nothing would let every file through. That
+holds for a project you have not trusted too: its `[fs]` applies without trust, so a project that
+piles on patterns is fixed in its own file.
 
 **What it costs you.** Every open of a project file goes through the supervisor, so a build is
 slower than it is without a scan. `scan` also brings that supervisor up on its own, without
