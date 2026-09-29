@@ -196,8 +196,9 @@ pub(super) const PAGES: &[Page] = &[
             deny list, and `deny=host1,host2` mirrors it. An entry in either list may be an\n\
             `@<group>` reference, resolved against the egress groups the global config declares\n\
             (`sbx net groups`), so a launch names the set the policy already names instead of\n\
-            spelling its hosts out again; a name no group defines is dropped with a warning. So\n\
-            `--net allow` is the posture to reach\n\
+            spelling its hosts out again. A name no group defines is dropped from `allow=` with a\n\
+            warning, and refuses the launch from `deny=` (exit 2), since leaving it out would\n\
+            open what it names. So `--net allow` is the posture to reach\n\
             for — the catch-all `--net 'allow=re:.*'` opens the same doors the long way round, and\n\
             differs only in that each request then carries a visible deciding rule in\n\
             `sbx net logs` instead of an `allowed-by-default` verdict. A bare posture replaces the\n\
@@ -435,7 +436,10 @@ pub(super) const PAGES: &[Page] = &[
             overlay first, then the ambient `SBX_*` one-shot override, which beats the overlay\n\
             exactly as it does at launch. A verdict read while the shell carries an override is\n\
             therefore the verdict that launch would get. Command-line override flags belong to the\n\
-            launching verbs and are not taken here.",
+            launching verbs and are not taken here.\n\
+            \n\
+            Where that launch would refuse, on a config file that cannot be read or a restriction\n\
+            sbx cannot apply, no verdict is given either (exit 2).",
     },
     Page {
         path: &["net"],

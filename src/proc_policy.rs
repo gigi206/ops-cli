@@ -66,9 +66,9 @@ pub(crate) enum ProcMode {
 }
 
 impl ProcMode {
-    /// Parse the `[proc] mode` string. An unknown value fails closed to [`Off`](ProcMode::Off) with
-    /// `None`, so the caller can warn — an unrecognised posture must never silently enforce or
-    /// silently disable in a surprising direction.
+    /// Parse the `[proc] mode` string. An unknown value is `None`, which the caller names and a
+    /// launch stops on: an unrecognised posture must never silently enforce or silently disable in
+    /// a surprising direction.
     pub(crate) fn parse(s: &str) -> Option<ProcMode> {
         match s {
             "off" => Some(ProcMode::Off),

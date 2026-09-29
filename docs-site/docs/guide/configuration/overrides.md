@@ -252,7 +252,8 @@ The name resolves against the groups the **global** config declares, the same vo
 grants nothing new: the invoker could always have typed the hosts out. What it buys is
 that a one-shot widening names the set the policy already names, which is what makes the
 launch line readable against it afterwards. A name no group defines is dropped with a
-warning, so an `allow` list built on a typo opens nothing.
+warning, so an `allow` list built on a typo opens nothing; in a `deny=` list it refuses the
+launch, like any restriction an override carries and sbx cannot apply.
 
 #### The `--bind` mode
 

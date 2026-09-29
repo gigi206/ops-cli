@@ -361,7 +361,8 @@ fields gated by [trust](trust).
 same, as validations that run at launch: a credential is inert unless the posture filters, a
 host carrying both a layer-4 and a layer-7 rule has the second one ignored, an undefined
 group reference is dropped. Each is reported as a warning to someone who has already written
-the file.
+the file, and where what was dropped is a restriction (a `deny` entry, a mode) the launch
+stops on it rather than run without it.
 
 **Where the sort landed**, because this one was open too: the inter-field rules were divided
 into the ones a stricter type could make unrepresentable and the ones that are genuinely

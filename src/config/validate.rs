@@ -7,9 +7,12 @@
 //! be read on its own.
 //!
 //! Every rule reports the same way: a rejected value is dropped with a note naming the field and
-//! the reason, and the launch proceeds without it. A refusal at this level is a fact about one
-//! entry, never a reason to fail the load, so a single bad line cannot cost a project its whole
-//! configuration.
+//! the reason, and the load goes on without it. A refusal at this level is a fact about one entry,
+//! never a reason to fail the load, so a single bad line cannot cost a project its whole
+//! configuration. Where the value dropped was a restriction (an unknown `network` or `proc` mode,
+//! a `deny` entry that cannot be read), the layer without it would allow more than it says, so the
+//! same note also goes to the refusals a launch stops on; the verbs that only show the
+//! configuration still answer.
 
 use super::*;
 
@@ -418,9 +421,11 @@ pub(super) fn validate_gui(
     }
 }
 
-/// Validate a `proc` field — either a bare mode string or a `[proc]` table — mapping it to a
-/// [`ProcPolicy`](crate::proc_policy::ProcPolicy) and warning on an unknown mode. A typo must never silently leave enforcement in the
-/// wrong posture; returning `None` keeps the prior (default or parent) policy rather than guessing.
+/// Validate a `proc` field, a bare mode string or a `[proc]` table, into a
+/// [`ProcPolicy`](crate::proc_policy::ProcPolicy). An unknown mode returns `None`, which leaves the
+/// layer below in force, so the note naming it goes to `refusals` too and a launch stops on it: a
+/// misspelled `enforce` must never run under a laxer posture.
+///
 /// `parent` is the policy of the layer immediately below: a `[proc]` table that omits `mode` inherits
 /// its mode from `parent` while keeping its own `allow`/`deny` rules.
 pub(super) fn validate_proc(
@@ -670,9 +675,11 @@ pub(super) enum Layering {
     Amend,
 }
 
-/// Validate a `network` field — either a posture string or a `[network]` table — mapping it to a
-/// policy and warning on anything unrecognized. A typo must never silently leave the network in the
-/// wrong posture; returning `None` keeps the prior (default or global) posture rather than guessing.
+/// Validate a `network` field, a posture string or a `[network]` table, into a policy. An unknown
+/// posture or mode returns `None`, which leaves the layer below in force, so the note naming it
+/// goes to `refusals` too and a launch stops on it: a misspelled `none` must never reach the
+/// network.
+///
 /// `parent` is the network of the layer immediately below (the global default for the baseline
 /// global layer, the resolved baseline for a project/app): a `[network]` table that omits `mode`
 /// inherits its mode from `parent` (see [`mode_from_parent`]).
@@ -830,11 +837,11 @@ fn warn_inert_under_posture(
 }
 
 /// Validate the table form of `network`: `none`/`shared` behave as the string form; `deny`/`allow`/
-/// `ask` classify each declared entry (a malformed one is dropped with a warning that names what
-/// the drop costs: an `allow` entry leaves its host unreachable, while a `deny` entry under an
-/// allow-by-default posture leaves the host it named **reachable** — which is why the drop is
-/// announced rather than called fail-closed); and an **omitted** `mode` inherits the filtering mode
-/// from `parent` while keeping this table's own rules.
+/// `ask` classify each declared entry (a malformed one is left out with a note that names what that
+/// costs: an `allow` entry leaves its host unreachable, while a `deny` entry would leave the host
+/// it named **reachable**, so that one stops a launch too, see [`classify_entries`]); and an
+/// **omitted** `mode` inherits the filtering mode from `parent` while keeping this table's own
+/// rules.
 pub(super) fn validate_network_table(
     warnings: &mut Vec<String>,
     refusals: &mut Vec<String>,

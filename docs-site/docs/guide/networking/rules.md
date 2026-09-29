@@ -108,10 +108,10 @@ request naming one is refused the same way, and names the IPv4 as an IPv4.
 
 A **rule** written in one of those spellings could match no request, so it is refused
 where it is written, with the spelling to use instead (`write 1.2.3.4`, or a dotted
-IPv4 in place of a number): a config list drops it with a warning, `sbx net allow` and
-`sbx net deny` refuse it, and a task whose `network` carries one is ignored, as a task
-is for any malformed `network` entry. A `deny 0x01020304` would otherwise read as a
-protection for `1.2.3.4` and refuse nothing.
+IPv4 in place of a number): a config `allow` list drops it with a warning, a `deny` list
+stops the launch on it, `sbx net allow` and `sbx net deny` refuse it, and a task whose
+`network` carries one is ignored, as a task is for any malformed `network` entry. A
+`deny 0x01020304` would otherwise read as a protection for `1.2.3.4` and refuse nothing.
 
 Note the proxy resolves DNS host-side and never connects to a private or internal
 address for an *unnamed* host: see the [SSRF guard](architecture#the-ssrf-guard).
@@ -166,7 +166,8 @@ allow = ["re:^https://files\\.test/app;jsessionid=[0-9A-F]+$"]   # this is how t
 
 A refused entry never becomes a rule. `sbx net allow|deny|mute` and `sbx config set
 network.allow` reject it before writing anything, and one written by hand straight
-into a config file is dropped at load with a warning naming the list it was in.
+into a config file is dropped at load with a warning naming the list it was in. From a
+`deny` list, where leaving it out would open what it closed, the launch stops on it.
 
 ### Path canonicalization
 
@@ -580,8 +581,8 @@ allow = ["@ci-hosts", "api.anthropic.com"]
 
 A `@` only counts as a reference at the *start* of an entry: a `@` inside a URL
 path (`host/@user`) or a `re:` pattern is a literal part of the rule. An **undefined**
-group reference is dropped with a *loud* warning (in a `deny` list this loses a
-carve-out, so it is never silent). See [Egress groups](groups).
+group reference is dropped from an `allow` list with a warning; in a `deny` list, where
+leaving it out would lose a carve-out, it stops the launch. See [Egress groups](groups).
 
 ---
 
