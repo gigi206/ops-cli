@@ -8225,6 +8225,50 @@ fn a_network_restriction_that_cannot_be_read_refuses_a_launch() {
     );
 }
 
+/// A `[proc]` mode sbx does not know refuses a launch: the layer's whole `[proc]` is left out, so
+/// the posture below it stands, and a misspelled `enforce` over a global `off` runs the lens off.
+/// From the global config, a trusted project and an app, whose refusal stops that app alone; an
+/// untrusted project's `[proc]` is never applied, so it refuses nothing.
+#[test]
+fn a_proc_mode_that_cannot_be_read_refuses_a_launch() {
+    let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
+    let project =
+        |text: &str, state| resolve_no_plugins(RawConfig::default(), Some((parse(text), state)));
+    let refused_over =
+        |refusals: &[String], what: &str| refusals.len() == 1 && refusals[0].contains(what);
+
+    let r = resolve_no_plugins(parse("[proc]\nmode = \"enforse\"\n"), None);
+    assert!(refused_over(&r.refusals, "enforse"), "{:?}", r.refusals);
+    let r = resolve_no_plugins(parse("proc = \"enforse\"\n"), None);
+    assert!(refused_over(&r.refusals, "enforse"), "{:?}", r.refusals);
+    let r = project("[proc]\nmode = \"enforse\"\n", TrustState::Trusted);
+    assert!(refused_over(&r.refusals, "enforse"), "{:?}", r.refusals);
+
+    let r = project(
+        "[app.demo]\ncmd = [\"true\"]\n\n[app.demo.proc]\nmode = \"enforse\"\n",
+        TrustState::Trusted,
+    );
+    assert!(
+        refused_over(&r.apps["demo"].refusals, "enforse"),
+        "{:?}",
+        r.apps["demo"].refusals
+    );
+    assert!(
+        r.refusals.is_empty(),
+        "the app's mode stops that app alone: {:?}",
+        r.refusals
+    );
+
+    let r = project("[proc]\nmode = \"enforse\"\n", TrustState::Untrusted);
+    assert!(
+        r.refusals.is_empty(),
+        "an untrusted project's proc is inert: {:?}",
+        r.refusals
+    );
+    let r = resolve_no_plugins(parse("[proc]\nmode = \"enforce\"\n"), None);
+    assert!(r.refusals.is_empty(), "{:?}", r.refusals);
+}
+
 /// A one-shot override carrying a restriction that cannot be applied is refused before it changes
 /// anything, like a bad scalar: a `deny` entry sbx cannot read, and an `[fs]` entry it refuses. The
 /// override must be exact, and one entry left out would leave its host or its path open.

@@ -157,6 +157,12 @@ prompt, a task command free to run anything. One mistyped value in any of them c
 the file, as two mistakes do, and the message names it. A launch is then refused until
 the value is fixed, whichever file it is in.
 
+The same holds for a restriction of the right type that sbx cannot apply: an `[fs]` entry or
+`scan` pattern it refuses, a `network.deny` entry it cannot classify or that names a group
+nobody defined, a `network` or `proc` mode it does not know. Each is named, and each stops a
+launch rather than letting it run without the restriction; one under `[app.<name>]` stops that
+app alone. An `allow` entry sbx cannot read only narrows, so it stays a warning.
+
 Note the direction, if you knew the old behaviour: a file that used to vanish now
 applies. A trusted project writing `mode = "allow"` beside a mistyped `allow` list
 used to fall back to whatever the global config said, which could be `deny`; now the

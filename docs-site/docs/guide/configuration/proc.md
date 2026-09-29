@@ -20,8 +20,10 @@ nor loosen the enforcement of its own agent. It can be set on the baseline **or*
 ([`[app.<name>.proc]`](apps)); an app's policy replaces the baseline's for that app.
 
 A table without a `mode` keeps its `allow`/`deny` lists and inherits the posture from the
-parent layer; an unrecognized `mode` drops the table with a warning, keeping the parent
-posture rather than guessing.
+parent layer. An unrecognized `mode` **stops the launch**, naming it: sbx will not guess, and
+leaving the table out would keep the parent posture, so a misspelled `enforce` over a global
+`off` would run the lens off. An app's unrecognized `mode` stops that app's launch alone, and
+`sbx config show` still answers.
 
 ## Why observe or enforce exec
 

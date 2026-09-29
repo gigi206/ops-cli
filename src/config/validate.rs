@@ -425,6 +425,7 @@ pub(super) fn validate_gui(
 /// its mode from `parent` while keeping its own `allow`/`deny` rules.
 pub(super) fn validate_proc(
     warnings: &mut Vec<String>,
+    refusals: &mut Vec<String>,
     source_label: &str,
     field: crate::config::schema::ProcField,
     parent: &crate::proc_policy::ProcPolicy,
@@ -438,11 +439,17 @@ pub(super) fn validate_proc(
     let mode = match mode_str {
         Some(m) => match ProcMode::parse(&m) {
             Some(pm) => pm,
+            // The layer's whole `[proc]` is left out, so the posture below it stands: a misspelled
+            // `enforce` over a global `off` runs the lens off. So a launch stops on it.
             None => {
-                warnings.push(format!(
-                    "{source_label}: ignoring unknown proc mode `{m}` \
-                     (expected \"off\", \"observe\", \"enforce\", or \"ask\")"
-                ));
+                let said = format!(
+                    "{source_label}: ignoring unknown proc mode `{}` (expected \"off\", \
+                     \"observe\", \"enforce\", or \"ask\"), and a launch stops rather than run \
+                     under the posture below",
+                    crate::diag::visible(&m)
+                );
+                refusals.push(said.clone());
+                warnings.push(said);
                 return None;
             }
         },

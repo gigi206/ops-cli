@@ -1620,7 +1620,14 @@ fn build_override_scalars(
     // keeping the baseline could leave *less* enforcement than the user's mistyped intent, a fail-open.
     if let Some(field) = proc {
         warn_unknown_proc_keys(notes, OVERRIDE_SOURCE, &field);
-        match validate_proc(notes, OVERRIDE_SOURCE, field, baseline_proc) {
+        // The refusal sentence is not kept: `None` is already fatal here, and the note says why.
+        match validate_proc(
+            notes,
+            &mut Vec::new(),
+            OVERRIDE_SOURCE,
+            field,
+            baseline_proc,
+        ) {
             Some(policy) => scalars.proc = Some(policy),
             None => fatal.push("proc".to_string()),
         }
@@ -2205,6 +2212,7 @@ fn resolve(
         warn_unknown_proc_keys(&mut warnings, GLOBAL_CONFIG, &v);
         validate_proc(
             &mut warnings,
+            &mut refusals,
             GLOBAL_CONFIG,
             v,
             &crate::proc_policy::ProcPolicy::off(),
@@ -2637,7 +2645,7 @@ fn resolve(
                 &mut warnings,
                 |w, parent| {
                     warn_unknown_proc_keys(w, PROJECT_CONFIG, &value);
-                    validate_proc(w, PROJECT_CONFIG, value, parent)
+                    validate_proc(w, &mut refusals, PROJECT_CONFIG, value, parent)
                 },
             );
         }

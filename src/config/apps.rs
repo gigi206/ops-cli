@@ -578,7 +578,9 @@ fn resolve_app(
             warn_unknown_proc_keys(&mut warnings, &source, &field);
             // A table without a mode inherits from the app's own proc so far, else the baseline.
             let parent = proc.as_ref().unwrap_or(baseline_proc);
-            if let Some(policy) = validate_proc(&mut warnings, &source, field, parent) {
+            if let Some(policy) =
+                validate_proc(&mut warnings, &mut refusals, &source, field, parent)
+            {
                 proc = Some(policy);
                 proc_origin = Provenance::Global;
             }
@@ -818,7 +820,7 @@ fn resolve_app(
                 |w, current| {
                     warn_unknown_proc_keys(w, &source, &field);
                     let parent = current.as_ref().unwrap_or(baseline_proc);
-                    validate_proc(w, &source, field, parent).map(Some)
+                    validate_proc(w, &mut refusals, &source, field, parent).map(Some)
                 },
             );
         }
