@@ -4396,6 +4396,9 @@ mod tests {
         ring.followed(7, interval, &first, false);
         push_event(&ring, "last.test", LogVerdict::Allow, "allowed");
         let cursor = first.head;
+        // Taken before the reader starts its sleep, so the read cannot land sooner than 100 ms
+        // after it, however late this thread is scheduled once the reader is spawned.
+        let begun = Instant::now();
         let reader = {
             let ring = Arc::clone(&ring);
             thread::spawn(move || {
@@ -4405,7 +4408,6 @@ mod tests {
                 next.events.len()
             })
         };
-        let begun = Instant::now();
         ring.linger(LINGER_MAX);
         let took = begun.elapsed();
         assert_eq!(
