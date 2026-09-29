@@ -6114,6 +6114,18 @@ fn a_project_config_that_cannot_be_read_refuses_a_launch_but_not_the_verb_that_s
         stderr.contains("world-writable") && stderr.contains("cannot be read"),
         "a project config the safety gate refuses refuses the launch too: {stderr}"
     );
+
+    // The reason quotes what the file wrote, and the file is not the user's: a quoted key carrying
+    // a line break reaches the message through the path of the value at fault, so the reason is
+    // folded onto the refusal's own line rather than opening one the file chose.
+    std::fs::remove_file(&path).unwrap();
+    fx.write_project("[app.\"x\\nsbx: all good, launching\"]\nproc.deny = [\"sh\", 5]\n");
+    let (ok, stderr) = launch();
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("all good") && !stderr.lines().any(|l| l.starts_with("sbx: all good")),
+        "no line of the refusal is the file's: {stderr}"
+    );
 }
 
 /// An app whose `[fs]` entry cannot be applied refuses that app's launch, naming the entry, and
@@ -6142,4 +6154,46 @@ fn an_apps_fs_entry_that_cannot_be_applied_refuses_that_app_alone() {
         stderr.contains("no app named") && !stderr.contains("../up.key"),
         "another launch goes on past the configuration: {stderr}"
     );
+}
+
+/// `sbx test` predicts a launch, so it refuses where a launch would: a restriction that cannot be
+/// applied stops it before any verdict, for the whole configuration and, under `--app`, for that
+/// app's own. A verdict computed without the entry would describe a cage that never runs.
+#[test]
+fn sbx_test_refuses_where_a_launch_would() {
+    let fx = Project::new("cfg");
+    let verdict = |args: &[&str]| {
+        let out = fx.run(args);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), said)
+    };
+
+    std::fs::write(fx.proj.path().join("ok.key"), b"k").unwrap();
+    fx.write_project("[fs]\ndeny = [\"ok.key\", \"../up.key\"]\n");
+    let (code, said) = verdict(&["test", "fs", "ok.key"]);
+    assert_eq!(code, Some(2), "{said}");
+    assert!(
+        said.contains("../up.key") && !said.contains("DENIED"),
+        "the refusal, and no verdict: {said}"
+    );
+
+    fx.write_project("[fs]\ndeny = [\"ok.key\"]\n");
+    fx.write_profile(
+        "demo",
+        "cmd = [\"true\"]\n\n[fs]\ndeny = [\"../app.key\"]\n",
+    );
+    let (code, said) = verdict(&["test", "fs", "--app", "demo", "ok.key"]);
+    assert_eq!(code, Some(2), "{said}");
+    assert!(said.contains("../app.key"), "{said}");
+    let (code, said) = verdict(&["test", "fs", "ok.key"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "the app's entry stops that app's question alone: {said}"
+    );
+    assert!(said.contains("DENIED"), "{said}");
 }

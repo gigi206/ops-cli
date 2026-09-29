@@ -56,6 +56,11 @@ stopped at. That line is printed as text: a control character or a character tha
 a line is written out as an escape (`\x1b`, `\u{202e}`), so the quote shows what the file
 holds without driving the terminal.
 
+A blob is also refused (exit 2), before it changes anything, when it carries a restriction sbx
+cannot apply: an `[fs]` entry or `scan` pattern the grammar refuses, a `network.deny` entry it
+cannot classify or that names a group nobody defined, a `network` or `proc` mode it does not
+know. An override must be exact, and the launch would otherwise run without that restriction.
+
 ### Typed flags: one field each
 
 Ergonomic shorthands for a single field, each with an `SBX_*` environment equivalent:
@@ -113,7 +118,9 @@ simply has nothing extra to say here.
 
 The side must be named (`deny=` or `readonly=`), because the table holds two lists and a bare
 path could only be guessed into one of them; guessing `readonly` where `deny` was meant leaves a
-secret readable. A value naming neither is a usage error (exit 2), like any other mistyped flag.
+secret readable. A value naming neither is a usage error (exit 2), like any other mistyped flag,
+and so is a path `[fs]` refuses (an absolute path, a `..` component): the launch would otherwise
+run with that path open.
 
 #### `--seccomp` / `--device`: relaxing the cage for one launch
 

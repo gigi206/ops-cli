@@ -24,6 +24,11 @@ override is therefore the verdict that launch would get. Override flags on the c
 belong to the launching verbs, so `sbx test` does not take them; export the variable instead if
 you want to ask about a posture you have not written to the file.
 
+It also refuses where that launch would refuse (exit 2): a config file that cannot be read, or a
+restriction sbx cannot apply, such as an `[fs]` entry the grammar refuses or a `deny` entry it
+cannot classify, is named and no verdict is given, since it would describe a cage that never
+runs. Under `--app`, the app's own entries count too.
+
 See also: [`sbx net`](net) · [`sbx fs`](fs) · [`sbx proc`](proc) · [the `[fs]` table](../configuration/fs) · [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Egress observability](../networking/observability).
 
 ## `sbx test net`

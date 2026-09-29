@@ -73,8 +73,12 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     let mut project = if source.includes_project() {
         read_project(cwd, &mut warnings).unwrap_or_else(|why| {
             warnings.push(format!("ignoring {why}"));
+            // Folded onto one line: the reason quotes what the file wrote (the path of the value
+            // at fault spells its keys, and a quoted key may carry a line break), and the file is
+            // the project's, not the user's. The global config's keeps the parser's drawing.
             refusals.push(format!(
-                "the project config exists but cannot be read: {why}"
+                "the project config exists but cannot be read: {}",
+                crate::diag::one_line(&why)
             ));
             None
         })

@@ -1411,7 +1411,9 @@ impl Resolved {
         }
         // `[fs]` — additive like the two above, and the one field where "trusted by invocation"
         // carries no weight either way: an override can only close more of the project for this
-        // launch, never reopen what a config layer closed.
+        // launch, never reopen what a config layer closed. Unlike the two above, an entry it could
+        // not apply was already fatal, before anything was mutated: skipping it would leave a path
+        // open, where a skipped token or device only relaxes or grants less.
         if let Some(over) = over_fs {
             self.warnings.append(&mut fs_notes);
             // `declares_nothing`, not `is_empty`: the latter asks whether there are mounts to lay
@@ -3363,10 +3365,13 @@ fn apply_fs(
         match crate::open_policy::validate_pattern(&entry) {
             Ok(()) if policy.scan.contains(&entry) => {}
             Ok(()) => policy.scan.push(entry),
+            // The reason may be the regex library's drawing, over several lines: folded, so the
+            // refusal reads as the one line it is.
             Err(reason) => unapplied(format!(
-                "{source}: cannot apply `[fs] scan` pattern `{}` ({reason}), and a launch stops \
-                 rather than let a file of that shape through",
-                crate::diag::visible(&entry)
+                "{source}: cannot apply `[fs] scan` pattern `{}` ({}), and a launch stops rather \
+                 than let a file of that shape through",
+                crate::diag::visible(&entry),
+                crate::diag::one_line(&reason)
             )),
         }
     }
@@ -3384,8 +3389,9 @@ fn apply_fs(
         crate::open_policy::OpenPolicy::compile(&policy.scan, crate::open_policy::MAX_SCAN_DEFAULT)
     {
         unapplied(format!(
-            "{source}: cannot apply `[fs] scan` ({reason}), and a launch stops rather than scan \
-             no file for those shapes"
+            "{source}: cannot apply `[fs] scan` ({}), and a launch stops rather than scan no file \
+             for those shapes",
+            crate::diag::one_line(&reason)
         ));
         policy.scan.clear();
     }
@@ -4311,8 +4317,10 @@ fn classify_entries(
         }
         match crate::allowlist::classify_in(&entry, slot) {
             Ok(rule) => rules.push(rule),
+            // Folded: a `re:` entry's reason is the regex library's drawing, over several lines.
             Err(e) => left_out(format!(
-                "{source_label}: ignoring {list} entry — {e} ({cost})"
+                "{source_label}: ignoring {list} entry — {} ({cost})",
+                crate::diag::one_line(&e.to_string())
             )),
         }
     }

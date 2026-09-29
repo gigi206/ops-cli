@@ -66,8 +66,9 @@ struct NetTestArgs<'a> {
 /// caller could learn by launching, and an override remains trusted by invocation exactly as it
 /// is at launch. What changes is that the answer stops disagreeing with the launch it predicts.
 ///
-/// Fail-closed like a launch: a malformed blob or an unreadable `@file` is reported and nothing is
-/// tested, rather than a verdict computed from a policy that would never have run.
+/// Fail-closed like a launch: a malformed blob, an unreadable `@file`, or a restriction the launch
+/// would refuse over (the configuration's, or the named app's) is reported and nothing is tested,
+/// rather than a verdict computed from a policy that would never have run.
 fn resolved_for(
     verb: &str,
     cwd: &Path,
@@ -76,6 +77,19 @@ fn resolved_for(
     let mut resolved = config::load(cwd);
     for w in &resolved.warnings {
         diag::warn_config(w);
+    }
+    // Read before the overlay is folded, which takes the app out of `apps`.
+    let own = app.and_then(|name| resolved.apps.get(name));
+    let refusals: Vec<&String> = resolved
+        .refusals
+        .iter()
+        .chain(own.into_iter().flat_map(|a| &a.refusals))
+        .collect();
+    if !refusals.is_empty() {
+        for why in refusals {
+            diag::error(&format!("sbx: {verb}: {why}"));
+        }
+        return Err(ExitCode::from(2));
     }
     if let Some(name) = app
         && let Err(e) = fold_app_overlay(&mut resolved, name)
