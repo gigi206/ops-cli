@@ -28,6 +28,11 @@ user namespace there is no security boundary. Fix the listed item (usually bubbl
 `kernel.apparmor_restrict_unprivileged_userns` sysctl) and re-run. See
 [Prerequisites](doctor).
 
+On a host that restricts unprivileged user namespaces, the `capture` line of the same report prints
+an AppArmor profile that lifts the restriction for `sbx` alone, the narrow alternative to the sysctl
+(see [below](#a-launch-warns-about-its-network-namespace)). It lifts the failure even where the
+host's `bwrap` carries no profile of its own.
+
 ## A launch warns about its network namespace
 
 On a host that restricts unprivileged user namespaces (Ubuntu 24.04 and later do by default), a

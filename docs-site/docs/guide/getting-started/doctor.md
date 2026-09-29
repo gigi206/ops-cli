@@ -156,5 +156,11 @@ If `doctor` reports that user namespaces are missing or non-capability-bearing:
   namespace `sbx` prepares for the capture tap and for graphical apps is refused:
   the `capture` line says so and prints what lifts it (see
   [Troubleshooting](troubleshooting#a-launch-warns-about-its-network-namespace)).
+  Where the host's `bwrap` carries no profile of its own, no engine gets the capability
+  and the boundary fails. The profile the `capture` line prints lifts that failure too,
+  because `bwrap` inherits the profile of the `sbx` that starts it. The cage's processes
+  then run under that profile rather than one the host gives `bwrap`, and the default
+  syscall filter still refuses them a nested user namespace, unless a
+  [`[seccomp]` relaxation](../configuration/seccomp) reopens one.
 
 The remediation hint `doctor` prints is specific to what it found.
