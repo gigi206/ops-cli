@@ -5,8 +5,8 @@ description: "Report whether an access would be allowed, and why, without launch
 # `sbx test`
 
 ```
-sbx test net  [--app <name>] [-X|--method <verb>] <url|tcp://host:port>
-sbx test fs   [--app <name>] <path>
+sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>
+sbx test fs [--app <name>] <path>
 sbx test proc [--app <name>] [--caller <path>]... <program>
 ```
 

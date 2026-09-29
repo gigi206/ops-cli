@@ -294,7 +294,7 @@ sbx app run claude-code --detach --observe   # start it; the launch prints the i
 sbx session ls                               # …or find it later, by app name
 
 sbx session logs 12345 -f                    # its output, as it comes
-sbx fs logs   12345 -f                       # what it writes (needs --observe)
+sbx fs logs 12345 -f                         # what it writes (needs --observe)
 sbx proc logs 12345 -f                       # what it executes (needs --observe)
 sbx net logs -f                              # where it goes
 

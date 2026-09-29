@@ -5,15 +5,15 @@ description: "Observe, and under `[proc]` enforcement block, what a running sand
 # `sbx proc`
 
 ```
-sbx proc ls      [<id>] [--json]
-sbx proc live    [<id>] [-i|--interval <secs>] [--json]
-sbx proc logs    [<id>] [-f|--follow] [--json]
+sbx proc ls [<id>] [--json]
+sbx proc live [<id>] [-i|--interval <secs>] [--json]
+sbx proc logs [<id>] [-f|--follow] [--json]
 sbx proc pending [allow|deny <id>] [--json]
-sbx proc allow   <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
-sbx proc deny    <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
+sbx proc allow <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
+sbx proc deny <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
 sbx proc unallow <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
-sbx proc undeny  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
-sbx proc rules   [-a <app>] [--all] [--json]
+sbx proc undeny <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
+sbx proc rules [-a <app>] [--all] [--json]
 ```
 
 Observe, and, under [`[proc]`](../configuration/proc) enforcement, **block**, what a running
@@ -203,7 +203,7 @@ constantly, `ask` is meant to run against a populated `allow` list: see
 
 ```
 sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
-sbx proc deny  <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
+sbx proc deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
 ```
 
 Persist an exec rule to a config file's [`[proc]`](../configuration/proc) `allow`/`deny` list, the sibling of [`sbx net allow`/`deny`](net). The `<rule>` is an exec-target glob (`*`/`?`):
@@ -262,7 +262,7 @@ refuse (`deny`) an `execve` already parked; decide those with [`pending`](#pendi
 
 ```
 sbx proc unallow <rule> [-l|--local|-g|--global] [-a|--app <name>]
-sbx proc undeny  <rule> [-l|--local|-g|--global] [-a|--app <name>]
+sbx proc undeny <rule> [-l|--local|-g|--global] [-a|--app <name>]
 ```
 
 Take one rule back out of the config file it was written to, in the vocabulary it was
@@ -300,8 +300,8 @@ rule ends with its session.
 
 ```sh
 sbx proc unallow git                 # `git` parks again under an `ask` posture
-sbx proc undeny  curl                # stop blocking `curl`
-sbx proc undeny  ssh -a claude-code  # from that app's own [proc] list
+sbx proc undeny curl                 # stop blocking `curl`
+sbx proc undeny ssh -a claude-code   # from that app's own [proc] list
 ```
 
 ## `rules`

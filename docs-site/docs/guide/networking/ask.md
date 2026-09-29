@@ -50,7 +50,7 @@ blocks inside the cage while it waits for your live decision.
 
    ```bash
    sbx net pending allow 12345.7@9657137   # let this destination proceed
-   sbx net pending deny  12345.7@9657137   # refuse it (the cage gets a 403)
+   sbx net pending deny 12345.7@9657137    # refuse it (the cage gets a 403)
    ```
 
    The id addresses one live session's destination. Answering unblocks the parked
@@ -100,7 +100,7 @@ retries). Two flags make an answer stick further:
 sbx net pending allow 12345.7@9657137 --session  # don't ask again this session
 sbx net pending allow 12345.7@9657137 --save     # write an allow rule (project config)
 sbx net pending allow 12345.7@9657137 --save -g  # write it to the global config
-sbx net pending deny  12345.7@9657137 --session  # remember as denied for the session
+sbx net pending deny 12345.7@9657137 --session   # remember as denied for the session
 ```
 
 `--session` and `--save` combine. With `--session`, the destination is remembered
@@ -133,7 +133,7 @@ the live session's overlay ahead of time:
 ```bash
 sbx net allow api.example.com --session          # this project's live session(s)
 sbx net allow api.example.com --session -a bot   # only app `bot`'s session(s)
-sbx net deny  ads.example.com --session --all    # every reachable session, this run only
+sbx net deny ads.example.com --session --all     # every reachable session, this run only
 ```
 
 The proxy folds the overlay into its effective policy, so this works on **any** filtering
@@ -151,7 +151,7 @@ relaunching. It writes no file and dies with the session. See
 
 ```bash
 sbx net pending allow --all                      # allow everything parked, every session
-sbx net pending deny  --all                      # deny everything parked
+sbx net pending deny --all                       # deny everything parked
 sbx net pending allow --all -a claude            # only one app's sessions
 sbx net pending allow --all --session            # …and remember each for its session
 ```

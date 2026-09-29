@@ -5,12 +5,12 @@ description: "Give sbx's data directory a compressed, self-growing filesystem of
 # `sbx storage`
 
 ```
-sbx storage init    [--image <path>] [--size <n>] [--label <name>]
+sbx storage init [--image <path>] [--size <n>] [--label <name>]
 sbx storage migrate [--image <path>] [--force]
-sbx storage use     [--image <path>] [--force]
-sbx storage status  [--image <path>] [--json]
-sbx storage up      [--image <path>]
-sbx storage down    [--image <path>]
+sbx storage use [--image <path>] [--force]
+sbx storage status [--image <path>] [--json]
+sbx storage up [--image <path>]
+sbx storage down [--image <path>]
 sbx storage unuse
 ```
 

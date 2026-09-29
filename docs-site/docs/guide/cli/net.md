@@ -64,7 +64,7 @@ scope flag). See [Egress groups](../networking/groups).
 
 ```
 sbx net allow <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
-sbx net deny  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
+sbx net deny <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
 ```
 
 Validates the rule, then persists it to a config file. `allow` on a fresh config
@@ -94,15 +94,15 @@ nothing to load into.
 ```sh
 sbx net allow api.example.com --session          # for this project's live ask session(s)
 sbx net allow api.example.com --session -a bot   # only app `bot`'s session(s)
-sbx net deny  ads.example.com --session --all    # every reachable session, this run only
+sbx net deny ads.example.com --session --all     # every reachable session, this run only
 ```
 
 ## sbx net unallow, undeny and unmute
 
 ```
 sbx net unallow <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
-sbx net undeny  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
-sbx net unmute  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
+sbx net undeny <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
+sbx net unmute <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
 ```
 
 Each takes one rule back out of the config file it was written to, in the vocabulary it was
@@ -147,8 +147,8 @@ the session; a session flag here is refused rather than silently ignored.
 
 ```sh
 sbx net unallow api.example.com              # take a persisted allow back out
-sbx net undeny  tracker.example.com          # reopen what a deny rule closed
-sbx net unmute  play.googleapis.com -a agy   # stop suppressing that refusal's log line
+sbx net undeny tracker.example.com           # reopen what a deny rule closed
+sbx net unmute play.googleapis.com -a agy    # stop suppressing that refusal's log line
 ```
 
 ## sbx net mute
@@ -353,7 +353,7 @@ sbx net pending deny --all             # drain everything with a refusal
 
 ```sh
 sbx net allow api.example.com --session         # this project's live session(s), immediately
-sbx net deny  ads.example.com --session --all   # every reachable session, this run only
+sbx net deny ads.example.com --session --all    # every reachable session, this run only
 ```
 
 A `--session` rule writes no file, so it never re-trusts the project, and it dies with

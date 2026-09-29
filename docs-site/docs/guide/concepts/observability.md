@@ -28,9 +28,9 @@ They compose into one account of a run, which is the point of the shared id:
 
 ```sh
 sbx run --detach --observe -- claude   # the launch prints the session id
-sbx proc logs   12345 -f               # what it executed
-sbx fs   logs   12345 -f               # what it wrote
-sbx net  logs        -f                # where it went
+sbx proc logs 12345 -f                 # what it executed
+sbx fs logs 12345 -f                   # what it wrote
+sbx net logs -f                        # where it went
 sbx ssh-agent logs 12345 -f            # what it signed
 ```
 
@@ -139,7 +139,7 @@ Live the way `tail -f` lives:
 
 ```sh
 sbx proc logs <pid> --follow        # every new cage process, since launch
-sbx fs   logs <pid> --follow        # every new write to the project tree
+sbx fs logs <pid> --follow          # every new write to the project tree
 sbx proc logs <pid> --json          # one event per line, machine-readable
 ```
 

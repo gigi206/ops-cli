@@ -74,7 +74,7 @@ the same policy):
 ```bash
 sbx net allow api.anthropic.com        # to the project .sbx.toml (default)
 sbx net allow "*.nixos.org" -g         # to the global config
-sbx net deny  telemetry.example.com    # deny always wins
+sbx net deny telemetry.example.com     # deny always wins
 sbx net allow "{POST} api.example.com/submit" -a writer   # under an app
 ```
 
@@ -269,7 +269,7 @@ You can edit the list from the CLI instead of the TOML, with the same scopes as
 config):
 
 ```bash
-sbx net mute   play.googleapis.com -a agy   # add: quiet a profile's telemetry host
+sbx net mute play.googleapis.com -a agy     # add: quiet a profile's telemetry host
 sbx net unmute play.googleapis.com -a agy   # remove (idempotent)
 ```
 

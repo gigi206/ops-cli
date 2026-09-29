@@ -140,10 +140,10 @@ for every app). The compact view counts those instead.
 ## get, set, add, rm, unset
 
 ```
-sbx config get   <key> [-l|-g|-c <file>] [-a|--app <name>]
-sbx config set   <key> <value> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
-sbx config add   <key> <entry> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
-sbx config rm    <key> <entry> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
+sbx config get <key> [-l|-g|-c <file>] [-a|--app <name>]
+sbx config set <key> <value> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
+sbx config add <key> <entry> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
+sbx config rm <key> <entry> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
 sbx config unset <key> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
 ```
 
@@ -168,16 +168,16 @@ sbx config set gpu true                        # boolean, written as one
 sbx config set limits.tasks_max 4096           # integer
 sbx config set fs.deny '[".env", "secrets/"]'  # the whole list
 sbx config add fs.deny .env                    # one entry, rest untouched
-sbx config rm  fs.deny .env
+sbx config rm fs.deny .env
 ```
 
 The difference is what survives. On a file that already reads `fs.deny = [".env"]`:
 
 ```sh
-sbx config set  fs.deny '["secrets/"]'   # → fs.deny = ["secrets/"]          ".env" is gone
-sbx config add  fs.deny .env             # → fs.deny = ["secrets/", ".env"]  both kept
-sbx config set  fs.deny .env             # → refused: a single value for a list
-sbx config add  fs.deny .env             # → already there: no change, no trust lost
+sbx config set fs.deny '["secrets/"]'    # → fs.deny = ["secrets/"]          ".env" is gone
+sbx config add fs.deny .env              # → fs.deny = ["secrets/", ".env"]  both kept
+sbx config set fs.deny .env              # → refused: a single value for a list
+sbx config add fs.deny .env              # → already there: no change, no trust lost
 ```
 
 `set` is a statement: "this is the whole value now". `add` is a suggestion:

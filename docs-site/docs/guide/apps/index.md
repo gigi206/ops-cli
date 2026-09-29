@@ -11,7 +11,7 @@ agent *on* untrusted code, safely and repeatably.
 
 ```sh
 sbx bundle import examples/bundle/claude-code.toml  # what the agent requires
-sbx app import    examples/app/claude-code.toml     # a deliberate trust act
+sbx app import examples/app/claude-code.toml        # a deliberate trust act
 sbx app run claude-code                             # launch it, sandboxed
 ```
 

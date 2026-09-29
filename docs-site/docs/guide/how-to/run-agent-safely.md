@@ -87,9 +87,9 @@ Background agents are where observability pays:
 
 ```sh
 sbx run --detach --observe -- claude   # prints the session id
-sbx proc logs   <id> -f                # what it executed
-sbx fs   logs   <id> -f                # what it wrote
-sbx net  logs        -f                # where it went, request by request
+sbx proc logs <id> -f                  # what it executed
+sbx fs logs <id> -f                    # what it wrote
+sbx net logs -f                        # where it went, request by request
 sbx ssh-agent logs <id> -f             # what it asked your keys to sign
 ```
 

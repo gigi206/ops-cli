@@ -158,7 +158,7 @@ You do not have to edit a file to reference a group:
 ```bash
 sbx net allow @ci-hosts               # add "@ci-hosts" to the project allow list
 sbx net allow @anthropic -a claude    # under an app's [app.claude.network]
-sbx net deny  @telemetry -g           # to the global config's deny list
+sbx net deny @telemetry -g            # to the global config's deny list
 ```
 
 `sbx net allow`/`deny` validate the reference name and write it like any other rule.

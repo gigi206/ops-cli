@@ -195,7 +195,7 @@ the bare `0`, since an `env` value is always stored as a string:
 
 ```sh
 sbx config set --global env.MISE_MINIMUM_RELEASE_AGE 0   # every app
-sbx config set --local  env.MISE_MINIMUM_RELEASE_AGE 0   # this project only
+sbx config set --local env.MISE_MINIMUM_RELEASE_AGE 0    # this project only
 ```
 
 Read it back with `sbx config get --global env.MISE_MINIMUM_RELEASE_AGE`, or remove it

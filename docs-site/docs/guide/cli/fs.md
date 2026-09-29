@@ -5,10 +5,10 @@ description: "Observe the files a running sandbox writes in its project tree, an
 # `sbx fs`
 
 ```
-sbx fs logs       [<id>] [-f|--follow] [--json]
-sbx fs deny       <path> [-l|--local|-g|--global] [-a|--app <name>]
-sbx fs undeny     <path> [-l|--local|-g|--global] [-a|--app <name>]
-sbx fs readonly   <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs logs [<id>] [-f|--follow] [--json]
+sbx fs deny <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs undeny <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs readonly <path> [-l|--local|-g|--global] [-a|--app <name>]
 sbx fs unreadonly <path> [-l|--local|-g|--global] [-a|--app <name>]
 ```
 
@@ -28,7 +28,7 @@ See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx 
 ## `deny` / `readonly`
 
 ```
-sbx fs deny     <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs deny <path> [-l|--local|-g|--global] [-a|--app <name>]
 sbx fs readonly <path> [-l|--local|-g|--global] [-a|--app <name>]
 ```
 
@@ -79,7 +79,7 @@ open rather than at launch.
 ## `undeny` / `unreadonly`
 
 ```
-sbx fs undeny     <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs undeny <path> [-l|--local|-g|--global] [-a|--app <name>]
 sbx fs unreadonly <path> [-l|--local|-g|--global] [-a|--app <name>]
 ```
 
@@ -164,9 +164,9 @@ run did:
 
 ```sh
 sbx run --detach --observe -- claude    # prints the session id
-sbx fs logs   12345 -f                  # what it wrote
+sbx fs logs 12345 -f                    # what it wrote
 sbx proc logs 12345 -f                  # what it executed
-sbx net logs        -f                  # where it went
+sbx net logs -f                         # where it went
 ```
 
 Watching a **detached** session is exactly what these are for: it has no terminal, so

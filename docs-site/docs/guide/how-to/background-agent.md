@@ -37,9 +37,9 @@ so a crashed session prunes itself rather than lingering as a stale row.
 
 ```sh
 sbx session logs <id> -f     # what it printed
-sbx proc    logs <id> -f     # what it executed        (needs --observe)
-sbx fs      logs <id> -f     # what it wrote           (needs --observe)
-sbx net     logs -f          # where it went
+sbx proc logs <id> -f        # what it executed        (needs --observe)
+sbx fs logs <id> -f          # what it wrote           (needs --observe)
+sbx net logs -f              # where it went
 ```
 
 One distinction is worth internalising before you rely on it: `session logs` reads what

@@ -9,7 +9,7 @@ starter profiles**. `sbx` ships **no built-in apps**: you import each deliberate
 
 ```sh
 sbx bundle import examples/bundle/claude-code.toml
-sbx app import    examples/app/claude-code.toml
+sbx app import examples/app/claude-code.toml
 sbx app run claude-code
 ```
 
