@@ -2762,6 +2762,46 @@ fn config_show_single_source_views_restrict_to_one_layer() {
 }
 
 #[test]
+fn a_local_view_resolves_the_bundles_and_groups_a_project_names() {
+    // `config show --local` reads no global config, but a project's `use` and `@<name>` name
+    // entries of the bundle and egress-group libraries, which live in directories of their own.
+    // The view called a reference the launch resolves undeclared, with a stop the launch does not
+    // make, and dropped the rules it expands to. A reference that names nothing is still named.
+    let fx = Project::new("cfg");
+    fx.write_bundle("block", "deny = [\"tracker.example.com\"]\n");
+    fx.write_group("ci", &["ci.example.com"]);
+    let local = |project: &str| {
+        fx.write_project(project);
+        assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+        let out = fx.run(&["config", "show", "--local"]);
+        assert!(out.status.success());
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (stdout, stderr) =
+        local("[network]\nmode = \"deny\"\nallow = [\"@ci\"]\n\n[app.demo]\nuse = [\"block\"]\n");
+    assert!(
+        stdout.contains("allow https://ci.example.com"),
+        "the group the project names expands as it does at launch:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("undefined group") && !stdout.contains("which is not declared"),
+        "a bundle and a group that exist are not called undeclared:\n{stdout}\n{stderr}"
+    );
+
+    let (stdout, stderr) =
+        local("[network]\nmode = \"deny\"\nallow = [\"@nope\"]\n\n[app.demo]\nuse = [\"nope\"]\n");
+    assert!(
+        stderr.contains("references undefined group `@nope`")
+            && stdout.contains("uses bundle `nope`, which is not declared"),
+        "a reference that names nothing is still named:\n{stdout}\n{stderr}"
+    );
+}
+
+#[test]
 fn config_show_rejects_conflicting_source_and_app_flags() {
     let fx = Project::new("cfg");
     // Two different source flags is a user error, not last-wins.

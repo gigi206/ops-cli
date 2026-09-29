@@ -70,6 +70,13 @@ whole contract is read. `[task]` is trust-gated, so an untrusted project shows n
 The single-source flags are mutually exclusive and do not combine with `--app`. Note
 `-d` is `--default`, so `--details` has no short form.
 
+`--local` still reads the [bundle](../configuration/bundles) and
+[egress-group](../networking/groups) files the project's `use` and `@<name>` references
+name, so they resolve as they do at launch rather than being reported as undeclared. What
+depends on a posture, such as a bundle's `deny` entries with no table to land in, is
+weighed over the built-in defaults there, since the global config is not read: the full
+view is the one a launch follows.
+
 ### What `--app` shows, and what it leaves out
 
 The per-app view answers one question: what would this app launch with, and who decided.

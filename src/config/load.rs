@@ -17,7 +17,9 @@ pub(crate) enum Source {
     All,
     /// The global config and imported profiles only; the project layer is ignored.
     Global,
-    /// The project config only; the global config and imported profiles are ignored.
+    /// The project config only; the global config and imported profiles are ignored. The bundle
+    /// and egress-group files its `use` and `@<name>` references name are read, so they resolve
+    /// as they do at launch.
     Local,
     /// Neither config; the built-in defaults alone.
     Default,
@@ -53,7 +55,8 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // Imported app profiles live beside the global config and are trusted by location, so they
     // join the global app layer before resolution — `resolve_app`/`resolve_apps` then gate and
     // layer them exactly like an inline global app, with no special casing. They ride the global
-    // layer, so a `--local` (project-only) view omits them just as it omits the global config.
+    // layer, so a `--local` (project-only) view omits them just as it omits the global config. The
+    // bundles and egress groups a project references are read for it all the same, below.
     // Carried out of the branches: a layer that exists and cannot be read is the one fact a launch
     // must weigh before standing anything up, and a single-source view never reads the other layer.
     let mut refusals = Vec::new();
@@ -68,7 +71,20 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         merge_profile_apps(&mut global, profiles, &mut warnings);
         global
     } else {
-        RawConfig::default()
+        let mut libraries = RawConfig::default();
+        // A project's `use` and `@<name>` name entries of the bundle and egress-group libraries,
+        // which live in directories of their own beside the global config rather than in it. A
+        // `--local` view reads them, and nothing else of the global layer, so a reference resolves
+        // as it does at launch: without them, one that resolves would be called undeclared and
+        // its rules would go missing from the view.
+        if source.includes_project() {
+            let (bundles, groups) = (
+                read_dir_bundles(&mut warnings),
+                read_dir_net_groups(&mut warnings),
+            );
+            merge_config_dirs(&mut libraries, bundles, groups, &mut warnings);
+        }
+        libraries
     };
     let mut project = if source.includes_project() {
         read_project(cwd, &mut warnings).unwrap_or_else(|why| {

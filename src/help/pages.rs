@@ -1797,6 +1797,11 @@ pub(super) const PAGES: &[Page] = &[
             the full layered configuration is shown. Each has a short form — -g, -l, -d, and -a\n\
             for --app; note -d is --default, so --details has no short form.\n\
             \n\
+            --local still reads the bundle and egress-group files the project's `use` and\n\
+            @<name> references name, so they resolve as they do at launch. What depends on a\n\
+            posture, such as a bundle's deny entries with no table to land in, is weighed over\n\
+            the built-in defaults there: the full view is the one a launch follows.\n\
+            \n\
             With --app <name>, the view is one app's effective configuration — the baseline\n\
             folded with the app's overlay — each field tagged (app:global)/(app:project) when the\n\
             app set it, (inherited) when a config layer set it and the app takes that value, or\n\
