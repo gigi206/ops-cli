@@ -391,6 +391,11 @@ impl Judge {
         self
     }
 
+    /// How many questions count against the cap now.
+    pub(crate) fn serving(&self) -> usize {
+        self.serving.load(Ordering::SeqCst)
+    }
+
     /// Let an operator's allow, and what a check kept, lapse after `ttl`.
     pub(crate) fn with_grant_ttl(mut self, ttl: Duration) -> Self {
         self.grant_ttl = ttl;

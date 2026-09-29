@@ -39,11 +39,14 @@
 //! connection ([`Link::connect`]), which crosses as a descriptor. The supervisor answers both from
 //! its own copy of what the decision reads ([`Judge`]), each on a thread of its own and no more of
 //! them at once than twice the policy's connection bound (a connection of the proxy asks one at a
-//! time, an HTTP/2 tunnel two): the reader never waits on a name or a dial.
+//! time, an HTTP/2 tunnel two): the reader never waits on a name or a dial. One thread writes the
+//! answers, and a question stops counting against that bound just before its answer is written,
+//! so the next question the proxy asks on reading it finds the room it left.
 
 mod judge;
 pub(super) mod wire;
 
+use judge::Serving;
 pub(crate) use judge::{Asked, Judge, Plane};
 
 use super::events::Emitter;
@@ -504,6 +507,9 @@ struct SupervisorSide {
     threads: fn(&str) -> std::thread::Builder,
     /// The way to the one thread that runs the admitted refreshes, while it runs.
     refreshes: Mutex<Option<Sender<(u64, Started)>>>,
+    /// The way to the one thread that writes the answers to checks and connections, while it runs:
+    /// each answer travels with the question's place against the judge's cap ([`write_answers`]).
+    answers: Mutex<Option<Sender<(ToProxy, Serving)>>>,
 }
 
 /// What the supervisor knows of the proxy's overlay and of its flushes.
@@ -748,6 +754,7 @@ fn supervise(
         judge,
         threads,
         refreshes: Mutex::new(None),
+        answers: Mutex::new(None),
     });
     // One thread runs every refresh, started here and ended with the link, rather than one per
     // refresh: a process a refresh starts — a signer handed a new key — is tied to the thread that
@@ -763,12 +770,24 @@ fn supervise(
             *locked(&side.refreshes) = Some(jobs);
         }
     }
+    // One thread writes every answer to a check or a connection, so a question's place is given
+    // back before its answer can be read ([`write_answers`]). Without it each question is refused
+    // busy ([`serve_question`]).
+    let (answers, to_write) = channel();
+    let writing = Arc::clone(&side);
+    if threads("sbx-link-answers")
+        .spawn(move || write_answers(&writing, &to_write))
+        .is_ok()
+    {
+        *locked(&side.answers) = Some(answers);
+    }
     let reading = Arc::clone(&side);
     match named_thread("sbx-link-supervisor").spawn(move || read_proxy(&reading, &socket)) {
         Ok(reader) => Ok((Supervisor { side }, reader)),
         Err(e) => {
-            // The refresh thread ends once nothing can queue a refresh for it.
+            // The refresh and answer threads end once nothing can queue work for them.
             locked(&side.refreshes).take();
+            locked(&side.answers).take();
             Err(e)
         }
     }
@@ -884,8 +903,10 @@ fn read_proxy(side: &Arc<SupervisorSide>, socket: &wire::Socket) -> io::Result<(
     socket.shutdown();
     locked(&side.heard).closed = true;
     side.changed.notify_all();
-    // The refresh thread ends once the refresh it may be running does.
+    // The refresh thread ends once the refresh it may be running does, and the answer thread once
+    // the questions still being answered have handed it theirs.
     locked(&side.refreshes).take();
+    locked(&side.answers).take();
     // Nobody is left to hear these answers, and a thread waiting without a timeout would otherwise
     // outlive the proxy that parked the request.
     if let Some(parks) = &side.parks {
@@ -966,13 +987,21 @@ enum Question {
 /// on a name or a dial; or refuse it at once when the judge is already answering as many as it
 /// answers at once, or no thread can be started. The proxy's request waits for an answer either
 /// way.
+///
+/// The answer is handed to the answer thread with the question's place against the cap, and that
+/// thread gives the place back before it writes. Given back after the write, as it was, the place
+/// was still held when the proxy read the answer and asked its next question at once, and that
+/// question was refused busy although the proxy had kept to its bound: two streams of three
+/// answered 503 on a loaded runner.
 fn serve_question(side: &Arc<SupervisorSide>, id: u64, question: Question) {
     let Some(serving) = side.judge.enter() else {
         return refuse(side, id, ConnectRefusal::Busy);
     };
+    let Some(answers) = locked(&side.answers).clone() else {
+        return refuse(side, id, ConnectRefusal::Busy);
+    };
     let answering = Arc::clone(side);
     let started = (side.threads)("sbx-link-connect").spawn(move || {
-        let _serving = serving;
         let judge = &answering.judge;
         // A resolver that panics is answered like a host that cannot be reached: the proxy waits
         // for this answer, and nothing else will send it.
@@ -991,10 +1020,31 @@ fn serve_question(side: &Arc<SupervisorSide>, id: u64, question: Question) {
         }))
         .unwrap_or(Err(ConnectRefusal::Unreachable))
         .unwrap_or_else(|refusal| ToProxy::Refused { id, refusal });
-        let _ = send(&answering, answer);
+        // The answer thread has ended only once the link has; the answer is then sent here, where
+        // it fails as every send after the link does.
+        if let Err(std::sync::mpsc::SendError((answer, serving))) = answers.send((answer, serving))
+        {
+            drop(serving);
+            let _ = send(&answering, answer);
+        }
     });
     if started.is_err() {
         refuse(side, id, ConnectRefusal::Busy);
+    }
+}
+
+/// The answer thread: write each answer to a check or a connection, giving back the place its
+/// question held against the judge's cap just before. Ends once the link has ended and every
+/// answer handed to it is written.
+///
+/// Given back before the write because the proxy may ask its next question as soon as it reads the
+/// answer, and nothing it reads can come before the write. The bound still holds against a proxy
+/// that stops reading: an answer waiting here keeps its place, so at most the cap wait, and one
+/// more is being written.
+fn write_answers(side: &SupervisorSide, queued: &Receiver<(ToProxy, Serving)>) {
+    for (answer, serving) in queued {
+        drop(serving);
+        let _ = send(side, answer);
     }
 }
 
@@ -2054,6 +2104,65 @@ mod tests {
         assert_eq!(
             link.connect(&asked, None, 0).map(|_| ()),
             Err(ConnectRefusal::Busy)
+        );
+    }
+
+    /// An answer the proxy holds no longer counts against the judge's cap: its place was given back
+    /// before it was written, so a proxy that asks again as soon as it is answered, and never has
+    /// more questions out than the cap, is never refused busy. With the place given back after the
+    /// write, a proxy quick enough to ask before the answering thread ended found the cap still
+    /// full.
+    #[test]
+    fn an_answer_the_proxy_holds_no_longer_counts_against_the_cap() {
+        let (judge, _listener, port) = judge_reaching_a_listener();
+        let asked = Asked::inspected("api.test", port, "GET", "/");
+        let capped = Arc::new(Arc::into_inner(judge).unwrap().with_cap(1));
+        let (link, supervisor) = joined(capped, None, None);
+        let judge = supervisor.judge();
+        for _ in 0..50 {
+            let checked = link
+                .check(&asked)
+                .expect("a check within the cap is answered");
+            assert_eq!(judge.serving(), 0, "the check's place outlived its answer");
+            link.connect(&asked, Some(checked.id), 0)
+                .expect("a connection within the cap is answered");
+            assert_eq!(
+                judge.serving(),
+                0,
+                "the connection's place outlived its answer"
+            );
+        }
+    }
+
+    /// The bound holds against a proxy that stops reading: an answer waiting for the answer thread
+    /// keeps its question's place, so no more answers wait than the cap allows, and the place is
+    /// given back only when the thread takes the answer to write it.
+    #[test]
+    fn an_answer_waiting_to_be_written_keeps_its_place() {
+        let judge = Arc::new(Arc::into_inner(default_judge()).unwrap().with_cap(1));
+        let serving = judge.enter().expect("room for one question");
+        let (queue, queued) = channel();
+        queue.send((ToProxy::Checked { id: 1 }, serving)).unwrap();
+        assert!(
+            judge.enter().is_none(),
+            "an answer waiting to be written still holds its place"
+        );
+        drop(queue);
+        let side = SupervisorSide {
+            down: Mutex::new(None),
+            heard: Mutex::new(Heard::default()),
+            changed: Condvar::new(),
+            parks: None,
+            refresh: None,
+            judge: Arc::clone(&judge),
+            threads: named_thread,
+            refreshes: Mutex::new(None),
+            answers: Mutex::new(None),
+        };
+        write_answers(&side, &queued);
+        assert!(
+            judge.enter().is_some(),
+            "taken to be written, it gave its place back"
         );
     }
 
