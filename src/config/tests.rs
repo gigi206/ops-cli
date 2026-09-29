@@ -13994,6 +13994,70 @@ fn a_bare_posture_names_the_table_it_drops_and_stays_quiet_when_it_drops_nothing
     }
 }
 
+/// A one-shot override that brings rules of its own replaces the configuration's for the launch,
+/// and a `deny` rule it drops opens a host the configuration closed: each is named, against the
+/// override, with `--config` as the way to keep it, since `--net` carries one list at a time. That
+/// holds for a list shorthand's table and for a blob's, with a `mode` or without one. A bare
+/// posture is left to its own count, which already says the `deny` went. A rule the override
+/// restates is not named, nor anything under `none`, where nothing reaches.
+#[test]
+fn a_deny_rule_a_one_shot_override_with_rules_of_its_own_drops_is_named() {
+    let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
+    let global = "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n\
+                  deny = [\"tracker.example.com\"]\n";
+    let over = |blob: &str| {
+        let mut r = resolve_no_plugins(parse(global), None);
+        r.apply_override(Override::for_test(parse(blob)), None)
+            .expect("the override applies");
+        r
+    };
+    let named = |r: &Resolved| -> Vec<String> {
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("do not apply to this launch"))
+            .cloned()
+            .collect()
+    };
+
+    for blob in [
+        "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n",
+        "[network]\nmode = \"allow\"\ndeny = [\"ads.example.com\"]\n",
+        "[network]\nallow = [\"*.example.com\"]\n",
+    ] {
+        let r = over(blob);
+        let said = named(&r);
+        assert!(
+            said.len() == 1
+                && said[0].starts_with("override: ")
+                && said[0].contains(
+                    "`deny` rules the layer below carried do not apply to this launch: \
+                     `https://tracker.example.com`"
+                )
+                && said[0].ends_with("restate them through `--config`"),
+            "{blob:?}: {:?}",
+            r.warnings
+        );
+    }
+
+    for blob in [
+        "[network]\nmode = \"allow\"\ndeny = [\"tracker.example.com\", \"ads.example.com\"]\n",
+        "network = \"none\"\n",
+    ] {
+        let r = over(blob);
+        assert!(named(&r).is_empty(), "{blob:?}: {:?}", r.warnings);
+    }
+
+    let bare = over("network = \"allow\"\n");
+    assert!(named(&bare).is_empty(), "{:?}", bare.warnings);
+    assert!(
+        bare.warnings
+            .iter()
+            .any(|w| w.contains("a bare network posture") && w.contains("1 deny")),
+        "the bare posture's own count says the `deny` went: {:?}",
+        bare.warnings
+    );
+}
+
 /// Resolve `global` under `project` at `state`, returning the `demo` app.
 fn contract_app(global: &str, project: Option<(&str, TrustState)>) -> ResolvedApp {
     let global: RawConfig = toml::from_str(global).unwrap();

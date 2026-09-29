@@ -97,11 +97,11 @@ pub(crate) use secrets::sops_ref_file;
 #[cfg(test)]
 use secrets::{validate_header_shape, validate_host_secret, validate_secret_target};
 use validate::{
-    amends_the_layer_below, deny_rules_replaced, replaced_deny_note, validate_contract,
-    validate_device_path, validate_distro, validate_forward, validate_gui, validate_home_scope,
-    validate_limits, validate_mise_engine, validate_network, validate_network_amending,
-    validate_nixpkgs, validate_notify, validate_open, validate_proc, validate_redact_min_len,
-    validate_service, validate_timezone,
+    amends_the_layer_below, deny_rules_replaced, override_replaced_deny_note, replaced_deny_note,
+    validate_contract, validate_device_path, validate_distro, validate_forward, validate_gui,
+    validate_home_scope, validate_limits, validate_mise_engine, validate_network,
+    validate_network_amending, validate_nixpkgs, validate_notify, validate_open, validate_proc,
+    validate_redact_min_len, validate_service, validate_timezone,
 };
 // Exercised by a cross-cutting config unit test (profile merge + the shared `raw_app` builders).
 #[cfg(test)]
@@ -1306,9 +1306,18 @@ impl Resolved {
             // the case worth naming: the operator asked for a posture and lost a list they never
             // mentioned. The refusals that follow then name hosts the app's own rules had covered,
             // which reads as a bug in the app rather than as the consequence of the flag just
-            // typed. A replacement that brings its own rules is a deliberate swap and says nothing.
+            // typed. A replacement that brings its own rules is a deliberate swap, and names only
+            // the `deny` rules it leaves behind, as a config layer's does: each is a host the
+            // configuration closed and this launch may reach. The bare posture's count already
+            // says its `deny` went, so the rules are not named a second time there.
             if let Some(note) = Self::bare_posture_drops_a_table(&self.network, &policy) {
                 self.warnings.push(note);
+            } else {
+                let dropped = deny_rules_replaced(&self.network, &policy);
+                if !dropped.is_empty() {
+                    self.warnings
+                        .push(override_replaced_deny_note(OVERRIDE_SOURCE, &dropped));
+                }
             }
             self.network = policy;
             self.network_origin = Provenance::Override;

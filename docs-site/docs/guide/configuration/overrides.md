@@ -220,10 +220,21 @@ dropped for this launch (11 allow, 2 deny, 16 mute): restate any you still need 
 ```
 
 The line appears only when something is actually lost: a bare posture over a project with no
-rules of its own says nothing, and neither does a `--config` blob that brings its own table,
-which is a deliberate swap rather than a silent loss. Without it the first symptom was a refusal
-naming a host the app's own rules had covered, which reads as a fault in the app instead of the
-consequence of the flag just typed.
+rules of its own says nothing. Without it the first symptom was a refusal naming a host the
+app's own rules had covered, which reads as a fault in the app instead of the consequence of the
+flag just typed.
+
+A value that brings rules of its own, a list shorthand below or a `--config` blob with its own
+table, is a deliberate swap rather than a silent loss, so its lists go unremarked, except the
+`deny` rules it leaves behind: each is a host the configuration closed and this launch may
+reach, so each is named, as a config layer's replacing table names them. With
+`deny = ["tracker.example.com"]` in the configuration and `--net deny=ads.example.com`:
+
+```text
+sbx: warning: override: this `network` posture replaces the one below it rather than adding to it, so `deny` rules the layer below carried do not apply to this launch: `https://tracker.example.com`. To keep them for this launch, restate them through `--config`
+```
+
+A rule the override restates is not named, nor anything under `none`, where nothing reaches.
 
 The `allow=`/`deny=` **list shorthands** build the common one-shot egress shapes:
 

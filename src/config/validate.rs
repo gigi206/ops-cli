@@ -822,21 +822,46 @@ pub(super) fn deny_rules_replaced(below: &NetworkPolicy, incoming: &NetworkPolic
 /// A replacing table names only the settings it drops, since replacing the rules is what declaring
 /// a table is for. A `deny` is the exception: each is a host the layer below closed and this
 /// posture may reach, so they are named rather than counted, unlike the one-shot override's note
-/// (`Resolved::bare_posture_drops_a_table`), and a `deny` list is short enough to read.
+/// for a bare posture (`Resolved::bare_posture_drops_a_table`), and a `deny` list is short enough
+/// to read.
 pub(super) fn replaced_deny_note(
     source_label: &str,
     whose: &str,
     whom: &str,
     entries: &[String],
 ) -> String {
+    format!(
+        "{}. To keep them, re-declare them under `deny` in a `[network]` table here",
+        replaced_deny_fact(source_label, whose, whom, entries)
+    )
+}
+
+/// [`replaced_deny_note`] for a one-shot override that brings rules of its own, which replaces
+/// the policy of the configuration it is laid over for this launch. The way to keep the entries
+/// differs: `--net` carries one list at a time, so a `deny` kept beside an `allow` list is
+/// restated through `--config`, as the bare posture's note advises for the rules it counts.
+pub(super) fn override_replaced_deny_note(source_label: &str, entries: &[String]) -> String {
+    format!(
+        "{}. To keep them for this launch, restate them through `--config`",
+        replaced_deny_fact(
+            source_label,
+            "rules the layer below carried",
+            "this launch",
+            entries
+        )
+    )
+}
+
+/// The sentence both notes on replaced `deny` entries open with: what replaced them, where they
+/// were written, what no longer has them, and each entry, made visible.
+fn replaced_deny_fact(source_label: &str, whose: &str, whom: &str, entries: &[String]) -> String {
     let list: Vec<String> = entries
         .iter()
         .map(|entry| format!("`{}`", crate::diag::visible(entry)))
         .collect();
     format!(
         "{source_label}: this `network` posture replaces the one below it rather than adding to \
-         it, so `deny` {whose} do not apply to {whom}: {}. To keep them, re-declare them under \
-         `deny` in a `[network]` table here",
+         it, so `deny` {whose} do not apply to {whom}: {}",
         list.join(", ")
     )
 }

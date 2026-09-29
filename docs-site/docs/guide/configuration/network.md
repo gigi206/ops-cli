@@ -629,6 +629,8 @@ sbx: warning: .sbx.toml: this `network` posture replaces the one below it rather
 
 An app profile's own `network` replaces that baseline for the app, and is named the same way,
 against the profile and for that app alone: `apps/<name>.toml: … do not apply to this app: …`.
+A one-shot override that brings rules of its own names them for the launch it shapes: see
+[One-shot overrides](overrides#the---net-posture).
 Nothing is said for a rule the replacing table keeps, or under `none`, where nothing reaches.
 Re-declare the ones you want in the table that replaced them. Three things stand outside this:
 the mode, inherited when omitted (above); `stats`, which is read outside the table and applies

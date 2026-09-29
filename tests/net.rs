@@ -2477,6 +2477,51 @@ fn a_test_verb_answers_under_the_one_shot_override_a_launch_would_carry() {
 }
 
 #[test]
+fn a_deny_rule_a_one_shot_override_with_rules_of_its_own_drops_is_named() {
+    // A one-shot value that brings rules of its own replaces the configuration's, `deny` included,
+    // so the host that `deny` closed is reachable for the launch. `test net` predicts the launch,
+    // so it names the rule the override leaves behind; a value that restates it names nothing.
+    let fx = Project::new("net");
+    fx.write_global(
+        "[network]\nmode = \"deny\"\nallow = [\"*.example.test\"]\n\
+         deny = [\"tracker.example.test\"]\n",
+    );
+    let under = |value: &str| {
+        let out = fx
+            .cmd(&["test", "net", "https://tracker.example.test/x"])
+            .env("SBX_NET", value)
+            .output()
+            .expect("spawn sbx");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (out, err) = under("deny=ads.example.test");
+    assert!(
+        out.contains("ALLOWED"),
+        "the override's own denylist does not carry the configuration's:\n{out}"
+    );
+    assert!(
+        err.contains("override: this `network` posture replaces the one below it")
+            && err.contains("do not apply to this launch: `https://tracker.example.test`")
+            && err.contains("restate them through `--config`"),
+        "the rule left behind is named, with the way to keep it:\n{err}"
+    );
+
+    let (out, err) = under("deny=ads.example.test,tracker.example.test");
+    assert!(
+        out.contains("DENIED"),
+        "a restated rule still closes its host:\n{out}"
+    );
+    assert!(
+        !err.contains("do not apply to this launch"),
+        "a rule the override restates is not named:\n{err}"
+    );
+}
+
+#[test]
 fn the_override_reaches_every_test_verb_and_not_only_the_one_that_wanted_it() {
     // The three verbs resolve their configuration through one function, so the override cannot
     // reach `test net` and miss the others. `test fs` is the witness: its mask arrives by a whole
