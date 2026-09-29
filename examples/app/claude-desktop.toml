@@ -1,13 +1,13 @@
 # Claude Desktop — Anthropic's official desktop app (Chat + Cowork + Code), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/claude-desktop.toml
-#   sbx app import    examples/app/claude-desktop.toml
+#   sbx app import examples/app/claude-desktop.toml
 #   sbx app run claude-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's `.deb`, the sign-in browser, the
 # environment it reads and the hosts it reaches come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/claude-desktop.toml
-#     sbx app import    examples/app/claude-desktop.toml
+#     sbx app import examples/app/claude-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

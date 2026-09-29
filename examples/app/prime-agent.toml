@@ -2,13 +2,13 @@
 # (PrimeIntellect-ai/prime-agent), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/prime-agent.toml
-#   sbx app import    examples/app/prime-agent.toml
+#   sbx app import examples/app/prime-agent.toml
 #   sbx app run prime-agent                      # interactive TUI, working on the current project
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The runtime its installer needs and the hosts it reaches come from a
 # shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/prime-agent.toml
-#     sbx app import    examples/app/prime-agent.toml
+#     sbx app import examples/app/prime-agent.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #   sbx app run prime-agent -- -p "<task>"       # one-shot, non-interactive

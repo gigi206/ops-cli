@@ -1,7 +1,7 @@
 # AionUi — the multi-agent "Cowork" desktop app (iOfficeAI/AionUi), sandboxed by sbx on Wayland.
 #
 #   sbx bundle import examples/bundle/opencode.toml
-#   sbx app import    examples/app/aionui.toml
+#   sbx app import examples/app/aionui.toml
 #   sbx app run aionui
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
@@ -27,7 +27,7 @@
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/opencode.toml
-#     sbx app import    examples/app/aionui.toml
+#     sbx app import examples/app/aionui.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent (this file used to miss `platform.claude.com`). The
 # other standalone agent profiles point at their own bundles the same way; only the profiles

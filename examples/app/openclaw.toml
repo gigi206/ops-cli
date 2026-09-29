@@ -1,13 +1,13 @@
 # OpenClaw — Personal AI Assistant you run on your own devices, sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/openclaw.toml
-#   sbx app import    examples/app/openclaw.toml
+#   sbx app import examples/app/openclaw.toml
 #   sbx app run openclaw
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/openclaw.toml
-#     sbx app import    examples/app/openclaw.toml
+#     sbx app import examples/app/openclaw.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

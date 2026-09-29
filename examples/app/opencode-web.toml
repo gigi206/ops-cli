@@ -1,13 +1,13 @@
 # opencode web — opencode's browser UI, served headless in the cage, opened in your HOST browser.
 #
 #   sbx bundle import examples/bundle/opencode.toml
-#   sbx app import    examples/app/opencode-web.toml
+#   sbx app import examples/app/opencode-web.toml
 #   sbx app run opencode-web
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/opencode.toml
-#     sbx app import    examples/app/opencode-web.toml
+#     sbx app import examples/app/opencode-web.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #   # then open http://127.0.0.1:4096 in your browser

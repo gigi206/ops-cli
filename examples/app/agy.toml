@@ -1,14 +1,14 @@
 # Antigravity CLI (agy) — Google's terminal coding agent, sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/agy.toml
-#   sbx app import    examples/app/agy.toml
+#   sbx app import examples/app/agy.toml
 #   sbx app run agy
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, and its Google account sign-in from a shared egress GROUP — import both:
-#     sbx bundle import    examples/bundle/agy.toml
+#     sbx bundle import examples/bundle/agy.toml
 #     sbx net groups import examples/net-groups/google-oauth.toml
-#     sbx app import       examples/app/agy.toml
+#     sbx app import examples/app/agy.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
@@ -104,7 +104,7 @@ exec agy "$@"
 # profile cannot fall behind when the agent's requirements change.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
-#     sbx bundle import    examples/bundle/agy.toml
+#     sbx bundle import examples/bundle/agy.toml
 # Without it the launch warns that a bundle is undeclared and the agent is simply absent.
 # The `agy` bundle carries the agent itself; the Google account sign-in hosts (accounts.google.com,
 # oauth2.googleapis.com, …) live in the app's OWN [network] allow below, not in the bundle.

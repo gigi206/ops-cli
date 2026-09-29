@@ -1,13 +1,13 @@
 # Dirac — an open-source coding agent built around context curation, sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/dirac.toml
-#   sbx app import    examples/app/dirac.toml
+#   sbx app import examples/app/dirac.toml
 #   sbx app run dirac
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/dirac.toml
-#     sbx app import    examples/app/dirac.toml
+#     sbx app import examples/app/dirac.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

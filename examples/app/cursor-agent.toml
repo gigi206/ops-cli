@@ -1,13 +1,13 @@
 # Cursor CLI — Cursor's headless terminal coding agent (`cursor-agent`), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/cursor-agent.toml
-#   sbx app import    examples/app/cursor-agent.toml
+#   sbx app import examples/app/cursor-agent.toml
 #   sbx app run cursor-agent -- -p "your task here"        # headless: prompt in, result out
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent itself and the hosts it reaches come from a
 # shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/cursor-agent.toml
-#     sbx app import    examples/app/cursor-agent.toml
+#     sbx app import examples/app/cursor-agent.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #   sbx app run cursor-agent                               # interactive TUI

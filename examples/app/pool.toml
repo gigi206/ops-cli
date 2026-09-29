@@ -1,13 +1,13 @@
 # Poolside Agent CLI — Poolside's coding agent CLI (`pool`), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/pool.toml
-#   sbx app import    examples/app/pool.toml
+#   sbx app import examples/app/pool.toml
 #   sbx app run pool -- "<task>"            # run a task (the agent's entrypoint)
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent itself, the resolver that keeps it
 # current and the hosts it reaches come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/pool.toml
-#     sbx app import    examples/app/pool.toml
+#     sbx app import examples/app/pool.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #   sbx app run pool                        # interactive REPL / terminal

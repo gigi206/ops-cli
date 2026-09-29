@@ -1,13 +1,13 @@
 # Hermes — NousResearch's open-source agent, served as a browser dashboard by sbx.
 #
 #   sbx bundle import examples/bundle/hermes.toml
-#   sbx app import    examples/app/hermes-web.toml
+#   sbx app import examples/app/hermes-web.toml
 #   sbx app run hermes-web        # then open http://127.0.0.1:9119 in your host browser
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/hermes.toml
-#     sbx app import    examples/app/hermes-web.toml
+#     sbx app import examples/app/hermes-web.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

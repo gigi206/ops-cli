@@ -1,13 +1,13 @@
 # Hermes Desktop — NousResearch's native Electron desktop app, built from source in the cage.
 #
 #   sbx bundle import examples/bundle/hermes-desktop.toml
-#   sbx app import    examples/app/hermes-desktop.toml
+#   sbx app import examples/app/hermes-desktop.toml
 #   sbx app run hermes-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The desktop build, the browser toolset, the
 # environment they read and the hosts they reach come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/hermes-desktop.toml
-#     sbx app import    examples/app/hermes-desktop.toml
+#     sbx app import examples/app/hermes-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

@@ -2,7 +2,7 @@
 # drives other coding agents, sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/traycer-desktop.toml
-#   sbx app import    examples/app/traycer-desktop.toml
+#   sbx app import examples/app/traycer-desktop.toml
 #   sbx app run traycer-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.deb` it installs, the resolver that rolls it

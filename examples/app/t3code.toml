@@ -1,7 +1,7 @@
 # T3 Code — the open-source control plane for coding agents (pingdotgg/t3code), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/claude-code.toml
-#   sbx app import    examples/app/t3code.toml
+#   sbx app import examples/app/t3code.toml
 #   sbx app run t3code
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):

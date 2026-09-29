@@ -1,13 +1,13 @@
 # Cursor — the Cursor AI code editor (desktop, Electron / VS Code fork), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/cursor.toml
-#   sbx app import    examples/app/cursor.toml
+#   sbx app import examples/app/cursor.toml
 #   sbx app run cursor
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The editor's package, its auto-upgrade resolver,
 # the sign-in browser and the hosts they reach come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/cursor.toml
-#     sbx app import    examples/app/cursor.toml
+#     sbx app import examples/app/cursor.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

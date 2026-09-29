@@ -1,13 +1,13 @@
 # freebuff desktop — the Electron GUI of Freebuff (by CodebuffAI), sandboxed by sbx (Wayland display).
 #
 #   sbx bundle import examples/bundle/freebuff-desktop.toml
-#   sbx app import    examples/app/freebuff-desktop.toml
+#   sbx app import examples/app/freebuff-desktop.toml
 #   sbx app run freebuff-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.AppImage`, its auto-upgrade resolver, the
 # sign-in browser and the hosts they reach come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/freebuff-desktop.toml
-#     sbx app import    examples/app/freebuff-desktop.toml
+#     sbx app import examples/app/freebuff-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

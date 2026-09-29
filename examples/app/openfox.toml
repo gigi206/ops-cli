@@ -1,7 +1,7 @@
 # OpenFox — a local-LLM web coding agent (github.com/co-l/openfox), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/openfox.toml
-#   sbx app import    examples/app/openfox.toml
+#   sbx app import examples/app/openfox.toml
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
@@ -10,7 +10,7 @@
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/openfox.toml
-#     sbx app import    examples/app/openfox.toml
+#     sbx app import examples/app/openfox.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

@@ -1,7 +1,7 @@
 # Kiro CLI — AWS's agentic coding CLI (the rebranded Amazon Q Developer CLI), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/kiro.toml
-#   sbx app import    examples/app/kiro.toml
+#   sbx app import examples/app/kiro.toml
 #   sbx app run kiro -- login --license free   # authenticate once (in-cage browser, see below)
 #   sbx app run kiro -- chat                    # agentic chat/coding mode (strict egress)
 #   sbx app run kiro                            # the CLI (kiro-cli)
@@ -9,7 +9,7 @@
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The CLI package, the sign-in browser and the
 # hosts they reach come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/kiro.toml
-#     sbx app import    examples/app/kiro.toml
+#     sbx app import examples/app/kiro.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

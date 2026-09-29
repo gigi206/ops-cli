@@ -1,13 +1,13 @@
 # Kilo Code (kilo) — a terminal AI coding agent (an opencode fork), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/kilocode.toml
-#   sbx app import    examples/app/kilocode.toml
+#   sbx app import examples/app/kilocode.toml
 #   sbx app run kilocode
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/kilocode.toml
-#     sbx app import    examples/app/kilocode.toml
+#     sbx app import examples/app/kilocode.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

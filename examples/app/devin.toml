@@ -1,13 +1,13 @@
 # devin — Devin CLI, the Rust terminal coding agent from Cognition, sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/devin.toml
-#   sbx app import    examples/app/devin.toml
+#   sbx app import examples/app/devin.toml
 #   sbx app run devin
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent itself, the resolver that keeps it
 # current and the hosts it reaches come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/devin.toml
-#     sbx app import    examples/app/devin.toml
+#     sbx app import examples/app/devin.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

@@ -1,14 +1,14 @@
 # GitHub Copilot CLI — the Copilot coding agent in your terminal, sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/copilot.toml
-#   sbx app import    examples/app/copilot.toml
+#   sbx app import examples/app/copilot.toml
 #   sbx app run copilot
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, and its GitHub account sign-in from a shared egress GROUP — import both:
-#     sbx bundle import    examples/bundle/copilot.toml
+#     sbx bundle import examples/bundle/copilot.toml
 #     sbx net groups import examples/net-groups/github-oauth.toml
-#     sbx app import       examples/app/copilot.toml
+#     sbx app import examples/app/copilot.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
@@ -84,7 +84,7 @@ exec copilot "$@"
 # profile cannot fall behind when the agent's requirements change.
 #
 # THE BUNDLE AND THE GROUP ARE NOT IN THIS FILE — import them too, in any order:
-#     sbx bundle import    examples/bundle/copilot.toml
+#     sbx bundle import examples/bundle/copilot.toml
 #     sbx net groups import examples/net-groups/github-oauth.toml
 # Without them the launch warns that a bundle/group is undeclared and the agent is simply absent.
 # The `copilot` bundle carries the agent itself; the GitHub account sign-in hosts

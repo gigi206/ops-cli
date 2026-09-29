@@ -1,13 +1,13 @@
 # rovo — Rovo Dev CLI (Atlassian's coding agent), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/rovo.toml
-#   sbx app import    examples/app/rovo.toml
+#   sbx app import examples/app/rovo.toml
 #   sbx app run rovo
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The Atlassian CLI this agent rides on, and the
 # hosts it reaches, come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/rovo.toml
-#     sbx app import    examples/app/rovo.toml
+#     sbx app import examples/app/rovo.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #   sbx app run rovo -- auth login

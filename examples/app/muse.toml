@@ -1,13 +1,13 @@
 # muse — Muse Code, Meta's terminal coding agent (Muse Spark), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/muse.toml
-#   sbx app import    examples/app/muse.toml
+#   sbx app import examples/app/muse.toml
 #   sbx app run muse
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The zone database it reads and the hosts it reaches come from a
 # shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/muse.toml
-#     sbx app import    examples/app/muse.toml
+#     sbx app import examples/app/muse.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

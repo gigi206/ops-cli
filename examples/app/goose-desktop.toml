@@ -1,13 +1,13 @@
 # Goose Desktop — Block's extensible AI agent as a GRAPHICAL Electron app, sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/goose-desktop.toml
-#   sbx app import    examples/app/goose-desktop.toml
+#   sbx app import examples/app/goose-desktop.toml
 #   sbx app run goose-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's `.deb` and the environment it reads come
 # from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/goose-desktop.toml
-#     sbx app import    examples/app/goose-desktop.toml
+#     sbx app import examples/app/goose-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

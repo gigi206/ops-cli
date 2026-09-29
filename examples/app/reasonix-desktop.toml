@@ -1,14 +1,14 @@
 # reasonix-desktop — the Reasonix desktop shell (reasonix.io), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/reasonix-desktop.toml
-#   sbx app import    examples/app/reasonix-desktop.toml
+#   sbx app import examples/app/reasonix-desktop.toml
 #   sbx app run reasonix-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.deb`, its resolver and library list, the
 # environment the shell needs to start, and its provider host come from a shared BUNDLE, so import
 # it too:
 #     sbx bundle import examples/bundle/reasonix-desktop.toml
-#     sbx app import    examples/app/reasonix-desktop.toml
+#     sbx app import examples/app/reasonix-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

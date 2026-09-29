@@ -1,13 +1,13 @@
 # Codex Desktop — OpenAI's desktop app (Chat + Work + Codex), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/codex-desktop.toml
-#   sbx app import    examples/app/codex-desktop.toml
+#   sbx app import examples/app/codex-desktop.toml
 #   sbx app run codex-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's `.deb`, the sign-in browser, the extra
 # libraries its build needs and the hosts it reaches come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/codex-desktop.toml
-#     sbx app import    examples/app/codex-desktop.toml
+#     sbx app import examples/app/codex-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

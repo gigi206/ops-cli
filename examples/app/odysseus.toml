@@ -2,13 +2,13 @@
 # notes, calendar, local-model workflows), served as a web UI by sbx.
 #
 #   sbx bundle import examples/bundle/odysseus.toml
-#   sbx app import    examples/app/odysseus.toml
+#   sbx app import examples/app/odysseus.toml
 #   sbx app run odysseus
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The substrate its source build needs and the hosts it reaches come from a
 # shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/odysseus.toml
-#     sbx app import    examples/app/odysseus.toml
+#     sbx app import examples/app/odysseus.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #   # then open http://127.0.0.1:7000 in your host browser

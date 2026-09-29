@@ -2,7 +2,7 @@
 # sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/traycer.toml
-#   sbx app import    examples/app/traycer.toml
+#   sbx app import examples/app/traycer.toml
 #   sbx app run traycer
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The packages it installs and the hosts it reaches

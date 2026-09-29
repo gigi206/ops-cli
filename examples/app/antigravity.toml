@@ -1,13 +1,13 @@
 # Antigravity IDE — Google's agentic IDE (desktop, Electron / VS Code fork), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/antigravity.toml
-#   sbx app import    examples/app/antigravity.toml
+#   sbx app import examples/app/antigravity.toml
 #   sbx app run antigravity
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The IDE tarball, its auto-upgrade resolver, the
 # sign-in browser and the hosts they reach come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/antigravity.toml
-#     sbx app import    examples/app/antigravity.toml
+#     sbx app import examples/app/antigravity.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

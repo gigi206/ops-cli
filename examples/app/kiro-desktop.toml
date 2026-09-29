@@ -1,13 +1,13 @@
 # Kiro — the Kiro agentic IDE (desktop, Electron / Code-OSS fork), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/kiro-desktop.toml
-#   sbx app import    examples/app/kiro-desktop.toml
+#   sbx app import examples/app/kiro-desktop.toml
 #   sbx app run kiro-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The IDE tarball, its auto-upgrade resolver, the
 # sign-in browser and the hosts they reach come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/kiro-desktop.toml
-#     sbx app import    examples/app/kiro-desktop.toml
+#     sbx app import examples/app/kiro-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

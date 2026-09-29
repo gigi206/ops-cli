@@ -1,7 +1,7 @@
 # Open Design — the local-first, open-source design studio, served in a host browser by sbx.
 #
 #   sbx bundle import examples/bundle/opencode.toml
-#   sbx app import    examples/app/open-design.toml
+#   sbx app import examples/app/open-design.toml
 #   sbx app run open-design
 #   # then open http://127.0.0.1:17573 in your host browser
 #
@@ -163,7 +163,7 @@ home_scope = "global"
 # profile, so this file cannot fall behind when the agent's requirements change.  IMPORT THE BUNDLE
 # TOO — it is not in this file:
 #     sbx bundle import examples/bundle/opencode.toml
-#     sbx app    import examples/app/open-design.toml
+#     sbx app import examples/app/open-design.toml
 # Without it the app resolves with a note saying the bundle is undeclared, and the engine is absent.
 #
 # The bundle installs the binary as `opencode`; Open Design's runtime def looks for `opencode-cli`

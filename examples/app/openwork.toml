@@ -1,13 +1,13 @@
 # OpenWork — the open-source agent workspace (different-ai/openwork), sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/openwork.toml
-#   sbx app import    examples/app/openwork.toml
+#   sbx app import examples/app/openwork.toml
 #   sbx app run openwork
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.AppImage`, its auto-upgrade resolver and the
 # hosts the app reaches come from a shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/openwork.toml
-#     sbx app import    examples/app/openwork.toml
+#     sbx app import examples/app/openwork.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
 # requirements silently falls behind the app.
 #

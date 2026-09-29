@@ -1,13 +1,13 @@
 # omp — a high-capability, multi-provider (BYOK) terminal coding agent forked from Pi, sandboxed by sbx.
 #
 #   sbx bundle import examples/bundle/omp.toml
-#   sbx app import    examples/app/omp.toml
+#   sbx app import examples/app/omp.toml
 #   sbx app run omp
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
 # BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/omp.toml
-#     sbx app import    examples/app/omp.toml
+#     sbx app import examples/app/omp.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
