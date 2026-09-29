@@ -1243,10 +1243,10 @@ mod tests {
     }
 
     /// A toast's text is laid out by the notification daemon, under the bidirectional algorithm: a
-    /// right-to-left override in a subject turns around what follows it.
-    /// The subjects here are the two a cage or a project writes: a program's path, read out of the
-    /// calling process's memory, and the name of a `[plugin.*]` table an untrusted project
-    /// declared, quoted by the warning that drops it.
+    /// right-to-left override in a subject turns around what follows it. The subjects here are the
+    /// two a cage or a project writes: a program's path, read out of the calling process's memory,
+    /// and the name of a `[plugin.*]` table an untrusted project declared, quoted by the warning
+    /// that drops it.
     #[test]
     fn a_toast_carries_no_character_that_breaks_or_turns_around_its_line() {
         let out = deliveries(
