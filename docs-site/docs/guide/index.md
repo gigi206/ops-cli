@@ -22,7 +22,7 @@ carries its own rationale and its own limits; what cuts across all of them is ga
 
 [The section](getting-started/) in four pages:
 
-- [Installation](getting-started/installation): build the static binary, or a dev build.
+- [Installation](getting-started/installation): the one-command install, or a build from source.
 - [Quick start](getting-started/quickstart): your first sandboxed command in five minutes.
 - [`sbx doctor` and prerequisites](getting-started/doctor): the runtime requirements and how to check them.
 - [Troubleshooting](getting-started/troubleshooting): the symptoms you may hit first, and the page that owns each fix.

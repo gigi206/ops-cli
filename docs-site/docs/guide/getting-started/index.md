@@ -5,12 +5,12 @@ description: "Check the machine can host a cage, build the binary, run something
 
 # Getting started
 
-Four pages, in order: check the machine can host a cage, build the binary, run
+Four pages, in order: check the machine can host a cage, install the binary, run
 something inside one, and know where to look when it refuses. Fifteen minutes end to
 end on a machine that already has the prerequisites.
 
-- [Installation](installation): the static binary, a dev build, and what the install
-  script places where.
+- [Installation](installation): the one-command install and what it places where, or a
+  build from source.
 - [Quick start](quickstart): your first sandboxed command, a project's toolchain, and a
   first agent launch.
 - [`sbx doctor` and prerequisites](doctor): the kernel features and host tools a cage
