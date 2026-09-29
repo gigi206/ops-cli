@@ -207,8 +207,9 @@ pub(super) fn validate_host_secret(
     let name = match raw.name.as_deref() {
         Some(n) => validate_secret_name(n)?.to_string(),
         // The classified rule's **host**, not the raw section key. A key may carry a path, and a
-        // path is held to nothing like `is_valid_hostname`: measured, `classify` accepts a control
-        // byte, a newline, an ESC introducer and a `}` inside one. This name is rendered as
+        // path is held to nothing like `is_valid_hostname`: measured when this was written,
+        // `classify` accepted a control byte, a newline, an ESC introducer and a `}` inside one,
+        // and it has refused a control character in any entry since. This name is rendered as
         // `${name}` wherever a value is withheld and into every diagnostic that mentions the
         // credential, so a default taken from the key could forge a placeholder or drive the
         // terminal reading it — the two things `validate_secret_name` refuses for a name an author

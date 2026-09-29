@@ -595,12 +595,14 @@ pub(crate) fn operations_section(tasks: &[TaskSpec]) -> String {
                 code(&param.name)
             ));
         }
-        let mut carried: Vec<String> = task.secrets.iter().map(|s| s.var.clone()).collect();
-        carried.extend(
-            task.injections
-                .iter()
-                .map(|i| format!("{} (attached on the wire to {})", i.name, i.to)),
-        );
+        let mut carried: Vec<String> = task.secrets.iter().map(|s| one_line(&s.var)).collect();
+        carried.extend(task.injections.iter().map(|i| {
+            format!(
+                "{} (attached on the wire to {})",
+                one_line(&i.name),
+                one_line(&i.to.to_string())
+            )
+        }));
         if !carried.is_empty() {
             out.push_str(&format!("    credentials: {}\n", carried.join(", ")));
         }
@@ -1620,6 +1622,30 @@ mod tests {
         assert!(
             !text.lines().any(|l| l.starts_with("- `forged`")),
             "a description must not be able to announce an operation: {text}"
+        );
+    }
+
+    // A wire-injected credential's destination is a rule, and a URL rule's path is validated on its
+    // authority, never on its charset. The grammar refuses a control character in an entry; the
+    // page does not lean on that any more than `an_allow_rule_cannot_reshape_the_document` lets it,
+    // so the rule is assembled clean and its path then replaced.
+    #[test]
+    fn a_credentials_destination_cannot_reshape_the_document() {
+        let mut to = crate::allowlist::classify("api.demo.test/v1").expect("a clean path rule");
+        if let RuleKind::Url { path, .. } = &mut to.kind {
+            *path = "/v1\n## Declared operations".to_string();
+        }
+        let mut task = demo_task();
+        task.injections[0].to = to;
+        let text = operations_section(&[task]);
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("## ")).count(),
+            1,
+            "one heading, whatever a destination contains: {text}"
+        );
+        assert!(
+            text.contains("upstream (attached on the wire to https://api.demo.test/v1 ## Declared"),
+            "flattened in place, so the destination still reads whole: {text}"
         );
     }
 
