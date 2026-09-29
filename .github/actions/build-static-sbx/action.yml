@@ -164,11 +164,10 @@ runs:
         if [ -e "$knob" ]; then
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         fi
-        t=sandbox::distro::unpack::tests::
-        t+=a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else
+        t=unpack::tests::a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else
         log="$RUNNER_TEMP/unpack-in-its-cage.log"
         PATH="$(dirname "$BWRAP_ENGINE"):$PATH" RUSTFLAGS="-D warnings" \
-          cargo test --bins -- --exact "$t" | tee "$log"
+          cargo test --bins -- "$t" | tee "$log"
         grep -q '^test result: ok\. 1 passed' "$log"
 
     - name: Build the bundled static musl binary
