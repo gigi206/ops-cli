@@ -1719,6 +1719,7 @@ fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
             app.warnings.push(replaced_deny_note(
                 &project_app_source(&name),
                 "entries of a bundle its profile uses",
+                "this app",
                 &deny,
             ));
         }

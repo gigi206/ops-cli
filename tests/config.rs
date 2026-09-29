@@ -4604,6 +4604,42 @@ fn a_profile_deny_rule_a_trusted_project_posture_replaces_is_named_on_the_app() 
 }
 
 #[test]
+fn a_global_deny_rule_a_trusted_project_network_replaces_is_named() {
+    // The global config closes a host; a trusted project's `[network]` writes `mode = "allow"`,
+    // which replaces the global table whole and opens the host. The launch still runs as the
+    // project wrote it, and the rule it dropped is named, in `config show` and `test net`.
+    let fx = Project::new("cfg");
+    fx.write_global(
+        "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n\
+         deny = [\"tracker.example.com\"]\n",
+    );
+    fx.write_project("[network]\nmode = \"allow\"\n");
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    let both = |args: &[&str]| {
+        let out = fx.run(args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+    let note = ".sbx.toml: this `network` posture replaces the one below it rather than adding \
+                to it, so `deny` rules the layer below carried do not apply to this project: \
+                `https://tracker.example.com`";
+
+    let (code, text) = both(&["test", "net", "https://tracker.example.com"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("ALLOWED") && text.contains(note),
+        "the host is open, and the rule is named:\n{text}"
+    );
+    let (code, shown) = both(&["config", "show"]);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(shown.contains(note), "`config show` names it too:\n{shown}");
+}
+
+#[test]
 fn an_untrusted_project_cannot_use_a_bundle_to_graft_trusted_egress_onto_its_app() {
     // The flagship property, on the `use` axis: a bundle is declared in the *global* config and
     // carries egress rules and credentials, so an untrusted project naming one would be choosing

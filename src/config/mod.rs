@@ -2632,6 +2632,19 @@ fn resolve(
                         parent,
                     );
                     accepted = policy.is_some();
+                    // A project's posture drops the global `deny` rules it does not keep, and each
+                    // opens a host: named, see `replaced_deny_note`.
+                    if let Some(policy) = &policy {
+                        let dropped = deny_rules_replaced(parent, policy);
+                        if !dropped.is_empty() {
+                            w.push(replaced_deny_note(
+                                PROJECT_CONFIG,
+                                "rules the layer below carried",
+                                "this project",
+                                &dropped,
+                            ));
+                        }
+                    }
                     policy
                 },
             );

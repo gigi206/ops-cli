@@ -808,6 +808,7 @@ fn resolve_app(
                         w.push(replaced_deny_note(
                             &source,
                             "rules the layer below carried",
+                            "this app",
                             &dropped,
                         ));
                     }

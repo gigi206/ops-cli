@@ -814,21 +814,28 @@ pub(super) fn deny_rules_replaced(below: &NetworkPolicy, incoming: &NetworkPolic
         .collect()
 }
 
-/// Said on an app whose trusted project writes a posture of its own, which replaces the one below
-/// it, for the `deny` entries that posture leaves behind: `whose` says where they were written.
+/// Said where a trusted project writes a posture of its own, which replaces the one below it, for
+/// the `deny` entries that posture leaves behind: `whose` says where they were written, and `whom`
+/// what no longer has them, `this project` for its `[network]` or `this app` for an
+/// `[app.<name>]`.
 ///
 /// A replacing table names only the settings it drops, since replacing the rules is what declaring
 /// a table is for. A `deny` is the exception: each is a host the layer below closed and this
 /// posture may reach, so they are named rather than counted, unlike the one-shot override's note
 /// (`Resolved::bare_posture_drops_a_table`), and a `deny` list is short enough to read.
-pub(super) fn replaced_deny_note(source_label: &str, whose: &str, entries: &[String]) -> String {
+pub(super) fn replaced_deny_note(
+    source_label: &str,
+    whose: &str,
+    whom: &str,
+    entries: &[String],
+) -> String {
     let list: Vec<String> = entries
         .iter()
         .map(|entry| format!("`{}`", crate::diag::visible(entry)))
         .collect();
     format!(
         "{source_label}: this `network` posture replaces the one below it rather than adding to \
-         it, so `deny` {whose} do not apply to this app: {}. To keep them, re-declare them under \
+         it, so `deny` {whose} do not apply to {whom}: {}. To keep them, re-declare them under \
          `deny` in a `[network]` table here",
         list.join(", ")
     )
@@ -1215,8 +1222,8 @@ pub(super) fn validate_network_table(
     // It is warned rather than merged because the rules a table declares are its own by design, and
     // because the layer that loses a setting is usually not the one that wrote it: `sbx net allow
     // --local` writes this table for a user whose settings live in the global config. The rules
-    // are left out of that message, but a trusted project's posture for an app names the `deny`
-    // rules it drops, where the overlay is laid (`replaced_deny_note`).
+    // are left out of that message, but a trusted project's posture, its `[network]` or an app's,
+    // names the `deny` rules it drops where the project layer is laid (`replaced_deny_note`).
     if let NetworkPolicy::Allowlist(below) = parent
         && !amends_below
     {

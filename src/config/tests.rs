@@ -8225,6 +8225,61 @@ fn a_network_restriction_that_cannot_be_read_refuses_a_launch() {
     );
 }
 
+/// A trusted project's `[network]` replaces the global one, rules included, and a `deny` rule it
+/// drops opens the host the global config closed: each is named, against the project, and the
+/// launch still runs as the project wrote it. That holds for a posture string and for a table
+/// with no `mode`, which inherits only the mode. A rule the project keeps is not named, nor is
+/// anything under `none`, where nothing reaches, nor under an untrusted project, which is inert.
+#[test]
+fn a_global_deny_rule_a_trusted_project_network_drops_is_named() {
+    let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
+    let global = "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n\
+                  deny = [\"tracker.example.com\"]\n";
+    let over =
+        |project: &str, state| resolve_no_plugins(parse(global), Some((parse(project), state)));
+    let named = |r: &Resolved| -> Vec<String> {
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("do not apply to this project"))
+            .cloned()
+            .collect()
+    };
+
+    for project in [
+        "[network]\nmode = \"allow\"\n",
+        "network = \"shared\"\n",
+        "[network]\nallow = [\"x.test\"]\n",
+    ] {
+        let r = over(project, TrustState::Trusted);
+        let said = named(&r);
+        assert!(
+            said.len() == 1
+                && said[0].starts_with(".sbx.toml: ")
+                && said[0].contains(
+                    "`deny` rules the layer below carried do not apply to this project: \
+                     `https://tracker.example.com`"
+                ),
+            "{project:?}: {:?}",
+            r.warnings
+        );
+        assert!(r.refusals.is_empty(), "{project:?}: {:?}", r.refusals);
+    }
+
+    for (project, state) in [
+        (
+            "[network]\nmode = \"allow\"\ndeny = [\"tracker.example.com\"]\n",
+            TrustState::Trusted,
+        ),
+        ("network = \"none\"\n", TrustState::Trusted),
+        ("[network]\nmode = \"allow\"\n", TrustState::Untrusted),
+    ] {
+        let r = over(project, state);
+        assert!(named(&r).is_empty(), "{project:?}: {:?}", r.warnings);
+    }
+    let alone = resolve_no_plugins(parse(global), None);
+    assert!(named(&alone).is_empty(), "{:?}", alone.warnings);
+}
+
 /// A `[proc]` mode sbx does not know refuses a launch: the layer's whole `[proc]` is left out, so
 /// the posture below it stands, and a misspelled `enforce` over a global `off` runs the lens off.
 /// From the global config, a trusted project and an app, whose refusal stops that app alone; an
