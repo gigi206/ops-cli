@@ -4640,6 +4640,50 @@ fn a_global_deny_rule_a_trusted_project_network_replaces_is_named() {
 }
 
 #[test]
+fn a_global_deny_rule_an_app_profile_network_replaces_is_named() {
+    // The global config closes a host; an app profile writes `mode = "allow"` of its own, which
+    // replaces the baseline for that app and opens the host there. The app still runs as its
+    // profile wrote it, and the rule it dropped is named, in `config show --app` and `test net`.
+    let fx = Project::new("cfg");
+    fx.write_global(
+        "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n\
+         deny = [\"tracker.example.com\"]\n",
+    );
+    fx.write_profile("demo", "cmd = \"x\"\n[network]\nmode = \"allow\"\n");
+    let both = |args: &[&str]| {
+        let out = fx.run(args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+    let note = "apps/demo.toml: this `network` posture replaces the one below it rather than \
+                adding to it, so `deny` rules the layer below carried do not apply to this app: \
+                `https://tracker.example.com`";
+
+    let (code, text) = both(&[
+        "test",
+        "net",
+        "--app",
+        "demo",
+        "https://tracker.example.com",
+    ]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("ALLOWED") && text.contains(note),
+        "the host is open for the app, and the rule is named:\n{text}"
+    );
+    let (code, shown) = both(&["config", "show", "--app", "demo"]);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(note),
+        "`config show --app` names it too:\n{shown}"
+    );
+}
+
+#[test]
 fn an_untrusted_project_cannot_use_a_bundle_to_graft_trusted_egress_onto_its_app() {
     // The flagship property, on the `use` axis: a bundle is declared in the *global* config and
     // carries egress rules and credentials, so an untrusted project naming one would be choosing

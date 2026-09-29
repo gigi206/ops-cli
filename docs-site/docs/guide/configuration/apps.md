@@ -67,7 +67,7 @@ tasks_max = 4096
 | `flakes`, `tarball`, `deb`, `appimage`, `binary` | security | the resolver tables pairing with this app's packages, `[app.<name>.flakes.<tool>]` etc. (see [packages](packages)) |
 | `accepts_fresh_releases` | security | package names exempted from the new-release cooling-off period, unioned onto the baseline's |
 | `allow_insecure_http` | security | plaintext-fetch posture for this app, overriding the baseline when set |
-| `network` | security | overrides the baseline posture when set |
+| `network` | security | overrides the baseline posture when set; a baseline `deny` rule it drops is named (see [network](network#what-a-table-does-not-inherit)) |
 | `proc` | security | overrides the baseline exec posture when set (see [proc](proc)) |
 | `notify` | security | overrides the baseline refusal-notification policy when set (see [notify](notify)) |
 | `gui` | security | overrides the baseline when set |

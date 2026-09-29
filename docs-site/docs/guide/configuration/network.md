@@ -606,7 +606,7 @@ the layer below rather than adding to it, so anything else that layer set revert
 built-in value: `mute`, `http2`, `dns_cache_ttl`, `pool`, `idle_timeout`, `max_connections`,
 `body_max_mb`, `ca_roots`, `capture` (with its `capture_max_kb`), `websocket_secret`,
 `ask_timeout` and `ask_notice`. The `allow`/`deny` rules are replaced too, which is what declaring a table is
-for; a trusted project's posture names the `deny` rules it drops, as shown below.
+for; a posture laid over the global config names the `deny` rules it drops, as shown below.
 
 This is easy to reach without meaning to, because [`sbx net allow --local`](../cli/net)
 writes a `[network]` table into the project: a `capture` or a `ca_roots = false` set once in
@@ -624,7 +624,9 @@ host that config closed. With `deny = ["tracker.example.com"]` in the global con
 sbx: warning: .sbx.toml: this `network` posture replaces the one below it rather than adding to it, so `deny` rules the layer below carried do not apply to this project: `https://tracker.example.com`. To keep them, re-declare them under `deny` in a `[network]` table here
 ```
 
-Nothing is said for a rule the project's table keeps, or under `none`, where nothing reaches.
+An app profile's own `network` replaces that baseline for the app, and is named the same way,
+against the profile and for that app alone: `apps/<name>.toml: … do not apply to this app: …`.
+Nothing is said for a rule the replacing table keeps, or under `none`, where nothing reaches.
 Re-declare the ones you want in the table that replaced them. Three things stand outside this:
 the mode, inherited when omitted (above); `stats`, which is read outside the table and applies
 to every launch; and one table that amends instead, below.

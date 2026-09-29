@@ -1306,9 +1306,9 @@ impl EgressPolicy {
             // where it is read without one — so naming `capture` names both. The posture is not a
             // setting either, but it is read below: it bounds where two of them mean anything.
             //
-            // One rule is named all the same: a `deny` rule a trusted project's posture drops, its
-            // `[network]` or an app's, opens a host, so the project layer names it on its own
-            // (`config::validate::replaced_deny_note`).
+            // One rule is named all the same: a `deny` rule dropped by a posture laid over the
+            // global config, a trusted project's or an app profile's, opens a host, so the layer
+            // that lays it names it on its own (`config::validate::replaced_deny_note`).
             allow: _,
             deny: _,
             capture_body_kb: _,

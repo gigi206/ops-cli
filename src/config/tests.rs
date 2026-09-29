@@ -8280,6 +8280,61 @@ fn a_global_deny_rule_a_trusted_project_network_drops_is_named() {
     assert!(named(&alone).is_empty(), "{:?}", alone.warnings);
 }
 
+/// An app profile's own `network` replaces the baseline for that app, rules included, and a
+/// `deny` rule of the global config it drops opens a host for that app: each is named on the app,
+/// against the profile, and the app still runs as the profile wrote it. A posture string and a
+/// table with no `mode` drop them alike. A rule the profile keeps is not named, nor anything
+/// under `none`, nor anything for an app that writes no `network` and runs under the baseline.
+#[test]
+fn a_global_deny_rule_an_app_profile_network_drops_is_named() {
+    let global = "[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n\
+                  deny = [\"tracker.example.com\"]\n";
+    let under = |network: &str| {
+        let mut raw = schema::parse(global.as_bytes()).expect("the config parses");
+        let profile = format!("cmd = \"demo\"\n{network}");
+        let app = schema::parse_app(profile.as_bytes()).expect("the profile parses");
+        raw.app.insert("demo".to_string(), app);
+        let mut r = resolve_no_plugins(raw, None);
+        r.apps.remove("demo").expect("the app resolves")
+    };
+    let named = |app: &ResolvedApp| -> Vec<String> {
+        app.warnings
+            .iter()
+            .filter(|w| w.contains("do not apply to this app"))
+            .cloned()
+            .collect()
+    };
+
+    for network in [
+        "[network]\nmode = \"allow\"\n",
+        "network = \"shared\"\n",
+        "[network]\nallow = [\"x.test\"]\n",
+    ] {
+        let app = under(network);
+        let said = named(&app);
+        assert!(
+            said.len() == 1
+                && said[0].starts_with("apps/demo.toml: ")
+                && said[0].contains(
+                    "`deny` rules the layer below carried do not apply to this app: \
+                     `https://tracker.example.com`"
+                ),
+            "{network:?}: {:?}",
+            app.warnings
+        );
+        assert!(app.refusals.is_empty(), "{network:?}: {:?}", app.refusals);
+    }
+
+    for network in [
+        "[network]\nmode = \"allow\"\ndeny = [\"tracker.example.com\"]\n",
+        "network = \"none\"\n",
+        "",
+    ] {
+        let app = under(network);
+        assert!(named(&app).is_empty(), "{network:?}: {:?}", app.warnings);
+    }
+}
+
 /// A `[proc]` mode sbx does not know refuses a launch: the layer's whole `[proc]` is left out, so
 /// the posture below it stands, and a misspelled `enforce` over a global `off` runs the lens off.
 /// From the global config, a trusted project and an app, whose refusal stops that app alone; an

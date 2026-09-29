@@ -567,6 +567,18 @@ fn resolve_app(
                 parent,
             );
             if let Some(policy) = resolved {
+                // The profile's posture drops the baseline's `deny` rules it does not keep, the
+                // global config's among them, and each opens a host: named, see
+                // `replaced_deny_note`.
+                let dropped = deny_rules_replaced(parent, &policy);
+                if !dropped.is_empty() {
+                    warnings.push(replaced_deny_note(
+                        &source,
+                        "rules the layer below carried",
+                        "this app",
+                        &dropped,
+                    ));
+                }
                 network = Some(policy);
                 network_origin = Provenance::Global;
                 if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {

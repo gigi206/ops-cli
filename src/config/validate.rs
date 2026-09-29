@@ -814,10 +814,10 @@ pub(super) fn deny_rules_replaced(below: &NetworkPolicy, incoming: &NetworkPolic
         .collect()
 }
 
-/// Said where a trusted project writes a posture of its own, which replaces the one below it, for
-/// the `deny` entries that posture leaves behind: `whose` says where they were written, and `whom`
-/// what no longer has them, `this project` for its `[network]` or `this app` for an
-/// `[app.<name>]`.
+/// Said where a layer writes a posture of its own over the global config, which replaces the one
+/// below it, for the `deny` entries that posture leaves behind: a trusted project's `[network]` or
+/// `[app.<name>]`, or an app's profile. `whose` says where the entries were written, and `whom`
+/// what no longer has them, `this project` or `this app`.
 ///
 /// A replacing table names only the settings it drops, since replacing the rules is what declaring
 /// a table is for. A `deny` is the exception: each is a host the layer below closed and this
@@ -1222,8 +1222,9 @@ pub(super) fn validate_network_table(
     // It is warned rather than merged because the rules a table declares are its own by design, and
     // because the layer that loses a setting is usually not the one that wrote it: `sbx net allow
     // --local` writes this table for a user whose settings live in the global config. The rules
-    // are left out of that message, but a trusted project's posture, its `[network]` or an app's,
-    // names the `deny` rules it drops where the project layer is laid (`replaced_deny_note`).
+    // are left out of that message, but a posture laid over the global config, a trusted
+    // project's or an app profile's, names the `deny` rules it drops where it is laid
+    // (`replaced_deny_note`).
     if let NetworkPolicy::Allowlist(below) = parent
         && !amends_below
     {
