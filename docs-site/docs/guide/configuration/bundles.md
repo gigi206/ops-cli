@@ -262,25 +262,39 @@ note: .sbx.toml [app.sneaky]: ignoring `use` of bundle(s) `claude-code` (untrust
 Run [`sbx trust`](../cli/trust) to apply it. A profile under `~/.config/sbx/apps/`
 is trusted by location, so its `use` always applies.
 
+A `use` entry that names no bundle, a typo or a bundle not imported yet, **stops that
+app's launch**, naming it: what the bundle carried is not known, and it may have been a
+`deny` entry.
+
 ## An app with no `[network]` table
 
 A bundle's egress entries are unioned into the app's **own** `[network]` table. An app
-that declares none has them **dropped, with a warning**: add a table to apply them:
+that declares none, or that writes its posture as a string (`network = "allow"`), has no
+table to take them, so they are left out.
 
-```toml
-[network]
-mode = "deny"
-```
+What that costs depends on the entry. An `allow` or `mute` entry left out only narrows
+the app or logs more, and an app with no table is told so. A `deny` entry left out would
+open the host its bundle closed wherever the app's posture filters: under `allow`, and
+under `deny` or `ask` too, where it carved an exception out of an `allow` rule. There it
+**stops the app's launch**, naming the entry and what to write instead:
 
-This looks over-cautious and is not. A `[network]` table with no `mode` inherits the
-parent posture, but *only a filtering one*: under a `shared` (or `allow`, or absent)
-baseline it falls back to `deny`. Synthesizing a table for you would therefore turn a
-wide-open app into a default-deny allowlist behind your back. A bundle must never move
-a posture in either direction, so the gap is the safe answer.
+- for a string posture, the table of the same mode, which changes nothing else:
 
-Under an app that declared `network = "shared"` or `"none"` the entries are simply
-redundant, that posture is already wider, or admits nothing at all, so they are
-dropped silently. Nothing was lost.
+  ```toml
+  [network]
+  mode = "allow"   # was: network = "allow"
+  ```
+
+- for no table at all, a table of the app's own with the mode it runs under now and the
+  rules it relies on, since a table replaces the policy the app inherits.
+
+sbx does not write that table for you. A table replaces the policy the app inherits, and
+one with no `mode` inherits only a `deny` or `ask` parent: under an `allow` one it falls
+back to `deny`. Writing one would move the app's posture behind your back, and a bundle
+must never move a posture in either direction.
+
+Under an app that runs `shared` or `none`, a `deny` entry changes nothing: that posture
+is already wider, or admits nothing at all.
 
 ## The shipped bundles
 

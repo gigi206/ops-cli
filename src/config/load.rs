@@ -94,10 +94,11 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     let bundles = std::mem::take(&mut global.bundle);
     // What the fold could not do is reported PER APP, not globally: `sbx config show --app <name>`
     // renders an app's own notes, and a global warning does not appear there — which is exactly
-    // where someone whose app came up without its agent will look. Collected here, merged into the
-    // resolved apps below (after `resolve`, so no signature has to carry it through the engine).
-    let mut app_notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    expand_bundles(&mut global.app, &bundles, &mut app_notes);
+    // where someone whose app came up without its agent will look. Collected here, settled on the
+    // resolved apps below (after `resolve`, so no signature has to carry it through the engine,
+    // and so a lost `deny` entry is weighed against the posture the app actually runs under).
+    let mut fold = BundleFold::default();
+    expand_bundles(&mut global.app, &bundles, &mut fold, FoldLayer::Profile);
     if let Some((raw, state, _)) = project.as_mut() {
         if !raw.bundle.is_empty() {
             warnings.push(
@@ -113,7 +114,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         // left intact so `resolve_app` can report the drop as a per-app note, where a user
         // inspecting that app (`sbx config show --app <name>`) will actually see it.
         if *state == TrustState::Trusted {
-            expand_bundles(&mut raw.app, &bundles, &mut app_notes);
+            expand_bundles(&mut raw.app, &bundles, &mut fold, FoldLayer::Project);
         }
     }
 
@@ -141,12 +142,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     resolved.mise = mise;
     resolved.mise_ignored = mise_ignored;
 
-    // Attach each app's bundle notes to that app, so they surface wherever its own notes do.
-    for (name, notes) in app_notes {
-        if let Some(app) = resolved.apps.get_mut(&name) {
-            app.warnings.extend(notes);
-        }
-    }
+    settle_bundles(&mut resolved, fold);
 
     // Canonicalize the (already absolute) bind sources, dropping any that cannot be
     // resolved — so `binds` is the *effective* list, identical to what the
@@ -1514,24 +1510,23 @@ fn merge_config_dirs(
 /// order written (a later one overrides an earlier one on the same key), and the app's own entries
 /// override every bundle. So a profile can name a bundle and still pin one of its packages.
 ///
-/// Two references that do not resolve are dropped with a loud warning rather than failing the load
-/// (which is infallible by design): an unknown name, and a malformed one. Both leave the app short
-/// of a tool or an egress rule, so the warning names the app *and* the bundle.
+/// Two references that do not resolve are named on the app and stop its launch, rather than fail
+/// the load (which is infallible by design): an unknown name, and a malformed one. What the bundle
+/// carried is not known, and it may have been a `deny` entry, so the app does not run short of it.
 ///
 /// The egress entries need somewhere to land: they are unioned into the app's **own** `[network]`
-/// table, and an app that declares none has its bundle's `allow`/`deny`/`mute` **dropped with a
-/// warning**. Synthesizing a table for it looks tempting — a [`NetworkTable`] with no `mode`
-/// inherits the parent's — but only a filtering parent posture is inherited: under a `shared` (or
-/// `allow`, or absent) baseline a mode-less table falls back to `deny`, so inventing one would
-/// silently narrow a wide-open app into a default-deny allowlist. A bundle must never move a
-/// posture in either direction, so the gap is the safe answer and the warning names the fix.
-///
-/// Under an app that declared `network = "shared"` or `"none"` the entries are simply redundant
-/// (that posture is already wider, or admits nothing at all), so they are dropped silently.
+/// table, and an app that declares none, or writes its posture as a string, has no table to take
+/// them. Synthesizing one looks tempting, but a table replaces the policy the app runs under and a
+/// mode-less one falls back to `deny` under an `allow` parent (`mode_from_parent`), and a bundle
+/// must never move a posture in either direction. So the entries are left out, and a `deny` entry
+/// left out would open the host its bundle closed wherever the app's posture filters: that one is
+/// kept in `fold` and weighed by [`settle_bundles`], once the resolution says what the posture is.
+/// An `allow` or `mute` entry left out only narrows or logs more; the app without a table is told.
 fn expand_bundles(
     apps: &mut BTreeMap<String, RawApp>,
     bundles: &BTreeMap<String, RawBundle>,
-    app_notes: &mut BTreeMap<String, Vec<String>>,
+    fold: &mut BundleFold,
+    layer: FoldLayer,
 ) {
     for (app_name, app) in apps.iter_mut() {
         if app.uses.is_empty() {
@@ -1541,21 +1536,18 @@ fn expand_bundles(
         // result *under* the app, so the app's own entries win over every bundle uniformly.
         let mut acc = RawBundle::default();
         let mut provisions = Vec::new();
-        let notes = app_notes.entry(app_name.clone()).or_default();
+        let notes = fold.notes.entry(app_name.clone()).or_default();
         for name in &app.uses {
-            if !is_valid_bundle_name(name) {
-                notes.push(format!(
-                    "ignoring `use` entry `{name}`: a bundle name is 1–64 of [A-Za-z0-9._-]"
-                ));
-                continue;
-            }
-            let Some(bundle) = bundles.get(name) else {
-                notes.push(format!(
-                    "uses bundle `{name}`, which is not declared — its tool, environment and \
-                     egress rules are missing, so this app is short of what it named. Import it \
-                     (`sbx bundle import <file>`), or list what is available with `sbx bundle`"
-                ));
-                continue;
+            let bundle = match resolve_use(name, bundles) {
+                Ok(bundle) => bundle,
+                Err(said) => {
+                    notes.push(said.clone());
+                    fold.refusals
+                        .entry(app_name.clone())
+                        .or_default()
+                        .push(said);
+                    continue;
+                }
             };
             let mut bundle = bundle.clone();
             // A key this bundle carries that sbx does not know. Named here, against the *app* that
@@ -1585,8 +1577,143 @@ fn expand_bundles(
             }
             absorb_bundle(&mut acc, bundle, notes);
         }
-        fold_bundle_into_app(app, acc, notes);
+        if let Some(lost) = fold_bundle_into_app(app, acc, notes, layer) {
+            fold.lost_deny
+                .entry(app_name.clone())
+                .or_default()
+                .push(lost);
+        }
         app.provisions = provisions;
+    }
+}
+
+/// The bundle a `use` entry names, or the sentence saying why it names none: a name no bundle
+/// could carry, or one no readable file declares.
+fn resolve_use<'a>(
+    name: &str,
+    bundles: &'a BTreeMap<String, RawBundle>,
+) -> Result<&'a RawBundle, String> {
+    if !is_valid_bundle_name(name) {
+        return Err(format!(
+            "ignoring `use` entry `{}`: a bundle name is 1–64 of [A-Za-z0-9._-], and a launch of \
+             this app stops rather than run without what it named",
+            crate::diag::visible(name)
+        ));
+    }
+    bundles.get(name).ok_or_else(|| {
+        format!(
+            "uses bundle `{name}`, which is not declared (no readable \
+             `{BUNDLES_DIR}/{name}.toml`): its tool, environment and egress rules are missing, \
+             and a launch of this app stops rather than run without them. Import it \
+             (`sbx bundle import <file>`), or list what is available with `sbx bundle`"
+        )
+    })
+}
+
+/// What folding the bundles leaves each app to answer for, keyed by app name. Settled on the
+/// resolved apps by [`settle_bundles`], since whether a lost `deny` entry opens anything depends on
+/// the posture the app runs under, which only the resolution knows.
+#[derive(Default)]
+struct BundleFold {
+    /// Said on the app, wherever its own notes are.
+    notes: BTreeMap<String, Vec<String>>,
+    /// Why the app may not launch: a `use` entry naming no bundle sbx can read.
+    refusals: BTreeMap<String, Vec<String>>,
+    /// The `deny` entries a bundle carried that found no table to land in.
+    lost_deny: BTreeMap<String, Vec<LostDeny>>,
+}
+
+/// The layer an app's `use` was folded in, which is where its `[network]` table would be written.
+#[derive(Clone, Copy)]
+enum FoldLayer {
+    /// The app's profile under `apps/`.
+    Profile,
+    /// The app's `[app.<name>]` in the project config.
+    Project,
+}
+
+/// A bundle's `deny` entries an app could not take in, and the shape of what it wrote instead.
+struct LostDeny {
+    entries: Vec<String>,
+    /// The posture the app wrote as a string in place of a table, or `None` when it wrote neither.
+    posture: Option<String>,
+    layer: FoldLayer,
+}
+
+/// Attach what [`expand_bundles`] left to each resolved app: its notes, its refusals, and a verdict
+/// on each lost `deny` entry.
+///
+/// A `deny` entry left out opens the host its bundle closed under every posture that filters, a
+/// default-`deny` or `ask` one included, where it carved an exception out of an `allow` rule. So
+/// under a filtering posture it stops the app's launch, naming what to write instead, which keeps
+/// the posture: a string posture written as the table of the same mode, or a table of the app's
+/// own that carries the rules it relies on, since a table replaces the policy it inherits. Under
+/// `shared` or `none` the entry changes nothing; without a table the app is told the entries were
+/// left out, as an app with only `allow` or `mute` entries is.
+fn settle_bundles(resolved: &mut Resolved, fold: BundleFold) {
+    for (name, notes) in fold.notes {
+        if let Some(app) = resolved.apps.get_mut(&name) {
+            app.warnings.extend(notes);
+        }
+    }
+    for (name, refusals) in fold.refusals {
+        if let Some(app) = resolved.apps.get_mut(&name) {
+            app.refusals.extend(refusals);
+        }
+    }
+    for (name, lost) in fold.lost_deny {
+        let Some(app) = resolved.apps.get_mut(&name) else {
+            continue;
+        };
+        let mode = match app.network.as_ref().unwrap_or(&resolved.network) {
+            NetworkPolicy::Allowlist(policy) => match policy.default_action() {
+                crate::allowlist::DefaultAction::Deny => Some("deny"),
+                crate::allowlist::DefaultAction::Allow => Some("allow"),
+                crate::allowlist::DefaultAction::Ask => Some("ask"),
+            },
+            NetworkPolicy::Shared | NetworkPolicy::Isolated => None,
+        };
+        for lost in lost {
+            let Some(mode) = mode else {
+                if lost.posture.is_none() {
+                    app.warnings.push(NO_TABLE_NOTE.to_string());
+                }
+                continue;
+            };
+            let entries: Vec<String> = lost
+                .entries
+                .iter()
+                .map(|e| format!("`{}`", crate::diag::visible(e)))
+                .collect();
+            let place = match lost.layer {
+                FoldLayer::Profile => format!("its profile, `apps/{name}.toml`"),
+                FoldLayer::Project => format!("`[app.{name}]` in {PROJECT_CONFIG}"),
+            };
+            let (shape, fix) = match lost.posture.as_deref().map(crate::diag::visible) {
+                Some(posture) => (
+                    format!("its posture is written as a string, `network = \"{posture}\"`"),
+                    format!(
+                        "write it as the table of the same mode, `[network] mode = \"{posture}\"`, \
+                         in {place}"
+                    ),
+                ),
+                None => (
+                    "it declares no `[network]` table".to_string(),
+                    format!(
+                        "give it a `[network]` table in {place}, with `mode = \"{mode}\"` and the \
+                         rules it relies on, since a table replaces the policy it runs under now"
+                    ),
+                ),
+            };
+            let said = format!(
+                "uses a bundle whose `deny` entries ({}) have no table to land in: {shape}, so \
+                 they are left out, and a launch of this app stops rather than run under `{mode}` \
+                 without them. To apply them, {fix}; or remove the bundle from `use`",
+                entries.join(", ")
+            );
+            app.warnings.push(said.clone());
+            app.refusals.push(said);
+        }
     }
 }
 
@@ -1659,8 +1786,14 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>
 }
 
 /// Fold the accumulated bundle *under* one app: every entry the app does not already declare is
-/// added, and everything the app declares itself stands.
-fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String>) {
+/// added, and everything the app declares itself stands. Returns the bundle's `deny` entries when
+/// the app has no table to take them, for [`settle_bundles`] to weigh.
+fn fold_bundle_into_app(
+    app: &mut RawApp,
+    acc: RawBundle,
+    notes: &mut Vec<String>,
+    layer: FoldLayer,
+) -> Option<LostDeny> {
     for (k, v) in acc.packages {
         app.packages.entry(k).or_insert(v);
     }
@@ -1736,8 +1869,13 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
         || !acc.mute.is_empty()
         || !acc.shared_credential.is_empty();
     if !egress {
-        return;
+        return None;
     }
+    let lost = |posture: Option<String>| LostDeny {
+        entries: acc.deny.clone(),
+        posture,
+        layer,
+    };
     match app.network.as_mut() {
         Some(NetworkField::Table(table)) => {
             // The app's own entries stay first; a duplicate the bundle repeats is dropped, so the
@@ -1746,19 +1884,28 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
             extend_deduped(&mut table.deny, acc.deny);
             extend_deduped(&mut table.mute, acc.mute);
             extend_deduped(&mut table.shared_credential, acc.shared_credential);
+            None
         }
-        // A scalar posture is already decided: `shared` is wider than any allow entry could grant
-        // and `none` admits nothing, so the bundle's entries are redundant either way.
-        Some(NetworkField::Posture(_)) => {}
-        None => notes.push(
-            "uses a bundle with egress rules or a shared-credential group but declares no \
-             `[network]` table, so they are dropped — add one (e.g. `[network] mode = \"deny\"`) \
-             to apply them; synthesizing one here could change the app's posture, which a bundle \
-             must never do"
-                .to_string(),
-        ),
+        // A string posture has no rules to add to. Under `shared` or `none` the entries change
+        // nothing; under a filtering one an `allow` or `mute` entry left out only narrows or logs
+        // more, while a `deny` entry would open its host: that one is weighed once the posture the
+        // app runs under is resolved.
+        Some(NetworkField::Posture(posture)) => {
+            (!acc.deny.is_empty()).then(|| lost(Some(posture.clone())))
+        }
+        None if acc.deny.is_empty() => {
+            notes.push(NO_TABLE_NOTE.to_string());
+            None
+        }
+        None => Some(lost(None)),
     }
 }
+
+/// Said on an app whose bundle carried egress entries it has no `[network]` table to take.
+const NO_TABLE_NOTE: &str = "uses a bundle with egress rules or a shared-credential group but \
+    declares no `[network]` table, so they are left out: add one to apply them, with the `mode` \
+    the app runs under and the rules it relies on, since a table replaces the policy it inherits. \
+    Synthesizing one here could change the app's posture, which a bundle must never do";
 
 /// Append the entries of `add` that `into` does not already carry, preserving order.
 fn extend_deduped<T: PartialEq>(into: &mut Vec<T>, add: Vec<T>) {
@@ -1957,15 +2104,21 @@ mod tests {
     }
 
     fn expand_one(app: RawApp, bundles: &[(&str, RawBundle)]) -> (RawApp, Vec<String>) {
+        let (app, fold) = fold_one(app, bundles);
+        let warnings = fold.notes.get("demo").cloned().unwrap_or_default();
+        (app, warnings)
+    }
+
+    /// [`expand_one`], keeping everything the fold left for the app to answer for.
+    fn fold_one(app: RawApp, bundles: &[(&str, RawBundle)]) -> (RawApp, BundleFold) {
         let mut apps: BTreeMap<String, RawApp> = [("demo".to_string(), app)].into_iter().collect();
         let map: BTreeMap<String, RawBundle> = bundles
             .iter()
             .map(|(n, b)| (n.to_string(), b.clone()))
             .collect();
-        let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        expand_bundles(&mut apps, &map, &mut notes);
-        let warnings = notes.remove("demo").unwrap_or_default();
-        (apps.remove("demo").unwrap(), warnings)
+        let mut fold = BundleFold::default();
+        expand_bundles(&mut apps, &map, &mut fold, FoldLayer::Profile);
+        (apps.remove("demo").unwrap(), fold)
     }
 
     #[test]
@@ -2130,18 +2283,73 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_or_malformed_bundle_reference_is_dropped_loudly() {
-        let (app, warnings) = expand_one(app_using(&["missing", "no spaces"]), &[]);
+    fn an_unknown_or_malformed_bundle_reference_refuses_the_app() {
+        // What the bundle carried is not known, and it may have been a `deny` entry, so the app
+        // does not run short of it: each reference is named and stops the app's launch.
+        let (app, fold) = fold_one(app_using(&["missing", "no\nspaces"]), &[]);
         assert!(app.packages.is_empty(), "nothing is invented");
+        let refusals = &fold.refusals["demo"];
+        assert_eq!(refusals.len(), 2, "{refusals:?}");
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("missing") && w.contains("not declared")),
-            "an undefined bundle is named: {warnings:?}"
+            refusals[0].contains("`missing`") && refusals[0].contains("not declared"),
+            "an undefined bundle is named: {refusals:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("no spaces")),
-            "so is a malformed name: {warnings:?}"
+            refusals[1].contains("`no\\x0aspaces`") && !refusals[1].contains('\n'),
+            "so is a malformed name, on one line: {refusals:?}"
+        );
+        assert_eq!(
+            &fold.notes["demo"], refusals,
+            "each is said where the app's notes are"
+        );
+
+        let (_, fold) = fold_one(app_using(&["a"]), &[("a", bundle("a"))]);
+        assert!(
+            fold.refusals.get("demo").is_none_or(Vec::is_empty),
+            "{:?}",
+            fold.refusals
+        );
+    }
+
+    /// A bundle's `deny` entry the app has no table for is weighed against the posture the app
+    /// runs under once it is resolved: under `ask` it stops the app, as under `deny` and `allow`;
+    /// under `shared` it changes nothing, and the app is told its bundle's entries were left out.
+    #[test]
+    fn a_lost_bundle_deny_entry_is_weighed_against_the_posture_the_app_runs_under() {
+        let blocker = RawBundle {
+            deny: vec!["tracker.example.com".to_string()],
+            ..RawBundle::default()
+        };
+        let settle = |baseline: &str| {
+            let mut app = schema::parse_app(b"cmd = \"demo\"\n").expect("the profile parses");
+            app.uses = vec!["b".to_string()];
+            let (app, fold) = fold_one(app, &[("b", blocker.clone())]);
+            let mut global = schema::parse(baseline.as_bytes()).expect("the config parses");
+            global.app.insert("demo".to_string(), app);
+            let mut resolved = resolve(global, None, &PluginRegistry::default());
+            settle_bundles(&mut resolved, fold);
+            resolved.apps.remove("demo").expect("the app resolves")
+        };
+
+        let asked = settle("network = \"ask\"\n");
+        assert!(
+            asked.refusals.len() == 1
+                && asked.refusals[0].contains("`tracker.example.com`")
+                && asked.refusals[0].contains("run under `ask`"),
+            "{:?}",
+            asked.refusals
+        );
+        assert!(
+            asked.warnings.contains(&asked.refusals[0]),
+            "said where notes are"
+        );
+
+        let shared = settle("network = \"shared\"\n");
+        assert!(shared.refusals.is_empty(), "{:?}", shared.refusals);
+        assert!(
+            shared.warnings.iter().any(|w| w == NO_TABLE_NOTE),
+            "{:?}",
+            shared.warnings
         );
     }
 

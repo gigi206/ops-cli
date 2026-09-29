@@ -4335,6 +4335,102 @@ type = "raw"
 }
 
 #[test]
+fn a_bundle_deny_entry_with_no_table_refuses_its_app_where_the_posture_filters() {
+    // A bundle's `deny` entry lands only in the app's own `[network]` table. Without one it is left
+    // out, which opens the host it closed wherever the posture filters: under a global `deny`
+    // whose `allow` rule it carved an exception from, and under an app's `network = "allow"`
+    // written as a string. Both refuse the app, and so does a `use` naming no bundle, since what
+    // it carried is not known. The fix each refusal names is calibrated below: written as it says,
+    // the entry denies and the app runs under the posture it ran under before.
+    let fx = Project::new("cfg");
+    fx.write_global("[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n");
+    fx.write_bundle("block", "deny = [\"tracker.example.com\"]\n");
+    fx.write_profile("inherits", "cmd = \"x\"\nuse = [\"block\"]\n");
+    fx.write_profile(
+        "bare",
+        "cmd = \"x\"\nuse = [\"block\"]\nnetwork = \"allow\"\n",
+    );
+    fx.write_profile(
+        "wide",
+        "cmd = \"x\"\nuse = [\"block\"]\nnetwork = \"shared\"\n",
+    );
+    fx.write_profile(
+        "missing",
+        "cmd = \"x\"\nuse = [\"blokc\"]\n[network]\nmode = \"deny\"\n",
+    );
+    let ask = |app: &str, url: &str| {
+        let out = fx.run(&["test", "net", "--app", app, url]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+    let tracker = "https://tracker.example.com";
+
+    for (app, mode, fix) in [
+        (
+            "inherits",
+            "deny",
+            "with `mode = \"deny\"` and the rules it relies on",
+        ),
+        ("bare", "allow", "`[network] mode = \"allow\"`"),
+    ] {
+        let (code, text) = ask(app, tracker);
+        assert_eq!(code, Some(2), "{app}: refused:\n{text}");
+        assert!(
+            text.contains("`tracker.example.com`")
+                && text.contains(&format!("run under `{mode}`"))
+                && text.contains(fix),
+            "{app}: the refusal names the entry, the posture and the fix:\n{text}"
+        );
+    }
+    let (code, text) = ask("missing", tracker);
+    assert_eq!(
+        code,
+        Some(2),
+        "a bundle not declared refuses its app:\n{text}"
+    );
+    assert!(
+        text.contains("blokc") && text.contains("not declared"),
+        "{text}"
+    );
+    let (code, text) = ask("wide", tracker);
+    assert_eq!(
+        code,
+        Some(0),
+        "under `shared` the entry changes nothing:\n{text}"
+    );
+
+    // Each fix, written as its refusal says.
+    fx.write_profile(
+        "inherits",
+        "cmd = \"x\"\nuse = [\"block\"]\n[network]\nmode = \"deny\"\nallow = [\"*.example.com\"]\n",
+    );
+    fx.write_profile(
+        "bare",
+        "cmd = \"x\"\nuse = [\"block\"]\n[network]\nmode = \"allow\"\n",
+    );
+    for (app, mode, neighbour) in [
+        ("inherits", "deny", "https://api.example.com"),
+        ("bare", "allow", "https://other.test"),
+    ] {
+        let (code, text) = ask(app, tracker);
+        assert_eq!(code, Some(0), "{app}: answered:\n{text}");
+        assert!(
+            text.contains(&format!("network (app {app}): {mode} ")) && text.contains("DENIED"),
+            "{app}: the entry denies, under the same posture:\n{text}"
+        );
+        let (_, text) = ask(app, neighbour);
+        assert!(
+            text.contains("ALLOWED"),
+            "{app}: and the posture still lets the rest through:\n{text}"
+        );
+    }
+}
+
+#[test]
 fn an_untrusted_project_cannot_use_a_bundle_to_graft_trusted_egress_onto_its_app() {
     // The flagship property, on the `use` axis: a bundle is declared in the *global* config and
     // carries egress rules and credentials, so an untrusted project naming one would be choosing

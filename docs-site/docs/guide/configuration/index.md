@@ -162,7 +162,8 @@ names it. A launch is then refused until the value is fixed, whichever file it i
 The same holds for a restriction of the right type that sbx cannot apply: an `[fs]` entry or
 `scan` pattern it refuses or an `[fs]` key it does not know, a `network.deny` entry it cannot
 classify or that names a group nobody defined, a `network` or `proc` mode or a `gui` posture it
-does not know. Each is named, and each stops a launch rather than letting it run without the
+does not know, a [bundle](bundles)'s `deny` entry an app has no table to take, and a `use` that
+names no bundle. Each is named, and each stops a launch rather than letting it run without the
 restriction; one under `[app.<name>]` stops that app alone. An `allow` entry sbx cannot read
 only narrows, so it stays a warning.
 
