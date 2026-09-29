@@ -142,6 +142,35 @@ runs:
         set -euo pipefail
         RUSTFLAGS="-D warnings" cargo test --bins -- --skip "$SKIP_TEST"
 
+    # The unpack's seccomp allowlist is written per architecture, and the one test that runs a real
+    # layer through the unpack's own process, in its cage and under its filters, needs a `bwrap` on
+    # the PATH and a user namespace. A hosted runner gives neither, so in the step above that test
+    # returns without running and reports `ok`. On ARM nothing else would run it: `ci.yml` and
+    # `cage.yml` are x86_64 only.
+    #
+    # The `bwrap` is the pinned engine realised above, the one the published binary carries. The
+    # AppArmor knob is lifted the way `cage.yml` lifts it. `SBX_REQUIRE_CAPABLE` turns the skip into
+    # a failure, and the count is read back so that a filter matching nothing cannot pass either.
+    # `RUSTFLAGS` is the step above's, so the test binary is reused rather than rebuilt.
+    - name: The unpack in its cage, under the aarch64 filters
+      if: runner.arch == 'ARM64'
+      shell: bash
+      env:
+        BWRAP_ENGINE: ${{ steps.bwrap.outputs.path }}
+        SBX_REQUIRE_CAPABLE: "1"
+      run: |
+        set -euo pipefail
+        knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        if [ -e "$knob" ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        t=sandbox::distro::unpack::tests::
+        t+=a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else
+        log="$RUNNER_TEMP/unpack-in-its-cage.log"
+        PATH="$(dirname "$BWRAP_ENGINE"):$PATH" RUSTFLAGS="-D warnings" \
+          cargo test --bins -- --exact "$t" | tee "$log"
+        grep -q '^test result: ok\. 1 passed' "$log"
+
     - name: Build the bundled static musl binary
       shell: bash
       env:
