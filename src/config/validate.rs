@@ -1199,6 +1199,9 @@ pub(super) fn validate_network_table(
     // side to fall on is that it is *announced* — the launch warns with the value and with the
     // posture it is running instead — while the permissive fallback is the one failure an operator
     // cannot notice from inside a cage, which is the whole point of setting this key.
+    //
+    // A value of the wrong type (`websocket_secret = true`) never reaches this point: dropping it
+    // would leave `warn` in force, so it costs the file instead (`WIDENING_DROPS` in `schema.rs`).
     if let Some(raw) = &table.websocket_secret {
         match crate::allowlist::WebsocketSecret::parse(raw) {
             Some(action) => policy = policy.with_websocket_secret(action),

@@ -2109,8 +2109,9 @@ pub(crate) struct NetworkTable {
     /// value is refused with a warning and the **strict** posture applies instead, as `capture`
     /// above applies its own `off`. The difference is which spelling that is: here the permissive
     /// value is the one a policy carries unasked, so leaving it in place would keep the weaker
-    /// setting on a value its author most likely wrote to mean `"block"`. Trusted/global-only like
-    /// the rest of the table.
+    /// setting on a value its author most likely wrote to mean `"block"`. A value of the wrong
+    /// type (`true`) costs the file for the same reason, since dropping it would leave `"warn"` in
+    /// force: see [`WIDENING_DROPS`]. Trusted/global-only like the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) websocket_secret: Option<String>,
     /// The per-body capture cap in KiB, meaningful only with `capture = "bodies"`. It is ignored
@@ -2582,8 +2583,9 @@ const MAX_RECOVERED_FIELDS: usize = 4;
 /// Recovery drops the mistyped value and keeps the rest, which is right for what a field *grants*
 /// (`network.allow` gone is fewer hosts) and wrong for what it *restricts*. Two kinds are listed.
 /// A list or a switch whose absence is its permissive end: a `deny`, `readonly` or `scan` list
-/// falls to empty, `ssh_agent.confirm` to signing unasked, a task's `spawn` to no exec supervision
-/// at all; a single mistake in `proc.deny = ["sh", 5]` launched `enforce` with nothing denied. And
+/// falls to empty, `ssh_agent.confirm` to signing unasked, `network.websocket_secret` to relaying a
+/// secret seen leaving through a WebSocket, a task's `spawn` to no exec supervision at all; a
+/// single mistake in `proc.deny = ["sh", 5]` launched `enforce` with nothing denied. And
 /// a posture, whose absence leaves the layer below in force whatever it is: `network` and `proc`
 /// with their `mode`, `gui`, `gpu`, `audio`, `dbus` and `allow_insecure_http`; a project's
 /// `gpu = "no"` over a global `gpu = true` ran with the render node open. The mistyped value does
@@ -2593,8 +2595,8 @@ const MAX_RECOVERED_FIELDS: usize = 4;
 /// config's and a project's alike.
 ///
 /// A value that bounds or tunes a posture rather than decides it is not listed (a limit falls to
-/// the layer below's, `websocket_secret` to `warn`). One left off this list is recovered as before,
-/// so an omission costs what it always did.
+/// the layer below's). One left off this list is recovered as before, so an omission costs what it
+/// always did.
 ///
 /// Each shape is a path of keys, `*` standing for any one key, and applies alike under an app's
 /// own table (`app.<name>.proc.deny`).
@@ -2609,6 +2611,7 @@ const WIDENING_DROPS: &[&[&str]] = &[
     &["network"],
     &["network", "mode"],
     &["network", "deny"],
+    &["network", "websocket_secret"],
     &["gui"],
     &["gpu"],
     &["audio"],
@@ -3014,6 +3017,10 @@ allow = \"github.com\"
                 "[network]\nmode = 7\nallow = [\"a.test\"]\n",
                 "network.mode",
             ),
+            (
+                "[network]\nmode = \"deny\"\nwebsocket_secret = true\n",
+                "network.websocket_secret",
+            ),
             ("gui = false\n", "gui"),
             ("gpu = \"no\"\n", "gpu"),
             ("audio = \"no\"\n", "audio"),
@@ -3023,6 +3030,10 @@ allow = \"github.com\"
             (
                 "[app.a]\ncmd = [\"x\"]\n\n[app.a.network]\nmode = 7\n",
                 "app.a.network.mode",
+            ),
+            (
+                "[app.a]\ncmd = [\"x\"]\n\n[app.a.network]\nwebsocket_secret = 1\n",
+                "app.a.network.websocket_secret",
             ),
         ];
         for (section, path) in refused {
@@ -3139,6 +3150,12 @@ mod layer_properties {
             true,
         ),
         ("mute", &["[\"noise.test\"]"], &["\"noise.test\""], false),
+        (
+            "websocket_secret",
+            &["\"warn\"", "\"block\""],
+            &["true", "5"],
+            true,
+        ),
     ];
     const FS: &[Spec] = &[
         (
@@ -3339,7 +3356,7 @@ mod layer_properties {
                 | ["fs"]
                 | ["fs", "deny" | "readonly" | "scan"]
                 | ["network"]
-                | ["network", "mode" | "deny"]
+                | ["network", "mode" | "deny" | "websocket_secret"]
                 | ["gui" | "gpu" | "audio" | "dbus" | "allow_insecure_http"]
                 | ["ssh_agent", "confirm"]
                 | ["task", _, "spawn"]

@@ -17,3 +17,4 @@ cc 67812f26f7a74a17973b02b35e3852c1c498c57ca4f8578cfe9afe58b58119e9 # `*` taken 
 cc 7be21e724d0fa80ad4cc2f8a8ac419d115cc539dc6b3be149c00f516aaf7787b # `*` taken literally: a mistyped task `spawn` dropped alone
 cc 2b8adcb14c17bc9b63a106bb3772bfdc4eb7d17ef2af7901a4bdf2f61b33a636 # a budget that never runs out: the search re-reads past a cap of 0
 cc 3fb53f7e52cf5f4da97b1ae37b8a6af9cf74fb675f5ae5d99eb89e0328dc8314 # running out keeps the path found: a mistyped app task `network`, cap 1315
+cc 40c09405954a194e412d3ac6d239ba15fd52332a0bc09bccadbcc88e8eadda8f # a mistyped app `websocket_secret` dropped alone, leaving `warn` in force, cap 0

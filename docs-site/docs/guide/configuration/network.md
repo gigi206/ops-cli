@@ -103,7 +103,7 @@ host, unfiltered".
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"`; an unrecognized value is refused and `"off"` applies, with a warning naming the value |
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"`; above the ceiling it is clamped, not refused |
-| `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel); an unrecognized value is refused and the strict `"block"` posture applies, with a warning naming the value: see below |
+| `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel); an unrecognized value is refused and the strict `"block"` posture applies, with a warning naming the value, and a value of the wrong type costs the file: see below |
 | `shared_credential` | groups of hosts that are one service, so a credential the cage obtained by its own sign-in may travel among them: see below |
 | `groups` | **ignored, with a warning**: an egress group lives in its own file under `net-groups/`, and a list references it as `@<name>`: see [Egress groups](../networking/groups) |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
@@ -186,7 +186,10 @@ on.
 A value sbx cannot read is refused at load, and the strict `"block"` posture applies in its
 place with a warning naming both the value and the posture taken. The default is only for the
 spelling `"warn"`: a typo like `"blocked"` must not leave the weaker setting in force, where
-nothing inside the cage could ever show you it had.
+nothing inside the cage could ever show you it had. A value of the wrong type, such as
+`websocket_secret = true`, costs the file instead, as a mistyped `deny` list does: dropping it
+alone would leave `"warn"` in force, so the file is refused and a launch stops until it is
+fixed (see [Forward compatibility](./#forward-compatibility)).
 
 The two settings also differ in what a tunnel watches for. sbx remembers a credential an app
 obtained by its own sign-in, so the set of values it scans for grows while a session runs, and
