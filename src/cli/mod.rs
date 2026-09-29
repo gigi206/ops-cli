@@ -753,11 +753,12 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // user directly, so it carries no page of its own. `rest` is
         // `[<media type>, <bytes spent>, <entries spent>]`.
         "__unpack" => crate::sandbox::run_unpack(&rest),
-        // Internal: `doctor`'s transparent-capture probe. Creates a throwaway user+network
-        // namespace and tries to install the redirect rules in it, so the answer is a measurement
-        // rather than an inference about the kernel. A subcommand because `doctor` cannot unshare
-        // itself. Never invoked by a user directly, so it carries no page of its own. `rest` is
-        // `[<nft path>]`; it never returns.
+        // Internal: the namespace and transparent-capture probe, run by `doctor` and by a launch
+        // before it chooses the netns holder. Creates a throwaway user+network namespace and,
+        // given an `nft`, tries to install the redirect rules in it, so the answer is a measurement
+        // rather than an inference about the kernel. A subcommand because neither caller can
+        // unshare itself. Never invoked by a user directly, so it carries no page of its own.
+        // `rest` is `[]` or `[<nft path>]`; it never returns.
         "__net-probe" => crate::sandbox::run_probe(&rest),
         // Internal: the oracle the emitted completion scripts call on every completion
         // request. Answers with the candidates for the words typed so far and nothing

@@ -270,6 +270,10 @@ pub(crate) fn install_redirect(nft: &Path) -> io::Result<()> {
 pub(crate) enum CaptureSupport {
     /// The rules installed. A launch under a filtering posture will capture.
     Ready,
+    /// sbx could not create the namespace the rules go in, with the probe's words. Asked whether
+    /// or not `nft` is present, because the holder needs that namespace for a graphical cage too;
+    /// a launch that meets it runs in bwrap's own empty namespace instead, without the holder.
+    NoNamespace(String),
     /// No `nft` on the host's PATH, so nothing can install them.
     NoNft,
     /// `nft` is there and the kernel refused, with its own words.
@@ -278,9 +282,17 @@ pub(crate) enum CaptureSupport {
 
 impl CaptureSupport {
     /// What the user is told, and what to do about it. `None` when there is nothing to fix.
+    ///
+    /// For [`CaptureSupport::NoNamespace`] this is what a launch loses; what lifts the refusal
+    /// depends on its cause and on where this binary lives, so `doctor` says that beside it.
     pub(crate) fn remediation(&self) -> Option<&'static str> {
         match self {
             CaptureSupport::Ready => None,
+            CaptureSupport::NoNamespace(_) => Some(
+                "a launch still filters its egress through the proxy, but a client that ignores \
+                 the proxy environment variables fails to connect rather than being routed, and a \
+                 graphical app may report itself offline",
+            ),
             CaptureSupport::NoNft => Some(
                 "install `nft` (the nftables CLI) to let sbx route clients that ignore the proxy \
                  environment variables; without it such a client fails to connect instead",
@@ -294,36 +306,23 @@ impl CaptureSupport {
     }
 }
 
-/// Ask the running kernel whether the redirect rules can be installed, by installing them in a
-/// throwaway user+network namespace that dies with the probe. Bounded: a probe that hangs is
-/// reported as a refusal rather than holding `doctor` open.
+/// Ask the running kernel whether sbx can create the namespace the holder runs in and, when a
+/// trusted `nft` is found, whether it takes the redirect rules there: both are done in a throwaway
+/// user+network namespace that dies with the probe.
 ///
-/// `exe` is sbx's own path — the probe runs as `<exe> __net-probe <nft>`, because the question
+/// `exe` is sbx's own path — the probe runs as `<exe> __net-probe [<nft>]`, because the question
 /// cannot be answered in-process (`unshare` is not something `doctor` may do to itself).
 pub(crate) fn probe_capture(exe: &Path) -> CaptureSupport {
     // Trusted form: `nft` writes the redirect that puts every outbound connection in front of the
     // proxy, so a binary anyone may replace would decide where a cage's traffic goes. An untrusted
     // match is named and skipped, and finding nothing usable reads as "no nft" — the posture a host
     // without it already has.
-    let Some(nft) = crate::store::find_trusted_on_path("nft") else {
-        return CaptureSupport::NoNft;
-    };
-    let out = std::process::Command::new(exe)
-        .arg("__net-probe")
-        .arg(&nft)
-        .stdin(std::process::Stdio::null())
-        .output();
-    match out {
-        Ok(out) if out.status.success() => CaptureSupport::Ready,
-        Ok(out) => {
-            let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            CaptureSupport::Refused(if why.is_empty() {
-                "the probe failed without saying why".to_string()
-            } else {
-                why
-            })
-        }
-        Err(e) => CaptureSupport::Refused(format!("the probe could not run ({e})")),
+    let nft = crate::store::find_trusted_on_path("nft");
+    match (super::netns::probe(exe, nft.as_deref()), nft) {
+        (super::netns::Probe::NamespaceRefused(why), _) => CaptureSupport::NoNamespace(why),
+        (super::netns::Probe::RulesRefused(why), _) => CaptureSupport::Refused(why),
+        (super::netns::Probe::Passed, Some(_)) => CaptureSupport::Ready,
+        (super::netns::Probe::Passed, None) => CaptureSupport::NoNft,
     }
 }
 

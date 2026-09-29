@@ -2,8 +2,10 @@
 //! ask the kernel whether the result is actually hardened.
 //!
 //! `doctor` used to decide the security boundary from a stand-in — a raw
-//! `unshare` in a forked child (still kept, as a fast launch gate and a failure
-//! classifier). The decisive test is the one sbx itself performs at launch: feed
+//! `unshare` in a forked child (still kept, as a launch's first answer and a
+//! failure classifier). A launch whose stand-in says no runs this probe before it
+//! refuses, since a path-profiled `bwrap` can keep capabilities that sbx's own
+//! process is denied. The decisive test is the one sbx itself performs at launch: feed
 //! [`super::argv::to_argv`] to the real `bwrap` and read `/proc/self/status` from
 //! inside. A successful launch reporting `CapEff=0` and `NoNewPrivs=1` proves the
 //! user namespace is capability-bearing more conclusively than the stand-in can —

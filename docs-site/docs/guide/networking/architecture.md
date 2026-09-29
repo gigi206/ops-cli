@@ -105,6 +105,14 @@ fails closed, and all real traffic still goes through the proxy on loopback. So:
   cage raised. A DNS resolver *is* present here, and it is the tap itself (see
   [`network`](../configuration/network#clients-that-ignore-the-proxy-variables)).
 
+The holder is sbx's own binary creating a user namespace with capabilities, which a host that
+restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) refuses it while still
+letting a path-profiled `bwrap` create its own. So a launch asks first, in a throwaway process, and
+a refusal leaves the cage to bwrap's `--unshare-net`: `lo` only, as in the first case above, with a
+warning that the capture tap and the `dummy0` are missing. The holder itself never carries on past
+a refusal, because bwrap behind it is not told to unshare a network namespace: going on would put
+the cage on the host network.
+
 Why the inverse fallback `lo` only → `lo + dummy0` does **not** re-introduce Model P's
 holes: under Model P a NAT uplink leaks the host's loopback and `169.254.169.254` by
 default; here the dummy has no peer, and either no default route at all or one whose every

@@ -1035,6 +1035,19 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
     Ok(PreparedConfig { layout, cwd, cfg })
 }
 
+/// Whether this host can run a cage, decided the way `sbx doctor` decides it.
+///
+/// `userns` is the stand-in, a user namespace sbx creates for itself ([`crate::probe_userns`]),
+/// answered first because it costs one fork. It is not the last word. A host that restricts
+/// unprivileged user namespaces (Ubuntu's AppArmor restriction) strips sbx's own namespace of its
+/// capabilities while a path-profiled `bwrap` keeps them, so a stand-in that says no is checked by
+/// `smoke`: the launch passes a minimal cage started through the `bwrap` it resolved, and only one
+/// that comes back hardened ([`crate::sandbox::smoke()`], the proof `doctor` reports) lets it go
+/// on.
+fn sandbox_available(userns: crate::Userns, smoke: impl FnOnce() -> bool) -> bool {
+    matches!(userns, crate::Userns::Ok) || smoke()
+}
+
 /// The half that needs the host to be able to sandbox: the engines, the user namespace, and the
 /// channel/userland resolution they drive.
 ///
@@ -1052,7 +1065,9 @@ fn prepare_engines(
         Ok(choice) => choice.path,
         Err(miss) => return Err(unresolved_engine("bubblewrap (the sandbox engine)", &miss)),
     };
-    if !matches!(crate::probe_userns(), crate::Userns::Ok) {
+    if !sandbox_available(crate::probe_userns(), || {
+        crate::sandbox::smoke(&bwrap).is_ok_and(|report| report.is_hardened())
+    }) {
         crate::diag::error(
             "sbx: no capability-bearing user namespace — the sandbox cannot run. See `sbx doctor`.",
         );

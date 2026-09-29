@@ -193,7 +193,12 @@ The two engines differ in how complete the independence is:
   and that profile is attached by path to the host's `/usr/bin/bwrap`. So on a
   restricted host `sbx` keeps the host `/usr/bin/bwrap` (the only bwrap that can
   create the namespace); on an unrestricted host the bundled engine leads. This
-  choice is non-regressive by construction.
+  choice is non-regressive by construction. The `sbx` binary itself carries no
+  such profile, so on a restricted host a launch proves the boundary through that
+  `bwrap` rather than through a namespace of its own, and runs without the network
+  namespace `sbx` would prepare itself; `sbx doctor` says what that costs and how
+  to lift it (see
+  [Troubleshooting](../getting-started/troubleshooting#a-launch-warns-about-its-network-namespace)).
 
 `sbx doctor` reports which engine it would use and why. See
 [`sbx doctor`](../getting-started/doctor).

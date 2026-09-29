@@ -619,6 +619,12 @@ fn collect_roots_unions_base_then_packages_then_tools_then_fonts() {
     );
 }
 
+/// The namespace probe handed to [`super::build::holder_plan`] where the launch needs no holder:
+/// the probe spawns a process, so a launch that returns before it must not reach it.
+fn unasked(_: &std::path::Path) -> Result<(), String> {
+    panic!("the namespace probe ran for a launch that needs no holder")
+}
+
 /// The holder is what a filtering launch now runs behind, and two downstream decisions read
 /// this one answer: whether to install the redirect rules, and whether the cage's
 /// `/etc/resolv.conf` names the tap's resolver. They must never be able to disagree — a cage
@@ -634,7 +640,8 @@ fn an_as_root_cage_never_runs_behind_the_holder() {
             true,
             std::path::Path::new("/usr/bin/bwrap"),
             Some(std::path::Path::new("/x.sock")),
-            None
+            None,
+            unasked,
         )
         .is_none(),
         "an as_root cage must not be given the holder"
@@ -650,7 +657,8 @@ fn a_shared_network_posture_needs_no_holder() {
             true,
             std::path::Path::new("/usr/bin/bwrap"),
             Some(std::path::Path::new("/x.sock")),
-            None
+            None,
+            unasked,
         )
         .is_none(),
         "there is nothing to capture and no empty namespace to reassure a browser about"
@@ -666,9 +674,109 @@ fn an_isolated_cage_with_neither_a_browser_nor_a_proxy_needs_no_holder() {
             false,
             std::path::Path::new("/usr/bin/bwrap"),
             None,
-            None
+            None,
+            unasked,
         )
         .is_none()
+    );
+}
+
+/// The argv bwrap is given for an isolated cage, placed behind the holder or not the way the launch
+/// does it.
+fn isolated_cage_argv(holder: Option<crate::sandbox::spec::NetnsDummy>) -> Vec<std::ffi::OsString> {
+    let spec = crate::sandbox::spec::SandboxSpec::new(
+        PathBuf::from("/work"),
+        vec![],
+        vec![],
+        NetPolicy::Isolated,
+        vec![std::ffi::OsString::from("true")],
+    )
+    .expect("a valid spec");
+    let spec = match holder {
+        Some(nd) => spec.with_netns_dummy(nd),
+        None => spec,
+    };
+    crate::sandbox::argv::to_argv(&spec)
+}
+
+/// The holder cannot fall back by itself: behind it bwrap is not told to unshare a network
+/// namespace, so a holder that carried on past a refusal would leave the cage on the host network.
+/// The refusal is therefore decided before the holder is chosen, and pinned where it lands: no
+/// holder, and bwrap's own `--unshare-net`.
+#[test]
+fn a_refused_namespace_leaves_a_graphical_cage_in_bwraps_own_empty_namespace() {
+    let bwrap = std::path::Path::new("/usr/bin/bwrap");
+    let refused =
+        super::build::holder_plan(NetPolicy::Isolated, false, true, bwrap, None, None, |_| {
+            Err("a private network namespace could not be created (refused)".to_string())
+        });
+    assert!(
+        refused.is_none(),
+        "a refused namespace must not be given the holder"
+    );
+    let argv = isolated_cage_argv(refused);
+    assert!(
+        argv.iter().any(|a| a == "--unshare-net"),
+        "without the holder, bwrap must create the cage's empty namespace: {argv:?}"
+    );
+
+    // teeth: granted, the same cage goes behind the holder and bwrap is told nothing about the
+    // network, which is why a refusal must never reach it.
+    let granted =
+        super::build::holder_plan(NetPolicy::Isolated, false, true, bwrap, None, None, |_| {
+            Ok(())
+        });
+    assert!(
+        granted.is_some(),
+        "a graphical cage whose namespace is granted gets the holder"
+    );
+    let argv = isolated_cage_argv(granted);
+    assert!(!argv.iter().any(|a| a == "--unshare-net"), "{argv:?}");
+}
+
+/// The second reason a launch takes the holder, the capture tap, meets the same refusal the same
+/// way. The tap is wired only when a trusted `nft` is on PATH, so a host without one cannot reach
+/// this branch at all.
+#[test]
+fn a_refused_namespace_gives_a_capturing_cage_no_holder() {
+    if crate::store::find_trusted_on_path("nft").is_none() {
+        skip_incapable!(
+            "skipping a_refused_namespace_gives_a_capturing_cage_no_holder: no trusted `nft` on \
+             PATH, so no launch here wires the capture tap"
+        );
+        return;
+    }
+    let bwrap = std::path::Path::new("/usr/bin/bwrap");
+    let uds = Some(std::path::Path::new("/x.sock"));
+    let asked = std::cell::Cell::new(0);
+    let refused =
+        super::build::holder_plan(NetPolicy::Isolated, false, false, bwrap, uds, None, |_| {
+            asked.set(asked.get() + 1);
+            Err("a private network namespace could not be created (refused)".to_string())
+        });
+    assert_eq!(
+        asked.get(),
+        1,
+        "a launch that wires the tap asks for the namespace first"
+    );
+    assert!(
+        refused.is_none(),
+        "a refused namespace must not be given the holder"
+    );
+    assert!(
+        isolated_cage_argv(refused)
+            .iter()
+            .any(|a| a == "--unshare-net")
+    );
+
+    // teeth: granted, the tap rides behind the holder.
+    let granted =
+        super::build::holder_plan(NetPolicy::Isolated, false, false, bwrap, uds, None, |_| {
+            Ok(())
+        });
+    assert!(
+        granted.is_some_and(|h| h.tap.is_some()),
+        "a granted namespace carries the tap"
     );
 }
 
@@ -683,5 +791,31 @@ fn nothing_on_the_launch_path_maps_the_cage_to_root() {
         !crate::testutil::calls_function(production, ".as_root("),
         "this file now maps a cage to uid 0; `holder_plan` is called with a hard-coded \
              `false` and would silently give that cage the holder. Thread the real value in."
+    );
+}
+
+/// The launch gate accepts what `sbx doctor` accepts. The stand-in is sbx's own user namespace,
+/// which Ubuntu's AppArmor restriction strips of its capabilities while a path-profiled `bwrap`
+/// keeps them, so a stand-in that says no is checked by a real hardened launch before the gate
+/// refuses, and one that says yes costs nothing more.
+#[test]
+fn the_launch_gate_asks_bwrap_before_refusing_a_namespace_sbx_was_denied() {
+    assert!(
+        super::sandbox_available(crate::Userns::Ok, || panic!(
+            "a stand-in that says yes must not pay for a launch"
+        )),
+        "a capability-bearing namespace of sbx's own lets the cage start"
+    );
+    assert!(
+        super::sandbox_available(crate::Userns::CapStripped, || true),
+        "a hardened launch through bwrap proves the boundary the stand-in could not"
+    );
+    assert!(
+        !super::sandbox_available(crate::Userns::CapStripped, || false),
+        "a cap-stripped namespace and a failed launch leave nothing to run a cage in"
+    );
+    assert!(
+        !super::sandbox_available(crate::Userns::Unsupported, || false),
+        "no user namespace and a failed launch leave nothing to run a cage in"
     );
 }

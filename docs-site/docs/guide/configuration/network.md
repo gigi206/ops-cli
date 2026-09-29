@@ -282,10 +282,13 @@ Two consequences worth knowing:
   The reason is deliberately not the proxy's `ip-literal`, which has a different remedy: that one is
   lifted by a rule naming the address, and this one cannot be. Allow such a destination the ordinary
   way (by name) or, for a protocol that cannot be inspected, with a `tcp://` rule.
-- The rules need a kernel that will take them (NAT support, and module loading not locked down) and
-  the `nft` command on the host. Where either is missing, launches are unaffected and keep the
-  behaviour above: a proxy-blind client fails to connect. Nothing is silently loosened, and
-  [`sbx doctor`](../cli/doctor) reports which of the two you have, once, with the reason:
+- The rules need a kernel that will take them (NAT support, and module loading not locked down),
+  the `nft` command on the host, and a network namespace sbx may create itself, which a host that
+  restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) refuses it. Where any of
+  them is missing, launches still run and keep the behaviour above: a proxy-blind client fails to
+  connect. Nothing is silently loosened: without its own namespace sbx leaves the cage in the empty
+  one bwrap creates, and each launch says so. [`sbx doctor`](../cli/doctor) reports which of them
+  you have, once, with the reason and, for the restriction, how to lift it:
 
 ```
   [ ok ] capture           a client that ignores the proxy variables is still routed

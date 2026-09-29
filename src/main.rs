@@ -1739,8 +1739,11 @@ enum Userns {
     Unsupported,
     /// The namespace is created but stripped of capabilities (the restricted
     /// Ubuntu 24.04+ default): `unshare(CLONE_NEWUSER)` succeeds, yet the child
-    /// cannot create the further namespaces bwrap needs. It looks available but
-    /// is not — so it must be reported distinctly from outright absence.
+    /// cannot create the further namespaces a cage needs. It looks available but
+    /// is not — so it must be reported distinctly from outright absence. Under
+    /// Ubuntu's AppArmor restriction this holds for sbx's own process only: a
+    /// `bwrap` carrying its own profile keeps its capabilities, which is why a
+    /// launch then asks `bwrap` itself ([`crate::sandbox::smoke()`]) before refusing.
     CapStripped,
 }
 

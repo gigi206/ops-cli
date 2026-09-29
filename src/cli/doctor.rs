@@ -107,6 +107,29 @@ impl<'a> Report<'a> {
         }
     }
 
+    /// Add a context line followed by lines meant to be copied as they stand: printed indented
+    /// under it with no bullet and no styling, so a selection picks up nothing but their text. The
+    /// document carries them in the same note, one per line.
+    fn note_with_lines(&mut self, text: &str, lines: &[String]) {
+        if !self.json {
+            println!(
+                "         {}",
+                style::dim_prose(&format!("· {text}"), self.pal)
+            );
+            for line in lines {
+                println!("             {line}");
+            }
+        }
+        if let Some(last) = self.checks.last_mut() {
+            let mut note = text.to_string();
+            for line in lines {
+                note.push('\n');
+                note.push_str(line);
+            }
+            last.notes.push(note);
+        }
+    }
+
     /// The document `--json` prints, once every check has been recorded. `remediation` is carried
     /// because it is the part a caller acts on: a red check says what is wrong, the hint says what
     /// to do, and splitting them across two outputs would make the document the less useful half.
@@ -194,8 +217,9 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
     // NoNewPrivs=1) proves the user namespace is capability-bearing more
     // conclusively than a raw `unshare` can — bubblewrap cannot nest its
     // namespaces on a cap-stripped one. The `unshare` stand-in survives only to
-    // classify a failure (and as the fast gate the launch path uses). The
-    // sysctls below are advisory context for the remediation hint.
+    // classify a failure (and as a launch's first answer, which falls back to this
+    // same real launch when it says no). The sysctls below are advisory context
+    // for the remediation hint.
     report_security_boundary(
         &mut rep,
         bwrap.as_ref().ok().map(|c| c.path.as_path()),
@@ -357,7 +381,8 @@ fn report_transparent_capture(rep: &mut Report<'_>) {
         );
         return;
     };
-    match sandbox::probe_capture(&exe) {
+    let support = sandbox::probe_capture(&exe);
+    match &support {
         sandbox::CaptureSupport::Ready => {
             rep.check(
                 "ok",
@@ -365,21 +390,84 @@ fn report_transparent_capture(rep: &mut Report<'_>) {
                 "a client that ignores the proxy variables is still routed",
             );
             rep.note("proven by installing the redirect rules in a throwaway namespace");
+            return;
         }
-        other => {
-            rep.check(
-                "warn",
-                "capture",
-                "proxy-blind clients will fail to connect, not be routed",
-            );
-            if let sandbox::CaptureSupport::Refused(why) = &other {
-                rep.note(&format!("the kernel refused: {why}"));
-            }
-            if let Some(hint) = other.remediation() {
-                rep.note(hint);
-            }
-        }
+        sandbox::CaptureSupport::NoNamespace(_) => rep.check(
+            "warn",
+            "capture",
+            "sbx cannot create the cage's network namespace, so a launch runs without capture",
+        ),
+        sandbox::CaptureSupport::NoNft | sandbox::CaptureSupport::Refused(_) => rep.check(
+            "warn",
+            "capture",
+            "proxy-blind clients will fail to connect, not be routed",
+        ),
     }
+    if let sandbox::CaptureSupport::NoNamespace(why) | sandbox::CaptureSupport::Refused(why) =
+        &support
+    {
+        rep.note(&format!("the kernel refused: {why}"));
+    }
+    if let Some(hint) = support.remediation() {
+        rep.note(hint);
+    }
+    if matches!(support, sandbox::CaptureSupport::NoNamespace(_)) {
+        report_namespace_remedies(rep, &exe);
+    }
+}
+
+/// Say what refused sbx its namespace and what lifts the refusal, when the host says what it was.
+///
+/// Only the AppArmor restriction is named, and only when its sysctl is set: that is a cause this
+/// host states, where any other would be a guess, and a guessed cause is how a remedy comes to
+/// point at the wrong layer. Two remedies, the narrow one first: a profile that grants `userns` to
+/// this binary alone, attached to the path it runs from (resolved, since AppArmor attaches to the
+/// file a link leads to), and the sysctl, which lifts the restriction for every program.
+fn report_namespace_remedies(rep: &mut Report<'_>, exe: &Path) {
+    if !store::apparmor_userns_restricted() {
+        return;
+    }
+    rep.note(
+        "cause: AppArmor restricts unprivileged user namespaces \
+         (kernel.apparmor_restrict_unprivileged_userns is set), and no AppArmor profile grants one \
+         to sbx",
+    );
+    match apparmor_profile(exe) {
+        Some(lines) => rep.note_with_lines(
+            "to lift it for sbx alone, save this profile as /etc/apparmor.d/sbx, then run \
+             `sudo apparmor_parser -r /etc/apparmor.d/sbx`:",
+            &lines,
+        ),
+        None => rep.note(&format!(
+            "to lift it for sbx alone, give {} an AppArmor profile that grants `userns`",
+            exe.display()
+        )),
+    }
+    rep.note(
+        "or for every program at once: `sudo sysctl -w \
+         kernel.apparmor_restrict_unprivileged_userns=0`, which undoes that hardening host-wide \
+         until the next boot (a file under /etc/sysctl.d/ makes it last)",
+    );
+}
+
+/// The AppArmor profile that lets the binary at `exe` create user namespaces with capabilities,
+/// and confines it no further: `unconfined` keeps every other permission it has today.
+///
+/// `None` when the path cannot be written between the profile's double quotes as it stands: a
+/// quote, a backslash or a line break would change what the profile says, so the caller names the
+/// remedy without writing it out.
+fn apparmor_profile(exe: &Path) -> Option<Vec<String>> {
+    let path = exe.to_str()?;
+    if path.contains(['"', '\\', '\n', '\r']) {
+        return None;
+    }
+    Some(vec![
+        "abi <abi/4.0>,".to_string(),
+        "include <tunables/global>".to_string(),
+        format!("profile sbx \"{path}\" flags=(unconfined) {{"),
+        "  userns,".to_string(),
+        "}".to_string(),
+    ])
 }
 
 /// Report best-effort cgroup v2 resource limiting (anti-DoS). Unlike the security

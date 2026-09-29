@@ -28,6 +28,42 @@ user namespace there is no security boundary. Fix the listed item (usually bubbl
 `kernel.apparmor_restrict_unprivileged_userns` sysctl) and re-run. See
 [Prerequisites](doctor).
 
+## A launch warns about its network namespace
+
+On a host that restricts unprivileged user namespaces (Ubuntu 24.04 and later do by default), a
+launch that would route proxy-blind clients, or that runs a graphical app, prints:
+
+```text
+sbx: warning: a private network namespace could not be created (Operation not permitted (os error 1)), so the cage runs in an empty network namespace of bwrap's own: a client that ignores the proxy variables will fail to connect rather than be routed; `sbx doctor` says what blocks it and how to lift it
+```
+
+The cage still runs, and it is still filtered: its network namespace is the empty one `bwrap`
+creates, and its egress goes through the proxy as usual. What is missing is the namespace `sbx`
+prepares itself, which carries the
+[capture tap](../configuration/network#clients-that-ignore-the-proxy-variables) and the interface
+that tells a graphical app it is online. The host's `bwrap` carries an AppArmor profile that lets
+it create user namespaces; the `sbx` binary carries none. `sbx doctor` names the cause and prints
+what lifts it:
+
+```text
+  [warn] capture           sbx cannot create the cage's network namespace, so a launch runs without capture
+         · the kernel refused: a private network namespace could not be created (Operation not permitted (os error 1))
+         · a launch still filters its egress through the proxy, but a client that ignores the proxy environment variables fails to connect rather than being routed, and a graphical app may report itself offline
+         · cause: AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns is set), and no AppArmor profile grants one to sbx
+         · to lift it for sbx alone, save this profile as /etc/apparmor.d/sbx, then run `sudo apparmor_parser -r /etc/apparmor.d/sbx`:
+             abi <abi/4.0>,
+             include <tunables/global>
+             profile sbx "/home/you/.local/bin/sbx" flags=(unconfined) {
+               userns,
+             }
+         · or for every program at once: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, which undoes that hardening host-wide until the next boot (a file under /etc/sysctl.d/ makes it last)
+```
+
+The profile is the narrow fix: it lets that one binary create user namespaces and confines it no
+further, while the cage's own processes stay under the confinement Ubuntu gives `bwrap`. It is
+attached to the path `doctor` printed, which is the file a link leads to, so a binary that moves
+needs its path updated. The sysctl lifts the restriction for every program on the host.
+
 ## The launch works, but the project's config is silently ignored
 
 A brand-new project's `.sbx.toml` is **untrusted**, so its security-relevant fields are

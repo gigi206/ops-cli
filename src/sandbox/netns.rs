@@ -170,7 +170,8 @@ pub(crate) fn run_holder(argv: &[OsString]) -> ! {
 /// configure — the interface, and the redirect rules — while the cage that later inherits the
 /// network namespace sits in a *nested* user namespace and holds no capability over it.
 ///
-/// Shared by the holder and by `doctor`'s probe, so what the probe proves is what the launch does.
+/// Shared by the holder and by the probe that `doctor` and a launch run first, so what the probe
+/// proves is what the holder does.
 fn enter_user_and_net_ns() -> std::io::Result<()> {
     // Capture the host credentials before entering the user namespace (afterwards we are the
     // namespace's overflow uid until the map is written).
@@ -201,27 +202,94 @@ fn enter_user_and_net_ns() -> std::io::Result<()> {
     Ok(())
 }
 
-/// The `__net-probe` subcommand body: answer whether this host can install the redirect rules, by
-/// installing them — in a throwaway namespace that dies with this process, so nothing is left
-/// behind and the host's own networking is never touched.
+/// What `__net-probe` exits with when the namespace itself was refused. Distinct from the status of
+/// refused redirect rules, so a caller tells the two apart by the status and never by the wording.
+const PROBE_NAMESPACE_REFUSED: i32 = 3;
+
+/// The `__net-probe` subcommand body: answer whether this host lets sbx create the namespace the
+/// holder runs in and, given an `nft`, whether it takes the redirect rules there, by doing both in
+/// a throwaway namespace that dies with this process, so nothing is left behind and the host's own
+/// networking is never touched.
 ///
 /// It exists as a subcommand because the question cannot be answered in-process: `unshare` is not
-/// something `doctor` may do to itself. `argv` is `[<nft path>]`.
+/// something `doctor` or a launch may do to itself. `argv` is `[]` for the namespace alone, or
+/// `[<nft path>]` for the namespace and the rules. A refused namespace exits
+/// [`PROBE_NAMESPACE_REFUSED`], refused rules exit 1.
 pub(crate) fn run_probe(argv: &[OsString]) -> ! {
-    let Some(nft) = argv.first().map(PathBuf::from) else {
-        eprintln!("__net-probe: no nft path given");
-        std::process::exit(2);
-    };
     if let Err(e) = enter_user_and_net_ns() {
         eprintln!("a private network namespace could not be created ({e})");
-        std::process::exit(1);
+        std::process::exit(PROBE_NAMESPACE_REFUSED);
     }
+    let Some(nft) = argv.first().map(PathBuf::from) else {
+        std::process::exit(0);
+    };
     match super::nettap::install_redirect(&nft) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// What a throwaway `__net-probe` found.
+pub(super) enum Probe {
+    /// The namespace was created and, when an `nft` was given, took the redirect rules.
+    Passed,
+    /// sbx could not create the namespace, with the probe's words. A launch then runs without the
+    /// holder: see [`probe_namespace`].
+    NamespaceRefused(String),
+    /// The namespace was created and `nft` refused the rules in it, with its words.
+    RulesRefused(String),
+}
+
+/// Run `<exe> __net-probe [<nft>]` and classify what it found, by its exit status.
+///
+/// A probe that cannot be started at all reads as a refused namespace: nothing proved the
+/// namespace can be created, and the launch reads the same answer, so the two stay in step.
+pub(super) fn probe(exe: &Path, nft: Option<&Path>) -> Probe {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__net-probe");
+    if let Some(nft) = nft {
+        cmd.arg(nft);
+    }
+    let out = match cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => return Probe::NamespaceRefused(format!("the probe could not run ({e})")),
+    };
+    if out.status.success() {
+        return Probe::Passed;
+    }
+    let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let why = if why.is_empty() {
+        "the probe failed without saying why".to_string()
+    } else {
+        why
+    };
+    if out.status.code() == Some(PROBE_NAMESPACE_REFUSED) {
+        Probe::NamespaceRefused(why)
+    } else {
+        Probe::RulesRefused(why)
+    }
+}
+
+/// Whether this host lets sbx create the namespace the holder runs in, asked of a throwaway
+/// [`probe`] so the answer is the kernel's, reached through the steps the holder takes.
+///
+/// Asked before a launch chooses the holder, never by the holder itself. Behind the holder, bwrap
+/// is not told to unshare a network namespace of its own, so a holder that carried on past a
+/// refusal would put the cage on the host network; and once its user namespace exists, a process
+/// cannot leave it. A host that restricts unprivileged user namespaces (Ubuntu's AppArmor
+/// restriction) refuses sbx here while still letting a path-profiled `bwrap` create its own, which
+/// is the namespace a launch falls back to. `Err` carries the probe's words.
+pub(super) fn probe_namespace(exe: &Path) -> Result<(), String> {
+    match probe(exe, None) {
+        Probe::Passed => Ok(()),
+        Probe::NamespaceRefused(why) | Probe::RulesRefused(why) => Err(why),
     }
 }
 

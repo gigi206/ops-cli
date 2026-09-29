@@ -603,7 +603,7 @@ pub(crate) fn try_resolve_bwrap(layout: Option<&Layout>) -> Result<BwrapChoice, 
 /// Whether the host enforces the AppArmor unprivileged-userns restriction: the sysctl
 /// reads a non-zero value. Absent, unreadable, or zero ⇒ not restricted (prefer the bundled
 /// engine). A non-numeric value is treated as not restricted — the sysctl is a 0/1 boolean.
-fn apparmor_userns_restricted() -> bool {
+pub(crate) fn apparmor_userns_restricted() -> bool {
     match std::fs::read_to_string(APPARMOR_USERNS_RESTRICT) {
         Ok(s) => s.trim().parse::<i64>().map(|v| v != 0).unwrap_or(false),
         Err(_) => false,
