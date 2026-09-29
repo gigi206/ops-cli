@@ -53,8 +53,8 @@ deliberately:
 
 ```sh
 sbx bundle import examples/bundle/claude-code.toml   # the agent's requirements
-sbx app import    examples/app/claude-code.toml      # a conscious trust act
-sbx app run       claude-code                        # launch it, sandboxed
+sbx app import examples/app/claude-code.toml         # a conscious trust act
+sbx app run claude-code                              # launch it, sandboxed
 ```
 
 Imported profiles live under `$XDG_CONFIG_HOME/sbx/apps/` and are **trusted by location**: honored
