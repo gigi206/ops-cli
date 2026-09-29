@@ -1123,10 +1123,12 @@ mod tests {
             "src/sandbox/smoke.rs",
             "src/sandbox/taskpool.rs",
         ];
-        // Holds a `bwrap` path to hand on and starts no cage with it. The process it does spawn is
-        // a host-side tool of its own, `sops` decrypting a secret, so what it owes is that the path
+        // Holds a `bwrap` path to hand on and starts no cage with it. The process each does spawn
+        // is a host-side one of its own: `sops` decrypting a secret, and sbx's `__net-probe`
+        // asking for a throwaway namespace. The netns holder passes its path to `selfcage` for the
+        // tap and becomes the command the launch composed, so what both owe is that the path
         // travels and nothing here starts a cage beside the ones above.
-        const HANDS_THE_PATH_ON: &[&str] = &["src/sandbox/egress.rs"];
+        const HANDS_THE_PATH_ON: &[&str] = &["src/sandbox/egress.rs", "src/sandbox/netns.rs"];
         // These read the pure list to assert something about what it contains, and run nothing.
         const READS_THE_LIST: &[&str] = &[];
         // The definitions themselves: this module, the one that compiles a filter into a descriptor
