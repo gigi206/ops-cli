@@ -149,13 +149,15 @@ that is not recovered either and costs the file the same way. Nothing is ever dr
 silently: one warning names the value, the other names the file.
 
 A value that **restricts** is not dropped on its own, because the file without it
-would allow more than it says. `proc` and its `mode`, `proc.deny`, `fs` and its
-`deny`, `readonly` and `scan`, `network.deny`, `ssh_agent.confirm` and a task's
-`spawn`, at the top of the file or under an app, would each fall back to the
-permissive end: the lens off, nothing denied, no path closed, signing without a
-prompt, a task command free to run anything. One mistyped value in any of them costs
-the file, as two mistakes do, and the message names it. A launch is then refused until
-the value is fixed, whichever file it is in.
+would allow more than it says. `proc.deny`, `fs` and its `deny`, `readonly` and
+`scan`, `network.deny`, `ssh_agent.confirm` and a task's `spawn`, at the top of the
+file or under an app, would each fall back to the permissive end: nothing denied, no
+path closed, signing without a prompt, a task command free to run anything. A
+posture, `network` and `proc` with their `mode`, `gui`, `gpu`, `audio`, `dbus` and
+`allow_insecure_http`, would fall back to the layer below, which may be the wider:
+a project's `gpu = "no"` over a global `gpu = true` would leave the render node open.
+One mistyped value in any of them costs the file, as two mistakes do, and the message
+names it. A launch is then refused until the value is fixed, whichever file it is in.
 
 The same holds for a restriction of the right type that sbx cannot apply: an `[fs]` entry or
 `scan` pattern it refuses, a `network.deny` entry it cannot classify or that names a group

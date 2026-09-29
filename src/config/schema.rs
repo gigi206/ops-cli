@@ -2576,20 +2576,25 @@ fn parse_layer_within(
 /// once; the bound is what keeps a pathological document from re-parsing the file all day.
 const MAX_RECOVERED_FIELDS: usize = 4;
 
-/// The values [`parse_layer`] will not drop on their own, because a layer without one of them says
-/// **less** than was written in the direction that matters: it allows more.
+/// The values [`parse_layer`] will not drop on their own, because a layer without one of them may
+/// say **less** than was written in the direction that matters: it allows more.
 ///
 /// Recovery drops the mistyped value and keeps the rest, which is right for what a field *grants*
-/// (`network.allow` gone is fewer hosts) and wrong for what it *restricts*. Each field here is one
-/// whose absence is the permissive end of what it can say: `proc` and its `mode` fall back to the
-/// lens off, a `deny`, `readonly` or `scan` list to empty, `ssh_agent.confirm` to signing unasked,
-/// and a task's `spawn` to no exec supervision at all. A single mistake in `proc.deny = ["sh", 5]`
-/// launched `enforce` with nothing denied. Such a value costs the file instead, as two mistakes do,
-/// and a file that cannot be read stops a launch, the global config's and a project's alike.
+/// (`network.allow` gone is fewer hosts) and wrong for what it *restricts*. Two kinds are listed.
+/// A list or a switch whose absence is its permissive end: a `deny`, `readonly` or `scan` list
+/// falls to empty, `ssh_agent.confirm` to signing unasked, a task's `spawn` to no exec supervision
+/// at all; a single mistake in `proc.deny = ["sh", 5]` launched `enforce` with nothing denied. And
+/// a posture, whose absence leaves the layer below in force whatever it is: `network` and `proc`
+/// with their `mode`, `gui`, `gpu`, `audio`, `dbus` and `allow_insecure_http`; a project's
+/// `gpu = "no"` over a global `gpu = true` ran with the render node open. The mistyped value does
+/// not say which side it meant, and the layer below may be the wider, as for a posture written with
+/// the right type that sbx does not recognize, which stops a launch too. Such a value costs the
+/// file instead, as two mistakes do, and a file that cannot be read stops a launch, the global
+/// config's and a project's alike.
 ///
-/// A field whose absence falls somewhere in the middle is not listed (`websocket_secret` falls to
-/// `warn`, a limit to its built-in value), since the mistyped value does not say which side it
-/// meant. One left off this list is recovered as before, so an omission costs what it always did.
+/// A value that bounds or tunes a posture rather than decides it is not listed (a limit falls to
+/// the layer below's, `websocket_secret` to `warn`). One left off this list is recovered as before,
+/// so an omission costs what it always did.
 ///
 /// Each shape is a path of keys, `*` standing for any one key, and applies alike under an app's
 /// own table (`app.<name>.proc.deny`).
@@ -2601,7 +2606,14 @@ const WIDENING_DROPS: &[&[&str]] = &[
     &["fs", "deny"],
     &["fs", "readonly"],
     &["fs", "scan"],
+    &["network"],
+    &["network", "mode"],
     &["network", "deny"],
+    &["gui"],
+    &["gpu"],
+    &["audio"],
+    &["dbus"],
+    &["allow_insecure_http"],
     &["ssh_agent", "confirm"],
     &["task", "*", "spawn"],
 ];
@@ -2962,10 +2974,11 @@ allow = \"github.com\"
     }
 
     /// A mistyped restriction costs the file, not the restriction. Recovery drops the value at fault
-    /// and keeps the rest, which for a `deny` list, a `mode`, a `scan` or a task's `spawn` is the
-    /// permissive direction: `proc.deny = ["sh", 5]` launched `enforce` with nothing denied. Each of
-    /// them, at the top of the file and under an app, refuses the file and names the value; a value
-    /// that grants is still dropped alone, and so is one a level below a listed shape.
+    /// and keeps the rest, which for a `deny` list, a `scan` or a task's `spawn` is the permissive
+    /// direction, and for a posture leaves the layer below in force: `proc.deny = ["sh", 5]`
+    /// launched `enforce` with nothing denied. Each of them, at the top of the file and under an
+    /// app, refuses the file and names the value; a value that grants is still dropped alone, and
+    /// so is one a level below a listed shape.
     #[test]
     fn a_mistyped_restriction_costs_the_file_not_the_restriction() {
         let refused = [
@@ -2995,6 +3008,21 @@ allow = \"github.com\"
             (
                 "[app.a.task.t]\ncmd = [\"make\"]\nspawn = 5\n",
                 "app.a.task.t.spawn",
+            ),
+            ("network = 5\n", "network"),
+            (
+                "[network]\nmode = 7\nallow = [\"a.test\"]\n",
+                "network.mode",
+            ),
+            ("gui = false\n", "gui"),
+            ("gpu = \"no\"\n", "gpu"),
+            ("audio = \"no\"\n", "audio"),
+            ("dbus = \"off\"\n", "dbus"),
+            ("allow_insecure_http = \"no\"\n", "allow_insecure_http"),
+            ("[app.a]\ncmd = [\"x\"]\ngpu = \"no\"\n", "app.a.gpu"),
+            (
+                "[app.a]\ncmd = [\"x\"]\n\n[app.a.network]\nmode = 7\n",
+                "app.a.network.mode",
             ),
         ];
         for (section, path) in refused {
@@ -3075,7 +3103,11 @@ mod layer_properties {
 
     const TOP: &[Spec] = &[
         ("timezone", &["\"UTC\""], &["5"], false),
-        ("gpu", &["false"], &["\"no\""], false),
+        ("gpu", &["false"], &["\"no\""], true),
+        ("gui", &["\"none\"", "\"wayland\""], &["false", "5"], true),
+        ("audio", &["false"], &["\"no\""], true),
+        ("dbus", &["true"], &["\"off\""], true),
+        ("allow_insecure_http", &["false"], &["\"no\""], true),
     ];
     const PROC: &[Spec] = &[
         (
@@ -3093,7 +3125,7 @@ mod layer_properties {
         ("allow", &["[\"git\"]", "[]"], &["\"git\"", "[1]"], false),
     ];
     const NETWORK: &[Spec] = &[
-        ("mode", &["\"deny\"", "\"allow\"", "\"ask\""], &["7"], false),
+        ("mode", &["\"deny\"", "\"allow\"", "\"ask\""], &["7"], true),
         (
             "allow",
             &["[\"github.com\"]", "[]"],
@@ -3146,7 +3178,7 @@ mod layer_properties {
     ];
     const APP: &[Spec] = &[
         ("cmd", &["[\"x\"]", "\"x\""], &["5"], false),
-        ("gpu", &["true"], &["\"on\""], false),
+        ("gpu", &["true"], &["\"on\""], true),
     ];
 
     /// Every table a generated layer may carry, in the order it is written. The top level comes
@@ -3306,7 +3338,9 @@ mod layer_properties {
                 | ["proc", "mode" | "deny"]
                 | ["fs"]
                 | ["fs", "deny" | "readonly" | "scan"]
-                | ["network", "deny"]
+                | ["network"]
+                | ["network", "mode" | "deny"]
+                | ["gui" | "gpu" | "audio" | "dbus" | "allow_insecure_http"]
                 | ["ssh_agent", "confirm"]
                 | ["task", _, "spawn"]
         )
