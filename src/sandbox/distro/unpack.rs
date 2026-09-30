@@ -29,6 +29,10 @@
 //! socket, runs no program and starts no process. The budget is still enforced by the code in the
 //! child, so it holds against what it held against before, and not against a child made to lie
 //! about what it spent. The cage bounds where the child writes, not how much.
+//!
+//! How long it runs is the parent's to bound, since a child made to spin never says so: the layers
+//! of an image share [`TIME_PER_IMAGE`], and a child still running when the image's share is spent
+//! is killed with its cage.
 
 use super::layers::{self, Budget};
 use crate::sandbox::selfcage;
@@ -39,7 +43,8 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{ExitCode, ExitStatus};
+use std::process::{Child, ExitCode, ExitStatus};
+use std::time::{Duration, Instant};
 
 /// Where the tree being assembled is, inside the unpack's cage.
 const ROOT: &str = "/rootfs";
@@ -53,15 +58,34 @@ const RESULT_MAX: usize = 64;
 /// child never waits on a full pipe, and the message says it was cut.
 const MESSAGE_MAX: usize = 16 * 1024;
 
+/// The most time one image's layers may take to unpack, all of them together: spent layer by
+/// layer, like the budget, so an image cannot multiply it by listing more layers.
+///
+/// Set from the costliest shapes the ceilings allow, measured on the unpack as it is: a member at
+/// the bottom of a 4 KiB path takes 0.6 ms, so a million entries take ten minutes, and 64 GiB
+/// written at 100 MB/s, a slow disk's pace, take eleven. An image that reaches both ceilings at
+/// once is inside this more than twice over, and a real one is minutes below it. Only the unpack
+/// counts, not the fetch of the blobs, which is bounded on its own.
+pub(super) const TIME_PER_IMAGE: Duration = Duration::from_secs(60 * 60);
+
+/// How often the parent looks whether a layer's unpack has ended. A layer often takes a few tens
+/// of milliseconds, and each look it waits for is added to the provision.
+const POLL: Duration = Duration::from_millis(20);
+
 /// Apply the layer at `blob` over `rootfs`, in a cage of its own started by `bwrap`, carrying
-/// `budget` from the layers before it on to the ones after.
+/// `budget` from the layers before it on to the ones after, and taking what it runs for out of
+/// `time_left`, the image's share of [`TIME_PER_IMAGE`] still unspent.
 pub(super) fn apply(
     bwrap: &Path,
     blob: &Path,
     media_type: &str,
     rootfs: &Path,
     budget: &mut Budget,
+    time_left: &mut Duration,
 ) -> io::Result<()> {
+    if time_left.is_zero() {
+        return Err(out_of_time());
+    }
     // The cage binds the tree, so it has to exist before the first layer does.
     std::fs::create_dir_all(rootfs)?;
     let layer = File::open(blob)?;
@@ -72,9 +96,21 @@ pub(super) fn apply(
         bytes.to_string().into(),
         entries.to_string().into(),
     ];
-    let (bytes, entries) = outcome(&process::run(bwrap, rootfs, layer, args)?)?;
+    let started = Instant::now();
+    let ended = process::run(bwrap, rootfs, layer, args, started + *time_left);
+    *time_left = time_left.saturating_sub(started.elapsed());
+    let (bytes, entries) = outcome(&ended?)?;
     *budget = Budget::resumed(bytes, entries);
     Ok(())
+}
+
+/// Why an image whose share of [`TIME_PER_IMAGE`] is spent is not unpacked further.
+fn out_of_time() -> io::Error {
+    io::Error::other(format!(
+        "this image's layers take more than {} minutes to unpack: stopping rather than waiting on \
+         them",
+        TIME_PER_IMAGE.as_secs() / 60
+    ))
 }
 
 /// `sbx __unpack <media type> <bytes spent> <entries spent>`: apply the layer on standard input
@@ -149,11 +185,13 @@ fn serve(
     }
 }
 
-/// How one layer's unpack ended: its status, and what it wrote on each stream, bounded.
+/// How one layer's unpack ended: its status, what it wrote on each stream, bounded, and whether
+/// the parent killed it for running past the image's time.
 struct Ended {
     status: ExitStatus,
     out: Bounded,
     message: Bounded,
+    out_of_time: bool,
 }
 
 /// What a stream held, up to a bound, and whether it held more.
@@ -174,6 +212,10 @@ fn bounded(mut from: impl Read, max: usize) -> Bounded {
 
 /// What the image has spent once a layer's unpack ended, or why the layer was not applied.
 fn outcome(ended: &Ended) -> io::Result<(u64, u64)> {
+    // Before the status, which for a child the parent killed is only the signal it sent.
+    if ended.out_of_time {
+        return Err(out_of_time());
+    }
     if ended.status.success() {
         return spent(&ended.out).ok_or_else(|| {
             io::Error::other("a layer's unpack ended without saying what it spent")
@@ -227,6 +269,49 @@ fn cage(binary: RawFd, copy: bool, rootfs: &Path, args: Vec<OsString>) -> io::Re
     )
 }
 
+/// Read what `child`, a layer's unpack, writes on its two pipes, and wait for it, killing it with
+/// its cage once `deadline` has passed ([`crate::sandbox::cagewait::wait_capped`]).
+///
+/// Both streams are drained on threads of their own, so a child that fills one pipe is never left
+/// waiting while this reads the other, and one that writes nothing and never ends still meets the
+/// deadline: this thread only waits. It is the thread that started the child, so the parent-death
+/// signal bubblewrap arms, which follows the starting thread, cannot fire early.
+///
+/// The streams are joined after the wait, and their end is what says the cage has gone with
+/// bubblewrap: the caller removes the tree on an error, and a child still writing into it would
+/// race that removal.
+fn collect(mut child: Child, deadline: Instant) -> io::Result<Ended> {
+    let out = drain(child.stdout.take(), RESULT_MAX, "sbx-unpack-out");
+    let message = drain(child.stderr.take(), MESSAGE_MAX, "sbx-unpack-err");
+    let (out, message) = match (out, message) {
+        (Ok(out), Ok(message)) => (out, message),
+        // Not returned before the child is gone, for the same removal.
+        (Err(e), _) | (_, Err(e)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    let (status, out_of_time) = crate::sandbox::cagewait::wait_capped(&mut child, deadline, POLL)?;
+    Ok(Ended {
+        status,
+        out: out.join().unwrap_or_default(),
+        message: message.join().unwrap_or_default(),
+        out_of_time,
+    })
+}
+
+/// Read `stream` to its end on a thread named `name`, keeping at most `max` bytes of it.
+fn drain(
+    stream: Option<impl Read + Send + 'static>,
+    max: usize,
+    name: &str,
+) -> io::Result<std::thread::JoinHandle<Bounded>> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || stream.map(|s| bounded(s, max)).unwrap_or_default())
+}
+
 /// The unpack as a process in its cage.
 #[cfg(not(test))]
 mod process {
@@ -235,13 +320,13 @@ mod process {
     use std::process::Stdio;
 
     /// Run `sbx` with `args` in the cage [`cage`] describes, `layer` on its standard input, and
-    /// wait for it. The thread that starts it is the one that waits, so the parent-death signal
-    /// bubblewrap arms, which follows the starting thread, cannot fire early.
+    /// wait for it until `deadline` ([`collect`]).
     pub(super) fn run(
         bwrap: &Path,
         rootfs: &Path,
         layer: File,
         args: Vec<OsString>,
+        deadline: Instant,
     ) -> io::Result<Ended> {
         let (binary, copy) = selfcage::running()?;
         let spec = cage(binary.as_raw_fd(), copy, rootfs, args)?;
@@ -253,35 +338,7 @@ mod process {
         crate::sandbox::memfd::inherit_across_exec(&mut command, &files);
         let started = command.spawn();
         drop(files);
-        let mut child = started?;
-        // Standard error is drained on a thread of its own while standard output is read here, so
-        // a child that fills one pipe is never left waiting while this reads the other.
-        let stderr = child.stderr.take();
-        let message = match std::thread::Builder::new()
-            .name("sbx-unpack-err".into())
-            .spawn(move || stderr.map(|e| bounded(e, MESSAGE_MAX)).unwrap_or_default())
-        {
-            Ok(message) => message,
-            // Not returned before the child is gone: the caller removes the tree on an error, and
-            // a child still writing into it would race that removal.
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e);
-            }
-        };
-        let out = child
-            .stdout
-            .take()
-            .map(|o| bounded(o, RESULT_MAX))
-            .unwrap_or_default();
-        let status = child.wait()?;
-        let message = message.join().unwrap_or_default();
-        Ok(Ended {
-            status,
-            out,
-            message,
-        })
+        collect(started?, deadline)
     }
 }
 
@@ -293,12 +350,14 @@ mod process {
     /// A test binary is not sbx and cannot be started as `sbx __unpack`, and a host without user
     /// namespaces has no cage to start. This runs [`serve`] here instead, over `rootfs` itself, and
     /// reads what it wrote through the same bounds, so everything but the process and the cage is
-    /// the unpack's own. The cage is tested on its own, by running this test binary in it.
+    /// the unpack's own. The cage is tested on its own, by running this test binary in it, and the
+    /// wait for the process, deadline included, by running [`collect`] on a child of its own.
     pub(super) fn run(
         _bwrap: &Path,
         rootfs: &Path,
         layer: File,
         args: Vec<OsString>,
+        _deadline: Instant,
     ) -> io::Result<Ended> {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = serve(&args[1..], layer, rootfs, &mut out, &mut err);
@@ -306,6 +365,7 @@ mod process {
             status: ExitStatus::from_raw(i32::from(code) << 8),
             out: bounded(&out[..], RESULT_MAX),
             message: bounded(&err[..], MESSAGE_MAX),
+            out_of_time: false,
         })
     }
 }

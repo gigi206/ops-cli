@@ -35,8 +35,9 @@ fn a_layer_lands_and_the_budget_it_spent_is_carried_to_the_next() {
     let rootfs = tmp.join("rootfs");
     let bwrap = Path::new("bwrap");
     let mut budget = Budget::new();
+    let mut time = TIME_PER_IMAGE;
     let first = blob(&tmp, "one", &layer_of(&[("etc/os-release", "ID=test\n")]));
-    apply(bwrap, &first, TAR, &rootfs, &mut budget).expect("the first layer applies");
+    apply(bwrap, &first, TAR, &rootfs, &mut budget, &mut time).expect("the first layer applies");
     let after_one = budget.spent();
     assert_eq!(
         after_one,
@@ -45,7 +46,7 @@ fn a_layer_lands_and_the_budget_it_spent_is_carried_to_the_next() {
     );
 
     let second = blob(&tmp, "two", &layer_of(&[("etc/hostname", "cage\n")]));
-    apply(bwrap, &second, TAR, &rootfs, &mut budget).expect("the second layer applies");
+    apply(bwrap, &second, TAR, &rootfs, &mut budget, &mut time).expect("the second layer applies");
     assert_eq!(
         budget.spent(),
         (13, 3),
@@ -69,8 +70,16 @@ fn a_layer_is_refused_by_the_budget_the_layers_before_it_spent() {
     let rootfs = tmp.join("rootfs");
     let layer = blob(&tmp, "near", &layer_of(&[("a", "x"), ("b", "y")]));
     let mut budget = Budget::resumed(0, layers::MAX_MEMBERS - 1);
-    let err = apply(Path::new("bwrap"), &layer, TAR, &rootfs, &mut budget)
-        .expect_err("two entries past one left are refused");
+    let mut time = TIME_PER_IMAGE;
+    let err = apply(
+        Path::new("bwrap"),
+        &layer,
+        TAR,
+        &rootfs,
+        &mut budget,
+        &mut time,
+    )
+    .expect_err("two entries past one left are refused");
     assert!(
         err.to_string().contains("entries"),
         "the refusal is the entry ceiling: {err}"
@@ -88,6 +97,7 @@ fn ended(status: ExitStatus, out: &[u8], message: &[u8]) -> Ended {
         status,
         out: bounded(out, RESULT_MAX),
         message: bounded(message, MESSAGE_MAX),
+        out_of_time: false,
     }
 }
 
@@ -161,6 +171,91 @@ fn a_bounded_read_keeps_its_bound_and_drains_the_rest() {
     let whole = bounded(&b"spent 1 1\n"[..], RESULT_MAX);
     assert_eq!(whole.kept, b"spent 1 1\n");
     assert!(!whole.cut);
+}
+
+/// A layer's unpack takes its time out of the image's, and an image whose time is spent unpacks no
+/// further layer: the next is refused before its cage is started, and the tree is left as it was.
+#[test]
+fn a_layer_spends_the_images_time_and_none_left_refuses_the_next() {
+    let tmp = TmpDir::new();
+    let rootfs = tmp.join("rootfs");
+    let layer = blob(&tmp, "one", &layer_of(&[("etc/hostname", "cage\n")]));
+    let mut budget = Budget::new();
+    let mut time = TIME_PER_IMAGE;
+    apply(
+        Path::new("bwrap"),
+        &layer,
+        TAR,
+        &rootfs,
+        &mut budget,
+        &mut time,
+    )
+    .expect("a layer with time left applies");
+    assert!(
+        time < TIME_PER_IMAGE,
+        "the layer spent some of the image's time"
+    );
+
+    let untouched = tmp.join("untouched");
+    let mut none = Duration::ZERO;
+    let err = apply(
+        Path::new("bwrap"),
+        &layer,
+        TAR,
+        &untouched,
+        &mut budget,
+        &mut none,
+    )
+    .expect_err("no time is left for it");
+    assert_eq!(
+        err.to_string(),
+        "this image's layers take more than 60 minutes to unpack: stopping rather than waiting on \
+         them"
+    );
+    assert!(!untouched.exists(), "nothing was started for it");
+    assert_eq!(budget.spent(), (5, 2), "a refused layer spends nothing");
+}
+
+/// An unpack still running at its deadline is killed, and said to be out of time rather than
+/// killed by a signal: the parent's wait, run here on a child that never ends.
+#[test]
+fn an_unpack_still_running_at_its_deadline_is_killed_and_named() {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sleep can be spawned");
+    let started = Instant::now();
+    let ended =
+        collect(child, started + Duration::from_millis(200)).expect("the child is waited for");
+    assert!(ended.out_of_time, "the deadline ended it");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the wait ended at the deadline, not with the child: {:?}",
+        started.elapsed()
+    );
+    let err = outcome(&ended).expect_err("an unpack out of time applied nothing");
+    assert!(err.to_string().contains("60 minutes"), "{err}");
+}
+
+/// An unpack that ends before its deadline is read whole off both of its streams, and is not out
+/// of time.
+#[test]
+fn an_unpack_that_ends_in_time_is_read_off_both_streams() {
+    let child = std::process::Command::new("sh")
+        .args(["-c", "printf 'spent 3 4\\n'; printf 'said' >&2"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("a shell can be spawned");
+    let ended =
+        collect(child, Instant::now() + Duration::from_secs(30)).expect("the child is waited for");
+    assert!(!ended.out_of_time);
+    assert_eq!(ended.message.kept, b"said");
+    assert_eq!(outcome(&ended).expect("it said what it spent"), (3, 4));
 }
 
 /// The unpack's cage names nothing of the host but the userland, the binary and the tree: the one

@@ -329,12 +329,21 @@ fn unpack_into(
         std::fs::create_dir_all(&blobs)?;
         let manifest = registry::resolve(image, credential)?;
         let rootfs = partial.join("rootfs");
-        // One budget for the image, not one per layer: the layers are applied over the same tree,
-        // so a per-layer ceiling would multiply by however many the manifest lists.
+        // One budget for the image, not one per layer, and one time to unpack it in: the layers are
+        // applied over the same tree, so a per-layer ceiling would multiply by however many the
+        // manifest lists.
         let mut budget = layers::Budget::new();
+        let mut time_left = super::unpack::TIME_PER_IMAGE;
         for layer in &manifest.layers {
             let blob = registry::fetch_layer(image, layer, &blobs, credential)?;
-            super::unpack::apply(bwrap, &blob, &layer.media_type, &rootfs, &mut budget)?;
+            super::unpack::apply(
+                bwrap,
+                &blob,
+                &layer.media_type,
+                &rootfs,
+                &mut budget,
+                &mut time_left,
+            )?;
             // Freed as soon as it is applied: the layers of one image can outweigh the tree they
             // produce, and keeping them all would double the cost of every provision for a set of
             // files nothing reads again.

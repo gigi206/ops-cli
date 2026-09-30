@@ -255,6 +255,13 @@ files), so an image that meets one is not a distribution.
 The budget spans the image, not the layer, because the layers are applied over the same
 tree.
 
+The layers of an image also have **one hour** to unpack, all of them together and the
+fetch of their blobs not counted. A layer still unpacking when the image's hour is spent is
+stopped, its cage with it, and the provision says the image took too long. The costliest
+image the two ceilings allow unpacks in well under half of that: a million entries at the
+bottom of the deepest path the kernel resolves take about ten minutes, and 64 GiB written at
+a slow disk's 100 MB/s about eleven.
+
 What the unpack reads to reach each member is bounded too, at **1 MiB**: the member's
 header, and the long name, long link or PAX record that describes it, which the tar reader
 holds whole in memory before the member reaches the budget. Nothing honest comes near it
@@ -298,7 +305,8 @@ It runs under a system-call filter that lists the calls its work makes, so it op
 socket, runs no program and starts no process. The checks above decide where every member
 lands; the cage is what stands behind them, so a flaw in one would write inside that tree
 and nowhere else. The ceilings are still counted by the unpack itself, carried from one
-layer's process to the next: the cage bounds where a layer writes, not how much.
+layer's process to the next: the cage bounds where a layer writes, not how much. How long
+it runs is bounded from outside, by the process that started it: the image's hour above.
 
 A refusal names what the image or its registry chose: a member's path, a media type, the
 registry's challenge or its token service's answer. A character in it that acts on a
