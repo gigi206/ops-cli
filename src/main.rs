@@ -129,9 +129,11 @@ fn main() -> ExitCode {
 /// detached daemon forks without an `exec`, and would otherwise keep a pipe of its invoker open for
 /// the session's whole life.
 ///
-/// The internal verbs keep theirs. sbx starts each of them itself, from a process that has already
-/// done this, and hands it the descriptors its arguments name: `__netns-holder` passes them on to
-/// the cage's bubblewrap, `__proxy` serves the link it is given.
+/// The internal verbs keep theirs. sbx starts each of them itself and hands it the descriptors its
+/// arguments name: `__netns-holder` passes them on to the cage's bubblewrap, `__proxy` serves the
+/// link it is given. Each is started from a process that has already done this, save the capture
+/// tap, which the holder starts while it holds the cage's descriptors, and which is handed its own
+/// alone ([`sandbox::memfd::inherit_only`]).
 fn close_inherited_descriptors() {
     // SAFETY: `close_range` takes no pointer, and nothing this process owns is open past the
     // standard three yet.

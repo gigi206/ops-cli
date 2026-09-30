@@ -83,6 +83,59 @@ pub(crate) fn inherit_across_exec(command: &mut Command, files: &[File]) {
     }
 }
 
+/// Let the exec `command` performs inherit `files` and nothing else of what this process holds.
+///
+/// [`inherit_across_exec`] is enough where the spawning process opened nothing it did not mean to
+/// hand on. One that holds descriptors another exec of its own needs, without the flag, would pass
+/// them to this one too: every descriptor past the standard three is marked close-on-exec in the
+/// child first, then the flag is cleared on `files`. Registered before, so it runs before. The
+/// parent's copies are its own, and keep what they had.
+pub(crate) fn inherit_only(command: &mut Command, files: &[File]) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: the closure runs in the child between fork and exec, where only async-signal-safe
+    // calls are allowed. `close_range`, `getrlimit` and `fcntl` are system calls that take no lock
+    // and allocate nothing.
+    unsafe {
+        command.pre_exec(|| {
+            mark_close_on_exec_past_the_standard_three();
+            Ok(())
+        });
+    }
+    inherit_across_exec(command, files);
+}
+
+/// Mark every descriptor past the standard three close-on-exec, in one call where the kernel has
+/// it (5.11), and one at a time below the descriptor limit where it does not. Called between a fork
+/// and an exec, so it reads no directory and allocates nothing: a number that is not open answers
+/// `EBADF`.
+fn mark_close_on_exec_past_the_standard_three() {
+    // SAFETY: `close_range` takes no pointer.
+    let marked = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if marked == 0 {
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes the one `rlimit` it is handed.
+    let top = match unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } {
+        0 => limit.rlim_cur.min(1 << 20),
+        _ => 1 << 20,
+    };
+    for fd in 3..top as libc::c_int {
+        // SAFETY: `fcntl` with `F_SETFD` on a number this child holds, or `EBADF`.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
 /// Clear `FD_CLOEXEC` on each of `fds`, reporting whether all of them took it.
 ///
 /// Answers with a `bool` rather than a `Result` because both callers are on the child side of a
@@ -165,9 +218,15 @@ mod tests {
             }
             // `spawn_launcher` counts: it is the one launch helper that prepares on its caller's
             // behalf, so a file handing it a command has already answered for its descriptors.
-            let prepares = ["inherit_across_exec", "clear_cloexec", "spawn_launcher("]
-                .iter()
-                .any(|needle| text.contains(needle));
+            // `inherit_only` prepares through `inherit_across_exec`, after closing the rest.
+            let prepares = [
+                "inherit_across_exec",
+                "inherit_only",
+                "clear_cloexec",
+                "spawn_launcher(",
+            ]
+            .iter()
+            .any(|needle| text.contains(needle));
             if !prepares {
                 offenders.push(path.display().to_string());
             }
@@ -248,5 +307,52 @@ mod tests {
             "an unprepared spawn must inherit nothing: {:?}",
             String::from_utf8_lossy(&bare.stdout)
         );
+    }
+
+    /// A spawn prepared with `inherit_only` hands on the files it names and nothing else the
+    /// spawning process holds without the flag, which `inherit_across_exec` alone lets through:
+    /// the tap is started from a process holding the cage's descriptors for another exec.
+    #[test]
+    fn a_spawn_prepared_with_inherit_only_hands_on_its_files_and_no_other() {
+        use std::os::unix::io::AsRawFd;
+
+        use std::os::unix::process::CommandExt as _;
+        const HELD: libc::c_int = 50;
+
+        let handed = super::write(c"sbx-handed", b"handed").expect("memfd");
+        let stray = super::write(c"sbx-stray", b"stray").expect("memfd");
+        let raw = stray.as_raw_fd();
+        // Held for another exec, the way a holder keeps the cage's descriptors: a copy without the
+        // flag, made in the child alone so no other test's spawn inherits it, and made first.
+        let hold = |command: &mut Command| {
+            // SAFETY: `dup2` is async-signal-safe, and `raw` is open for the whole spawn.
+            unsafe {
+                command.pre_exec(move || match libc::dup2(raw, HELD) {
+                    HELD => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                });
+            }
+        };
+        let read_both = format!(
+            "cat /proc/self/fd/{}; cat /proc/self/fd/{HELD}",
+            handed.as_raw_fd()
+        );
+
+        let mut across = Command::new("/bin/sh");
+        across.arg("-c").arg(&read_both);
+        hold(&mut across);
+        super::inherit_across_exec(&mut across, std::slice::from_ref(&handed));
+        let out = across.output().expect("the child runs");
+        assert_eq!(
+            out.stdout, b"handedstray",
+            "the control: the stray one crosses"
+        );
+
+        let mut only = Command::new("/bin/sh");
+        only.arg("-c").arg(&read_both);
+        hold(&mut only);
+        super::inherit_only(&mut only, std::slice::from_ref(&handed));
+        let out = only.output().expect("the child runs");
+        assert_eq!(out.stdout, b"handed");
     }
 }
