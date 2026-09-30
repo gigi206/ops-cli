@@ -91,6 +91,48 @@ fn a_layer_is_refused_by_the_budget_the_layers_before_it_spent() {
     );
 }
 
+/// The unpack takes the room the store's filesystem had free as its fourth argument, and a layer
+/// past it is refused: the parent reads the figure, since the cage has no view of that filesystem.
+/// An unpack given fewer arguments applies nothing.
+#[test]
+fn the_unpack_is_held_to_the_room_it_is_told_the_filesystem_has() {
+    let tmp = TmpDir::new();
+    let rootfs = tmp.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    let layer = blob(&tmp, "big", &layer_of(&[("big", &"x".repeat(100))]));
+    let arg = |a: &str| OsString::from(a);
+    let tight = (layers::ROOM_KEPT + 50).to_string();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = serve(
+        &[arg(TAR), arg("0"), arg("0"), arg(&tight)],
+        File::open(&layer).unwrap(),
+        &rootfs,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, 1, "{}", String::from_utf8_lossy(&err));
+    assert!(
+        String::from_utf8_lossy(&err).contains("need more room than the store's filesystem has"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = serve(
+        &[arg(TAR), arg("0"), arg("0")],
+        File::open(&layer).unwrap(),
+        &rootfs,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, 2, "three arguments are one short");
+    assert!(
+        String::from_utf8_lossy(&err).contains("the bytes free on the store's filesystem"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
 /// An ending of the unpack, for [`outcome`].
 fn ended(status: ExitStatus, out: &[u8], message: &[u8]) -> Ended {
     Ended {
@@ -444,7 +486,8 @@ fn probe_in_the_unpacks_cage() {
     let to = (std::net::Ipv4Addr::new(192, 0, 2, 1), 443).into();
     let connect = std::net::TcpStream::connect_timeout(&to, std::time::Duration::from_secs(1));
     say("connect", errno(connect.map(drop)));
-    let args = [TAR, "0", "0"].map(OsString::from);
+    let free = u64::MAX.to_string();
+    let args = [TAR, "0", "0", free.as_str()].map(OsString::from);
     let code = run(&args, &mut io::stdout().lock(), &mut io::stderr().lock());
     say("unpack", i32::from(code));
     say(

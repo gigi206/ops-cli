@@ -16,10 +16,12 @@
 //! arguments and comes back as one line, and each layer is parsed by a process that has seen no
 //! other.
 //!
-//! `sbx __unpack <media type> <bytes spent> <entries spent>` reads the layer on its standard input
-//! and applies it over [`ROOT`]. It prints `spent <bytes> <entries>` and exits 0, or prints why it
-//! stopped on its standard error and exits 1. Both are read bounded ([`RESULT_MAX`],
-//! [`MESSAGE_MAX`]), and an exit of 0 without that one line is a failure.
+//! `sbx __unpack <media type> <bytes spent> <entries spent> <bytes free>` reads the layer on its
+//! standard input and applies it over [`ROOT`], within what the store's filesystem had free as the
+//! layer began ([`Budget::within`]), which the parent reads since the cage has no view of it. It
+//! prints `spent <bytes> <entries>` and exits 0, or prints why it stopped on its standard error and
+//! exits 1. Both are read bounded ([`RESULT_MAX`], [`MESSAGE_MAX`]), and an exit of 0 without that
+//! one line is a failure.
 //!
 //! ## What the cage holds against
 //!
@@ -91,11 +93,16 @@ pub(super) fn apply(
     std::fs::create_dir_all(rootfs)?;
     let layer = File::open(blob)?;
     let (bytes, entries) = budget.spent();
+    // Read before each layer rather than once for the image: the blob being applied sits on the
+    // same filesystem, and what the layers before it wrote is gone from it. A filesystem that
+    // cannot say leaves the ceiling where it is.
+    let free = crate::storage::free_bytes(rootfs).unwrap_or(u64::MAX);
     let args = vec![
         OsString::from("__unpack"),
         media_type.into(),
         bytes.to_string().into(),
         entries.to_string().into(),
+        free.to_string().into(),
     ];
     let started = Instant::now();
     let ended = process::run(bwrap, rootfs, layer, args, started + *time_left);
@@ -154,23 +161,22 @@ fn serve(
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> u8 {
+    let count = |arg: &OsString| arg.to_str().and_then(|n| n.parse::<u64>().ok());
     let parsed = match argv {
-        [media, bytes, entries] => media.to_str().zip(
-            bytes
-                .to_str()
-                .and_then(|b| b.parse::<u64>().ok())
-                .zip(entries.to_str().and_then(|e| e.parse::<u64>().ok())),
-        ),
+        [media, bytes, entries, free] => media
+            .to_str()
+            .zip(count(bytes).zip(count(entries)).zip(count(free))),
         _ => None,
     };
-    let Some((media_type, (bytes, entries))) = parsed else {
+    let Some((media_type, ((bytes, entries), free))) = parsed else {
         let _ = writeln!(
             err,
-            "sbx: __unpack: expects a media type, then the bytes and the entries spent so far"
+            "sbx: __unpack: expects a media type, then the bytes and the entries spent so far, \
+             then the bytes free on the store's filesystem"
         );
         return 2;
     };
-    let mut budget = Budget::resumed(bytes, entries);
+    let mut budget = Budget::resumed(bytes, entries).within(free);
     match layers::apply(layer, media_type, root, &mut budget) {
         Ok(()) => {
             let (bytes, entries) = budget.spent();

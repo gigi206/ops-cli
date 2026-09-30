@@ -105,10 +105,7 @@ fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_di
     // A hundred bytes to write and nine left: the refusal names the member it stopped on, and the
     // file on disk holds the nine the ceiling allowed plus the one that proves it was exceeded,
     // never the hundred. Measuring after the copy would leave the whole member on disk.
-    let mut budget = Budget {
-        bytes: MAX_UNPACKED_BYTES - 9,
-        members: 0,
-    };
+    let mut budget = Budget::resumed(MAX_UNPACKED_BYTES - 9, 0);
     let root = tmp.join("over-bytes");
     let err = apply_tar_within(tmp.path(), &root, &archive, &mut budget)
         .expect_err("past the byte ceiling");
@@ -122,10 +119,7 @@ fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_di
     );
 
     // The member ceiling answers the shape that never approaches the byte one.
-    let mut budget = Budget {
-        bytes: 0,
-        members: MAX_MEMBERS,
-    };
+    let mut budget = Budget::resumed(0, MAX_MEMBERS);
     let err = apply_tar_within(tmp.path(), &tmp.join("over-members"), &archive, &mut budget)
         .expect_err("past the member ceiling");
     assert!(err.to_string().contains("more than"), "{err}");
@@ -139,6 +133,40 @@ fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_di
     assert_eq!((budget.bytes, budget.members), (100, 1));
 }
 
+/// The byte ceiling is held to the room the store's filesystem has, less what is kept for the
+/// host: a member past it is refused, cut where the room ends, and the refusal says the filesystem
+/// is what ran short. Room past the ceiling leaves the ceiling as it was.
+#[test]
+fn an_image_is_held_to_the_room_its_filesystem_has() {
+    let tmp = crate::testutil::TmpDir::new();
+    let archive = tar_of(&[("big", Member::File(&"x".repeat(100)))]);
+
+    let mut budget = Budget::resumed(5, 0).within(ROOM_KEPT + 9);
+    let root = tmp.join("short");
+    let err =
+        apply_tar_within(tmp.path(), &root, &archive, &mut budget).expect_err("past the room");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "this image's layers need more room than the store's filesystem has: it had 1.0 GiB \
+             free as this layer began, and 1.0 GiB of that is kept for the host (reached at `{}`): \
+             refusing rather than filling it",
+            root.join("big").display()
+        )
+    );
+    assert_eq!(fs::metadata(root.join("big")).unwrap().len(), 10);
+
+    let mut budget = Budget::resumed(5, 0).within(ROOM_KEPT + 100);
+    apply_tar_within(tmp.path(), &tmp.join("fits"), &archive, &mut budget)
+        .expect("the room is enough");
+
+    assert_eq!(
+        Budget::new().within(u64::MAX).remaining_bytes(),
+        MAX_UNPACKED_BYTES,
+        "room past the ceiling changes nothing"
+    );
+}
+
 /// A directory the unpack makes on the way to a member is an entry of the budget, not free.
 ///
 /// `create_dir_all` made every missing parent for the price of the one member that named them, so
@@ -150,19 +178,13 @@ fn a_directory_made_for_a_members_path_counts_against_the_member_ceiling() {
     let tmp = crate::testutil::TmpDir::new();
     let archive = tar_of(&[("a/b/c/f", Member::File("x"))]);
 
-    let mut budget = Budget {
-        bytes: 0,
-        members: MAX_MEMBERS - 4,
-    };
+    let mut budget = Budget::resumed(0, MAX_MEMBERS - 4);
     let root = tmp.join("fits");
     apply_tar_within(tmp.path(), &root, &archive, &mut budget).expect("four entries left");
     assert_eq!(budget.members, MAX_MEMBERS);
     assert!(root.join("a/b/c/f").is_file());
 
-    let mut budget = Budget {
-        bytes: 0,
-        members: MAX_MEMBERS - 3,
-    };
+    let mut budget = Budget::resumed(0, MAX_MEMBERS - 3);
     let root = tmp.join("over");
     let err =
         apply_tar_within(tmp.path(), &root, &archive, &mut budget).expect_err("one entry short");
@@ -1587,10 +1609,7 @@ proptest::proptest! {
         (layers, bytes_left, entries_left) in budgets(),
     ) {
         let ground = Ground::new();
-        let mut budget = Budget {
-            bytes: MAX_UNPACKED_BYTES - bytes_left,
-            members: MAX_MEMBERS - entries_left,
-        };
+        let mut budget = Budget::resumed(MAX_UNPACKED_BYTES - bytes_left, MAX_MEMBERS - entries_left);
         let mut refused = None;
         for (n, members) in layers.iter().enumerate() {
             if let Err(e) = ground.apply(n, &honest_tar(members), n % 2 == 1, &mut budget) {

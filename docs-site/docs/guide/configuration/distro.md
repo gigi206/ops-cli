@@ -255,6 +255,14 @@ files), so an image that meets one is not a distribution.
 The budget spans the image, not the layer, because the layers are applied over the same
 tree.
 
+The byte ceiling is also held to the room the store's filesystem has. Before each layer,
+`sbx` reads what is free there and lets the layer write all of it but **1 GiB**, kept so the
+host can still write once an image too large for the disk has been refused. The figure is
+an estimate both ways, since the budget counts a file's length: a sparse file counts whole
+and takes nothing, and a file of one byte takes a block. The entry ceiling is not compared
+with the free inodes, which a filesystem that allocates them as it goes, btrfs among them,
+reports as none.
+
 The layers of an image also have **one hour** to unpack, all of them together and the
 fetch of their blobs not counted. A layer still unpacking when the image's hour is spent is
 stopped, its cage with it, and the provision says the image took too long. The costliest

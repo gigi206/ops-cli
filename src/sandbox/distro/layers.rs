@@ -82,10 +82,25 @@ use std::rc::Rc;
 const MAX_UNPACKED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub(super) const MAX_MEMBERS: u64 = 1_000_000;
 
+/// What an unpack leaves free on the store's filesystem: the byte ceiling is held to the room the
+/// filesystem has less this ([`Budget::within`]), so an image too large for the disk is refused
+/// with the host still able to write, rather than stopped by the disk once it is full.
+///
+/// The comparison is an estimate either way, since the budget counts a file's length: a sparse
+/// file counts whole and takes nothing, and a file of one byte takes a block. The entry ceiling is
+/// not compared with the free inodes, which a filesystem that allocates them as it goes, btrfs
+/// among them, reports as none.
+pub(super) const ROOM_KEPT: u64 = 1024 * 1024 * 1024;
+
 /// What one image's unpack has spent, carried across its layers. See [`MAX_UNPACKED_BYTES`].
 pub(super) struct Budget {
     bytes: u64,
     members: u64,
+    /// The most bytes the image may have written: [`MAX_UNPACKED_BYTES`], or less where the store's
+    /// filesystem has less room ([`Self::within`]).
+    ceiling: u64,
+    /// What the filesystem had free when it lowered the ceiling, for the refusal to say.
+    free: Option<u64>,
 }
 
 impl Budget {
@@ -94,13 +109,30 @@ impl Budget {
         Self {
             bytes: 0,
             members: 0,
+            ceiling: MAX_UNPACKED_BYTES,
+            free: None,
         }
     }
 
     /// The budget of an image whose earlier layers spent `bytes` and `members`: how a layer
     /// applied by a process of its own ([`super::unpack`]) takes up where the one before stopped.
     pub(super) fn resumed(bytes: u64, members: u64) -> Self {
-        Self { bytes, members }
+        Self {
+            bytes,
+            members,
+            ..Self::new()
+        }
+    }
+
+    /// The same budget, its byte ceiling held to what the store's filesystem can take of the next
+    /// layer: the `free` bytes it has, less [`ROOM_KEPT`]. Room past the ceiling changes nothing.
+    pub(super) fn within(mut self, free: u64) -> Self {
+        let ceiling = self.bytes.saturating_add(free.saturating_sub(ROOM_KEPT));
+        if ceiling < MAX_UNPACKED_BYTES {
+            self.ceiling = ceiling;
+            self.free = Some(free);
+        }
+        self
     }
 
     /// What the image has spent so far, in bytes written and entries created.
@@ -124,20 +156,30 @@ impl Budget {
 
     /// What is left of the byte ceiling.
     fn remaining_bytes(&self) -> u64 {
-        MAX_UNPACKED_BYTES.saturating_sub(self.bytes)
+        self.ceiling.saturating_sub(self.bytes)
     }
 
-    /// Record `n` written bytes, refusing past [`MAX_UNPACKED_BYTES`].
+    /// Record `n` written bytes, refusing past the byte ceiling, and naming which one held.
     fn spend(&mut self, n: u64, dest: &Path) -> io::Result<()> {
         self.bytes = self.bytes.saturating_add(n);
-        if self.bytes > MAX_UNPACKED_BYTES {
-            return Err(io::Error::other(format!(
+        if self.bytes <= self.ceiling {
+            return Ok(());
+        }
+        Err(io::Error::other(match self.free {
+            Some(free) => format!(
+                "this image's layers need more room than the store's filesystem has: it had {} \
+                 free as this layer began, and {} of that is kept for the host (reached at `{}`): \
+                 refusing rather than filling it",
+                crate::sandbox::human_bytes(free),
+                crate::sandbox::human_bytes(ROOM_KEPT),
+                dest.display()
+            ),
+            None => format!(
                 "this image's layers unpack to more than {MAX_UNPACKED_BYTES} bytes (reached at \
                  `{}`): refusing rather than filling the store's filesystem",
                 dest.display()
-            )));
-        }
-        Ok(())
+            ),
+        }))
     }
 }
 
