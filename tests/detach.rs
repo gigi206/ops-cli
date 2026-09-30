@@ -167,7 +167,9 @@ impl Drop for Cleanup {
 fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     // Two apps so both daemon paths run under one provisioning: `sup` has a network allowlist (the
     // supervised path — the daemon hosts the proxy thread, the registered pid is the supervisor),
-    // `plain` has none (the exec path — the daemon becomes bubblewrap). The unusual sleep durations
+    // `plain` has none (the exec path — the daemon becomes bubblewrap). The project sets
+    // `git_writable`, since a project without a repository is otherwise watched for one the cage
+    // leaves there, which keeps the daemon to look once the cage exits. The unusual sleep durations
     // are unique fingerprints in the host process table, and unique across test *binaries* too:
     // cargo runs the suites as concurrent processes, so a duration this file shares with another
     // would make each one's liveness assertions read the other's cage, and each one's cleanup kill
@@ -177,7 +179,9 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     let state = TmpDir::prefixed("d", "state");
     std::fs::write(
         project.path().join(".sbx.toml"),
-        "[app.sup]\n\
+        "[fs]\n\
+         git_writable = true\n\
+         [app.sup]\n\
          cmd = [\"sleep\", \"31351\"]\n\
          [app.sup.network]\n\
          mode = \"deny\"\n\

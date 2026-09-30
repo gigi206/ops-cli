@@ -90,7 +90,8 @@ there is no setuid binary to attack. The hardening flags below are emitted
 > **The `--die-with-parent` nuance.** The flag arms a signal that kills the cage when the
 > process supervising it dies, so it belongs on every launch that has such a process. One
 > shape does not: a `--detach`ed session that needs no proxy, broker, ssh-agent, forward,
-> portal, task plane or process observation has nothing to supervise it, so the daemon
+> portal, task plane, process observation or look at the project's git once the cage exits
+> (which only `git_writable` leaves out) has nothing to supervise it, so the daemon
 > replaces itself with bwrap. The cage's parent is then the launcher that prints the session
 > id and exits, which is precisely the process `--detach` exists to outlive, and the flag is
 > omitted there. Every other launch, detached ones included, keeps it.
