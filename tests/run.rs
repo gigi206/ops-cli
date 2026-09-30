@@ -2218,7 +2218,10 @@ fn comm_settles(pid: u32, want: impl Fn(&str) -> bool) -> String {
 /// A launch with nothing host-side to outlive the cage **execs into it**: the pid stays, the
 /// process becomes `bwrap`, and the command's exit status is sbx's own. One that stands something
 /// up — a filtering proxy, a broker, an observer — has to fork and wait instead, because an exec
-/// would discard the threads and drop the guards that unlink its sockets.
+/// would discard the threads and drop the guards that unlink its sockets. So does one that looks
+/// at the project's git again once the cage has exited, which a project without a repository at
+/// its root gets by default: the project here sets `git_writable`, under which nothing of git is
+/// watched, and a third launch without it is supervised.
 ///
 /// The middle case is the one that has no other witness, and the reason this test exists: a config
 /// that *declares* a broker whose plugin is missing stands nothing up, so it must exec like any
@@ -2233,15 +2236,18 @@ fn a_launch_execs_into_the_cage_unless_something_host_side_must_outlive_it() {
     let data = TmpDir::prefixed("r", "supd");
     let state = TmpDir::prefixed("r", "sups");
     let config = TmpDir::prefixed("r", "supc");
-    // `network = "none"` is what leaves nothing host-side: no filtering proxy, so no guard.
-    std::fs::write(project.path().join(".sbx.toml"), "network = \"none\"\n").unwrap();
+    // `network = "none"` is what leaves nothing host-side: no filtering proxy, so no guard. And
+    // `git_writable` leaves no git watch, which a project without a repository gets otherwise.
+    let lifted = "network = \"none\"\n[fs]\ngit_writable = true\n";
+    std::fs::write(project.path().join(".sbx.toml"), lifted).unwrap();
 
     probe_or_skip!(
         "supervision e2e",
         run_in(project.path(), data.path(), &["true"])
     );
-    // `network` is a trusted-only field: untrusted, the launch would fall back to the filtering
-    // default and stand a proxy up, which is the very thing this test is checking the absence of.
+    // `network` and `git_writable` are trusted-only: untrusted, the launch would fall back to the
+    // filtering default and stand a proxy up, which is the very thing this test is checking the
+    // absence of.
     let trusted = sbx_in(
         project.path(),
         data.path(),
@@ -2291,6 +2297,55 @@ fn a_launch_execs_into_the_cage_unless_something_host_side_must_outlive_it() {
         comm, "sbx",
         "a broker that could not start leaves nothing behind, so the launch still execs"
     );
+
+    // 3. The git watch back on: the launch has to be there when the cage exits, so it supervises.
+    std::fs::write(project.path().join(".sbx.toml"), "network = \"none\"\n").unwrap();
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let mut watched = launch("");
+    let started = command_settles(watched.id());
+    let comm = comm_of(watched.id());
+    let _ = watched.kill();
+    let _ = watched.wait();
+    assert!(started, "the cage's `sleep` started under the launch");
+    assert_eq!(
+        comm, "sbx",
+        "a launch that looks at git once the cage exits stays to do it"
+    );
+}
+
+/// Poll until the command the launch runs, `sleep`, is running below the pid, which it is under a
+/// launch that supervises the cage and under one that became it, and report whether it ever was.
+/// Every thread's children are read, since the one that starts the cage need not be the first.
+fn command_settles(pid: u32) -> bool {
+    fn below(pid: u32) -> bool {
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .into_iter()
+            .flatten();
+        tasks
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+            .flat_map(|c| {
+                c.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .any(|child| comm_of(child) == "sleep" || below(child))
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !below(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    below(pid)
 }
 
 /// Whether a failed build log shows a *transient* upstream-download fault — a truncated tarball,
