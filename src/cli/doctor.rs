@@ -273,6 +273,9 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
             // Say it plainly even when present: unlike bubblewrap and nix above, git is not a
             // prerequisite — a sandbox launches without it. It only enables `sbx plugins store`.
             rep.note("optional — needed only for `sbx plugins store`, not to run a sandbox");
+            if let Some(note) = bare_repository_note(safe_bare_repository(&git).as_deref()) {
+                rep.note_with_lines(note, &[SAFE_BARE_REPOSITORY.to_string()]);
+            }
         }
         None => rep.check(
             "warn",
@@ -755,8 +758,52 @@ fn classify_namespace_failure(
     remediation.push(USERNS_REMEDIATION);
 }
 
+/// The command that has the host's git read a bare repository only when it is named with
+/// `--git-dir`, never one it finds in a directory.
+const SAFE_BARE_REPOSITORY: &str = "git config --global safe.bareRepository explicit";
+
+/// The value the host's `git` at `git` gives `safe.bareRepository`, asked outside any repository,
+/// or `None` when it gives none. git honors that setting from the system and global files alone,
+/// so a repository cannot turn it off.
+fn safe_bare_repository(git: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new(git)
+        .args(["config", "--get", "safe.bareRepository"])
+        .current_dir("/")
+        .env_remove("GIT_DIR")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The note `doctor` adds under git when the host's git reads a bare repository it finds in a
+/// directory, given the value of its `safe.bareRepository`, or `None` when that is `explicit`.
+///
+/// A bare repository the cage plants below a project, which no mount holds, is read by a git
+/// command run in its directory, its configuration and hooks with it; sbx names it only once the
+/// cage has exited. With the setting, git refuses it, while submodules and worktrees keep working.
+fn bare_repository_note(value: Option<&str>) -> Option<&'static str> {
+    (value != Some("explicit")).then_some(
+        "your git reads a bare repository it finds in a directory, one the cage could plant below \
+         a project, where sbx names it only after the session; this has git refuse it:",
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    /// The note under git appears unless `safe.bareRepository` is `explicit`, which git reads
+    /// case by case: it refuses `Explicit` as a bad value.
+    #[test]
+    fn the_bare_repository_note_appears_unless_git_refuses_them() {
+        assert!(bare_repository_note(None).is_some());
+        assert!(bare_repository_note(Some("all")).is_some());
+        assert!(bare_repository_note(Some("Explicit")).is_some());
+        assert!(bare_repository_note(Some("explicit")).is_none());
+    }
+
     use super::*;
 
     /// The `capture` check `doctor` records for a namespace the kernel refused, beside a boundary

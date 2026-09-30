@@ -104,6 +104,14 @@ differently, and the store moves into it:
   grants `userns` to the `sbx` binary alone, or the sysctl, for every program. See
   [Clients that ignore the proxy variables](../configuration/network#clients-that-ignore-the-proxy-variables).
 
+- **git** (optional). Needed only to fetch a remote plugin store, never to run a sandbox.
+  When your git reads a bare repository it finds in a directory, a note under the line gives
+  the command that makes it refuse one, `git config --global safe.bareRepository explicit`: a
+  bare repository the cage plants below a project is then refused by your git rather than read,
+  and sbx names it only once the cage has exited ([below the
+  root](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)). Submodules
+  and worktrees keep working with it.
+
 - **The store location and channel revision.** Where `sbx`'s user-owned store lives
   and which nixpkgs revision the base userland is pinned to.
 
