@@ -2171,14 +2171,24 @@ fn listed_work_tree(dir: &Path) -> Option<PathBuf> {
 /// not yet under version control, has no git file to hold, and the cage can make it one: a `.git`,
 /// or a bare repository's `HEAD`, `objects` and `refs`, which a git command run there then reads in
 /// place of the repository above it, if any, with the configuration and hooks the cage wrote. That
-/// is watched too ([`GitWatch::Absent`]), and named once the cage has exited.
+/// is watched too ([`RootWatch::Absent`]), and named once the cage has exited. So are the
+/// repositories below the root the launch did not carry, one the cage planted in a subdirectory or
+/// one already there that the index does not name ([`NestedWatch`]).
 ///
 /// It needs sbx alive when the cage exits, which is why a launch with a watch supervises the cage
 /// rather than replacing itself with it. A supervisor killed along with its terminal says nothing,
 /// and a detached session says it in its log; the next launch, which refuses a `commondir` in the
 /// common directory and protects every `config.worktree` present and every worktree git lists,
 /// covers all but what a submodule or a worktree added during the session already holds.
-pub(crate) enum GitWatch {
+pub(crate) struct GitWatch {
+    /// What is watched at the project's root.
+    root: RootWatch,
+    /// The repositories below the root the launch did not carry.
+    nested: NestedWatch,
+}
+
+/// What a [`GitWatch`] looks at in the project's root.
+enum RootWatch {
     /// The repository the launch carried.
     Repo(Box<RepoWatch>),
     /// A project whose root held no repository at launch, canonical.
@@ -2200,41 +2210,350 @@ impl GitWatch {
         let _asking = GitAsking::open();
         let root = project.canonicalize().ok()?;
         let reach = Reach::of(&root, binds, data);
-        match project_repo(&reach, git_writable) {
-            Ok(Some(repo)) => Some(GitWatch::Repo(Box::new(RepoWatch::start(reach, repo)))),
-            Ok(None) if !git_writable && !repository_at(&root) => Some(GitWatch::Absent(root)),
-            _ => None,
-        }
+        let at_root = match project_repo(&reach, git_writable) {
+            Ok(Some(repo)) => RootWatch::Repo(Box::new(RepoWatch::start(reach.clone(), repo))),
+            Ok(None) if !git_writable && !repository_at(&root) => RootWatch::Absent(root.clone()),
+            _ => return None,
+        };
+        Some(GitWatch {
+            root: at_root,
+            nested: NestedWatch::start(root, reach),
+        })
     }
 
     /// What appeared during the session, one message per finding, escaped for the terminal.
     pub(crate) fn findings(&self) -> Vec<String> {
         let _asking = GitAsking::open();
-        match self {
-            GitWatch::Repo(watch) => watch.findings(),
-            GitWatch::Absent(root) => {
-                let dot_git = root.join(".git");
-                let found = if std::fs::symlink_metadata(&dot_git).is_ok() {
-                    format!("`{}`", dot_git.display())
-                } else if repository_at(root) {
-                    format!(
-                        "a bare repository at `{}` (its `HEAD`, `objects` and `refs`)",
-                        root.display()
-                    )
-                } else {
-                    return Vec::new();
-                };
-                vec![visible(&format!(
-                    "{found} appeared during the session in a project that had no repository at \
-                     launch, so sbx protected none of git's files: a git command run in `{}` now \
-                     reads that repository, its configuration and its hooks as the cage wrote \
-                     them, instead of the one above it, if any. Check it, or remove it, before \
-                     running git there",
-                    root.display()
-                ))]
+        let (mut out, covered) = match &self.root {
+            RootWatch::Repo(watch) => watch.findings(),
+            RootWatch::Absent(root) => (absent_findings(root), BTreeSet::new()),
+        };
+        out.extend(self.nested.findings(&covered, NESTED_DIR_MAX));
+        out
+    }
+}
+
+/// What the end of a session finds at the root of a project that held no repository at launch
+/// ([`RootWatch::Absent`]).
+fn absent_findings(root: &Path) -> Vec<String> {
+    let dot_git = root.join(".git");
+    let found = if std::fs::symlink_metadata(&dot_git).is_ok() {
+        format!("`{}`", dot_git.display())
+    } else if repository_at(root) {
+        format!(
+            "a bare repository at `{}` (its `HEAD`, `objects` and `refs`)",
+            root.display()
+        )
+    } else {
+        return Vec::new();
+    };
+    vec![visible(&format!(
+        "{found} appeared during the session in a project that had no repository at launch, so \
+         sbx protected none of git's files: a git command run in `{}` now reads that repository, \
+         its configuration and its hooks as the cage wrote them, instead of the one above it, if \
+         any. Check it, or remove it, before running git there",
+        root.display()
+    ))]
+}
+
+/// The files of a repository's git directory that name a program git runs, or where git finds
+/// them, and that the end of a session compares against the launch below the project's root
+/// ([`NestedWatch`]): the configuration, the files git reads beside it, the hooks directory, whose
+/// entries are compared too, and a stopped rebase's todo list.
+const NESTED_WATCHED: [&str; 5] = [
+    "config",
+    "config.worktree",
+    "commondir",
+    "hooks",
+    REBASE_TODO,
+];
+
+/// How many directories the end of a session looks through below the project's root for
+/// repositories; past it the look stops and says so.
+const NESTED_DIR_MAX: usize = 250_000;
+
+/// How long the end of a session looks below the project's root for repositories; past it the look
+/// stops and says so. A home directory of some 250,000 directories takes over twenty seconds with a
+/// cold cache, a project a tenth of a second.
+const NESTED_TIME: Duration = Duration::from_secs(3);
+
+/// The line a `CACHEDIR.TAG` opens with, by the Cache Directory Tagging specification, which marks
+/// the directory holding it as a cache: cargo writes it in `target/`, and pytest and ruff in
+/// theirs.
+const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// How many entries of a repository's hooks directory are compared; git runs a few dozen at most.
+const NESTED_HOOKS_MAX: usize = 1024;
+
+/// How many repositories below the root the end of a session names one by one; past it they are
+/// counted.
+const NESTED_SHOWN: usize = 16;
+
+/// How many changed files of one repository a finding names.
+const NESTED_FILES_SHOWN: usize = 4;
+
+/// The watch of the repositories below the project's root that the launch did not carry
+/// ([`GitWatch`]).
+///
+/// git run in a subdirectory reads the repository it finds there first: a `.git` of any kind, or
+/// the `HEAD`, `objects` and `refs` of a bare one. One the cage made there, or one already there
+/// that the index does not name (an ignored clone, an untracked one), is no submodule, and the
+/// launch holds none of its files: holding them would take a scan of the whole tree and a few
+/// mounts per repository at every launch, and a launch from a directory that holds many
+/// repositories would reach the mount ceiling. So the end of a session looks instead: it walks the
+/// project, without following a link or descending into a git directory, and names each repository
+/// whose configuration, hooks, or the other files git reads there to find a program
+/// ([`NESTED_WATCHED`]), changed during the session, a planted one included, since planting writes
+/// them.
+///
+/// Changed means a ctime at or after the one a file created at launch in the project's root got:
+/// the cage cannot write a file without moving its ctime forward, nor move it back, and the time
+/// comes from the file system that holds the project, which on a network file system is the
+/// server's rather than the host's ([`file_system_now`]). The git directory itself is not
+/// compared, since every `git status` there rewrites its index. A `.git` file is compared, and so
+/// is the repository it names where the cage writes it. What a repository's configuration names
+/// elsewhere, an included file or a `core.hooksPath` outside its git directory, is not followed.
+///
+/// A directory tagged as a cache before the session, by a `CACHEDIR.TAG` whose ctime is older than
+/// the launch, is not walked: a Rust project's `target/` holds most of its directories, and
+/// walking it could hold the end of a session for seconds, some ten with a cold cache for 155,000
+/// directories. A tag the cage writes during the session is not honored, so it cannot hide a
+/// directory by tagging it; a repository it places inside a directory tagged before, wherever that
+/// directory now lies, is not looked for.
+struct NestedWatch {
+    root: PathBuf,
+    reach: Reach,
+    /// The ctime a file created at the project's root at launch got, as seconds and nanoseconds,
+    /// less [`CLOCK_MARGIN`] when it came from the host's clock.
+    since: (i64, i64),
+}
+
+/// How far the host's clock is set back when it stands in for the file system's ([`file_system_now`]),
+/// to cover a clock that runs a little ahead of the file system's.
+const CLOCK_MARGIN: i64 = 2;
+
+impl NestedWatch {
+    fn start(root: PathBuf, reach: Reach) -> Self {
+        let since = file_system_now(&root);
+        NestedWatch { root, reach, since }
+    }
+
+    /// Whether the file at `path` changed at or after the launch, or appeared then.
+    fn changed(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|meta| (meta.ctime(), meta.ctime_nsec()) >= self.since)
+    }
+
+    /// Whether `dir` is tagged as a cache by a `CACHEDIR.TAG` that was there before the session.
+    fn tagged_cache(&self, dir: &Path) -> bool {
+        let tag = dir.join("CACHEDIR.TAG");
+        !self.changed(&tag)
+            && super::inspect::read_cage_file(&tag, 1024)
+                .ok()
+                .flatten()
+                .is_some_and(|tag| tag.starts_with(CACHEDIR_SIGNATURE))
+    }
+
+    /// The files of the git directory `git_dir` that changed during the session
+    /// ([`NESTED_WATCHED`]), and whether its hooks directory held more entries than were compared.
+    fn changed_files(&self, git_dir: &Path, out: &mut Vec<PathBuf>) -> bool {
+        out.extend(
+            NESTED_WATCHED
+                .iter()
+                .map(|name| git_dir.join(name))
+                .filter(|path| self.changed(path)),
+        );
+        let Ok(hooks) = std::fs::read_dir(git_dir.join("hooks")) else {
+            return false;
+        };
+        let mut read = 0;
+        for entry in hooks {
+            read += 1;
+            if read > NESTED_HOOKS_MAX {
+                return true;
+            }
+            let Ok(entry) = entry else { continue };
+            if self.changed(&entry.path()) {
+                out.push(entry.path());
             }
         }
+        false
     }
+
+    /// The files git reads for a program at `dot_git`, the `.git` in a directory below the root,
+    /// that changed during the session: a directory's own, or a file's and the repository's it
+    /// names where the cage writes it.
+    fn changed_at(&self, dot_git: &Path, kind: std::fs::FileType, out: &mut Vec<PathBuf>) -> bool {
+        if kind.is_dir() {
+            return self.changed_files(dot_git, out);
+        }
+        if !kind.is_file() {
+            if self.changed(dot_git) {
+                out.push(dot_git.to_path_buf());
+            }
+            return false;
+        }
+        if self.changed(dot_git) {
+            out.push(dot_git.to_path_buf());
+        }
+        let Ok(Some(target)) = gitfile_target(dot_git) else {
+            return false;
+        };
+        let named = crate::trust::canonicalize_existing_prefix(&target);
+        if self.reach.holds(&named) && named.is_dir() {
+            return self.changed_files(&named, out);
+        }
+        false
+    }
+
+    /// One finding for each repository below the root, other than those `covered`, whose files
+    /// changed during the session, looking through at most `max_dirs` directories, and for no
+    /// longer than [`NESTED_TIME`].
+    fn findings(&self, covered: &BTreeSet<PathBuf>, max_dirs: usize) -> Vec<String> {
+        let mut found: Vec<(PathBuf, Vec<PathBuf>, bool)> = Vec::new();
+        let mut dirs = vec![self.root.clone()];
+        let mut walked = 0;
+        let mut stopped = false;
+        let ends = Instant::now() + NESTED_TIME;
+        while let Some(dir) = dirs.pop() {
+            if walked >= max_dirs || Instant::now() >= ends {
+                stopped = true;
+                break;
+            }
+            walked += 1;
+            let Ok(listing) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let entries: Vec<(std::ffi::OsString, std::fs::FileType)> = listing
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    Some((entry.file_name(), entry.file_type().ok()?))
+                })
+                .collect();
+            let named = |name: &str| entries.iter().find(|(n, _)| n == name).map(|(_, t)| *t);
+            if named("CACHEDIR.TAG").is_some_and(|kind| kind.is_file()) && self.tagged_cache(&dir) {
+                continue;
+            }
+            if dir != self.root {
+                let mut changed = Vec::new();
+                let mut more = false;
+                let mut bare = false;
+                if let Some(kind) = named(".git") {
+                    let dot_git = dir.join(".git");
+                    if !covered.contains(&dot_git) {
+                        more = self.changed_at(&dot_git, kind, &mut changed);
+                    }
+                } else if named("HEAD").is_some()
+                    && named("objects").is_some()
+                    && named("refs").is_some()
+                {
+                    bare = true;
+                    more = self.changed_files(&dir, &mut changed);
+                }
+                if !changed.is_empty() || more {
+                    found.push((dir.clone(), changed, more));
+                }
+                if bare {
+                    continue;
+                }
+            }
+            dirs.extend(
+                entries
+                    .iter()
+                    .filter(|(name, kind)| kind.is_dir() && name != ".git")
+                    .map(|(name, _)| dir.join(name)),
+            );
+        }
+        found.sort();
+        let mut out: Vec<String> = found
+            .iter()
+            .take(NESTED_SHOWN)
+            .map(|(dir, changed, more)| {
+                let mut shown: Vec<String> = changed
+                    .iter()
+                    .take(NESTED_FILES_SHOWN)
+                    .map(|path| format!("`{}`", path.display()))
+                    .collect();
+                if changed.len() > NESTED_FILES_SHOWN {
+                    shown.push(format!("{} more", changed.len() - NESTED_FILES_SHOWN));
+                }
+                if *more {
+                    shown.push("a hooks directory with more entries than sbx compares".to_string());
+                }
+                format!(
+                    "`{}` holds a repository whose files git reads for a program changed during \
+                     the session, where no mount held them ({}): a git command run in `{}` reads \
+                     them. Check them, or remove the repository if you did not make it, before \
+                     running git there",
+                    dir.display(),
+                    shown.join(", "),
+                    dir.display()
+                )
+            })
+            .collect();
+        if found.len() > NESTED_SHOWN {
+            out.push(format!(
+                "{} more repositories below `{}` changed during the session the same way: check \
+                 them before running git in a subdirectory",
+                found.len() - NESTED_SHOWN,
+                self.root.display()
+            ));
+        }
+        if stopped {
+            out.push(format!(
+                "the look for repositories below `{}` stopped after {walked} directories, at its \
+                 bound of {max_dirs} directories or {} seconds, so a repository the cage planted \
+                 or changed further down is not named: check before running git in a \
+                 subdirectory",
+                self.root.display(),
+                NESTED_TIME.as_secs()
+            ));
+        }
+        out.iter().map(|m| visible(m)).collect()
+    }
+}
+
+/// The time of the file system that holds `dir`, as seconds and nanoseconds: the ctime a file
+/// created there now gets, which a file changed later there can only pass, whatever the host's
+/// clock says. The file is made with `O_TMPFILE`, which gives it no name, or where the file system
+/// does not offer that (a network one) under a name removed at once. The host's clock, set back by
+/// [`CLOCK_MARGIN`], answers when neither can be made.
+fn file_system_now(dir: &Path) -> (i64, i64) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let ctime = |file: &std::fs::File| {
+        file.metadata()
+            .ok()
+            .map(|meta| (meta.ctime(), meta.ctime_nsec()))
+    };
+    let unnamed = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_TMPFILE)
+        .mode(0o600)
+        .open(dir);
+    if let Some(now) = unnamed.as_ref().ok().and_then(ctime) {
+        return now;
+    }
+    let named = dir.join(format!(".sbx-clock-{}", std::process::id()));
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&named)
+    {
+        let now = ctime(&file);
+        let _ = std::fs::remove_file(&named);
+        if let Some(now) = now {
+            return now;
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+    (
+        secs.saturating_sub(CLOCK_MARGIN),
+        i64::from(now.subsec_nanos()),
+    )
 }
 
 /// Whether git finds a repository at `root` itself: a `.git` of any kind, or the `HEAD`, `objects`
@@ -2245,7 +2564,7 @@ fn repository_at(root: &Path) -> bool {
     there(".git") || (there("HEAD") && there("objects") && there("refs"))
 }
 
-/// The watch of the repository the launch carried ([`GitWatch::Repo`]).
+/// The watch of the repository the launch carried ([`RootWatch::Repo`]).
 pub(crate) struct RepoWatch {
     reach: Reach,
     repo: GitRepo,
@@ -2330,8 +2649,10 @@ impl RepoWatch {
         out
     }
 
-    /// What appeared during the session, one message per finding, escaped for the terminal.
-    fn findings(&self) -> Vec<String> {
+    /// What appeared during the session, one message per finding, escaped for the terminal, with
+    /// the `.git` of each work tree and submodule this watch covers, which the watch of the
+    /// repositories below the root leaves to it ([`NestedWatch`]).
+    fn findings(&self) -> (Vec<String>, BTreeSet<PathBuf>) {
         let mut out: Vec<String> = Vec::new();
         let commondir = self.repo.common.join("commondir");
         if self.reach.holds(&commondir) && std::fs::symlink_metadata(&commondir).is_ok() {
@@ -2400,7 +2721,19 @@ impl RepoWatch {
                 self.repo.dir.join("index").display()
             ));
         }
-        out.iter().map(|m| visible(m)).collect()
+        let listed = worktree_dirs(&self.reach, &self.repo.common)
+            .dirs
+            .into_iter()
+            .filter_map(|dir| listed_work_tree(&dir))
+            .map(|tree| crate::trust::canonicalize_existing_prefix(&tree).join(".git"));
+        let covered = self
+            .trees
+            .iter()
+            .map(|tree| tree.work_tree.join(".git"))
+            .chain(listed)
+            .chain(now.repos)
+            .collect();
+        (out.iter().map(|m| visible(m)).collect(), covered)
     }
 
     /// One finding for each linked worktree of the repository the launch did not carry whose `.git`
@@ -5585,6 +5918,179 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Append `text` to the file at `path`, in place, as `>>` does.
+    fn append_in_place(path: &Path, text: &str) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    /// Below the project's root, the end of a session names each repository the launch did not
+    /// carry whose files git reads for a program changed during the session: an ordinary `.git`
+    /// and a bare repository the cage planted, an ignored clone whose configuration it appended to
+    /// in place, a hook it added to an untracked one, and a `.git` file it pointed at a repository
+    /// of its own. Working in a repository below the root, a commit and a `git status` there, is
+    /// not named, and a submodule added during the session is named once, as a submodule.
+    #[test]
+    fn the_git_watch_names_a_repository_below_the_root_whose_files_changed() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the watch below the root: no git on this host");
+            return;
+        };
+        std::fs::write(root.join(".gitignore"), "vendor/\n").unwrap();
+        for dir in ["vendor/x", "untracked/y", "worked", "pointed"] {
+            assert!(git_repo_at(&root.join(dir), &[]));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let watch = GitWatch::start(&root, false, &[], None).expect("a carried repository");
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+
+        let worked = root.join("worked");
+        let in_worked = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+                .arg(&worked)
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        std::fs::write(worked.join("f"), "f").unwrap();
+        assert!(in_worked(&["add", "f"]) && in_worked(&["commit", "-q", "--no-verify", "-m", "f"]));
+        assert!(in_worked(&["status", "--short"]));
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+
+        assert!(git_repo_at(&root.join("sub"), &[]));
+        let bare = root.join("deep/er/bare");
+        assert!(git(&["init", "-q", "--bare", bare.to_str().unwrap()]));
+        append_in_place(
+            &root.join("vendor/x/.git/config"),
+            "[core]\n\tfsmonitor = planted\n",
+        );
+        std::fs::write(
+            root.join("untracked/y/.git/hooks/pre-commit"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let other = root.join("other");
+        assert!(git_repo_at(&other, &[]));
+        let pointed = root.join("pointed/.git");
+        std::fs::remove_dir_all(&pointed).unwrap();
+        std::fs::write(
+            &pointed,
+            format!("gitdir: {}\n", other.join(".git").display()),
+        )
+        .unwrap();
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+
+        let found = watch.findings();
+        let holds = |dir: &str| {
+            found.iter().find(|f| {
+                f.contains(&format!(
+                    "`{}` holds a repository",
+                    root.join(dir).display()
+                ))
+            })
+        };
+        for dir in [
+            "sub",
+            "deep/er/bare",
+            "vendor/x",
+            "untracked/y",
+            "pointed",
+            "other",
+        ] {
+            assert!(holds(dir).is_some(), "{dir}: {found:#?}");
+        }
+        assert!(holds("worked").is_none(), "{found:#?}");
+        assert!(holds("emb").is_none(), "{found:#?}");
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("emb/.git` is a submodule's repository")),
+            "{found:#?}"
+        );
+        let x = holds("vendor/x").unwrap();
+        assert!(x.contains("vendor/x/.git/config`"), "{x}");
+        let y = holds("untracked/y").unwrap();
+        assert!(y.contains("untracked/y/.git/hooks/pre-commit`"), "{y}");
+        assert!(holds("pointed").unwrap().contains("pointed/.git`"));
+    }
+
+    /// A project with no repository at its root, a directory that holds repositories, has each of
+    /// them watched below it: one whose configuration was rewritten during the session is named,
+    /// the others are not, and a look through more directories than its bound stops and says so. A
+    /// directory tagged as a cache before the session is not walked, and one tagged during it is.
+    #[test]
+    fn the_git_watch_looks_below_a_root_that_holds_repositories() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        for dir in ["a", "b", "cache/r", "late/r"] {
+            if !git_repo_at(&root.join(dir), &[]) {
+                skip_incapable!("skipping the watch below a root: no git on this host");
+                return;
+            }
+        }
+        let tag = [CACHEDIR_SIGNATURE, b"\n"].concat();
+        std::fs::write(root.join("cache/CACHEDIR.TAG"), &tag).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let watch = GitWatch::start(&root, false, &[], None).expect("no repository at the root");
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+        std::fs::write(root.join("late/CACHEDIR.TAG"), &tag).unwrap();
+        for dir in ["b", "cache/r", "late/r"] {
+            append_in_place(
+                &root.join(dir).join(".git/config"),
+                "[core]\n\tpager = planted\n",
+            );
+        }
+        let found = watch.findings();
+        let holds = |dir: &str| {
+            let at = format!("`{}` holds a repository", root.join(dir).display());
+            found.iter().any(|f| f.contains(&at))
+        };
+        assert!(holds("b") && !holds("a"), "{found:#?}");
+        assert!(!holds("cache/r"), "a cache tagged before: {found:#?}");
+        assert!(
+            holds("late/r"),
+            "a cache tagged during the session: {found:#?}"
+        );
+        let stopped = watch.nested.findings(&BTreeSet::new(), 1);
+        assert!(
+            stopped
+                .iter()
+                .any(|f| f.contains("stopped after 1 directories")),
+            "{stopped:#?}"
+        );
+    }
+
+    /// The time of a project's file system is read from a file created there that leaves no name
+    /// behind, and lands within a moment of the host's clock on a local file system; a directory
+    /// where no file can be made falls back to the host's clock, set back.
+    #[test]
+    fn the_file_systems_time_is_read_without_leaving_a_file() {
+        let tmp = TmpDir::new();
+        let dir = project(&tmp).canonicalize().unwrap();
+        let host = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let host = i64::try_from(host).unwrap();
+        let listing = || {
+            let mut names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing();
+        let (secs, _) = file_system_now(&dir);
+        assert!((secs - host).abs() <= 2, "{secs} against {host}");
+        assert_eq!(listing(), before, "nothing left");
+        let (secs, _) = file_system_now(&dir.join("absent"));
+        assert!(secs <= host - CLOCK_MARGIN + 1 && secs >= host - CLOCK_MARGIN - 1);
     }
 
     /// Near the mount budget and past it, a launch whose repository has many work trees says they

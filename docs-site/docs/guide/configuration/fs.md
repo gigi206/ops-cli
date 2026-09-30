@@ -179,9 +179,32 @@ directory then reads the repository the cage made, its configuration and its hoo
 the one above it, and `git init` there keeps the configuration it finds. sbx names such a
 repository once the cage has exited, as it names a `.git/commondir`; nothing refuses the next
 launch, since a repository you create there yourself looks the same. Run sbx from the root of
-the repository to have its files held. The same holds, in any project, for a repository the
-cage leaves in a subdirectory: a git command run from inside that subdirectory reads it, and
-neither a mask nor the check at the end of the session looks there.
+the repository to have its files held.
+
+The same holds, in any project, for a **repository below the root** that is no submodule: one
+the cage leaves in a subdirectory, a `.git` or a bare repository, and one already there that the
+index does not name, an ignored clone or an untracked one. A git command run from inside that
+subdirectory reads it, and sbx holds none of its files: that would take a walk of the whole
+tree and a few mounts per repository at every launch, and a launch from a directory holding
+many repositories would reach the mount ceiling. Once the cage has exited, sbx walks the project
+instead and names each such repository whose configuration, `config.worktree`, `commondir`,
+hooks directory or hooks, or stopped rebase's todo list changed during the session, or that
+appeared then, and a `.git` file that was repointed. It compares ctimes, which the cage cannot
+set back, against a file it created at the project's root at launch, so the time is the file
+system's own, a network server's included. Working in such a repository, committing or running
+`git status` there, changes none of these and is not named. What a repository's configuration
+names elsewhere, an included file or a `core.hooksPath` outside its git directory, is not
+followed.
+
+The walk stops after 250,000 directories or 3 seconds, and says so: a launch from your home
+directory reaches that bound. It skips a directory tagged as a cache before the session, by the
+`CACHEDIR.TAG` of the Cache Directory Tagging convention (cargo's `target/`, pytest's and
+ruff's caches), which keeps a Rust project's walk to a few tens of milliseconds; a tag the cage
+writes during the session is not honored, and a repository placed inside a directory tagged
+before is not looked for. For a bare repository, your own git can refuse it outright:
+`git config --global safe.bareRepository explicit` has git read a bare repository only when
+named with `--git-dir`, which the cage cannot turn off from the repository's configuration,
+while submodules and worktrees keep working.
 
 A **symbolic link** on the way to any of these refuses the launch, naming the link, wherever it
 leads: `.git` itself, `.git/hooks`, `.git/config`, a directory above the one `core.hooksPath`

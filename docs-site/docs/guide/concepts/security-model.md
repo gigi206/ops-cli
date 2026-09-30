@@ -283,8 +283,12 @@ git reads as configuration beside it are held the same way (`.git/config.worktre
 linked worktree's `config.worktree`, `commondir` and `gitdir`), and a `.git/commondir` in the
 project's own repository, which would have git read its configuration from elsewhere, refuses
 the launch, as does a linked worktree's `commondir` that is missing or names another directory
-than the repository holding it. Such a file cannot be held before it exists, so sbx names any that appeared once the
-cage has exited. A `.git` that is a file, the pointer a linked worktree keeps to its
+than the repository holding it. Such a file cannot be held before it exists, so sbx names any
+that appeared once the cage has exited. A repository below the project's root that is no
+submodule, one the cage plants in a subdirectory or an ignored clone already there, is not held
+either: sbx names each whose configuration or hooks changed during the session, once the cage
+has exited ([below the root](../configuration/fs#read-only-without-an-entry-the-project-config-and-git)).
+A `.git` that is a file, the pointer a linked worktree keeps to its
 repository, is read-only as well, and the repository it names is held like `.git` wherever the
 cage writes it; so are the repositories of the submodules the index names, which a
 `git status` in the superproject reads too, and the repository's other work trees there, the
