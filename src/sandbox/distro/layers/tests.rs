@@ -821,6 +821,41 @@ fn a_contiguous_or_sparse_member_lands_like_the_regular_file_it_is() {
 /// The fallback used to return `Ok(())` for everything that was not a file, a directory, a link or
 /// a hard link, which is how the two above went missing. Device nodes, fifos and sockets keep the
 /// skip: the cage mounts its own `/dev`, and unprivileged creation would fail anyway.
+#[test]
+fn a_member_of_an_unwritable_type_is_named_rather_than_skipped() {
+    for (flag, shown) in [(b'Z', "(type flag `Z`)"), (0x01, "(type flag `\\x01`)")] {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.join("root");
+        let err = apply_tar(
+            tmp.path(),
+            &root,
+            &tar_of(&[("weird", Member::Typed(tar::EntryType::new(flag), ""))]),
+        )
+        .expect_err("an unknown member type is refused");
+        let said = err.to_string();
+        assert!(said.contains("does not write"), "{said}");
+        assert!(
+            said.ends_with(shown),
+            "the type named by its flag: {said:?}"
+        );
+    }
+
+    // The witness: a device node is still skipped, and the layer applies.
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[
+            ("dev/null", Member::Typed(tar::EntryType::Char, "")),
+            ("etc/keep", Member::File("k")),
+        ]),
+    )
+    .expect("a device node is skipped, not refused");
+    assert!(root.join("etc/keep").is_file());
+    assert!(!root.join("dev/null").exists());
+}
+
 /// A PAX global header describes the archive rather than a member, and every other reader
 /// ignores it: `git archive` writes one first, carrying the commit it archived. It is skipped, and
 /// what follows it applies.
@@ -996,41 +1031,6 @@ fn a_directory_is_dated_only_if_it_is_still_the_one_the_layer_made() {
     )
     .unwrap();
     assert_eq!(fs::metadata(outside.join("b")).unwrap().mtime(), before);
-}
-
-#[test]
-fn a_member_of_an_unwritable_type_is_named_rather_than_skipped() {
-    for (flag, shown) in [(b'Z', "(type flag `Z`)"), (0x01, "(type flag `\\x01`)")] {
-        let tmp = crate::testutil::TmpDir::new();
-        let root = tmp.join("root");
-        let err = apply_tar(
-            tmp.path(),
-            &root,
-            &tar_of(&[("weird", Member::Typed(tar::EntryType::new(flag), ""))]),
-        )
-        .expect_err("an unknown member type is refused");
-        let said = err.to_string();
-        assert!(said.contains("does not write"), "{said}");
-        assert!(
-            said.ends_with(shown),
-            "the type named by its flag: {said:?}"
-        );
-    }
-
-    // The witness: a device node is still skipped, and the layer applies.
-    let tmp = crate::testutil::TmpDir::new();
-    let root = tmp.join("root");
-    apply_tar(
-        tmp.path(),
-        &root,
-        &tar_of(&[
-            ("dev/null", Member::Typed(tar::EntryType::Char, "")),
-            ("etc/keep", Member::File("k")),
-        ]),
-    )
-    .expect("a device node is skipped, not refused");
-    assert!(root.join("etc/keep").is_file());
-    assert!(!root.join("dev/null").exists());
 }
 
 /// An opaque marker at the layer's own root empties the root, as every other applier does.
