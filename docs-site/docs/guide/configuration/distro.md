@@ -285,7 +285,10 @@ A layer's members are applied as the image declares them: regular files (includi
 contiguous and GNU sparse spellings, a sparse file's holes left as holes on disk),
 directories, symlinks, hard links, and the whiteout markers that delete a path a lower
 layer created. A marker reaches only what the layers below put there, wherever it stands
-in its own layer, so an entry its layer wrote before it stays. Each member keeps the
+in its own layer, so an entry its layer wrote before it stays. A directory a marker has
+emptied is not read again in that layer, since all that appears below it afterwards is the
+layer's own: markers repeated over one directory cost one read of it, not one each. Each
+member keeps the
 modification time the image gives it, so a cache checked against its source's date, such
 as Python's `.pyc`, stays valid on the read-only root rather than being recompiled on
 every import. A whiteout that names no entry beside it

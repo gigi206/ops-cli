@@ -583,6 +583,32 @@ fn a_whiteout_keeps_what_its_own_layer_wrote_before_it() {
     assert_eq!(tree(&root), ["dir", "dir/new", "file"]);
 }
 
+/// A directory a marker of the layer has emptied is not read again, by a marker for it or for a
+/// directory above it: what is below it now, the layer wrote. The entries planted here after the
+/// first marker stand for them, and are left where a second read would have removed them.
+#[test]
+fn a_directory_a_marker_emptied_is_not_read_again_in_the_same_layer() {
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("top/dir")).unwrap();
+    fs::write(root.join("top/dir/lower"), "lower").unwrap();
+    let mut written = Written::new();
+    written.hold(&root, &root.join("top/dir/kept"));
+    fs::write(root.join("top/dir/kept"), "kept").unwrap();
+
+    clear_directory(&root.join("top/dir"), &mut written).unwrap();
+    assert_eq!(tree(&root), ["top", "top/dir", "top/dir/kept"]);
+
+    fs::write(root.join("top/dir/planted"), "").unwrap();
+    clear_directory(&root.join("top/dir"), &mut written).unwrap();
+    clear_directory(&root.join("top"), &mut written).unwrap();
+    assert_eq!(
+        tree(&root),
+        ["top", "top/dir", "top/dir/kept", "top/dir/planted"],
+        "neither marker read the emptied directory again"
+    );
+}
+
 #[test]
 fn an_opaque_marker_never_empties_through_a_symlink_an_earlier_layer_planted() {
     // The escape the parent-chain check does not catch: the link is the marker's *own* directory,

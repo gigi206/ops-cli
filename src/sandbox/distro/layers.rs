@@ -283,7 +283,7 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
             } else {
                 safe_path(root, parent)?
             };
-            clear_directory(&dir, &written)?;
+            clear_directory(&dir, &mut written)?;
             continue;
         }
         if let Some(target) = name.strip_prefix(WHITEOUT) {
@@ -303,7 +303,7 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
             if !written.holds(&dest) {
                 remove(&dest)?;
             } else if dest.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-                clear_directory(&dest, &written)?;
+                clear_directory(&dest, &mut written)?;
             }
             continue;
         }
@@ -559,9 +559,13 @@ fn absent(e: &io::Error) -> bool {
 /// four kilobytes of path each, and the unpack runs with no bound on its memory. Two paths that
 /// hash alike would keep an entry a marker hides, a file too many and nothing reached, and the hash
 /// is keyed afresh by each unpack, so a layer cannot choose paths that collide.
+///
+/// It also holds the directories a marker of the layer has already emptied ([`clear_directory`]),
+/// on the same keys.
 struct Written {
     keys: std::hash::RandomState,
     held: std::collections::HashSet<u64>,
+    emptied: std::collections::HashSet<u64>,
 }
 
 impl Written {
@@ -569,6 +573,7 @@ impl Written {
         Written {
             keys: std::hash::RandomState::new(),
             held: std::collections::HashSet::new(),
+            emptied: std::collections::HashSet::new(),
         }
     }
 
@@ -591,6 +596,12 @@ impl Written {
     fn holds(&self, path: &Path) -> bool {
         self.held.contains(&self.key(path))
     }
+
+    /// Note that a marker of the layer empties the directory `path`, answering whether it is the
+    /// first to: once it has, nothing of the lower layers is left below it.
+    fn empty(&mut self, path: &Path) -> bool {
+        self.emptied.insert(self.key(path))
+    }
 }
 
 /// Empty a directory without removing it, of what the layers below put there: what an opaque
@@ -603,7 +614,12 @@ impl Written {
 /// before creating anything, and it does not hold for a read of the entries below. A link has no
 /// entries of its own, so an honest image never asks for this, and following one would empty the
 /// directory it names instead.
-fn clear_directory(dir: &Path, written: &Written) -> io::Result<()> {
+///
+/// A directory is read once per layer ([`Written::empty`]): whatever appears below it afterwards,
+/// the layer wrote, so a later marker has nothing to take from it. Read again, it would cost each
+/// marker the whole of what the layer holds there, and a layer of files and markers for their one
+/// directory the square of its size.
+fn clear_directory(dir: &Path, written: &mut Written) -> io::Result<()> {
     if dir
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
@@ -616,6 +632,9 @@ fn clear_directory(dir: &Path, written: &Written) -> io::Result<()> {
     // Only a real directory is descended into: `symlink_metadata` answers for the entry itself.
     let mut pending = vec![dir.to_path_buf()];
     while let Some(at) = pending.pop() {
+        if !written.empty(&at) {
+            continue;
+        }
         let entries = match fs::read_dir(&at) {
             Ok(entries) => entries,
             Err(e) if absent(&e) => continue,
