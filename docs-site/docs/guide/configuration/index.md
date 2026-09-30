@@ -126,9 +126,12 @@ A project's mise files (`[tools]`, `.tool-versions`) are a related input: see
 
 ## Forward compatibility
 
-The schema is **additive**: every field is optional, and unknown fields are ignored.
-A config written for a newer `sbx` still loads on an older one: a new field is
-skipped rather than failing the parse. A config file that is malformed (or fails the
+The schema is **additive**: every field is optional, and a field `sbx` does not know is
+ignored, with a warning naming it. A config written for a newer `sbx` still loads on an
+older one, save where skipping a field would let the file allow more than it says: a key
+under `[fs]` this `sbx` does not know, and a posture value it does not know (a `network`
+or `proc` mode, a `gui` posture, `gpu = "auto"`), stop a launch instead, as the paragraphs
+below describe. A config file that is malformed (or fails the
 [safety gate](../concepts/trust#the-safety-gate)) refuses a launch (exit 2) rather
 than letting it run without what the file says, and so does a project changed since you
 [trusted](../concepts/trust) it, whose security fields are held back until it is

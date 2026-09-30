@@ -1,6 +1,6 @@
 //! sbx's own binary, run in a cage of its own: how the supervisor starts the helpers that read what
-//! a cage sends, the egress proxy ([`super::proxy::child`]) and the transparent-capture tap
-//! ([`super::nettap`]).
+//! a cage or a registry sends, the egress proxy ([`super::proxy::child`]), the transparent-capture
+//! tap ([`super::nettap`]) and the unpack of an image's layer ([`super::distro::unpack`]).
 //!
 //! Each helper is the running build, bound at [`BINARY`] through a descriptor opened on it (or
 //! copied in when its file has gone since), over the host's userland read-only for a binary that
