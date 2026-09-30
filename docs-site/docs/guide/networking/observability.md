@@ -457,7 +457,8 @@ closes the tunnel instead: see below.)
 - **By name, never by value.** The credential's configured name is printed; its value stays
   on the host, as everywhere else.
 - **Once per credential per direction.** A value that keeps crossing says nothing new, and
-  repeating it would turn an alarm into noise.
+  repeating it would turn an alarm into noise. An exchange lists at most 32 sightings, both
+  directions of sixteen names, so the log's memory stays bounded whatever the proxy reports.
 - **Independent of `capture`.** It runs whenever a secret is configured, whether or not the
   launch captures. A check that followed a debugging setting would be missing exactly when it
   mattered. It sees the same decoded payloads a capture would, so a masked frame and a
@@ -551,7 +552,7 @@ it appears when the tunnel opens (with its handshake), then as each direction's 
 fills, then once more at close if that changed anything. **Four lines of traffic** over the
 tunnel's whole life is the ceiling, and it is never re-emitted showing what it already
 showed. A [secret sighting](#a-secret-crossing-a-websocket) adds at most one line per
-credential per direction on top of that, since it re-emits the event too. Nothing else is
+credential per direction on top of that, 32 in all, since it re-emits the event too. Nothing else is
 ever re-emitted more than once.
 
 ---

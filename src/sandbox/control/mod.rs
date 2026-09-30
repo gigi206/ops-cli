@@ -541,6 +541,16 @@ impl ManualRules {
 /// The default number of recent egress events a session retains for the live log.
 pub(crate) const LOG_RING_CAP: usize = 1000;
 
+/// The most secret sightings one event keeps ([`LogRing::secret_seen`]). A proxy reports each
+/// credential once per direction, and the names it reports are the launch's declared secrets and
+/// the few header names an app's own sign-in is learned under, so this covers both directions of
+/// sixteen names. The names are the proxy's to report, and nothing else bounds how many distinct
+/// ones it sends: past this, a sighting changes nothing. A full ring then holds at most this many
+/// names of [`SANITIZED_CHARS`](crate::sandbox::observe_feed::SANITIZED_CHARS) characters per
+/// event, about 64 MiB across [`LOG_RING_CAP`] events, and each sighting's search and amendment
+/// stay short under the lock every proxy of the session and every `sbx net logs` reader share.
+const SIGHTINGS_MAX: usize = 32;
+
 /// The most `--follow` readers one ring keeps track of for [`LogRing::linger`]. Past it, the reader
 /// heard from longest ago is forgotten.
 const FOLLOWERS_MAX: usize = 16;
@@ -946,7 +956,8 @@ pub(crate) struct LogEvent {
     /// everything else: the two HTTP tripwires act on the exchange itself (a `403` outbound, a
     /// masked response inbound), while an open tunnel is relayed byte-exact, so the sighting IS the
     /// outcome there. Each credential appears at most once per direction — a value that keeps
-    /// crossing says nothing new after the first time.
+    /// crossing says nothing new after the first time — and the event keeps at most
+    /// [`SIGHTINGS_MAX`] of them.
     pub(crate) secrets_seen: Vec<SecretSighting>,
 }
 
@@ -1321,7 +1332,8 @@ impl LogRing {
     /// tunnel adds at most two amendments per configured secret over its whole life.
     ///
     /// A repeat of an already-recorded (name, direction) is dropped rather than amending again, so a
-    /// second caller cannot turn the alarm into a stream.
+    /// second caller cannot turn the alarm into a stream, and so is any sighting past
+    /// [`SIGHTINGS_MAX`] on one event, since distinct names are the proxy's to invent.
     pub(crate) fn secret_seen(&self, seq: u64, name: &str, way: SecretWay) {
         // The proxy reports the name, and is held to what it reports like every logged field.
         let name = super::sanitize(name);
@@ -1329,10 +1341,11 @@ impl LogRing {
         let mut guard = locked(&self.inner);
         let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
-            if ev
-                .secrets_seen
-                .iter()
-                .any(|s| s.name == name && s.way == way)
+            if ev.secrets_seen.len() >= SIGHTINGS_MAX
+                || ev
+                    .secrets_seen
+                    .iter()
+                    .any(|s| s.name == name && s.way == way)
             {
                 return;
             }
@@ -4804,5 +4817,54 @@ mod tests {
         let back = super::read_record(&path).unwrap();
         assert_eq!(back.events[0].secrets_seen.len(), 1);
         assert_eq!(back.events[0].secrets_seen[0].name, "API_TOKEN");
+    }
+
+    /// The names a sighting carries are the proxy's to report, so an event keeps at most
+    /// [`SIGHTINGS_MAX`] of them: one more neither lists a name, nor amends the event for a
+    /// `--follow` reader, nor writes a line to the record.
+    #[test]
+    fn an_event_keeps_a_bounded_number_of_secret_sightings() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("record-1-2.log");
+        let record = crate::sandbox::lens::Recorder::create(
+            &path,
+            "/p",
+            None,
+            std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+        )
+        .unwrap();
+        let ring = LogRing::new(8).with_record(Some(record));
+        let seq = ring.push(
+            false,
+            "ws.test",
+            443,
+            None,
+            None,
+            LogVerdict::Allow,
+            "allowed",
+            Proto::Https,
+            HttpVer::Unknown,
+            RpcKind::None,
+            Plane::Agent,
+        );
+        for n in 0..SIGHTINGS_MAX + 8 {
+            ring.secret_seen(seq, &format!("NAME_{n}"), SecretWay::Out);
+        }
+
+        let snap = ring.snapshot(None, None, false);
+        let names: Vec<&str> = snap.events[0]
+            .secrets_seen
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let kept: Vec<String> = (0..SIGHTINGS_MAX).map(|n| format!("NAME_{n}")).collect();
+        assert_eq!(names, kept);
+        assert_eq!(snap.amend_head, 32);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("seen ")).count(),
+            32,
+            "{body}"
+        );
     }
 }

@@ -162,7 +162,8 @@ worded to prevent.
 - Both directions: `cage → upstream` (the agent sent it out) and `upstream → cage` (the far
   side sent it back).
 - The credential's **name**, never its value.
-- **Once per credential per direction**: a repeat carries no new information.
+- **Once per credential per direction**: a repeat carries no new information. An exchange
+  lists at most 32 sightings, both directions of sixteen names.
 - It runs **whether or not the launch captures**: an enforcement path must not depend on a
   debugging setting. It sees the payloads decoded, so a masked frame and a
   `permessage-deflate` message are scanned as the text they carry.
