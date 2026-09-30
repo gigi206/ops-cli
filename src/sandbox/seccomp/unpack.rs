@@ -51,6 +51,9 @@ fn work() -> Vec<i64> {
         libc::SYS_fstat,
         libc::SYS_getdents64,
         libc::SYS_unlinkat,
+        // A sparse member's holes skipped over rather than written, and its length set.
+        libc::SYS_lseek,
+        libc::SYS_ftruncate,
         // Memory.
         libc::SYS_brk,
         libc::SYS_munmap,

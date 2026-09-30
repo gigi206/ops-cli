@@ -260,7 +260,7 @@ header, and the long name, long link or PAX record that describes it, which the 
 holds whole in memory before the member reaches the budget. Nothing honest comes near it
 (a path is at most 4 KiB, an extended attribute at most 64 KiB), so a layer past it is
 refused rather than held. A member's own data is not under this bound; the byte ceiling
-above counts it.
+above counts it, a sparse file at its whole length, holes included.
 
 A member whose path is longer than the kernel resolves, **4095 bytes**, is refused too,
 a whiteout or an opaque marker included: it names nothing a layer can hold, and a marker,
@@ -273,11 +273,12 @@ check then looks at one directory at a time, which costs the square of the depth
 ### What a layer may contain
 
 A layer's members are applied as the image declares them: regular files (including the
-contiguous and GNU sparse spellings), directories, symlinks, hard links, and the
-whiteout markers that delete a path a lower layer created. A whiteout that names no entry
-beside it (`.wh.`, `.wh..`) is refused rather than taking its own directory with it. A
-device node, block or character, and a fifo are skipped: the cage mounts its own `/dev`
-over whatever the image carries, and creating either unprivileged would fail anyway. So is
+contiguous and GNU sparse spellings, a sparse file's holes left as holes on disk),
+directories, symlinks, hard links, and the whiteout markers that delete a path a lower
+layer created. A whiteout that names no entry beside it (`.wh.`, `.wh..`) is refused
+rather than taking its own directory with it. A device node, block or character, and a
+fifo are skipped: the cage mounts its own `/dev` over whatever the image carries, and
+creating either unprivileged would fail anyway. So is
 a PAX global header, which describes the archive rather than a member (`git archive`
 writes one). Any **other** member type stops the unpack and is named, by the type flag
 its header carries (a `Z`, say), rather than being dropped in silence: a member the

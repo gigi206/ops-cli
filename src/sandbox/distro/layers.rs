@@ -599,9 +599,9 @@ fn write_member<R: io::Read>(
     }
 
     // Three spellings of "this member is a file". A GNU sparse entry (`S`) is read back with its
-    // holes filled by the tar crate, and a `7` (contiguous) is a regular file on every filesystem
-    // this runs on: both took the fallback below and were dropped without a word, so an image
-    // built by GNU tar with `--sparse` lost the file it declared.
+    // holes as zeros, which [`copy_sparse`] leaves as holes, and a `7` (contiguous) is a regular
+    // file on every filesystem this runs on: both took the fallback below and were dropped without
+    // a word, so an image built by GNU tar with `--sparse` lost the file it declared.
     if kind.is_file() || kind.is_gnu_sparse() || kind == tar::EntryType::Continuous {
         remove(dest)?;
         let mut file = fs::File::create(dest)?;
@@ -611,7 +611,11 @@ fn write_member<R: io::Read>(
         // understates its member would write past a ceiling read from it.
         let allowed = budget.remaining_bytes();
         let mut bounded = io::Read::take(&mut *entry, allowed + 1);
-        let written = io::copy(&mut bounded, &mut file)?;
+        let written = if kind.is_gnu_sparse() {
+            copy_sparse(&mut bounded, &mut file)?
+        } else {
+            io::copy(&mut bounded, &mut file)?
+        };
         budget.spend(written, dest)?;
         // The owner keeps read and write access whatever the archive says: the tree is assembled
         // by this user, a later layer has to be able to replace a member of it, and reclaiming the
@@ -634,6 +638,34 @@ fn write_member<R: io::Read>(
         dest.display(),
         std::ascii::escape_default(kind.as_byte())
     )))
+}
+
+/// Copy a sparse member's content into `file`, leaving its holes as holes, and return its length.
+///
+/// The tar reader hands a hole back as zeros, and written out they took the hole's whole size on
+/// disk: a hole of a hundred mebibytes is a few bytes of a layer. A read that brought only zeros is
+/// skipped over rather than written, and the file is given its length at the end, for a hole it
+/// ends on. The length is still what the budget counts, since it is what the tar reader produced.
+fn copy_sparse(from: &mut impl io::Read, file: &mut fs::File) -> io::Result<u64> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut buf = vec![0; 64 * 1024];
+    let mut length = 0u64;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf[..n].iter().all(|&b| b == 0) {
+            file.seek(SeekFrom::Current(n as i64))?;
+        } else {
+            file.write_all(&buf[..n])?;
+        }
+        length += n as u64;
+    }
+    file.set_len(length)?;
+    Ok(length)
 }
 
 #[cfg(test)]

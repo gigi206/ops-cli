@@ -237,8 +237,26 @@ fn every_kind_of_member() -> Vec<u8> {
     add("dir2/y", Regular, "y", 0o644, None);
     add("dir2", Regular, "now a file", 0o644, None);
     add("locked", Regular, "l", 0o000, None);
+    // A GNU sparse member: a mebibyte long, one byte at its middle and holes around it, the last
+    // spelled as GNU tar spells it, an empty extent where the file ends.
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::GNUSparse);
+    header.set_mode(0o644);
+    header.set_size(1);
+    let gnu = header.as_gnu_mut().unwrap();
+    gnu.sparse[0].set_offset(SPARSE_LEN / 2);
+    gnu.sparse[0].set_length(1);
+    gnu.sparse[1].set_offset(SPARSE_LEN);
+    gnu.sparse[1].set_length(0);
+    gnu.set_real_size(SPARSE_LEN);
+    header.set_path("sparse").unwrap();
+    header.set_cksum();
+    builder.append(&header, &b"s"[..]).unwrap();
     builder.into_inner().unwrap()
 }
+
+/// The length of the sparse member of [`every_kind_of_member`].
+const SPARSE_LEN: u64 = 1024 * 1024;
 
 /// What [`every_kind_of_member`] leaves in `root` once applied.
 fn assert_every_kind_of_member_landed(root: &Path) {
@@ -261,6 +279,14 @@ fn assert_every_kind_of_member_landed(root: &Path) {
     assert!(root.join("was").is_dir(), "a file replaced by a directory");
     assert_eq!(read("dir2"), "now a file", "a directory replaced by a file");
     assert_eq!(read("locked"), "l");
+    let sparse = std::fs::read(root.join("sparse")).unwrap();
+    assert_eq!(sparse.len() as u64, SPARSE_LEN);
+    assert_eq!(sparse[SPARSE_LEN as usize / 2], b's');
+    let blocks = std::os::unix::fs::MetadataExt::blocks(&root.join("sparse").metadata().unwrap());
+    assert!(
+        blocks * 512 < SPARSE_LEN / 2,
+        "its holes stay holes: {blocks} blocks"
+    );
 }
 
 /// The variable that tells [`probe_in_the_unpacks_cage`] it runs in the unpack's cage, and names

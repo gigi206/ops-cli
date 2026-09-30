@@ -786,6 +786,57 @@ fn a_whiteout_that_names_no_entry_beside_it_is_refused() {
     }
 }
 
+/// A tar holding one GNU sparse member at `path`: `real_size` bytes long, holding `data` at
+/// `offset` and holes everywhere else.
+fn sparse_tar(path: &str, real_size: u64, offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::GNUSparse);
+    header.set_mode(0o644);
+    header.set_size(data.len() as u64);
+    let gnu = header.as_gnu_mut().expect("a GNU header");
+    gnu.sparse[0].set_offset(offset);
+    gnu.sparse[0].set_length(data.len() as u64);
+    // The hole after the data, as GNU tar spells it: an empty extent where the file ends.
+    gnu.sparse[1].set_offset(real_size);
+    gnu.sparse[1].set_length(0);
+    gnu.set_real_size(real_size);
+    header.set_path(path).unwrap();
+    header.set_cksum();
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.append(&header, data).unwrap();
+    builder.into_inner().unwrap()
+}
+
+/// A GNU sparse member's holes stay holes: the tar reader reads them back as zeros, and written
+/// out they took their whole size on disk, a hundred mebibytes for a hundred-odd bytes of layer.
+/// The file keeps its length and its content.
+#[test]
+fn a_sparse_members_holes_are_left_as_holes() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    let (size, at) = (16 * 1024 * 1024, 8 * 1024 * 1024);
+    let mut budget = Budget::new();
+    apply_tar_within(
+        tmp.path(),
+        &root,
+        &sparse_tar("big", size, at, b"data"),
+        &mut budget,
+    )
+    .unwrap();
+    let meta = fs::metadata(root.join("big")).unwrap();
+    assert_eq!(meta.len(), size, "the file keeps its length");
+    assert!(
+        meta.blocks() * 512 < 1024 * 1024,
+        "{} bytes on disk for {size} of them",
+        meta.blocks() * 512
+    );
+    let content = fs::read(root.join("big")).unwrap();
+    assert_eq!(&content[at as usize..at as usize + 4], b"data");
+    assert!(content[..at as usize].iter().all(|&b| b == 0));
+    assert_eq!(budget.spent().0, size, "the budget counts the length");
+}
+
 #[test]
 fn a_member_of_an_unwritable_type_is_named_rather_than_skipped() {
     for (flag, shown) in [(b'Z', "(type flag `Z`)"), (0x01, "(type flag `\\x01`)")] {
