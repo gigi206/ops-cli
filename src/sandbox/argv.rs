@@ -42,7 +42,7 @@ fn path(p: &Path) -> OsString {
 /// What stands in for the descriptor carrying the cage's environment until [`compose`] can create
 /// it. Not a number, so a spec that skipped that step cannot accidentally name a descriptor this
 /// process happens to hold — bwrap refuses it loudly instead.
-pub(crate) const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
+const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
 
 /// The bubblewrap argument list for `spec`, ready to exec, plus the descriptors it must inherit to
 /// read what that list points at: the compiled seccomp filters, then the cage's environment.
@@ -70,7 +70,7 @@ pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File
     }
     // The prefix names the filter descriptors and only those, so it is built before the
     // environment's descriptor joins them: the two kinds share a lifetime, not a meaning.
-    let mut full = crate::sandbox::seccomp::argv_prefix(&filters);
+    let mut full = argv_prefix(&filters);
     let mut held = filters;
     if let Some(file) = env_fd(spec)? {
         let at = env_args_slot(&argv)?;
@@ -79,6 +79,20 @@ pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File
     }
     full.extend(argv);
     Ok((full, held))
+}
+
+/// The bwrap flags that load `filters` as seccomp filters, placed before the rest of the argv. Each
+/// is applied on top of the others.
+///
+/// Private to this module, so an argument list that loads the mandatory filters is always one
+/// [`compose`] built.
+fn argv_prefix(filters: &[File]) -> Vec<OsString> {
+    let mut a = Vec::with_capacity(filters.len() * 2);
+    for f in filters {
+        a.push(lit("--add-seccomp-fd"));
+        a.push(OsString::from(f.as_raw_fd().to_string()));
+    }
+    a
 }
 
 /// Where in `argv` the descriptor carrying the cage's environment has its number written: the word
@@ -152,68 +166,11 @@ fn env_fd(spec: &SandboxSpec) -> io::Result<Option<File>> {
     super::memfd::write(c"sbx-args", &bytes).map(Some)
 }
 
-/// The argument list a *helper* cage starts from — the hardening, then a minimal usable root.
-///
-/// Two cages in this crate are not launches: they run one of sbx's own fixed operations, decided
-/// at the call site before any configuration has been resolved, so no [`SandboxSpec`] exists for
-/// them to be built from. They used to assemble the flags below by hand, each carrying a comment
-/// promising to stay in step with [`to_argv`]; the promise was not kept, and what it cost is the
-/// reason this function exists.
-///
-/// `slug` names the cage. A fresh UTS namespace inherits the hostname it was created from, so
-/// unsharing it without naming the cage is what reveals the host's hostname rather than hiding it.
-///
-/// The network is unshared unconditionally, unlike in a launch: neither helper reaches it.
-///
-/// [`to_argv`] does not call this, and the parity test in this module is what holds the two in
-/// step instead. Its own emission is conditional flag by flag — the network follows the policy, the
-/// session and the parent-death signal each have a shape that omits them, and the netns-holder
-/// branch replaces the namespace flags with a uid/gid pair — so there is no prefix to share, only
-/// a set of flags to agree on.
-pub(crate) fn helper_argv(slug: &str, store_nix: &Path) -> Vec<OsString> {
-    let mut a: Vec<OsString> = Vec::new();
-    for ns in [
-        "--unshare-user",
-        "--unshare-ipc",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-uts",
-        "--unshare-cgroup",
-    ] {
-        a.push(lit(ns));
-    }
-    // Start from a clean environment, die with the launcher, drop every capability, and take a
-    // session of its own — the last of which the syscall filters do not stand in for: they refuse
-    // `ioctl(TIOCSTI)`, while a controlling terminal kept across the launch is reachable by
-    // opening `/dev/tty` and reading it.
-    a.push(lit("--clearenv"));
-    a.push(lit("--die-with-parent"));
-    a.push(lit("--cap-drop"));
-    a.push(lit("ALL"));
-    a.push(lit("--new-session"));
-    a.push(lit("--hostname"));
-    a.push(OsString::from(super::naming::cage_hostname(slug)));
-
-    // The store backs the relocated binary these cages run; `/proc`, `/dev` and a `/tmp` tmpfs
-    // round out a minimal usable root. Nothing here is writable — each caller adds its own single
-    // write surface after this.
-    a.push(lit("--ro-bind"));
-    a.push(store_nix.as_os_str().to_os_string());
-    a.push(lit("/nix"));
-    a.push(lit("--proc"));
-    a.push(lit("/proc"));
-    a.push(lit("--dev"));
-    a.push(lit("/dev"));
-    a.push(lit("--tmpfs"));
-    a.push(lit("/tmp"));
-    a
-}
-
 /// Build the bubblewrap argument list for `spec`. Pure: same Spec in, same argv
 /// out, no I/O and no globals read. The environment is represented by the
 /// [`ENV_ARGS_PLACEHOLDER`] that [`compose`] resolves — nothing here is what
 /// bwrap is finally given.
-pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
+pub(in crate::sandbox) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
 
     // Namespaces: isolate everything. The pid namespace is mandatory — the
@@ -449,95 +406,6 @@ mod tests {
         // `sbx-cage`), so the fresh UTS namespace never inherits — nor reveals — the host's
         let h = index_of(&argv, "--hostname").expect("--hostname present");
         assert_eq!(argv[h + 1], OsString::from("sbx-cage"));
-    }
-
-    /// The hardening every bubblewrap argument list sbx builds carries, whatever built it.
-    ///
-    /// Written as literals rather than read back from [`to_argv`], because an expectation
-    /// computed from one of the three subjects shares whatever that subject is missing: a flag
-    /// dropped from the keystone would quietly stop being owed by the two hand-built lists
-    /// instead of failing here.
-    ///
-    /// `--cap-drop` and `--hostname` are absent from this list and checked below as pairs,
-    /// since a flag whose value carries the meaning is not held by its presence alone.
-    const HARDENING_BASELINE: &[&str] = &[
-        "--unshare-user",
-        "--unshare-ipc",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-uts",
-        "--unshare-cgroup",
-        "--clearenv",
-        "--die-with-parent",
-        "--new-session",
-    ];
-
-    /// Two argument lists in this crate are assembled by hand rather than through
-    /// [`SandboxSpec`], because what they run is fixed at the call site and no spec exists yet: the
-    /// one driving mise over a project's files, and the one formatting a storage image. Both stated
-    /// in prose that they were kept in step with the keystone's baseline, and a promise held by
-    /// hand is the shape this test replaces.
-    ///
-    /// It is what the exhaustiveness guard below cannot ask. That guard checks that a file
-    /// building a list *declares itself*, and that it prepends the syscall filters; it never
-    /// reads a flag. Between the two, a hand-built list is accounted for and hardened.
-    #[test]
-    fn the_hand_built_argument_lists_carry_the_keystones_hardening() {
-        fn holds(argv: &[OsString], who: &str) {
-            for flag in HARDENING_BASELINE {
-                assert!(
-                    index_of(argv, flag).is_some(),
-                    "{who} is missing {flag}: {argv:?}"
-                );
-            }
-            let caps = index_of(argv, "--cap-drop").unwrap_or_else(|| {
-                panic!("{who} drops no capability: {argv:?}");
-            });
-            assert_eq!(argv[caps + 1], OsString::from("ALL"), "{who}: {argv:?}");
-            // A fresh UTS namespace inherits the hostname it was created from, so unsharing it
-            // without naming the cage is what *reveals* the host's hostname rather than hiding
-            // it. The value differs per cage; the `sbx-` prefix is what says one was set.
-            let host = index_of(argv, "--hostname").unwrap_or_else(|| {
-                panic!("{who} keeps the host's hostname: {argv:?}");
-            });
-            assert!(
-                argv[host + 1].to_string_lossy().starts_with("sbx-"),
-                "{who}: {argv:?}"
-            );
-        }
-
-        // The keystone, first, so the literals above are pinned to what it actually emits and
-        // cannot drift away from it unnoticed. Isolated, since that is the posture the two
-        // hand-built cages take (neither reaches the network).
-        holds(
-            &to_argv(&spec(vec![], vec![], NetPolicy::Isolated)),
-            "the keystone",
-        );
-
-        holds(
-            &super::super::mise::bwrap_argv(
-                Path::new("/data/store/nix"),
-                Path::new("/data/mise"),
-                &[],
-                None,
-                Path::new("/nix/store/abc-mise/bin/mise"),
-                &[OsString::from("--version")],
-            ),
-            "the mise cage",
-        );
-
-        let (mkfs, _fds) = crate::storage::mkfs_command(
-            &crate::storage::Mkfs::Owned {
-                bwrap: PathBuf::from("/e/bwrap"),
-                store_nix: PathBuf::from("/d/store/nix"),
-                bin: PathBuf::from("/nix/store/x-btrfs-progs/bin/mkfs.btrfs"),
-            },
-            Path::new("/vol/sbx-storage.btrfs"),
-            Path::new("/vol/sbx-storage.seed"),
-            "l",
-        );
-        let argv: Vec<OsString> = mkfs.get_args().map(|a| a.to_os_string()).collect();
-        holds(&argv, "the mkfs cage");
     }
 
     #[test]
@@ -1065,15 +933,14 @@ mod tests {
         );
     }
 
-    /// Every bubblewrap argument list this crate assembles either comes from [`compose`], which
-    /// loads the mandatory filters, or is one of the hand-built lists named below, and each of
-    /// those loads them itself; and every cage that runs code sbx did not write also carries the
-    /// resource scope.
+    /// Every bubblewrap argument list this crate starts a cage with comes from [`compose`], which
+    /// loads the mandatory filters; and every cage that runs code sbx did not write also carries
+    /// the resource scope.
     ///
     /// The population is every file that spawns bubblewrap by name, plus every file calling
-    /// [`to_argv`] or `argv_prefix` outside the two that define them. The first criterion is the
-    /// one that matters: a list written by hand names neither function, and the process it starts
-    /// is the only trace it leaves. Sorting the population into kinds is the whole point of the
+    /// [`to_argv`] outside the one that defines it. The first criterion is the one that matters: a
+    /// list written by hand names no function, and the process it starts is the only trace it
+    /// leaves. Sorting the population into kinds is the whole point of the
     /// guard: it asks a new file's author which kind it is, and each kind carries an obligation the
     /// guard then checks. Nothing in the type system asks that question, and the failure it
     /// prevents is an absence: an argument list assembled beside the one definition, running a cage
@@ -1090,16 +957,6 @@ mod tests {
     /// list of its own, belongs in one of them the day it is written.
     #[test]
     fn every_bubblewrap_argument_list_outside_compose_is_accounted_for() {
-        // Builds its list around `helper_argv` rather than from a `SandboxSpec`: the argument set
-        // is fixed and known at the call site rather than resolved from a project's configuration.
-        // The shared definition carries the hardening and the minimal root; the filters and the
-        // scope are not flags, so each is added where the list is assembled — what a spec would
-        // have carried has to come from somewhere. This cage drives provisioning off a project's
-        // own files, which is why it owes the scope.
-        const ASSEMBLES_BY_HAND_IN_A_SCOPE: &[&str] = &["src/sandbox/mise.rs"];
-        // The same shape, running one of sbx's own fixed operations rather than anything a project
-        // chose: formatting an image sbx owns. It owes the filters and no scope.
-        const ASSEMBLES_BY_HAND_UNSCOPED: &[&str] = &["src/storage.rs"];
         // These spawn their cage through the shared launch command, which is what carries the
         // filters, the netns holder and the scope in one step. Each runs code sbx did not write: a
         // profile's own `resolve` command, a plugin from a store, a declared task's command, and an
@@ -1110,18 +967,23 @@ mod tests {
             "src/sandbox/resolver.rs",
             "src/sandbox/task.rs",
         ];
-        // Spawns bubblewrap itself rather than through the launch command, and the list it hands it
-        // is the composed one. `doctor`'s probe is sbx's own, fixed, and reports on the host rather
-        // than running anything for a project, so it owes no scope; the session launcher and the
-        // task pool each run a project's own code and take the scope with the composed list.
-        // `selfcage` builds the cage sbx's own binary runs in, the egress proxy's and the capture
-        // tap's; that binary bounds its own memory (`[network] body_max_mb`, `max_connections`), and
-        // takes no scope.
-        const SPAWNS_THE_COMPOSED_LIST: &[&str] = &[
+        // Spawn bubblewrap themselves rather than through the launch command, with the composed
+        // list inside the resource scope. Each runs a project's own code: the session launcher, the
+        // task pool, and mise driven over the files a project declared.
+        const SPAWNS_THE_COMPOSED_LIST_IN_A_SCOPE: &[&str] = &[
             "src/sandbox/launch/cage.rs",
+            "src/sandbox/mise.rs",
+            "src/sandbox/taskpool.rs",
+        ];
+        // The same, and outside the scope, because what runs is sbx's own and fixed. `doctor`'s
+        // probe reports on the host rather than running anything for a project; `selfcage` builds
+        // the cage sbx's own binary runs in, the egress proxy's and the capture tap's, and that
+        // binary bounds its own memory (`[network] body_max_mb`, `max_connections`); and the storage
+        // helper formats an image sbx owns.
+        const SPAWNS_THE_COMPOSED_LIST: &[&str] = &[
             "src/sandbox/selfcage.rs",
             "src/sandbox/smoke.rs",
-            "src/sandbox/taskpool.rs",
+            "src/storage.rs",
         ];
         // Holds a `bwrap` path to hand on and starts no cage with it. The process each does spawn
         // is a host-side one of its own: `sops` decrypting a secret, sbx's `__net-probe` asking
@@ -1136,8 +998,8 @@ mod tests {
         ];
         // These read the pure list to assert something about what it contains, and run nothing.
         const READS_THE_LIST: &[&str] = &[];
-        // The definitions themselves: this module, the one that compiles a filter into a descriptor
-        // and names it, and the one that wraps a launch in its resource scope.
+        // The definitions themselves: this module, the one that compiles the filters into
+        // descriptors, and the one that wraps a launch in its resource scope.
         const DEFINES_THEM: &[&str] = &[
             "src/sandbox/argv.rs",
             "src/sandbox/cgroup.rs",
@@ -1188,9 +1050,7 @@ mod tests {
             // file's own cut past its test module and offer these fixtures to every guard that
             // reads a production half -- which is exactly what it did.
             let production = crate::testutil::production_half(&text);
-            let names_the_list = ["to_argv(", "argv_prefix("]
-                .iter()
-                .any(|needle| crate::testutil::calls_function(production, needle));
+            let names_the_list = crate::testutil::calls_function(production, "to_argv(");
             let spawns = holds_bwrap_and_spawns(production);
             if !names_the_list && !spawns {
                 continue;
@@ -1200,23 +1060,21 @@ mod tests {
                 continue;
             }
             let calls = |needle: &str| crate::testutil::calls_function(production, needle);
-            // What each kind owes. A hand-built list owes the filters' descriptors, and the scope
-            // too where the kind says so; a cage run through the shared launch command owes that
-            // call, which carries both; a composed one owes the call that compiles the filters; a
-            // file that only reads the list owes nothing, and spawning bubblewrap is what would
-            // make it something else.
-            let honoured = if ASSEMBLES_BY_HAND_IN_A_SCOPE.contains(&relative.as_str()) {
-                calls("argv_prefix(") && calls("cgroup::wrap(")
-            } else if ASSEMBLES_BY_HAND_UNSCOPED.contains(&relative.as_str()) {
-                calls("argv_prefix(")
-            } else if RUNS_THE_SHARED_LAUNCH_COMMAND.contains(&relative.as_str()) {
+            // What each kind owes. A cage run through the shared launch command owes that call,
+            // which carries the filters and the scope; a composed list owes the call that compiles
+            // the filters, and the scope's own call too where the kind says so; a file that only
+            // reads the list owes nothing, and spawning bubblewrap is what would make it something
+            // else.
+            let honoured = if RUNS_THE_SHARED_LAUNCH_COMMAND.contains(&relative.as_str()) {
                 calls("cage_command(")
+            } else if SPAWNS_THE_COMPOSED_LIST_IN_A_SCOPE.contains(&relative.as_str()) {
+                calls("argv::compose(") && calls("cgroup::wrap(")
             } else if SPAWNS_THE_COMPOSED_LIST.contains(&relative.as_str()) {
                 calls("argv::compose(")
             } else if HANDS_THE_PATH_ON.contains(&relative.as_str()) {
                 // Nothing to check in the text: the claim is that no cage starts here, and the
-                // three calls above are what starting one looks like.
-                !calls("argv::compose(") && !calls("argv_prefix(") && !calls("cage_command(")
+                // two calls above are what starting one looks like.
+                !calls("argv::compose(") && !calls("cage_command(")
             } else {
                 !spawns
             };
@@ -1227,10 +1085,9 @@ mod tests {
         }
         population.sort();
 
-        let mut declared: Vec<String> = ASSEMBLES_BY_HAND_IN_A_SCOPE
+        let mut declared: Vec<String> = RUNS_THE_SHARED_LAUNCH_COMMAND
             .iter()
-            .chain(ASSEMBLES_BY_HAND_UNSCOPED)
-            .chain(RUNS_THE_SHARED_LAUNCH_COMMAND)
+            .chain(SPAWNS_THE_COMPOSED_LIST_IN_A_SCOPE)
             .chain(SPAWNS_THE_COMPOSED_LIST)
             .chain(HANDS_THE_PATH_ON)
             .chain(READS_THE_LIST)

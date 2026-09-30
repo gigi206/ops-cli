@@ -34,6 +34,7 @@
 //! `btrfs filesystem usage`. Both work unprivileged, so `btrfs-progs` is needed only to
 //! *create* a volume, never to use one.
 
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1171,43 +1172,30 @@ pub(crate) fn mkfs_command(
     image: &Path,
     seed: &Path,
     label: &str,
-) -> (Command, Vec<std::fs::File>) {
-    let args = |c: &mut Command| {
-        c.arg("-q")
-            .arg("-L")
-            .arg(label)
-            .arg("--rootdir")
-            .arg(seed)
-            .arg(image);
-    };
+) -> Result<(Command, Vec<std::fs::File>), String> {
+    let args: Vec<OsString> = vec![
+        OsString::from("-q"),
+        OsString::from("-L"),
+        OsString::from(label),
+        OsString::from("--rootdir"),
+        seed.as_os_str().to_os_string(),
+        image.as_os_str().to_os_string(),
+    ];
     match mkfs {
         // The host's own tool, run as the user runs it: there is no cage here to harden.
         Mkfs::Host(path) => {
             let mut c = Command::new(path);
-            args(&mut c);
-            (c, Vec::new())
+            c.args(args);
+            Ok((c, Vec::new()))
         }
         Mkfs::Owned {
             bwrap,
             store_nix,
             bin,
         } => {
-            let mut c = Command::new(bwrap);
-            // The mandatory syscall denylist, which the shared hardening below does not carry:
-            // it is a pair of descriptors compiled per call, not a flag, and the caller is what
-            // holds them open across the exec. This argv is assembled by hand rather than through
-            // the `SandboxSpec` keystone, and had the namespaces and the capabilities without it.
-            #[expect(
-                clippy::expect_used,
-                reason = "the filters are built from constants `seccomp` declares, so a failure \
-                          here is that module disagreeing with itself rather than an input"
-            )]
-            let seccomp = crate::sandbox::seccomp::memfds(&Default::default())
-                .expect("the statically-defined filters compile");
-            c.args(crate::sandbox::seccomp::argv_prefix(&seccomp));
-            // The hardening and the minimal root, from the one definition every helper cage
-            // shares. The network is unshared there too: formatting reaches nothing.
-            c.args(crate::sandbox::helper_argv("mkfs", store_nix));
+            use crate::sandbox::{Mount, NetPolicy, SandboxSpec};
+            // sbx's store at `/nix`, which backs the binary's interpreter, and a minimal root.
+            let mut mounts = crate::sandbox::store_tool_mounts(store_nix);
             // The seed is read; the image's directory is written. Each is bound at its own
             // path so the arguments below stay valid inside.
             //
@@ -1218,17 +1206,38 @@ pub(crate) fn mkfs_command(
             // "the seed is read" above was not true of the cage it built. The narrower mount lands
             // last.
             if let Some(parent) = image.parent() {
-                c.arg("--bind").arg(parent).arg(parent);
+                mounts.push(Mount::Bind {
+                    src: parent.to_path_buf(),
+                    dest: parent.to_path_buf(),
+                });
             }
-            c.arg("--ro-bind").arg(seed).arg(seed);
-            c.arg("--").arg(bin);
-            args(&mut c);
+            mounts.push(Mount::RoBind {
+                src: seed.to_path_buf(),
+                dest: seed.to_path_buf(),
+            });
+            let mut cmd = vec![bin.as_os_str().to_os_string()];
+            cmd.extend(args);
+            // The network is unshared: formatting reaches nothing. Every path the command names is
+            // absolute, so the working directory is the root.
+            let spec = SandboxSpec::new(
+                PathBuf::from("/"),
+                mounts,
+                Vec::new(),
+                NetPolicy::Isolated,
+                cmd,
+            )
+            .map_err(|e| format!("cannot build the mkfs cage: {e:?}"))?
+            .with_cage_slug("mkfs".to_string());
+            // The step every cage goes through, which compiles the mandatory syscall filters.
+            let (argv, held) = crate::sandbox::argv::compose(&spec)
+                .map_err(|e| format!("cannot build the mkfs cage: {e}"))?;
+            let mut c = Command::new(bwrap);
+            c.args(argv);
             // Prepared here, where the descriptors and the command are both in hand: they are
             // close-on-exec, and this is what carries them across the exec bwrap performs.
-            crate::sandbox::memfd::inherit_across_exec(&mut c, &seccomp);
-            // Handed back rather than dropped here: the filters' descriptors are not
-            // close-on-exec, and bwrap reads them at the exec.
-            (c, seccomp)
+            crate::sandbox::memfd::inherit_across_exec(&mut c, &held);
+            // Handed back rather than dropped here: bwrap reads them at the exec.
+            Ok((c, held))
         }
     }
 }
@@ -1314,7 +1323,7 @@ pub(crate) fn init(image: &Path, size_bytes: u64, label: &str, mkfs: &Mkfs) -> R
         f.set_len(size_bytes)
             .map_err(|e| format!("cannot size image: {e}"))?;
         drop(f);
-        let (mut cmd, _seccomp) = mkfs_command(mkfs, image, &seed, label);
+        let (mut cmd, _held) = mkfs_command(mkfs, image, &seed, label)?;
         run(&mut cmd).map(|_| ())
     });
     let _ = std::fs::remove_dir_all(&seed);
@@ -2599,7 +2608,8 @@ this line has no separator at all
             image,
             seed,
             "l",
-        );
+        )
+        .expect("the host's command");
         assert!(
             host_fds.is_empty(),
             "the host's own tool runs uncaged, so there is nothing to keep open"
@@ -2626,12 +2636,11 @@ this line has no separator at all
             image,
             seed,
             "l",
-        );
+        )
+        .expect("the caged command");
         let a = args(&owned);
         assert_eq!(a[0], "/e/bwrap");
-        // The mandatory syscall denylist, ahead of everything: this argv is built by hand rather
-        // than through the `SandboxSpec` keystone, so "hardened like every other helper" below is
-        // only true if the filters are here too.
+        // The mandatory syscall denylist, ahead of everything, as on every cage `compose` builds.
         assert_eq!(
             (a[1].as_str(), a[3].as_str()),
             ("--add-seccomp-fd", "--add-seccomp-fd"),

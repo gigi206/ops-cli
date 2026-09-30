@@ -14,7 +14,7 @@
 //! without it.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One filesystem exposure inside the sandbox. The set of `Mount`s is the *only*
 /// source of filesystem visibility: the sandbox starts from nothing, so a path
@@ -392,6 +392,31 @@ pub(crate) fn minimal_userland_mounts() -> Vec<Mount> {
         Mount::Symlink {
             target: PathBuf::from("usr/bin"),
             dest: PathBuf::from("/bin"),
+        },
+        Mount::Proc {
+            dest: PathBuf::from("/proc"),
+        },
+        Mount::Dev {
+            dest: PathBuf::from("/dev"),
+        },
+        Mount::Tmpfs {
+            dest: PathBuf::from("/tmp"),
+        },
+    ]
+}
+
+/// The root a binary sbx provisioned into its own store runs on: that store read-only at `/nix`,
+/// and fresh `/proc`, `/dev` and `/tmp`.
+///
+/// A nix-built binary names its interpreter and libraries under `/nix/store/…`, which on the host
+/// live under sbx's store root instead, so binding that root at `/nix` is what lets it start; the
+/// host's own userland is not needed and is not bound. Nothing here is writable: each caller
+/// appends its own single write surface, which is why this returns the vector rather than a spec.
+pub(crate) fn store_tool_mounts(store_nix: &Path) -> Vec<Mount> {
+    vec![
+        Mount::RoBind {
+            src: store_nix.to_path_buf(),
+            dest: PathBuf::from("/nix"),
         },
         Mount::Proc {
             dest: PathBuf::from("/proc"),

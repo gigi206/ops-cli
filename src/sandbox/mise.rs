@@ -28,6 +28,7 @@
 //! logical paths resolve — the same mechanism the sandbox uses for its userland,
 //! applied to a tool sbx runs itself.
 
+use super::spec::{Mount, NetPolicy, SandboxSpec};
 use crate::store::{self, Layout};
 use std::ffi::OsString;
 use std::io;
@@ -137,33 +138,29 @@ fn command(
     // lives on the one writable surface the helper has.
     let plugin = super::miseplugin::stage(layout.data_dir())?;
     super::miseplugin::register(&home_src, MISE_PLUGINS_REL)?;
-    // The mandatory syscall denylist, as every other cage sbx builds carries it. This one is
-    // assembled by hand rather than through the `SandboxSpec` keystone, which is how it came to have
-    // the namespaces and the dropped capabilities but not the filters — and this is the cage that
-    // drives provisioning off what a project asks for. Nothing relaxes it: `[seccomp] allow` is a
-    // launch's grant to its own cage, not to a helper.
-    let seccomp = super::seccomp::memfds(&super::seccomp::SeccompPolicy::default())?;
-    let mut argv = super::seccomp::argv_prefix(&seccomp);
-    argv.extend(bwrap_argv(
+    let spec = cage_spec(
         &store_nix,
         &home_src,
         project_binds,
         Some(plugin.as_path()),
         mise_bin,
         args,
-    ));
-    // The resource scope, applied here for the reason the filters are: this list is built by hand,
-    // so what a `SandboxSpec` would have carried has to be added where the list is assembled. The
-    // launcher exec-chains into bwrap, so the descriptors below still reach it.
+    )?;
+    // The step every cage goes through: it compiles the mandatory syscall filters and puts the
+    // environment on a descriptor. Nothing relaxes the filters here: `[seccomp] allow` is a
+    // launch's grant to its own cage, not to a helper.
+    let (argv, held) = super::argv::compose(&spec)?;
+    // The resource scope. The launcher exec-chains into bwrap, so the descriptors below still
+    // reach it.
     let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, slug);
     let mut cmd = Command::new(prog);
     cmd.args(args);
     // Prepared before the command leaves this function: the descriptors are close-on-exec, and the
     // exec bwrap performs inherits them only because of this.
-    super::memfd::inherit_across_exec(&mut cmd, &seccomp);
+    super::memfd::inherit_across_exec(&mut cmd, &held);
     // Returned alongside, never dropped here: bwrap reads them at the exec, so closing one before
     // the caller runs the command turns into `Invalid fd`.
-    Ok((cmd, seccomp))
+    Ok((cmd, held))
 }
 
 /// Resolve a trusted project's mise `[env]` into sandbox environment variables.
@@ -315,115 +312,122 @@ fn ensure_home(layout: &Layout) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Build the bubblewrap argument list that runs mise hermetically. Pure: the whole
-/// invocation is one auditable argv, like the sandbox's own. It binds sbx's store
-/// read-only (so the relocated binary's logical paths resolve), binds the private
-/// home read-write (the **only** writable mount), isolates every namespace
-/// including the network, clears the environment, and rebuilds it from keys that
-/// all point inside the private home — so the run cannot read or write the user's
-/// real mise state, reach the network, or inherit a host variable.
+/// The cage that runs mise hermetically. Pure: the whole invocation is one spec, turned into an
+/// argument list by the step every other cage goes through. It binds sbx's store read-only (so the
+/// relocated binary's logical paths resolve), binds the private home read-write (the **only**
+/// writable mount), isolates every namespace including the network, and sets an environment whose
+/// keys all point inside the private home, so the run cannot read or write the user's real mise
+/// state, reach the network, or inherit a host variable.
 ///
 /// `project_binds` exposes the authorized project mise files (read-only) under
 /// [`MISE_PROJECT`], from where mise is then run so its discovery finds exactly that
 /// set; their in-sandbox paths are also named in `MISE_TRUSTED_CONFIG_PATHS` so mise
 /// loads them without a trust prompt. Empty for a config-free invocation, which is
 /// run from the private home instead and trusts nothing.
-///
-/// The hardening and the minimal root come from [`crate::sandbox::helper_argv`], the definition
-/// this cage shares with the storage helper; only what is specific to running mise is added here.
-pub(super) fn bwrap_argv(
+fn cage_spec(
     store_nix: &Path,
     home_src: &Path,
     project_binds: &[ProjectBind],
     plugin_dir: Option<&Path>,
     mise_bin: &Path,
     args: &[OsString],
-) -> Vec<OsString> {
-    let lit = |s: &str| OsString::from(s);
-    let path = |p: &Path| p.as_os_str().to_os_string();
-    let home = |sub: &str| OsString::from(format!("{MISE_HOME}{sub}"));
+) -> io::Result<SandboxSpec> {
+    let home = |sub: &str| format!("{MISE_HOME}{sub}");
 
-    // The hardening and the minimal root, from the one definition every helper cage shares —
-    // every namespace isolated, the network included, since provisioning the engine and running
-    // it offline needs no connectivity (a later, online step toggles this).
-    let mut a = super::helper_argv("mise", store_nix);
+    // sbx's store at `/nix` and a minimal root, nothing of it writable.
+    let mut mounts = super::spec::store_tool_mounts(store_nix);
 
     // The private home, bound read-write: the sole writable surface in this cage.
-    a.push(lit("--bind"));
-    a.push(path(home_src));
-    a.push(lit(MISE_HOME));
+    mounts.push(Mount::Bind {
+        src: home_src.to_path_buf(),
+        dest: PathBuf::from(MISE_HOME),
+    });
 
     // The authorized project mise files, each read-only under `/project` — the only
     // configs mise can see, so its discovery cannot reach an unhashed sibling.
     for b in project_binds {
-        a.push(lit("--ro-bind"));
-        a.push(path(&b.src));
-        a.push(path(&b.dest));
+        mounts.push(Mount::RoBind {
+            src: b.src.clone(),
+            dest: b.dest.clone(),
+        });
     }
 
     // The staged `nix:` backend plugin, read-only at the path its registration symlink points at.
     // Read-only because nothing here writes to a plugin, and because the tree is content-keyed and
     // shared with every other cage that mounts it.
     if let Some(dir) = plugin_dir {
-        a.push(lit("--ro-bind"));
-        a.push(path(dir));
-        a.push(lit(super::miseplugin::INCAGE_DIR));
+        mounts.push(Mount::RoBind {
+            src: dir.to_path_buf(),
+            dest: PathBuf::from(super::miseplugin::INCAGE_DIR),
+        });
     }
 
     // Confine every mise directory to the private home, auto-confirm so a prompt
     // never blocks a non-interactive run, and force offline so mise never reaches
     // the network for a self-version check.
-    for (key, val) in [
+    let mut env: Vec<(String, String)> = [
         ("HOME", home("")),
         ("MISE_DATA_DIR", home("/data")),
         ("MISE_CACHE_DIR", home("/cache")),
         ("MISE_STATE_DIR", home("/state")),
         ("MISE_CONFIG_DIR", home("/config")),
-        ("MISE_YES", lit("1")),
-        ("MISE_OFFLINE", lit("1")),
-    ] {
-        a.push(lit("--setenv"));
-        a.push(lit(key));
-        a.push(val);
-    }
+        ("MISE_YES", "1".to_string()),
+        ("MISE_OFFLINE", "1".to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect();
     // Name the bound files as trusted, so mise loads them without prompting and
     // never treats one as an untrusted config to ignore.
     if !project_binds.is_empty() {
-        a.push(lit("--setenv"));
-        a.push(lit("MISE_TRUSTED_CONFIG_PATHS"));
-        a.push(join_paths(project_binds.iter().map(|b| b.dest.as_path())));
+        env.push((
+            "MISE_TRUSTED_CONFIG_PATHS".to_string(),
+            join_paths(project_binds.iter().map(|b| b.dest.as_path()))?,
+        ));
     }
 
     // Pin the working directory: into the project mount when reading a config (so
     // discovery starts there), else the private home. The launching cwd does not
     // exist inside this minimal root, and leaving it unset would make mise's cwd
     // non-deterministic.
-    a.push(lit("--chdir"));
-    a.push(lit(if project_binds.is_empty() {
+    let workdir = if project_binds.is_empty() {
         MISE_HOME
     } else {
         MISE_PROJECT
-    }));
+    };
 
-    // The command after `--`, so mise's own flags are never parsed by bwrap.
-    a.push(lit("--"));
-    a.push(path(mise_bin));
-    a.extend(args.iter().cloned());
-    a
+    let mut cmd = vec![mise_bin.as_os_str().to_os_string()];
+    cmd.extend(args.iter().cloned());
+    // The network is unshared: provisioning the engine and running it offline needs no
+    // connectivity.
+    SandboxSpec::new(
+        PathBuf::from(workdir),
+        mounts,
+        env,
+        NetPolicy::Isolated,
+        cmd,
+    )
+    .map(|spec| spec.with_cage_slug("mise".to_string()))
+    .map_err(|e| io::Error::other(format!("cannot build the mise cage: {e:?}")))
 }
 
-/// Join in-sandbox paths into a single `:`-separated `OsString`, for
-/// `MISE_TRUSTED_CONFIG_PATHS`. The paths are sbx-constructed under [`MISE_PROJECT`]
-/// (ASCII), so a colon separator is unambiguous.
-fn join_paths<'a>(paths: impl Iterator<Item = &'a Path>) -> OsString {
-    let mut out = OsString::new();
+/// Join in-sandbox paths into a single `:`-separated value, for `MISE_TRUSTED_CONFIG_PATHS`. The
+/// paths are sbx-constructed under [`MISE_PROJECT`] from validated file names, so a colon
+/// separator is unambiguous; one that is not UTF-8 refuses the cage rather than crossing altered.
+fn join_paths<'a>(paths: impl Iterator<Item = &'a Path>) -> io::Result<String> {
+    let mut out = String::new();
     for (i, p) in paths.enumerate() {
         if i > 0 {
-            out.push(":");
+            out.push(':');
         }
-        out.push(p);
+        out.push_str(p.to_str().ok_or_else(|| {
+            io::Error::other(format!(
+                "a project mise file's in-cage path is not UTF-8: {}",
+                p.display()
+            ))
+        })?);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -436,19 +440,27 @@ mod tests {
         argv.iter().position(|a| a == needle)
     }
 
-    /// The value bwrap is told to set for `key` (the token after its `--setenv key`).
-    fn setenv<'a>(argv: &'a [OsString], key: &str) -> Option<&'a OsString> {
-        argv.windows(3)
+    /// The value bwrap is told to set for `key` (the token after its `--setenv key`), in the
+    /// arguments the environment's descriptor carries.
+    fn setenv<'a>(env: &'a [OsString], key: &str) -> Option<&'a OsString> {
+        env.windows(3)
             .find(|w| w[0] == "--setenv" && w[1] == key)
             .map(|w| &w[2])
     }
 
+    /// The argument list the cage's spec turns into, and the arguments its environment's
+    /// descriptor carries, the one read back as bwrap parses it.
+    fn argv_and_env(spec: &SandboxSpec) -> (Vec<OsString>, Vec<OsString>) {
+        (
+            super::super::argv::to_argv(spec),
+            super::super::argv::env_args(spec),
+        )
+    }
+
     /// The cage carries the mandatory syscall denylist, like every other cage sbx builds.
     ///
-    /// It is assembled here by hand rather than through the `SandboxSpec` keystone, which is how it
-    /// came to have the namespaces and the dropped capabilities but not the filters. Asserted on
-    /// what [`command`] hands to bwrap, since the filters are descriptors prefixed at that step and
-    /// are not part of [`bwrap_argv`] at all.
+    /// Asserted on what [`command`] hands to bwrap, since the filters are descriptors that
+    /// `compose` prefixes and are not part of the spec at all.
     #[test]
     fn the_cage_carries_the_mandatory_seccomp_denylist() {
         let dir = crate::testutil::TmpDir::new();
@@ -484,8 +496,8 @@ mod tests {
         assert_eq!(fds, vec![0, 2], "{argv:?}");
         assert_eq!(
             keep_open.len(),
-            2,
-            "each filter's descriptor is held open until bwrap has read it"
+            3,
+            "each filter's descriptor, and the environment's, is held open until bwrap has read it"
         );
         // ...and the hardening this cage already had is still behind them.
         for flag in [
@@ -551,14 +563,16 @@ mod tests {
 
     #[test]
     fn the_argv_is_hermetic_offline_and_writes_only_to_the_private_home() {
-        let argv = bwrap_argv(
+        let spec = cage_spec(
             Path::new("/data/store/nix"),
             Path::new("/data/mise"),
             &[],
             None,
             Path::new("/nix/store/abc-mise/bin/mise"),
             &[OsString::from("--version")],
-        );
+        )
+        .expect("a valid spec");
+        let (argv, env) = argv_and_env(&spec);
 
         // every namespace is isolated, including the network (offline by construction)
         for ns in [
@@ -580,10 +594,18 @@ mod tests {
         let host = index_of(&argv, "--hostname").expect("--hostname present");
         assert_eq!(argv[host + 1], OsString::from("sbx-mise"));
 
-        // the environment is cleared before anything is set into it
+        // the environment is cleared before anything is set into it, and what is set travels on a
+        // descriptor rather than in this list, which every uid on the machine can read
         let clear = index_of(&argv, "--clearenv").expect("--clearenv present");
-        let first_set = index_of(&argv, "--setenv").expect("--setenv present");
-        assert!(clear < first_set, "clearenv must precede setenv: {argv:?}");
+        let set = index_of(&argv, "--args").expect("the environment's descriptor is named");
+        assert!(
+            clear < set,
+            "clearenv must precede the environment: {argv:?}"
+        );
+        assert!(
+            index_of(&argv, "--setenv").is_none(),
+            "a variable reached the world-readable argument list: {argv:?}"
+        );
 
         // the store is read-only; the private home is the ONLY writable bind — the
         // structural guarantee that mise cannot mutate the host
@@ -603,19 +625,19 @@ mod tests {
 
         // every mise directory is confined under that private home, and the run is
         // non-interactive and offline
-        assert_eq!(setenv(&argv, "HOME"), Some(&OsString::from("/mise")));
+        assert_eq!(setenv(&env, "HOME"), Some(&OsString::from("/mise")));
         for (key, val) in [
             ("MISE_DATA_DIR", "/mise/data"),
             ("MISE_CACHE_DIR", "/mise/cache"),
             ("MISE_STATE_DIR", "/mise/state"),
             ("MISE_CONFIG_DIR", "/mise/config"),
         ] {
-            assert_eq!(setenv(&argv, key), Some(&OsString::from(val)), "{key}");
+            assert_eq!(setenv(&env, key), Some(&OsString::from(val)), "{key}");
         }
-        assert_eq!(setenv(&argv, "MISE_YES"), Some(&OsString::from("1")));
-        assert_eq!(setenv(&argv, "MISE_OFFLINE"), Some(&OsString::from("1")));
+        assert_eq!(setenv(&env, "MISE_YES"), Some(&OsString::from("1")));
+        assert_eq!(setenv(&env, "MISE_OFFLINE"), Some(&OsString::from("1")));
         // a config-free invocation trusts nothing — no project file is exposed
-        assert_eq!(setenv(&argv, "MISE_TRUSTED_CONFIG_PATHS"), None);
+        assert_eq!(setenv(&env, "MISE_TRUSTED_CONFIG_PATHS"), None);
 
         // the working directory is pinned to the private home (deterministic, and
         // not the launching cwd that does not exist inside this root), immediately
@@ -658,14 +680,16 @@ mod tests {
                 dest: PathBuf::from("/project/mise.toml"),
             },
         ];
-        let argv = bwrap_argv(
+        let spec = cage_spec(
             Path::new("/data/store/nix"),
             Path::new("/data/mise"),
             &binds,
             Some(Path::new("/data/mise-plugin/abc")),
             Path::new("/nix/store/abc-mise/bin/mise"),
             &[OsString::from("env"), OsString::from("--json-extended")],
-        );
+        )
+        .expect("a valid spec");
+        let (argv, env) = argv_and_env(&spec);
 
         // each authorized file is bound read-only at its /project path — and these
         // are the only configs mise can see
@@ -711,7 +735,7 @@ mod tests {
 
         // named trusted (colon-joined) so mise loads them without prompting
         assert_eq!(
-            setenv(&argv, "MISE_TRUSTED_CONFIG_PATHS"),
+            setenv(&env, "MISE_TRUSTED_CONFIG_PATHS"),
             Some(&OsString::from("/project/.mise.toml:/project/mise.toml"))
         );
 

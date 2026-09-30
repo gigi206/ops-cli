@@ -6,12 +6,10 @@
 //! function of the Spec. So whatever reaches bubblewrap was declared in one
 //! place — a security review has a single surface to audit.
 
-// Launch core: the SandboxSpec -> bwrap-argv -> cage pipeline, plus the terminal.
-mod argv;
-// The one definition of a helper cage's argument list, reached from outside `sandbox` by the
-// storage helper. Re-exported item by item rather than opening the module, whose other contents
-// belong to the launch path.
-pub(crate) use argv::helper_argv;
+// Launch core: the SandboxSpec -> bwrap-argv -> cage pipeline, plus the terminal. Open to the
+// crate because `compose` is the one way to turn a spec into a runnable argument list, and the
+// storage helper's cage is built outside `sandbox`; everything else in the module is narrower.
+pub(crate) mod argv;
 // Installing a file so no reader ever sees half of it: temp sibling, then rename.
 pub(crate) mod atomicfile;
 mod binds;
@@ -36,6 +34,8 @@ mod openuri;
 mod pty;
 mod smoke;
 mod spec;
+// What a cage built outside `sandbox` is described with: the storage helper's.
+pub(crate) use spec::{Mount, NetPolicy, SandboxSpec, store_tool_mounts};
 
 // Declared operations: a fixed command run in an ephemeral sibling cage with a brokered credential,
 // plus the control plane a caller reaches to invoke one and the host-only invocation log.

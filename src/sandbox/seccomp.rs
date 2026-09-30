@@ -73,10 +73,8 @@ use seccompiler::{
     SeccompRule, TargetArch,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 
 mod allowlist;
 pub(crate) mod proxy;
@@ -525,7 +523,7 @@ fn programs(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
 /// [`super::memfd::inherit_across_exec`], which the caller must apply to the command it spawns;
 /// the caller must also keep the returned files alive until bwrap has read them. (No `memfd` seal
 /// is applied or needed — the file is written, rewound, and read once by bwrap.)
-pub(crate) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
+pub(super) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
     programs(policy)
         .into_iter()
         .map(|p| write_to_memfd(&p))
@@ -567,17 +565,6 @@ pub(crate) fn ownership_noop_memfd() -> io::Result<File> {
 
 fn write_to_memfd(bytes: &[u8]) -> io::Result<File> {
     super::memfd::write(c"sbx-seccomp", bytes)
-}
-
-/// The bwrap flags that load `memfds` as additional seccomp filters, to be placed
-/// before the rest of the argv. Each is applied on top of the others.
-pub(crate) fn argv_prefix(memfds: &[File]) -> Vec<OsString> {
-    let mut a = Vec::with_capacity(memfds.len() * 2);
-    for f in memfds {
-        a.push(OsString::from("--add-seccomp-fd"));
-        a.push(OsString::from(f.as_raw_fd().to_string()));
-    }
-    a
 }
 
 /// The compiled denylist filters (serialized cBPF) for `policy`, in load order — the
@@ -804,6 +791,7 @@ impl SeccompPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     /// One instruction, decoded from the serialized `struct sock_filter` bwrap reads.
     fn insn(bytes: &[u8], at: usize) -> (u16, u8, u8, u32) {
@@ -1354,18 +1342,6 @@ mod tests {
             f.read_to_end(&mut got).expect("read memfd");
             assert_eq!(got, want, "memfd content must equal the compiled filter");
         }
-    }
-
-    #[test]
-    fn argv_prefix_emits_one_add_flag_per_filter() {
-        let files = memfds(&SeccompPolicy::default()).expect("memfds");
-        let argv = argv_prefix(&files);
-        assert_eq!(argv.len(), 4);
-        assert_eq!(argv[0], "--add-seccomp-fd");
-        assert_eq!(argv[2], "--add-seccomp-fd");
-        // the fd numbers are the live descriptors
-        assert_eq!(argv[1], files[0].as_raw_fd().to_string().as_str());
-        assert_eq!(argv[3], files[1].as_raw_fd().to_string().as_str());
     }
 
     /// `bwrap` plus a capability-bearing user namespace, or `None` to skip. x86_64-only, like
