@@ -1957,25 +1957,30 @@ fn listed_work_tree(dir: &Path) -> Option<PathBuf> {
 /// index it could read at launch and cannot read after the session is named too, rather than
 /// passed over. Every name it prints is escaped.
 ///
+/// A project with no repository at its root at launch, a directory of a larger repository or one
+/// not yet under version control, has no git file to hold, and the cage can make it one: a `.git`,
+/// or a bare repository's `HEAD`, `objects` and `refs`, which a git command run there then reads in
+/// place of the repository above it, if any, with the configuration and hooks the cage wrote. That
+/// is watched too ([`GitWatch::Absent`]), and named once the cage has exited.
+///
 /// It needs sbx alive when the cage exits, which is why a launch with a watch supervises the cage
 /// rather than replacing itself with it. A supervisor killed along with its terminal says nothing,
 /// and a detached session says it in its log; the next launch, which refuses a `commondir` in the
 /// common directory and protects every `config.worktree` present and every worktree git lists,
 /// covers all but what a submodule or a worktree added during the session already holds.
-pub(crate) struct GitWatch {
-    reach: Reach,
-    repo: GitRepo,
-    /// The repository's work trees the launch carried, `repo`'s own first.
-    trees: Vec<GitRepo>,
-    configs: BTreeSet<PathBuf>,
-    submodules: GitlinkScan,
+pub(crate) enum GitWatch {
+    /// The repository the launch carried.
+    Repo(Box<RepoWatch>),
+    /// A project whose root held no repository at launch, canonical.
+    Absent(PathBuf),
 }
 
 impl GitWatch {
-    /// The watch for a launch in `project`, or `None` when the launch does not protect the git
-    /// carrier, where there is nothing for it to look at. `binds` and `data` are what [`expand`]
-    /// is given, so the watch looks at the repository the launch carried ([`project_repo`]) and
-    /// follows a submodule's repository where the launch held one.
+    /// The watch for a launch in `project`, or `None` when there is nothing for it to look at: the
+    /// launch does not protect the git carrier (`git_writable`), or the project's root holds a
+    /// repository the launch did not carry. `binds` and `data` are what [`expand`] is given, so the
+    /// watch looks at the repository the launch carried ([`project_repo`]) and follows a
+    /// submodule's repository where the launch held one.
     pub(crate) fn start(
         project: &Path,
         git_writable: bool,
@@ -1984,23 +1989,79 @@ impl GitWatch {
     ) -> Option<Self> {
         let root = project.canonicalize().ok()?;
         let reach = Reach::of(&root, binds, data);
-        let repo = project_repo(&reach, git_writable).ok().flatten()?;
+        match project_repo(&reach, git_writable) {
+            Ok(Some(repo)) => Some(GitWatch::Repo(Box::new(RepoWatch::start(reach, repo)))),
+            Ok(None) if !git_writable && !repository_at(&root) => Some(GitWatch::Absent(root)),
+            _ => None,
+        }
+    }
+
+    /// What appeared during the session, one message per finding, escaped for the terminal.
+    pub(crate) fn findings(&self) -> Vec<String> {
+        match self {
+            GitWatch::Repo(watch) => watch.findings(),
+            GitWatch::Absent(root) => {
+                let dot_git = root.join(".git");
+                let found = if std::fs::symlink_metadata(&dot_git).is_ok() {
+                    format!("`{}`", dot_git.display())
+                } else if repository_at(root) {
+                    format!(
+                        "a bare repository at `{}` (its `HEAD`, `objects` and `refs`)",
+                        root.display()
+                    )
+                } else {
+                    return Vec::new();
+                };
+                vec![visible(&format!(
+                    "{found} appeared during the session in a project that had no repository at \
+                     launch, so sbx protected none of git's files: a git command run in `{}` now \
+                     reads that repository, its configuration and its hooks as the cage wrote \
+                     them, instead of the one above it, if any. Check it, or remove it, before \
+                     running git there",
+                    root.display()
+                ))]
+            }
+        }
+    }
+}
+
+/// Whether git finds a repository at `root` itself: a `.git` of any kind, or the `HEAD`, `objects`
+/// and `refs` a bare repository keeps at its top, which git reads as one before looking in the
+/// directory above.
+fn repository_at(root: &Path) -> bool {
+    let there = |name: &str| std::fs::symlink_metadata(root.join(name)).is_ok();
+    there(".git") || (there("HEAD") && there("objects") && there("refs"))
+}
+
+/// The watch of the repository the launch carried ([`GitWatch::Repo`]).
+pub(crate) struct RepoWatch {
+    reach: Reach,
+    repo: GitRepo,
+    /// The repository's work trees the launch carried, `repo`'s own first.
+    trees: Vec<GitRepo>,
+    configs: BTreeSet<PathBuf>,
+    submodules: GitlinkScan,
+}
+
+impl RepoWatch {
+    /// What the launch finds in `repo`, the repository it carried, to compare against at the end.
+    fn start(reach: Reach, repo: GitRepo) -> Self {
         let found = worktree_dirs(&reach, &repo.common);
         let others = other_work_trees(&reach, &repo, &found, &mut Vec::new(), &mut None);
         let trees: Vec<GitRepo> = std::iter::once(repo.clone()).chain(others).collect();
         let configs = WorktreeScan::of(&reach, &repo.common).configs;
         let submodules = GitlinkScan::of(&reach, &trees);
-        Some(GitWatch {
+        RepoWatch {
             reach,
             repo,
             trees,
             configs,
             submodules,
-        })
+        }
     }
 
     /// What appeared during the session, one message per finding, escaped for the terminal.
-    pub(crate) fn findings(&self) -> Vec<String> {
+    fn findings(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let commondir = self.repo.common.join("commondir");
         if self.reach.holds(&commondir) && std::fs::symlink_metadata(&commondir).is_ok() {
@@ -5299,6 +5360,50 @@ mod tests {
                 .iter()
                 .any(|f| f.contains(".git/index` cannot be read in full")),
             "{found:#?}"
+        );
+    }
+
+    /// A project with no repository at its root at launch is watched too: a `.git` of any kind,
+    /// or a bare repository's top, that appears during the session is named, since the host's git
+    /// run there would read it. `git_writable` watches nothing, and neither does a project whose
+    /// root is a repository the launch did not carry.
+    #[test]
+    fn the_git_watch_names_a_repository_that_appeared_in_a_project_without_one() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        assert!(
+            GitWatch::start(&root, true, &[], None).is_none(),
+            "git_writable"
+        );
+        let watch = GitWatch::start(&root, false, &[], None).expect("a project without git");
+        assert!(watch.findings().is_empty(), "nothing appeared yet");
+
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let found = watch.findings();
+        assert!(
+            found.len() == 1 && found[0].contains(".git`") && found[0].contains("no repository"),
+            "{found:#?}"
+        );
+        std::fs::remove_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(watch.findings().len(), 1, "a `.git` file too");
+        std::fs::remove_file(root.join(".git")).unwrap();
+
+        std::fs::write(root.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        assert!(
+            watch.findings().is_empty(),
+            "not a repository without `refs`"
+        );
+        std::fs::create_dir_all(root.join("refs")).unwrap();
+        let found = watch.findings();
+        assert!(
+            found.len() == 1 && found[0].contains("a bare repository at"),
+            "{found:#?}"
+        );
+        assert!(
+            GitWatch::start(&root, false, &[], None).is_none(),
+            "a root that is a repository already is not one that appeared"
         );
     }
 

@@ -161,10 +161,21 @@ exited, and names a `.git/commondir`, a `config.worktree`, a submodule's reposit
 worktree that appeared during the session, or a link where the launch refuses one, before your
 own git reads them; the next launch
 refuses on a `.git/commondir` too. Check what it names and remove it. To be there when the
-cage exits, sbx stays its parent whenever `.git` is protected, which the default network
-posture already does. A detached session writes the warning to its log, and a session whose
-`sbx` is killed along with its terminal cannot write it at all: the next launch is then what
-catches a `.git/commondir`.
+cage exits, sbx stays its parent whenever `.git` is protected or the project has no repository
+(below), which the default network posture already does. A detached session writes the warning
+to its log, and a session whose `sbx` is killed along with its terminal cannot write it at all:
+the next launch is then what catches a `.git/commondir`.
+
+A project with **no repository at its root**, a directory of a larger repository or a tree not
+yet under version control, has no git file for sbx to hold, and the cage can make it one: a
+`.git`, or the `HEAD`, `objects` and `refs` of a bare repository. A git command you run in that
+directory then reads the repository the cage made, its configuration and its hooks, instead of
+the one above it, and `git init` there keeps the configuration it finds. sbx names such a
+repository once the cage has exited, as it names a `.git/commondir`; nothing refuses the next
+launch, since a repository you create there yourself looks the same. Run sbx from the root of
+the repository to have its files held. The same holds, in any project, for a repository the
+cage leaves in a subdirectory: a git command run from inside that subdirectory reads it, and
+neither a mask nor the check at the end of the session looks there.
 
 A **symbolic link** on the way to any of these refuses the launch, naming the link, wherever it
 leads: `.git` itself, `.git/hooks`, `.git/config`, a directory above the one `core.hooksPath`
