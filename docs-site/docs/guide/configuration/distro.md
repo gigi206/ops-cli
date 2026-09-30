@@ -259,8 +259,8 @@ The layers of an image also have **one hour** to unpack, all of them together an
 fetch of their blobs not counted. A layer still unpacking when the image's hour is spent is
 stopped, its cage with it, and the provision says the image took too long. The costliest
 image the two ceilings allow unpacks in well under half of that: a million entries at the
-bottom of the deepest path the kernel resolves take about ten minutes, and 64 GiB written at
-a slow disk's 100 MB/s about eleven.
+bottom of the deepest path the kernel resolves take about ten minutes (forty-five on a
+kernel older than 5.6, below), and 64 GiB written at a slow disk's 100 MB/s about eleven.
 
 What the unpack reads to reach each member is bounded too, at **1 MiB**: the member's
 header, and the long name, long link or PAX record that describes it, which the tar reader
@@ -275,7 +275,9 @@ which creates nothing, would otherwise pass without a word. The directories on t
 each member are checked for a symlink in one resolution by the kernel (`openat2`, Linux
 5.6 and later), so a member at the bottom of a deep tree costs a few walks of its own path
 rather than one walk per directory on it. A kernel older than 5.6 has no such call, and the
-check then looks at one directory at a time, which costs the square of the depth.
+check then looks at one directory at a time, each from the one before it: still a walk of
+the path, about four times slower, so a million entries at that depth take some forty-five
+minutes there, inside the image's hour.
 
 ### What a layer may contain
 

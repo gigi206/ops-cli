@@ -389,14 +389,24 @@ fn a_member_path_longer_than_the_kernel_resolves_is_refused() {
 }
 
 /// The parent chain is checked in one resolution where the kernel offers it, and by a look at each
-/// directory on the way where it does not: both refuse the planted link and name it.
+/// directory on the way where it does not: both refuse the planted link and name it. The look
+/// finds a link at the first directory as at a deeper one, and stops at an entry on the way that
+/// is not a directory, which nothing is below.
 #[test]
 fn both_checks_of_a_members_parents_name_the_link_on_the_way() {
     let tmp = crate::testutil::TmpDir::new();
     let root = tmp.join("root");
     fs::create_dir_all(root.join("usr/lib")).unwrap();
+    fs::write(root.join("usr/lib/file"), b"").unwrap();
     std::os::unix::fs::symlink(tmp.path(), root.join("usr/lib/link")).unwrap();
+    std::os::unix::fs::symlink(tmp.path(), root.join("top")).unwrap();
     let dir = Root::open(&root).unwrap();
+    assert_eq!(
+        dir.first_link(Path::new("top/file")),
+        Some(root.join("top")),
+        "a link at the first directory"
+    );
+    assert_eq!(dir.first_link(Path::new("usr/lib/file/below")), None);
     let member = Path::new("usr/lib/link/deep/file");
 
     let err = safe_path(&dir, member).expect_err("the resolution refuses the link");

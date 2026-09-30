@@ -348,11 +348,10 @@ impl<'a> Root<'a> {
     /// Refuse `rel` when one of the directories on the way to its final component, `parents`, is
     /// a symlink on disk.
     ///
-    /// One `openat2` resolves them all, refusing to follow any link: a look at each directory in
-    /// turn restarts from the root every time, so it costs the square of the depth, for every
-    /// member of the layer. A resolution that stops at a directory that is missing, or at a
-    /// component that is not one, met no link before it, and nothing past it is there to follow.
-    /// On a kernel without the call (5.6 brought it) the look at each directory
+    /// One `openat2` resolves them all, refusing to follow any link, in one call where a look at
+    /// each directory in turn makes two for each. A resolution that stops at a directory that is
+    /// missing, or at a component that is not one, met no link before it, and nothing past it is
+    /// there to follow. On a kernel without the call (5.6 brought it) the look at each directory
     /// ([`Self::first_link`]) answers instead; any other failure refuses the member, since a check
     /// that could not run is not one that passed.
     fn check_parents(&self, rel: &Path, parents: &Path) -> io::Result<()> {
@@ -410,9 +409,15 @@ impl<'a> Root<'a> {
     }
 
     /// The first directory on the way to `rel`'s final component that is a symlink on disk, looked
-    /// at one at a time. The look stops at the first that is not there to look at: nothing past it
-    /// is.
+    /// at one at a time. The look stops at the first that is not there to look at, or is not a
+    /// directory: nothing past it is.
+    ///
+    /// Each look is made from a descriptor on the directory before it, so it resolves one name: a
+    /// look by path walks from the root every time, which at each directory of a member costs the
+    /// square of its depth.
     fn first_link(&self, rel: &Path) -> Option<PathBuf> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
         let mut out = self.path.to_path_buf();
         let mut parents: Vec<_> = rel
             .components()
@@ -422,13 +427,39 @@ impl<'a> Root<'a> {
             })
             .collect();
         parents.pop();
+        let mut held: Option<OwnedFd> = None;
         for part in parents {
             out.push(part);
-            match out.symlink_metadata() {
-                Ok(meta) if meta.file_type().is_symlink() => return Some(out),
-                Ok(_) => {}
-                Err(_) => return None,
+            let at = held.as_ref().unwrap_or(&self.dir).as_raw_fd();
+            let name = std::ffi::CString::new(part.as_bytes()).ok()?;
+            // SAFETY: `stat` is integer counters and times, so all-zero is a valid value, and the
+            // call below fills it before any field is read.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `at` is a descriptor held open for the call, `name` a live NUL-terminated
+            // string and `stat` a live struct of the type the call fills.
+            if unsafe { libc::fstatat(at, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
+                != 0
+            {
+                return None;
             }
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFLNK => return Some(out),
+                libc::S_IFDIR => {}
+                _ => return None,
+            }
+            // SAFETY: as above, and the flags ask for a descriptor on the directory itself.
+            let fd = unsafe {
+                libc::openat(
+                    at,
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return None;
+            }
+            // SAFETY: a fresh descriptor the call returned, owned here and closed once, on drop.
+            held = Some(unsafe { OwnedFd::from_raw_fd(fd) });
         }
         None
     }

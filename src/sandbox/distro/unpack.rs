@@ -64,8 +64,9 @@ const MESSAGE_MAX: usize = 16 * 1024;
 /// Set from the costliest shapes the ceilings allow, measured on the unpack as it is: a member at
 /// the bottom of a 4 KiB path takes 0.6 ms, so a million entries take ten minutes, and 64 GiB
 /// written at 100 MB/s, a slow disk's pace, take eleven. An image that reaches both ceilings at
-/// once is inside this more than twice over, and a real one is minutes below it. Only the unpack
-/// counts, not the fetch of the blobs, which is bounded on its own.
+/// once is inside this more than twice over, and a real one is minutes below it. On a kernel
+/// without `openat2` such a member takes 2.7 ms, and the million entries forty-five minutes, still
+/// inside it. Only the unpack counts, not the fetch of the blobs, which is bounded on its own.
 pub(super) const TIME_PER_IMAGE: Duration = Duration::from_secs(60 * 60);
 
 /// How often the parent looks whether a layer's unpack has ended. A layer often takes a few tens
