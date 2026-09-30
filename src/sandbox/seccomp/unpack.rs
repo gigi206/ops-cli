@@ -54,6 +54,8 @@ fn work() -> Vec<i64> {
         // A sparse member's holes skipped over rather than written, and its length set.
         libc::SYS_lseek,
         libc::SYS_ftruncate,
+        // Each member given the date the image gives it.
+        libc::SYS_utimensat,
         // Memory.
         libc::SYS_brk,
         libc::SYS_munmap,

@@ -837,6 +837,88 @@ fn a_sparse_members_holes_are_left_as_holes() {
     assert_eq!(budget.spent().0, size, "the budget counts the length");
 }
 
+/// A tar of `(path, member)` pairs, each dated `mtime`.
+fn dated_tar_of(members: &[(&str, Member<'_>)], mtime: u64) -> Vec<u8> {
+    let undated = tar_of(members);
+    let mut archive = tar::Archive::new(&undated[..]);
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let mut header = entry.header().clone();
+        header.set_mtime(mtime);
+        header.set_cksum();
+        let path = entry.path().unwrap().into_owned();
+        let mut body = Vec::new();
+        io::Read::read_to_end(&mut entry, &mut body).unwrap();
+        match entry.link_name().unwrap() {
+            Some(target) => builder.append_link(&mut header, &path, target).unwrap(),
+            None => builder.append_data(&mut header, &path, &body[..]).unwrap(),
+        }
+    }
+    builder.into_inner().unwrap()
+}
+
+/// A member keeps the date the image gives it: a `.pyc` is checked against its source's date, and
+/// on a read-only root a stale one is recompiled on every import and never written back. A
+/// directory is dated once the layer is applied, since each member written into it moves its date,
+/// and a symlink is dated itself rather than what it names.
+#[test]
+fn a_member_keeps_the_date_the_image_gives_it() {
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    let date = 1_000_000_000;
+    apply_tar(
+        tmp.path(),
+        &root,
+        &dated_tar_of(
+            &[
+                ("lib/", Member::Dir),
+                ("lib/mod.py", Member::File("x = 1\n")),
+                ("lib/link", Member::Symlink("mod.py")),
+            ],
+            date,
+        ),
+    )
+    .unwrap();
+    let dated = |path: &str| {
+        let meta = root.join(path).symlink_metadata().unwrap();
+        meta.modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    for path in ["lib", "lib/mod.py", "lib/link"] {
+        assert_eq!(dated(path), date, "{path}");
+    }
+}
+
+/// A directory's date is set by what the directory is, not by its path: one a later member of the
+/// layer put a link on the way to is left undated, and so is what the link names.
+#[test]
+fn a_directory_is_dated_only_if_it_is_still_the_one_the_layer_made() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    let outside = tmp.join("outside");
+    fs::create_dir_all(outside.join("b")).unwrap();
+    let before = fs::metadata(outside.join("b")).unwrap().mtime();
+    apply_tar(
+        tmp.path(),
+        &root,
+        &dated_tar_of(
+            &[
+                ("a/", Member::Dir),
+                ("a/b/", Member::Dir),
+                ("a", Member::Symlink(outside.to_str().unwrap())),
+            ],
+            1_000_000_000,
+        ),
+    )
+    .unwrap();
+    assert_eq!(fs::metadata(outside.join("b")).unwrap().mtime(), before);
+}
+
 #[test]
 fn a_member_of_an_unwritable_type_is_named_rather_than_skipped() {
     for (flag, shown) in [(b'Z', "(type flag `Z`)"), (0x01, "(type flag `\\x01`)")] {

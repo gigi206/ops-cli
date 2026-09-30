@@ -216,6 +216,7 @@ fn every_kind_of_member() -> Vec<u8> {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(kind);
         header.set_mode(mode);
+        header.set_mtime(DATED);
         header.set_size(body.len() as u64);
         match link {
             Some(target) => builder.append_link(&mut header, path, target).unwrap(),
@@ -258,6 +259,9 @@ fn every_kind_of_member() -> Vec<u8> {
 /// The length of the sparse member of [`every_kind_of_member`].
 const SPARSE_LEN: u64 = 1024 * 1024;
 
+/// The date every member of [`every_kind_of_member`] carries but the sparse one.
+const DATED: u64 = 1_000_000_000;
+
 /// What [`every_kind_of_member`] leaves in `root` once applied.
 fn assert_every_kind_of_member_landed(root: &Path) {
     let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
@@ -287,6 +291,21 @@ fn assert_every_kind_of_member_landed(root: &Path) {
         blocks * 512 < SPARSE_LEN / 2,
         "its holes stay holes: {blocks} blocks"
     );
+    for dated in ["etc", "etc/os-release", "etc/link"] {
+        let date = root
+            .join(dated)
+            .symlink_metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            date.duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            DATED,
+            "{dated} keeps the date the image gives it"
+        );
+    }
 }
 
 /// The variable that tells [`probe_in_the_unpacks_cage`] it runs in the unpack's cage, and names

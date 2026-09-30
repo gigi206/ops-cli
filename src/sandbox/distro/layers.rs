@@ -28,6 +28,11 @@
 //! failing the unpack: the cage runs as one uid and mounts the tree read-only, so an image's uid
 //! table and its `/dev` entries describe a world it does not get.
 //!
+//! Dates are restored: a file, a symlink and a directory each keep the modification time the image
+//! gives them, a directory's set once its layer is applied. A cache that is checked against its
+//! source's date, Python's `.pyc` among them, would otherwise read as stale on every launch, on a
+//! root the cage cannot write a fresh one to.
+//!
 //! ## Two deliberate departures from the archive's modes
 //!
 //! The owner's read and write bits are **added** to every member, search as well on a directory,
@@ -206,6 +211,7 @@ pub(super) fn apply(
 /// Walk one layer's members, applying each.
 fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result<()> {
     let root = &Root::open(root)?;
+    let mut dates = DirectoryDates::default();
     let left = Rc::new(Cell::new(None));
     let mut archive = tar::Archive::new(Metered {
         inner: layer,
@@ -219,6 +225,7 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
         let next = entries.next();
         left.set(None);
         let Some(entry) = next else {
+            dates.apply();
             return Ok(());
         };
         budget.member()?;
@@ -292,7 +299,7 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
         }
 
         let dest = safe_path(root, &path)?;
-        write_member(&mut entry, &dest, root, budget)?;
+        write_member(&mut entry, &dest, root, budget, &mut dates)?;
     }
 }
 
@@ -540,9 +547,15 @@ fn write_member<R: io::Read>(
     dest: &Path,
     root: &Root<'_>,
     budget: &mut Budget,
+    dates: &mut DirectoryDates,
 ) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let kind = entry.header().entry_type();
+    // The date the image gives the member, when it is one a file can carry.
+    let date =
+        entry.header().mtime().ok().and_then(|secs| {
+            std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
+        });
     // `setuid`/`setgid`/sticky are masked off here rather than at each call below, so no path
     // through this function can carry one through by omission.
     let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
@@ -565,6 +578,9 @@ fn write_member<R: io::Read>(
         // Owner write and search, so a later layer can add to this directory and `sbx gc` can
         // remove it.
         let _ = fs::set_permissions(dest, fs::Permissions::from_mode(mode | 0o700));
+        if let Some(date) = date {
+            dates.hold(dest, date);
+        }
         return Ok(());
     }
 
@@ -577,6 +593,9 @@ fn write_member<R: io::Read>(
         // read-only cage root a link pointing out of the tree resolves against the cage's own root,
         // not the host's. What must not happen is writing *through* one, which `safe_path` refuses.
         std::os::unix::fs::symlink(target, dest)?;
+        if let Some(date) = date {
+            date_link(dest, date);
+        }
         return Ok(());
     }
 
@@ -621,6 +640,9 @@ fn write_member<R: io::Read>(
         // by this user, a later layer has to be able to replace a member of it, and reclaiming the
         // store must not need a recursive `chmod` first.
         let _ = fs::set_permissions(dest, fs::Permissions::from_mode(mode | 0o600));
+        if let Some(date) = date {
+            let _ = file.set_modified(date);
+        }
         return Ok(());
     }
 
@@ -638,6 +660,93 @@ fn write_member<R: io::Read>(
         dest.display(),
         std::ascii::escape_default(kind.as_byte())
     )))
+}
+
+/// The most bytes of path [`DirectoryDates`] holds for one layer. A directory's date waits for the
+/// end of its layer, and the paths waiting are the one thing an unpack holds that grows with the
+/// layer; this is far above what the directories of a userland spell. Past it, a directory keeps
+/// the date the unpack gave it.
+const DIRECTORY_DATES_MAX: usize = 16 * 1024 * 1024;
+
+/// The directories a layer declared, each with the date the image gives it, set once the layer is
+/// applied: every member written into a directory, and every one removed from it, moves its date.
+///
+/// Each is dated through what it is rather than where it was: reopened at its path without
+/// following a final link, and dated only if it is still the directory the layer made, the same
+/// device and inode. A later member of the layer may have replaced it, or put a link on the way to
+/// it, and a date set by path would then land on whatever that link names.
+#[derive(Default)]
+struct DirectoryDates {
+    held: Vec<(PathBuf, u64, u64, std::time::SystemTime)>,
+    bytes: usize,
+}
+
+impl DirectoryDates {
+    /// Hold `dir`, just made or kept by a directory member, to be dated `date`.
+    fn hold(&mut self, dir: &Path, date: std::time::SystemTime) {
+        use std::os::unix::fs::MetadataExt;
+        let len = dir.as_os_str().len();
+        if self.bytes + len > DIRECTORY_DATES_MAX {
+            return;
+        }
+        let Ok(meta) = dir.symlink_metadata() else {
+            return;
+        };
+        self.bytes += len;
+        self.held
+            .push((dir.to_path_buf(), meta.dev(), meta.ino(), date));
+    }
+
+    /// Date every directory held that is still the one the layer made. A date is not what an image
+    /// is refused over, so one that cannot be set is left.
+    fn apply(self) {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        for (path, dev, ino, date) in self.held {
+            let Ok(dir) = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&path)
+            else {
+                continue;
+            };
+            if dir
+                .metadata()
+                .is_ok_and(|m| m.dev() == dev && m.ino() == ino)
+            {
+                let _ = dir.set_modified(date);
+            }
+        }
+    }
+}
+
+/// Date the symlink at `path` itself, never what it names. Its directories were checked for a link
+/// by [`safe_path`] just before it was made. A date that cannot be set is left.
+fn date_link(path: &Path, date: std::time::SystemTime) {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(secs) = date
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| libc::time_t::try_from(d.as_secs()).ok())
+    else {
+        return;
+    };
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    // SAFETY: `timespec` is two integers on the targets sbx builds for, so all-zero is valid.
+    let mut times: [libc::timespec; 2] = unsafe { std::mem::zeroed() };
+    times[0].tv_nsec = libc::UTIME_OMIT;
+    times[1].tv_sec = secs;
+    // SAFETY: `path` is a live NUL-terminated string and `times` two live `timespec`s, the access
+    // time left as it is and the modification time set.
+    unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
 }
 
 /// Copy a sparse member's content into `file`, leaving its holes as holes, and return its length.
