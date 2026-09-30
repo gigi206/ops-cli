@@ -3337,3 +3337,54 @@ proptest::proptest! {
         }
     }
 }
+
+/// What one rule covers of another, and whether two may meet, answer on the side that keeps a note
+/// when the rules do not show it: a wider host covers a narrower one on its own ports and layer,
+/// for every verb; a `re:` pattern, a path, a set of verbs or another layer covers nothing but
+/// itself; two rules stay apart only when their hosts or ports cannot meet.
+#[test]
+fn a_rule_covers_or_meets_another_only_where_the_two_show_it() {
+    for (wide, narrow) in [
+        ("*.bad.com", "api.bad.com"),
+        ("*.bad.com", "bad.com"),
+        ("*.bad.com", "*.x.bad.com"),
+        ("bad.com", "bad.com/path"),
+        ("bad.com:*", "bad.com:8443"),
+        ("{*} *.bad.com", "{POST} api.bad.com"),
+        ("re:^https://x", "re:^https://x"),
+    ] {
+        assert!(rule(wide).covers(&rule(narrow)), "{wide} covers {narrow}");
+    }
+    for (wide, narrow) in [
+        ("*.bad.com", "evilbad.com"),
+        ("api.bad.com", "*.bad.com"),
+        ("*.bad.com", "api.bad.com:8443"),
+        ("{GET} *.bad.com", "api.bad.com"),
+        ("http://*.bad.com", "api.bad.com"),
+        ("bad.com/path", "bad.com"),
+        ("re:bad\\.com", "bad.com"),
+    ] {
+        assert!(
+            !rule(wide).covers(&rule(narrow)),
+            "{wide} does not cover {narrow}"
+        );
+    }
+    for (a, b) in [
+        ("*.bad.com", "api.bad.com"),
+        ("api.bad.com", "*.bad.com"),
+        ("*.x.bad.com", "*.bad.com"),
+        ("re:github", "evil.com"),
+        ("{GET} bad.com", "{POST} bad.com"),
+        ("tcp://bad.com:443", "bad.com"),
+    ] {
+        assert!(rule(a).may_meet(&rule(b)), "{a} may meet {b}");
+    }
+    for (a, b) in [
+        ("github.com", "evil.com"),
+        ("*.bad.com", "evilbad.com"),
+        ("bad.com:8443", "bad.com"),
+        ("1.2.3.4", "bad.com"),
+    ] {
+        assert!(!rule(a).may_meet(&rule(b)), "{a} and {b} stay apart");
+    }
+}

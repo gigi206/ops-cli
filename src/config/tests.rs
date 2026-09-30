@@ -8255,7 +8255,7 @@ fn a_global_deny_rule_a_trusted_project_network_drops_is_named() {
     for project in [
         "[network]\nmode = \"allow\"\n",
         "network = \"shared\"\n",
-        "[network]\nallow = [\"x.test\"]\n",
+        "[network]\nallow = [\"*.example.com\"]\n",
     ] {
         let r = over(project, TrustState::Trusted);
         let said = named(&r);
@@ -8287,6 +8287,40 @@ fn a_global_deny_rule_a_trusted_project_network_drops_is_named() {
     assert!(named(&alone).is_empty(), "{:?}", alone.warnings);
 }
 
+/// A `deny` rule the project drops is named only where its host can now be reached: not when the
+/// project's own `deny` covers it with a wider rule, and not under a project that denies by
+/// default when no `allow` of its own, nor any built-in one, reaches it.
+#[test]
+fn a_dropped_deny_rule_the_project_still_closes_is_not_named() {
+    let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
+    let global = "[network]\nmode = \"allow\"\ndeny = [\"evil.com\", \"api.bad.com\"]\n";
+    let named = |project: &str| -> Vec<String> {
+        resolve_no_plugins(parse(global), Some((parse(project), TrustState::Trusted)))
+            .warnings
+            .into_iter()
+            .filter(|w| w.contains("do not apply to this project"))
+            .collect()
+    };
+    for project in [
+        "[network]\nmode = \"allow\"\ndeny = [\"*.bad.com\", \"evil.com\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n",
+    ] {
+        assert!(
+            named(project).is_empty(),
+            "{project:?}: {:?}",
+            named(project)
+        );
+    }
+    // The control: an `allow` that reaches one of them names that one alone.
+    let said = named("[network]\nmode = \"deny\"\nallow = [\"*.bad.com\"]\n");
+    assert!(
+        said.len() == 1
+            && said[0].contains("`https://api.bad.com`")
+            && !said[0].contains("evil.com"),
+        "{said:?}"
+    );
+}
+
 /// An app profile's own `network` replaces the baseline for that app, rules included, and a
 /// `deny` rule of the global config it drops opens a host for that app: each is named on the app,
 /// against the profile, and the app still runs as the profile wrote it. A posture string and a
@@ -8315,7 +8349,7 @@ fn a_global_deny_rule_an_app_profile_network_drops_is_named() {
     for network in [
         "[network]\nmode = \"allow\"\n",
         "network = \"shared\"\n",
-        "[network]\nallow = [\"x.test\"]\n",
+        "[network]\nallow = [\"*.example.com\"]\n",
     ] {
         let app = under(network);
         let said = named(&app);

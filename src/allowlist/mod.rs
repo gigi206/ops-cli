@@ -345,6 +345,19 @@ impl Ports {
         }
     }
 
+    /// Whether every port of `other` is in this set. A range of `other` has to fall within one
+    /// range of this set, so a range this set covers only across two of its own reads as not
+    /// covered: the answer can be no where it is yes, never the reverse.
+    fn covers(&self, other: &Ports) -> bool {
+        match (self, other) {
+            (Ports::Any, _) => true,
+            (Ports::Ranges(_), Ports::Any) => false,
+            (Ports::Ranges(mine), Ports::Ranges(theirs)) => theirs
+                .iter()
+                .all(|(lo, hi)| mine.iter().any(|(mlo, mhi)| mlo <= lo && hi <= mhi)),
+        }
+    }
+
     /// Whether this set shares at least one port with `other` — `Any` overlaps everything, two
     /// range sets overlap when any range of one meets any range of the other. Used to flag an
     /// L4/L7 rule overlap on the same host.
@@ -455,7 +468,88 @@ impl Request {
     }
 }
 
+/// The hosts a rule names, as far as its kind shows them: one host, or a domain and everything
+/// below it. A `re:` rule shows none.
+enum HostReach<'a> {
+    Exact(std::borrow::Cow<'a, str>),
+    Below(&'a str),
+}
+
+impl HostReach<'_> {
+    /// Whether every host `other` names is one this names.
+    fn takes_in(&self, other: &HostReach<'_>) -> bool {
+        match (self, other) {
+            (HostReach::Exact(mine), HostReach::Exact(theirs)) => mine == theirs,
+            (HostReach::Exact(_), HostReach::Below(_)) => false,
+            (HostReach::Below(domain), HostReach::Exact(host)) => apex_or_subdomain(domain, host),
+            (HostReach::Below(domain), HostReach::Below(below)) => apex_or_subdomain(domain, below),
+        }
+    }
+
+    /// Whether some host is one both name.
+    fn meets(&self, other: &HostReach<'_>) -> bool {
+        match (self, other) {
+            (HostReach::Exact(a), HostReach::Exact(b)) => a == b,
+            (HostReach::Exact(host), HostReach::Below(domain))
+            | (HostReach::Below(domain), HostReach::Exact(host)) => apex_or_subdomain(domain, host),
+            (HostReach::Below(a), HostReach::Below(b)) => {
+                apex_or_subdomain(a, b) || apex_or_subdomain(b, a)
+            }
+        }
+    }
+}
+
+impl RuleKind {
+    /// The hosts and ports this kind names, or `None` for a `re:` pattern, whose reach its text
+    /// does not show.
+    fn host_reach(&self) -> Option<(HostReach<'_>, &Ports)> {
+        use std::borrow::Cow;
+        match self {
+            RuleKind::Ip(ip, ports) => Some((HostReach::Exact(Cow::Owned(ip.to_string())), ports)),
+            RuleKind::Host(host, ports) | RuleKind::Url { host, ports, .. } => {
+                Some((HostReach::Exact(Cow::Borrowed(host)), ports))
+            }
+            RuleKind::Subdomain(domain, ports) => Some((HostReach::Below(domain), ports)),
+            RuleKind::Regex { .. } => None,
+        }
+    }
+}
+
 impl Rule {
+    /// Whether this rule matches every request `other` matches, as far as the two rules show it:
+    /// `other` itself, or a rule for every verb, on the same layer and with no path, whose hosts
+    /// and ports take in all of `other`'s. Anything this cannot read off the rules, a `re:`
+    /// pattern, a path or a set of verbs, answers no, so what a caller sets aside as covered is
+    /// covered.
+    pub(crate) fn covers(&self, other: &Rule) -> bool {
+        if self == other {
+            return true;
+        }
+        if self.layer != other.layer
+            || !matches!(self.methods, Methods::Unspecified | Methods::Any)
+            || matches!(self.kind, RuleKind::Url { .. })
+        {
+            return false;
+        }
+        let (Some((mine, my_ports)), Some((theirs, their_ports))) =
+            (self.kind.host_reach(), other.kind.host_reach())
+        else {
+            return false;
+        };
+        mine.takes_in(&theirs) && my_ports.covers(their_ports)
+    }
+
+    /// Whether some request could match both this rule and `other`, as far as the two rules show
+    /// it: no only when their hosts or their ports cannot meet. A `re:` pattern meets everything,
+    /// and verbs and layers are not read, so what a caller sets aside as out of reach is.
+    pub(crate) fn may_meet(&self, other: &Rule) -> bool {
+        let (Some((mine, my_ports)), Some((theirs, their_ports))) =
+            (self.kind.host_reach(), other.kind.host_reach())
+        else {
+            return true;
+        };
+        mine.meets(&theirs) && my_ports.intersects(their_ports)
+    }
     /// The one concrete destination this rule names, when it names one.
     ///
     /// `None` for a wildcard or a regex, which name a family rather than a host. A credential's
