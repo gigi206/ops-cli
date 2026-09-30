@@ -638,8 +638,8 @@ connections as it opens at once, twice `[network] max_connections`), `splice-cap
 concurrent raw `tcp://` tunnel ceiling),
 `injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
 `upstream-cert-rejected`, `upstream-http2-unsupported`, `upstream-closed`,
-`interim-head-cap`, and `upstream-head-too-large`. A genuine upstream status (a real
-`404`) is relayed verbatim with no such header.
+`interim-head-cap`, `upstream-head-too-large`, and `upstream-not-websocket`. A genuine
+upstream status (a real `404`) is relayed verbatim with no such header.
 
 One reason in the log comes from somewhere else: `dns-bypassed` is written by the
 [transparent-capture tap](../configuration/network#clients-that-ignore-the-proxy-variables)
@@ -709,6 +709,15 @@ stream between two maskers, and a reflected credential lying across that cut is 
 neither, which is the one thing masking a relayed head is for. So the exchange is refused
 rather than passed on in pieces. This is about the server, not the caller: the same shape in
 a request the cage sent is `bad-request:head`.
+
+`upstream-not-websocket` is the fourth, and it answers a permitted WebSocket upgrade. A
+`101` is a switch to whatever protocol the server chose, and past it sbx relays the
+connection as a WebSocket. So the handshake sbx forwards offers the WebSocket protocol
+alone, whatever else the client listed beside it, and the `101` has to switch to that
+protocol alone and carry the `Sec-WebSocket-Accept` owed to the handshake's key. A server
+that honoured `h2c` instead would otherwise hand the cage raw HTTP/2 to the origin, past
+every rule on path and method. Any other `101` is refused under this reason before
+anything of it reaches the client.
 
 `signer-refused` is the one that is not a policy verdict: the policy allowed the host,
 and the request was refused because its credential could not be formed. See

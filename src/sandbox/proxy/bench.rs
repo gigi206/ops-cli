@@ -649,7 +649,7 @@ fn spawn_ws_bulk_upstream(
         if tls
             .write_all(
                 b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Accept: bench\r\n\r\n",
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
             )
             .is_err()
         {

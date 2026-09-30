@@ -502,6 +502,19 @@ fn spawn_ws_upstream_closing() -> (SocketAddr, CertificateDer<'static>, thread::
 fn spawn_ws_upstream_prefixed(
     interim: &'static [u8],
 ) -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
+    spawn_ws_upstream_answering(interim, WS_OPENING)
+}
+
+/// What [`spawn_ws_upstream`] answers a handshake with: the `101` owed to the key every test
+/// handshake carries (RFC 6455 §1.3's example), then its unsolicited push.
+const WS_OPENING: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+    Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\nS-FIRST;";
+
+/// The same upstream, answering the handshake with `opening` in place of [`WS_OPENING`].
+fn spawn_ws_upstream_answering(
+    interim: &'static [u8],
+    opening: &'static [u8],
+) -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
     let ca = Arc::new(Ca::ephemeral().unwrap());
     let ca_der = ca.ca_cert_der();
     let server_config = Arc::new(
@@ -532,10 +545,7 @@ fn spawn_ws_upstream_prefixed(
             }
         }
         let _ = tls.write_all(interim);
-        let _ = tls.write_all(
-            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\nS-FIRST;",
-        );
+        let _ = tls.write_all(opening);
         let _ = tls.flush();
         let mut buf = [0u8; 64];
         if let Ok(n) = tls.read(&mut buf) {
@@ -1099,6 +1109,47 @@ fn a_completed_response_ends_with_a_clean_tls_close_notify() {
     );
 }
 
+/// A `101` that switches to anything but the WebSocket the handshake asked for is answered `502`
+/// before any of it reaches the client: an upstream that honours `h2c` would otherwise hand the
+/// cage raw HTTP/2 to the origin, past every rule on path and method, and one that does not answer
+/// the key was not replying to this handshake.
+#[test]
+fn a_101_that_is_not_the_websocket_asked_for_is_answered_502() {
+    for opening in [
+        &b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n\
+           PRI * HTTP/2.0"[..],
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+          Sec-WebSocket-Accept: not-the-answer\r\n\r\nS-FIRST;",
+    ] {
+        let (addr, upstream_ca, up) = spawn_ws_upstream_answering(b"", opening);
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let transcript =
+            through_proxy_websocket(ctx, proxy_ca_der, "upstream.test", addr.port()).unwrap();
+        up.join().unwrap();
+        assert!(
+            transcript.starts_with("HTTP/1.1 502") && transcript.contains("upstream-not-websocket"),
+            "{transcript:?}"
+        );
+        for relayed in ["101", "PRI *", "S-FIRST"] {
+            assert!(!transcript.contains(relayed), "{relayed}: {transcript:?}");
+        }
+    }
+}
+
 /// An allowed WebSocket upgrade is relayed bidirectionally: the client gets the `101`, the server's
 /// unsolicited push (`S-FIRST;`, proving upstream→client AND that bytes buffered past the `101` are
 /// not lost — the buffer-drain), and the echo of its own frame (`ECHO:client-frame`, proving
@@ -1595,7 +1646,7 @@ fn spawn_ws_upstream_bulk(
         }
         let _ = tls.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
         );
         let _ = tls.write_all(&bulk_payload(n));
         let _ = tls.flush();
@@ -1727,7 +1778,7 @@ fn spawn_ws_upstream_burst_then_idle(
         }
         let _ = tls.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
         );
         let _ = tls.write_all(&bulk_payload(n));
         let _ = tls.flush();
@@ -11266,7 +11317,7 @@ fn spawn_leaking_ws_upstream(
             }
         }
         let mut opening = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-                 Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n"
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
             .to_vec();
         opening.extend(ws_frame(0x1, payload, None));
         let _ = tls.write_all(&opening);
@@ -11322,7 +11373,7 @@ fn spawn_listening_ws_upstream() -> (
         }
         let _ = tls.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-              Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+              Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
         );
         let _ = tls.flush();
         let mut got = Vec::new();
@@ -11373,7 +11424,7 @@ fn spawn_reporting_ws_upstream() -> (
         }
         let _ = tls.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-              Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+              Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
         );
         let _ = tls.flush();
         let mut buf = [0u8; 8192];
@@ -11737,7 +11788,7 @@ fn spawn_frame_ws_upstream() -> (SocketAddr, CertificateDer<'static>, thread::Jo
             }
         }
         let mut opening = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-                 Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n"
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
             .to_vec();
         opening.extend(ws_frame(0x1, br#"{"from":"server"}"#, None));
         let _ = tls.write_all(&opening);
@@ -11989,7 +12040,7 @@ fn spawn_held_ws_upstream() -> (
         }
         let _ = tls.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
         );
         let _ = tls.flush();
         // Send nothing more and do not close: the proxy stays inside its relay, which is the

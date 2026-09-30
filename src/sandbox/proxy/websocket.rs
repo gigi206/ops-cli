@@ -38,9 +38,11 @@ pub(super) fn is_websocket_upgrade(head: &Head) -> bool {
 
 /// Reserialize a WebSocket upgrade handshake for forwarding upstream. Like [`reserialize_request`]
 /// it injects any matching credential and strips the client's copy of an injected header, but it
-/// PRESERVES the hop-by-hop `Connection`/`Upgrade` headers (and the `Sec-WebSocket-*` set) so the
-/// upstream actually performs the upgrade — the opposite of the normal path, which forces
-/// `Connection: close`. `Proxy-Connection` and `Expect` are still stripped (proxy-local hop headers).
+/// PRESERVES the hop-by-hop `Connection` header (and the `Sec-WebSocket-*` set) and writes
+/// `Upgrade: websocket`, so the upstream actually performs the upgrade — the opposite of the normal
+/// path, which forces `Connection: close`. The client's own `Upgrade` lines are replaced by that
+/// one: they may offer a protocol beside the WebSocket. `Proxy-Connection` and `Expect` are still
+/// stripped (proxy-local hop headers).
 ///
 /// `force_identity_encoding` replaces the client's content codings with [`IDENTITY_ENCODINGS`], the
 /// same rewrite [`reserialize_request`] performs and for the same reason: the caller masks this
@@ -74,6 +76,12 @@ pub(super) fn reserialize_upgrade(
             // handshake means, so what is forwarded stops claiming it.
             || k.eq_ignore_ascii_case("content-length")
             || k.eq_ignore_ascii_case("transfer-encoding")
+            // The protocols the client offers to switch to, written once below as the WebSocket
+            // alone: another offered beside it, on the same line or a second one, is one an
+            // upstream may pick instead (`h2c`, with the settings it travels with), and the relay
+            // past the `101` is a WebSocket's.
+            || k.eq_ignore_ascii_case("upgrade")
+            || k.eq_ignore_ascii_case("http2-settings")
         {
             continue;
         }
@@ -95,6 +103,7 @@ pub(super) fn reserialize_upgrade(
         out.push_str(v);
         out.push_str("\r\n");
     }
+    out.push_str("Upgrade: websocket\r\n");
     if force_identity_encoding {
         for (name, value) in IDENTITY_ENCODINGS {
             out.push_str(name);
@@ -113,19 +122,98 @@ pub(super) fn reserialize_upgrade(
     out.into_bytes()
 }
 
+/// The `Sec-WebSocket-Accept` a server owes a handshake carrying `key` (RFC 6455 §4.2.2): the
+/// SHA-1 of the key followed by the protocol's own GUID, in base64.
+fn accept_for(key: &str) -> String {
+    const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut sha1 = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    sha1.update(key.as_bytes());
+    sha1.update(GUID.as_bytes());
+    crate::config::base64_encode(sha1.finish().as_ref())
+}
+
+/// Whether a `101` switched to the WebSocket `request` asked for: one `Upgrade` naming that
+/// protocol alone, and one `Sec-WebSocket-Accept` answering the handshake's one key (RFC 6455
+/// §4.1, where a client fails the connection on anything else).
+///
+/// The status alone is not that answer. A `101` is the switch to whatever protocol the upstream
+/// chose, and one that honours `h2c` switches to raw HTTP/2, which the relay would carry as frames
+/// it cannot decode: the cage would then reach any path and method of the origin, past every rule
+/// on either. The key is checked as well because the proxy is the client of this exchange, and a
+/// reply that does not answer it was not written for this handshake.
+fn switched_to_websocket(response: &[u8], request: &Head) -> bool {
+    let Ok(response) = wire::parse_head(response) else {
+        return false;
+    };
+    let (Some(upgrade), Some(accept), Some(key)) = (
+        only_one(&response, "upgrade"),
+        only_one(&response, "sec-websocket-accept"),
+        only_one(request, "sec-websocket-key"),
+    ) else {
+        return false;
+    };
+    upgrade.eq_ignore_ascii_case("websocket") && accept == accept_for(key)
+}
+
+/// The value of the header `name` in `head`, trimmed, when `head` carries exactly one.
+fn only_one<'h>(head: &'h Head, name: &str) -> Option<&'h str> {
+    (head.count(name) == 1)
+        .then(|| head.header(name))
+        .flatten()
+        .map(str::trim)
+}
+
+/// Why an upgrade the policy permitted ends in a `502` rather than a WebSocket.
+#[derive(Clone, Copy)]
+enum Unresolved {
+    /// The upstream gave no final head, as the three request planes read it.
+    NoFinalHead(NoFinalHead),
+    /// The upstream's `101` switched to something other than the WebSocket the handshake asked
+    /// for ([`switched_to_websocket`]).
+    NotWebSocket,
+}
+
+impl From<NoFinalHead> for Unresolved {
+    fn from(why: NoFinalHead) -> Self {
+        Unresolved::NoFinalHead(why)
+    }
+}
+
+impl Unresolved {
+    /// The refusal reason token this is logged and answered under, from the module's table.
+    fn tag(self) -> &'static str {
+        match self {
+            Unresolved::NoFinalHead(why) => why.tag(),
+            Unresolved::NotWebSocket => "upstream-not-websocket",
+        }
+    }
+
+    /// The sentence the client is answered with, naming the upstream `host` it is about.
+    fn sentence(self, host: &str) -> String {
+        match self {
+            Unresolved::NoFinalHead(why) => why.sentence(host),
+            Unresolved::NotWebSocket => format!(
+                "`{host}` answered the upgrade with a switch to something other than the \
+                 WebSocket it asked for"
+            ),
+        }
+    }
+}
+
 /// Answer an upgrade the upstream never resolved, and close.
 ///
 /// The same `502`, the same reason token and the same `error` log line the three request planes
-/// give, because they are the same fact about the server: it was reached and it did not answer. A
-/// refusal after interim heads have already crossed is a legal response, and it is the shape
-/// `relay_response_head` produces.
+/// give when the upstream gave no final head, because they are the same fact about the server: it
+/// was reached and it did not answer. A refusal after interim heads have already crossed is a legal
+/// response, and it is the shape `relay_response_head` produces. A `101` that is not a WebSocket's
+/// is answered the same way, before anything of it reaches the client.
 ///
 /// The line is what makes the exchange readable. The `allow` was recorded before this plane was
 /// entered and it stands — policy did permit the upgrade — but its status never arrives, so without
 /// the line a stalled WebSocket shows in `sbx net logs` as an allow with no outcome and no cause.
 fn refuse_upgrade(
     br: &mut BufReader<StreamOwned<ServerConnection, UnixStream>>,
-    why: NoFinalHead,
+    why: Unresolved,
     host: &str,
     ctx: &ProxyCtx,
     port: u16,
@@ -228,7 +316,7 @@ pub(super) fn relay_upgrade(
             Err(_) => {
                 return refuse_upgrade(
                     &mut br,
-                    NoFinalHead::UpstreamClosed,
+                    NoFinalHead::UpstreamClosed.into(),
                     &host,
                     ctx,
                     port,
@@ -246,7 +334,7 @@ pub(super) fn relay_upgrade(
                 if interim_seen > INTERIM_HEAD_MAX {
                     return refuse_upgrade(
                         &mut br,
-                        NoFinalHead::InterimCap,
+                        NoFinalHead::InterimCap.into(),
                         &host,
                         ctx,
                         port,
@@ -259,6 +347,12 @@ pub(super) fn relay_upgrade(
             _ => break head,
         }
     };
+
+    // A switch to anything but the WebSocket asked for is refused before the `101` is recorded or
+    // reaches the client: past it, the relay carries whatever that protocol is.
+    if parse_status_code(&resp_head) == Some(101) && !switched_to_websocket(&resp_head, inner) {
+        return refuse_upgrade(&mut br, Unresolved::NotWebSocket, &host, ctx, port, target);
+    }
 
     if parse_status_code(&resp_head) != Some(101) {
         // The upstream declined the upgrade — relay its response as a normal one, then close. The
@@ -944,6 +1038,94 @@ mod tests {
             "Host: chat.example",
         ] {
             assert!(wire.contains(kept), "`{kept}` must survive: {wire}");
+        }
+    }
+
+    /// The handshake offers the WebSocket protocol and nothing else. A client that lists another
+    /// protocol beside it (`h2c`), on the same line or a second one, would let an upstream that
+    /// honours that one switch to it, and the cage would then speak raw HTTP/2 to the origin,
+    /// past every rule on path and method.
+    #[test]
+    fn the_forwarded_handshake_offers_the_websocket_protocol_alone() {
+        let head = wire::parse_head(
+            b"GET /chat HTTP/1.1\r\nHost: chat.example\r\nUpgrade: h2c, websocket\r\n\
+              Upgrade: h2c\r\nConnection: Upgrade, HTTP2-Settings\r\n\
+              HTTP2-Settings: AAMAAABkAAQAAP__\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .expect("a well-formed head");
+        let wire = String::from_utf8(reserialize_upgrade(&head, &[], false)).expect("ascii");
+        let upgrades: Vec<&str> = wire
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("upgrade:"))
+            .collect();
+        assert_eq!(upgrades, ["Upgrade: websocket"], "{wire}");
+        assert!(
+            !wire.to_ascii_lowercase().contains("http2-settings:"),
+            "{wire}"
+        );
+    }
+
+    /// The `Sec-WebSocket-Accept` a server owes a key, from RFC 6455 §1.3's own example, and a
+    /// `101` is taken for a WebSocket only when it switches to that protocol alone and answers the
+    /// key the handshake carried.
+    #[test]
+    fn a_101_is_a_websocket_only_when_it_switches_to_one_and_answers_the_key() {
+        let request = wire::parse_head(
+            b"GET /chat HTTP/1.1\r\nHost: chat.example\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .expect("a well-formed head");
+        // Worked out with Python's `hashlib.sha1` and `base64`, as the RFC prints it.
+        assert_eq!(
+            accept_for("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+        let answer = |upgrade: &str, accept: &str| {
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\n{upgrade}Connection: Upgrade\r\n{accept}\r\n"
+            )
+        };
+        let good = "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
+        assert!(switched_to_websocket(
+            answer("Upgrade: websocket\r\n", good).as_bytes(),
+            &request
+        ));
+        assert!(switched_to_websocket(
+            answer("Upgrade: WebSocket\r\n", good).as_bytes(),
+            &request
+        ));
+        for (upgrade, accept) in [
+            ("Upgrade: h2c\r\n", good),
+            ("Upgrade: h2c, websocket\r\n", good),
+            ("Upgrade: websocket\r\nUpgrade: h2c\r\n", good),
+            ("", good),
+            ("Upgrade: websocket\r\n", ""),
+            (
+                "Upgrade: websocket\r\n",
+                "Sec-WebSocket-Accept: test-accept\r\n",
+            ),
+            (
+                "Upgrade: websocket\r\n",
+                "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+                 Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n",
+            ),
+        ] {
+            assert!(
+                !switched_to_websocket(answer(upgrade, accept).as_bytes(), &request),
+                "{upgrade:?} {accept:?}"
+            );
+        }
+        // No key in the handshake, or two: there is nothing one answer could be checked against.
+        for keys in ["", "Sec-WebSocket-Key: a\r\nSec-WebSocket-Key: b\r\n"] {
+            let request = wire::parse_head(
+                format!("GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n{keys}\r\n").as_bytes(),
+            )
+            .unwrap();
+            assert!(!switched_to_websocket(
+                answer("Upgrade: websocket\r\n", good).as_bytes(),
+                &request
+            ));
         }
     }
 
