@@ -72,9 +72,10 @@ const MASK_WARN: usize = 64;
 /// than quietly dropping the tail: a truncated mask list reads exactly like a complete one.
 const MASK_MAX: usize = 256;
 
-/// The largest `.git/index` the tracked-file guard will read. An index is a few MiB on a large
-/// repository; a file past this is not one the guard needs to be right about, and reading it would
-/// be the only unbounded allocation in a launch.
+/// The largest index, and shared index, read ([`read_git_index`]). git writes about a hundred bytes
+/// per tracked file in a version 2 index, so this holds some 650 000 of them. The cage writes the
+/// index and can grow it past any bound, and reading it whole would otherwise be an allocation it
+/// sizes; an index past this refuses the launch ([`submodule_carrier`]).
 const INDEX_MAX: u64 = 64 * 1024 * 1024;
 
 /// One project path a mask covers, and the entry that named it.
@@ -1049,9 +1050,9 @@ const SUBMODULE_DEPTH: usize = 8;
 /// read-only ([`git_modules_dir`]), and the repository of each submodule found in it is reopened
 /// read-write in `carried`.
 ///
-/// An index this cannot read refuses the launch when the repository shows submodules (a
-/// `.gitmodules`, or a `modules` directory with anything in it), since their repositories could not
-/// be found; otherwise there is nothing to look for.
+/// An index this cannot read in full refuses the launch, whether or not the repository shows
+/// submodules: a gitlink needs no `.gitmodules`, and the cage writes the index, so it could add one
+/// and then grow the index past [`INDEX_MAX`], which the host's git still reads.
 fn submodule_carrier(
     reach: &Reach,
     repo: &GitRepo,
@@ -1070,14 +1071,7 @@ fn submodule_carrier(
     let links = match gitlinks(repo) {
         Ok(links) => links,
         Err(reason) => {
-            // Made empty by an earlier launch where it was absent, which shows no submodule.
-            let populated = match std::fs::read_dir(repo.dir.join("modules")) {
-                Ok(mut entries) => entries.next().is_some(),
-                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-            };
-            if repo.work_tree.join(".gitmodules").exists() || populated {
-                refused.get_or_insert_with(|| visible(&reason));
-            }
+            refused.get_or_insert_with(|| visible(&reason));
             return;
         }
     };
@@ -2149,9 +2143,9 @@ impl RepoWatch {
             out.push(format!(
                 "`{}` cannot be read in full after the session (larger than sbx reads, split from \
                  a shared index sbx cannot read, or of another format), so a submodule's \
-                 repository added during it cannot be named. \
-                 Check the gitlinks from a cage (`sbx run -- git ls-files --stage`) before running \
-                 git here",
+                 repository added during it cannot be named, and the next launch refuses until it \
+                 can. Check the gitlinks from a cage (`sbx run -- git ls-files --stage`) before \
+                 running git here",
                 index.display()
             ));
         }
@@ -5652,6 +5646,33 @@ mod tests {
                 .iter()
                 .any(|m| m.path == sha.join("emb/.git/config"))
         );
+    }
+
+    /// An index sbx cannot read in full refuses the launch where the repository shows no submodule,
+    /// with no `.gitmodules` and no `.git/modules`, since a gitlink needs neither: one past
+    /// [`INDEX_MAX`], which the host's git still reads, and a split index whose shared index is
+    /// missing.
+    #[test]
+    fn an_index_sbx_cannot_read_in_full_refuses_without_a_gitmodules() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping an unreadable index: no git on this host");
+            return;
+        };
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+        assert!(!root.join(".gitmodules").exists() && !root.join(".git/modules").exists());
+        let refused = || expand(&root, &FsPolicy::default(), &[], None).refused;
+        assert_eq!(refused(), None);
+        assert!(git(&["update-index", "--split-index"]));
+        remove_shared_indexes(&root.join(".git"));
+        let why = refused().expect("a missing shared index refuses");
+        assert!(why.contains("not an index sbx reads in full"), "{why}");
+        let index = root.join(".git/index");
+        std::fs::remove_file(&index).unwrap();
+        let sparse = std::fs::File::create(&index).unwrap();
+        sparse.set_len(INDEX_MAX + 1).unwrap();
+        let why = refused().expect("an index past the bound refuses");
+        assert!(why.contains("larger than 64 MiB"), "{why}");
     }
 
     /// The end of a session names a submodule's repository that was not there at launch, found in

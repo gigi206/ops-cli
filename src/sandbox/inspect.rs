@@ -220,10 +220,15 @@ pub(crate) fn read_cage_file(path: &Path, cap: u64) -> std::io::Result<Option<Ve
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refused("is a symlink")),
         Err(e) => return Err(named(e)),
     };
-    if !file.metadata().map_err(named)?.is_file() {
+    let meta = file.metadata().map_err(named)?;
+    if !meta.is_file() {
         return Err(refused("is not a regular file"));
     }
-    // One byte past the ceiling, so a file exactly at it and one over it are told apart.
+    if meta.len() > cap {
+        return Err(refused(&format!("is larger than {cap} bytes")));
+    }
+    // One byte past the ceiling, so a file exactly at it and one over it are told apart, should it
+    // grow after the check.
     let mut body = Vec::new();
     file.take(cap + 1).read_to_end(&mut body).map_err(named)?;
     if body.len() as u64 > cap {

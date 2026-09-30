@@ -199,10 +199,11 @@ the project's repository is, its configuration, its hooks directory and the file
 configuration includes, and the `.git` file in its directory that points at it is read-only
 as well. That covers a submodule's repository under `.git/modules/`, one in a read-write bind,
 and a repository embedded in the tree and added to the index. The submodules are found in the
-index, which sbx reads itself, a split index together with the shared index it names;
-an index it cannot read in full (one past its size bound, or a split index whose shared index is
-missing) refuses the launch in a repository that has submodules, and so does a link where a submodule's `.git` is looked
-for. Holding a submodule's configuration costs what holding `.git/config` costs:
+index, which sbx reads itself, a split index together with the shared index it names. An
+index it cannot read in full refuses the launch, whether or not the repository shows
+submodules, since a gitlink needs no `.gitmodules`: one past its size bound of 64 MiB, some
+650,000 tracked files, which your git still reads, or a split index whose shared index is
+missing. So does a link where a submodule's `.git` is looked for. Holding a submodule's configuration costs what holding `.git/config` costs:
 `git submodule update` rewrites the submodule's configuration every time it runs and is
 refused, as are `git submodule sync`, `git config` and `git remote add` inside a submodule, and
 `git mv` or `git rm` of a submodule's directory, which is held in place. The commits, branches
@@ -222,9 +223,10 @@ from the cage was already refused, since it writes `.git/config`. The same holds
 Each submodule adds a few mounts to the ceiling `[fs]` counts, so a superproject with many of
 them can reach it; the refusal says so. What no mount can hold is a repository that appears
 during the session in a gitlink's directory: one the cage creates there, or adds to the index,
-is read by your next `git status` in the superproject. sbx names it once the cage has exited, as it names
-a `.git/commondir`, and so does an index the cage leaves in a form sbx cannot read in full,
-since the repositories it names can then not be listed.
+is read by your next `git status` in the superproject. sbx names it once the cage has exited,
+as it names a `.git/commondir`, and so does an index the cage leaves in a form sbx cannot read
+in full, since the repositories it names can then not be listed; the next launch refuses on
+that index.
 
 **What this does not close: the hooks a project already has run its code.** The protection
 closes the hooks git would run without a trace: an untracked script in the hooks directory, a
