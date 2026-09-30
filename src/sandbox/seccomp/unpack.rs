@@ -56,6 +56,10 @@ fn work() -> Vec<i64> {
         libc::SYS_ftruncate,
         // Each member given the date the image gives it.
         libc::SYS_utimensat,
+        // The keys of the hash that tells what a layer wrote from what the layers below it did:
+        // refused, the standard library reads `/dev/urandom` instead, which the cage does not have,
+        // and stops the unpack.
+        libc::SYS_getrandom,
         // Memory.
         libc::SYS_brk,
         libc::SYS_munmap,

@@ -229,7 +229,8 @@ fn every_kind_of_member() -> Vec<u8> {
     add("etc/os-release", Regular, "ID=caged\n", 0o644, None);
     add("etc/link", Symlink, "", 0o777, Some("os-release"));
     add("etc/hard", Link, "", 0o644, Some("etc/os-release"));
-    add("gone", Regular, "g", 0o644, None);
+    // The two markers reach what [`lower_layer`] left, and the opaque one keeps what this layer
+    // wrote before it.
     add(".wh.gone", Regular, "", 0o644, None);
     add("opq/x", Regular, "x", 0o644, None);
     add("opq/.wh..wh..opq", Regular, "", 0o644, None);
@@ -262,7 +263,14 @@ const SPARSE_LEN: u64 = 1024 * 1024;
 /// The date every member of [`every_kind_of_member`] carries but the sparse one.
 const DATED: u64 = 1_000_000_000;
 
-/// What [`every_kind_of_member`] leaves in `root` once applied.
+/// What a layer below [`every_kind_of_member`] left in `root`, for its markers to hide.
+fn lower_layer(root: &Path) {
+    std::fs::write(root.join("gone"), b"g").unwrap();
+    std::fs::create_dir_all(root.join("opq")).unwrap();
+    std::fs::write(root.join("opq/old"), b"o").unwrap();
+}
+
+/// What [`every_kind_of_member`] leaves in `root` once applied over [`lower_layer`].
 fn assert_every_kind_of_member_landed(root: &Path) {
     let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
     assert_eq!(read("etc/os-release"), "ID=caged\n");
@@ -275,10 +283,14 @@ fn assert_every_kind_of_member_landed(root: &Path) {
         root.join("gone").symlink_metadata().is_err(),
         "the whiteout removed it"
     );
+    let opq: Vec<_> = std::fs::read_dir(root.join("opq"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
     assert_eq!(
-        std::fs::read_dir(root.join("opq")).unwrap().count(),
-        0,
-        "the opaque marker emptied it"
+        opq,
+        ["x"],
+        "the opaque marker emptied it of the lower layer and kept its own"
     );
     assert!(root.join("was").is_dir(), "a file replaced by a directory");
     assert_eq!(read("dir2"), "now a file", "a directory replaced by a file");
@@ -375,6 +387,7 @@ fn a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else() {
     std::fs::write(&host_file, b"x").unwrap();
     let rootfs = tmp.join("rootfs");
     std::fs::create_dir_all(&rootfs).unwrap();
+    lower_layer(&rootfs);
     let layer = blob(&tmp, "layer", &every_kind_of_member());
 
     let binary = File::open("/proc/self/exe").unwrap();

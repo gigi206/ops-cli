@@ -494,6 +494,85 @@ fn an_opaque_marker_empties_the_directory_it_sits_in() {
     assert!(root.join("keep").exists(), "another directory is untouched");
 }
 
+/// Every path under `dir`, relative to it, in order.
+fn tree(dir: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        for entry in fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            paths.push(path.strip_prefix(dir).unwrap().display().to_string());
+            if path.symlink_metadata().unwrap().is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// A marker hides only what the layers below put there: an opaque marker that comes after what
+/// its own layer wrote in the directory keeps that, down to a file the layer wrote into a
+/// subdirectory a lower layer made, and removes the rest. The order is the producer's to choose.
+#[test]
+fn an_opaque_marker_keeps_what_its_own_layer_wrote_before_it() {
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[
+            ("d/old", Member::File("old")),
+            ("d/sub/old", Member::File("old")),
+            ("d/sub/deeper/old", Member::File("old")),
+        ]),
+    )
+    .unwrap();
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[
+            ("d/", Member::Dir),
+            ("d/new", Member::File("new")),
+            ("d/sub/new", Member::File("new")),
+            ("d/.wh..wh..opq", Member::File("")),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(tree(&root.join("d")), ["new", "sub", "sub/new"]);
+}
+
+/// A whiteout hides only what the layers below put there, so one that comes after the entry its
+/// own layer wrote keeps it; a directory its layer wrote keeps what that layer put in it and
+/// nothing a lower layer did.
+#[test]
+fn a_whiteout_keeps_what_its_own_layer_wrote_before_it() {
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[
+            ("file", Member::File("lower")),
+            ("dir/old", Member::File("old")),
+        ]),
+    )
+    .unwrap();
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[
+            ("file", Member::File("upper")),
+            (".wh.file", Member::File("")),
+            ("dir/new", Member::File("new")),
+            (".wh.dir", Member::File("")),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(root.join("file")).unwrap(), "upper");
+    assert_eq!(tree(&root), ["dir", "dir/new", "file"]);
+}
+
 #[test]
 fn an_opaque_marker_never_empties_through_a_symlink_an_earlier_layer_planted() {
     // The escape the parent-chain check does not catch: the link is the marker's *own* directory,

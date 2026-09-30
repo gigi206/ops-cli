@@ -11,6 +11,9 @@
 //! written out. An applier that ignored them would produce a tree carrying files the image
 //! deleted, which is the kind of failure that is silent until something reads one.
 //!
+//! A marker reaches only what the **lower** layers put there, wherever it stands in its own layer:
+//! an entry its layer wrote before it stays ([`Written`]).
+//!
 //! ## Where a member is allowed to land
 //!
 //! Every destination is decided here, never by the archive. Three ways an archive tries to leave
@@ -212,6 +215,7 @@ pub(super) fn apply(
 fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result<()> {
     let root = &Root::open(root)?;
     let mut dates = DirectoryDates::default();
+    let mut written = Written::new();
     let left = Rc::new(Cell::new(None));
     let mut archive = tar::Archive::new(Metered {
         inner: layer,
@@ -279,7 +283,7 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
             } else {
                 safe_path(root, parent)?
             };
-            clear_directory(&dir)?;
+            clear_directory(&dir, &written)?;
             continue;
         }
         if let Some(target) = name.strip_prefix(WHITEOUT) {
@@ -294,12 +298,19 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
             }
             let parent = path.parent().unwrap_or(Path::new(""));
             let dest = safe_path(root, &parent.join(target))?;
-            remove(&dest)?;
+            // A whiteout reaches only what the layers below put there: an entry its own layer
+            // wrote stays, and a directory its layer wrote loses only what a lower one left in it.
+            if !written.holds(&dest) {
+                remove(&dest)?;
+            } else if dest.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                clear_directory(&dest, &written)?;
+            }
             continue;
         }
 
         let dest = safe_path(root, &path)?;
         write_member(&mut entry, &dest, root, budget, &mut dates)?;
+        written.hold(root.path, &dest);
     }
 }
 
@@ -491,7 +502,55 @@ fn absent(e: &io::Error) -> bool {
     )
 }
 
-/// Empty a directory without removing it: what an opaque marker means.
+/// The paths the layer being applied has written, with the directories on the way to each, so a
+/// marker can tell them from what the layers below put there.
+///
+/// A whiteout or an opaque marker hides what the **lower** layers put in its place, and an entry
+/// its own layer wrote is hidden only by a marker in a later layer. A producer may put a marker
+/// after the entries beside it, and a marker applied as it is read would otherwise take them with
+/// it: the image's own files, missing in silence.
+///
+/// Held as hashes rather than paths: a layer may write a million entries of up to the kernel's
+/// four kilobytes of path each, and the unpack runs with no bound on its memory. Two paths that
+/// hash alike would keep an entry a marker hides, a file too many and nothing reached, and the hash
+/// is keyed afresh by each unpack, so a layer cannot choose paths that collide.
+struct Written {
+    keys: std::hash::RandomState,
+    held: std::collections::HashSet<u64>,
+}
+
+impl Written {
+    fn new() -> Self {
+        Written {
+            keys: std::hash::RandomState::new(),
+            held: std::collections::HashSet::new(),
+        }
+    }
+
+    fn key(&self, path: &Path) -> u64 {
+        std::hash::BuildHasher::hash_one(&self.keys, path)
+    }
+
+    /// Note that the layer wrote `dest`, under `root`, and every directory on the way to it: one it
+    /// writes into is its own as much as one it declares. The walk up stops at a directory already
+    /// held, whose own way up is held with it.
+    fn hold(&mut self, root: &Path, dest: &Path) {
+        for at in dest.ancestors() {
+            if at == root || !self.held.insert(self.key(at)) {
+                return;
+            }
+        }
+    }
+
+    /// Whether the layer wrote `path`, or wrote something below it.
+    fn holds(&self, path: &Path) -> bool {
+        self.held.contains(&self.key(path))
+    }
+}
+
+/// Empty a directory without removing it, of what the layers below put there: what an opaque
+/// marker means. What the marker's own layer wrote stays ([`Written`]), and a directory it wrote
+/// into is emptied the same way, down to what it holds of the lower layers.
 ///
 /// A symlink is refused rather than followed. This is the one place that reads *through* the path
 /// `safe_path` hands back, whose final component is deliberately left unresolved so that a layer
@@ -499,7 +558,7 @@ fn absent(e: &io::Error) -> bool {
 /// before creating anything, and it does not hold for a read of the entries below. A link has no
 /// entries of its own, so an honest image never asks for this, and following one would empty the
 /// directory it names instead.
-fn clear_directory(dir: &Path) -> io::Result<()> {
+fn clear_directory(dir: &Path, written: &Written) -> io::Result<()> {
     if dir
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
@@ -509,13 +568,22 @@ fn clear_directory(dir: &Path) -> io::Result<()> {
             dir.display()
         )));
     }
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if absent(&e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        remove(&entry?.path())?;
+    // Only a real directory is descended into: `symlink_metadata` answers for the entry itself.
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        let entries = match fs::read_dir(&at) {
+            Ok(entries) => entries,
+            Err(e) if absent(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if !written.holds(&path) {
+                remove(&path)?;
+            } else if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                pending.push(path);
+            }
+        }
     }
     Ok(())
 }

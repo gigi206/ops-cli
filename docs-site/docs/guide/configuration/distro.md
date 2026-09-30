@@ -275,9 +275,11 @@ check then looks at one directory at a time, which costs the square of the depth
 A layer's members are applied as the image declares them: regular files (including the
 contiguous and GNU sparse spellings, a sparse file's holes left as holes on disk),
 directories, symlinks, hard links, and the whiteout markers that delete a path a lower
-layer created. Each keeps the modification time the image gives it, so a cache checked
-against its source's date, such as Python's `.pyc`, stays valid on the read-only root
-rather than being recompiled on every import. A whiteout that names no entry beside it
+layer created. A marker reaches only what the layers below put there, wherever it stands
+in its own layer, so an entry its layer wrote before it stays. Each member keeps the
+modification time the image gives it, so a cache checked against its source's date, such
+as Python's `.pyc`, stays valid on the read-only root rather than being recompiled on
+every import. A whiteout that names no entry beside it
 (`.wh.`, `.wh..`) is refused rather than taking its own directory with it. A device node,
 block or character, and a fifo are skipped: the cage mounts its own `/dev` over whatever
 the image carries, and creating either unprivileged would fail anyway. So is a PAX global
