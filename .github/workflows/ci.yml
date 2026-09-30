@@ -264,5 +264,7 @@ jobs:
           [ -f "$SBX_SKIP_LOG" ] && n=$(wc -l < "$SBX_SKIP_LOG" | tr -d ' ')
           echo "::notice::$n test(s) reported ok without running: this runner has no userns, no bwrap and no nix, so anything needing a cage skips. A green check here does not mean the sandbox was exercised."
           if [ "$n" -gt 0 ]; then
-            sort "$SBX_SKIP_LOG" | uniq -c | sort -rn | head -40
+            # `sed` reads the list to its end: `head` would stop early, and the `sort` it cut off
+            # fails the step under `pipefail`.
+            sort "$SBX_SKIP_LOG" | uniq -c | sort -rn | sed -n '1,40p'
           fi

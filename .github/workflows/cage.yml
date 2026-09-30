@@ -316,7 +316,9 @@ jobs:
             echo
             if [ "$n" -gt 0 ]; then
               echo '```'
-              sort "$SBX_SKIP_LOG" | uniq -c | sort -rn | head -40
+              # `sed` reads the list to its end: `head` would stop early, and the `sort` it cut off
+              # fails the step under `pipefail`.
+              sort "$SBX_SKIP_LOG" | uniq -c | sort -rn | sed -n '1,40p'
               echo '```'
               echo
               echo "Each line is a prerequisite this runner did not offer. Re-run with"
