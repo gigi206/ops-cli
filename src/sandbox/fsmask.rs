@@ -58,6 +58,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// How many mounts `[fs]` may cost a launch before it says the cost is getting real.
 ///
@@ -416,6 +417,7 @@ pub(crate) fn expand(
     binds: &[crate::config::Bind],
     data: Option<&Path>,
 ) -> Expanded {
+    let _asking = GitAsking::open();
     let mut out = Expanded::default();
     if policy.is_empty()
         && builtin_readonly_names(project, policy.git_writable()).is_empty()
@@ -1406,13 +1408,19 @@ fn git_hook_dirs(
         "Replace it with the directory it names, or remove it and point `core.hooksPath` at that \
          directory (`git config core.hooksPath <dir>`), which sbx protects in place",
     )];
-    if let Some(named) = git_hooks_path(repo) {
-        let shown = format!("core.hooksPath = {}", named.display());
-        dirs.push((
-            named,
-            shown,
-            "Point `core.hooksPath` at the directory by a path with no link in it",
-        ));
+    match git_hooks_path(repo) {
+        Ok(Some(named)) => {
+            let shown = format!("core.hooksPath = {}", named.display());
+            dirs.push((
+                named,
+                shown,
+                "Point `core.hooksPath` at the directory by a path with no link in it",
+            ));
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            refused.get_or_insert(reason);
+        }
     }
     let mut out: Vec<Masked> = Vec::new();
     for (path, pattern, instead) in dirs {
@@ -1489,25 +1497,110 @@ fn git_hook_dirs(
 }
 
 /// Ask the host's own git a `config` question about `repo`, returning its standard output, or
-/// `None` when there is no trusted git on the host, when git does not read the repository's git
-/// directory as one, or when nothing matches (git's exit status 1).
+/// `Ok(None)` when there is no trusted git on the host, when git does not read the repository's git
+/// directory as one, or when nothing matches (git's exit status 1); `Err` with the refusal when git
+/// does not answer in time.
 ///
 /// `--git-dir` rather than `-C`, so a `.git` git does not recognise is not answered by a repository
 /// discovered above it. The answer is the one the host's git acts on — the global and system files
 /// and every include count — which is the point of asking git rather than reading the file. And
 /// `git config` reads configuration and runs nothing it names: no hook, no fsmonitor, no pager.
-fn host_git_config(repo: &GitRepo, args: &[&str]) -> Option<Vec<u8>> {
-    let git = crate::store::resolve_git()?;
-    let out = std::process::Command::new(git)
+///
+/// **Within a budget.** git opens every file the configuration includes, and a FIFO there, which
+/// the cage can plant in a repository it made, holds it until a writer comes, which is never; a
+/// slow file system holds it too. So the questions share the budget of the span they are asked in
+/// ([`GitAsking`]), git is killed once it is spent, and the launch refuses, naming the question:
+/// without the answer, what the host's git reads is not known, and a launch that waited for it
+/// would wait without a word.
+fn host_git_config(repo: &GitRepo, args: &[&str]) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read as _;
+    let Some(git) = crate::store::resolve_git() else {
+        return Ok(None);
+    };
+    let held = || {
+        visible(&format!(
+            "the host's git did not answer `git config {}` about `{}` within {} s: a FIFO, or a \
+             file on a slow file system, among the configuration it reads holds it. Check that \
+             configuration and the files it includes, then launch again. {GIT_WRITABLE_HINT}",
+            args.join(" "),
+            repo.dir.display(),
+            GIT_ASK_BUDGET.as_secs()
+        ))
+    };
+    let deadline = GitAsking::deadline();
+    if Instant::now() >= deadline {
+        return Err(held());
+    }
+    let Ok(mut child) = std::process::Command::new(git)
         .arg("--git-dir")
         .arg(&repo.dir)
         .arg("config")
         .args(args)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status.success().then_some(out.stdout)
+        .spawn()
+    else {
+        return Ok(None);
+    };
+    // Read on a thread of its own, so a long answer never fills the pipe while git is waited on.
+    let reader = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut answer = Vec::new();
+            let _ = out.read_to_end(&mut answer);
+            answer
+        })
+    });
+    let waited = super::cagewait::wait_capped(&mut child, deadline, GIT_ASK_POLL);
+    let answer = reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    match waited {
+        Ok((_, true)) => Err(held()),
+        Ok((status, false)) => Ok(status.success().then_some(answer)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// How long the questions of one span may take the host's git, all together ([`GitAsking`]). git
+/// answers each in milliseconds from local files.
+const GIT_ASK_BUDGET: Duration = Duration::from_secs(10);
+
+/// How often a question to the host's git is checked for an answer.
+const GIT_ASK_POLL: Duration = Duration::from_millis(1);
+
+thread_local! {
+    /// When the questions of the span open on this thread must be answered by ([`GitAsking`]).
+    static GIT_ASK_DEADLINE: std::cell::Cell<Option<Instant>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// The span of one expansion's, or one watch's, questions to the host's git ([`host_git_config`]):
+/// while it lives, they share one [`GIT_ASK_BUDGET`] on this thread, so a git held on each of many
+/// repositories holds the launch once, not once per question; the span it opened within is back
+/// when it ends. A question asked outside any span has the budget to itself.
+struct GitAsking(Option<Instant>);
+
+impl GitAsking {
+    fn open() -> Self {
+        let ends = Instant::now() + GIT_ASK_BUDGET;
+        let outer = GIT_ASK_DEADLINE.get();
+        GitAsking(GIT_ASK_DEADLINE.replace(Some(outer.map_or(ends, |outer| outer.min(ends)))))
+    }
+
+    /// When the question asked now must be answered by.
+    fn deadline() -> Instant {
+        GIT_ASK_DEADLINE
+            .get()
+            .unwrap_or_else(|| Instant::now() + GIT_ASK_BUDGET)
+    }
+}
+
+impl Drop for GitAsking {
+    fn drop(&mut self) {
+        GIT_ASK_DEADLINE.set(self.0);
+    }
 }
 
 /// A path as git reads one in its configuration: `~/` against the home, a relative one against
@@ -1527,14 +1620,18 @@ fn git_config_path(value: &str, base: Option<&Path>) -> Option<PathBuf> {
 /// The host git's `core.hooksPath` for `repo`, resolved the way git resolves it for a working tree
 /// (a relative value against the top of the tree), or `None` when it is unset or cannot be asked
 /// ([`host_git_config`]).
-fn git_hooks_path(repo: &GitRepo) -> Option<PathBuf> {
-    let out = host_git_config(repo, &["--get", "core.hooksPath"])?;
-    let value = String::from_utf8(out).ok()?;
+fn git_hooks_path(repo: &GitRepo) -> Result<Option<PathBuf>, String> {
+    let Some(out) = host_git_config(repo, &["--get", "core.hooksPath"])? else {
+        return Ok(None);
+    };
+    let Ok(value) = String::from_utf8(out) else {
+        return Ok(None);
+    };
     let value = value.trim_end_matches('\n');
     if value.is_empty() {
-        return None;
+        return Ok(None);
     }
-    git_config_path(value, Some(&repo.work_tree))
+    Ok(git_config_path(value, Some(&repo.work_tree)))
 }
 
 /// The files the cage writes ([`Reach`]) that an `include.path` or `includeIf.<condition>.path`
@@ -1555,7 +1652,7 @@ fn git_hooks_path(repo: &GitRepo) -> Option<PathBuf> {
 /// refuses the launch as well, wherever the link leads ([`git_link_on_the_way`]), and so does an
 /// include in sbx's data directory, present or not, which the cage writes under other names.
 fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
-    let Some(out) = host_git_config(
+    let out = match host_git_config(
         repo,
         &[
             "-z",
@@ -1563,8 +1660,13 @@ fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>
             "--get-regexp",
             r"^include(if\..*)?\.path$",
         ],
-    ) else {
-        return Vec::new();
+    ) {
+        Ok(Some(out)) => out,
+        Ok(None) => return Vec::new(),
+        Err(reason) => {
+            refused.get_or_insert(reason);
+            return Vec::new();
+        }
     };
     // `-z` records: `file:<origin>` NUL `<key>` LF `<value>` NUL.
     let text = String::from_utf8_lossy(&out);
@@ -1720,7 +1822,7 @@ fn git_worktree_files(
     found: &WorktreeDirs,
     refused: &mut Option<String>,
 ) -> Vec<Masked> {
-    let extension = host_git_config(
+    let extension = match host_git_config(
         repo,
         &[
             "--local",
@@ -1728,8 +1830,13 @@ fn git_worktree_files(
             "--get",
             "extensions.worktreeConfig",
         ],
-    )
-    .is_some_and(|out| out.trim_ascii() == b"true");
+    ) {
+        Ok(out) => out.is_some_and(|out| out.trim_ascii() == b"true"),
+        Err(reason) => {
+            refused.get_or_insert(reason);
+            false
+        }
+    };
     let mut out: Vec<Masked> = Vec::new();
     let git = &repo.common;
     let config = repo.shown(reach.project(), "config");
@@ -1869,7 +1976,13 @@ fn other_work_trees(
     masks: &mut Vec<Masked>,
     refused: &mut Option<String>,
 ) -> Vec<GitRepo> {
-    let mut trees: Vec<GitRepo> = main_work_tree(repo).into_iter().collect();
+    let mut trees: Vec<GitRepo> = match main_work_tree(repo) {
+        Ok(main) => main.into_iter().collect(),
+        Err(reason) => {
+            refused.get_or_insert(reason);
+            Vec::new()
+        }
+    };
     if found.more {
         return trees;
     }
@@ -1932,21 +2045,21 @@ fn linked_common_dir_refusal(reach: &Reach, repo: &GitRepo, dir: &Path) -> Optio
 /// with `--git-dir`, git resolves it against that directory, which nothing records. One whose git
 /// directory was placed apart with `--separate-git-dir` records its main work tree nowhere, and git
 /// lists the repository in its place: nothing is carried there.
-fn main_work_tree(repo: &GitRepo) -> Option<GitRepo> {
+fn main_work_tree(repo: &GitRepo) -> Result<Option<GitRepo>, String> {
     if repo.dir == repo.common {
-        return None;
+        return Ok(None);
     }
     let bare = GitRepo::at(repo.common.clone(), repo.common.clone());
-    if host_git_config(&bare, &["--type=bool", "--get", "core.bare"])
+    if host_git_config(&bare, &["--type=bool", "--get", "core.bare"])?
         .is_some_and(|out| out.trim_ascii() == b"true")
     {
-        return Some(bare);
+        return Ok(Some(bare));
     }
     let checkout = repo
         .common
         .parent()
-        .filter(|_| repo.common.file_name() == Some(std::ffi::OsStr::new(".git")))?;
-    Some(GitRepo::at(repo.common.clone(), checkout.to_path_buf()))
+        .filter(|_| repo.common.file_name() == Some(std::ffi::OsStr::new(".git")));
+    Ok(checkout.map(|checkout| GitRepo::at(repo.common.clone(), checkout.to_path_buf())))
 }
 
 /// The work tree, canonical, of the linked worktree whose directory under `worktrees` is `dir`,
@@ -2084,6 +2197,7 @@ impl GitWatch {
         binds: &[crate::config::Bind],
         data: Option<&Path>,
     ) -> Option<Self> {
+        let _asking = GitAsking::open();
         let root = project.canonicalize().ok()?;
         let reach = Reach::of(&root, binds, data);
         match project_repo(&reach, git_writable) {
@@ -2095,6 +2209,7 @@ impl GitWatch {
 
     /// What appeared during the session, one message per finding, escaped for the terminal.
     pub(crate) fn findings(&self) -> Vec<String> {
+        let _asking = GitAsking::open();
         match self {
             GitWatch::Repo(watch) => watch.findings(),
             GitWatch::Absent(root) => {
@@ -3204,16 +3319,20 @@ fn index_varint(data: &[u8]) -> Option<(usize, usize)> {
 fn gitlinks(repo: &GitRepo) -> Result<Vec<PathBuf>, String> {
     use std::os::unix::ffi::OsStrExt;
     let index = repo.dir.join("index");
-    let hash_len = || {
-        if host_git_config(repo, &["--get", "extensions.objectFormat"])
-            .is_some_and(|out| out.trim_ascii() == b"sha256")
-        {
-            SHA256_LEN
-        } else {
+    let mut held = None;
+    let hash_len = || match host_git_config(repo, &["--get", "extensions.objectFormat"]) {
+        Ok(Some(out)) if out.trim_ascii() == b"sha256" => SHA256_LEN,
+        Ok(_) => SHA1_LEN,
+        Err(reason) => {
+            held = Some(reason);
             SHA1_LEN
         }
     };
-    let entries = match read_git_index(&repo.dir, hash_len) {
+    let read = read_git_index(&repo.dir, hash_len);
+    if let Some(reason) = held {
+        return Err(reason);
+    }
+    let entries = match read {
         Ok(entries) => entries.unwrap_or_default(),
         Err(e) if e.kind() == io::ErrorKind::InvalidData => {
             return Err(format!(
@@ -5433,6 +5552,38 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("emb/.git/rebase-merge/git-rebase-todo` holds 1 `exec` line")),
             "{found:#?}"
+        );
+    }
+
+    /// A question to the host's git that does not come back, git held on a FIFO the configuration
+    /// includes, refuses the launch once the budget is spent, naming it, rather than holding the
+    /// launch for good; the questions after it do not wait again, so the whole expansion takes
+    /// about one budget.
+    #[test]
+    fn a_host_git_held_on_a_fifo_refuses_within_the_budget() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a held git: no git on this host");
+            return;
+        };
+        assert!(git(&["config", "include.path", "held"]));
+        crate::testutil::make_fifo(&root.join(".git/held"));
+        let budget = GIT_ASK_BUDGET;
+        let started = std::time::Instant::now();
+        let why = crate::testutil::returns_within(budget * 3, "an expansion on a held git", {
+            let root = root.clone();
+            move || expand(&root, &FsPolicy::default(), &[], None).refused
+        })
+        .expect("a held git refuses");
+        assert!(why.contains("did not answer `git config "), "{why}");
+        assert!(
+            why.contains(&format!("{}`", root.join(".git").display())),
+            "{why}"
+        );
+        assert!(
+            started.elapsed() < budget * 3 / 2,
+            "{:?}",
+            started.elapsed()
         );
     }
 

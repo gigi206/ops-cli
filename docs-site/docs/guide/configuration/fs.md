@@ -128,7 +128,10 @@ repository has its own, and each one the cage writes is held ([other work
 trees](#where-the-cage-writes)). The value
 is read from your host's own `git` at launch, so an include file or your global config counts;
 a directory the cage does not write is left alone, and with no `git` on the host there is
-nothing to ask and no hook to run. A hooks directory that does not exist yet is **created
+nothing to ask and no hook to run. The questions a launch asks your `git` share a budget of
+10 seconds: past it, git is stopped and the launch **refuses**, naming the question, since a
+FIFO among the files the configuration includes, which the cage can plant in a repository it
+made, would hold git for good, and a slow file system holds it too. A hooks directory that does not exist yet is **created
 empty at launch** and then protected, which is what `git init` makes: otherwise the cage could
 create it and fill it. It is made one component at a time, and a symbolic link found on the
 way refuses the launch rather than being followed.
