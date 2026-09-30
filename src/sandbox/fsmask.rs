@@ -2147,8 +2147,9 @@ impl RepoWatch {
             .filter(|index| !self.submodules.unread.contains(index))
         {
             out.push(format!(
-                "`{}` cannot be read in full after the session (split, larger than sbx reads, or of \
-                 another format), so a submodule's repository added during it cannot be named. \
+                "`{}` cannot be read in full after the session (larger than sbx reads, split from \
+                 a shared index sbx cannot read, or of another format), so a submodule's \
+                 repository added during it cannot be named. \
                  Check the gitlinks from a cage (`sbx run -- git ls-files --stage`) before running \
                  git here",
                 index.display()
@@ -2771,33 +2772,26 @@ fn guard_git_tracked(root: &Path, denied: &[Masked], warnings: &mut Vec<String>)
 /// and this launcher is pointed at a project it treats as untrusted — `core.fsmonitor` alone turns
 /// a status query into "run this program". Reading the index is the same answer with no execution.
 ///
-/// Handles index versions 2 and 3, which is what git writes unless a repository opts into 4's
-/// path compression. An unreadable, oversized, unknown or malformed index yields `None`, and the
-/// guard simply does not fire — it is an aid, not a gate.
+/// The index is read as [`read_git_index`] reads it. An unreadable, oversized, unknown or malformed
+/// index yields `None`, and the guard simply does not fire — it is an aid, not a gate.
 fn git_tracked_paths(git_dir: &Path) -> Option<BTreeSet<String>> {
-    let index = git_dir.join("index");
-    let meta = std::fs::metadata(&index).ok()?;
-    if !meta.is_file() || meta.len() > INDEX_MAX {
-        return None;
-    }
-    let data = std::fs::read(&index).ok()?;
-    parse_git_index(&data)
+    read_git_index(git_dir, || SHA1_LEN)
+        .ok()?
+        .map(tracked_paths)
 }
 
-/// The path list out of a git index blob. Split from the I/O so the format is testable from bytes.
+/// The path list out of a git index's entries.
 ///
 /// A path flagged `skip-worktree` is deliberately **left out**. That flag is the cure this guard
 /// recommends, and it works: with it set, git stops comparing the path against the worktree, so the
 /// mask no longer breaks commits. Reporting the path anyway would leave the warning standing after
 /// the user did exactly what it asked, which is the fastest way to teach someone to ignore it.
-fn parse_git_index(data: &[u8]) -> Option<BTreeSet<String>> {
-    Some(
-        parse_git_index_entries(data, SHA1_LEN)?
-            .into_iter()
-            .filter(|entry| !entry.skip_worktree)
-            .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
-            .collect(),
-    )
+fn tracked_paths(entries: Vec<IndexEntry>) -> BTreeSet<String> {
+    entries
+        .into_iter()
+        .filter(|entry| !entry.skip_worktree)
+        .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+        .collect()
 }
 
 /// The length of an object name in a repository that keeps SHA-1 names, git's default.
@@ -2816,15 +2810,171 @@ struct IndexEntry {
     skip_worktree: bool,
 }
 
-/// The entries of a git index blob whose object names are `hash_len` bytes long, or `None` when the
-/// blob is not an index this reads in full.
+/// A git index blob read in full: its own entries, and the split index extension when it carries
+/// one.
+struct IndexBlob {
+    entries: Vec<IndexEntry>,
+    link: Option<SplitLink>,
+}
+
+/// What the `link` extension of a split index holds: the name of the shared index its entries are
+/// merged with, in hexadecimal, and the EWAH bitmaps of the shared entries it deletes and replaces,
+/// each as its compressed words ([`ewah_positions`]).
+struct SplitLink {
+    shared: String,
+    deleted: Vec<u64>,
+    replaced: Vec<u64>,
+}
+
+/// The entries of the index in the git directory `dir` as git reads them, whose object names are
+/// `hash_len()` bytes long, or `None` when there is none; `hash_len` is asked only of an index that
+/// is there.
+///
+/// A split index, which `core.splitIndex` or `git update-index --split-index` makes, keeps most of
+/// its entries in `sharedindex.<name>` beside it, and is merged with it the way git merges them
+/// ([`merge_split_index`]). The cage can write both, so each is read as
+/// [`super::inspect::read_cage_file`] reads a file it writes, within [`INDEX_MAX`]. An error of kind
+/// `InvalidData` says the index is not one this reads in full: one of the two larger than that or
+/// not a regular file, a shared index that is missing, or a format this does not know.
+fn read_git_index(
+    dir: &Path,
+    hash_len: impl FnOnce() -> usize,
+) -> io::Result<Option<Vec<IndexEntry>>> {
+    let not_read = || io::Error::new(io::ErrorKind::InvalidData, "not an index sbx reads in full");
+    let Some(data) = super::inspect::read_cage_file(&dir.join("index"), INDEX_MAX)? else {
+        return Ok(None);
+    };
+    let hash_len = hash_len();
+    let blob = parse_git_index_entries(&data, hash_len).ok_or_else(not_read)?;
+    // A shared index named by zeros is none, and the entries are the index's own.
+    let Some(link) = blob
+        .link
+        .filter(|link| link.shared.bytes().any(|b| b != b'0'))
+    else {
+        return Ok(Some(blob.entries));
+    };
+    let shared = dir.join(format!("sharedindex.{}", link.shared));
+    let shared = super::inspect::read_cage_file(&shared, INDEX_MAX)?.ok_or_else(not_read)?;
+    let base = parse_git_index_entries(&shared, hash_len)
+        .filter(|base| base.link.is_none())
+        .ok_or_else(not_read)?;
+    merge_split_index(blob.entries, &link, base.entries)
+        .map(Some)
+        .ok_or_else(not_read)
+}
+
+/// The entries git reads from a split index whose own entries are `split`, merged with `shared`,
+/// those of the shared index its `link` names, or `None` when they do not fit together, which git
+/// refuses too.
+///
+/// The shared entries `link` deletes are dropped. Each one it replaces takes the mode and the flags
+/// of the next of the first entries of `split`, which git writes without a path, the path staying
+/// the shared entry's. The rest of `split` is added.
+fn merge_split_index(
+    split: Vec<IndexEntry>,
+    link: &SplitLink,
+    shared: Vec<IndexEntry>,
+) -> Option<Vec<IndexEntry>> {
+    let deleted = ewah_positions(&link.deleted, shared.len())?;
+    let replaced = ewah_positions(&link.replaced, shared.len())?;
+    let mut merged: Vec<Option<IndexEntry>> = shared.into_iter().map(Some).collect();
+    let mut split = split.into_iter();
+    for at in replaced {
+        let entry = split.next()?;
+        let base = merged.get_mut(at)?.as_mut()?;
+        if !entry.path.is_empty() {
+            return None;
+        }
+        base.mode = entry.mode;
+        base.skip_worktree = entry.skip_worktree;
+    }
+    for at in deleted {
+        *merged.get_mut(at)? = None;
+    }
+    Some(merged.into_iter().flatten().chain(split).collect())
+}
+
+/// The positions an EWAH bitmap sets, in increasing order, from its compressed `words`, or `None`
+/// when one is at or past `limit`, the number of entries of the shared index it marks, which git
+/// refuses as well.
+///
+/// Each marker word holds a bit repeated over a run of 64-bit words (bit 0, and the run's length in
+/// words in the next 32 bits) and, in its top 31 bits, how many literal words follow it, read from
+/// their lowest bit up. A run of set bits is checked against `limit` before it is expanded, so the
+/// work stays bounded by the words themselves.
+fn ewah_positions(words: &[u64], limit: usize) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut pos: usize = 0;
+    let mut at = 0;
+    while let Some(&marker) = words.get(at) {
+        at += 1;
+        let run = usize::try_from((marker >> 1) & 0xffff_ffff)
+            .ok()?
+            .checked_mul(64)?;
+        let literals = usize::try_from(marker >> 33).ok()?;
+        let end = pos.checked_add(run)?;
+        if marker & 1 != 0 {
+            if end > limit {
+                return None;
+            }
+            out.extend(pos..end);
+        }
+        pos = end;
+        for &word in words.get(at..at.checked_add(literals)?)? {
+            for bit in (0..64).filter(|bit| word >> bit & 1 != 0) {
+                let set = pos.checked_add(bit)?;
+                if set >= limit {
+                    return None;
+                }
+                out.push(set);
+            }
+            pos = pos.checked_add(64)?;
+        }
+        at += literals;
+    }
+    Some(out)
+}
+
+/// The `link` extension's `body`: the shared index's name, `hash_len` bytes, then the deletion
+/// bitmap and the replacement bitmap as git serializes them ([`ewah_words`]).
+fn split_link(body: &[u8], hash_len: usize) -> Option<SplitLink> {
+    let shared = crate::plugins::catalogue::to_hex(body.get(..hash_len)?);
+    let (deleted, used) = ewah_words(body.get(hash_len..)?)?;
+    let (replaced, _) = ewah_words(body.get(hash_len.checked_add(used)?..)?)?;
+    Some(SplitLink {
+        shared,
+        deleted,
+        replaced,
+    })
+}
+
+/// The compressed words of the EWAH bitmap git serializes at the start of `data`, and how many bytes
+/// it takes: its size in bits and its count of 64-bit words on 32 bits each, the words, then the
+/// 32-bit position of its last marker word, all big-endian.
+fn ewah_words(data: &[u8]) -> Option<(Vec<u64>, usize)> {
+    let count = usize::try_from(u32::from_be_bytes(data.get(4..8)?.try_into().ok()?)).ok()?;
+    let end = count.checked_mul(8)?.checked_add(12)?;
+    let words = data
+        .get(8..end - 4)?
+        .chunks_exact(8)
+        .map(|word| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(word);
+            u64::from_be_bytes(bytes)
+        })
+        .collect();
+    Some((words, end))
+}
+
+/// The entries of a git index blob whose object names are `hash_len` bytes long, with its split
+/// index extension, or `None` when the blob is not an index this reads in full.
 ///
 /// Versions 2 and 3 pad each entry to a multiple of 8 bytes; version 4, which git writes when a
 /// repository asks for it and which `git update-index --index-version 4` switches any index to,
 /// writes each path as the length it strips from the previous one and the rest. A split index keeps
-/// most of its entries in a shared file of its own, so an index that carries one is not read in
-/// full here and answers `None`.
-fn parse_git_index_entries(data: &[u8], hash_len: usize) -> Option<Vec<IndexEntry>> {
+/// most of its entries in a shared index of its own, which the `link` extension names
+/// ([`read_git_index`]).
+fn parse_git_index_entries(data: &[u8], hash_len: usize) -> Option<IndexBlob> {
     if data.len() < 12 || &data[0..4] != b"DIRC" {
         return None;
     }
@@ -2887,14 +3037,16 @@ fn parse_git_index_entries(data: &[u8], hash_len: usize) -> Option<Vec<IndexEntr
     // The extensions run from the last entry to the checksum: four bytes of signature and four of
     // length each.
     let body_end = data.len().saturating_sub(hash_len);
+    let mut link = None;
     while pos + 8 <= body_end {
         let size = u32::from_be_bytes(data[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let next = pos.checked_add(8)?.checked_add(size)?;
         if &data[pos..pos + 4] == b"link" {
-            return None;
+            link = Some(split_link(data.get(pos + 8..next)?, hash_len)?);
         }
-        pos = pos.checked_add(8)?.checked_add(size)?;
+        pos = next;
     }
-    Some(out)
+    Some(IndexBlob { entries: out, link })
 }
 
 /// git's offset varint, which index version 4 writes the stripped length in, and how many bytes
@@ -2921,43 +3073,42 @@ fn index_varint(data: &[u8]) -> Option<(usize, usize)> {
 /// whether that stops the launch.
 ///
 /// Read rather than asked, for the reason [`git_tracked_paths`] gives: listing the index through
-/// git runs what its configuration names. A path that is not plain names below the work tree is
-/// not one git writes, and is left out.
+/// git runs what its configuration names. A path that is not plain names below the work tree, an
+/// empty one included, is not one git writes, and is left out.
 fn gitlinks(repo: &GitRepo) -> Result<Vec<PathBuf>, String> {
     use std::os::unix::ffi::OsStrExt;
     let index = repo.dir.join("index");
-    let meta = match std::fs::metadata(&index) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(git_unreadable("look at", &index, &e)),
-        Ok(meta) => meta,
+    let hash_len = || {
+        if host_git_config(repo, &["--get", "extensions.objectFormat"])
+            .is_some_and(|out| out.trim_ascii() == b"sha256")
+        {
+            SHA256_LEN
+        } else {
+            SHA1_LEN
+        }
     };
-    let unread = || {
-        format!(
-            "`{}` is not an index sbx reads in full (larger than {} MiB, split, or of another \
-             format), so the submodules whose repositories git reads cannot be found. {GIT_WRITABLE_HINT}",
-            index.display(),
-            INDEX_MAX / (1024 * 1024)
-        )
+    let entries = match read_git_index(&repo.dir, hash_len) {
+        Ok(entries) => entries.unwrap_or_default(),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            return Err(format!(
+                "`{}` is not an index sbx reads in full (larger than {} MiB, split from a shared \
+                 index sbx cannot read, or of another format), so the submodules whose \
+                 repositories git reads cannot be found. {GIT_WRITABLE_HINT}",
+                index.display(),
+                INDEX_MAX / (1024 * 1024)
+            ));
+        }
+        Err(e) => return Err(git_unreadable("read", &index, &e)),
     };
-    if !meta.is_file() || meta.len() > INDEX_MAX {
-        return Err(unread());
-    }
-    let data = std::fs::read(&index).map_err(|e| git_unreadable("read", &index, &e))?;
-    let hash_len = if host_git_config(repo, &["--get", "extensions.objectFormat"])
-        .is_some_and(|out| out.trim_ascii() == b"sha256")
-    {
-        SHA256_LEN
-    } else {
-        SHA1_LEN
-    };
-    let entries = parse_git_index_entries(&data, hash_len).ok_or_else(unread)?;
     Ok(entries
         .into_iter()
         .filter(|entry| entry.mode == GITLINK_MODE)
         .map(|entry| PathBuf::from(std::ffi::OsStr::from_bytes(&entry.path)))
         .filter(|rel| {
-            rel.components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            rel.components().next().is_some()
+                && rel
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
         })
         .map(|rel| repo.work_tree.join(rel))
         .collect())
@@ -5211,6 +5362,100 @@ mod tests {
         );
     }
 
+    /// A split index is read with the shared index it names, wherever it keeps a gitlink: in the
+    /// shared index, among the entries the split index adds, and in an entry it replaces, which
+    /// carries no path, turning a file of the shared index into a gitlink. Each is held without a
+    /// `.gitmodules`, in index versions 2 and 4.
+    #[test]
+    fn a_split_index_is_read_with_the_shared_index_it_names() {
+        for version in ["2", "4"] {
+            let tmp = TmpDir::new();
+            let Some((root, git)) = git_project(&tmp) else {
+                skip_incapable!("skipping a split index: no git on this host");
+                return;
+            };
+            assert!(git(&["config", "index.version", version]));
+            assert!(git(&["config", "splitIndex.maxPercentChange", "100"]));
+            for i in 0..12 {
+                std::fs::write(root.join(format!("f{i}")), "x").unwrap();
+            }
+            assert!(git_repo_at(&root.join("in_shared"), &[]));
+            assert!(git(&["add", "."]) && git(&["update-index", "--split-index"]));
+            assert!(git_repo_at(&root.join("added"), &[]) && git(&["add", "added"]));
+            std::fs::remove_file(root.join("f3")).unwrap();
+            assert!(git_repo_at(&root.join("f3"), &[]) && git(&["add", "f3"]));
+
+            let index = std::fs::read(root.join(".git/index")).unwrap();
+            let blob = parse_git_index_entries(&index, SHA1_LEN).expect("a split index parses");
+            let link = blob.link.as_ref().expect("a split index");
+            let shared = std::fs::read(root.join(format!(".git/sharedindex.{}", link.shared)));
+            let shared = parse_git_index_entries(&shared.unwrap(), SHA1_LEN).unwrap();
+            let gitlink = |e: &IndexEntry, path: &[u8]| e.mode == GITLINK_MODE && e.path == path;
+            assert!(shared.entries.iter().any(|e| gitlink(e, b"in_shared")));
+            assert!(blob.entries.iter().any(|e| gitlink(e, b"added")));
+            assert!(
+                blob.entries.iter().any(|e| gitlink(e, b"")),
+                "a replaced entry"
+            );
+            assert!(
+                shared
+                    .entries
+                    .iter()
+                    .any(|e| e.path == b"f3" && e.mode != GITLINK_MODE)
+            );
+
+            let e = expand(&root, &FsPolicy::default(), &[], None);
+            assert!(e.refused.is_none(), "{:?}", e.refused);
+            for held in ["in_shared", "added", "f3"] {
+                let config = root.join(held).join(".git/config");
+                assert!(
+                    e.readonly.iter().any(|m| m.path == config && m.builtin),
+                    "v{version} {held}: {:?}",
+                    e.readonly
+                );
+            }
+        }
+    }
+
+    /// A split index's bitmaps are read as git reads them, a run of set bits and literal words
+    /// alike, and one that marks an entry past the shared index, or counts more literal words than
+    /// it holds, is not read.
+    #[test]
+    fn a_split_indexs_bitmap_is_read_within_the_shared_index() {
+        // Two words of set bits, then one literal word setting bits 0 and 2.
+        let run = 1 | (1 << 1) | (1 << 33);
+        let words = [run, 0b101];
+        let mut want: Vec<usize> = (0..64).collect();
+        want.extend([64, 66]);
+        assert_eq!(ewah_positions(&words, 67), Some(want));
+        assert_eq!(ewah_positions(&words, 66), None, "a literal past the end");
+        assert_eq!(ewah_positions(&words, 63), None, "a run past the end");
+        // Two words of clear bits skipped, then bit 0 of a literal word.
+        let skip = (2 << 1) | (1 << 33);
+        assert_eq!(ewah_positions(&[skip, 1], 129), Some(vec![128]));
+        assert_eq!(ewah_positions(&[skip], 129), None, "a missing literal");
+        assert_eq!(ewah_positions(&[], 0), Some(Vec::new()));
+    }
+
+    /// A gitlink whose path is empty, which git does not write, names no submodule: the project's
+    /// own repository is not read as one of its submodules.
+    #[test]
+    fn a_gitlink_without_a_path_names_no_submodule() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp).canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let mut index = b"DIRC".to_vec();
+        index.extend_from_slice(&2u32.to_be_bytes());
+        index.extend_from_slice(&1u32.to_be_bytes());
+        // 62 bytes of metadata, an empty name's NUL, and a byte of padding.
+        let mut entry = vec![0u8; 64];
+        entry[24..28].copy_from_slice(&GITLINK_MODE.to_be_bytes());
+        index.extend(entry);
+        std::fs::write(root.join(".git/index"), index).unwrap();
+        let repo = GitRepo::at(root.join(".git"), root.clone());
+        assert_eq!(gitlinks(&repo), Ok(Vec::new()));
+    }
+
     /// The directory git keeps its submodules' repositories in is held read-only, so the cage can
     /// neither plant a repository there for `git submodule update --init` to reuse nor rewrite the
     /// one a deinitialized submodule left behind; the repository of each initialized submodule is
@@ -5356,9 +5601,10 @@ mod tests {
         );
     }
 
-    /// The index is read in the formats git writes it in: version 4, and the longer object names of
-    /// a SHA-256 repository. A split index, whose entries this does not read in full, refuses the
-    /// launch where the repository shows submodules.
+    /// The index is read in the formats git writes it in: version 4, split with the shared index it
+    /// names, and the longer object names of a SHA-256 repository. A split index whose shared index
+    /// is missing, which this cannot read in full, refuses the launch where the repository shows
+    /// submodules.
     #[test]
     fn the_index_is_read_in_the_formats_git_writes() {
         let tmp = TmpDir::new();
@@ -5380,9 +5626,11 @@ mod tests {
         assert!(git(&["update-index", "--index-version", "4"]));
         assert!(held(&root), "version 4");
         assert!(git(&["update-index", "--split-index"]));
+        assert!(held(&root), "split");
+        remove_shared_indexes(&root.join(".git"));
         let why = expand(&root, &FsPolicy::default(), &[], None)
             .refused
-            .expect("a split index refuses");
+            .expect("a missing shared index refuses");
         assert!(why.contains("not an index sbx reads in full"), "{why}");
 
         let sha = tmp.path().join("sha");
@@ -5407,8 +5655,8 @@ mod tests {
     }
 
     /// The end of a session names a submodule's repository that was not there at launch, found in
-    /// an index the cage rewrote in version 4 or in the index of a submodule held at launch, and an
-    /// index it can no longer read in full. One present at launch is not named.
+    /// an index the cage rewrote in version 4 or split, or in the index of a submodule held at
+    /// launch, and an index it can no longer read in full. One present at launch is not named.
     #[test]
     fn the_git_watch_names_a_submodule_repository_that_appeared() {
         let tmp = TmpDir::new();
@@ -5453,6 +5701,15 @@ mod tests {
         );
 
         assert!(git(&["update-index", "--split-index"]));
+        assert!(git_repo_at(&root.join("late"), &[]) && git(&["add", "late"]));
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("late/.git` is a submodule's repository")),
+            "{found:#?}"
+        );
+        remove_shared_indexes(&root.join(".git"));
         let found = watch.findings();
         assert!(
             found
@@ -5460,6 +5717,20 @@ mod tests {
                 .any(|f| f.contains(".git/index` cannot be read in full")),
             "{found:#?}"
         );
+    }
+
+    /// Remove the shared indexes of the git directory `dir`, leaving its split index naming one
+    /// that is missing.
+    fn remove_shared_indexes(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("sharedindex."))
+            {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
     }
 
     /// A project with no repository at its root at launch is watched too: a `.git` of any kind,
@@ -6018,6 +6289,14 @@ mod tests {
         assert!(mounts.is_empty());
     }
 
+    /// The tracked paths of a git index blob that is not split, as [`git_tracked_paths`] reads
+    /// them.
+    fn parse_git_index(data: &[u8]) -> Option<BTreeSet<String>> {
+        parse_git_index_entries(data, SHA1_LEN)
+            .filter(|blob| blob.link.is_none())
+            .map(|blob| tracked_paths(blob.entries))
+    }
+
     #[test]
     fn the_git_index_parse_reads_the_tracked_paths() {
         // A version-2 index with two entries, built to the format's own rules: 62 bytes of
@@ -6094,8 +6373,9 @@ mod tests {
         v4.extend(entry(0, "sub/a.txt", 0o100644));
         v4.extend(entry(5, "b.txt", 0o100644));
         v4.extend(entry(9, "vendor/lib", GITLINK_MODE));
-        let entries =
-            parse_git_index_entries(&v4, SHA1_LEN).expect("a well-formed v4 index parses");
+        let entries = parse_git_index_entries(&v4, SHA1_LEN)
+            .expect("a well-formed v4 index parses")
+            .entries;
         let read: Vec<(String, u32)> = entries
             .iter()
             .map(|e| (String::from_utf8_lossy(&e.path).into_owned(), e.mode))

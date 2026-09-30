@@ -199,9 +199,9 @@ the project's repository is, its configuration, its hooks directory and the file
 configuration includes, and the `.git` file in its directory that points at it is read-only
 as well. That covers a submodule's repository under `.git/modules/`, one in a read-write bind,
 and a repository embedded in the tree and added to the index. The submodules are found in the
-index, which sbx reads itself;
-an index it cannot read in full (a split index, or one past its size bound) refuses the launch
-in a repository that has submodules, and so does a link where a submodule's `.git` is looked
+index, which sbx reads itself, a split index together with the shared index it names;
+an index it cannot read in full (one past its size bound, or a split index whose shared index is
+missing) refuses the launch in a repository that has submodules, and so does a link where a submodule's `.git` is looked
 for. Holding a submodule's configuration costs what holding `.git/config` costs:
 `git submodule update` rewrites the submodule's configuration every time it runs and is
 refused, as are `git submodule sync`, `git config` and `git remote add` inside a submodule, and
