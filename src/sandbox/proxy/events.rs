@@ -53,7 +53,10 @@ const QUEUE: usize = 4096;
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
 /// The longest host an event may name. A DNS name is at most 253 bytes; a longer one is no
-/// destination the proxy can have reached, so an event naming it is dropped on arrival.
+/// destination the proxy can have reached, so an event naming it is dropped on arrival. A counted
+/// decision and an opened flow are held to it: the [`FlowRegistry`] keeps the host of every flow it
+/// lists for as long as the flow is open, so its cap on open flows bounds its memory only once each
+/// host is bounded.
 const MAX_HOST: usize = 253;
 
 /// The longest text a logged decision may carry in any one field. Every such field is cut from a
@@ -727,7 +730,7 @@ impl Applier {
                 proto,
             } => {
                 if let Some(flows) = &sinks.flows
-                    && host.len() <= MAX_FIELD
+                    && host.len() <= MAX_HOST
                 {
                     flows.open(id, &host, port, proto);
                 }
@@ -928,6 +931,30 @@ mod tests {
         let snap = counts.snapshot();
         assert_eq!(snap.len(), 1, "{:?}", snap.keys().collect::<Vec<_>>());
         assert!(snap.contains_key(&"b".repeat(MAX_HOST)));
+    }
+
+    /// A flow opened to a host longer than any name is not listed: the proxy opens one only for a
+    /// tunnel the supervisor dialled, to a host it resolved, and the registry keeps each host it
+    /// lists for as long as the flow is open.
+    #[test]
+    fn a_flow_to_a_host_longer_than_any_name_is_not_listed() {
+        let registry = Arc::new(FlowRegistry::new());
+        let events = spawn(Sinks {
+            flows: Some(Arc::clone(&registry)),
+            ..Sinks::default()
+        })
+        .unwrap();
+        for (id, host) in [(1, "a".repeat(MAX_HOST + 1)), (2, "b".repeat(MAX_HOST))] {
+            events.send(ProxyEvent::FlowOpened {
+                id,
+                host,
+                port: 443,
+                proto: Proto::Https,
+            });
+        }
+        events.flush();
+        let hosts: Vec<String> = registry.snapshot().into_iter().map(|f| f.host).collect();
+        assert_eq!(hosts, ["b".repeat(MAX_HOST)]);
     }
 
     /// A `flush` never waits on an applying side that has ended: the channel is then closed, and

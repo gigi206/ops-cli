@@ -1538,7 +1538,9 @@ pub(crate) struct FlowSnapshot {
 
 /// The most flows the registry lists at once. A proxy has no more tunnels open than its connection
 /// cap and each connection's streams allow, so this is reached only by a proxy reporting flows it
-/// does not have; past it an opening is not listed, and the view stays bounded.
+/// does not have; past it an opening is not listed, and the view stays bounded. What each listing
+/// keeps is bounded on arrival too: a host longer than the 253 bytes of a name is no flow the proxy
+/// opened ([`crate::sandbox::proxy::events`]), so the listed hosts take under 16 MiB together.
 const MAX_OPEN_FLOWS: usize = 65_536;
 
 /// The set of currently-open egress tunnels, keyed by the number the proxy gave each. Shared (via
