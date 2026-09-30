@@ -223,6 +223,13 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
         };
         budget.member()?;
         let mut entry = entry?;
+        // A PAX global header describes the archive rather than a member (`git archive` writes one
+        // carrying the commit it archived), and every other reader ignores it. The tar reader hands
+        // it on as an entry of its own, so it is skipped here rather than refused as a type this
+        // does not write.
+        if entry.header().entry_type() == tar::EntryType::XGlobalHeader {
+            continue;
+        }
         let path = entry.path()?.into_owned();
         resolvable(&path)?;
         let name = match path.file_name() {
@@ -269,6 +276,15 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
             continue;
         }
         if let Some(target) = name.strip_prefix(WHITEOUT) {
+            // A whiteout deletes the entry beside it that it names. An empty name or `.` would name
+            // the directory it sits in and remove it whole, and `..` the one above: none is an entry
+            // beside the marker.
+            if matches!(target, "" | "." | "..") {
+                return Err(io::Error::other(format!(
+                    "layer member `{}` is a whiteout that names no entry beside it",
+                    path.display()
+                )));
+            }
             let parent = path.parent().unwrap_or(Path::new(""));
             let dest = safe_path(root, &parent.join(target))?;
             remove(&dest)?;

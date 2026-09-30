@@ -742,6 +742,50 @@ fn a_contiguous_or_sparse_member_lands_like_the_regular_file_it_is() {
 /// The fallback used to return `Ok(())` for everything that was not a file, a directory, a link or
 /// a hard link, which is how the two above went missing. Device nodes, fifos and sockets keep the
 /// skip: the cage mounts its own `/dev`, and unprivileged creation would fail anyway.
+/// A PAX global header describes the archive rather than a member, and every other reader
+/// ignores it: `git archive` writes one first, carrying the commit it archived. It is skipped, and
+/// what follows it applies.
+#[test]
+fn a_pax_global_header_is_skipped_rather_than_refusing_the_image() {
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    let record = "52 comment=0123456789abcdef0123456789abcdef01234567\n";
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[
+            (
+                "pax_global_header",
+                Member::Typed(tar::EntryType::XGlobalHeader, record),
+            ),
+            ("etc/keep", Member::File("k")),
+        ]),
+    )
+    .expect("a global header is skipped");
+    assert!(root.join("etc/keep").is_file());
+    assert!(!root.join("pax_global_header").exists());
+}
+
+/// A whiteout names the entry beside it that it deletes, so one naming no entry, or the directory
+/// it sits in, is refused rather than taking that directory with it.
+#[test]
+fn a_whiteout_that_names_no_entry_beside_it_is_refused() {
+    for marker in ["a/b/.wh.", "a/b/.wh..", "a/b/.wh..."] {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.join("root");
+        apply_tar(
+            tmp.path(),
+            &root,
+            &tar_of(&[("a/b/keep", Member::File("k"))]),
+        )
+        .unwrap();
+        let err =
+            apply_tar(tmp.path(), &root, &tar_of(&[(marker, Member::File(""))])).expect_err(marker);
+        assert!(err.to_string().contains(marker), "{marker}: {err}");
+        assert!(root.join("a/b/keep").is_file(), "{marker}");
+    }
+}
+
 #[test]
 fn a_member_of_an_unwritable_type_is_named_rather_than_skipped() {
     for (flag, shown) in [(b'Z', "(type flag `Z`)"), (0x01, "(type flag `\\x01`)")] {
