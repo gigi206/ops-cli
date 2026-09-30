@@ -974,7 +974,10 @@ pub(crate) enum WebsocketSecret {
     /// What this buys is bounded by how the bytes arrive, and the bound is worth knowing: the scan
     /// runs on each chunk read from the cage, before that chunk is written on, so a secret whole
     /// inside one chunk never crosses. A secret split across chunks has had its first part relayed
-    /// by the time the second completes the match, and the close then stops the rest.
+    /// by the time the second completes the match, and the close then stops the rest. A
+    /// `permessage-deflate` message is read whole, at its final frame, so its earlier frames have
+    /// crossed by then; one left unfinished, by another message begun in its midst or by a close,
+    /// stops the scan of that direction, which closes the tunnel.
     Block,
 }
 

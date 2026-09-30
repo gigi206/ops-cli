@@ -466,19 +466,22 @@ closes the tunnel instead: see below.)
 - **Byte-exact, per message.** Like the other tripwires it matches a verbatim value; a
   re-encoded one, or one split across two separate messages, is out of scope by design.
   Within one message a value spanning several frames is still seen, and a
-  `permessage-deflate` message is scanned whole, past whatever a capture keeps of it.
+  `permessage-deflate` message is scanned whole, past whatever a capture keeps of it, at
+  its final frame: the frames before that one have crossed by the time it is read.
   Control frames past 125 bytes or fragmented leave that direction unscanned. A direction
   stops instead on a compressed message it cannot read whole: one of more than 1 MiB on
   the wire (four times `capture_max_kb` when a body capture keeps more than 256 KiB), one
   that decompresses to more than 64 MiB past its first 256 KiB, one that does not decode,
-  or one on a direction whose upgrade response agreed no compression sbx can follow. A
+  one left unfinished (another message begun in its midst, or a close), or one on a
+  direction whose upgrade response agreed no compression sbx can follow. A
   direction that stops while it is scanned is named in a warning. Under `websocket_secret
   = "block"`, which follows the framing from the `101` whether or not there is a secret
   yet, a stopped `cage → upstream` direction also closes the tunnel.
 - **`websocket_secret` decides what happens next.** The default `"warn"` only records,
   as above. With `websocket_secret = "block"` the tunnel is recorded **and closed**;
-  the match is bounded to one message chunk, so a secret already partly relayed cannot
-  be un-sent. See [`websocket_secret`](../configuration/network#table-fields).
+  the match is bounded to one chunk read from the cage, or for a compressed message to
+  its final frame, so a secret already partly relayed cannot be un-sent. See
+  [`websocket_secret`](../configuration/network#table-fields).
 
 Under `--json` the same fact rides on every event as `secrets_seen`, a possibly-empty list of
 `{"name": …, "way": "out"|"back"}`.

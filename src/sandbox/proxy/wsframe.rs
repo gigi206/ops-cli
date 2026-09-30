@@ -575,6 +575,8 @@ enum HeaderScan {
         rsv1: bool,
         /// Whether this frame opens a message (a text or binary opcode) rather than continuing one.
         starts_message: bool,
+        /// Whether this frame closes the connection.
+        closes: bool,
     },
 }
 
@@ -750,7 +752,19 @@ impl FrameTee {
                         fin,
                         rsv1,
                         starts_message,
+                        closes,
                     } => {
+                        // A compressed message is scanned whole, at its final frame, so one that
+                        // never reaches it is a message the scan never sees: its frames before this
+                        // one have crossed, and nothing will look at them. A new message begun in
+                        // its midst (RFC 6455 §5.4 forbids it) or a close is where it is left
+                        // unfinished, and the direction stops there, which
+                        // [`Self::newly_blinded`] reports. A ping or a pong may sit between two of
+                        // its frames.
+                        if self.compressed && !self.fin && (starts_message || closes) {
+                            self.done = true;
+                            break;
+                        }
                         self.payload_left = payload_len;
                         self.keeps = keeps;
                         self.control = control;
@@ -1011,6 +1025,7 @@ fn scan_frame_header(buf: &[u8]) -> HeaderScan {
         fin: buf[0] & 0x80 != 0,
         rsv1: buf[0] & 0x40 != 0,
         starts_message: matches!(opcode, 0x1 | 0x2),
+        closes: opcode == 0x8,
     }
 }
 
@@ -1540,6 +1555,47 @@ mod tests {
         let (mut t, sink) = deflating_tee(4096, false);
         t.push(&wire);
         assert_eq!(captured(&sink).bytes, payload);
+    }
+
+    /// A compressed message is scanned whole, at its final frame, so one that never reaches it is a
+    /// message the scan never sees: a new message begun in its midst, which RFC 6455 §5.4 forbids,
+    /// or a close. The direction says it has gone blind rather than letting the message pass in
+    /// silence. A ping between two of its frames is legal, and the message is scanned when it ends.
+    #[test]
+    fn a_compressed_message_left_unfinished_blinds_its_direction() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        const KEY: Option<[u8; 4]> = Some([1, 2, 3, 4]);
+        let first = |c: &mut CompressorOxide| {
+            let mut text = b"hello ".to_vec();
+            text.extend_from_slice(NEEDLE_VALUE);
+            text.extend_from_slice(b" bye");
+            let mut framed = frame_with_fin(0x1, &deflated(&text, c), KEY, false);
+            framed[0] |= 0x40; // RSV1: the message is compressed
+            framed
+        };
+        for (after, what) in [
+            (frame(0x1, b"next", KEY), "a new message"),
+            (frame(0x8, b"", KEY), "a close"),
+        ] {
+            let mut c = CompressorOxide::new(raw_deflate_flags());
+            let mut t = scanning_tee(&[needle()], Some(false));
+            t.push(&first(&mut c));
+            assert!(!t.newly_blinded(), "{what}: the message is still open");
+            t.push(&after);
+            assert!(t.newly_blinded(), "{what}");
+        }
+
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let mut t = scanning_tee(&[needle()], Some(false));
+        t.push(&first(&mut c));
+        t.push(&frame(0x9, b"ping", KEY));
+        assert!(
+            !t.newly_blinded(),
+            "a ping may sit between two frames of a message"
+        );
+        t.push(&frame_with_fin(0x0, b"", KEY, true));
+        assert!(!t.newly_blinded());
+        assert_eq!(t.sightings(), ["demo-token"]);
     }
 
     /// A message the peer chose NOT to compress rides the same connection with `RSV1` clear, and must
@@ -2219,11 +2275,13 @@ mod tests {
     }
 
     /// A direction's negotiated compression as the tee is told it (`Some(no_context_takeover)`),
-    /// and the messages sent down it.
+    /// the messages sent down it, and the payload of the close that ends it, if one does.
     #[derive(Debug, Clone)]
     struct Conversation {
         deflate: Option<bool>,
         sent: Vec<Sent>,
+        /// Last when sent at all: RFC 6455 §5.5.1 has nothing sent after a close.
+        close: Option<Vec<u8>>,
     }
 
     /// Text made of pieces: arbitrary bytes, the two declared values, and the halves of one, so a
@@ -2245,18 +2303,18 @@ mod tests {
     }
 
     /// Conversations of up to four messages, each in one to three frames, masked or not, with
-    /// control frames between or after them. A compressed message is now and then preceded by
-    /// [`SCAN_MESSAGE_CAP`] bytes of padding, which puts what follows past the plaintext cap.
+    /// pings and pongs between or after them, and now and then a close to end them. A compressed
+    /// message is now and then preceded by [`SCAN_MESSAGE_CAP`] bytes of padding, which puts what
+    /// follows past the plaintext cap.
     fn conversations() -> impl proptest::strategy::Strategy<Value = Conversation> {
         use proptest::prelude::{Just, any, prop_oneof};
         use proptest::sample::Index;
         use proptest::strategy::Strategy;
-        let control = (prop_oneof![Just(0x8u8), Just(0x9), Just(0xa)], texts()).prop_map(
-            |(opcode, mut payload)| {
+        let control =
+            (prop_oneof![Just(0x9u8), Just(0xa)], texts()).prop_map(|(opcode, mut payload)| {
                 payload.truncate(CONTROL_MAX);
                 (opcode, payload)
-            },
-        );
+            });
         let sent = (
             (
                 any::<bool>(),
@@ -2290,9 +2348,14 @@ mod tests {
         (
             proptest::option::of(any::<bool>()),
             proptest::collection::vec(sent, 0..5),
+            proptest::option::of(texts()),
         )
-            .prop_map(|(deflate, sent)| Conversation {
+            .prop_map(|(deflate, sent, close)| Conversation {
                 deflate,
+                close: close.map(|mut payload| {
+                    payload.truncate(CONTROL_MAX);
+                    payload
+                }),
                 sent: sent
                     .into_iter()
                     .map(|(padded, mut sent)| {
@@ -2353,6 +2416,9 @@ mod tests {
                 }
             }
         }
+        if let Some(close) = &talk.close {
+            out.extend(frame(0x8, close, None));
+        }
         out
     }
 
@@ -2412,7 +2478,7 @@ mod tests {
                 let within = |text: &[u8]| text.windows(value.len()).any(|w| w == value);
                 talk.sent.iter().any(|sent| {
                     within(&sent.text) || sent.controls.iter().any(|(_, _, c)| within(c))
-                })
+                }) || talk.close.as_deref().is_some_and(within)
             };
             if scan {
                 let mut expected: Vec<String> = two_needles()

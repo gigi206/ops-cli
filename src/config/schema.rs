@@ -2105,7 +2105,8 @@ pub(crate) struct NetworkTable {
     /// match, which may be the app legitimately echoing a value that looks like the secret. What
     /// `"block"` buys is bounded by how the bytes arrive: the scan runs on each chunk read from the
     /// cage before that chunk is written on, so a secret whole inside one chunk never crosses, while
-    /// one split across chunks has had its first part relayed before the match completes. An unknown
+    /// one split across chunks has had its first part relayed before the match completes, and a
+    /// compressed message is read at its final frame, after the frames before it. An unknown
     /// value is refused with a warning and the **strict** posture applies instead, as `capture`
     /// above applies its own `off`. The difference is which spelling that is: here the permissive
     /// value is the one a policy carries unasked, so leaving it in place would keep the weaker

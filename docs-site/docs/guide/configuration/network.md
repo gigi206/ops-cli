@@ -176,7 +176,11 @@ It ends a live conversation on a byte-exact match, which can be the app legitima
 back a value that looks like the secret. And what it prevents is bounded by how the bytes
 arrive: the scan runs on each chunk read from the cage **before** that chunk is written on,
 so a secret contained in one chunk never reaches the far side, while one split across chunks
-has had its first part relayed before the match completes, and the close stops the rest.
+has had its first part relayed before the match completes, and the close stops the rest. A
+`permessage-deflate` message is the exception: it is read whole, at its final frame, so the
+frames before that one have crossed by then. One left unfinished (another message begun in
+its midst, or a close) stops the scan of that direction, which under `"block"` closes the
+tunnel.
 
 The way back is recorded and never closed, whichever setting you choose: a secret arriving
 *into* the cage is not an exfiltration, and the answer the request paths give that is
