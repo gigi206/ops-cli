@@ -4801,6 +4801,12 @@ mod tests {
                 e.readonly
             );
         }
+        // The worktree's own `modules` directory is held, and the submodule initialized in it is
+        // reopened, so a commit in that submodule still works.
+        assert!(e.reopened.contains(&modules), "{:?}", e.reopened);
+        assert!(e.covering(&modules.join("objects/x")).is_none());
+        let planted = root.join(".git/worktrees/inner/modules/planted/config");
+        assert!(e.covering(&planted).is_some());
     }
 
     /// A worktree's `.git` where the cage writes that does not name back the directory whose

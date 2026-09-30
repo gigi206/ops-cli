@@ -1117,7 +1117,8 @@ fn fs_test(args: &[OsString]) -> ExitCode {
         // reader to look for, or remove, a line that is in no config.
         Some((_, m)) if m.builtin => println!(
             "  {dim}by sbx itself: the project config, its mise files, and what the project's git \
-             reads where the cage writes (its hooks, its configuration, a `.git` file) are \
+             reads where the cage writes (its hooks, its configuration, a `.git` file, the \
+             directory of its submodules' repositories) are \
              read-only in the cage by default{r}",
             dim = pal.dim
         ),
