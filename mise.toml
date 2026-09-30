@@ -105,8 +105,10 @@ run = ["cargo audit", "cargo audit -f proc-shim/Cargo.lock"]
 
 [tasks.rustdoc]
 description = "Build the crate's own rustdoc, denying warnings (a doc reference that resolves to nothing)"
-# `--document-private-items` is not a nicety here: sbx is a binary crate, so without it rustdoc
-# documents almost nothing and the guard guards nothing.
+# `--document-private-items` restates cargo's default for a binary target, which already documents
+# non-public items. It is written out so the guard does not rest on that default: a library target is
+# documented without its non-public items, and nearly every doc comment in sbx sits on one, so a
+# library added to the package would leave them unchecked with nothing failing.
 #
 # What it catches is a reference in a doc comment that names a symbol which was renamed, moved, or
 # never existed. rustdoc drops the link and renders the label as plain code font, so a normal build
