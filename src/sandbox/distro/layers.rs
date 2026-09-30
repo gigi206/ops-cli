@@ -205,6 +205,7 @@ pub(super) fn apply(
 
 /// Walk one layer's members, applying each.
 fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result<()> {
+    let root = &Root::open(root)?;
     let left = Rc::new(Cell::new(None));
     let mut archive = tar::Archive::new(Metered {
         inner: layer,
@@ -223,6 +224,7 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
         budget.member()?;
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
+        resolvable(&path)?;
         let name = match path.file_name() {
             Some(raw) => match raw.to_str() {
                 Some(name) => name,
@@ -259,7 +261,7 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
             // member being *written* and wrong here: this one names a directory to empty, and
             // every other applier empties the root for it. Refusing cost the whole image.
             let dir = if parent.components().all(|c| matches!(c, Component::CurDir)) {
-                root.to_path_buf()
+                root.path.to_path_buf()
             } else {
                 safe_path(root, parent)?
             };
@@ -278,13 +280,137 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
     }
 }
 
+/// The tree a layer is applied over: its path, and a descriptor on it that the directories of each
+/// member are resolved beneath ([`safe_path`]).
+struct Root<'a> {
+    path: &'a Path,
+    dir: fs::File,
+}
+
+impl<'a> Root<'a> {
+    fn open(path: &'a Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(path)?;
+        Ok(Root { path, dir })
+    }
+
+    /// Refuse `rel` when one of the directories on the way to its final component, `parents`, is
+    /// a symlink on disk.
+    ///
+    /// One `openat2` resolves them all, refusing to follow any link: a look at each directory in
+    /// turn restarts from the root every time, so it costs the square of the depth, for every
+    /// member of the layer. A resolution that stops at a directory that is missing, or at a
+    /// component that is not one, met no link before it, and nothing past it is there to follow.
+    /// On a kernel without the call (5.6 brought it) the look at each directory
+    /// ([`Self::first_link`]) answers instead; any other failure refuses the member, since a check
+    /// that could not run is not one that passed.
+    fn check_parents(&self, rel: &Path, parents: &Path) -> io::Result<()> {
+        let through = |link: Option<PathBuf>| {
+            let link = link.map_or_else(String::new, |l| format!(" `{}`", l.display()));
+            io::Error::other(format!(
+                "layer member `{}` would be written through the symlink{link}",
+                rel.display()
+            ))
+        };
+        match self.resolve(parents) {
+            Ok(()) => Ok(()),
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOENT | libc::ENOTDIR) => Ok(()),
+                Some(libc::ELOOP) => Err(through(self.first_link(rel))),
+                Some(libc::ENOSYS) => self
+                    .first_link(rel)
+                    .map_or(Ok(()), |l| Err(through(Some(l)))),
+                _ => Err(io::Error::other(format!(
+                    "layer member `{}`: its directories cannot be resolved: {e}",
+                    rel.display()
+                ))),
+            },
+        }
+    }
+
+    /// `parents`, relative to the root, resolved without following a single link.
+    fn resolve(&self, parents: &Path) -> io::Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(parents.as_os_str().as_bytes())
+            .map_err(|_| io::Error::other("a layer member's path carries a NUL byte"))?;
+        // SAFETY: `open_how` is three `u64`s, so all-zero is a valid value, and the one the kernel
+        // reads as "unset" for the field this leaves alone.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+        how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_BENEATH;
+        // SAFETY: the descriptor is the root's, open for the whole call; `path` is a live
+        // NUL-terminated string and `how` a live `open_how` of the size passed.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                self.dir.as_raw_fd(),
+                path.as_ptr(),
+                std::ptr::addr_of!(how),
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor the call returned, owned here and closed once, on drop.
+        drop(unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) });
+        Ok(())
+    }
+
+    /// The first directory on the way to `rel`'s final component that is a symlink on disk, looked
+    /// at one at a time. The look stops at the first that is not there to look at: nothing past it
+    /// is.
+    fn first_link(&self, rel: &Path) -> Option<PathBuf> {
+        let mut out = self.path.to_path_buf();
+        let mut parents: Vec<_> = rel
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(part) => Some(part),
+                _ => None,
+            })
+            .collect();
+        parents.pop();
+        for part in parents {
+            out.push(part);
+            match out.symlink_metadata() {
+                Ok(meta) if meta.file_type().is_symlink() => return Some(out),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
+/// Refuse a path the kernel would refuse to resolve: it names nothing a layer can hold. Checked
+/// before any walk, since a whiteout or an opaque marker there creates nothing that would fail
+/// instead.
+fn resolvable(path: &Path) -> io::Result<()> {
+    let longest = libc::PATH_MAX as usize - 1;
+    let len = path.as_os_str().len();
+    if len > longest {
+        return Err(io::Error::other(format!(
+            "a layer member names a path of {len} bytes, longer than the kernel resolves (at most \
+             {longest})"
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve `rel` under `root`, refusing every shape that would leave it.
 ///
 /// The symlink check looks at what is **on disk**, because that is what an `open` would follow: a
 /// link planted by an earlier layer is exactly the case a check against the archive's own paths
-/// misses.
-fn safe_path(root: &Path, rel: &Path) -> io::Result<PathBuf> {
-    let mut out = root.to_path_buf();
+/// misses. The final component is exempt because a layer replacing a link writes *at* it and not
+/// *through* it, which is why every branch of `write_member` unlinks what is there before creating
+/// anything.
+fn safe_path(root: &Root<'_>, rel: &Path) -> io::Result<PathBuf> {
+    resolvable(rel)?;
+    let mut out = root.path.to_path_buf();
     // Which component is the last one, counted rather than compared against a rebuilt path: a
     // member spelled `./bin` has the same destination as `bin`, and a comparison would find the two
     // unequal and refuse the first for a symlink the second is allowed to replace.
@@ -292,26 +418,15 @@ fn safe_path(root: &Path, rel: &Path) -> io::Result<PathBuf> {
         .components()
         .filter(|c| matches!(c, Component::Normal(_)))
         .count();
+    let mut parents = PathBuf::new();
     let mut seen = 0;
     for component in rel.components() {
         match component {
             Component::Normal(part) => {
                 seen += 1;
                 out.push(part);
-                // The parent chain is checked as it is built, so a link is caught before anything
-                // is created beyond it. The final component is exempt because a layer replacing a
-                // link writes *at* it and not *through* it, which is why every branch of
-                // `write_member` unlinks what is there before creating anything.
-                if seen < last
-                    && out
-                        .symlink_metadata()
-                        .is_ok_and(|m| m.file_type().is_symlink())
-                {
-                    return Err(io::Error::other(format!(
-                        "layer member `{}` would be written through the symlink `{}`",
-                        rel.display(),
-                        out.display()
-                    )));
+                if seen < last {
+                    parents.push(part);
                 }
             }
             Component::CurDir => {}
@@ -323,20 +438,34 @@ fn safe_path(root: &Path, rel: &Path) -> io::Result<PathBuf> {
             }
         }
     }
-    if out == *root {
+    if out == *root.path {
         return Err(io::Error::other("a layer member names the root itself"));
+    }
+    if last > 1 {
+        root.check_parents(rel, &parents)?;
     }
     Ok(out)
 }
 
 /// Remove whatever is at `path`, if anything. A whiteout for something no lower layer created is
-/// not an error: layers are written against an assumed base, not against this one.
+/// not an error: layers are written against an assumed base, not against this one. Nothing there
+/// is the one answer taken for none; a path that could not be looked at is not one that was empty.
 fn remove(path: &Path) -> io::Result<()> {
     match path.symlink_metadata() {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
         Ok(_) => fs::remove_file(path),
-        Err(_) => Ok(()),
+        Err(e) if absent(&e) => Ok(()),
+        Err(e) => Err(e),
     }
+}
+
+/// Whether `e` says there is nothing at a path: nothing by that name, or a component on the way
+/// that is not a directory.
+fn absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
 }
 
 /// Empty a directory without removing it: what an opaque marker means.
@@ -357,8 +486,10 @@ fn clear_directory(dir: &Path) -> io::Result<()> {
             dir.display()
         )));
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(());
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if absent(&e) => return Ok(()),
+        Err(e) => return Err(e),
     };
     for entry in entries {
         remove(&entry?.path())?;
@@ -391,7 +522,7 @@ fn create_parents(dir: &Path, budget: &mut Budget) -> io::Result<()> {
 fn write_member<R: io::Read>(
     entry: &mut tar::Entry<'_, R>,
     dest: &Path,
-    root: &Path,
+    root: &Root<'_>,
     budget: &mut Budget,
 ) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;

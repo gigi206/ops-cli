@@ -369,6 +369,55 @@ fn a_member_is_never_written_through_a_symlink_an_earlier_layer_planted() {
     );
 }
 
+/// A member whose path is longer than the kernel resolves names nothing a layer can hold: a file
+/// there cannot be created, and a whiteout or an opaque marker there, which creates nothing, was
+/// accepted in silence, each after a walk of its whole path.
+#[test]
+fn a_member_path_longer_than_the_kernel_resolves_is_refused() {
+    let tmp = crate::testutil::TmpDir::new();
+    let deep = "a/".repeat(libc::PATH_MAX as usize / 2);
+    for (what, member) in [
+        ("a whiteout", format!("{deep}.wh.x")),
+        ("an opaque marker", format!("{deep}.wh..wh..opq")),
+        ("a file", format!("{deep}x")),
+    ] {
+        let root = tmp.join(what);
+        let err =
+            apply_tar(tmp.path(), &root, &tar_of(&[(&member, Member::File(""))])).expect_err(what);
+        assert!(err.to_string().contains("longer than"), "{what}: {err}");
+    }
+}
+
+/// The parent chain is checked in one resolution where the kernel offers it, and by a look at each
+/// directory on the way where it does not: both refuse the planted link and name it.
+#[test]
+fn both_checks_of_a_members_parents_name_the_link_on_the_way() {
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("usr/lib")).unwrap();
+    std::os::unix::fs::symlink(tmp.path(), root.join("usr/lib/link")).unwrap();
+    let dir = Root::open(&root).unwrap();
+    let member = Path::new("usr/lib/link/deep/file");
+
+    let err = safe_path(&dir, member).expect_err("the resolution refuses the link");
+    assert!(
+        err.to_string().contains(&format!(
+            "the symlink `{}`",
+            root.join("usr/lib/link").display()
+        )),
+        "{err}"
+    );
+    assert_eq!(
+        dir.first_link(member),
+        Some(root.join("usr/lib/link")),
+        "the look at each directory finds the same link"
+    );
+    for clean in ["usr/lib/file", "usr/missing/deep/file", "file"] {
+        assert!(safe_path(&dir, Path::new(clean)).is_ok(), "{clean}");
+        assert_eq!(dir.first_link(Path::new(clean)), None, "{clean}");
+    }
+}
+
 #[test]
 fn a_whiteout_removes_what_a_lower_layer_put_there() {
     let tmp = crate::testutil::TmpDir::new();

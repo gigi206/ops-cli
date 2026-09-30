@@ -262,6 +262,14 @@ holds whole in memory before the member reaches the budget. Nothing honest comes
 refused rather than held. A member's own data is not under this bound; the byte ceiling
 above counts it.
 
+A member whose path is longer than the kernel resolves, **4095 bytes**, is refused too,
+a whiteout or an opaque marker included: it names nothing a layer can hold, and a marker,
+which creates nothing, would otherwise pass without a word. The directories on the way to
+each member are checked for a symlink in one resolution by the kernel (`openat2`, Linux
+5.6 and later), so a member at the bottom of a deep tree costs a few walks of its own path
+rather than one walk per directory on it. A kernel older than 5.6 has no such call, and the
+check then looks at one directory at a time, which costs the square of the depth.
+
 ### What a layer may contain
 
 A layer's members are applied as the image declares them: regular files (including the

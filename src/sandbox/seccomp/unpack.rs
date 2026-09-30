@@ -18,6 +18,10 @@
 //!
 //! `fcntl` is allowed only to duplicate a descriptor, mark it close-on-exec or read its flags.
 //!
+//! `openat2` is made by number rather than through a C library, on every architecture: the unpack
+//! resolves the directories on the way to each member in that one call, following no link. Left
+//! off the list, it would refuse every member below the root rather than fall back.
+//!
 //! The unpack is one thread, and ends by ending its process: nothing on the list ends a thread.
 //!
 //! On x86_64 its C libraries make some of those calls under their older names (`open`, `stat`,
@@ -34,8 +38,10 @@ fn work() -> Vec<i64> {
         libc::SYS_read,
         libc::SYS_write,
         libc::SYS_close,
-        // The tree: entries made, linked, looked at, given a mode, listed and removed.
+        // The tree: entries made, linked, looked at, given a mode, listed and removed, and the
+        // directories on the way to each resolved in one call, following no link.
         libc::SYS_openat,
+        libc::SYS_openat2,
         libc::SYS_mkdirat,
         libc::SYS_symlinkat,
         libc::SYS_linkat,
