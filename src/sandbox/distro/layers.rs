@@ -318,16 +318,30 @@ fn unpack<R: io::Read>(layer: R, root: &Path, budget: &mut Budget) -> io::Result
 /// member are resolved beneath ([`safe_path`]).
 struct Root<'a> {
     path: &'a Path,
-    dir: fs::File,
+    dir: std::os::fd::OwnedFd,
 }
 
 impl<'a> Root<'a> {
+    /// Open the tree at `path` as a descriptor to resolve beneath, pinning no more than the inode:
+    /// through `libc::open`, since `OpenOptions` masks `O_PATH` away on musl, the target sbx ships
+    /// as.
     fn open(path: &'a Path) -> io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let dir = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
-            .open(path)?;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::other("the tree's path carries a NUL byte"))?;
+        // SAFETY: `name` is a live NUL-terminated string for the whole call.
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor the call returned, owned here and closed once, on drop.
+        let dir = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         Ok(Root { path, dir })
     }
 
