@@ -228,6 +228,15 @@ as it names a `.git/commondir`, and so does an index the cage leaves in a form s
 in full, since the repositories it names can then not be listed; the next launch refuses on
 that index.
 
+A **rebase that stopped**, on a conflict or an `edit`, keeps the commands it has left in
+`.git/rebase-merge/git-rebase-todo`, and `git rebase --continue` runs each `exec` line there in
+a shell, on the host when you continue it there. git rewrites that list at each step of a
+rebase run in the cage, so it stays writable. sbx names instead the `exec` lines written in it
+during the session once the cage has exited, and every launch warns while it holds any, in the
+project's repository, its worktrees and its submodules. Check them with `git rebase
+--edit-todo` before you continue such a rebase outside the cage. A cherry-pick or a revert that
+stops keeps a list of its own, where git refuses any command but its own.
+
 **What this does not close: the hooks a project already has run its code.** The protection
 closes the hooks git would run without a trace: an untracked script in the hooks directory, a
 configuration key that names a program. It cannot close the hooks a project already uses,

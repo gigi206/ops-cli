@@ -54,7 +54,7 @@ use super::binds::ExtraBind;
 use super::spec::Mount;
 use crate::config::fspolicy::{FsPolicy, has_wildcard, matches_component};
 use crate::diag::visible;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1026,7 +1026,71 @@ fn repo_carrier(
         masks.extend(git_include_files(reach, tree, refused));
         submodule_carrier(reach, tree, depth, masks, &mut carried, warnings, refused);
     }
+    for tree in std::iter::once(repo).chain(&trees) {
+        let todo = tree.dir.join(REBASE_TODO);
+        match rebase_exec_lines(reach, &tree.dir) {
+            Ok(Some(lines)) if !lines.is_empty() => warnings.push(visible(&format!(
+                "`{}` holds `exec` lines, the commands of a stopped rebase that `git rebase \
+                 --continue` runs on your host, and the cage writes it: check them (`git rebase \
+                 --edit-todo`) before you continue that rebase outside the cage",
+                todo.display()
+            ))),
+            Err(e) => warnings.push(visible(&format!(
+                "`{}` cannot be read ({e}): it lists the commands of a stopped rebase, `exec` \
+                 lines among them, that `git rebase --continue` runs on your host. Check it before \
+                 you continue that rebase outside the cage",
+                todo.display()
+            ))),
+            Ok(_) => {}
+        }
+    }
     carried
+}
+
+/// Where a stopped rebase keeps the commands it has left, in the git directory of the work tree
+/// it runs in.
+const REBASE_TODO: &str = "rebase-merge/git-rebase-todo";
+
+/// How much of a rebase's todo list is read: a line per commit left, so a few MiB is far above a
+/// real one.
+const REBASE_TODO_MAX: u64 = 4 * 1024 * 1024;
+
+/// How much of an `exec` line the end of a session shows, in characters.
+const REBASE_LINE_SHOWN: usize = 120;
+
+/// The `exec` lines of the todo list of a rebase stopped in the git directory `git_dir`, where the
+/// cage writes it ([`Reach`]), or `None` when there is none or the cage does not write it; `Err`
+/// when it cannot be read in full.
+///
+/// A rebase that stops, on a conflict or an `edit`, leaves the commands it has left in that list,
+/// and git runs each `exec` line in a shell when the rebase goes on (`git rebase --continue`),
+/// whoever continues it: one the cage wrote runs on the host. The list cannot be held read-only,
+/// since git rewrites it at each step of a rebase run in the cage, so it is read instead, as
+/// [`super::inspect::read_cage_file`] reads a file the cage writes. A line counts as git counts it:
+/// its first word past the blanks that open it is `exec` or its abbreviation `x`, followed by a
+/// blank. A cherry-pick or a revert that stops keeps its list elsewhere, and git refuses any command
+/// there but its own.
+fn rebase_exec_lines(reach: &Reach, git_dir: &Path) -> io::Result<Option<BTreeSet<String>>> {
+    let todo = git_dir.join(REBASE_TODO);
+    if !reach.holds(&todo) {
+        return Ok(None);
+    }
+    let Some(body) = super::inspect::read_cage_file(&todo, REBASE_TODO_MAX)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        body.split(|&b| b == b'\n')
+            .map(<[u8]>::trim_ascii)
+            .filter(|line| {
+                let rest = line
+                    .strip_prefix(b"exec")
+                    .or_else(|| line.strip_prefix(b"x"));
+                rest.and_then(|rest| rest.first())
+                    .is_some_and(|b| matches!(b, b' ' | b'\t'))
+            })
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect(),
+    ))
 }
 
 /// How deep submodules of submodules are followed; one nested deeper refuses the launch.
@@ -1984,6 +2048,12 @@ fn listed_work_tree(dir: &Path) -> Option<PathBuf> {
 /// index it could read at launch and cannot read after the session is named too, rather than
 /// passed over. Every name it prints is escaped.
 ///
+/// A stopped rebase's todo list is watched the same way, in the git directory of each work tree
+/// the launch carried and of each submodule's repository: git rewrites it at each step, so it
+/// cannot be held, and an `exec` line written in it during the session runs on the host at `git
+/// rebase --continue` ([`rebase_exec_lines`]). The lines there at launch are noted, and the ones
+/// that were not are named.
+///
 /// A project with no repository at its root at launch, a directory of a larger repository or one
 /// not yet under version control, has no git file to hold, and the cage can make it one: a `.git`,
 /// or a bare repository's `HEAD`, `objects` and `refs`, which a git command run there then reads in
@@ -2068,6 +2138,8 @@ pub(crate) struct RepoWatch {
     trees: Vec<GitRepo>,
     configs: BTreeSet<PathBuf>,
     submodules: GitlinkScan,
+    /// The `exec` lines of each stopped rebase's todo list at launch, by git directory.
+    rebases: BTreeMap<PathBuf, BTreeSet<String>>,
 }
 
 impl RepoWatch {
@@ -2078,13 +2150,69 @@ impl RepoWatch {
         let trees: Vec<GitRepo> = std::iter::once(repo.clone()).chain(others).collect();
         let configs = WorktreeScan::of(&reach, &repo.common).configs;
         let submodules = GitlinkScan::of(&reach, &trees);
+        let rebases = Self::git_dirs(&trees, &submodules)
+            .filter_map(|dir| {
+                let lines = rebase_exec_lines(&reach, dir).ok()??;
+                Some((dir.clone(), lines))
+            })
+            .collect();
         RepoWatch {
             reach,
             repo,
             trees,
             configs,
             submodules,
+            rebases,
         }
+    }
+
+    /// The git directories of the work trees the launch carried and of the submodules' repositories
+    /// `scan` found.
+    fn git_dirs<'a>(
+        trees: &'a [GitRepo],
+        scan: &'a GitlinkScan,
+    ) -> impl Iterator<Item = &'a PathBuf> {
+        trees.iter().map(|tree| &tree.dir).chain(&scan.git_dirs)
+    }
+
+    /// One finding for each stopped rebase whose todo list holds `exec` lines it did not hold at
+    /// launch ([`rebase_exec_lines`]), or that cannot be read after the session, in the work trees
+    /// the launch carried and in the submodules' repositories `now` found.
+    fn rebase_findings(&self, now: &GitlinkScan) -> Vec<String> {
+        let none = BTreeSet::new();
+        let mut out = Vec::new();
+        for dir in Self::git_dirs(&self.trees, now) {
+            let todo = dir.join(REBASE_TODO);
+            let lines = match rebase_exec_lines(&self.reach, dir) {
+                Ok(Some(lines)) => lines,
+                Ok(None) => continue,
+                Err(e) => {
+                    out.push(format!(
+                        "`{}` cannot be read after the session ({e}): it lists the commands of a \
+                         stopped rebase, `exec` lines among them, that `git rebase --continue` \
+                         runs on your host. Check it before you continue that rebase outside the \
+                         cage",
+                        todo.display()
+                    ));
+                    continue;
+                }
+            };
+            let before = self.rebases.get(dir).unwrap_or(&none);
+            let added: Vec<&String> = lines.difference(before).collect();
+            let Some(first) = added.first() else {
+                continue;
+            };
+            let first: String = first.chars().take(REBASE_LINE_SHOWN).collect();
+            out.push(format!(
+                "`{}` holds {} `exec` line{} written during the session, which `git rebase \
+                 --continue` runs on your host, the first `{first}`: check them (`git rebase \
+                 --edit-todo`) before you continue that rebase outside the cage",
+                todo.display(),
+                added.len(),
+                if added.len() == 1 { "" } else { "s" }
+            ));
+        }
+        out
     }
 
     /// What appeared during the session, one message per finding, escaped for the terminal.
@@ -2149,6 +2277,7 @@ impl RepoWatch {
                 index.display()
             ));
         }
+        out.extend(self.rebase_findings(&now));
         if now.more && !self.submodules.more {
             out.push(format!(
                 "`{}` names more submodules after the session than sbx follows: check them from a \
@@ -2233,6 +2362,8 @@ impl WorktreeScan {
 #[derive(Default)]
 struct GitlinkScan {
     repos: BTreeSet<PathBuf>,
+    /// The git directory of each repository in `repos` the walk followed.
+    git_dirs: Vec<PathBuf>,
     unread: Vec<PathBuf>,
     more: bool,
 }
@@ -2274,6 +2405,7 @@ impl GitlinkScan {
             } else {
                 continue;
             };
+            self.git_dirs.push(git_dir.clone());
             self.walk(reach, &GitRepo::at(git_dir, dir), depth + 1);
         }
     }
@@ -5226,6 +5358,80 @@ mod tests {
         assert!(evil.contains("`commondir` is missing"), "{evil}");
         assert!(
             named("inner/emb/.git` is a submodule's repository"),
+            "{found:#?}"
+        );
+    }
+
+    /// The todo list of a stopped rebase stays writable, since git rewrites it at each step, so the
+    /// `exec` lines in it, which `git rebase --continue` runs, are named instead: by the launch,
+    /// and at the end of a session for the ones written during it, in the project's repository and
+    /// in a submodule's. A line there at launch is not named again at the end.
+    #[test]
+    fn the_exec_lines_of_a_stopped_rebase_are_named() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a stopped rebase: no git on this host");
+            return;
+        };
+        let commit = |name: &str, text: &str| {
+            std::fs::write(root.join(name), text).unwrap();
+            assert!(git(&["add", name]) && git(&["commit", "-q", "--no-verify", "-m", text]));
+        };
+        commit("f", "a");
+        assert!(git(&["checkout", "-q", "-b", "side"]));
+        commit("f", "b");
+        commit("g", "c");
+        assert!(git(&["checkout", "-q", "@{-1}"]));
+        commit("f", "z");
+        assert!(git(&["checkout", "-q", "side"]));
+        assert!(!git(&["rebase", "-q", "@{-1}"]), "stops on the conflict");
+        let todo = root.join(".git/rebase-merge/git-rebase-todo");
+        assert!(todo.is_file());
+        let append = |file: &Path, line: &str| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(file)
+                .unwrap();
+            file.write_all(line.as_bytes()).unwrap();
+        };
+        let warned = |what: &str| {
+            let e = expand(&root, &FsPolicy::default(), &[], None);
+            e.warnings.iter().any(|w| w.contains(what))
+        };
+        assert!(!warned("`exec` lines"));
+        append(&todo, "exec make test\n");
+        assert!(warned("git-rebase-todo` holds `exec` lines"));
+
+        let watch = GitWatch::start(&root, false, &[], None).expect("a carried repository");
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+        append(&todo, "  x touch planted\n");
+        let found = watch.findings();
+        let rebase = found
+            .iter()
+            .find(|f| f.contains("git-rebase-todo` holds 1 `exec` line written"))
+            .expect("named");
+        assert!(
+            rebase.contains("x touch planted") && !rebase.contains("make test"),
+            "{rebase}"
+        );
+
+        assert!(git_repo_at(&root.join("emb"), &[]) && git(&["add", "emb"]));
+        let emb = root.join("emb/.git/rebase-merge");
+        std::fs::create_dir_all(&emb).unwrap();
+        append(
+            &emb.join("git-rebase-todo"),
+            "pick 0000000 c\nexec touch sub\n",
+        );
+        assert!(warned(
+            "emb/.git/rebase-merge/git-rebase-todo` holds `exec` lines"
+        ));
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains("emb/.git/rebase-merge/git-rebase-todo` holds 1 `exec` line")),
             "{found:#?}"
         );
     }
