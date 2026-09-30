@@ -1770,8 +1770,17 @@ fn read_sops(
     deadline: std::time::Duration,
 ) -> io::Result<Option<String>> {
     let path = sops_path(file, project_root);
+    let not_decrypted =
+        |e: io::Error| io::Error::other(format!("the secret for `{header}` is not decrypted: {e}"));
     match path.try_exists() {
-        Ok(false) => return Ok(None),
+        // Absent is no source, and the chain goes on, unless the project's trust covered the file
+        // and it has gone since: removing it would then choose which source of the chain answers,
+        // which `file://` refuses for a file in the project the same way.
+        Ok(false) => {
+            crate::trust::sops_removed_since_approval(store_dir, project_root, file)
+                .map_err(not_decrypted)?;
+            return Ok(None);
+        }
         Ok(true) => {}
         Err(e) => {
             return Err(io::Error::other(format!(
@@ -1780,9 +1789,8 @@ fn read_sops(
             )));
         }
     }
-    let covered = crate::trust::covered_sops_bytes(store_dir, project_root, file).map_err(|e| {
-        io::Error::other(format!("the secret for `{header}` is not decrypted: {e}"))
-    })?;
+    let covered =
+        crate::trust::covered_sops_bytes(store_dir, project_root, file).map_err(not_decrypted)?;
     // Three causes, not two: the trusted lookup also declines a match it found. That one is
     // already named on stderr with its reason, so this says there is one rather than repeating it.
     let Some(sops) = locate() else {
@@ -3702,6 +3710,45 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not trusted"), "{err}");
+        assert!(!bin.join("arg").exists(), "sops must not have run");
+    }
+
+    /// A sops file in the project removed after its approval refuses, before `sops` is looked for,
+    /// rather than handing the chain to its next source: the rule `file://` states for a file in
+    /// the project, so removing it cannot choose which source answers. One the approved
+    /// configuration names and that was absent when it was approved is no source at all, and the
+    /// chain goes on, as before.
+    #[test]
+    fn a_sops_file_removed_after_its_approval_refuses_rather_than_passing_the_chain_on() {
+        let (bin, store, project) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+        let sops = recording_sops(&bin);
+        let file = project.join("prod.enc.yaml");
+        let cfg = project.join(".sbx.toml");
+        std::fs::write(&cfg, "x = \"sops://prod.enc.yaml#k\"\n").unwrap();
+        let read = || {
+            read_sops_with(
+                &sops,
+                Path::new("prod.enc.yaml"),
+                project.path(),
+                store.path(),
+            )
+        };
+
+        crate::trust::trust(store.path(), &cfg).unwrap();
+        assert_eq!(
+            read().unwrap(),
+            None,
+            "absent when approved: the next source answers"
+        );
+
+        std::fs::write(&file, "sops: {kms: approved}\n").unwrap();
+        crate::trust::trust(store.path(), &cfg).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let err = read().unwrap_err();
+        assert!(
+            err.to_string().contains("changed since it was trusted"),
+            "{err}"
+        );
         assert!(!bin.join("arg").exists(), "sops must not have run");
     }
 

@@ -379,6 +379,55 @@ pub(crate) fn covered_sops_bytes(
         })
 }
 
+/// Refuse a sops source that is absent because it was removed after the project's trust covered
+/// it: `Err` when `file` lies in the project, the `.sbx.toml` names it, and the project reads
+/// `Changed`. An absent file is left out of the hash ([`sops_inputs_for`]), so one that was there
+/// when the project was approved changes it by going. Every other absent file is no source, and a
+/// chain goes on to its next one: outside the project, not named, not approved, or absent when it
+/// was approved.
+pub(crate) fn sops_removed_since_approval(
+    store_dir: Option<&Path>,
+    project_root: &Path,
+    file: &Path,
+) -> io::Result<()> {
+    let root = canonicalize_existing_prefix(project_root);
+    let path = crate::sandbox::egress::sops_path(file, &root);
+    let config = root.join(crate::config::PROJECT_CONFIG);
+    let (true, Some(store)) = (in_project(&root, &path), store_dir) else {
+        return Ok(());
+    };
+    let Ok(sbx_bytes) = crate::config::safety::read_safe_bytes(&config) else {
+        return Ok(());
+    };
+    let named = sops_files_named(&sbx_bytes)
+        .iter()
+        .any(|named| crate::sandbox::egress::sops_path(named, &root) == path);
+    if !named {
+        return Ok(());
+    }
+    let changed = match trust_inputs_for(&config, &sbx_bytes) {
+        Ok(inputs) => {
+            verdict_for_hash(store, &config, &content_hash(&sbx_bytes, &inputs))
+                == TrustState::Changed
+        }
+        // A file its trust covers can no longer be read: its approval cannot be confirmed.
+        Err(_) => true,
+    };
+    if changed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is in the project, which the cage can write, and the project, or a file its \
+                 trust covers, changed since it was trusted: it is not read as absent, which would \
+                 let removing it choose which source answers. Review the change and run `sbx \
+                 trust`, or keep the file outside the project",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The trust content hash for a project: the `.sbx.toml` bytes alone when the
 /// project has no mise file and names no sops file in it — so a project that never had
 /// one keeps a marker byte-identical to hashing the single file — or an unambiguous

@@ -184,7 +184,10 @@ the file (`sops edit`, `sops updatekeys`) re-arms the gate like any other edit.
 At each resolution (the launch, a task run, a credential refresh), sbx re-reads the
 file, checks that the project is trusted over those very bytes, and hands `sops` a
 private copy of them rather than the path. A file the trust does not cover, or one
-rewritten since, is refused before `sops` runs.
+rewritten since, is refused before `sops` runs. So is one **removed** since: a named file
+that is absent is otherwise no source, and a chain goes on to its next one, so reading a
+removal as absence would let the cage choose which source answers. A named file that was
+already absent when you approved the project stays no source, and the chain goes on.
 
 A named sops file passes the same [safety gate](#the-safety-gate) as the config, size
 ceiling of 1 MiB included. One it refuses makes the project unverifiable: a project
