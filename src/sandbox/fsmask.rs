@@ -3349,9 +3349,7 @@ fn guard_git_tracked(root: &Path, denied: &[Masked], warnings: &mut Vec<String>)
 /// The index is read as [`read_git_index`] reads it. An unreadable, oversized, unknown or malformed
 /// index yields `None`, and the guard simply does not fire — it is an aid, not a gate.
 fn git_tracked_paths(git_dir: &Path) -> Option<BTreeSet<String>> {
-    read_git_index(git_dir, || SHA1_LEN)
-        .ok()?
-        .map(tracked_paths)
+    read_git_index(git_dir, git_dir).ok()?.map(tracked_paths)
 }
 
 /// The path list out of a git index's entries.
@@ -3384,6 +3382,235 @@ struct IndexEntry {
     skip_worktree: bool,
 }
 
+/// The largest repository configuration read for its object format ([`repository_hash_len`]):
+/// git reads one of any size, and one past this refuses the launch rather than being guessed at.
+const GIT_CONFIG_MAX: u64 = 16 * 1024 * 1024;
+
+/// How long the object names of the repository whose common directory is `common` are, from its
+/// own configuration ([`object_format_is_sha256`]): SHA-256's or SHA-1's, git's default, which a
+/// missing configuration keeps.
+///
+/// Guessing wrong is no refusal: an index read with the other length can still parse, into paths
+/// that name nothing, and the submodules it names would go unprotected without a word. So the file
+/// is read as git reads it for this, following a link but without waiting on a FIFO, the type
+/// checked on the descriptor; one that cannot be read in full is an error, which is not of kind
+/// `InvalidData` and names the file.
+fn repository_hash_len(common: &Path) -> io::Result<usize> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let config = common.join("config");
+    let named =
+        |e: &dyn std::fmt::Display| io::Error::other(format!("`{}`: {e}", config.display()));
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&config)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SHA1_LEN),
+        Err(e) => return Err(named(&e)),
+    };
+    let meta = file.metadata().map_err(|e| named(&e))?;
+    if !meta.is_file() || meta.len() > GIT_CONFIG_MAX {
+        return Err(named(&format!(
+            "not a regular file of at most {GIT_CONFIG_MAX} bytes"
+        )));
+    }
+    let mut body = Vec::new();
+    file.take(GIT_CONFIG_MAX + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| named(&e))?;
+    if body.len() as u64 > GIT_CONFIG_MAX {
+        return Err(named(&format!("larger than {GIT_CONFIG_MAX} bytes")));
+    }
+    Ok(if object_format_is_sha256(&body) {
+        SHA256_LEN
+    } else {
+        SHA1_LEN
+    })
+}
+
+/// Whether `config`, a repository's own configuration file, sets `extensions.objectFormat` to
+/// `sha256`, as git reads it to know how long the repository's object names are.
+///
+/// git reads the repository's extensions from this file alone: not through an include, nor from
+/// the global or the system configuration, all of which `git config --get` reports too, so asking
+/// it would answer SHA-256 for a SHA-1 repository whose user set the key globally (measured, git
+/// 2.53). So the file is parsed here as git parses a configuration: `[section]` headers, their
+/// name and a key's folded to lower case, a key on a header's line or on its own, `#` and `;`
+/// comments, and a value's quotes, escapes, line continuations and surrounding blanks, which are
+/// spaces, tabs and carriage returns alone; the last value wins, and git takes `sha256` alone, case
+/// by case. A file git could not parse leaves git unable to use the repository at all, and answers
+/// `false`.
+fn object_format_is_sha256(config: &[u8]) -> bool {
+    let text = config.strip_prefix(b"\xef\xbb\xbf").unwrap_or(config);
+    let text: Vec<u8> = text
+        .iter()
+        .enumerate()
+        .filter(|&(at, &c)| !(c == b'\r' && text.get(at + 1) == Some(&b'\n')))
+        .map(|(_, &c)| c)
+        .collect();
+    let blank = |c: u8| matches!(c, b' ' | b'\t' | b'\r');
+    let mut at = 0;
+    let mut section: Vec<u8> = Vec::new();
+    let mut sha256 = false;
+    while let Some(&c) = text.get(at) {
+        at += 1;
+        if c == b'\n' || blank(c) {
+            continue;
+        }
+        if c == b'#' || c == b';' {
+            while text.get(at).is_some_and(|&c| c != b'\n') {
+                at += 1;
+            }
+            continue;
+        }
+        if c == b'[' {
+            let Some(name) = config_section(&text, &mut at) else {
+                return false;
+            };
+            section = name;
+            continue;
+        }
+        if !c.is_ascii_alphabetic() {
+            return false;
+        }
+        let mut key = vec![c.to_ascii_lowercase()];
+        while let Some(&c) = text
+            .get(at)
+            .filter(|c| c.is_ascii_alphanumeric() || **c == b'-')
+        {
+            key.push(c.to_ascii_lowercase());
+            at += 1;
+        }
+        while text.get(at).is_some_and(|&c| c == b' ' || c == b'\t') {
+            at += 1;
+        }
+        let value = match text.get(at) {
+            None | Some(b'\n') => None,
+            Some(b'=') => {
+                at += 1;
+                let Some(value) = config_value(&text, &mut at) else {
+                    return false;
+                };
+                Some(value)
+            }
+            Some(_) => return false,
+        };
+        if section == b"extensions" && key == b"objectformat" {
+            let Some(value) = value else {
+                return false;
+            };
+            sha256 = value == b"sha256";
+        }
+    }
+    sha256
+}
+
+/// The name of the section whose header opens just before `at` in `text`, past its `[`, folded to
+/// lower case, with a subsection's (`[section "sub"]`) after a dot as given; `at` is left past its
+/// `]`. `None` for a header git refuses.
+fn config_section(text: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+    let mut name = Vec::new();
+    loop {
+        let c = *text.get(*at)?;
+        *at += 1;
+        match c {
+            b']' => return Some(name),
+            b' ' | b'\t' | b'\r' => break,
+            c if c.is_ascii_alphanumeric() || c == b'-' || c == b'.' => {
+                name.push(c.to_ascii_lowercase());
+            }
+            _ => return None,
+        }
+    }
+    while text
+        .get(*at)
+        .is_some_and(|&c| matches!(c, b' ' | b'\t' | b'\r'))
+    {
+        *at += 1;
+    }
+    if text.get(*at) != Some(&b'"') {
+        return None;
+    }
+    *at += 1;
+    name.push(b'.');
+    loop {
+        let mut c = *text.get(*at)?;
+        *at += 1;
+        match c {
+            b'\n' => return None,
+            b'"' => break,
+            b'\\' => {
+                c = *text.get(*at)?;
+                *at += 1;
+                if c == b'\n' {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        name.push(c);
+    }
+    let close = text.get(*at) == Some(&b']');
+    *at += 1;
+    close.then_some(name)
+}
+
+/// The value that starts at `at` in `text`, past a key's `=`, as git reads it; `at` is left past the
+/// line that ends it. `None` for a value git refuses: an open quote at the end of a line, or an
+/// escape it does not know.
+fn config_value(text: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+    let mut value = Vec::new();
+    let (mut quoted, mut comment) = (false, false);
+    // Where the blanks that may end the value started, as git trims them.
+    let mut trim: Option<usize> = None;
+    loop {
+        let c = text.get(*at).copied().unwrap_or(b'\n');
+        *at += 1;
+        if c == b'\n' {
+            if quoted {
+                return None;
+            }
+            if let Some(len) = trim {
+                value.truncate(len);
+            }
+            return Some(value);
+        }
+        if comment {
+            continue;
+        }
+        if matches!(c, b' ' | b'\t' | b'\r') && !quoted {
+            trim.get_or_insert(value.len());
+            if !value.is_empty() {
+                value.push(c);
+            }
+            continue;
+        }
+        if !quoted && (c == b'#' || c == b';') {
+            comment = true;
+            continue;
+        }
+        trim = None;
+        match c {
+            b'\\' => {
+                let escaped = text.get(*at).copied().unwrap_or(b'\n');
+                *at += 1;
+                match escaped {
+                    b'\n' => {}
+                    b't' => value.push(b'\t'),
+                    b'b' => value.push(0x08),
+                    b'n' => value.push(b'\n'),
+                    b'\\' | b'"' => value.push(escaped),
+                    _ => return None,
+                }
+            }
+            b'"' => quoted = !quoted,
+            c => value.push(c),
+        }
+    }
+}
+
 /// A git index blob read in full: its own entries, and the split index extension when it carries
 /// one.
 struct IndexBlob {
@@ -3400,9 +3627,10 @@ struct SplitLink {
     replaced: Vec<u64>,
 }
 
-/// The entries of the index in the git directory `dir` as git reads them, whose object names are
-/// `hash_len()` bytes long, or `None` when there is none; `hash_len` is asked only of an index that
-/// is there.
+/// The entries of the index in the git directory `dir` as git reads them, or `None` when there is
+/// none. Its object names are as long as the configuration of the repository whose common
+/// directory is `common` says ([`repository_hash_len`]), which is read only for an index that is
+/// there.
 ///
 /// A split index, which `core.splitIndex` or `git update-index --split-index` makes, keeps most of
 /// its entries in `sharedindex.<name>` beside it, and is merged with it the way git merges them
@@ -3410,15 +3638,12 @@ struct SplitLink {
 /// [`super::inspect::read_cage_file`] reads a file it writes, within [`INDEX_MAX`]. An error of kind
 /// `InvalidData` says the index is not one this reads in full: one of the two larger than that or
 /// not a regular file, a shared index that is missing, or a format this does not know.
-fn read_git_index(
-    dir: &Path,
-    hash_len: impl FnOnce() -> usize,
-) -> io::Result<Option<Vec<IndexEntry>>> {
+fn read_git_index(dir: &Path, common: &Path) -> io::Result<Option<Vec<IndexEntry>>> {
     let not_read = || io::Error::new(io::ErrorKind::InvalidData, "not an index sbx reads in full");
     let Some(data) = super::inspect::read_cage_file(&dir.join("index"), INDEX_MAX)? else {
         return Ok(None);
     };
-    let hash_len = hash_len();
+    let hash_len = repository_hash_len(common)?;
     let blob = parse_git_index_entries(&data, hash_len).ok_or_else(not_read)?;
     // A shared index named by zeros is none, and the entries are the index's own.
     let Some(link) = blob
@@ -3652,20 +3877,7 @@ fn index_varint(data: &[u8]) -> Option<(usize, usize)> {
 fn gitlinks(repo: &GitRepo) -> Result<Vec<PathBuf>, String> {
     use std::os::unix::ffi::OsStrExt;
     let index = repo.dir.join("index");
-    let mut held = None;
-    let hash_len = || match host_git_config(repo, &["--get", "extensions.objectFormat"]) {
-        Ok(Some(out)) if out.trim_ascii() == b"sha256" => SHA256_LEN,
-        Ok(_) => SHA1_LEN,
-        Err(reason) => {
-            held = Some(reason);
-            SHA1_LEN
-        }
-    };
-    let read = read_git_index(&repo.dir, hash_len);
-    if let Some(reason) = held {
-        return Err(reason);
-    }
-    let entries = match read {
+    let entries = match read_git_index(&repo.dir, &repo.common) {
         Ok(entries) => entries.unwrap_or_default(),
         Err(e) if e.kind() == io::ErrorKind::InvalidData => {
             return Err(format!(
@@ -6272,6 +6484,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A repository's object format is read from its configuration as git reads it, which git
+    /// itself answers for each file here (`git config -f`, which reads that file alone): the
+    /// forms a key and a value can take, the sections it does not count in, and the files git
+    /// refuses to parse.
+    #[test]
+    fn the_object_format_is_read_as_git_reads_it() {
+        let tmp = TmpDir::new();
+        let file = tmp.path().join("config");
+        let cases: &[&[u8]] = &[
+            b"[extensions]\n\tobjectformat = sha256\n",
+            b"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n",
+            b"[Extensions]\n\tObjectFormat = sha256\n",
+            b"[extensions] objectFormat = sha256\n",
+            b"[extensions]\nobjectformat = sha256 # a comment\n",
+            b"[extensions]\nobjectformat = sha256;c\n",
+            b"[extensions]\nobjectformat = \"sha256\"\n",
+            b"[extensions]\nobjectformat = \" sha256\"\n",
+            b"[extensions]\nobjectformat = sha\\\n256\n",
+            b"[extensions]\r\nobjectformat = sha256\r\n",
+            b"\xef\xbb\xbf[extensions]\nobjectformat = sha256\n",
+            b"[extensions]\nobjectformat = sha256   \n",
+            b"[extensions]\nobjectformat = SHA256\n",
+            b"[extensions]\nobjectformat = \"sha\\\"256\"\n",
+            b"[extensions]\nobjectformat =\x0bsha256\n",
+            b"[extensions]\nobjectformat =\x0csha256\n",
+            b"[extensions \"x\"]\nobjectformat = sha256\n",
+            b"[extensions.x]\nobjectformat = sha256\n",
+            b"[core]\nobjectformat = sha256\n",
+            b"[extensions]\nobjectformat = sha256\n[extensions]\nobjectformat = sha1\n",
+            b"[extensions]\nobjectformat = sha1\n[extensions]\nobjectformat = sha256\n",
+            b"[extensions]\nobjectformat\n",
+            b"[extensions]\nobjectformat = \"sha256\n",
+            b"[extensions]\nobjectformat = sha\\x256\n",
+            b"[extensions]\nobjectformat = sha256\n[broken\n",
+            b"objectformat = sha256\n",
+            b"[include]\npath = other\n",
+        ];
+        for case in cases {
+            std::fs::write(&file, case).unwrap();
+            let Ok(out) = std::process::Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["config", "-f"])
+                .arg(&file)
+                .args(["--get", "extensions.objectformat"])
+                .output()
+            else {
+                skip_incapable!("skipping the object format oracle: no git on this host");
+                return;
+            };
+            let git = out.status.success() && out.stdout == b"sha256\n";
+            assert_eq!(
+                object_format_is_sha256(case),
+                git,
+                "{:?}",
+                String::from_utf8_lossy(case)
+            );
+        }
+    }
+
+    /// The length of a repository's object names comes from its own configuration, never from
+    /// the host's git: a SHA-256 repository made by git reads as one, a SHA-1 one and one with
+    /// no configuration as SHA-1, and a configuration that cannot be read in full is an error
+    /// naming it rather than a guess.
+    #[test]
+    fn the_object_name_length_comes_from_the_repositorys_own_configuration() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().canonicalize().unwrap();
+        if !git_repo_at(&base.join("sha1"), &[]) {
+            skip_incapable!("skipping object name lengths: no git on this host");
+            return;
+        }
+        assert_eq!(
+            repository_hash_len(&base.join("sha1/.git")).unwrap(),
+            SHA1_LEN
+        );
+        assert_eq!(repository_hash_len(&base.join("none")).unwrap(), SHA1_LEN);
+        if git_repo_at(&base.join("sha256"), &["--object-format=sha256"]) {
+            let len = repository_hash_len(&base.join("sha256/.git")).unwrap();
+            assert_eq!(len, SHA256_LEN);
+        } else {
+            skip_incapable!("skipping a SHA-256 repository: this git does not make one");
+        }
+        let fifo = base.join("fifo");
+        std::fs::create_dir_all(&fifo).unwrap();
+        crate::testutil::make_fifo(&fifo.join("config"));
+        let e = crate::testutil::returns_within(
+            std::time::Duration::from_secs(10),
+            "reading a FIFO configuration",
+            move || repository_hash_len(&fifo).unwrap_err(),
+        );
+        assert!(e.kind() != io::ErrorKind::InvalidData, "{e}");
+        assert!(e.to_string().contains("fifo/config`"), "{e}");
     }
 
     /// A split index's bitmaps are read as git reads them, a run of set bits and literal words
