@@ -722,6 +722,88 @@ fn prune_reports_nothing_when_all_installed_tools_are_declared() {
     );
 }
 
+/// Which tools are undeclared is read from the configuration, so a project file a launch refuses
+/// as it stands says nothing about them: one that cannot be read declares no tool at all. The sweep
+/// is left alone and says why, in the preview as with `--yes`; once the file reads again, the same
+/// command sweeps.
+#[test]
+fn prune_leaves_the_tools_alone_while_the_file_that_declares_them_is_refused() {
+    let fx = Project::new("app");
+    let project = |extra: &str| {
+        fx.write_project(&format!(
+            "[app.demo-app]\ncmd = [\"demo\"]\n{extra}\n[app.demo-app.packages]\n\
+             keep = \"mise:aqua:demo/keep\"\n"
+        ));
+        let out = fx.run(&["trust", "--yes"]);
+        assert!(out.status.success(), "trust failed: {}", text(&out));
+    };
+    project("gpu = \"no\"");
+    fx.install_mise_tool("demo-app", "aqua-demo-keep", "1.0.0");
+    fx.set_tool_token("demo-app", "aqua-demo-keep", "aqua:demo/keep");
+    fx.install_mise_tool("demo-app", "pipx-orphan", "0.9.0");
+    fx.set_tool_token("demo-app", "pipx-orphan", "pipx:orphan");
+
+    for args in [
+        &["app", "prune", "demo-app"][..],
+        &["app", "prune", "demo-app", "--yes"],
+        &["app", "prune", "--all", "--yes"],
+    ] {
+        let out = fx.run(args);
+        let s = text(&out);
+        assert!(!out.status.success(), "{args:?}:\n{s}");
+        assert!(s.contains(".sbx.toml"), "{args:?}: the file is named:\n{s}");
+        assert!(
+            s.contains("the undeclared mise tools of demo-app are left alone"),
+            "{args:?}:\n{s}"
+        );
+        assert!(
+            !s.contains("would prune") && !s.contains("pruned"),
+            "{args:?}:\n{s}"
+        );
+        assert!(!s.contains("no undeclared mise tools"), "{args:?}:\n{s}");
+        for tool in ["aqua-demo-keep", "pipx-orphan"] {
+            assert!(
+                fx.installs_dir("demo-app").join(tool).is_dir(),
+                "{args:?}: {tool}"
+            );
+        }
+    }
+
+    project("");
+    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!fx.installs_dir("demo-app").join("pipx-orphan").exists());
+    assert!(fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir());
+}
+
+/// An app whose bundle cannot be resolved is missing the tools the bundle declares, so its sweep is
+/// left alone, while `--all` still sweeps the apps whose configuration reads whole.
+#[test]
+fn prune_all_leaves_alone_only_the_app_whose_bundle_is_missing() {
+    let fx = fixture_with_a_leftover();
+    fx.write_project("[app.bundled]\ncmd = [\"demo\"]\nuse = [\"tools\"]\n");
+    let out = fx.run(&["trust", "--yes"]);
+    assert!(out.status.success(), "trust failed: {}", text(&out));
+    // What the missing bundle would have declared.
+    fx.install_mise_tool("bundled", "aqua-demo-tool", "1.0.0");
+    fx.set_tool_token("bundled", "aqua-demo-tool", "aqua:demo/tool");
+
+    let out = fx.run(&["app", "prune", "--all", "--yes"]);
+    let s = text(&out);
+    assert!(!out.status.success(), "{s}");
+    assert!(s.contains("bundled: uses bundle `tools`"), "{s}");
+    assert!(
+        s.contains("the undeclared mise tools of bundled are left alone"),
+        "{s}"
+    );
+    assert!(fx.installs_dir("bundled").join("aqua-demo-tool").is_dir());
+    assert!(
+        !fx.installs_dir("demo-app").join("pipx-orphan").exists(),
+        "{s}"
+    );
+    assert!(fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir());
+}
+
 /// A named entry goes and the app stays signed in: `--drop` takes what it is told and reaches
 /// nothing else, so login and session state under `.config` and `.local/share` survives. A declared
 /// tool is not an entry anybody named, and stays installed.

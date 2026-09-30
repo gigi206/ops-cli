@@ -2455,7 +2455,14 @@ pub(super) const PAGES: &[Page] = &[
             that session is using, so deleting them takes an interpreter or a `PATH` entry out from\n\
             under a command in flight. Stop it with `sbx session stop` and retry. Under `--all` such\n\
             an app is skipped and named instead, so one running agent does not hold up the rest, and\n\
-            the sweep then exits non-zero. The preview deletes nothing and stays available.",
+            the sweep then exits non-zero. The preview deletes nothing and stays available.\n\
+            \n\
+            Which tools are undeclared is read from the configuration, so an app's tools are left\n\
+            alone while its configuration is one a launch refuses: a config file that cannot be\n\
+            read, a bundle it uses that cannot be found, or a project changed since it was approved.\n\
+            A declared tool would otherwise read as undeclared. The preview and `--yes` both name\n\
+            the reason and exit non-zero; `--stale`, `--drop` and `--reset` read the home rather\n\
+            than the configuration, and go on.",
     },
     Page {
         path: &["app", "show"],

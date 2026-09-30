@@ -2331,6 +2331,9 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     // The `--stale` sweeps left alone because a file that says what to keep was there but could
     // not be read, each with the reason.
     let mut unread: Vec<String> = Vec::new();
+    // The apps whose undeclared tools are left alone because the configuration that declares them
+    // is one a launch refuses as it stands.
+    let mut held: Vec<String> = Vec::new();
     let mut had_error = false;
 
     // The live-session guard below reads the registry once for the whole sweep, and an error
@@ -2406,15 +2409,30 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             }
         }
 
+        // A tool is undeclared when the configuration does not declare it, so a configuration a
+        // launch refuses cannot say which tools are: a file that could not be read declares
+        // nothing, and a bundle that could not be resolved leaves out what it carries, so a
+        // declared tool would read as undeclared. The sweep is left alone rather than run on that
+        // reading, in the preview as with `--yes`, as `--stale` leaves a pool whose file it could
+        // not read.
+        let refused = !resolved.refusals.is_empty()
+            || resolved
+                .apps
+                .get(app_name)
+                .is_some_and(|app| !app.refusals.is_empty());
+        let sweep = !reset && !refused;
+        if !reset && refused {
+            held.push(app_name.clone());
+        }
         let declared = declared_mise_tokens(&resolved, app_name);
         let declared: Vec<&str> = declared.iter().map(String::as_str).collect();
         for home in &homes {
             // `--reset` stands instead of the tool sweep rather than beside it: it takes the
             // directory the sweep would have worked through.
-            let pruned = if reset {
-                Vec::new()
-            } else {
+            let pruned = if sweep {
                 sandbox::prune_app_tools(&home.dir, &declared, apply)
+            } else {
+                Vec::new()
             };
             let taken = if reset {
                 sandbox::reset_home(&home.dir, apply)
@@ -2590,8 +2608,34 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         ));
         had_error = true;
     }
+    if !held.is_empty() {
+        // Each reason once: the configuration's own are the same for every app it held.
+        for why in &resolved.refusals {
+            diag::note(&format!("sbx: app prune: {why}"));
+        }
+        for app_name in &held {
+            for why in resolved
+                .apps
+                .get(app_name)
+                .into_iter()
+                .flat_map(|a| &a.refusals)
+            {
+                diag::note(&format!("sbx: app prune: {app_name}: {why}"));
+            }
+        }
+        diag::note(&format!(
+            "sbx: app prune: the undeclared mise tools of {} are left alone, since the \
+             configuration that declares them is one a launch refuses as it stands",
+            held.join(", ")
+        ));
+        had_error = true;
+    }
 
     if totals.tools == 0 && totals.versions == 0 && totals.entries == 0 {
+        // "Nothing to prune" is not what a run that left a sweep alone found: the notes say why.
+        if !held.is_empty() {
+            return ExitCode::FAILURE;
+        }
         let subject = match &name {
             Some(n) => n.clone(),
             None => "no app".to_string(),

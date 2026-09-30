@@ -434,6 +434,15 @@ as an empty one. Under `--all` that refuses the whole sweep, since naming the ap
 needs the answer the registry could not give. The preview never asks the registry, so it
 keeps working.
 
+Which tools are undeclared is read from the configuration, so the sweep is **left alone
+while the configuration is one a launch refuses**: a config file that exists and cannot be
+read declares no tool at all, a bundle the app uses and that cannot be found leaves out the
+tools it carries, and a project changed since it was approved waits for its re-approval.
+Every declared tool would otherwise read as undeclared. The preview and `--yes` both name the
+reason and the apps left alone, and exit non-zero; under `--all` the apps whose own
+configuration reads whole are still swept. `--stale`, `--drop` and `--reset` read the home
+rather than the configuration, and go on.
+
 ### Taking a named entry
 
 `--drop <entry>` removes one entry of each home, named relative to the home exactly as
