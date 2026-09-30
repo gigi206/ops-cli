@@ -1492,6 +1492,8 @@ fn the_directories_above_a_mask_keep_their_path_inside_the_cage() {
     };
     let expanded = crate::sandbox::fsmask::expand(&root, &policy, &[], None);
     assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
+    // As the launcher does: a built-in directory mask needs its directory to land on.
+    crate::sandbox::fsmask::create_absent_dirs(&expanded).unwrap();
     let decoys = crate::sandbox::fsmask::stage_decoys(&scratch.path().join("mask")).unwrap();
     let mut mounts = vec![
         Mount::RoBind {

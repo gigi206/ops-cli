@@ -193,11 +193,22 @@ for. Holding a submodule's configuration costs what holding `.git/config` costs:
 refused, as are `git submodule sync`, `git config` and `git remote add` inside a submodule, and
 `git mv` or `git rm` of a submodule's directory, which is held in place. The commits, branches
 and checkouts inside a submodule work, and `git submodule foreach -q 'git checkout -q $sha1'`
-puts each submodule on the commit the superproject records, which is what `update` does. Each
-submodule adds a few mounts to the ceiling `[fs]` counts, so a superproject with many of them
-can reach it; the refusal says so. What no mount can hold is a repository that appears during
-the session: one the cage creates in a gitlink's directory, or adds to the index, is read by
-your next `git status` in the superproject. sbx names it once the cage has exited, as it names
+puts each submodule on the commit the superproject records, which is what `update` does.
+
+The directory git keeps submodules' repositories in, **`.git/modules/`**, is read-only as a
+whole, and sbx creates it empty when it is absent so it can hold it. `git submodule update
+--init` reuses a repository it finds there rather than cloning one, so a repository the cage
+left under the name of a submodule nobody initialized, or in place of one put away with
+`git submodule deinit`, would run its configuration and its hooks at your next git command in
+that submodule. The repository of each submodule initialized at launch is writable again inside
+it, its configuration and hooks excepted, so the cage keeps committing in it; initializing one
+from the cage was already refused, since it writes `.git/config`. The same holds for the
+`modules` directory of each submodule's repository and of each worktree.
+
+Each submodule adds a few mounts to the ceiling `[fs]` counts, so a superproject with many of
+them can reach it; the refusal says so. What no mount can hold is a repository that appears
+during the session in a gitlink's directory: one the cage creates there, or adds to the index,
+is read by your next `git status` in the superproject. sbx names it once the cage has exited, as it names
 a `.git/commondir`, and so does an index the cage leaves in a form sbx cannot read in full,
 since the repositories it names can then not be listed.
 

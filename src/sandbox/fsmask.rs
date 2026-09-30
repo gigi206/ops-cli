@@ -103,6 +103,10 @@ pub(crate) struct Expanded {
     /// deep, that the agent's cage holds in place so each mask keeps naming the file it protects.
     /// See [`holding_dirs`].
     pub(crate) pins: Vec<PathBuf>,
+    /// The repositories of initialized submodules, bound back read-write over themselves inside the
+    /// read-only `modules` directory that holds them, so the cage keeps working in a submodule
+    /// while it cannot create a repository there ([`git_modules_dir`]).
+    pub(crate) reopened: Vec<PathBuf>,
     /// What the expansion found worth saying: an entry that matched nothing, a file reachable by a
     /// second name, a path git tracks. Surfaced by the launch, never fatal on its own.
     pub(crate) warnings: Vec<String>,
@@ -321,24 +325,38 @@ impl Expanded {
     /// - **A directory carries its subtree.** A bind at a directory covers every path below it, so
     ///   a path under a denied directory is denied even when nothing on disk bears its name yet —
     ///   which is the one shape that stays closed for a whole session.
-    /// - **`deny` is checked first.** `agent_binds` emits `readonly` and then `deny`, and the later
-    ///   mount is the one that wins, so where a denied file sits inside a read-only directory the
-    ///   answer is the decoy. The opposite nesting cannot occur: [`expand`] drops a `readonly`
-    ///   entry that a `deny` already covers.
+    /// - **`deny` is checked first.** `agent_binds` lays a deeper mount after a shallower one, and
+    ///   the later mount is the one that wins, so where a denied file sits inside a read-only
+    ///   directory the answer is the decoy. The opposite nesting cannot occur: [`expand`] drops a
+    ///   `readonly` entry that a `deny` already covers.
+    /// - **The deepest read-only mount answers.** A submodule's repository reopened inside a
+    ///   read-only `modules` directory is open unless a mask below it, its configuration or its
+    ///   hooks, holds the path again.
     pub(crate) fn covering(&self, path: &Path) -> Option<Cover<'_>> {
-        fn under<'m>(masks: &'m [Masked], path: &Path) -> Option<&'m Masked> {
+        fn covers(at: &Path, is_dir: bool, path: &Path) -> bool {
+            at == path || (is_dir && path.starts_with(at))
+        }
+        fn deepest<'m>(masks: &'m [Masked], path: &Path) -> Option<&'m Masked> {
             masks
                 .iter()
-                .find(|m| m.path == path || (m.is_dir && path.starts_with(&m.path)))
+                .filter(|m| covers(&m.path, m.is_dir, path))
+                .max_by_key(|m| m.path.components().count())
         }
-        under(&self.denied, path)
-            .map(Cover::Denied)
-            .or_else(|| under(&self.readonly, path).map(Cover::ReadOnly))
+        if let Some(m) = deepest(&self.denied, path) {
+            return Some(Cover::Denied(m));
+        }
+        let held = deepest(&self.readonly, path)?;
+        let reopened = self
+            .reopened
+            .iter()
+            .any(|dir| covers(dir, true, path) && dir.starts_with(&held.path) && *dir != held.path);
+        (!reopened).then_some(Cover::ReadOnly(held))
     }
 
-    /// How many binds this expansion costs: its masks and the directories that hold them in place.
+    /// How many binds this expansion costs: its masks, the directories that hold them in place and
+    /// the submodules' repositories reopened inside them.
     fn count(&self) -> usize {
-        self.denied.len() + self.readonly.len() + self.pins.len()
+        self.denied.len() + self.readonly.len() + self.pins.len() + self.reopened.len()
     }
 }
 
@@ -493,11 +511,19 @@ pub(crate) fn expand(
     }
     for mut m in builtin.into_iter().chain(carrier) {
         m.builtin = true;
-        let covered = out
-            .denied
-            .iter()
-            .chain(&out.readonly)
-            .any(|c| c.path == m.path || (c.is_dir && m.path.starts_with(&c.path)));
+        // A `modules` directory sbx holds does not cover what lies in a repository reopened inside
+        // it: the mask is what holds that path once the repository is writable again.
+        let reopened_between = |c: &Masked| {
+            c.builtin
+                && carried.modules.contains(&c.path)
+                && carried
+                    .reopened
+                    .iter()
+                    .any(|r| r.starts_with(&c.path) && *r != c.path && m.path.starts_with(r))
+        };
+        let covered = out.denied.iter().chain(&out.readonly).any(|c| {
+            c.path == m.path || (c.is_dir && m.path.starts_with(&c.path) && !reopened_between(c))
+        });
         if !covered {
             out.readonly.push(m);
         }
@@ -544,6 +570,23 @@ pub(crate) fn expand(
              which closes the whole path — this one adds nothing and is dropped"
         ));
     }
+    // A submodule's repository is reopened only where the `modules` directories sbx holds are all
+    // that cover it: a declared mask over it, or one of sbx's own that is not a `modules`
+    // directory (a `core.hooksPath` naming `.git`), keeps it closed.
+    let masks: Vec<&Masked> = out.denied.iter().chain(&out.readonly).collect();
+    carried.reopened.retain(|dir| {
+        let over: Vec<&&Masked> = masks
+            .iter()
+            .filter(|m| m.path == *dir || (m.is_dir && dir.starts_with(&m.path)))
+            .collect();
+        !over.is_empty()
+            && over
+                .iter()
+                .all(|m| m.builtin && m.path != *dir && carried.modules.contains(&m.path))
+    });
+    carried.reopened.sort();
+    carried.reopened.dedup();
+    out.reopened = std::mem::take(&mut carried.reopened);
     out.reach = reach;
     out.pins = holding_dirs(&out);
 
@@ -617,8 +660,10 @@ pub(crate) fn expand(
 /// read-write: its contents stay writable, and it becomes a mount point too. The project root or
 /// the bind needs no pin, being a mount of its own.
 ///
-/// None is laid at or under a read-only directory mask. Nothing inside a read-only mount can be
-/// renamed already, and a read-write bind there would reopen that directory to writes.
+/// None is laid at or under a read-only directory mask, unless a submodule's repository reopened
+/// inside it lies between ([`Expanded::reopened`]). Nothing inside a read-only mount can be renamed
+/// already, and a read-write bind there would reopen that directory to writes. Nor is one laid at a
+/// reopened repository, a mount of its own.
 ///
 /// What holding a directory costs the cage: renaming or removing it is refused (`EBUSY`), and a
 /// `rename` across its boundary is refused (`EXDEV`), which `mv` answers by copying. The one git
@@ -631,6 +676,26 @@ fn holding_dirs(expanded: &Expanded) -> Vec<PathBuf> {
         .filter(|m| m.is_dir)
         .map(|m| m.path.as_path())
         .collect();
+    // Read-only when the deepest of the read-only directories and the reopened repositories above
+    // it, itself included, is a read-only one.
+    let read_only = |dir: &Path| {
+        let depth = |at: &Path| at.components().count();
+        let held = read_only_dirs
+            .iter()
+            .filter(|ro| dir.starts_with(ro))
+            .map(|ro| depth(ro))
+            .max();
+        let open = expanded
+            .reopened
+            .iter()
+            .filter(|open| dir.starts_with(open))
+            .map(|open| depth(open))
+            .max();
+        match (held, open) {
+            (Some(held), Some(open)) => held >= open,
+            (held, _) => held.is_some(),
+        }
+    };
     let mut pins: BTreeSet<PathBuf> = BTreeSet::new();
     for m in expanded.denied.iter().chain(&expanded.readonly) {
         let Some(root) = expanded.reach.root_of(&m.path) else {
@@ -642,7 +707,7 @@ fn holding_dirs(expanded: &Expanded) -> Vec<PathBuf> {
             .skip(1)
             .take_while(|d| *d != root && d.starts_with(root))
         {
-            if !read_only_dirs.iter().any(|ro| dir.starts_with(ro)) {
+            if !read_only(dir) && !expanded.reopened.iter().any(|open| open == dir) {
                 pins.insert(dir.to_path_buf());
             }
         }
@@ -916,6 +981,10 @@ struct Carried {
     submodules: usize,
     /// Its other work trees ([`other_work_trees`]).
     worktrees: usize,
+    /// The `modules` directories held read-only, one per repository carried ([`git_modules_dir`]).
+    modules: Vec<PathBuf>,
+    /// The submodules' repositories found inside one of them, to be reopened read-write.
+    reopened: Vec<PathBuf>,
 }
 
 /// The carrier of `repo`, a repository the host's git reads for the project or a submodule, and of
@@ -943,16 +1012,17 @@ fn repo_carrier(
     masks.extend(git_worktree_files(reach, repo, &found, refused));
     let trees = other_work_trees(reach, repo, &found, masks, refused);
     let mut carried = Carried {
-        submodules: submodule_carrier(reach, repo, depth, masks, warnings, refused),
         worktrees: trees.len(),
+        ..Carried::default()
     };
+    submodule_carrier(reach, repo, depth, masks, &mut carried, warnings, refused);
     for tree in &trees {
         if carried.submodules > MASK_MAX {
             break;
         }
         masks.extend(git_hook_dirs(reach, tree, warnings, refused));
         masks.extend(git_include_files(reach, tree, refused));
-        carried.submodules += submodule_carrier(reach, tree, depth, masks, warnings, refused);
+        submodule_carrier(reach, tree, depth, masks, &mut carried, warnings, refused);
     }
     carried
 }
@@ -961,8 +1031,8 @@ fn repo_carrier(
 const SUBMODULE_DEPTH: usize = 8;
 
 /// The repositories of `repo`'s submodules that the host's git reads, and theirs below them, each
-/// with the carrier its own repository has, as read-only masks added to `masks`; the number of
-/// repositories found is returned.
+/// with the carrier its own repository has, as read-only masks added to `masks`; the repositories
+/// found are counted in `carried`.
 ///
 /// The host's git reads a submodule's configuration whenever a gitlink of the index has a
 /// repository in its directory, whether or not `.gitmodules` names it: a `git status` in the
@@ -974,29 +1044,42 @@ const SUBMODULE_DEPTH: usize = 8;
 /// found gets what the project's own does: its `config`, and its carrier and its other work trees'
 /// ([`repo_carrier`]), and a link or a `commondir` in it refuses the launch ([`git_repo_refusal`]).
 ///
+/// The repository's `modules` directory, where git keeps its submodules' repositories, is held
+/// read-only ([`git_modules_dir`]), and the repository of each submodule found in it is reopened
+/// read-write in `carried`.
+///
 /// An index this cannot read refuses the launch when the repository shows submodules (a
-/// `.gitmodules`, or a `modules` directory in its git directory), since their repositories could not
+/// `.gitmodules`, or a `modules` directory with anything in it), since their repositories could not
 /// be found; otherwise there is nothing to look for.
 fn submodule_carrier(
     reach: &Reach,
     repo: &GitRepo,
     depth: usize,
     masks: &mut Vec<Masked>,
+    carried: &mut Carried,
     warnings: &mut Vec<String>,
     refused: &mut Option<String>,
-) -> usize {
+) {
+    let modules = git_modules_dir(reach, repo, refused).inspect(|held| {
+        if held.is_dir {
+            carried.modules.push(held.path.clone());
+        }
+        masks.push(held.clone());
+    });
     let links = match gitlinks(repo) {
         Ok(links) => links,
         Err(reason) => {
-            let shows =
-                repo.work_tree.join(".gitmodules").exists() || repo.dir.join("modules").exists();
-            if shows {
+            // Made empty by an earlier launch where it was absent, which shows no submodule.
+            let populated = match std::fs::read_dir(repo.dir.join("modules")) {
+                Ok(mut entries) => entries.next().is_some(),
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            };
+            if repo.work_tree.join(".gitmodules").exists() || populated {
                 refused.get_or_insert_with(|| visible(&reason));
             }
-            return 0;
+            return;
         }
     };
-    let mut found = 0;
     for dir in links {
         let dot_git = dir.join(".git");
         let what = "a submodule's repository";
@@ -1056,7 +1139,13 @@ fn submodule_carrier(
             refused.get_or_insert(reason);
             continue;
         }
-        found += 1;
+        carried.submodules += 1;
+        if let Some(held) = modules.as_ref().filter(|held| held.is_dir)
+            && sub.dir.starts_with(&held.path)
+            && sub.dir != held.path
+        {
+            carried.reopened.push(sub.dir.clone());
+        }
         git_file(reach, &sub.common.join("config"), None, refused, masks);
         if depth + 1 == SUBMODULE_DEPTH {
             refused.get_or_insert_with(|| {
@@ -1068,12 +1157,71 @@ fn submodule_carrier(
             });
             continue;
         }
-        found += repo_carrier(reach, &sub, depth + 1, masks, warnings, refused).submodules;
-        if found > MASK_MAX {
+        let below = repo_carrier(reach, &sub, depth + 1, masks, warnings, refused);
+        carried.submodules += below.submodules;
+        carried.modules.extend(below.modules);
+        carried.reopened.extend(below.reopened);
+        if carried.submodules > MASK_MAX {
             break;
         }
     }
-    found
+}
+
+/// The `modules` directory of `repo`, held read-only where the cage writes it, or `None` where it
+/// does not; created empty at launch when absent ([`create_absent_dirs`]).
+///
+/// git keeps a submodule's repository in `<git dir>/modules/<name>`, and `git submodule update
+/// --init` reuses one it finds there rather than cloning: its configuration and its hooks then run
+/// at the user's next git command in the submodule. A submodule never initialized, or put away with
+/// `git submodule deinit`, has no `.git` in its directory for [`submodule_carrier`] to follow, and
+/// the name git looks up comes from `.gitmodules`, which the cage writes. So the whole directory is
+/// held, and the repositories of the submodules the index shows initialized are reopened inside it:
+/// the cage works in them, and cannot add one. Initializing a submodule from the cage was refused
+/// already, since it writes the repository's held `config`.
+///
+/// A link on the way refuses the launch, like one on the way to the hooks ([`git_link_on_the_way`]),
+/// and one in sbx's data directory, which the cage writes under other names. Something other than a
+/// directory there is held as it is, so the cage cannot replace it with one.
+fn git_modules_dir(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>) -> Option<Masked> {
+    let path = repo.dir.join("modules");
+    let pattern = format!(
+        "{}/",
+        path.strip_prefix(reach.project())
+            .unwrap_or(&path)
+            .display()
+    );
+    let what = format!("the directory your git keeps submodules' repositories in ({pattern})");
+    if let Some(reason) = git_link_on_the_way(reach, &path, &what, GIT_LINK_INSTEAD) {
+        refused.get_or_insert(reason);
+        return None;
+    }
+    let (canon, is_dir) = match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (crate::trust::canonicalize_existing_prefix(&path), true)
+        }
+        Err(e) => {
+            refused.get_or_insert_with(|| visible(&git_unreadable("look at", &path, &e)));
+            return None;
+        }
+        Ok(meta) => match path.canonicalize() {
+            Ok(canon) => (canon, meta.is_dir()),
+            Err(e) => {
+                refused.get_or_insert_with(|| visible(&git_unreadable("resolve", &path, &e)));
+                return None;
+            }
+        },
+    };
+    if reach.written_elsewhere(&canon) {
+        refused.get_or_insert_with(|| git_data_refusal(&what, &canon));
+        return None;
+    }
+    let root = reach.root_of(&canon)?;
+    (canon != root).then_some(Masked {
+        path: canon,
+        is_dir,
+        pattern,
+        builtin: true,
+    })
 }
 
 /// The repository a `.git` file names, or `None` when git would not read the file as a pointer.
@@ -2727,18 +2875,20 @@ pub(crate) fn agent_binds(
     project_writable: bool,
 ) -> Vec<ExtraBind> {
     let mut out = Vec::with_capacity(expanded.count());
-    // The held directories first, shallow to deep, so every mask lands inside the directories
-    // already held above it rather than being covered by one laid after it.
+    // The held directories first, so every mask lands inside the directories already held above it
+    // rather than being covered by one laid after it. A read-write bind is left out where the
+    // project is mounted read-only, since it would reopen what that mount closes.
+    let rebound = |dir: &PathBuf| ExtraBind {
+        src: dir.clone(),
+        dest: dir.clone(),
+        writable: true,
+    };
     out.extend(
         expanded
             .pins
             .iter()
             .filter(|dir| project_writable || !expanded.reach.in_project(dir))
-            .map(|dir| ExtraBind {
-                src: dir.clone(),
-                dest: dir.clone(),
-                writable: true,
-            }),
+            .map(rebound),
     );
     // Then `readonly`, then `deny`. The two can legitimately nest the one way round that is left
     // after the expansion drops the other (`readonly = [".git/"]` with `deny = [".git/config"]`),
@@ -2753,6 +2903,15 @@ pub(crate) fn agent_binds(
             writable: false,
         });
     }
+    // A submodule's repository is reopened after the read-only `modules` directory holding it, and
+    // the masks inside it land after it.
+    out.extend(
+        expanded
+            .reopened
+            .iter()
+            .filter(|dir| project_writable || !expanded.reach.in_project(dir))
+            .map(rebound),
+    );
     for m in &expanded.denied {
         out.push(ExtraBind {
             src: if m.is_dir {
@@ -2764,6 +2923,10 @@ pub(crate) fn agent_binds(
             writable: false,
         });
     }
+    // Shallow to deep, the order above kept between binds at one depth: a bind covers everything
+    // laid below it before, so each has to come after every bind above it. Of the binds this
+    // emits, one only ever lies under a shallower one.
+    out.sort_by_key(|b| b.dest.components().count());
     out
 }
 
@@ -3306,8 +3469,9 @@ mod tests {
     }
 
     /// The git carrier is read-only by default, with or without a `.sbx.toml`: the hooks
-    /// directory, so a hook created mid-session is refused too, and the config, whose keys can name
-    /// a program as surely as a hook can.
+    /// directory, so a hook created mid-session is refused too, the config, whose keys can name
+    /// a program as surely as a hook can, and the directory of the submodules' repositories, absent
+    /// here and made at launch.
     #[test]
     fn the_git_hooks_and_config_are_read_only_by_default_and_git_writable_lifts_them() {
         let tmp = TmpDir::new();
@@ -3326,6 +3490,7 @@ mod tests {
             vec![
                 (root.join(".git/config").as_path(), false),
                 (root.join(".git/hooks").as_path(), true),
+                (root.join(".git/modules").as_path(), true),
             ]
         );
         assert!(e.readonly.iter().all(|m| m.builtin));
@@ -4880,6 +5045,100 @@ mod tests {
         );
     }
 
+    /// The directory git keeps its submodules' repositories in is held read-only, so the cage can
+    /// neither plant a repository there for `git submodule update --init` to reuse nor rewrite the
+    /// one a deinitialized submodule left behind; the repository of each initialized submodule is
+    /// reopened inside it, its configuration and hooks held again. A declared mask over it wins,
+    /// and the binds are laid shallow to deep.
+    #[test]
+    fn the_submodules_repositories_directory_is_held_and_initialized_ones_reopened() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the submodules' directory: no git on this host");
+            return;
+        };
+        let source = tmp.path().join("source");
+        assert!(git_repo_at(&source, &[]));
+        let file = ["-c", "protocol.file.allow=always"];
+        for name in ["lib", "old"] {
+            let add = [
+                &file[..],
+                &["submodule", "add", "-q", source.to_str().unwrap(), name],
+            ];
+            assert!(git(&add.concat()));
+        }
+        assert!(git(&["commit", "-q", "--no-verify", "-m", "subs"]));
+        assert!(git(&["submodule", "deinit", "-q", "-f", "old"]));
+        let modules = root.join(".git/modules");
+        assert!(
+            modules.join("old/config").exists(),
+            "deinit leaves the repository"
+        );
+
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert_eq!(
+            e.reopened,
+            vec![modules.join("lib")],
+            "only the initialized one"
+        );
+        let covered = |rel: &str| e.covering(&root.join(rel)).is_some();
+        for held in [
+            ".git/modules/planted/hooks/post-checkout",
+            ".git/modules/old/config",
+            ".git/modules/old/hooks/post-checkout",
+            ".git/modules/lib/config",
+            ".git/modules/lib/hooks/post-checkout",
+        ] {
+            assert!(covered(held), "{held} is held");
+        }
+        for open in [
+            ".git/modules/lib/objects/x",
+            ".git/modules/lib/refs/heads/main",
+        ] {
+            assert!(!covered(open), "{open} is open to the cage's git");
+        }
+
+        let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
+        let binds = agent_binds(&e, &decoys, true);
+        let at = |dest: &Path| binds.iter().position(|b| b.dest == dest).unwrap();
+        let (held, open, config) = (
+            at(&modules),
+            at(&modules.join("lib")),
+            at(&modules.join("lib/config")),
+        );
+        assert!(!binds[held].writable && binds[open].writable && !binds[config].writable);
+        assert!(held < open && open < config, "{binds:?}");
+        assert!(
+            !binds
+                .iter()
+                .any(|b| b.writable && b.dest == modules.join("old")),
+            "nothing reopens the deinitialized one: {binds:?}"
+        );
+        assert!(
+            agent_binds(&e, &decoys, false)
+                .iter()
+                .all(|b| b.dest != modules.join("lib")),
+            "no read-write bind where the project is read-only"
+        );
+
+        let declared = expand(&root, &policy(&[], &[".git/"]), &[], None);
+        assert!(declared.reopened.is_empty(), "a declared mask over it wins");
+        assert!(declared.covering(&modules.join("lib/objects/x")).is_some());
+
+        let fresh = TmpDir::new();
+        let Some((bare, _)) = git_project(&fresh) else {
+            return;
+        };
+        let e = expand(&bare, &FsPolicy::default(), &[], None);
+        assert!(!bare.join(".git/modules").exists());
+        create_absent_dirs(&e).unwrap();
+        assert!(
+            bare.join(".git/modules").is_dir(),
+            "made at launch to be held"
+        );
+    }
+
     /// Where a submodule's `.git` cannot be held to the repository git reads, the launch refuses:
     /// a link there, or a `.git` file naming a repository inside the project that does not exist.
     /// One naming a repository outside the project holds the file alone.
@@ -5368,8 +5627,8 @@ mod tests {
     }
 
     /// Every directory between the project root and a mask is held in place, shallow to deep, and
-    /// before any mask: a mask's path then keeps naming the file it protects for the host's git
-    /// after the session and for the next launch. The built-in git masks count as masks.
+    /// before any mask under it: a mask's path then keeps naming the file it protects for the host's
+    /// git after the session and for the next launch. The built-in git masks count as masks.
     #[test]
     fn each_directory_above_a_mask_is_held_in_place_before_the_masks() {
         let tmp = TmpDir::new();
@@ -5397,17 +5656,28 @@ mod tests {
             "each directory above a mask, the project root excepted, shallow to deep"
         );
         let binds = agent_binds(&e, &decoys, true);
-        let (held, masks) = binds.split_at(e.pins.len());
         assert!(
-            held.iter()
-                .zip(&e.pins)
-                .all(|(b, dir)| b.writable && b.src == *dir && b.dest == *dir),
-            "each held directory is bound over itself read-write, first: {binds:?}"
+            e.pins.iter().all(|dir| binds
+                .iter()
+                .any(|b| b.writable && b.src == *dir && b.dest == *dir)),
+            "each held directory is bound over itself read-write: {binds:?}"
         );
         assert!(
-            masks.iter().all(|b| !b.writable),
-            "every mask comes after them: {binds:?}"
+            binds
+                .iter()
+                .filter(|b| !e.pins.contains(&b.dest))
+                .all(|b| !b.writable),
+            "every mask is read-only: {binds:?}"
         );
+        for (i, b) in binds.iter().enumerate() {
+            assert!(
+                !binds[i + 1..]
+                    .iter()
+                    .any(|later| b.dest.starts_with(&later.dest) && b.dest != later.dest),
+                "`{}` is laid before a directory above it, which would cover it: {binds:?}",
+                b.dest.display()
+            );
+        }
     }
 
     /// Inside a read-only directory mask nothing can be renamed already, and a read-write bind

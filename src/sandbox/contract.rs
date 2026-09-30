@@ -312,6 +312,10 @@ fn syscalls_section(families: &[&str]) -> String {
 /// write. A bind may sit outside the project, which is why the section speaks of paths rather than
 /// of the project.
 ///
+/// A submodule's repository reopened inside the read-only `.git/modules` ([`Expanded::reopened`])
+/// is listed on its own: without it, the directory above reads as closing the repository the cage
+/// commits in.
+///
 /// What is listed is the resolved bind, not the declared one: a path that did not canonicalize is
 /// already gone by here, and one the control plane forced read-only already carries that mode, so
 /// the line describes the mount rather than the request. A bind that a later mount covers (the
@@ -352,6 +356,19 @@ fn covered_paths_section(masks: &Expanded, binds: &[Bind]) -> String {
     if !readonly.is_empty() {
         out.push_str("\nRead-only (the contents are the real ones; a write is refused):\n");
         out.push_str(&sorted_list(readonly));
+    }
+    if !masks.reopened.is_empty() {
+        out.push_str(
+            "\nWritable again inside a read-only directory above (a submodule's repository; its \
+             configuration and hooks stay read-only):\n",
+        );
+        out.push_str(&sorted_list(
+            masks
+                .reopened
+                .iter()
+                .map(|p| format!("- {}", code(&p.display().to_string())))
+                .collect(),
+        ));
     }
     out.push_str(COVERED_CAVEAT);
     out
@@ -844,6 +861,7 @@ fn fixed_protected_names() -> Vec<&'static str> {
         ".git/config",
         ".git/config.worktree",
         ".git/hooks",
+        ".git/modules",
     ];
     names.extend(crate::trust::MISE_CONFIG_NAMES.iter().copied());
     names
@@ -1232,6 +1250,23 @@ mod tests {
             out.contains("Read-only") && out.contains("certs"),
             "the write-refusing paths are named too: {out}"
         );
+    }
+
+    /// A submodule's repository reopened inside a read-only `.git/modules` is named as writable,
+    /// so the directory listed read-only above it is not read as closing the repository the cage
+    /// commits in.
+    #[test]
+    fn a_reopened_repository_is_named_writable() {
+        let (_tmp, mut masks) = masks_for(&[], &["certs/"]);
+        let lib = masks.readonly[0].path.join("lib");
+        masks.reopened = vec![lib.clone()];
+        let out = covered_paths_section(&masks, &[]);
+        assert!(
+            out.contains("Writable again") && out.contains(&lib.display().to_string()),
+            "{out}"
+        );
+        masks.reopened.clear();
+        assert!(!covered_paths_section(&masks, &[]).contains("Writable again"));
     }
 
     /// The listing states its own limits, so it is not read as the whole of `[fs]`.
