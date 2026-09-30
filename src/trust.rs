@@ -116,7 +116,17 @@ pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
     let dir = config_path.parent();
     let mut out = Vec::new();
     for path in mise_files_for(config_path) {
-        let bytes = crate::config::safety::read_safe_bytes(&path)?;
+        // Worded as `sops_inputs_for` words its refusal, for the same reason: `sbx trust` reads
+        // this file too, so the way out is the file itself.
+        let bytes = crate::config::safety::read_safe_bytes(&path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{e}; a mise file beside {} is covered by its trust: fix it or remove it",
+                    crate::config::PROJECT_CONFIG
+                ),
+            )
+        })?;
         // The path relative to the project, not the filename: `.config/mise/config.toml` and
         // `.mise/config.toml` share the second and would share a tag, which is exactly what the
         // framing in `content_hash` may not allow.
@@ -456,7 +466,8 @@ pub(crate) enum TrustState {
     Trusted,
     /// No marker for this config path — never approved.
     Untrusted,
-    /// A marker exists but the stored hash differs: the file changed since it was
+    /// A marker exists but the stored hash differs, or a file the trust covers can no
+    /// longer be hashed ([`unverifiable_verdict`]): the project changed since it was
     /// trusted, so it must be re-approved before its security fields apply again.
     Changed,
 }
@@ -618,13 +629,31 @@ pub(crate) fn verdict_for_hash(
     }
 }
 
+/// Trust verdict for a config whose covered files cannot be hashed: one of them is present but
+/// refused by the safety gate (world-writable, a link, over the size ceiling) or unreadable.
+///
+/// Never `Trusted`, since nothing can be compared. What separates the other two is whether the
+/// project was approved: a marker proves it was, and the file that blocks the hash is a change to
+/// what was approved, so the verdict is `Changed`, the one a launch refuses on. `Untrusted` would
+/// let a session that makes a covered file unsafe (the project tree is bound read-write into the
+/// cage, and a mise file absent at launch is not masked) run the next launch under the layers
+/// below, which is the widening `Changed` exists to stop. A project with no marker was never
+/// approved and stays `Untrusted`.
+pub(crate) fn unverifiable_verdict(store_dir: &Path, config_path: &Path) -> TrustState {
+    match marker_path(store_dir, config_path) {
+        Some(marker) if std::fs::symlink_metadata(&marker).is_ok() => TrustState::Changed,
+        _ => TrustState::Untrusted,
+    }
+}
+
 /// Current trust state of `config_path` under `store_dir`. Reads through the same
 /// safety gate the loader uses, so a file the loader would reject (world-writable,
 /// foreign-owned) or cannot read is reported `Untrusted`, never `Trusted` — the
 /// displayed verdict matches what a launch would actually act on. A sibling mise
-/// file, or a sops file the config names, that is present but unsafe is also reported
-/// `Untrusted`: the trusted content folds in that file, and an unverifiable one cannot
-/// yield `Trusted`.
+/// file, or a sops file the config names, that is present but unsafe cannot yield
+/// `Trusted` either, since the trusted content folds in that file: it is reported
+/// [`unverifiable_verdict`]'s answer, `Changed` for an approved project and `Untrusted`
+/// for one never approved, as the loader reads it.
 pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
     state_with_inputs(store_dir, config_path).0
 }
@@ -636,8 +665,9 @@ pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
 /// nothing else. Reading the covered files again at bless time would answer the same question
 /// twice, and the project tree is bound read-write into the cage — so the two answers can differ by
 /// an in-cage write, and the second one was admitted by nobody. An unreadable or unsafe file yields
-/// `(Untrusted, empty)`: the verdict the fail-closed arms of this function already give, paired
-/// with the expectation only a project with no covered file at all can meet.
+/// an empty list, the expectation only a project with no covered file at all can meet, paired with
+/// a verdict that is never `Trusted`: `Untrusted` for the config itself, [`unverifiable_verdict`]'s
+/// for a covered file.
 pub(crate) fn state_with_inputs(store_dir: &Path, config_path: &Path) -> (TrustState, TrustInputs) {
     let sbx_bytes = match crate::config::safety::read_safe_bytes(config_path) {
         Ok(b) => b,
@@ -645,7 +675,7 @@ pub(crate) fn state_with_inputs(store_dir: &Path, config_path: &Path) -> (TrustS
     };
     let inputs = match trust_inputs_for(config_path, &sbx_bytes) {
         Ok(m) => m,
-        Err(_) => return (TrustState::Untrusted, Vec::new()),
+        Err(_) => return (unverifiable_verdict(store_dir, config_path), Vec::new()),
     };
     let verdict = verdict_for_hash(store_dir, config_path, &content_hash(&sbx_bytes, &inputs));
     (verdict, inputs)
@@ -1787,6 +1817,41 @@ mod tests {
         // ...and is never reported Trusted even if the .sbx.toml was trusted earlier
         // (here it was not), failing closed on the unverifiable file.
         assert_eq!(state(store.path(), &cfg), TrustState::Untrusted);
+    }
+
+    /// An approved project whose covered file becomes one the safety gate refuses reads
+    /// `Changed`, the verdict a launch stops on, never `Untrusted`, which would run the next launch
+    /// under the layers below. Both the file the cage can create (a mise file absent at launch)
+    /// and the one it can rewrite in place (a sops file the config names) are exercised.
+    #[test]
+    fn an_approved_project_whose_covered_file_turns_unsafe_reads_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let world_writable = std::fs::Permissions::from_mode(0o666);
+
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        std::fs::write(&cfg, b"network = \"none\"\n").unwrap();
+        trust(store.path(), &cfg).unwrap();
+        let tool_versions = proj.join(".tool-versions");
+        std::fs::write(&tool_versions, b"node 20\n").unwrap();
+        std::fs::set_permissions(&tool_versions, world_writable.clone()).unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Changed);
+        assert_eq!(
+            unverifiable_verdict(store.path(), &cfg),
+            TrustState::Changed
+        );
+
+        let store = TmpDir::new();
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        let sops = proj.join("s.enc.yaml");
+        std::fs::write(&cfg, b"x = \"sops://s.enc.yaml#k\"\n").unwrap();
+        std::fs::write(&sops, b"k: ENC[...]\n").unwrap();
+        trust(store.path(), &cfg).unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Trusted);
+        std::fs::set_permissions(&sops, world_writable).unwrap();
+        assert_eq!(state(store.path(), &cfg), TrustState::Changed);
     }
 
     #[test]

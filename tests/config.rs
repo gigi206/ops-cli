@@ -1385,6 +1385,51 @@ fn a_project_changed_since_it_was_trusted_stops_a_launch_until_it_is_re_approved
 }
 
 #[test]
+fn an_approved_project_whose_covered_file_turns_unsafe_stops_a_launch() {
+    // The cage can do more to a covered file than create it: it can make it one the safety gate
+    // refuses, which leaves the trust nothing to hash. An approved project is then as changed as
+    // one edited, and a launch stops; read as never approved, it would run under the global's
+    // `allow`. Both a mise file created world-writable and a named sops file rewritten in place are
+    // exercised, each against a project approved with `network = "none"`.
+    use std::os::unix::fs::PermissionsExt;
+    let stop = "changed since it was trusted, so its security fields are held back";
+    let check = |fx: &Project, what: &str| {
+        let out = fx.run(&["test", "net", "https://example.test/x"]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.code() == Some(2)
+                && text.contains(stop)
+                && text.contains(what)
+                && !text.contains("ALLOWED"),
+            "a covered file turned unsafe stops the launch and names the file:\n{text}"
+        );
+    };
+    let world_writable = || std::fs::Permissions::from_mode(0o666);
+
+    let fx = Project::new("cfg");
+    fx.write_global("network = \"allow\"\n");
+    fx.write_project("network = \"none\"\n");
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    let tool_versions = fx.proj.path().join(".tool-versions");
+    std::fs::write(&tool_versions, "node 20\n").unwrap();
+    std::fs::set_permissions(&tool_versions, world_writable()).unwrap();
+    check(&fx, ".tool-versions");
+
+    let fx = Project::new("cfg");
+    fx.write_global("network = \"allow\"\n");
+    fx.write_project("network = \"none\"\n[env]\nTOK = \"sops://s.enc.yaml#k\"\n");
+    let sops = fx.proj.path().join("s.enc.yaml");
+    std::fs::write(&sops, "k: ENC[...]\n").unwrap();
+    assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
+    std::fs::set_permissions(&sops, world_writable()).unwrap();
+    check(&fx, "s.enc.yaml");
+}
+
+#[test]
 fn editing_a_trusted_project_re_arms_the_gate() {
     let fx = Project::new("cfg");
     fx.write_project("binds = [\"/etc/ssh\"]\n");

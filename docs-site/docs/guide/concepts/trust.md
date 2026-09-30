@@ -28,7 +28,10 @@ of its own beside the global config, where the user owns it, and referenced (`@g
 `use`) from anywhere.
 
 ² A project you approved and that changed since, its `.sbx.toml` or a mise or sops file
-its trust covers, is not treated as one never approved. Its security fields are held
+its trust covers, is not treated as one never approved. A covered file the
+[safety gate](#the-safety-gate) now refuses (made world-writable, turned into a link,
+grown past the size ceiling) counts as such a change: it cannot be hashed, so nothing
+confirms it is what you approved. Its security fields are held
 back, and what would run in their place is the layers below, which are not what it
 wrote: it may be what closed its paths or narrowed its network. A launch stops instead,
 naming `sbx trust`, which shows what changed before re-approving it. `sbx config show`
@@ -184,8 +187,9 @@ private copy of them rather than the path. A file the trust does not cover, or o
 rewritten since, is refused before `sops` runs.
 
 A named sops file passes the same [safety gate](#the-safety-gate) as the config, size
-ceiling of 1 MiB included. One it refuses makes the project unverifiable, so the
-project reads untrusted, and `sbx trust` refuses too: it reads the same file. The
+ceiling of 1 MiB included. One it refuses makes the project unverifiable: a project
+you approved reads changed, so a launch stops, and one you never approved reads
+untrusted. `sbx trust` refuses too: it reads the same file. The
 error names the file. Fix it, or keep it outside the project and name it by its
 absolute path, which the trust does not hash.
 

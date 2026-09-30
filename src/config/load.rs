@@ -105,8 +105,8 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // security fields are held back until it is re-approved, and what would run in their place is
     // the layers below, which are not what it wrote: it may be what closed its paths or narrowed
     // its network, the reason a file that cannot be read stops a launch. A covered file the cage
-    // can create (a mise file absent at launch) makes it changed as well, so running on would let
-    // a session widen the next one. A launch stops instead; the read-only verbs still answer, and
+    // can create (a mise file absent at launch), or make unsafe to hash, makes it changed as well,
+    // so running on would let a session widen the next one. A launch stops instead; the read-only verbs still answer, and
     // the warning is what tells them a launch would not.
     if let Some((_, TrustState::Changed, _)) = &project {
         warnings.push(format!(
@@ -728,9 +728,10 @@ fn read_project(
     };
 
     // Fold the sibling mise files and the sops files the config names into the verdict —
-    // trust covers every one of them. A present-but-unsafe one is unverifiable, so it forces
-    // the project untrusted: its `.sbx.toml` still parses (its free `env` applies under
-    // untrusted rules), but its security fields drop. Verdict over the exact bytes that will
+    // trust covers every one of them. A present-but-unsafe one is unverifiable, so the project
+    // is never trusted: `Changed` when it was approved, which stops a launch, `Untrusted` when it
+    // never was. Its `.sbx.toml` still parses (its free `env` applies under untrusted rules), but
+    // its security fields drop. Verdict over the exact bytes that will
     // be parsed (closes the trust→parse window): hash these bytes — framed with the covered
     // files — and compare to the marker, never re-reading. Only the mise half travels on to
     // the launcher; the sops half is read again, and checked again, at each resolution.
@@ -740,8 +741,14 @@ fn read_project(
     });
     let (state, mise_inputs) = match covered {
         Err(e) => {
-            warnings.push(format!("treating {} as untrusted: {e}", path.display()));
-            (TrustState::Untrusted, Vec::new())
+            let state = trust::default_store_dir().map_or(TrustState::Untrusted, |store| {
+                trust::unverifiable_verdict(&store, &path)
+            });
+            warnings.push(format!(
+                "cannot verify the trust of {}: {e}",
+                path.display()
+            ));
+            (state, Vec::new())
         }
         Ok((mise_inputs, sops_inputs)) => {
             let state = match trust::default_store_dir() {
