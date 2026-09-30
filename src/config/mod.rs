@@ -4344,12 +4344,13 @@ fn classify_entries(
                 // Both ways in are named: a group most often arrives as a portable fragment
                 // (`sbx net groups import`), and pointing only at hand-editing sends the reader to
                 // write by hand what a verb already imports — the same defect as a message that
-                // names a remedy the product does not offer, inverted.
+                // names a remedy the product does not offer, inverted. Written by hand, a group is
+                // a file of its own: an inline `[network.groups]` in the global config is ignored.
                 None => left_out(format!(
-                    "{source_label}: {list} references undefined group `@{}` — import it \
-                     (`sbx net groups import <file>`) or define it under `[network.groups]` in the \
-                     global config, or remove the reference ({cost})",
-                    crate::diag::visible(name)
+                    "{source_label}: {list} references undefined group `@{name}` — import it \
+                     (`sbx net groups import <file>`) or write it as `{NET_GROUPS_DIR}/{name}.toml` \
+                     beside the global config, or remove the reference ({cost})",
+                    name = crate::diag::visible(name)
                 )),
             }
             continue;

@@ -626,6 +626,13 @@ fn an_undefined_group_reference_is_dropped_with_a_loud_warning() {
         "the warning spells out the deny-list consequence: {}",
         w[0]
     );
+    // The way out it names is one the product reads: a group's own file, never the inline
+    // `[network.groups]` table the global config is warned it ignores.
+    assert!(
+        w[0].contains("net-groups/telemetr.toml") && !w[0].contains("[network.groups]"),
+        "{}",
+        w[0]
+    );
 }
 
 #[test]
