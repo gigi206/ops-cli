@@ -791,19 +791,20 @@ impl DirectoryDates {
 /// by [`safe_path`] just before it was made. A date that cannot be set is left.
 fn date_link(path: &Path, date: std::time::SystemTime) {
     use std::os::unix::ffi::OsStrExt;
-    let Some(secs) = date
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| libc::time_t::try_from(d.as_secs()).ok())
-    else {
-        return;
-    };
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return;
     };
     // SAFETY: `timespec` is two integers on the targets sbx builds for, so all-zero is valid.
     let mut times: [libc::timespec; 2] = unsafe { std::mem::zeroed() };
     times[0].tv_nsec = libc::UTIME_OMIT;
+    // Converted into whatever width the field has on the target, rather than a named type.
+    let Some(secs) = date
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| d.as_secs().try_into().ok())
+    else {
+        return;
+    };
     times[1].tv_sec = secs;
     // SAFETY: `path` is a live NUL-terminated string and `times` two live `timespec`s, the access
     // time left as it is and the modification time set.
