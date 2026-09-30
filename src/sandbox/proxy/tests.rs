@@ -2851,6 +2851,83 @@ fn a_proxy_authorization_header_is_never_forwarded_upstream() {
     );
 }
 
+/// A WebSocket handshake in absolute form does not open a WebSocket: this plane relays one request
+/// and one response. The handshake reaches the upstream without the `Connection: Upgrade` an
+/// upgrade needs, and a `101` the upstream sends anyway reaches the client with nothing of what
+/// the upstream pushes behind it. Pinned so the networking guide, which once said the client takes
+/// the connection over, keeps saying this.
+#[test]
+fn an_absolute_form_websocket_handshake_opens_no_websocket() {
+    let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+          Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\nS-FIRST;",
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            policy(&["{WS} host.test:*"]),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let _settle = super::events::Settle(ctx.events.clone());
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+    });
+    let mut sock = UnixStream::connect(&path).unwrap();
+    let port = addr.port();
+    sock.write_all(
+        format!(
+            "GET https://host.test:{port}/socket HTTP/1.1\r\nHost: host.test:{port}\r\n\
+             Upgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n\
+             client-frame"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+
+    let head = rx.recv_timeout(UPSTREAM_WAIT).unwrap_or_default();
+    assert!(head.contains("Upgrade: websocket"), "{head:?}");
+    assert!(
+        !head.to_ascii_lowercase().contains("connection:"),
+        "the upgrade's `Connection` does not reach the upstream: {head:?}"
+    );
+
+    // What the upstream pushes after its `101` arrives within milliseconds on a plane that relays
+    // it; a second with nothing is the answer.
+    sock.set_read_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = sock.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    let got = String::from_utf8_lossy(&got);
+    assert!(
+        got.starts_with("HTTP/1.1 101") && !got.contains("S-FIRST"),
+        "{got:?}"
+    );
+}
+
 #[test]
 fn parse_status_code_reads_a_well_formed_status_line_only() {
     // A normal status line → the code.
