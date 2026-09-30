@@ -1156,7 +1156,8 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
     }
     // The host-reach switches, each a plain yes/no the reader must see stated. They are cheap to
     // omit and expensive to be surprised by: `allow_insecure_http` is the one that turns off the
-    // refusal to speak cleartext, and the three below hand the cage a device or the session bus.
+    // refusal to speak cleartext, and the three below hand the cage a device, the host's audio
+    // server, or a route to its notification daemon.
     for (name, on, what) in [
         (
             "allow_insecure_http",
@@ -1165,7 +1166,11 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
         ),
         ("gpu", app.gpu, "the host GPU is bound into the cage"),
         ("audio", app.audio, "the host audio server is reachable"),
-        ("dbus", app.dbus, "the host session bus is reachable"),
+        (
+            "dbus",
+            app.dbus,
+            "the cage's notifications reach the host desktop",
+        ),
     ] {
         if on == Some(true) {
             lines.push(format!("{name}: true — {what}"));

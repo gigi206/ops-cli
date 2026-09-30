@@ -131,12 +131,6 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::None,
     },
     Entry {
-        label: "dbus/",
-        rel: "dbus",
-        desc: "per-launch filtered D-Bus proxy sockets",
-        enumerate: Enumerate::None,
-    },
-    Entry {
         label: "portal/",
         rel: "portal",
         desc: "per-launch in-cage desktop portal state",

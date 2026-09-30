@@ -3,22 +3,24 @@
 //! The in-cage portal ([`super::portal`]) gives a Chromium/Electron app its own private D-Bus bus so
 //! its file chooser renders in-cage. That private bus carries the portal, but nothing serves
 //! `org.freedesktop.Notifications` on it, so the app cannot raise a desktop notification. This relay
-//! bridges the gap: it runs **host-side** (sbx's own trusted infrastructure, like the egress and
-//! filtered-D-Bus proxies), connects both to the private bus (through the socket the portal exposes
-//! on a host path) and to the real host session bus, **owns `org.freedesktop.Notifications` on the
-//! private bus**, and forwards every call to the host daemon — re-emitting the host's `ActionInvoked`
-//! and `NotificationClosed` signals back onto the private bus so click-to-focus and notification
-//! actions work end to end. The notification id the host returns is passed through verbatim, so a
-//! signal carrying that id routes back to the right notification with no remapping.
+//! bridges the gap: it runs **host-side**, in the supervisor's own process, connects both to the
+//! private bus (through the socket the portal exposes on a host path) and to the real host session
+//! bus, **owns `org.freedesktop.Notifications` on the private bus**, and forwards every call to the
+//! host daemon — re-emitting the host's `ActionInvoked` and `NotificationClosed` signals back onto
+//! the private bus so click-to-focus and notification actions work end to end. The notification id
+//! the host returns is passed through verbatim, so a signal carrying that id routes back to the
+//! right notification with no remapping.
 //!
-//! What that forwarding costs is stated here rather than justified away. This section used to argue
-//! that the relay adds no capability beyond what the filtered host bus already grants, but under
-//! `dbus = true` the cage gets a private bus and no host bus at all, so the relay is its *only*
-//! route to the host daemon and everything the relay forwards is capability it would otherwise not
-//! have. What it forwards is the notifications interface alone (no keyring, no portal, no other host
-//! service). The residual accepted is notification **spoofing**: the cage picks the *text* of a
-//! toast the user reads as the desktop's. Three things are held back from it, because each of them
-//! turns spoofing into something else:
+//! **It runs in the supervisor, not in a caged helper.** The reasons, and what would change them,
+//! are written in [`crate::sandbox::selfcage`].
+//!
+//! What that forwarding costs is stated here rather than justified away. Under `dbus = true` the
+//! cage gets a private bus and no host bus at all, so the relay is its *only* route to the host
+//! daemon and everything the relay forwards is capability it would otherwise not have. What it
+//! forwards is the notifications interface alone (no keyring, no portal, no other host service).
+//! The residual accepted is notification **spoofing**: the cage picks the *text* of a toast the
+//! user reads as the desktop's. What follows is held back from it, because each turns spoofing into
+//! something else:
 //!
 //! - **Identity.** The application name is written by the supervisor first and by the cage only
 //!   after it ([`relayed_app_name`]). sbx raises its own refusal toasts on this same host daemon,

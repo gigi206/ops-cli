@@ -123,7 +123,7 @@ pub(crate) struct ConfigView {
     pub(crate) audio: bool,
     /// Which layer supplied the audio posture (`Default` when neither config set it).
     pub(crate) audio_origin: ProvenanceView,
-    /// The resolved D-Bus posture (off, filtered host bus, or in-cage portal).
+    /// Whether the cage gets its private in-cage desktop portal (`dbus = true`).
     pub(crate) dbus: bool,
     /// Which layer supplied the D-Bus posture (`Default` when neither config set it).
     pub(crate) dbus_origin: ProvenanceView,
@@ -2328,7 +2328,7 @@ mod tests {
         // The GPU posture and its provenance travel with the view too.
         assert_eq!(json["gpu"], true);
         assert_eq!(json["gpu_origin"], "Project");
-        // The filtered-D-Bus posture and its provenance likewise.
+        // The D-Bus posture and its provenance likewise.
         assert_eq!(json["dbus"], true);
         assert_eq!(json["dbus_origin"], "Project");
         // The forward port list + its origin travel with the view, so a front-end can render

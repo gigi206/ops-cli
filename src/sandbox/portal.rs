@@ -1,11 +1,9 @@
 //! The in-cage desktop portal (`dbus = true`).
 //!
 //! A Chromium/Electron app on Linux opens its file chooser through the desktop portal
-//! (`org.freedesktop.portal.FileChooser`). Under the filtered *host* bus (`dbus = true`) that
-//! portal is the **host's**, whose dialog is a host-privileged file manager the cage must not be
-//! able to summon — so sbx refuses the FileChooser interface, and the app's "browse for a folder"
-//! then fails (recent Chromium commits to the portal and no longer falls back to its in-process
-//! GTK dialog once a portal advertises a new-enough version).
+//! (`org.freedesktop.portal.FileChooser`). If that portal were the **host's**, its dialog would be
+//! a host-privileged file manager the cage must not be able to summon, so no cage is given the host
+//! session bus.
 //!
 //! `dbus = true` gives the cage its **own** portal instead: a private D-Bus session bus runs
 //! inside the cage carrying sbx-provisioned `xdg-desktop-portal` with the reference GTK backend
@@ -17,17 +15,17 @@
 //! *reference* backend (the universal fallback used by sway/XFCE/MATE), depending only on the GTK
 //! library the Electron app already carries.
 //!
-//! The bus carries only in-cage services and never connects to the host session bus, so — unlike
-//! the filtered host bus — it is unaffected by the network posture. Its socket, however, lives on a
-//! host directory sbx bind-mounts into the cage (at [`CAGE_DIR`]): the in-cage `dbus-daemon` creates
-//! it there, so a host-side process can reach the private bus. That is what lets the desktop
-//! notifications relay (`org.freedesktop.Notifications`, forwarded to the host daemon) attach to the
-//! bus. The exposure is benign under sbx's same-uid model: the directory is owner-only (0700), the
-//! only host process that connects is sbx's own relay, and every portal backend on the bus is
-//! confined to the cage (the socket carries no reach the user's own uid does not already have). The
-//! host light/dark theme is seeded into the cage at launch (read host-side, best-effort) so both the
-//! app and the file dialog open in the right theme, and a later host switch is followed live by the
-//! theme relay (see [`super::theme_relay`]) rewriting the GSettings keyfile both surfaces watch.
+//! The bus carries only in-cage services and never connects to the host session bus, so it is
+//! unaffected by the network posture. Its socket, however, lives on a host directory sbx
+//! bind-mounts into the cage (at [`CAGE_DIR`]): the in-cage `dbus-daemon` creates it there, so a
+//! host-side process can reach the private bus. That is what lets the desktop notifications relay
+//! (`org.freedesktop.Notifications`, forwarded to the host daemon) attach to the bus. The exposure
+//! is benign under sbx's same-uid model: the directory is owner-only (0700), the only host process
+//! that connects is sbx's own relay, and every portal backend on the bus is confined to the cage
+//! (the socket carries no reach the user's own uid does not already have). The host light/dark
+//! theme is seeded into the cage at launch (read host-side, best-effort) so both the app and the
+//! file dialog open in the right theme, and a later host switch is followed live by the theme relay
+//! (see [`super::theme_relay`]) rewriting the GSettings keyfile both surfaces watch.
 //!
 //! Needs `gui = "wayland"`: the GTK backend renders through the compositor, so without a display it
 //! cannot start and the FileChooser interface never appears.

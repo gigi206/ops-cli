@@ -435,13 +435,13 @@ fn launch_foreground(
         }
         // Supervise instead of exec-replace — fork bwrap, wait, propagate the exit status — whenever
         // a host-side thing must outlive the cage. That is a guard (a network allowlist's filtering
-        // proxy, a forward forwarder, a filtered D-Bus proxy, or an in-cage portal whose runtime dir
-        // must be cleaned up), OR observation: the observer runs in a host thread that needs a live
-        // parent for the cage's lifetime, so observation forces supervision even with no guard. The
-        // observer roots on this supervisor's own pid — the cage is its descendant in host pid-space —
-        // and its socket + poll thread are torn down on drop, before the guard is released. `inline`
-        // is true here: this is the non-tty foreground path, the one place the `[sbx:exec]` feed
-        // streams to stderr (as well as into the ring `sbx proc logs` reads).
+        // proxy, a forward forwarder, the notifications or theme relay, or an in-cage portal whose
+        // runtime dir must be cleaned up), OR observation: the observer runs in a host thread that
+        // needs a live parent for the cage's lifetime, so observation forces supervision even with no
+        // guard. The observer roots on this supervisor's own pid — the cage is its descendant in host
+        // pid-space — and its socket + poll thread are torn down on drop, before the guard is
+        // released. `inline` is true here: this is the non-tty foreground path, the one place the
+        // `[sbx:exec]` feed streams to stderr (as well as into the ring `sbx proc logs` reads).
         maybe_guard => {
             let observer = (exec_poll || fs).then(|| {
                 super::observe_feed::Observation::start(

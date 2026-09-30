@@ -56,7 +56,6 @@ The important subtrees:
 | `ssh-agent/` | per-launch ssh-agent fence sockets and their record |
 | `forward/` | per-launch inbound port-forward sockets |
 | `distro/` | unpacked distribution root filesystems (one per image digest) |
-| `dbus/` | per-launch filtered D-Bus proxy sockets |
 | `portal/` | per-launch in-cage desktop portal state |
 | `audio/` | generated ALSA config for the audio hole |
 | `fontconfig/` | generated fontconfig for the Wayland hole |

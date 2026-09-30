@@ -667,8 +667,7 @@ fn portal_stack(
     // wrap (below), so the bus is up before the app. Best-effort: a provisioning failure warns and
     // the app runs without an in-cage portal (its file chooser then falls back to its own dialog).
     // Requires the Wayland display (the GTK backend renders through the compositor), so it is gated
-    // on both. Unlike the filtered host bus, the private bus touches no host socket, so the network
-    // posture does not gate it.
+    // on both. The private bus touches no host socket, so the network posture does not gate it.
     // The portal's host-side runtime directory, bound into the cage so the in-cage dbus-daemon's
     // socket is reachable from the host (the notifications relay attaches there). Created alongside
     // the provision so `portal` being `Some` implies the directory exists; a create failure drops the

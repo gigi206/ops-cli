@@ -29,6 +29,18 @@
 //! before it is parsed. A helper would need a syscall list that admits sockets, the `distro`
 //! credential inside its cage, and every layer passed back through the supervisor to be hashed,
 //! for a gain confined to one path while nix's fetches stay uncaged beside it.
+//!
+//! The notifications relay ([`super::notify_relay`]) parses what a cage writes, every call that
+//! arrives on the cage's private bus, and offers neither while its work stays what it is. Its one
+//! effect is a call on the host's notification daemon, which it would make from a cage all the
+//! same, and which it holds to rules of its own before making it. A helper for it would also have
+//! to hold the relay's other end, a connection to the host session bus, and that bus reaches every
+//! service of the session: the login keyring, the desktop portal and, where systemd manages the
+//! session, a service manager that starts any command it is asked to. A flaw handed that connection
+//! keeps the supervisor's reach, one call away. The relay leaves the supervisor once that end can
+//! reach it narrowed to the notifications interface, or once it is split the way the egress proxy
+//! is: the parse in a cage, and the supervisor holding the host bus to forward a request it has
+//! typed.
 
 use super::spec::{Mount, NetPolicy, SandboxSpec};
 use std::ffi::OsString;

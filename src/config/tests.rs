@@ -4143,8 +4143,8 @@ fn validating_a_profile_requires_a_command_and_summarizes_its_posture() {
 
     // The switches and sections that widen host reach without being a list of paths. Each of these
     // arrived unstated: the report named the profile's binds and credentials and said nothing about
-    // the cage speaking cleartext, holding the session bus, reaching a listener on the host, or
-    // carrying declared operations of its own.
+    // the cage speaking cleartext, raising notifications on the host desktop, reaching a listener on
+    // the host, or carrying declared operations of its own.
     let wider = validate_profile(
         br#"
             cmd = "demo-app"
@@ -4175,6 +4175,12 @@ fn validating_a_profile_requires_a_command_and_summarizes_its_posture() {
             "the consent report must state `{expected}`: {joined}"
         );
     }
+    // What `dbus = true` reaches on the host is the notification daemon, through the relay, and
+    // nothing else of the session bus: the cage's bus is a private one. The line says that much.
+    assert!(
+        joined.contains("dbus: true — the cage's notifications reach the host desktop"),
+        "{joined}"
+    );
 
     // And whatever it has no line for is still named, so a field added to the schema without a
     // line here cannot arrive in silence.

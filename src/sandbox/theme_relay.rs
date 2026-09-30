@@ -2,9 +2,8 @@
 //!
 //! The in-cage portal ([`super::portal`]) seeds the host light/dark theme into the cage **once** at
 //! launch (so the app opens in the right scheme), but does not follow a host theme switch made
-//! afterwards. This relay closes that gap. It runs **host-side** (sbx's own trusted infrastructure,
-//! like the notifications relay and the egress proxy), connects to the real host session bus,
-//! subscribes to the desktop portal's `org.freedesktop.portal.Settings.SettingChanged` signal for
+//! afterwards. This relay closes that gap. It runs **host-side**, connects to the real host session
+//! bus, subscribes to the desktop portal's `org.freedesktop.portal.Settings.SettingChanged` signal for
 //! the `org.freedesktop.appearance` `color-scheme` key, and on each change **rewrites the in-cage
 //! GSettings keyfile** through the home bind. The keyfile carries both surface keys
 //! ([`super::portal::keyfile_body`]):
