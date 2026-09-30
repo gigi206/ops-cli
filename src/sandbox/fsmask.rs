@@ -967,9 +967,10 @@ fn git_common_dir(dir: &Path) -> Result<PathBuf, String> {
         _ => Err(visible(&format!(
             "`{}` does not name the repository whose `worktrees` directory holds it, the only \
              `commondir` git writes: your git would read its configuration and its hooks from \
-             elsewhere. Check the file and the `.git` file of the project, then launch again. \
+             elsewhere. Check the file and the `.git` file that names `{}`, then launch again. \
              {GIT_WRITABLE_HINT}",
-            file.display()
+            file.display(),
+            dir.display()
         ))),
     }
 }
@@ -1800,8 +1801,9 @@ fn worktree_entries(worktrees: &Path) -> io::Result<(Vec<PathBuf>, bool)> {
 /// The work trees of `repo`'s repository other than `repo`'s own, each as the [`GitRepo`] the
 /// host's git reads there: the main one when `repo` is a linked worktree's ([`main_work_tree`]),
 /// and each linked worktree `found` lists whose `.git` file names its directory back
-/// ([`linked_work_tree`]), that file held where the cage writes it. None is listed past the bound
-/// [`git_worktree_files`] refuses on.
+/// ([`linked_work_tree`]), that file held where the cage writes it, and its `commondir` checked
+/// there ([`linked_common_dir_refusal`]). None is listed past the bound [`git_worktree_files`]
+/// refuses on.
 fn other_work_trees(
     reach: &Reach,
     repo: &GitRepo,
@@ -1816,6 +1818,9 @@ fn other_work_trees(
     for dir in found.dirs.iter().filter(|dir| **dir != repo.dir) {
         match linked_work_tree(reach, dir) {
             Ok(Some(work_tree)) => {
+                if let Some(reason) = linked_common_dir_refusal(reach, repo, dir) {
+                    refused.get_or_insert(reason);
+                }
                 git_file(reach, &work_tree.join(".git"), None, refused, masks);
                 trees.push(GitRepo {
                     dir: dir.clone(),
@@ -1830,6 +1835,34 @@ fn other_work_trees(
         }
     }
     trees
+}
+
+/// The refusal the `commondir` of the linked worktree whose directory under `repo`'s `worktrees` is
+/// `dir` earns where the cage writes it ([`Reach`]), or `None`.
+///
+/// The host's git run in that worktree reads the configuration and the hooks of the directory its
+/// `commondir` names, and of `dir` itself when it holds none, where the cage could make a
+/// repository of its own. So where the cage writes it, a `commondir` git would not have written
+/// refuses the launch ([`git_common_dir`]), and so does an absent one; a present one is then held
+/// read-only as it was at launch ([`git_worktree_files`]).
+fn linked_common_dir_refusal(reach: &Reach, repo: &GitRepo, dir: &Path) -> Option<String> {
+    let file = dir.join("commondir");
+    if !reach.holds(&file) {
+        return None;
+    }
+    match git_common_dir(dir) {
+        Ok(common) if common == repo.common => None,
+        Ok(_) => Some(visible(&format!(
+            "`{}` holds no `commondir`, which git writes for every linked worktree: your git in \
+             that worktree would read `{}` as a repository of its own, with the configuration and \
+             the hooks the cage could write there. Check it, write `../..` to `{}`, the value git \
+             writes, then launch again. {GIT_WRITABLE_HINT}",
+            dir.display(),
+            dir.display(),
+            file.display()
+        ))),
+        Err(reason) => Some(reason),
+    }
 }
 
 /// The main work tree of the repository `repo` is a linked worktree of, as the [`GitRepo`] the
@@ -2133,7 +2166,8 @@ impl RepoWatch {
 
     /// One finding for each linked worktree of the repository the launch did not carry whose `.git`
     /// is now where the cage writes: one added during the session, or one whose work tree came
-    /// back.
+    /// back. A `commondir` there the next launch refuses on ([`linked_common_dir_refusal`]) is
+    /// named in it.
     fn added_work_trees(&self) -> Vec<String> {
         let found = worktree_dirs(&self.reach, &self.repo.common);
         found
@@ -2145,11 +2179,21 @@ impl RepoWatch {
                 let dot_git = work_tree.join(".git");
                 let there = std::fs::symlink_metadata(&dot_git).is_ok();
                 (there && self.reach.holds(&dot_git)).then(|| {
+                    let common = if linked_common_dir_refusal(&self.reach, &self.repo, dir)
+                        .is_some()
+                    {
+                        ". Its `commondir` is missing or does not name this repository: your git \
+                         there reads the configuration and the hooks of another directory, and \
+                         the next launch refuses until it names this one"
+                    } else {
+                        ""
+                    };
                     format!(
                         "`{}` became a worktree of this repository during the session (`{}`), and \
-                         sbx did not protect it at launch: its `.git` file, the hooks a relative \
-                         `core.hooksPath` names there and its submodules' repositories were \
-                         writable to the cage. Check them before running git in it",
+                         sbx did not protect it at launch: its `.git` file, its `commondir`, the \
+                         hooks a relative `core.hooksPath` names there and its submodules' \
+                         repositories were writable to the cage. Check them before running git in \
+                         it{common}",
                         work_tree.display(),
                         dir.display()
                     )
@@ -4627,6 +4671,51 @@ mod tests {
         );
     }
 
+    /// A linked worktree's `commondir` that does not name the repository whose `worktrees` holds
+    /// it, or an absent one, refuses the launch where the cage writes it: git in that worktree
+    /// would read the configuration and the hooks of the directory it names, or of the worktree's
+    /// own directory, where the cage could make a repository. Where the cage does not write it,
+    /// nothing is refused.
+    #[test]
+    fn a_linked_worktrees_commondir_git_would_not_write_refuses_where_the_cage_writes_it() {
+        let tmp = TmpDir::new();
+        let Some((main, feat, git)) = linked_worktree(&tmp) else {
+            skip_incapable!("skipping a linked worktree's commondir: no git, or a cage mount");
+            return;
+        };
+        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/sib"]));
+        let other = tmp.path().canonicalize().unwrap().join("other");
+        assert!(git_repo_at(&other, &[]));
+        let refused = |project: &Path, binds: &[crate::config::Bind]| {
+            expand(project, &FsPolicy::default(), binds, None).refused
+        };
+        let sib = main.join(".git/worktrees/sib/commondir");
+        for commondir in [main.join(".git/worktrees/feat/commondir"), sib.clone()] {
+            std::fs::write(&commondir, format!("{}\n", other.join(".git").display())).unwrap();
+            let why = refused(&main, &[]).expect("another repository");
+            assert!(
+                why.contains(&format!("{}` does not name", commondir.display())),
+                "{why}"
+            );
+            std::fs::remove_file(&commondir).unwrap();
+            let why = refused(&main, &[]).expect("none");
+            let dir = commondir.parent().unwrap();
+            assert!(
+                why.contains(&format!("{}` holds no `commondir`", dir.display())),
+                "{why}"
+            );
+            std::fs::write(&commondir, "../..\n").unwrap();
+            assert_eq!(refused(&main, &[]), None);
+        }
+
+        std::fs::remove_file(&sib).unwrap();
+        assert_eq!(refused(&feat, &[]), None, "not the cage's to write");
+        assert!(refused(&feat, &[rw_bind(&main)]).is_some());
+        std::fs::write(&sib, format!("{}\n", other.join(".git").display())).unwrap();
+        assert_eq!(refused(&feat, &[]), None, "not the cage's to write");
+        assert!(refused(&feat, &[rw_bind(&main)]).is_some());
+    }
+
     /// The end of a session looks at the repository a linked worktree's `.git` file names: a
     /// gitlink added to the worktree's own index is named, and a `commondir` appearing in the main
     /// `.git` is named where the cage writes it, not where it does not, as the next launch refuses
@@ -4959,8 +5048,9 @@ mod tests {
     }
 
     /// The end of a session names a worktree that became one of the repository's where the cage
-    /// writes, not one the launch carried, and a submodule's repository added to the index of a
-    /// worktree the launch carried.
+    /// writes, not one the launch carried, and says so when its `commondir` names another
+    /// repository, and a submodule's repository added to the index of a worktree the launch
+    /// carried.
     #[test]
     fn the_git_watch_names_a_worktree_added_during_the_session() {
         let tmp = TmpDir::new();
@@ -4980,6 +5070,15 @@ mod tests {
         let named = |what: &str| found.iter().any(|f| f.contains(what));
         assert!(named(".wt/added` became a worktree"), "{found:#?}");
         assert!(!named(".wt/inner` became a worktree"), "{found:#?}");
+        assert!(!named("`commondir` is missing"), "{found:#?}");
+        assert!(git(&["worktree", "add", "-q", "--detach", ".wt/evil"]));
+        std::fs::write(root.join(".git/worktrees/evil/commondir"), "../../../x\n").unwrap();
+        let found = watch.findings();
+        let evil = found
+            .iter()
+            .find(|f| f.contains(".wt/evil` became a worktree"))
+            .expect("named");
+        assert!(evil.contains("`commondir` is missing"), "{evil}");
         assert!(
             named("inner/emb/.git` is a submodule's repository"),
             "{found:#?}"

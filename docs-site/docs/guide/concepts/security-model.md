@@ -282,7 +282,8 @@ does. The files
 git reads as configuration beside it are held the same way (`.git/config.worktree`, and a
 linked worktree's `config.worktree`, `commondir` and `gitdir`), and a `.git/commondir` in the
 project's own repository, which would have git read its configuration from elsewhere, refuses
-the launch. Such a file cannot be held before it exists, so sbx names any that appeared once the
+the launch, as does a linked worktree's `commondir` that is missing or names another directory
+than the repository holding it. Such a file cannot be held before it exists, so sbx names any that appeared once the
 cage has exited. A `.git` that is a file, the pointer a linked worktree keeps to its
 repository, is read-only as well, and the repository it names is held like `.git` wherever the
 cage writes it; so are the repositories of the submodules the index names, which a

@@ -148,7 +148,10 @@ your global config or an included file), and then an absent one refuses the laun
 missing include does. Each linked worktree's own `config.worktree`, `commondir` and `gitdir`,
 under `.git/worktrees/`, are read-only too, so `git worktree remove`, `prune`, `move` and
 `repair` cannot change, from inside the cage, a worktree that existed at launch: run them on the
-host. A
+host. A worktree's `commondir` names the repository whose configuration and hooks your git reads
+in that worktree, so one that names any other directory than the repository holding it, or a
+missing one, which has git read the worktree's own directory as a repository the cage could
+fill, refuses the launch where the cage writes it. A
 symbolic link at any of these paths, or in place of `.git/worktrees`, refuses the launch,
 since the cage could point it elsewhere during the session.
 
