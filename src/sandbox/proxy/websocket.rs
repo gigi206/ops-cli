@@ -5,7 +5,7 @@
 //! between the in-cage client and the validated upstream. These helpers detect the
 //! upgrade, reserialize the upgrade request/response, and pump the two directions.
 //!
-//! The frame decoder the relay drives — the framing, the `permessage-deflate` reassembly, the
+//! The frame decoder the relay drives — the framing, the `permessage-deflate` inflation, the
 //! capture tee and the leak tripwire — is [`super::wsframe`]: none of it is needed to forward a
 //! byte, and the relay reaches it only through [`FrameTee`].
 
@@ -1276,5 +1276,54 @@ mod tests {
         let seeded = seed_outbound_pending(&mut upstream, &ordinary, &mut tee, &obs, true).unwrap();
         assert!(!seeded.followed.seen && seeded.crossed);
         assert_eq!(upstream, ordinary);
+    }
+
+    /// Under `block`, the first frame of a compressed message that carries a declared secret is
+    /// gated like any chunk: it does not reach the upstream, although the message it opens has not
+    /// ended. The frame is compressed the way a `permessage-deflate` client sends it, flushed where
+    /// it ends.
+    #[test]
+    fn a_compressed_frame_carrying_a_secret_is_gated_before_its_message_ends() {
+        use miniz_oxide::deflate::core::{CompressorOxide, TDEFLFlush, compress};
+        let ctx = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            crate::allowlist::EgressPolicy::default(),
+        )
+        .unwrap();
+        let obs = TunnelObservers {
+            up: Arc::new(AtomicU64::new(0)),
+            down: Arc::new(AtomicU64::new(0)),
+            capture: None,
+            ctx: &ctx,
+            seq: None,
+        };
+        let flags = miniz_oxide::deflate::core::create_comp_flags_from_zip_params(9, -15, 0);
+        let mut c = CompressorOxide::new(flags);
+        let mut text = b"token=".to_vec();
+        text.extend_from_slice(NEEDLE_VALUE);
+        let mut body = vec![0u8; text.len() * 2 + 64];
+        let (_, consumed, n) = compress(&mut c, &text, &mut body, TDEFLFlush::Sync);
+        assert_eq!(consumed, text.len());
+        body.truncate(n);
+        let mut opening = frame(0x1, &body, Some([0x37, 0xfa, 0x21, 0x3d]));
+        opening[0] = 0x41; // RSV1 | text, and not the message's last frame
+        assert!(
+            !opening
+                .windows(NEEDLE_VALUE.len())
+                .any(|w| w == NEEDLE_VALUE),
+            "the secret must not cross in the clear, else this tests nothing"
+        );
+
+        let mut tee = FrameTee::new(None, &[needle()], Some(false), false);
+        let mut upstream = Vec::new();
+        let seeded = seed_outbound_pending(&mut upstream, &opening, &mut tee, &obs, true).unwrap();
+        assert!(
+            seeded.followed.seen,
+            "the frame's bytes decode to the secret"
+        );
+        assert!(
+            !seeded.crossed && upstream.is_empty(),
+            "so under `block` it does not cross"
+        );
     }
 }

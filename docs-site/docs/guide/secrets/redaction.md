@@ -166,8 +166,8 @@ worded to prevent.
   lists at most 32 sightings, both directions of sixteen names.
 - It runs **whether or not the launch captures**: an enforcement path must not depend on a
   debugging setting. It sees the payloads decoded, so a masked frame and a
-  `permessage-deflate` message are scanned as the text they carry, a compressed message at
-  its final frame, once the frames before it have crossed.
+  `permessage-deflate` message are scanned as the text they carry, a compressed one as its
+  frames arrive.
 - Byte-exact and per message, with the same honest scope as the rest of this page: a
   re-encoded value, or one split across two separate messages, is not caught.
 

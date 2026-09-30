@@ -2105,14 +2105,14 @@ pub(crate) struct NetworkTable {
     /// match, which may be the app legitimately echoing a value that looks like the secret. What
     /// `"block"` buys is bounded by how the bytes arrive: the scan runs on each chunk read from the
     /// cage before that chunk is written on, so a secret whole inside one chunk never crosses, while
-    /// one split across chunks has had its first part relayed before the match completes, and a
-    /// compressed message is read at its final frame, after the frames before it. An unknown
-    /// value is refused with a warning and the **strict** posture applies instead, as `capture`
-    /// above applies its own `off`. The difference is which spelling that is: here the permissive
-    /// value is the one a policy carries unasked, so leaving it in place would keep the weaker
-    /// setting on a value its author most likely wrote to mean `"block"`. A value of the wrong
-    /// type (`true`) costs the file for the same reason, since dropping it would leave `"warn"` in
-    /// force: see [`WIDENING_DROPS`]. Trusted/global-only like the rest of the table.
+    /// one split across chunks has had its first part relayed before the match completes; a
+    /// compressed message is inflated as it arrives, so the same holds of the text it carries. An
+    /// unknown value is refused with a warning and the **strict** posture applies instead, as
+    /// `capture` above applies its own `off`. The difference is which spelling that is: here the
+    /// permissive value is the one a policy carries unasked, so leaving it in place would keep the
+    /// weaker setting on a value its author most likely wrote to mean `"block"`. A value of the
+    /// wrong type (`true`) costs the file for the same reason, since dropping it would leave
+    /// `"warn"` in force: see [`WIDENING_DROPS`]. Trusted/global-only like the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) websocket_secret: Option<String>,
     /// The per-body capture cap in KiB, meaningful only with `capture = "bodies"`. It is ignored

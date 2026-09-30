@@ -1045,9 +1045,9 @@ pub(crate) enum WebsocketSecret {
     /// runs on each chunk read from the cage, before that chunk is written on, so a secret whole
     /// inside one chunk never crosses. A secret split across chunks has had its first part relayed
     /// by the time the second completes the match, and the close then stops the rest. A
-    /// `permessage-deflate` message is read whole, at its final frame, so its earlier frames have
-    /// crossed by then; one left unfinished, by another message begun in its midst or by a close,
-    /// stops the scan of that direction, which closes the tunnel.
+    /// `permessage-deflate` message is inflated as its frames arrive, so the same holds of the text
+    /// it carries; a compressed stream the decoder can no longer follow stops the scan of that
+    /// direction, which closes the tunnel.
     Block,
 }
 
