@@ -134,7 +134,9 @@ FIFO among the files the configuration includes, which the cage can plant in a r
 made, would hold git for good, and a slow file system holds it too. A hooks directory that does not exist yet is **created
 empty at launch** and then protected, which is what `git init` makes: otherwise the cage could
 create it and fill it. It is made one component at a time, and a symbolic link found on the
-way refuses the launch rather than being followed.
+way refuses the launch rather than being followed. A `core.hooksPath` that names a **file**
+the cage writes refuses the launch instead: the file runs no hook, but the cage could replace
+it with a directory of hooks, and sbx cannot hold a directory in place of a file.
 
 A file the configuration **includes** is configuration too: an `include.path` or
 `includeIf.<condition>.path` that names a file the cage writes (from `.git/config`, from your
@@ -142,7 +144,9 @@ global config, or from an included file) makes that file read-only as well, whet
 condition holds today. The list is the one your host's `git` reports. An include that names
 such a file that does not exist **refuses the launch**, naming the file: the cage could create
 it and git would read it, and sbx does not write a configuration file into your tree. Create
-it (empty is enough), remove the include, or set `git_writable`.
+it (empty is enough), remove the include, or set `git_writable`. A repository with no
+`config` of its own, where the cage writes, refuses the launch the same way: git reads one
+whenever it is there, and there is nothing to hold until it is.
 
 The files git reads **beside** `.git/config` are configuration as well.
 `.git/config.worktree` is read-only whenever it is there. git reads it when `.git/config`

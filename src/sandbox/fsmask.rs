@@ -1010,6 +1010,9 @@ fn repo_carrier(
     warnings: &mut Vec<String>,
     refused: &mut Option<String>,
 ) -> Carried {
+    if let Some(reason) = absent_config_refusal(reach, repo) {
+        refused.get_or_insert(reason);
+    }
     masks.extend(git_hook_dirs(reach, repo, warnings, refused));
     masks.extend(git_include_files(reach, repo, refused));
     let found = worktree_dirs(reach, &repo.common);
@@ -1047,6 +1050,30 @@ fn repo_carrier(
         }
     }
     carried
+}
+
+/// The refusal a repository earns when it has no `config` where the cage writes it ([`Reach`]),
+/// or `None`. git reads a repository's `config` whenever it is there, and a mask needs something to
+/// land on: absent, there is nothing to hold, and the cage could create one naming a program the
+/// host's git runs at its next command. Only an answer that the file is not there refuses here;
+/// any other is left to the checks that hold it.
+fn absent_config_refusal(reach: &Reach, repo: &GitRepo) -> Option<String> {
+    let config = repo.common.join("config");
+    if !reach.holds(&config) {
+        return None;
+    }
+    matches!(
+        std::fs::symlink_metadata(&config),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+    .then(|| {
+        visible(&format!(
+            "git reads `{}` as the repository's configuration, and it does not exist: the cage \
+             could create it and your git would read it. Create it (empty is enough), then launch \
+             again. {GIT_WRITABLE_HINT}",
+            config.display()
+        ))
+    })
 }
 
 /// Where a stopped rebase keeps the commands it has left, in the git directory of the work tree
@@ -1444,7 +1471,21 @@ fn git_hook_dirs(
             }
             Ok(_) => match path.canonicalize() {
                 Ok(c) if c.is_dir() => c,
-                // A file where hooks are looked for runs none; nothing to protect.
+                // A file where hooks are looked for runs none, but the cage can replace it with a
+                // directory of hooks, and a directory cannot be held in place of a file.
+                Ok(c) if reach.holds(&c) => {
+                    refused.get_or_insert_with(|| {
+                        visible(&format!(
+                            "{pattern} names `{}`, a file: it runs no hook, but the cage could \
+                             replace it with a directory of hooks your git would run, and sbx \
+                             cannot hold a directory in place of a file. Remove the file or point \
+                             `core.hooksPath` at a directory, then launch again. \
+                             {GIT_WRITABLE_HINT}",
+                            c.display()
+                        ))
+                    });
+                    continue;
+                }
                 Ok(_) => continue,
                 Err(e) => {
                     refused.get_or_insert_with(|| {
@@ -4829,6 +4870,53 @@ mod tests {
             expand(&root, &lifted, &[], None).refused.is_none(),
             "git_writable lifts it"
         );
+    }
+
+    /// A repository with no `config` of its own, where the cage writes, refuses the launch: there
+    /// is nothing to hold, and the cage could create one naming a program the host's git runs at
+    /// the next command. Nothing is created, and `git_writable` lifts it.
+    #[test]
+    fn a_repository_with_no_config_refuses_where_the_cage_would_write_one() {
+        let tmp = TmpDir::new();
+        let Some((root, _git)) = git_project(&tmp) else {
+            skip_incapable!("skipping config protection: no git on this host");
+            return;
+        };
+        std::fs::remove_file(root.join(".git/config")).unwrap();
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        let why = e.refused.as_deref().expect("no config to hold");
+        assert!(
+            why.contains(".git/config")
+                && why.contains("does not exist")
+                && why.contains("git_writable"),
+            "{why}"
+        );
+        assert!(!root.join(".git/config").exists(), "nothing is created");
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        assert!(expand(&root, &lifted, &[], None).refused.is_none());
+    }
+
+    /// A `core.hooksPath` that names a file where the cage writes refuses the launch: a file runs
+    /// no hook, but the cage can replace it with a directory of hooks the host's git runs, and a
+    /// directory cannot be held in place of a file.
+    #[test]
+    fn a_hooks_path_naming_a_file_the_cage_writes_refuses() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping core.hooksPath protection: no git on this host");
+            return;
+        };
+        std::fs::write(root.join(".githooks"), "not hooks").unwrap();
+        assert!(git(&["config", "core.hooksPath", ".githooks"]));
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        let why = e
+            .refused
+            .as_deref()
+            .expect("a file cannot hold hooks in place");
+        assert!(why.contains(".githooks") && why.contains("a file"), "{why}");
     }
 
     /// `.git/config.worktree` is read-only when present. When `.git/config` turns
