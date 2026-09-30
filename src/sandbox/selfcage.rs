@@ -7,6 +7,28 @@
 //! loads libraries, and nothing else of the host but what its caller adds. The cage carries the
 //! hardening every cage gets ([`super::argv::compose`]): every namespace but the network one the
 //! caller names, no capability, a cleared environment, the syscall denylist.
+//!
+//! ## What stays in the supervisor
+//!
+//! A helper is worth what it takes away from a flaw in the code it runs, and there are two things
+//! it can take. One is the supervisor's own reach, the user's uid outside any cage, should a flaw
+//! hand over execution. The other is an effect a flaw could redirect without that: an unpack writes
+//! at paths an archive's members name, which is why [`super::distro::unpack`] runs caged.
+//!
+//! The documents sbx fetches through nix, a release's asset list or a package index's answer,
+//! offer neither. Nix has already fetched and handled them host-side, outside any cage, with its
+//! own TLS and HTTP stack, so the supervisor's reach is exposed to those bytes either way, and the
+//! parse has no effect beyond the value it returns. Those parses stay in the supervisor until nix's
+//! host-side fetches run in a cage themselves.
+//!
+//! The registry client ([`super::distro::registry`]) offers the first and not the second: no
+//! uncaged reader precedes it, but where it writes is settled before the bytes arrive, since a
+//! layer lands under the name its validated digest spells and is kept only once its bytes hash to
+//! that digest. It stays in the supervisor as well. Only the global configuration or a project the
+//! trust gate admits declares the image it fetches, and a manifest pinned by digest is hashed
+//! before it is parsed. A helper would need a syscall list that admits sockets, the `distro`
+//! credential inside its cage, and every layer passed back through the supervisor to be hashed,
+//! for a gain confined to one path while nix's fetches stay uncaged beside it.
 
 use super::spec::{Mount, NetPolicy, SandboxSpec};
 use std::ffi::OsString;

@@ -21,6 +21,9 @@
 //! **A redirect drops the credential.** Registries answer a blob request with a redirect to object
 //! storage, which is a different origin; sending the bearer token there would hand a third party a
 //! credential scoped to the repository. Only the first request carries the caller's headers.
+//!
+//! **It runs in the supervisor, not in a caged helper.** The reasons, and what would change them,
+//! are written in [`crate::sandbox::selfcage`].
 
 use super::super::proxy::ca;
 use super::super::proxy::wire;

@@ -668,6 +668,10 @@ pub(crate) fn fetch_metadata(
 /// cleanly. `url` must already be safe to place in a nix string literal: callers build
 /// it from a validated package name or a percent-encoded query, so it carries no quote,
 /// `$`, or backslash to escape the expression.
+///
+/// The parse runs in the supervisor and not in a caged helper: nix has already handled the
+/// body outside any cage, and the parse produces nothing but the value it returns
+/// ([`crate::sandbox::selfcage`] gives the reasoning).
 pub(crate) fn fetch_url_json(
     nix: &Path,
     layout: &Layout,
