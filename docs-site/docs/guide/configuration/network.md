@@ -639,9 +639,9 @@ against the profile and for that app alone: `apps/<name>.toml: … do not apply 
 A one-shot override that brings rules of its own names them for the launch it shapes: see
 [One-shot overrides](overrides#the---net-posture).
 Nothing is said for a rule the replacing table keeps or covers with a wider `deny` of its own
-(`*.example.com` covers `tracker.example.com`), for one whose host it cannot reach (under
-`deny`, when no `allow` of its own, built-in ones included, names that host), or under
-`none`, where nothing reaches.
+(`*.example.com` covers `tracker.example.com`), or under `none`, where nothing reaches. A rule
+whose host the table's own `allow` does not name is still said: a layer laid over it later, a
+project's `[app.<name>.network]` with no `mode` or a one-shot override, may add one that does.
 Re-declare the ones you want in the table that replaced them. Three things stand outside this:
 the mode, inherited when omitted (above); `stats`, which is read outside the table and applies
 to every launch; and one table that amends instead, below.

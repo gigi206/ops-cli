@@ -794,41 +794,28 @@ pub(super) fn amends_the_layer_below(field: &NetworkField) -> bool {
     matches!(field, NetworkField::Table(table) if table.mode.is_none())
 }
 
-/// The `deny` rules of `below` that `incoming`, the posture laid over it, no longer closes, as
-/// they render: those a replacing posture drops, since an amending one keeps them all, and whose
-/// hosts it can reach. None when `incoming` admits nothing, since no host those rules closed can
-/// be reached.
+/// The `deny` rules of `below` that `incoming`, the posture laid over it, no longer carries, as
+/// they render: those a replacing posture drops, since an amending one keeps them all. None when
+/// `incoming` admits nothing, since no host those rules closed can be reached.
 ///
-/// A rule is not dropped when a `deny` of `incoming` covers it ([`Rule::covers`]), a wider one
-/// included, and under a posture that denies by default it is out of reach unless an `allow` of
-/// `incoming` or a built-in one may meet it ([`Rule::may_meet`]): the note tells the reader to
-/// declare the rule again, which it asks only of a rule that no longer closes anything. Both
-/// predicates answer on the side that keeps the note where they cannot tell.
+/// A rule a `deny` of `incoming` covers ([`Rule::covers`]), a wider one included, is still closed
+/// and is not dropped: the note asks the reader to declare the rule again, which would change
+/// nothing. Whether a host is out of reach under `incoming` is not asked, since a layer laid over
+/// it later (a project's mode-less app overlay, a one-shot override) may still add an `allow`
+/// that reaches it, and nothing would then name the rule that closed it.
 pub(super) fn deny_rules_replaced(below: &NetworkPolicy, incoming: &NetworkPolicy) -> Vec<String> {
     let NetworkPolicy::Allowlist(below) = below else {
         return Vec::new();
     };
-    let (kept, allows) = match incoming {
+    let kept = match incoming {
         NetworkPolicy::Isolated => return Vec::new(),
-        NetworkPolicy::Shared => (&[][..], None),
-        NetworkPolicy::Allowlist(policy) => (
-            policy.deny_rules(),
-            (policy.default_action() == crate::allowlist::DefaultAction::Deny).then(|| {
-                let mut allows = policy.allow_rules().to_vec();
-                allows.extend(crate::sandbox::builtin_allow_rules());
-                allows
-            }),
-        ),
+        NetworkPolicy::Shared => &[][..],
+        NetworkPolicy::Allowlist(policy) => policy.deny_rules(),
     };
     below
         .deny_rules()
         .iter()
         .filter(|rule| !rule.builtin && !kept.iter().any(|k| k.covers(rule)))
-        .filter(|rule| {
-            allows
-                .as_ref()
-                .is_none_or(|allows| allows.iter().any(|a| a.may_meet(rule)))
-        })
         .map(ToString::to_string)
         .collect()
 }

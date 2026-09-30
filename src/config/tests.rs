@@ -8255,7 +8255,7 @@ fn a_global_deny_rule_a_trusted_project_network_drops_is_named() {
     for project in [
         "[network]\nmode = \"allow\"\n",
         "network = \"shared\"\n",
-        "[network]\nallow = [\"*.example.com\"]\n",
+        "[network]\nallow = [\"x.test\"]\n",
     ] {
         let r = over(project, TrustState::Trusted);
         let said = named(&r);
@@ -8287,11 +8287,12 @@ fn a_global_deny_rule_a_trusted_project_network_drops_is_named() {
     assert!(named(&alone).is_empty(), "{:?}", alone.warnings);
 }
 
-/// A `deny` rule the project drops is named only where its host can now be reached: not when the
-/// project's own `deny` covers it with a wider rule, and not under a project that denies by
-/// default when no `allow` of its own, nor any built-in one, reaches it.
+/// A `deny` rule the project drops is not named when the project's own `deny` still covers it,
+/// a wider rule included: declaring it again would change nothing. One its host is merely out of
+/// reach of is still named, under a project that denies by default, since a layer laid over it
+/// later may add an `allow` that reaches it.
 #[test]
-fn a_dropped_deny_rule_the_project_still_closes_is_not_named() {
+fn a_dropped_deny_rule_the_project_still_covers_is_not_named() {
     let parse = |text: &str| schema::parse(text.as_bytes()).expect("the config parses");
     let global = "[network]\nmode = \"allow\"\ndeny = [\"evil.com\", \"api.bad.com\"]\n";
     let named = |project: &str| -> Vec<String> {
@@ -8301,23 +8302,40 @@ fn a_dropped_deny_rule_the_project_still_closes_is_not_named() {
             .filter(|w| w.contains("do not apply to this project"))
             .collect()
     };
-    for project in [
-        "[network]\nmode = \"allow\"\ndeny = [\"*.bad.com\", \"evil.com\"]\n",
-        "[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n",
-    ] {
-        assert!(
-            named(project).is_empty(),
-            "{project:?}: {:?}",
-            named(project)
-        );
-    }
-    // The control: an `allow` that reaches one of them names that one alone.
-    let said = named("[network]\nmode = \"deny\"\nallow = [\"*.bad.com\"]\n");
+    let covered = named("[network]\nmode = \"allow\"\ndeny = [\"*.bad.com\", \"evil.com\"]\n");
+    assert!(covered.is_empty(), "{covered:?}");
+    let out_of_reach = named("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     assert!(
-        said.len() == 1
-            && said[0].contains("`https://api.bad.com`")
-            && !said[0].contains("evil.com"),
-        "{said:?}"
+        out_of_reach.len() == 1
+            && out_of_reach[0].contains("`https://evil.com`")
+            && out_of_reach[0].contains("`https://api.bad.com`"),
+        "{out_of_reach:?}"
+    );
+}
+
+/// A profile that replaces the global `network` under `deny`, with no `allow` reaching a global
+/// `deny` rule's host, still names that rule: a project's mode-less `[app.<name>.network]` adds
+/// its `allow` over the profile afterwards, and may reach the host the rule closed.
+#[test]
+fn a_dropped_deny_rule_a_later_overlay_may_reach_is_named() {
+    let global = "[network]\nmode = \"allow\"\ndeny = [\"tracker.example.com\"]\n";
+    let mut raw = schema::parse(global.as_bytes()).expect("the config parses");
+    let profile = "cmd = \"demo\"\n[network]\nmode = \"deny\"\nallow = [\"x.test\"]\n";
+    raw.app.insert(
+        "demo".to_string(),
+        schema::parse_app(profile.as_bytes()).expect("the profile parses"),
+    );
+    let project = schema::parse(b"[app.demo.network]\nallow = [\"*.example.com\"]\n")
+        .expect("the project parses");
+    let r = resolve_no_plugins(raw, Some((project, TrustState::Trusted)));
+    let app = &r.apps["demo"];
+    assert!(
+        app.warnings
+            .iter()
+            .any(|w| w.contains("do not apply to this app")
+                && w.contains("`https://tracker.example.com`")),
+        "{:?}",
+        app.warnings
     );
 }
 
@@ -8349,7 +8367,7 @@ fn a_global_deny_rule_an_app_profile_network_drops_is_named() {
     for network in [
         "[network]\nmode = \"allow\"\n",
         "network = \"shared\"\n",
-        "[network]\nallow = [\"*.example.com\"]\n",
+        "[network]\nallow = [\"x.test\"]\n",
     ] {
         let app = under(network);
         let said = named(&app);

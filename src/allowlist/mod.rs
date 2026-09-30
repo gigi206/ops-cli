@@ -485,18 +485,6 @@ impl HostReach<'_> {
             (HostReach::Below(domain), HostReach::Below(below)) => apex_or_subdomain(domain, below),
         }
     }
-
-    /// Whether some host is one both name.
-    fn meets(&self, other: &HostReach<'_>) -> bool {
-        match (self, other) {
-            (HostReach::Exact(a), HostReach::Exact(b)) => a == b,
-            (HostReach::Exact(host), HostReach::Below(domain))
-            | (HostReach::Below(domain), HostReach::Exact(host)) => apex_or_subdomain(domain, host),
-            (HostReach::Below(a), HostReach::Below(b)) => {
-                apex_or_subdomain(a, b) || apex_or_subdomain(b, a)
-            }
-        }
-    }
 }
 
 impl RuleKind {
@@ -537,18 +525,6 @@ impl Rule {
             return false;
         };
         mine.takes_in(&theirs) && my_ports.covers(their_ports)
-    }
-
-    /// Whether some request could match both this rule and `other`, as far as the two rules show
-    /// it: no only when their hosts or their ports cannot meet. A `re:` pattern meets everything,
-    /// and verbs and layers are not read, so what a caller sets aside as out of reach is.
-    pub(crate) fn may_meet(&self, other: &Rule) -> bool {
-        let (Some((mine, my_ports)), Some((theirs, their_ports))) =
-            (self.kind.host_reach(), other.kind.host_reach())
-        else {
-            return true;
-        };
-        mine.meets(&theirs) && my_ports.intersects(their_ports)
     }
     /// The one concrete destination this rule names, when it names one.
     ///

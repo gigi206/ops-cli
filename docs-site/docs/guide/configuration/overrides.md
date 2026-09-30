@@ -234,9 +234,8 @@ reach, so each is named, as a config layer's replacing table names them. With
 sbx: warning: override: this `network` posture replaces the one below it rather than adding to it, so `deny` rules the layer below carried do not apply to this launch: `https://tracker.example.com`. To keep them for this launch, restate them through `--config`
 ```
 
-A rule the override restates, or covers with a wider `deny`, is not named, nor one whose host
-it cannot reach (under `deny`, when no `allow` of its own, built-in ones included, names that
-host), nor anything under `none`, where nothing reaches.
+A rule the override restates, or covers with a wider `deny`, is not named, nor anything under
+`none`, where nothing reaches.
 
 The `allow=`/`deny=` **list shorthands** build the common one-shot egress shapes:
 
