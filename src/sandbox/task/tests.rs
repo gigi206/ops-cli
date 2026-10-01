@@ -1249,6 +1249,44 @@ fn a_relative_node_is_keyed_by_the_program_the_caller_will_report() {
     );
 }
 
+/// A command that names a **FIFO** is answered, not waited on.
+///
+/// The project is the agent's to write, so the file a task's command resolves to can be replaced
+/// with a pipe nobody writes to. Opened plainly to find its `#!` line, that pipe held the
+/// invocation's admission for good, and with it the live slot and the connection the admission
+/// had taken, before the task's `timeout` or a `stop` could reach it.
+#[test]
+fn a_fifo_where_the_command_was_is_answered_not_waited_on() {
+    let root = crate::testutil::TmpDir::new();
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).expect("the project");
+    let mut task = task();
+    task.cmd = vec!["./build.sh".to_string()];
+    task.spawn = Some(vec!["less".to_string()]);
+    let mut engine = engine_with_store(root.path(), &["less"], vec![task.clone()]);
+    engine.project = project.clone();
+    let fifo = project.join("build.sh");
+    crate::testutil::make_fifo(&fifo);
+
+    let policy = crate::testutil::returns_within(
+        std::time::Duration::from_secs(5),
+        "the exec policy of a task whose command is a FIFO",
+        move || engine.spawn_policy(&task, task.spawn.as_ref().unwrap(), &engine.base_env),
+    )
+    .expect("a policy");
+    use crate::proc_policy::Verdict;
+    // The kernel runs only a regular file, so a FIFO is no script: the command's node stays on the
+    // file itself, as it does for a binary.
+    assert_eq!(
+        policy.decide(
+            &[fifo.to_string_lossy().into_owned()],
+            "/nix/store/demo/bin/less"
+        ),
+        Verdict::Allow,
+        "a file with no `#!` line to read is entered as itself"
+    );
+}
+
 /// The value the graph exists for: a chain is permitted without the shortcut a flat set would
 /// grant. The command may run `less` and only `less`; `less` may run `psql`; the command may
 /// **not** run `psql` itself, which is precisely what naming all three in one list would allow.

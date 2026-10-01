@@ -167,6 +167,7 @@ mod pending;
 mod report;
 mod target;
 
+pub(crate) use open_lens::open_probe;
 pub(crate) use overlay::ProcOverlay;
 pub(crate) use pending::PendingExec;
 
@@ -1029,6 +1030,48 @@ fn exec_head(
     {
         return Err(libc::ESRCH);
     }
+    Ok(head)
+}
+
+/// The first [`crate::proc_policy::SCRIPT_HEAD`] bytes of the file an [`open_probe`] descriptor
+/// holds, which is what the kernel itself reads before deciding whether a file is a script, or the
+/// errno the reopen or the read met. Fewer are returned only when the file is shorter.
+///
+/// **Empty for anything that is not a regular file**, and nothing opened to find that out. The
+/// kernel runs only a regular file, answering `EACCES` to any other before it reads a byte, so no
+/// other file has a head anyone would act on. And reopening one to read would be the hazard itself:
+/// a FIFO with no writer holds its reader's open until a writer comes, through `/proc/self/fd` as
+/// surely as through its name, and a device would have its driver opened on this host.
+///
+/// Filled rather than read once: a short read would hand the grammar a line the file has not
+/// finished writing out. Bounded in size, not in time: a regular file on a store that can stall
+/// (FUSE, NFS) still holds the read, because bounding that needs a reader that can be abandoned
+/// rather than a ceiling.
+pub(crate) fn script_head(probe: &std::fs::File) -> Result<Vec<u8>, libc::c_int> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let meta = probe
+        .metadata()
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    if !meta.is_file() {
+        return Ok(Vec::new());
+    }
+    // The probe is an `O_PATH` descriptor, which no read answers; reopening through it reads the
+    // object already resolved rather than whatever the path names a moment later -- and it is also
+    // where a file that may be executed and not read says `EACCES`.
+    let mut file = std::fs::File::open(format!("/proc/self/fd/{}", probe.as_raw_fd()))
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+    let mut head = vec![0u8; crate::proc_policy::SCRIPT_HEAD];
+    let mut filled = 0;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+    head.truncate(filled);
     Ok(head)
 }
 

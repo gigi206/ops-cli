@@ -1754,29 +1754,23 @@ impl TaskEngine {
     /// bash. Reporting `bash` here would name a program that is not what the process becomes. The
     /// grammar is [`crate::proc_policy::shebang_interpreter`], which is the same reading the exec
     /// supervisor decides a notified `execve` against.
+    ///
+    /// Read through an `O_PATH` probe, never a plain open. The file is often the project's, which the
+    /// session's agent writes, and a FIFO left where a script was declared would hold a plain open
+    /// until a writer came: this runs on the invocation's admission, before its `timeout` or a `stop`
+    /// can reach it, so the live slot and the connection that admission took would be held for the
+    /// rest of the session. [`super::proc_enforce::script_head`] reads only a regular file, which is
+    /// also the only kind the kernel runs.
     fn shebang_of(&self, incage: &str, task: &TaskSpec) -> Option<String> {
-        use std::io::Read;
         let host = self.host_path(Path::new(incage), task)?;
-        // The amount the kernel itself reads before it decides, which also keeps a named pipe or a
-        // huge binary from being pulled in. Filled rather than read once: a short read would hand
-        // the grammar a line the file has not finished writing out.
-        let mut head = [0u8; crate::proc_policy::SCRIPT_HEAD];
-        let mut file = std::fs::File::open(&host).ok()?;
-        let mut filled = 0;
-        while filled < head.len() {
-            match file.read(&mut head[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return None,
-            }
-        }
+        let probe = super::proc_enforce::open_probe(&host).ok()?;
+        let head = super::proc_enforce::script_head(&probe).ok()?;
         // One grammar for the whole product: the supervisor decides a notified `execve` against the
         // same reading, so a node keyed here on a different one would govern a caller the
         // supervisor never sees. `Unsettled` (a relative interpreter, a name no rule can carry)
         // reads as "not a script" for this caller, which leaves the node on the file rather than
         // inventing a path that would match nothing anyway.
-        match crate::proc_policy::shebang_interpreter(&head[..filled]) {
+        match crate::proc_policy::shebang_interpreter(&head) {
             crate::proc_policy::ScriptHead::Interpreter(path) => Some(path),
             crate::proc_policy::ScriptHead::NotScript
             | crate::proc_policy::ScriptHead::Unsettled => None,

@@ -596,6 +596,23 @@ pub(super) fn probe_and_vouch(
     target: &Path,
     own: bool,
 ) -> Result<std::fs::File, libc::c_int> {
+    let probe = open_probe(target)?;
+    // Before a byte is read from it or it is handed over: is this what the *cage's* walk would have
+    // reached? Asked before the type test below, because a device and a FIFO are served from the
+    // probe without ever being scanned — and `/dev/stdout` is exactly such a device.
+    vouched_probe(mounts, pid, probe, own)
+}
+
+/// An `O_PATH` descriptor for whatever `target` names, its symlinks followed as an open would follow
+/// them, or the errno the walk met.
+///
+/// Nothing at the path is opened: not a FIFO, whose reader would wait for a writer, and not a
+/// device, whose driver would run on this host. What the descriptor holds can still be asked its
+/// type, its links and its mount, and reopened through `/proc/self/fd` once that type is known.
+///
+/// Opened by the syscall rather than through `OpenOptions::custom_flags`, which masks `O_PATH` away
+/// on the musl target ([`crate::sandbox::forward::dial_cage_socket`] says how).
+pub(crate) fn open_probe(target: &Path) -> Result<std::fs::File, libc::c_int> {
     use std::os::unix::io::FromRawFd;
     let Ok(cpath) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
         return Err(libc::EINVAL);
@@ -608,11 +625,7 @@ pub(super) fn probe_and_vouch(
             .unwrap_or(libc::ENOENT));
     }
     // SAFETY: probe is a fresh owned descriptor; the File takes sole ownership and closes it.
-    let probe = unsafe { std::fs::File::from_raw_fd(probe) };
-    // Before a byte is read from it or it is handed over: is this what the *cage's* walk would have
-    // reached? Asked before the type test below, because a device and a FIFO are served from the
-    // probe without ever being scanned — and `/dev/stdout` is exactly such a device.
-    vouched_probe(mounts, pid, probe, own)
+    Ok(unsafe { std::fs::File::from_raw_fd(probe) })
 }
 
 /// The walk again, this time taken from **inside the cage's root**, for a path this process could
