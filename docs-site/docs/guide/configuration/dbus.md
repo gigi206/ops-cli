@@ -61,8 +61,8 @@ The app probes *that* portal and gets three things:
   ways of asking that a toast stay on screen until it is clicked away (`urgency = critical` and an
   expiry of `0`, both of which sbx declines for its own toasts as well). It runs in `sbx` itself,
   outside the cage's memory limit, so it serves one call at a time and refuses outright a call
-  larger than 1 MiB, which an icon of 512 by 512 pixels sent as raw image data already is. A caged
-  app's ordinary notification is unaffected.
+  larger than 1 MiB, which an icon of 512 by 512 RGBA pixels sent as raw image data already is. A
+  caged app's ordinary notification is unaffected.
 
 The **host's** keyring is never exposed: the private bus carries only sbx's own portal, relays
 and services, and touches no host socket. What answers `org.freedesktop.secrets` there is a
