@@ -369,7 +369,7 @@ pub(crate) enum TaskError {
     /// No task by that name is declared for this session.
     Unknown(String),
     /// A caller-supplied parameter or environment variable was refused.
-    Refused(String),
+    Refused(Refusal),
     /// A credential could not be resolved host-side. The message names the *source*, never a value.
     Credential(String),
     /// The cage could not be built or run.
@@ -387,19 +387,69 @@ impl std::fmt::Display for TaskError {
     }
 }
 
+impl TaskError {
+    /// A refusal whose sentence is the same for the caller, the log and an announcement.
+    fn refused(why: String) -> TaskError {
+        TaskError::Refused(why.into())
+    }
+}
+
+/// Why an admission was refused, said two ways: to the caller and the log, and on the desktop.
+///
+/// The two differ only where the sentence quotes a name the caller sent. The caller is answered
+/// with it, and `sbx task logs` records it, because that row is the record of what the cage asked
+/// for, and a bound applies to an announcement, never to the record. An announcement is raised in
+/// sbx's own voice, so it quotes such a name only when it is one a declaration could carry, and
+/// says what kind of name it was otherwise: a caller choosing the name could otherwise write a
+/// sentence, a command or markup into a toast that speaks for sbx.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    /// The whole sentence, the caller's names included: what the caller is answered with and the
+    /// log records.
+    said: String,
+    /// What an announcement shows instead, or `None` when it shows [`Self::said`].
+    shown: Option<String>,
+}
+
+impl Refusal {
+    /// A refusal that quotes a name the caller sent: `said` with the name, and `shown`, without
+    /// it, for an announcement when the name is not one a declaration could carry.
+    fn quoting(said: String, shown: Option<String>) -> Refusal {
+        Refusal { said, shown }
+    }
+
+    /// The sentence an announcement shows.
+    fn shown(&self) -> &str {
+        self.shown.as_deref().unwrap_or(&self.said)
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(said: String) -> Refusal {
+        Refusal { said, shown: None }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.said)
+    }
+}
+
 /// The announcement one refused admission makes.
 ///
-/// Split out because of what `name` is: the tail of a `RUN <name>` request line, chosen by the
-/// cage and bounded by the crossing socket only at that plane's `MAX_PAYLOAD_BYTES`, a mebibyte.
-/// The notifier keys its repeat memory on a subject as a toast shows it
-/// ([`crate::notify::Block::key`]), but it queues a block as it was made, up to its queue's
-/// capacity while a desktop is slow. A name taken whole, in the subject and again in the detail,
-/// would hold two mebibytes per queued refusal: some half a gibibyte of supervisor memory for a
-/// cage asking over and over for tasks that do not exist.
+/// `name` arrives declared: the task list is fixed for the session, and the socket answers a name
+/// it does not hold before any admission ([`super::task_control`]), so the subject is a name the
+/// declaration's grammar allows. What the caller chose arrives in `detail`, the sentence
+/// [`Refusal::shown`] gives, which quotes a parameter or variable name the caller sent only when
+/// that name is one a declaration could carry.
 ///
-/// [`super::sanitize`] is the crate's single answer to a value the cage chose — control characters
-/// (a newline that would forge a second line) to spaces, and the length capped. `detail` takes it
-/// too, since `TaskError::Unknown`'s `Display` embeds the very same name.
+/// Both are still cut where they are made. The notifier keys its repeat memory on a subject as a
+/// toast shows it ([`crate::notify::Block::key`]), but it queues a block as it was made, up to its
+/// queue's capacity while a desktop is slow, and a name a caller sends can reach a mebibyte, the
+/// bound of the crossing socket's request line. [`super::sanitize`] is the crate's single answer
+/// to a value the cage chose: control characters (a newline that would forge a second line) to
+/// spaces, and the length capped.
 fn refusal_block(name: &str, reason: &str, detail: &str) -> crate::notify::Block {
     crate::notify::Block {
         event: crate::notify::NotifyEvent::Task,
@@ -635,6 +685,7 @@ impl TaskEngine {
             };
             if let Some(reason) = reason {
                 let detail = match &outcome {
+                    Err(TaskError::Refused(refusal)) => refusal.shown().to_string(),
                     Err(e) => e.to_string(),
                     Ok(_) => String::new(),
                 };
@@ -662,7 +713,7 @@ impl TaskEngine {
         // that cannot be stopped during it either.
         let live = self
             .enter(invocation, name, detached)
-            .map_err(TaskError::Refused)?;
+            .map_err(TaskError::refused)?;
         let mut values = resolve_params(task, params).map_err(TaskError::Refused)?;
         let caller_env = caller_env(task, env).map_err(TaskError::Refused)?;
 
@@ -671,7 +722,7 @@ impl TaskEngine {
         // invocation of the same task is refused against.
         let output = match task.output {
             false => None,
-            true => Some(self.claim_output(task).map_err(TaskError::Refused)?),
+            true => Some(self.claim_output(task).map_err(TaskError::refused)?),
         };
         if output.is_some() {
             values.insert(
@@ -704,7 +755,7 @@ impl TaskEngine {
         let task = self
             .task(name)
             .ok_or_else(|| TaskError::Unknown(name.into()))?;
-        let argv = substitute(&task.cmd, &values).map_err(TaskError::Refused)?;
+        let argv = substitute(&task.cmd, &values).map_err(TaskError::refused)?;
         // Recorded here, where it is the task's own command: below it is wrapped for exec
         // confinement and for the egress forwarder, and neither is what a reader is asking about.
         self.note_argv(invocation, &argv);
@@ -774,7 +825,7 @@ impl TaskEngine {
             Some(declared) => {
                 let policy = self
                     .spawn_policy(task, declared, &cage_env)
-                    .map_err(|e| TaskError::Refused(format!("task `{name}`: {e}")))?;
+                    .map_err(|e| TaskError::refused(format!("task `{name}`: {e}")))?;
                 let shim = crate::store::ensure_proc_shim(&self.layout).map_err(TaskError::Io)?;
                 let (guard, wiring) = super::proc_enforce::start_for_task(
                     self.layout.data_dir(),
@@ -2400,14 +2451,19 @@ fn task_env(cage: &[(String, String)]) -> Vec<(String, String)> {
 fn resolve_params(
     task: &TaskSpec,
     supplied: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, String> {
+) -> Result<BTreeMap<String, String>, Refusal> {
     if let Some(unknown) = supplied
         .keys()
         .find(|k| !task.params.iter().any(|p| &&p.name == k))
     {
-        return Err(format!(
-            "`{unknown}` is not a parameter of task `{}`",
-            task.name
+        return Err(Refusal::quoting(
+            format!("`{unknown}` is not a parameter of task `{}`", task.name),
+            (!crate::config::is_param_name(unknown)).then(|| {
+                format!(
+                    "task `{}` was sent a parameter whose name no task can declare",
+                    task.name
+                )
+            }),
         ));
     }
     let mut out = BTreeMap::new();
@@ -2419,7 +2475,7 @@ fn resolve_params(
             }
             (None, Some(d)) => d.clone(),
             (None, None) => {
-                return Err(format!("parameter `{}` is required", param.name));
+                return Err(format!("parameter `{}` is required", param.name).into());
             }
         };
         out.insert(param.name.clone(), value);
@@ -2432,22 +2488,32 @@ fn resolve_params(
 fn caller_env(
     task: &TaskSpec,
     supplied: &BTreeMap<String, String>,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>, Refusal> {
     let mut out = Vec::new();
     for (name, value) in supplied {
         if !task.env_allow.iter().any(|a| a == name) {
-            return Err(format!(
-                "`{name}` is not settable for task `{}` (its `env_allow` lists {})",
-                task.name,
-                if task.env_allow.is_empty() {
-                    "nothing".to_string()
-                } else {
-                    task.env_allow.join(", ")
-                }
+            let allowed = if task.env_allow.is_empty() {
+                "nothing".to_string()
+            } else {
+                task.env_allow.join(", ")
+            };
+            return Err(Refusal::quoting(
+                format!(
+                    "`{name}` is not settable for task `{}` (its `env_allow` lists {allowed})",
+                    task.name
+                ),
+                (!crate::config::is_env_name(name)).then(|| {
+                    format!(
+                        "task `{}` was sent a variable whose name is not a variable name (its \
+                         `env_allow` lists {allowed})",
+                        task.name
+                    )
+                }),
             ));
         }
+        // Only a name `env_allow` lists reaches here, so the name this quotes is a declared one.
         if value.contains('\0') {
-            return Err(format!("`{name}` contains a NUL byte"));
+            return Err(format!("`{name}` contains a NUL byte").into());
         }
         out.push((name.clone(), value.clone()));
     }

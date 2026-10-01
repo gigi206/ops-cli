@@ -634,15 +634,24 @@ fn validate_param_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("a parameter name is empty".to_string());
     }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
-    {
+    if let Some(bad) = name.chars().find(|c| !is_param_name_char(*c)) {
         return Err(format!(
             "parameter name `{name}` contains `{bad}` — use letters, digits, `_`, or `-`"
         ));
     }
     Ok(())
+}
+
+/// Whether `c` may appear in a parameter name: letters, digits, `_` and `-`.
+fn is_param_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+}
+
+/// Whether `name` is shaped as a declared parameter's name can be: the test
+/// [`validate_param_name`] applies, asked as well by a refusal before it quotes a name a caller
+/// sent, since a name of another shape is no parameter any task declares.
+pub(crate) fn is_param_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(is_param_name_char)
 }
 
 /// Build a parameter's bound from the declared `match`/`enum`, requiring exactly one and validating
@@ -988,6 +997,20 @@ fn validate_task_network(raw: &[String]) -> Result<Vec<Rule>, String> {
         .collect()
 }
 
+/// Whether `c` may appear in an environment variable name: letters, digits and `_`.
+fn is_env_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Whether `name` is shaped as an environment variable name: letters, digits and `_`, not led by
+/// a digit. The shape alone, which is what a refusal asks before it quotes a name a caller sent:
+/// [`validate_env_name`] refuses some names of this shape as well.
+pub(crate) fn is_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(is_env_name_char)
+}
+
 /// An environment variable name: the POSIX shape (letters, digits, underscore; not starting with a
 /// digit). Rejected outright are the loader- and interpreter-control names, whatever their case: a
 /// task's command is sbx's choice, and `LD_PRELOAD`/`BASH_ENV`/`PATH` would hand that choice back to
@@ -1009,10 +1032,7 @@ pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
     if name.starts_with(|c: char| c.is_ascii_digit()) {
         return Err(format!("`{name}` starts with a digit"));
     }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
-    {
+    if let Some(bad) = name.chars().find(|c| !is_env_name_char(*c)) {
         return Err(format!(
             "`{name}` contains `{bad}` — a variable name is letters, digits, and `_`"
         ));

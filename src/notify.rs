@@ -244,11 +244,24 @@ pub(crate) struct Block {
     /// Which lens refused.
     pub(crate) event: NotifyEvent,
     /// What was refused, in its most stable form: `api.example.com:443`, `/usr/bin/curl`, a task name.
+    ///
+    /// It can carry words the cage chose, and that is a limit rather than a defect, since what was
+    /// refused is the thing to name: an exec refusal names the path the cage ran, which may hold
+    /// spaces and read as a sentence, and a trust drop names the bind paths of a project file the
+    /// cage can write. The proxy's host and a task's name are held to a name's grammar where they
+    /// are made. The notification specification gives markup to the body only, so a summary is
+    /// shown as plain text.
     pub(crate) subject: String,
     /// The stable category, as the corresponding log records it: `denied-by-rule`, `denied-default`,
     /// `denied-method`, `outbound-secret`…
     pub(crate) reason: String,
     /// One human sentence explaining the refusal, or empty.
+    ///
+    /// Neither this nor `fix` may carry text the cage chose. The body they make goes to the
+    /// desktop's daemon unescaped, a daemon that advertises `body-markup` renders the tags it knows
+    /// in it, and the body is where a toast speaks for sbx: an explanation, and a command to run. A
+    /// lens that must mention something the cage named quotes it only when it fits the grammar that
+    /// thing is declared in, as the proxy's fix and a task's refusals do.
     pub(crate) detail: String,
     /// The command that would allow it, or empty. Offered only where allowing is a sound suggestion —
     /// never for a refusal that fired on a security ground (a leaked credential, an SSRF target).

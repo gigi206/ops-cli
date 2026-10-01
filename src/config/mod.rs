@@ -88,7 +88,7 @@ use secrets::{
 // The two leaf checks the task engine re-runs at invocation time: a caller's value against its
 // declared bound, and the `{param}` placeholders in one argv element. They live with the validator
 // so the check a task is accepted under and the check its invocation enforces cannot drift.
-pub(crate) use tasks::check_value;
+pub(crate) use tasks::{check_value, is_env_name, is_param_name};
 // The trust gate folds the sops files a project names into its hash, and reads the names with the
 // same split a source is parsed with.
 pub(crate) use secrets::sops_ref_file;

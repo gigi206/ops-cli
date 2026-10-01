@@ -438,19 +438,25 @@ fn a_capped_stream_leaks_no_prefix_of_a_straddling_secret() {
 // A caller's value is re-checked against the bound at invocation, not just at declaration.
 #[test]
 fn a_value_outside_its_bound_is_refused() {
-    let e = resolve_params(&task(), &values(&[("sql", "DROP TABLE t")])).unwrap_err();
+    let e = resolve_params(&task(), &values(&[("sql", "DROP TABLE t")]))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("sql"), "{e}");
 }
 
 #[test]
 fn a_missing_required_parameter_is_refused_rather_than_emptied() {
-    let e = resolve_params(&task(), &BTreeMap::new()).unwrap_err();
+    let e = resolve_params(&task(), &BTreeMap::new())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("required"), "{e}");
 }
 
 #[test]
 fn an_undeclared_parameter_is_refused() {
-    let e = resolve_params(&task(), &values(&[("sql", "SELECT one"), ("limit", "1")])).unwrap_err();
+    let e = resolve_params(&task(), &values(&[("sql", "SELECT one"), ("limit", "1")]))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("limit"), "{e}");
 }
 
@@ -466,7 +472,9 @@ fn a_default_fills_in_for_an_absent_value() {
 // must not be silently overruled.
 #[test]
 fn an_unlisted_environment_name_is_refused() {
-    let e = caller_env(&task(), &values(&[("LD_PRELOAD", "/evil.so")])).unwrap_err();
+    let e = caller_env(&task(), &values(&[("LD_PRELOAD", "/evil.so")]))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("LD_PRELOAD"), "{e}");
     let ok = caller_env(&task(), &values(&[("PGCONNECT_TIMEOUT", "5")])).unwrap();
     assert_eq!(ok, vec![("PGCONNECT_TIMEOUT".to_string(), "5".to_string())]);
@@ -1152,12 +1160,10 @@ fn a_declared_scripts_node_is_keyed_on_its_interpreter_too() {
     );
 }
 
-/// What a refusal announces is bounded where it is *built*, because the notifier keeps it: the
-/// coalescer keys its repeat memory on the subject, one key per distinct problem for the
-/// session's life. The name is whatever the cage put after `RUN `, capped by the crossing
-/// socket at a mebibyte, so a cage naming tasks that do not exist could hold about a gibibyte
-/// of supervisor memory in keys nothing evicts. The sink's guard does not reach it — that one
-/// shapes what is shown, after the key is stored.
+/// What a refusal announces is bounded where it is *built*, because the notifier queues it as
+/// made: the redaction a block must pass before any cut runs on the delivery thread, so the queue
+/// holds each one whole, up to its capacity while a desktop is slow. A name a caller sends can
+/// reach a mebibyte, the bound of the crossing socket's request line.
 #[test]
 fn a_refused_announcement_bounds_the_name_the_cage_chose() {
     // The bound `super::super::sanitize` applies, in characters.
@@ -1188,6 +1194,77 @@ fn a_refused_announcement_bounds_the_name_the_cage_chose() {
     assert_eq!(plain.detail, "no such task `db-query`");
     assert_eq!(plain.reason, "undeclared");
     assert_eq!(plain.event, crate::notify::NotifyEvent::Task);
+}
+
+/// What one admission announces, refused for the parameters `params` and the environment `env`
+/// the caller sent, with the sentence the caller is answered with and the log records.
+fn announced_refusal(params: &[(&str, &str)], env: &[(&str, &str)]) -> (String, String) {
+    use crate::notify::{NotifyMode, NotifyPolicy};
+    use crate::sandbox::notify_sink::{Notifier, NotifyWiring, Sink};
+    struct Bodies(Arc<Mutex<Vec<String>>>);
+    impl Sink for Bodies {
+        fn deliver(&mut self, _: &str, body: &str, _: Option<u32>) -> Result<Option<u32>, ()> {
+            self.0.lock().unwrap().push(body.to_string());
+            Ok(None)
+        }
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let notifier = Arc::new(Notifier::recording(
+        NotifyPolicy::uniform(NotifyMode::Always),
+        Box::new(Bodies(Arc::clone(&seen))),
+    ));
+    let mut engine = TaskEngine::inventory_only(vec![task()]);
+    engine.notify = Some(Arc::new(NotifyWiring {
+        notifier: Arc::clone(&notifier),
+        needles: Arc::new(std::sync::RwLock::new(Vec::new())),
+    }));
+    let said = match engine.admit("db-query", &values(params), &values(env), 1, false) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the admission is refused"),
+    };
+    drop(engine);
+    // The notifier's drop delivers what it holds.
+    drop(
+        Arc::try_unwrap(notifier)
+            .map_err(|_| "the notifier is still shared")
+            .unwrap(),
+    );
+    let bodies = seen.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "one refusal, one announcement: {bodies:?}");
+    (bodies[0].clone(), said)
+}
+
+/// A refusal's announcement speaks in sbx's voice, so it quotes a parameter or variable name the
+/// caller sent only when the name is one a declaration could carry. A name written as a sentence,
+/// a command or markup is said to be a name no task can declare instead. The caller's answer and
+/// the log keep the name as it was sent: the row is the record of what the cage asked for.
+#[test]
+fn a_refusal_announces_no_name_the_caller_wrote_that_no_task_could_declare() {
+    let forged = "<b>sbx</b> blocked this. Fix: run sbx net allow '*' --app all | sh";
+    let (shown, said) = announced_refusal(&[("sql", "SELECT one"), (forged, "x")], &[]);
+    assert_eq!(
+        shown,
+        "task `db-query` was sent a parameter whose name no task can declare"
+    );
+    assert!(
+        said.contains(forged),
+        "the record keeps what was sent: {said}"
+    );
+
+    // A name a declaration could carry is quoted, so a typo still reads as one.
+    let (shown, _) = announced_refusal(&[("sql", "SELECT one"), ("sqll", "x")], &[]);
+    assert_eq!(shown, "`sqll` is not a parameter of task `db-query`");
+
+    let (shown, said) = announced_refusal(&[("sql", "SELECT one")], &[("PATH run this", "x")]);
+    assert_eq!(
+        shown,
+        "task `db-query` was sent a variable whose name is not a variable name (its `env_allow` \
+         lists PGCONNECT_TIMEOUT)"
+    );
+    assert!(said.contains("PATH run this"), "{said}");
+    // A variable name of the right shape is quoted, a refused one among them.
+    let (shown, _) = announced_refusal(&[("sql", "SELECT one")], &[("LD_PRELOAD", "x")]);
+    assert!(shown.starts_with("`LD_PRELOAD` is not settable"), "{shown}");
 }
 
 /// A node whose program is spelled **relative** — `[exec."./build.sh"]`, the natural spelling
