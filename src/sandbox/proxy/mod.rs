@@ -697,10 +697,11 @@ impl PolicyRefusal {
 /// they were told to write; a bare `sbx net allow host` for a cleartext refusal is worse still, since
 /// it writes an `https`/443 rule that cannot open the clear at all.
 ///
-/// One function for all three sites — the two refusal bodies and the desktop notification the
-/// [`ProxyCtx::outcome_l7`] chokepoint raises — because the notification is the channel that exists
-/// precisely because the agent may never surface the `403` body, and the two must not tell the user
-/// to run different commands about the same refusal. Same shape as the `host_token` net-learn
+/// One function for all three sites, the two refusal bodies and the desktop notification the
+/// supervisor words from what the [`ProxyCtx::outcome_l7`] chokepoint reports
+/// ([`events::ProxyEvent::Refusal`]), because the notification is the channel that exists
+/// precisely because the agent may never surface the `403` body, and the two must not tell the
+/// user to run different commands about the same refusal. Same shape as the `host_token` net-learn
 /// synthesizes its candidate rules with, which learns from these very refusals — the three must not
 /// drift.
 ///
@@ -720,6 +721,23 @@ fn rule_destination(proto: super::control::Proto, host: &str, port: u16) -> Stri
         format!("{scheme}{host}")
     } else {
         format!("{scheme}{host}:{port}")
+    }
+}
+
+/// The copy-paste `sbx net allow` command that admits `destination`, a rule spelled by
+/// [`rule_destination`], for a launch that runs `app`. This decides the *scoping*, never what is
+/// being allowed: when the launch is an `sbx app <name>`, it names the app, and `sbx net allow
+/// <destination> --app <name>` writes the allow into that app's config rather than the project
+/// baseline, which is what the user almost always means when an *app's* egress was blocked. The
+/// `--app` write defaults to the project scope (least privilege); the user adds `-g` to reach a
+/// global profile.
+///
+/// One wording for the refusal bodies the proxy writes ([`ProxyCtx::allow_suggestion`]) and the
+/// announcement the supervisor raises for an [`events::ProxyEvent::Refusal`].
+pub(super) fn allow_command(app: Option<&str>, destination: &str) -> String {
+    match app {
+        Some(name) => format!("sbx net allow {destination} --app {name}"),
+        None => format!("sbx net allow {destination}"),
     }
 }
 

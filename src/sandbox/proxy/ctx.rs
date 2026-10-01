@@ -116,7 +116,7 @@ pub(crate) struct ProxyCtx {
     pub(super) link: Arc<Link>,
     /// Whether the launch announces a parked request on stderr (`[network] ask_notice`), which the
     /// supervisor does. Read here for what follows a denied ask: the person was already shown that
-    /// request, so its refusal is not announced a second time ([`refusal_block`]). Off by default
+    /// request, so its refusal is not announced a second time ([`announced`]). Off by default
     /// (tests, non-ask launches); the launch turns it on when it wires the control socket.
     pub(super) notices: bool,
     /// Where this proxy reports what it did — the decisions it counts for `sbx net stats` and logs
@@ -294,9 +294,9 @@ impl ProxyCtx {
         self
     }
 
-    /// Name the `sbx app <name>` this launch runs, so the refusal notice scopes its `sbx net allow`
-    /// suggestion to that app. Set once by the launch ([`crate::sandbox::egress::start`]); left unset (a bare
-    /// `sbx run`/`shell`) the suggestion targets the project baseline.
+    /// Name the `sbx app <name>` this launch runs, so the `sbx net allow` a refusal body suggests
+    /// is scoped to that app. Set once by the launch ([`crate::sandbox::egress::start`]); left
+    /// unset (a bare `sbx run`/`shell`) the suggestion targets the project baseline.
     pub(crate) fn with_app(mut self, app: Option<String>) -> Self {
         self.app = app;
         self
@@ -467,12 +467,15 @@ impl ProxyCtx {
     /// - an `asked-denied` while the interactive park notices are on, because the person was already
     ///   asked about this exact request and answered (or let it time out).
     ///
-    /// `proto` is carried in for one reason: the copy-paste fix. A notification is the channel that
-    /// exists *because* the agent may never surface the refusal body, so the command it offers has to
-    /// be the one that body offers — which means the same [`rule_destination`](super::rule_destination)
-    /// spelling, scheme and port included. Built from the bare host, it told the user to run
-    /// `sbx net allow host` for a refusal on `:8443` (an https rule on 443, which admits nothing they
-    /// asked for) or for a cleartext one (an https rule, which cannot open the clear at all).
+    /// What is reported is the refusal itself, not its words: the supervisor writes the
+    /// announcement ([`super::events`]), so a proxy that an attacker controls cannot put a sentence
+    /// or a command of its own on the operator's desktop. `proto` is reported for one reason: the
+    /// copy-paste fix. A notification is the channel that exists *because* the agent may never
+    /// surface the refusal body, so the command it offers has to be the one that body offers, which
+    /// means the same [`rule_destination`](super::rule_destination) spelling, scheme and port
+    /// included. Built from the bare host, it told the user to run `sbx net allow host` for a
+    /// refusal on `:8443` (an https rule on 443, which admits nothing they asked for) or for a
+    /// cleartext one (an https rule, which cannot open the clear at all).
     fn announce_refusal(
         &self,
         proto: crate::sandbox::control::Proto,
@@ -485,32 +488,22 @@ impl ProxyCtx {
         let Some(events) = self.events.as_ref().filter(|e| e.keeps().refusals) else {
             return;
         };
-        if let Some(block) = refusal_block(
-            host,
-            port,
-            kind,
-            reason,
-            muted,
-            self.notices,
-            &self.allow_suggestion(&super::rule_destination(proto, host, port)),
-        ) {
-            events.send(super::events::ProxyEvent::Refusal(block));
+        if announced(kind, reason, muted, self.notices) {
+            events.send(super::events::ProxyEvent::Refusal {
+                proto,
+                host: host.to_string(),
+                port,
+                reason: reason.to_string(),
+            });
         }
     }
 
-    /// The copy-paste `sbx net allow` command a `denied-default` refusal suggests, wrapped around
-    /// the rule `destination` its caller spelled with [`rule_destination`](super::rule_destination)
-    /// — this decides the *scoping*, never what is being allowed. When the launch is an `sbx app
-    /// <name>` (the app hint is set), it names the app — `sbx net allow <destination> --app <name>`
-    /// writes the allow into that app's config rather than the project baseline, which is what the
-    /// user almost always means when an *app's* egress was blocked. Pure so it is unit-testable. The
-    /// `--app` write defaults to the project scope (least privilege); the user adds `-g` to reach a
-    /// global profile.
+    /// The copy-paste `sbx net allow` command a `denied-default` refusal body suggests, wrapped
+    /// around the rule `destination` its caller spelled with
+    /// [`rule_destination`](super::rule_destination) and scoped to the app this launch runs: see
+    /// [`allow_command`](super::allow_command).
     pub(super) fn allow_suggestion(&self, destination: &str) -> String {
-        match &self.app {
-            Some(name) => format!("sbx net allow {destination} --app {name}"),
-            None => format!("sbx net allow {destination}"),
-        }
+        super::allow_command(self.app.as_deref(), destination)
     }
 
     /// Push one event into the live log **without** touching the stat counters — for the outcomes the
@@ -841,67 +834,11 @@ impl ProxyCtx {
     }
 }
 
-/// Whether one decision is announced, and as what — the whole rule, pure over its inputs so every
-/// branch is pinned by a test rather than only reachable through a live proxy.
-///
-/// `suggestion` is the `sbx net allow …` the caller would offer; whether it is actually attached is
-/// decided here, because *when* a fix may be suggested is a security judgement, not a formatting one.
-fn refusal_block(
-    host: &str,
-    port: u16,
-    kind: StatKind,
-    reason: &str,
-    muted: bool,
-    notices: bool,
-    suggestion: &str,
-) -> Option<crate::notify::Block> {
-    if matches!(kind, StatKind::Allow) || muted || (reason == "asked-denied" && notices) {
-        return None;
-    }
-    // Only a host that nothing allowed gets a copy-paste `sbx net allow`. A request stopped by an
-    // explicit deny rule, or by a security guard (a credential on its way out, an SSRF target), must
-    // never carry one: telling the user to allow a credential leak would be actively harmful advice,
-    // and re-allowing what they deliberately denied is not the fix either.
-    let fix = if reason == "denied-default" {
-        suggestion.to_string()
-    } else {
-        String::new()
-    };
-    Some(crate::notify::Block {
-        event: crate::notify::NotifyEvent::Network,
-        subject: format!("{host}:{port}"),
-        reason: reason.to_string(),
-        detail: refusal_detail(reason).to_string(),
-        fix,
-    })
-}
-
-/// One sentence explaining a refusal category to the person the notification is for.
-///
-/// The categories are the stable tokens the refusal bodies and `sbx net logs` already use, so a
-/// notification and the log line for the same request name the same thing. Pure, and total: an
-/// unrecognized token still yields a usable sentence rather than an empty body, which is what keeps a
-/// refusal category added later from silently announcing nothing.
-fn refusal_detail(reason: &str) -> &'static str {
-    match reason {
-        "denied-default" => "no rule in the network policy allows this host",
-        "denied-by-rule" => "an explicit deny rule in the network policy blocked it",
-        "denied-method" => "the host is allowed, but not for this HTTP method",
-        "asked-denied" => "the live decision was `deny`, or the ask timed out",
-        "outbound-secret" => {
-            "the request was carrying a configured secret out of the cage (credential leak refused)"
-        }
-        "ssrf-blocked" => "the target resolves to a private or link-local address",
-        "host-mismatch" => "the request's `Host` did not match the host it was tunnelled to",
-        "splice-cap" => "too many raw tunnels are already open for this session",
-        "ws-injection-refused" => "a credential cannot be injected into a WebSocket upgrade",
-        "http2-ask-unsupported" => "an HTTP/2 host cannot be decided interactively",
-        "supervisor-denied" => {
-            "the supervisor's copy of the network policy refused it while a session rule changed"
-        }
-        "supervisor-busy" => "the supervisor was already opening as many connections as it opens",
-        _ => "the network policy refused it",
-    }
+/// Whether one decision is announced at all: the whole rule, pure over its inputs so every branch
+/// is pinned by a test rather than only reachable through a live proxy. What an announcement says
+/// is the supervisor's to write ([`super::events`]).
+fn announced(kind: StatKind, reason: &str, muted: bool, notices: bool) -> bool {
+    !(matches!(kind, StatKind::Allow) || muted || (reason == "asked-denied" && notices))
 }
 
 /// Append the built-in self-equip allow rules to a policy's allow list (deny is unchanged, so a
@@ -961,114 +898,40 @@ pub(super) fn folded<'a>(
 mod notify_tests {
     use super::*;
 
-    const SUGGEST: &str = "sbx net allow api.example.com";
-
-    fn block_for(reason: &str, kind: StatKind) -> Option<crate::notify::Block> {
-        refusal_block("api.example.com", 443, kind, reason, false, false, SUGGEST)
-    }
-
     #[test]
-    fn a_host_nothing_allowed_carries_the_command_that_allows_it() {
-        let b = block_for("denied-default", StatKind::Deny).expect("a denial is announced");
-        assert_eq!(b.subject, "api.example.com:443");
-        assert_eq!(b.reason, "denied-default");
-        assert_eq!(b.fix, SUGGEST);
-        assert!(b.detail.contains("no rule"));
-    }
-
-    #[test]
-    fn a_security_refusal_never_suggests_allowing_it() {
-        // The harmful advice this guards: a request is refused *because* it was carrying a
-        // credential out of the cage, and the notification tells the user to allow that host —
-        // which would open the very leak the guard just closed. Same for an SSRF target.
-        for reason in ["outbound-secret", "ssrf-blocked", "host-mismatch"] {
-            let b = block_for(reason, StatKind::Blocked).expect("a security refusal is announced");
-            assert_eq!(b.fix, "", "`{reason}` must offer no fix, got {:?}", b.fix);
+    fn a_refusal_is_announced_whatever_refused_it() {
+        for (reason, kind) in [
+            ("denied-default", StatKind::Deny),
+            ("denied-by-rule", StatKind::Deny),
+            ("outbound-secret", StatKind::Blocked),
+            ("ssrf-blocked", StatKind::Blocked),
+        ] {
+            assert!(
+                announced(kind, reason, false, false),
+                "`{reason}` is announced"
+            );
         }
-        // And an explicit deny rule is a decision already taken — not something to undo in a toast.
-        let b = block_for("denied-by-rule", StatKind::Deny).unwrap();
-        assert_eq!(b.fix, "");
     }
 
     #[test]
     fn an_allowed_request_is_not_announced() {
-        assert!(block_for("allowed", StatKind::Allow).is_none());
+        assert!(!announced(StatKind::Allow, "allowed", false, false));
     }
 
     #[test]
     fn a_muted_denial_is_not_announced() {
         // A `mute` (`dontaudit`) rule says "stop telling me about this one". Honouring that for the
         // log while still raising a desktop notification would defeat the point of the rule.
-        assert!(
-            refusal_block(
-                "api.example.com",
-                443,
-                StatKind::Deny,
-                "denied-default",
-                true,
-                false,
-                SUGGEST
-            )
-            .is_none()
-        );
+        assert!(!announced(StatKind::Deny, "denied-default", true, false));
     }
 
     #[test]
     fn an_answered_ask_is_not_announced_twice() {
         // Under the interactive posture the person was already shown this exact request and answered
         // it (or let it time out). A second, after-the-fact notification is pure noise.
-        assert!(
-            refusal_block(
-                "api.example.com",
-                443,
-                StatKind::Deny,
-                "asked-denied",
-                false,
-                true,
-                SUGGEST
-            )
-            .is_none()
-        );
+        assert!(!announced(StatKind::Deny, "asked-denied", false, true));
         // With the park notices off, nothing announced it the first time, so the refusal is said.
-        assert!(
-            refusal_block(
-                "api.example.com",
-                443,
-                StatKind::Deny,
-                "asked-denied",
-                false,
-                false,
-                SUGGEST
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn every_refusal_category_the_proxy_emits_has_its_own_sentence() {
-        // A category with no sentence would announce a blank explanation. The list is the set of
-        // tokens the refusal sites record; the fallback covers one added later, but every token that
-        // exists today must be spelled out.
-        for reason in [
-            "denied-default",
-            "denied-by-rule",
-            "denied-method",
-            "asked-denied",
-            "outbound-secret",
-            "ssrf-blocked",
-            "host-mismatch",
-            "splice-cap",
-            "ws-injection-refused",
-            "http2-ask-unsupported",
-            "supervisor-denied",
-            "supervisor-busy",
-        ] {
-            assert_ne!(
-                refusal_detail(reason),
-                refusal_detail("something-added-later"),
-                "`{reason}` must have its own sentence, not the fallback"
-            );
-        }
+        assert!(announced(StatKind::Deny, "asked-denied", false, false));
     }
 }
 
@@ -1095,7 +958,7 @@ mod wiring_tests {
 
     /// A refusal recorded through the decision chokepoint reaches the notifier.
     ///
-    /// The unit tests above pin what `refusal_block` *decides*; this pins that `outcome` actually
+    /// The unit tests above pin what `announced` *decides*; this pins that `outcome` actually
     /// calls it. Without this, removing the announcement from the chokepoint — or dropping the
     /// `with_events` a launch attaches — would leave every test green and every refusal silent,
     /// which is the one regression nothing else here would catch.

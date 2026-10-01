@@ -1068,6 +1068,7 @@ pub(crate) fn start(
         capture: capture.clone(),
         flows: Some(Arc::clone(&flows)),
         plane,
+        app: app.map(str::to_string),
     };
     // The stop signal of the control thread. Set by the guard's `Drop`, which then connects to the
     // socket once to unpark the `accept` that would otherwise block forever: see `Egress`.
