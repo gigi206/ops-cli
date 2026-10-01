@@ -20,12 +20,10 @@ fn holds_open(dev: u64, ino: u64) -> bool {
         })
 }
 
-/// A launcher's `--args` file holds the invocation's resolved credential in plaintext and is
-/// deliberately **not** close-on-exec, so bwrap can still read it after the exec. A descriptor
-/// with that property survives *every* exec this process makes while it is open — so one kept
-/// for the length of a run is inherited by every sibling cage spawned during it, and a task cage
-/// runs a program from the project tree, which the agent's own cage may write. That walks around
-/// the pid namespace keeping a task's `/proc/<pid>/environ` out of the agent's reach.
+/// A launcher's `--args` file holds the invocation's resolved credential in plaintext. Its
+/// descriptor is close-on-exec in this process, so a sibling cage spawned while it is open inherits
+/// nothing (`memfd::tests::the_parents_own_copy_is_close_on_exec` pins that). What this pins is how
+/// long this process keeps it: no longer than the spawn that hands it to bwrap.
 ///
 /// The descriptors have done their whole job once `spawn` has forked, which is why they are
 /// taken by value here and the caller is handed back only the child.

@@ -659,9 +659,9 @@ fn run(
 ) -> io::Result<InstallRun> {
     let (argv, memfds) = super::argv::compose(spec)?;
     let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, slug);
-    // Through [`super::task::spawn_launcher`], which states why: an install runs for minutes, and
-    // these descriptors are not close-on-exec, so every cage this process spawns while one is open
-    // inherits it — including the credential-bearing task cages the pool is being filled for.
+    // Through [`super::task::spawn_launcher`], which prepares the exec and closes this process's
+    // copies once bwrap holds its own: an install runs for minutes, and nothing here needs them
+    // past the spawn.
     let mut child = super::task::spawn_launcher(
         Command::new(prog)
             .args(args)

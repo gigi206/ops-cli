@@ -2273,25 +2273,15 @@ impl RawOutput {
 /// Spawn a cage launcher, then close this process's copies of the descriptors bwrap was told to
 /// read.
 ///
-/// [`super::argv::compose`] returns the compiled seccomp filters and the `--args` file as
-/// anonymous in-memory files that are deliberately **not** close-on-exec ([`super::memfd`]), because
-/// bwrap has to still be able to read them after the exec. A descriptor that survives one exec
-/// survives every exec this process makes while it is open, and `Command::spawn` closes nothing in
-/// the child that it was not told about — so every one of these that is still open when a *sibling*
-/// cage is spawned is inherited by that sibling's command.
+/// [`super::argv::compose`] returns the compiled seccomp filters and the `--args` file as anonymous
+/// in-memory files, close-on-exec in this process ([`super::memfd::write`]). The preparation below
+/// clears the flag on the child's copies only, so a sibling cage spawned while these are open
+/// inherits none of them, however long they stay open.
 ///
-/// That is not a theoretical cost here: the `--args` file of a task invocation holds its
-/// `--setenv <VAR> <plaintext>` credential pairs, [`MAX_LIVE`] invocations may run at once, and a
-/// task cage runs a program from the project tree — a tree the agent's own cage may write. Holding
-/// the descriptors for the run would therefore hand one invocation's resolved credential to any
-/// other invocation started during it, walking around the pid namespace that keeps a task's
-/// `/proc/<pid>/environ` out of the agent's reach.
-///
-/// `spawn` has already forked and exec'd by the time it returns, so the descriptors have done their
-/// whole job and this is the earliest moment they can go. What remains is the fork window itself: a
-/// sibling spawning between this `spawn` and this `drop` still inherits them. Closing that residual
-/// means creating the file close-on-exec and clearing the flag only on the child's own copy, which
-/// is a property of [`super::memfd`] rather than of any call site.
+/// What closing them here buys is a narrower lifetime, not a second barrier. The `--args` file of a
+/// task invocation holds its `--setenv <VAR> <plaintext>` credential pairs, and `spawn` has already
+/// forked and exec'd by the time it returns, so bwrap holds its own copies and these have done their
+/// whole job: this process keeps no descriptor to the plaintext for the rest of the run.
 pub(super) fn spawn_launcher(
     command: &mut Command,
     memfds: Vec<std::fs::File>,

@@ -265,9 +265,9 @@ fn cage_output_line(line: &str) -> String {
 /// [`crate::sandbox::netns`]), and for every other spec `holder_wrap` is a byte-for-byte passthrough.
 ///
 /// The returned files are the memfds behind the seccomp filters and the cage's environment. They are
-/// not close-on-exec and bwrap reads them at the exec, so the caller must keep them alive until the
-/// process it starts has been replaced — dropping them early closes the descriptors bwrap is told to
-/// read.
+/// close-on-exec in this process and bwrap reads them at the exec, so the caller prepares that exec
+/// with [`crate::sandbox::memfd::inherit_across_exec`] and keeps them alive until the process it
+/// starts has been replaced: dropping them early closes the descriptors bwrap is told to read.
 pub(in crate::sandbox) fn cage_command(
     bwrap: &Path,
     spec: &SandboxSpec,
