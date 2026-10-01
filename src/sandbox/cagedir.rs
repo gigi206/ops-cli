@@ -131,15 +131,24 @@ fn one_name(name: &OsStr) -> io::Result<()> {
 
 /// The directory `name` of the directory `dir` holds, opened through `dir` and refused unless it is
 /// one, the way the walk refuses a component: a link is never followed, and what stands at `name`
-/// instead is reported by kind and by the path the user finds it at ([`shown`]). Opened read-only
-/// rather than `O_PATH`, so the caller can set the directory's mode through it.
+/// instead is reported by kind and by the path the user finds it at ([`shown`]). Nothing at `name`
+/// is reported by that path too, still as `NotFound`. Opened read-only rather than `O_PATH`, so the
+/// caller can set the directory's mode through it.
 pub(crate) fn open_entry_dir(dir: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
     use std::os::fd::AsRawFd;
 
     one_name(name)?;
     let cname = cstr(name.as_encoded_bytes())?;
-    open_dir(dir.as_raw_fd(), &cname, libc::O_RDONLY)
-        .map_err(|e| describe(&shown(dir, name), dir.as_raw_fd(), &cname, e))
+    open_dir(dir.as_raw_fd(), &cname, libc::O_RDONLY).map_err(|e| {
+        let at = shown(dir, name);
+        if e.kind() == io::ErrorKind::NotFound {
+            return io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("`{}` does not exist", at.display()),
+            );
+        }
+        describe(&at, dir.as_raw_fd(), &cname, e)
+    })
 }
 
 /// The path a user finds the entry `name` of the directory `dir` holds at: the directory's own path,
@@ -486,6 +495,26 @@ mod tests {
         assert!(
             open_entry_dir(&held, OsStr::new("dir/..")).is_err(),
             "a name that is not one component is opened"
+        );
+    }
+
+    /// Nothing at the name is reported by the path the user would look at, as `NotFound`. A caller
+    /// that has just made the directory meets this when another process removed it in between.
+    #[test]
+    fn an_entry_that_is_not_there_is_named_by_its_path() {
+        let tmp = TmpDir::new();
+        let parent = tmp.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let held = hold_under(&parent, "", 0o700).unwrap();
+        let path = std::fs::canonicalize(&parent).unwrap().join("gone");
+
+        let err = open_entry_dir(&held, OsStr::new("gone")).expect_err("nothing to open");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("`{}` does not exist", path.display())),
+            "the error does not name `{}`: {err}",
+            path.display()
         );
     }
 }
