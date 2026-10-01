@@ -340,7 +340,7 @@ pub(crate) fn app_per_project_mise_pools(data_dir: &Path, name: &str) -> Vec<App
 /// is that cage's to write, so the bind takes the pool itself and `installs` is resolved inside the
 /// reading cage. What is checked here is the shape a launch left: a pool is kept only where
 /// `<app>/mise/installs` opens as a real directory at every component, walked from the project's
-/// `apps` directory without following a link ([`super::gc::open_beneath`]). A pool that is not
+/// `apps` directory without following a link ([`super::cagedir::open_beneath`]). A pool that is not
 /// what a launch left is not shared, and the asking app installs its own copy, as it would with no
 /// neighbour at all.
 pub(crate) fn project_mise_pools(
@@ -353,7 +353,7 @@ pub(crate) fn project_mise_pools(
         .into_iter()
         .filter_map(|name| {
             let pool = Path::new(&name).join("mise");
-            super::gc::open_beneath(&apps, &pool.join("installs")).ok()?;
+            super::cagedir::open_beneath(&apps, &pool.join("installs")).ok()?;
             Some((name, apps.join(pool)))
         })
         .collect()

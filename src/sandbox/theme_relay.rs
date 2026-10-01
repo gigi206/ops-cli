@@ -553,12 +553,12 @@ const TMP_NAME: &str = "keyfile.sbx-tmp";
 /// target. That is an arbitrary-file-truncation primitive handed out of the sandbox, against the
 /// module header's claim that the relay "adds no capability".
 ///
-/// So the walk starts at `home` — the bind's mount point, which the cage cannot replace — and takes
-/// one component at a time through `openat`, each with `O_NOFOLLOW`, ending at a descriptor for the
-/// real `settings/` directory. The temp file is created `O_CREAT|O_EXCL|O_NOFOLLOW` relative to that
-/// descriptor, so an entry the cage pre-planted is refused rather than followed, and the rename is a
-/// `renameat` within the same descriptor. A cage that plants a symlink now costs itself its own live
-/// theme updates and nothing else.
+/// So the walk is [`super::cagedir::hold_under`], anchored at `home` (the bind's mount point, which
+/// the cage cannot replace), and it ends at a descriptor for the real `settings/` directory. The
+/// temp file is created exclusively inside that descriptor ([`super::cagedir::entry`]), so an entry
+/// the cage pre-planted is refused rather than followed, and the rename stays within the same
+/// directory. A cage that plants a symlink now costs itself its own live theme updates and nothing
+/// else.
 fn write_keyfile(home: &Path, scheme: &str) {
     let _ = write_keyfile_confined(home, scheme);
 }
@@ -566,8 +566,9 @@ fn write_keyfile(home: &Path, scheme: &str) {
 /// The fallible body of [`write_keyfile`], split out so every step's error can propagate with `?`
 /// while the caller stays best-effort.
 fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
+    use std::ffi::OsStr;
     use std::io::Write as _;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     #[expect(
         clippy::expect_used,
@@ -580,73 +581,32 @@ fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
 
     // The anchor: the project home itself. It is sbx's own directory (created `0700` under the data
     // dir) and it is the cage's mount point, so it is the one component in this path the cage cannot
-    // have swapped.
-    let mut dir = std::fs::File::open(home).map(OwnedFd::from)?;
-    for comp in dirs.split('/') {
-        let c = std::ffi::CString::new(comp).map_err(std::io::Error::other)?;
-        // Create it if it is missing; an existing entry is fine here, and the `O_NOFOLLOW` open
-        // below is what decides whether it is a directory or a link the cage left.
-        // SAFETY: `dir` is a live descriptor and `c` is a NUL-terminated name valid for the call.
-        unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) };
-        // SAFETY: same, and the returned descriptor is taken ownership of immediately below.
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `fd` is a fresh, owned descriptor this thread just opened.
-        dir = unsafe { OwnedFd::from_raw_fd(fd) };
-    }
+    // have swapped. A missing directory below it is created; an existing entry that is not a real
+    // directory is refused.
+    let dir = super::cagedir::hold_under(home, dirs, 0o700)?;
 
-    let tmp = std::ffi::CString::new(TMP_NAME).map_err(std::io::Error::other)?;
-    // A leftover temp from a killed run would fail the `O_EXCL` below forever, so clear it first.
-    // `unlinkat` removes the entry itself and never follows it, so this cannot reach out of the
-    // directory even when what sits there is a symlink the cage planted.
-    // SAFETY: `dir` is a live directory descriptor and `tmp` is a valid NUL-terminated name.
-    unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
-    // SAFETY: same; the descriptor is owned immediately below.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            tmp.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a fresh, owned descriptor this thread just opened.
-    let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let tmp = super::cagedir::entry(&dir, OsStr::new(TMP_NAME))?;
+    // A leftover temp from a killed run would fail the exclusive create below forever, so clear it
+    // first. Removing it unlinks the entry itself and never follows it, so this cannot reach out of
+    // the directory even when what sits there is a symlink the cage planted.
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
     let write = f
         .write_all(super::portal::keyfile_body(scheme).as_bytes())
         .and_then(|()| f.sync_all());
     drop(f);
     if let Err(e) = write {
-        // SAFETY: `dir` is live and `tmp` is a valid name; the half-written temp is removed.
-        unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+        // The half-written temp is removed.
+        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
 
-    let dest = std::ffi::CString::new(leaf).map_err(std::io::Error::other)?;
-    // SAFETY: both names are valid and `dir` is a live directory descriptor for both ends.
-    let renamed = unsafe {
-        libc::renameat(
-            dir.as_raw_fd(),
-            tmp.as_ptr(),
-            dir.as_raw_fd(),
-            dest.as_ptr(),
-        )
-    };
-    if renamed < 0 {
-        let e = std::io::Error::last_os_error();
-        // SAFETY: as above.
-        unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+    if let Err(e) = std::fs::rename(&tmp, super::cagedir::entry(&dir, OsStr::new(leaf))?) {
+        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
