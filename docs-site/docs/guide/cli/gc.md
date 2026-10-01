@@ -50,13 +50,15 @@ tree, with the state `unknown` in place of a `live`/`idle` finding nothing estab
 
 ## When the store holds an entry nix did not make
 
-A project's store is writable from inside its cage, and `nix-store` runs on it on the host,
-at each launch and in `sbx gc`. So before `nix-store` starts, what it writes to is checked:
-its database directory, its lock and root directories, its temporary roots and its
-deduplication pool must be real directories, and the database files, its locks and the
-temporary roots must be regular files. A symlink or anything else in their place stops the
-launch or the collection with that entry's path, and `nix-store` does not run. The entry is
-left where it is, so you can see it: remove it by hand, then run again.
+A project's store is writable from inside its cage, and `nix-store` runs on it at each
+launch and in `sbx gc`. Both register the seed in a cage of its own, which sees nothing of
+the host's but that store, so a link inside the store leads nowhere on the host; `sbx gc`
+then collects and deduplicates on the host. Either way, before `nix-store` starts, what it
+writes to is checked: its database directory, its lock, root and profile directories, its
+temporary roots and its deduplication pool must be real directories, and the database files,
+its locks and the temporary roots must be regular files. A symlink or anything else in their
+place stops the launch or the collection with that entry's path, and `nix-store` does not
+run. The entry is left where it is, so you can see it: remove it by hand, then run again.
 
 ## Runtime files
 

@@ -1069,11 +1069,13 @@ mod tests {
             "src/sandbox/task.rs",
         ];
         // Spawn bubblewrap themselves rather than through the launch command, with the composed
-        // list inside the resource scope. Each runs a project's own code: the session launcher, the
-        // task pool, and mise driven over the files a project declared.
+        // list inside the resource scope. Each runs a project's own code, or reads what a project
+        // wrote: the session launcher, the task pool, mise driven over the files a project
+        // declared, and nix registering a seed in the database a project's cage writes.
         const SPAWNS_THE_COMPOSED_LIST_IN_A_SCOPE: &[&str] = &[
             "src/sandbox/launch/cage.rs",
             "src/sandbox/mise.rs",
+            "src/sandbox/projectstore.rs",
             "src/sandbox/taskpool.rs",
         ];
         // The same, and outside the scope, because what runs is sbx's own and fixed. `doctor`'s

@@ -73,41 +73,49 @@ pub(crate) fn spec(
     net: NetPolicy,
     args: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
-    let ro = |p: &str| Mount::RoBind {
-        src: p.into(),
-        dest: p.into(),
-    };
-    let symlink = |target: &str, dest: &str| Mount::Symlink {
-        target: target.into(),
-        dest: dest.into(),
-    };
-    let mut mounts = vec![
-        ro("/usr"),
-        symlink("usr/lib", "/lib"),
-        symlink("usr/lib64", "/lib64"),
-        Mount::RoBindTry {
-            src: "/etc/ld.so.cache".into(),
-            dest: "/etc/ld.so.cache".into(),
-        },
-        if copy {
-            Mount::Copy {
-                fd: binary,
-                dest: BINARY.into(),
-            }
-        } else {
-            // Through the descriptor's own link, which names the file it was opened on even after
-            // a rename.
-            Mount::RoBind {
-                src: format!("/proc/self/fd/{binary}").into(),
-                dest: BINARY.into(),
-            }
-        },
-    ];
+    let mut mounts = userland();
+    mounts.push(if copy {
+        Mount::Copy {
+            fd: binary,
+            dest: BINARY.into(),
+        }
+    } else {
+        // Through the descriptor's own link, which names the file it was opened on even after a
+        // rename.
+        Mount::RoBind {
+            src: format!("/proc/self/fd/{binary}").into(),
+            dest: BINARY.into(),
+        }
+    });
     mounts.extend(extra);
     let mut cmd = vec![OsString::from(BINARY)];
     cmd.extend(args);
     SandboxSpec::new("/".into(), mounts, Vec::new(), net, cmd)
         .map_err(|e| io::Error::other(format!("cannot build {who}'s cage: {e:?}")))
+}
+
+/// The host's userland, read-only, for a binary that loads libraries: `/usr`, the `/lib` and
+/// `/lib64` links into it, and the loader's cache. The base of every helper's cage here, and of the
+/// one the project store's registration runs in ([`super::projectstore`]), whose program is nix's.
+pub(crate) fn userland() -> Vec<Mount> {
+    vec![
+        Mount::RoBind {
+            src: "/usr".into(),
+            dest: "/usr".into(),
+        },
+        Mount::Symlink {
+            target: "usr/lib".into(),
+            dest: "/lib".into(),
+        },
+        Mount::Symlink {
+            target: "usr/lib64".into(),
+            dest: "/lib64".into(),
+        },
+        Mount::RoBindTry {
+            src: "/etc/ld.so.cache".into(),
+            dest: "/etc/ld.so.cache".into(),
+        },
+    ]
 }
 
 /// bwrap starting `spec`, holding the descriptors it reads: the spec's own, then `binary`, the file

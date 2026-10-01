@@ -33,8 +33,16 @@
 //! through a descriptor for the directory the walk checked, never through a path
 //! re-resolved at the write, and every entry is created exclusively, so a link the
 //! cage planted fails the seed instead of being written through (see
-//! [`hold_dir_chain`]). What this cannot cover is `nix-store` itself, which opens
-//! the same tree by name ([`ensure_nix_state`]).
+//! [`hold_dir_chain`]). `nix-store` opens the same tree by name, so the registration
+//! every seed runs on it does so in a cage of its own ([`load_cage`]), where a link in
+//! the tree reaches nothing of the host's. `sbx gc` still runs its collection and
+//! deduplication there on the host, behind its refusal of a store a live cage holds
+//! ([`ensure_nix_state`]). That refusal and the check keep a link from being followed;
+//! they leave nix and SQLite reading, on the host, a database the project's cage wrote.
+//! The collection stays out of a cage because it must see the project's indirect roots
+//! (`gcroots/auto`, the `result` links a build in the cage leaves in the project): a
+//! cage that does not mount the project at its own path finds them stale, unlinks them
+//! and collects their builds, even on a dry run.
 //!
 //! The cage's nix reads and writes only this self-contained store; sbx's own seed
 //! is the only reader of the shared store, and only ever reads its content paths
@@ -100,6 +108,34 @@ impl ProjectStore {
     /// The directory passed to `nix --store`, backing the sandbox's `/nix`.
     pub(crate) fn store_dir(&self) -> &Path {
         &self.store_dir
+    }
+}
+
+/// What [`prepare`] runs nix with: `nix_store`, run on the host against the shared store, and the
+/// cage the registration into the project's store runs in, started by `bwrap` in the launch's
+/// resource scope (`limits`, under the name `slug`).
+pub(crate) struct Engine<'a> {
+    pub(crate) nix_store: &'a Path,
+    pub(crate) bwrap: &'a Path,
+    pub(crate) limits: &'a super::cgroup::Limits,
+    pub(crate) slug: &'a str,
+}
+
+#[cfg(test)]
+impl<'a> Engine<'a> {
+    /// The engine a test seeds with: no limit of a configuration's own, under a test's name.
+    pub(crate) fn for_tests(nix_store: &'a Path, bwrap: &'a Path) -> Self {
+        static NO_OVERRIDE: super::cgroup::Limits = super::cgroup::Limits {
+            memory_high: None,
+            memory_max: None,
+            tasks_max: None,
+        };
+        Self {
+            nix_store,
+            bwrap,
+            limits: &NO_OVERRIDE,
+            slug: "sbx-test",
+        }
     }
 }
 
@@ -236,7 +272,7 @@ pub(crate) fn write_marker(layout: &Layout, project_id: &str, canonical: &Path) 
 /// without disturbing anything the project's own nix has since written. The shared
 /// store is only ever read.
 pub(crate) fn prepare(
-    nix_store: &Path,
+    engine: &Engine<'_>,
     layout: &Layout,
     project_id: &str,
     roots: &[PathBuf],
@@ -266,7 +302,7 @@ pub(crate) fn prepare(
     // collector does. Released when `_shared` drops at the end of this function.
     let _shared = lock_shared(layout)?;
     let shared_store = layout.store_dir();
-    let closure = closure_of(nix_store, &shared_store, roots)?;
+    let closure = closure_of(engine.nix_store, &shared_store, roots)?;
 
     // Probe once whether the project store's filesystem supports reflinks, rather
     // than attempting (and failing) a clone per file on a filesystem without them.
@@ -286,8 +322,10 @@ pub(crate) fn prepare(
     }
     record_seed_mode(&store_dir, all_cloned)?;
 
-    // Register exactly that closure in the project store's own database.
-    load_db(nix_store, &shared_store, &store_dir, &closure)?;
+    // Register exactly that closure in the project store's own database, through the `nix/` this
+    // holds rather than its path, for the registration's cage to bind ([`load_cage`]).
+    let nix_dir = super::cagedir::hold_under(&store_dir, "nix", DIR_MODE)?;
+    load_db(engine, &shared_store, &nix_dir, &closure)?;
 
     // Root the seeded paths so a later `nix-store --gc` against this store keeps the
     // base userland and the project's tools while collecting only orphaned paths (a
@@ -632,10 +670,16 @@ fn discard(dir: &OwnedFd, name: &OsStr) {
 /// paths the project's own nix has registered — so this serves both the first seed
 /// and a later top-up. Daemonless (`NIX_REMOTE` empty), like every other store
 /// operation.
+///
+/// The two halves run apart. The dump reads the shared store, which no cage writes, on the host.
+/// The load opens the project's store, which a cage of the project writes at will and may be
+/// rewriting while this runs, so it runs in a cage of its own ([`load_cage`]) over `nix_dir`, the
+/// project's `nix/` as [`prepare`] holds it: a link planted anywhere in that tree leads into the
+/// load's cage, never to a file of the user's.
 fn load_db(
-    nix_store: &Path,
+    engine: &Engine<'_>,
     shared_store: &Path,
-    project_store: &Path,
+    nix_dir: &OwnedFd,
     closure: &[PathBuf],
 ) -> io::Result<()> {
     // Retry a lost lock race. Several sandboxes of the same project can seed at once, and the
@@ -649,7 +693,7 @@ fn load_db(
     // surfaced. The `--load-db` marker only distinguishes the load half from the dump half.
     retry_transient(
         LOAD_DB_ATTEMPTS,
-        || load_db_once(nix_store, shared_store, project_store, closure),
+        || load_db_once(engine, shared_store, nix_dir, closure),
         |e| e.to_string().contains("--load-db"),
     )
 }
@@ -662,13 +706,13 @@ const LOAD_DB_ATTEMPTS: u32 = 6;
 /// lock race). The `--load-db` half's stderr is captured so a failure carries nix's reason (a
 /// locked database vs. a real error) — surfaced to the caller after the retry budget is spent.
 fn load_db_once(
-    nix_store: &Path,
+    engine: &Engine<'_>,
     shared_store: &Path,
-    project_store: &Path,
+    nix_dir: &OwnedFd,
     closure: &[PathBuf],
 ) -> io::Result<()> {
     use std::process::{Command, Stdio};
-    let mut dump = Command::new(nix_store)
+    let mut dump = Command::new(engine.nix_store)
         .env("NIX_REMOTE", "")
         .arg("--store")
         .arg(shared_store)
@@ -685,11 +729,7 @@ fn load_db_once(
     let dump_out = dump.stdout.take().expect("stdout was requested as a pipe");
     // The reader child consumes the pipe directly, so a large dump never blocks on
     // a full pipe buffer; reap the writer only once the reader has finished.
-    let load = Command::new(nix_store)
-        .env("NIX_REMOTE", "")
-        .arg("--store")
-        .arg(project_store)
-        .arg("--load-db")
+    let load = load_command(engine, nix_dir)?
         .stdin(Stdio::from(dump_out))
         .stderr(Stdio::piped())
         .output()?;
@@ -707,13 +747,99 @@ fn load_db_once(
         return Err(io::Error::other(if reason.is_empty() {
             "nix-store --load-db failed".to_string()
         } else {
-            format!("nix-store --load-db failed: {reason}")
+            format!(
+                "nix-store --load-db failed (it sees the project's store at `{LOAD_ROOT}`): \
+                 {reason}"
+            )
         }));
     }
     if !dump_status.success() {
         return Err(io::Error::other("nix-store --dump-db failed"));
     }
     Ok(())
+}
+
+/// Where the registration's cage sees the project's store: the `--store` it names, with the
+/// project's `nix/` bound below it.
+const LOAD_ROOT: &str = "/project";
+
+/// Where the registration's cage sees `nix-store`. nix is one binary that acts on the name it was
+/// started under, so the destination keeps that name.
+const LOAD_ENGINE: &str = "/bin/nix-store";
+
+/// The registration's `nix-store --load-db` ready to start: the cage [`load_cage`] describes, with
+/// the mandatory syscall filters, in the launch's resource scope, and holding a copy of `nix_dir`
+/// for bwrap to bind. A copy per call, since a command gives up what it holds when it is spent and
+/// [`load_db`] may make several.
+///
+/// In the scope because what runs is nix and SQLite over a database a project's cage wrote, which
+/// is a program sbx did not write reading what a project chose, the way mise reads a project's
+/// files.
+fn load_command(engine: &Engine<'_>, nix_dir: &OwnedFd) -> io::Result<std::process::Command> {
+    use std::os::fd::AsRawFd;
+    let held = fs::File::from(nix_dir.try_clone()?);
+    let spec = load_cage(engine.nix_store, held.as_raw_fd())?;
+    let mut cage = super::argv::compose(engine.bwrap, &spec)?.wrapped(|bwrap, argv| {
+        super::cgroup::wrap(
+            bwrap,
+            argv,
+            engine.limits,
+            &format!("{}-store", engine.slug),
+        )
+    });
+    cage.hand(held);
+    Ok(cage.into_command())
+}
+
+/// The cage the registration into a project's store runs in: no network, the host's userland and
+/// `/nix/store` read-only for an engine that loads its libraries from either, `nix_store` at
+/// [`LOAD_ENGINE`], and the project's `nix/`, open as `nix_dir`, the one writable thing of the
+/// host's, at [`LOAD_ROOT`].
+///
+/// What a link the project's cage planted in that tree can reach is decided by this mount
+/// namespace: an absolute target, or a relative one that climbs out of the tree, resolves in here,
+/// where nothing else of the host's is writable. The descriptor fixes `nix/` itself, which the
+/// project's cage cannot replace, being where its own `/nix` is mounted. nix needs a home of its
+/// own; a private tmpfs is enough.
+fn load_cage(
+    nix_store: &Path,
+    nix_dir: std::os::fd::RawFd,
+) -> io::Result<super::spec::SandboxSpec> {
+    use super::spec::{Mount, NetPolicy, SandboxSpec};
+    let mut mounts = super::selfcage::userland();
+    mounts.extend([
+        Mount::RoBindTry {
+            src: "/nix/store".into(),
+            dest: "/nix/store".into(),
+        },
+        Mount::RoBind {
+            src: nix_store.into(),
+            dest: LOAD_ENGINE.into(),
+        },
+        // Through the descriptor's own link, which names the directory it was opened on.
+        Mount::Bind {
+            src: format!("/proc/self/fd/{nix_dir}").into(),
+            dest: format!("{LOAD_ROOT}/nix").into(),
+        },
+        Mount::Proc {
+            dest: "/proc".into(),
+        },
+        Mount::Dev {
+            dest: "/dev".into(),
+        },
+        Mount::Tmpfs {
+            dest: "/tmp".into(),
+        },
+    ]);
+    let env = vec![
+        ("HOME".to_string(), "/tmp".to_string()),
+        ("NIX_REMOTE".to_string(), String::new()),
+    ];
+    let cmd = [LOAD_ENGINE, "--store", LOAD_ROOT, "--load-db"]
+        .map(std::ffi::OsString::from)
+        .to_vec();
+    SandboxSpec::new("/".into(), mounts, env, NetPolicy::Isolated, cmd)
+        .map_err(|e| io::Error::other(format!("cannot build the store registration's cage: {e:?}")))
 }
 
 /// Retry `op` while it fails with an error `transient` deems worth retrying, up to `attempts` total
@@ -831,7 +957,11 @@ const NIX_STATE_FILES: &[&str] = &[
 /// the tree is still the cage's between this check and the `nix-store` run. `sbx gc` refuses a
 /// store a live cage of the project holds. A launch does not, since two launches of one project
 /// may run at once, so a cage of the project that is running while another launch seeds can
-/// replace a checked name before `nix-store` opens it.
+/// replace a checked name before `nix-store` opens it. The registration a launch runs answers that
+/// with its cage ([`load_cage`]), and this check is then what makes a name the cage planted a
+/// refusal that names it rather than a failure inside that cage; `sbx gc`'s own runs on the host
+/// are the ones it still guards, against links only: SQLite there still reads a database the cage
+/// wrote.
 fn ensure_nix_state(store_dir: &Path) -> io::Result<()> {
     for rel in NIX_STATE_DIRS {
         ensure_dir_chain(store_dir, rel)?;
@@ -1164,15 +1294,18 @@ mod tests {
         path
     }
 
-    /// [`prepare`], waiting out the `ETXTBSY` a just-written executable meets under the parallel
-    /// runner, which says nothing about `prepare` itself.
+    /// [`prepare`] with the fake `nix_store`, waiting out the `ETXTBSY` a just-written executable
+    /// meets under the parallel runner, which says nothing about `prepare` itself. The
+    /// registration's cage is given a bwrap that does not exist: every caller expects a refusal
+    /// before any `nix-store` starts, so reaching it is already a failure.
     fn prepare_past_etxtbsy(
         nix_store: &Path,
         layout: &Layout,
         roots: &[PathBuf],
     ) -> io::Result<()> {
+        let engine = Engine::for_tests(nix_store, Path::new("/nonexistent/bwrap"));
         for _ in 0..100 {
-            match prepare(nix_store, layout, "p", roots) {
+            match prepare(&engine, layout, "p", roots) {
                 Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
@@ -1182,9 +1315,8 @@ mod tests {
         panic!("the fake nix-store stayed held open for writing by another thread");
     }
 
-    /// `nix-store` runs on the host, as the user, on a tree the cage writes, and opens by path the
-    /// directories and files it keeps there. Each one the cage replaced is refused before
-    /// `nix-store` starts, and left in place.
+    /// `nix-store` opens by path the directories and files it keeps in a tree the cage writes. Each
+    /// one the cage replaced is refused before any `nix-store` starts, and left in place.
     #[test]
     fn nix_store_is_not_started_on_a_store_whose_state_the_cage_replaced() {
         let roots = [PathBuf::from(
@@ -1285,17 +1417,16 @@ mod tests {
         }
     }
 
-    /// And a store whose state is its own is still handed to `nix-store`, first seed or not: a
-    /// check that refused everything would pass the test above while stopping every launch.
+    /// And a store whose state is its own passes the check, first seed or not: a check that refused
+    /// everything would pass the test above while stopping every launch. That the registration
+    /// then runs on such a store is a smoke test's, since it needs a real `nix-store`
+    /// (`smoke::the_registration_runs_in_its_cage_and_a_planted_link_reaches_nothing_of_the_host`).
     #[test]
-    fn a_store_whose_state_is_its_own_is_handed_to_nix_store() {
-        let roots = [PathBuf::from(
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-base",
-        )];
+    fn a_store_whose_state_is_its_own_passes_the_check() {
         for seeded_before in [false, true] {
             let base = TmpDir::new();
-            let layout = Layout::under(&base.join("data"));
-            let nix = store_dir_for(&layout, "p").join("nix");
+            let store_dir = base.join("store");
+            let nix = store_dir.join("nix");
             if seeded_before {
                 std::fs::create_dir_all(nix.join("var/nix/db")).unwrap();
                 std::fs::create_dir_all(nix.join("var/nix/temproots")).unwrap();
@@ -1307,17 +1438,10 @@ mod tests {
                     std::fs::write(nix.join(file), b"").unwrap();
                 }
             }
-            let ran = base.join("ran");
-            let nix_store = fake_nix_store(base.path(), &ran);
 
-            prepare_past_etxtbsy(&nix_store, &layout, &roots)
+            ensure_nix_state(&store_dir)
                 .unwrap_or_else(|e| panic!("seeded before: {seeded_before}: {e}"));
 
-            let runs = std::fs::read_to_string(&ran).unwrap_or_default();
-            assert!(
-                runs.contains("--load-db"),
-                "seeded before: {seeded_before}: nix-store never registered the seed: {runs:?}"
-            );
             for dir in [
                 "store/.links",
                 "var/nix/db",
@@ -1330,6 +1454,31 @@ mod tests {
                 assert!(meta.is_dir(), "nix/{dir} is not a real directory");
             }
         }
+    }
+
+    /// The registration's cage: the project's `nix/`, bound from the descriptor, is the one thing of
+    /// the host's it can write, it has no network, and it runs nothing but the load.
+    #[test]
+    fn the_registrations_cage_writes_only_the_project_store() {
+        use super::super::spec::{Mount, NetPolicy};
+        let spec = load_cage(Path::new("/opt/engine/nix-store"), 7).unwrap();
+        let writable: Vec<&Mount> = spec
+            .mounts
+            .iter()
+            .filter(|m| matches!(m, Mount::Bind { .. } | Mount::DevBind { .. }))
+            .collect();
+        assert_eq!(
+            writable,
+            [&Mount::Bind {
+                src: "/proc/self/fd/7".into(),
+                dest: "/project/nix".into(),
+            }]
+        );
+        assert_eq!(spec.net, NetPolicy::Isolated);
+        assert_eq!(
+            spec.cmd,
+            ["/bin/nix-store", "--store", "/project", "--load-db"].map(std::ffi::OsString::from)
+        );
     }
 
     #[test]
@@ -1825,9 +1974,16 @@ mod smoke {
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
 
-    /// `(nix, nix-store)` when both are present; otherwise `None` to skip.
-    fn prerequisites() -> Option<(PathBuf, PathBuf)> {
-        Some((store::resolve_nix(None)?, store::resolve_nix_store(None)?))
+    /// `(nix, nix-store, bwrap)` when all three are present and bwrap can make the user namespace
+    /// the registration's cage needs; otherwise `None` to skip.
+    fn prerequisites() -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let bwrap = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))?;
+        Some((
+            store::resolve_nix(None)?,
+            store::resolve_nix_store(None)?,
+            bwrap,
+        ))
     }
 
     fn ino(path: &Path) -> (u64, u64) {
@@ -1844,8 +2000,8 @@ mod smoke {
 
     #[test]
     fn seed_is_closure_scoped_consistent_isolated_and_tops_up() {
-        let Some((nix, nix_store)) = prerequisites() else {
-            skip_incapable!("skipping projectstore smoke: need nix and nix-store");
+        let Some((nix, nix_store, bwrap)) = prerequisites() else {
+            skip_incapable!("skipping projectstore smoke: need nix, nix-store, bwrap and userns");
             return;
         };
 
@@ -1881,7 +2037,8 @@ mod smoke {
 
         // seed only `hello` as a root — `jq` is in the shared store but not in the
         // requested closure
-        let project = prepare(&nix_store, &layout, "smoke", std::slice::from_ref(&hello))
+        let engine = Engine::for_tests(&nix_store, &bwrap);
+        let project = prepare(&engine, &layout, "smoke", std::slice::from_ref(&hello))
             .expect("seed the project store");
 
         // the seeded store is internally consistent: every registered path's files
@@ -1946,7 +2103,7 @@ mod smoke {
         // re-seed with jq added as a root: a top-up brings jq's closure in, leaves
         // the already-seeded hello in place (same inode, not recopied), and does not
         // disturb the agent-written path
-        let project = prepare(&nix_store, &layout, "smoke", &[hello.clone(), jq.clone()])
+        let project = prepare(&engine, &layout, "smoke", &[hello.clone(), jq.clone()])
             .expect("re-seed the project store");
         verify("after top-up");
         assert!(
@@ -1976,8 +2133,10 @@ mod smoke {
     #[test]
     fn concurrent_same_project_seeds_converge_to_a_consistent_registered_store() {
         use std::collections::BTreeSet;
-        let Some((nix, nix_store)) = prerequisites() else {
-            skip_incapable!("skipping concurrent-seed smoke: need nix and nix-store");
+        let Some((nix, nix_store, bwrap)) = prerequisites() else {
+            skip_incapable!(
+                "skipping concurrent-seed smoke: need nix, nix-store, bwrap and userns"
+            );
             return;
         };
 
@@ -2007,9 +2166,10 @@ mod smoke {
         // must succeed: a lost rename is success (the path is present), and concurrent
         // `--load-db` merges serialise on the project store's own nix lock.
         let roots = std::slice::from_ref(&hello);
+        let engine = Engine::for_tests(&nix_store, &bwrap);
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..4)
-                .map(|_| scope.spawn(|| prepare(&nix_store, &layout, "concurrent", roots)))
+                .map(|_| scope.spawn(|| prepare(&engine, &layout, "concurrent", roots)))
                 .collect();
             for handle in handles {
                 handle
@@ -2070,5 +2230,108 @@ mod smoke {
             fingerprint(&shared_paths),
             "the shared store's paths changed under concurrent seeding"
         );
+    }
+
+    /// The registration runs in its cage, through the real composition (the mandatory filters, the
+    /// descriptor bind): on a store whose state is its own it creates the database there, and a
+    /// link planted after the tree was held, the race a cage of the project running beside a
+    /// launch can win, leads it nowhere on the host, absolute or climbing out by `..`.
+    ///
+    /// The control arm gives the same store and link to `nix-store` on the host, as the
+    /// registration ran before it had a cage. It writes where the link points, so the link does
+    /// reach the host and the caged arm's silence is the cage's. Neither arm is given a dump: nix
+    /// opens and writes the database before it reads one, so no shared store is needed.
+    #[test]
+    fn the_registration_runs_in_its_cage_and_a_planted_link_reaches_nothing_of_the_host() {
+        use std::process::{Command, Stdio};
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            skip_incapable!(
+                "skipping the registration's cage: no bwrap or no capability-bearing userns"
+            );
+            return;
+        };
+        let Some(nix_store) = crate::store::resolve_nix_store(None) else {
+            skip_incapable!("skipping the registration's cage: no nix-store");
+            return;
+        };
+        let engine = Engine::for_tests(&nix_store, &bwrap);
+        let caged = |nix_dir: &OwnedFd| {
+            load_command(&engine, nix_dir)
+                .unwrap()
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let entries = |dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        ensure_nix_state(&store_dir).unwrap();
+        let nix_dir = super::super::cagedir::hold_under(&store_dir, "nix", DIR_MODE).unwrap();
+        let ran = caged(&nix_dir);
+        assert!(
+            ran.status.success(),
+            "the load failed in its cage: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert!(
+            store_dir.join("nix/var/nix/db/db.sqlite").is_file(),
+            "the load ran without creating the project's database"
+        );
+
+        let base = TmpDir::new();
+        let outside = base.join("outside");
+        // The relative link sits in `<store>/nix/var/nix`, four levels below `base`.
+        for (kind, target) in [
+            ("absolute", outside.clone()),
+            ("relative", PathBuf::from("../../../../outside")),
+        ] {
+            let store_dir = base.join(&format!("store-{kind}"));
+            ensure_nix_state(&store_dir).unwrap();
+            let nix_dir = super::super::cagedir::hold_under(&store_dir, "nix", DIR_MODE).unwrap();
+            let _ = std::fs::remove_dir_all(&outside);
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("mine"), b"mine\n").unwrap();
+            let db = store_dir.join("nix/var/nix/db");
+            std::fs::remove_dir(&db).unwrap();
+            std::os::unix::fs::symlink(&target, &db).unwrap();
+            assert_eq!(
+                std::fs::canonicalize(&db).unwrap(),
+                std::fs::canonicalize(&outside).unwrap(),
+                "{kind}: the planted link must reach the outside directory on the host"
+            );
+
+            caged(&nix_dir);
+            assert_eq!(
+                entries(&outside),
+                ["mine"],
+                "{kind}: the load in its cage wrote where the link points"
+            );
+            assert_eq!(std::fs::read(outside.join("mine")).unwrap(), b"mine\n");
+
+            let host = Command::new(&nix_store)
+                .env("NIX_REMOTE", "")
+                .arg("--store")
+                .arg(&store_dir)
+                .arg("--load-db")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                entries(&outside).len() > 1,
+                "{kind}: the control arm on the host wrote nothing through the link, so this test \
+                 shows nothing about the cage: {}",
+                String::from_utf8_lossy(&host.stderr)
+            );
+        }
     }
 }

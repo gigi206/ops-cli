@@ -1299,7 +1299,15 @@ fn seed_project_store(
 ) -> io::Result<super::projectstore::ProjectStore> {
     let (id, canonical) = binds::project_identity(&prep.cwd)?;
     let roots = collect_roots(&prep.userland, pkg_roots, tool_roots, font_roots);
-    let store = super::projectstore::prepare(&prep.nix_store, &prep.layout, &id, &roots)?;
+    // The project's own name: the store is the project's, whichever app is launched over it.
+    let slug = crate::sandbox::naming::cage_slug(None, &prep.cwd);
+    let engine = super::projectstore::Engine {
+        nix_store: &prep.nix_store,
+        bwrap: &prep.bwrap,
+        limits: &prep.cfg.limits,
+        slug: &slug,
+    };
+    let store = super::projectstore::prepare(&engine, &prep.layout, &id, &roots)?;
     // The canonical path a later `sbx gc` recognises this tree by. Written again here because it
     // is what keeps the record current when a project moves, and idempotent: the launch already
     // wrote it before provisioning, where its absence is what a concurrent prune reads as a dead

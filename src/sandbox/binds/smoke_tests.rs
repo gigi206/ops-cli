@@ -381,8 +381,13 @@ fn the_cage_runs_from_a_writable_per_project_store_seeded_with_the_base_closure(
     let proj = project.path().canonicalize().unwrap();
     std::fs::write(proj.join("MARKER"), b"x").unwrap();
     let id = super::project_runtime_id(&proj).expect("project id");
-    let store = super::super::projectstore::prepare(&nix_store, &layout, &id, &userland.base_roots)
-        .expect("seed the per-project store");
+    let store = super::super::projectstore::prepare(
+        &super::super::projectstore::Engine::for_tests(&nix_store, &bwrap),
+        &layout,
+        &id,
+        &userland.base_roots,
+    )
+    .expect("seed the per-project store");
     let in_store = |logical: &Path| {
         store
             .store_dir()
@@ -564,8 +569,13 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
     let project = TmpDir::new();
     let proj = project.path().canonicalize().unwrap();
     let id = super::project_runtime_id(&proj).expect("project id");
-    let store = super::super::projectstore::prepare(&nix_store, &layout, &id, &userland.base_roots)
-        .expect("seed the per-project store");
+    let store = super::super::projectstore::prepare(
+        &super::super::projectstore::Engine::for_tests(&nix_store, &bwrap),
+        &layout,
+        &id,
+        &userland.base_roots,
+    )
+    .expect("seed the per-project store");
 
     // the reuse derivation: build closure is bash + coreutils only, both seeded.
     // `builtins.storePath` validates them against the per-project store's own DB, so
@@ -768,8 +778,13 @@ fn the_cage_self_equips_a_nix_tool_via_mise() {
     let project = TmpDir::new();
     let proj = project.path().canonicalize().unwrap();
     let id = super::project_runtime_id(&proj).expect("project id");
-    let store = super::super::projectstore::prepare(&nix_store, &layout, &id, &userland.base_roots)
-        .expect("seed the per-project store");
+    let store = super::super::projectstore::prepare(
+        &super::super::projectstore::Engine::for_tests(&nix_store, &bwrap),
+        &layout,
+        &id,
+        &userland.base_roots,
+    )
+    .expect("seed the per-project store");
 
     // The agent's commands: self-equip jq, then prove it installed and runs. A
     // successful `mise install nix:<pkg>` is itself the proof the plugin is wired —
@@ -916,9 +931,13 @@ fn a_mise_used_tool_is_activated_on_path_in_a_later_launch() {
     // launch would: re-seed (a top-up, so jq installed by an earlier cage survives),
     // back `/nix` read-write, build, run. Returns (success, stdout, stderr).
     let run_script = |script: &str| {
-        let store =
-            super::super::projectstore::prepare(&nix_store, &layout, &id, &userland.base_roots)
-                .expect("seed the per-project store");
+        let store = super::super::projectstore::prepare(
+            &super::super::projectstore::Engine::for_tests(&nix_store, &bwrap),
+            &layout,
+            &id,
+            &userland.base_roots,
+        )
+        .expect("seed the per-project store");
         let nix_mount = NixMount {
             src: store.store_dir().join("nix"),
             writable: true,
