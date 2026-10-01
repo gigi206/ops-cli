@@ -325,7 +325,7 @@ pub(crate) fn prepare(
     // Register exactly that closure in the project store's own database, through the `nix/` this
     // holds rather than its path, for the registration's cage to bind ([`load_cage`]).
     let nix_dir = super::cagedir::hold_under(&store_dir, "nix", DIR_MODE)?;
-    load_db(engine, &shared_store, &nix_dir, &closure)?;
+    load_db(engine, &shared_store, &store_dir, &nix_dir, &closure)?;
 
     // Root the seeded paths so a later `nix-store --gc` against this store keeps the
     // base userland and the project's tools while collecting only orphaned paths (a
@@ -462,7 +462,10 @@ fn copy_recursive(from: &Path, dir: &OwnedFd, name: &OsStr, reflink_ok: bool) ->
     let file_type = meta.file_type();
     let to = super::cagedir::entry(dir, name)?;
     if file_type.is_dir() {
-        DirBuilder::new().mode(DIR_MODE).create(&to)?;
+        DirBuilder::new()
+            .mode(DIR_MODE)
+            .create(&to)
+            .map_err(|e| already_there(dir, name, e))?;
         // Opened, never re-entered by name: a link swapped in after the `mkdir` fails this open,
         // and what is placed below goes into the directory it reached.
         let made = OwnedFd::from(
@@ -481,11 +484,35 @@ fn copy_recursive(from: &Path, dir: &OwnedFd, name: &OsStr, reflink_ok: bool) ->
         fs::File::from(made).set_permissions(meta.permissions())?;
         Ok(cloned)
     } else if file_type.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(from)?, &to)?;
+        std::os::unix::fs::symlink(fs::read_link(from)?, &to)
+            .map_err(|e| already_there(dir, name, e))?;
         Ok(true)
     } else {
         place_file(from, dir, name, reflink_ok)
     }
+}
+
+/// `e`, or, when it says the entry `name` of the directory `dir` holds was already there, the
+/// error that names that entry by the path the user finds it at ([`super::cagedir::shown`]).
+///
+/// The copy creates every entry exclusively, and the kernel's answer, `File exists`, names
+/// nothing. Below the temporary directory a copy starts with, an entry already there is one
+/// something else made after that directory was, and a cage of the project writes this tree. At
+/// that directory itself it may also be a leftover [`discard`] could not remove, so the error says
+/// what is known: the entry was there, nothing was written through it, and it was left alone.
+fn already_there(dir: &OwnedFd, name: &OsStr, e: io::Error) -> io::Error {
+    if e.kind() != io::ErrorKind::AlreadyExists {
+        return e;
+    }
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "`{}` already exists where the seed creates a new entry, and nothing was written \
+             through it. This tree is writable by a cage of this project, so the entry is left in \
+             place for you to see",
+            super::cagedir::shown(dir, name).display()
+        ),
+    )
 }
 
 /// Place one regular file at the entry `name` of the directory `dir` holds, as a physically
@@ -509,7 +536,8 @@ fn place_file(from: &Path, dir: &OwnedFd, name: &OsStr, reflink_ok: bool) -> io:
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(super::cagedir::entry(dir, name)?)?;
+        .open(super::cagedir::entry(dir, name)?)
+        .map_err(|e| already_there(dir, name, e))?;
     let cloned = reflink_ok && clone_into(&src, &dst).is_ok();
     if !cloned {
         // Whatever a failed clone left is cut first; a plain copy is independent on every
@@ -679,9 +707,23 @@ fn discard(dir: &OwnedFd, name: &OsStr) {
 fn load_db(
     engine: &Engine<'_>,
     shared_store: &Path,
+    store_dir: &Path,
     nix_dir: &OwnedFd,
     closure: &[PathBuf],
 ) -> io::Result<()> {
+    retry_load(store_dir, || {
+        load_db_once(engine, shared_store, nix_dir, closure)
+    })
+}
+
+/// [`load_db`]'s attempts at the registration into `store_dir`, each made by `attempt`.
+///
+/// A failed attempt is followed by [`ensure_nix_state`] again. A cage of the project running while
+/// the seed ran can replace a name the first check passed, and nix then fails on it inside the
+/// registration's cage, naming it as that cage sees it. The second check names it on the host and
+/// refuses the store, and its refusal is not retried. A failure the check does not explain keeps
+/// nix's reason.
+fn retry_load(store_dir: &Path, mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     // Retry a lost lock race. Several sandboxes of the same project can seed at once, and the
     // `--load-db` merge serialises on the project database's own lock (SQLite); under heavy
     // parallel load one attempt can exhaust nix's internal busy timeout and exit with the database
@@ -690,12 +732,22 @@ fn load_db(
     // merge is idempotent (re-loading the same closure re-registers already-present paths as a
     // no-op), so a bounded retry is harmless even for a non-lock error: a genuinely broken seed (a
     // malformed dump) simply exhausts the small attempt budget and then fails, its captured reason
-    // surfaced. The `--load-db` marker only distinguishes the load half from the dump half.
+    // surfaced. The `--load-db` marker only distinguishes the load half from the dump half, and the
+    // kind keeps a refusal out of the retries whatever its words.
     retry_transient(
         LOAD_DB_ATTEMPTS,
-        || load_db_once(engine, shared_store, nix_dir, closure),
-        |e| e.to_string().contains("--load-db"),
+        || attempt().map_err(|e| refused_since(store_dir, e)),
+        |e| e.kind() == io::ErrorKind::Other && e.to_string().contains("--load-db"),
     )
+}
+
+/// `failed`, or the refusal [`ensure_nix_state`] now makes of `store_dir`, when it makes one. Only a
+/// refusal replaces `failed`: an error the check meets on its way is not the registration's reason.
+fn refused_since(store_dir: &Path, failed: io::Error) -> io::Error {
+    match ensure_nix_state(store_dir) {
+        Err(refusal) if refusal.kind() == io::ErrorKind::InvalidData => refusal,
+        _ => failed,
+    }
 }
 
 /// How many times [`load_db`] attempts the registration merge before giving up. Small: a lost lock
@@ -958,10 +1010,10 @@ const NIX_STATE_FILES: &[&str] = &[
 /// store a live cage of the project holds. A launch does not, since two launches of one project
 /// may run at once, so a cage of the project that is running while another launch seeds can
 /// replace a checked name before `nix-store` opens it. The registration a launch runs answers that
-/// with its cage ([`load_cage`]), and this check is then what makes a name the cage planted a
-/// refusal that names it rather than a failure inside that cage; `sbx gc`'s own runs on the host
-/// are the ones it still guards, against links only: SQLite there still reads a database the cage
-/// wrote.
+/// with its cage ([`load_cage`]), and this check, made again when the registration fails
+/// ([`retry_load`]), is then what makes a name the cage planted a refusal that names it rather than
+/// a failure inside that cage; `sbx gc`'s own runs on the host are the ones it still guards, against
+/// links only: SQLite there still reads a database the cage wrote.
 fn ensure_nix_state(store_dir: &Path) -> io::Result<()> {
     for rel in NIX_STATE_DIRS {
         ensure_dir_chain(store_dir, rel)?;
@@ -1836,6 +1888,43 @@ mod tests {
         }
     }
 
+    /// An entry already at a name the seed creates is reported by the path the user finds it at,
+    /// for each kind of entry the copy makes: a directory, a link and a file. The kernel's answer,
+    /// `File exists`, names nothing, and the seed meets it in a tree a cage of the project writes.
+    #[test]
+    fn an_entry_already_at_a_name_the_seed_creates_is_named_by_its_path() {
+        let base = TmpDir::new();
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("file"), b"store content").unwrap();
+        symlink("file", src.join("link")).unwrap();
+        let witness = base.join("witness");
+        std::fs::write(&witness, b"the user's file").unwrap();
+        let tree = base.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        // The descriptor's path, as the kernel resolves it: the test's directory may sit behind a
+        // link.
+        let shown = std::fs::canonicalize(&tree).unwrap();
+
+        for kind in ["dir", "link", "file"] {
+            symlink(&witness, tree.join(kind)).unwrap();
+            let err = copy_recursive(&src.join(kind), &hold(&tree), OsStr::new(kind), false)
+                .expect_err(kind);
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{kind}: {err}");
+            let path = shown.join(kind);
+            assert!(
+                err.to_string().contains(&format!("`{}`", path.display())),
+                "{kind}: the error does not name `{}`: {err}",
+                path.display()
+            );
+            assert_eq!(
+                std::fs::read(&witness).unwrap(),
+                b"the user's file",
+                "{kind}: the file the link names was written"
+            );
+        }
+    }
+
     /// A store directory the cage swaps for a link after the walk checked it does not redirect the
     /// seed: what is placed lands in the directory the walk reached.
     ///
@@ -1943,6 +2032,44 @@ mod tests {
         );
         assert!(out.is_err());
         assert_eq!(calls.get(), 1, "a non-transient error must not be retried");
+    }
+
+    /// A name planted in the store's state while the registration ran fails it at once, by the path
+    /// the host knows it at, where nix in its cage names it as that cage sees it. On a store whose
+    /// state is its own, a failure keeps nix's reason and is retried.
+    #[test]
+    fn a_name_planted_while_the_registration_ran_is_refused_by_name_and_not_retried() {
+        use std::cell::Cell;
+        let nix_says = "nix-store --load-db failed (it sees the project's store at `/project`): \
+                        error: creating directory \"/project/nix/var/nix/db\": File exists";
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        ensure_nix_state(&store_dir).unwrap();
+        let calls = Cell::new(0);
+        let failing = || {
+            calls.set(calls.get() + 1);
+            Err(io::Error::other(nix_says))
+        };
+
+        let err = retry_load(&store_dir, failing).unwrap_err();
+        assert_eq!(calls.get(), LOAD_DB_ATTEMPTS, "a lost lock race is retried");
+        assert_eq!(err.to_string(), nix_says, "nix's reason is lost");
+
+        let db = store_dir.join("nix/var/nix/db");
+        std::fs::remove_dir(&db).unwrap();
+        symlink(base.join("elsewhere"), &db).unwrap();
+        calls.set(0);
+        let err = retry_load(&store_dir, failing).unwrap_err();
+        assert_eq!(calls.get(), 1, "a planted name was retried: {err}");
+        assert!(
+            err.to_string().contains(&format!("`{}`", db.display())),
+            "the refusal does not name `{}`: {err}",
+            db.display()
+        );
+        assert!(
+            db.symlink_metadata().unwrap().file_type().is_symlink(),
+            "the planted link is left for the user to see"
+        );
     }
 }
 

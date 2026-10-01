@@ -124,6 +124,18 @@ pub(crate) fn entry(dir: &OwnedFd, name: &OsStr) -> io::Result<PathBuf> {
     Ok(at)
 }
 
+/// The path a user finds the entry `name` of the directory `dir` holds at: the directory's own path,
+/// read from its descriptor's link, then `name`. For a message, never for an open: the cage may
+/// rename the names above the directory at any moment, and the path then leads elsewhere, which is
+/// what [`entry`] exists to avoid. When the link cannot be read, `name` alone stands in.
+pub(crate) fn shown(dir: &OwnedFd, name: &OsStr) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+        .unwrap_or_default()
+        .join(name)
+}
+
 /// The walk behind [`ensure_under`], [`hold_under`] and [`open_beneath`]: the leaf's path, and the
 /// descriptor the walk reached it with, each component opened with `access` (`O_PATH` or
 /// `O_RDONLY`). `make` is the mode a missing component is created with, the anchor included; with
