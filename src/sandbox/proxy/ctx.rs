@@ -468,14 +468,14 @@ impl ProxyCtx {
     ///   asked about this exact request and answered (or let it time out).
     ///
     /// What is reported is the refusal itself, not its words: the supervisor writes the
-    /// announcement ([`super::events`]), so a proxy that an attacker controls cannot put a sentence
-    /// or a command of its own on the operator's desktop. `proto` is reported for one reason: the
-    /// copy-paste fix. A notification is the channel that exists *because* the agent may never
-    /// surface the refusal body, so the command it offers has to be the one that body offers, which
-    /// means the same [`rule_destination`](super::rule_destination) spelling, scheme and port
-    /// included. Built from the bare host, it told the user to run `sbx net allow host` for a
-    /// refusal on `:8443` (an https rule on 443, which admits nothing they asked for) or for a
-    /// cleartext one (an https rule, which cannot open the clear at all).
+    /// announcement ([`super::events`]), so what a proxy that an attacker controls puts on the
+    /// operator's desktop is a host, and only one a request can name. `proto` is reported for one
+    /// reason: the copy-paste fix. A notification is the channel that exists *because* the agent
+    /// may never surface the refusal body, so the command it offers has to be the one that body
+    /// offers, which means the same [`rule_destination`](super::rule_destination) spelling, scheme
+    /// and port included. Built from the bare host, it told the user to run `sbx net allow host`
+    /// for a refusal on `:8443` (an https rule on 443, which admits nothing they asked for) or for
+    /// a cleartext one (an https rule, which cannot open the clear at all).
     fn announce_refusal(
         &self,
         proto: crate::sandbox::control::Proto,

