@@ -149,8 +149,9 @@ const SOPS_TAG_PREFIX: &str = "sops:";
 ///
 /// The safety gate bounds each file, not how many a config names, and a link, a `..` or a hard
 /// link gives one file as many spellings as a `.sbx.toml` has room for. Every one is read into
-/// host memory by every sbx invocation in the directory, before any verdict, and held again by the
-/// hash that folds them. Four times the gate's ceiling leaves room for several files at it, far
+/// host memory by every sbx command that loads the project's config in the directory (`sbx run`,
+/// `sbx config show`, `sbx trust`), before any verdict, and held again by the hash that folds
+/// them. Four times the gate's ceiling leaves room for several files at it, far
 /// more than a set of encrypted secrets weighs, and bounds that read to a few of them.
 const MAX_SOPS_BYTES: usize = 4 << 20;
 

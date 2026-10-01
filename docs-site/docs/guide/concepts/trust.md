@@ -192,7 +192,8 @@ already absent when you approved the project stays no source, and the chain goes
 A named sops file passes the same [safety gate](#the-safety-gate) as the config, size
 ceiling of 1 MiB included. Together, the sops files a config names in the project come
 to 4 MiB at most, a file counted once for each way the config spells it: every sbx
-command run in the directory reads them all, before any verdict. A file the gate
+command that loads the project's config (`sbx run`, `sbx config show`, `sbx trust`)
+reads them all, before any verdict. A file the gate
 refuses, or one that takes the total past 4 MiB, makes the project unverifiable: a
 project you approved reads changed, so a launch stops, and one you never approved reads
 untrusted. `sbx trust` refuses too: it reads the same files. The error names the file.
