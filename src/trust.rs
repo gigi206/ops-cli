@@ -144,6 +144,16 @@ pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
 /// entry of [`MISE_CONFIG_NAMES`] begins so, which keeps every tag of one hash distinct.
 const SOPS_TAG_PREFIX: &str = "sops:";
 
+/// The most the sops files a config names in the project may come to together, a file counted
+/// once for each way the config spells it, since each spelling is read on its own.
+///
+/// The safety gate bounds each file, not how many a config names, and a link, a `..` or a hard
+/// link gives one file as many spellings as a `.sbx.toml` has room for. Every one is read into
+/// host memory by every sbx invocation in the directory, before any verdict, and held again by the
+/// hash that folds them. Four times the gate's ceiling leaves room for several files at it, far
+/// more than a set of encrypted secrets weighs, and bounds that read to a few of them.
+const MAX_SOPS_BYTES: usize = 4 << 20;
+
 /// The directory a project's relative paths resolve against, resolved as far as it exists, so the
 /// same project yields the same sops parts whichever spelling of its config path was given.
 fn project_root_of(config_path: &Path) -> PathBuf {
@@ -278,17 +288,38 @@ fn sops_files_named(sbx_bytes: &[u8]) -> std::collections::BTreeSet<PathBuf> {
 /// gate the config uses, as `(tag, bytes)` for folding into the trust hash. A file outside the
 /// project is left out (the cage is not given it to write), as is one that does not exist: a file
 /// that appears later changes the hash a resolution recomputes, so it is refused, not admitted.
-/// `Err` when one is present but unsafe or unreadable, for the reason [`mise_inputs_for`] gives.
+/// `Err` when one is present but unsafe or unreadable, for the reason [`mise_inputs_for`] gives,
+/// and when together they come to more than [`MAX_SOPS_BYTES`], refused at the read that crosses
+/// it: the hash covers every file named or the project is not trusted, never the first few.
 pub(crate) fn sops_inputs_for(config_path: &Path, sbx_bytes: &[u8]) -> io::Result<TrustInputs> {
     let root = project_root_of(config_path);
     let mut out = Vec::new();
+    let mut total = 0;
     for file in sops_files_named(sbx_bytes) {
         let path = crate::sandbox::egress::sops_path(&file, &root);
         if !in_project(&root, &path) {
             continue;
         }
         match crate::config::safety::read_safe_bytes_as(&path, "sops file") {
-            Ok(bytes) => out.push((format!("{SOPS_TAG_PREFIX}{}", file.display()), bytes)),
+            Ok(bytes) => {
+                total += bytes.len();
+                if total > MAX_SOPS_BYTES {
+                    // Opens with a file, as the gate's refusals do, since `sbx trust` prefixes an
+                    // action alone (`cannot trust {e}`).
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "{}: refusing to load sops file: with it, the sops files {} names in \
+                             the project come to more than {MAX_SOPS_BYTES} bytes, a file counted \
+                             once for each way it is spelled; name fewer, or keep some outside \
+                             the project and name them by their absolute path",
+                            path.display(),
+                            crate::config::PROJECT_CONFIG
+                        ),
+                    ));
+                }
+                out.push((format!("{SOPS_TAG_PREFIX}{}", file.display()), bytes));
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             // `sbx trust` cannot clear this refusal, since it reads the same file; the way out is
             // the one the hash leaves open, a file outside the project.
@@ -1289,6 +1320,44 @@ mod tests {
             !text.contains("config"),
             "a sops file is not a config: {text}"
         );
+    }
+
+    /// The sops files a config names are bounded together, not only each on its own, and one file
+    /// spelled many ways counts once per spelling, since each is read: at the ceiling they are
+    /// all covered, one byte past it the project is refused, with the way out.
+    #[test]
+    fn the_sops_files_a_config_names_are_bounded_together() {
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        let size = 512 * 1024;
+        assert_eq!(MAX_SOPS_BYTES % size, 0);
+        let spellings = MAX_SOPS_BYTES / size;
+        std::fs::write(proj.join("secret.enc"), vec![b'x'; size]).unwrap();
+        std::fs::write(proj.join("tail.enc"), b"x").unwrap();
+        let mut refs = String::from("x = [\n");
+        for i in 0..spellings {
+            std::fs::create_dir(proj.join(&format!("d{i}"))).unwrap();
+            refs.push_str(&format!("  \"sops://d{i}/../secret.enc#k\",\n"));
+        }
+        let at_ceiling = format!("{refs}]\n");
+        let inputs = sops_inputs_for(&cfg, at_ceiling.as_bytes()).unwrap();
+        assert_eq!(inputs.len(), spellings);
+
+        let past_it = format!("{refs}  \"sops://tail.enc#k\",\n]\n");
+        let err = sops_inputs_for(&cfg, past_it.as_bytes()).unwrap_err();
+        let text = err.to_string();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{text}");
+        let ceiling = format!("more than {MAX_SOPS_BYTES} bytes");
+        for part in [
+            "tail.enc",
+            "sops file",
+            ceiling.as_str(),
+            "spelled",
+            "name fewer",
+            "absolute path",
+        ] {
+            assert!(text.contains(part), "missing `{part}`: {text}");
+        }
     }
 
     /// The bytes a resolution may hand `sops`: `None` outside the project, the approved bytes for a

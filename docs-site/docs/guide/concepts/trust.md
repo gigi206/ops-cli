@@ -190,11 +190,14 @@ removal as absence would let the cage choose which source answers. A named file 
 already absent when you approved the project stays no source, and the chain goes on.
 
 A named sops file passes the same [safety gate](#the-safety-gate) as the config, size
-ceiling of 1 MiB included. One it refuses makes the project unverifiable: a project
-you approved reads changed, so a launch stops, and one you never approved reads
-untrusted. `sbx trust` refuses too: it reads the same file. The
-error names the file. Fix it, or keep it outside the project and name it by its
-absolute path, which the trust does not hash.
+ceiling of 1 MiB included. Together, the sops files a config names in the project come
+to 4 MiB at most, a file counted once for each way the config spells it: every sbx
+command run in the directory reads them all, before any verdict. A file the gate
+refuses, or one that takes the total past 4 MiB, makes the project unverifiable: a
+project you approved reads changed, so a launch stops, and one you never approved reads
+untrusted. `sbx trust` refuses too: it reads the same files. The error names the file.
+Fix it or name fewer, or keep it outside the project and name it by its absolute path,
+which the trust does not hash.
 
 ## Why the whole file
 
