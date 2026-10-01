@@ -134,6 +134,11 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 /// Each of those was, at some point, a place a caged process could write a line of its own. Narrowing
 /// what this replaces, or moving it somewhere a caller stops finding it, reopens all of them at once
 /// and nothing will fail to say so — a forged line is well-formed by construction.
+///
+/// One more caller depends on the cut rather than on the cleaning: [`crate::notify::Block::key`]
+/// builds the notifier's repeat memory, kept for the whole session, from a refusal's subject and
+/// reason as this leaves them, so a cap that went away would let each of its keys grow back to
+/// whatever length a lens let through.
 pub(crate) fn sanitize(s: &str) -> String {
     const MAX: usize = SANITIZED_CHARS;
     let cleaned: String = s

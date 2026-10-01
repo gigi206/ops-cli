@@ -43,6 +43,13 @@ use crate::sandbox::redact::{Placeholder, redact_string};
 /// turn that into unbounded memory in the supervisor. What is lost when it fills is a *repeat* — the
 /// first of each distinct problem is long delivered by then — and the count is reported at teardown
 /// rather than silently swallowed.
+///
+/// The bound is in blocks, and a queued block is held as its lens made it, before the redaction
+/// that must precede any cut. Its weight is the lens's to bound: a proxy's refusal names a host of
+/// at most 64 KiB, twice when it carries the command that allows it, and a reason of as much; a
+/// task's is cut where it is made; an exec refusal's subject can be a loader's argument vector, at
+/// most 256 KiB. A full queue of the heaviest holds some 64 MiB while a desktop is slow. The
+/// repeat memory, which outlives the queue, keys on the cut fields ([`Block::key`]).
 const QUEUE_CAP: usize = 256;
 
 /// The application name every sbx notification carries, alone when there is no session to name.

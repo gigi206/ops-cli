@@ -237,7 +237,8 @@ impl NotifyPolicy {
 /// body may be journaled by the desktop daemon — so a block is redacted at the sink, before it leaves
 /// the process, exactly like every other outward-facing sink. It is sanitized there too, after the
 /// redaction: the daemon lays out what it is handed, and a subject can carry a line break or a
-/// right-to-left override.
+/// right-to-left override. Its key is cut the same way, without the redaction, which a key that
+/// never leaves the process does not need ([`Block::key`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Block {
     /// Which lens refused.
@@ -255,20 +256,29 @@ pub(crate) struct Block {
 }
 
 impl Block {
-    /// The identity a repeat is measured against: the event, the subject, and the reason. Two refusals
-    /// share a key exactly when they are the same problem with the same fix.
+    /// The identity a repeat is measured against: the event, and the subject and the reason cut and
+    /// cleaned by [`crate::sandbox::sanitize`], as a toast shows them. Two refusals share a key
+    /// when they are the same problem as far as a toast can tell.
     ///
-    /// The subject is length-prefixed rather than merely separator-joined. A subject is agent-chosen
-    /// text (a host it asked for, a path it ran) and no byte can be assumed absent from it, so a plain
-    /// join would let one triple produce another's key — and a forged collision does not just mislabel,
-    /// it makes `once` swallow the refusal it collided with.
+    /// Cut, because the key is what the repeat memory keeps for the session's life, up to
+    /// [`SEEN_MAX`] of them. A subject is agent-chosen text (a host it asked for, a path it ran,
+    /// the argument vector of a loader it ran), and a key holding it whole held it at whatever
+    /// length the lens let through, some hundreds of kibibytes each. Cut, a key costs a few
+    /// kibibytes at most. Two subjects alike in what a toast shows and different past it now share
+    /// a key, which gives an agent nothing: it can as readily cause the refusal it would collide
+    /// with.
+    ///
+    /// The subject is length-prefixed as well as separator-joined. The cleaning leaves no control
+    /// character, the separator included, but the key does not rest on that alone: a forged
+    /// collision does not just mislabel, it makes `once` swallow the refusal it collided with.
     pub(crate) fn key(&self) -> String {
+        let subject = crate::sandbox::sanitize(&self.subject);
         format!(
             "{}\u{1f}{}:{}\u{1f}{}",
             self.event.as_str(),
-            self.subject.len(),
-            self.subject,
-            self.reason
+            subject.len(),
+            subject,
+            crate::sandbox::sanitize(&self.reason)
         )
     }
 
@@ -888,5 +898,23 @@ mod tests {
         let a = block(NotifyEvent::Network, "a", "b\u{1f}c");
         let b = block(NotifyEvent::Network, "a\u{1f}b", "c");
         assert_ne!(a.key(), b.key(), "distinct triples must not share a key");
+    }
+
+    /// A key holds the subject and the reason as a toast shows them, not as long as the agent
+    /// made them: the repeat memory keeps up to [`SEEN_MAX`] keys for the session's life.
+    #[test]
+    fn a_key_holds_no_more_of_a_subject_than_a_toast_shows() {
+        let long = |tail: &str| format!("{}{tail}", "p".repeat(1024 * 1024));
+        let a = block(NotifyEvent::Proc, &long("/a"), &long(" a"));
+        let b = block(NotifyEvent::Proc, &long("/b"), &long(" b"));
+        // Each field is held to the cut's characters, of at most four bytes each.
+        let most = "proc".len() + 2 * 4 * crate::sandbox::SANITIZED_CHARS + 16;
+        assert!(a.key().len() <= most, "{} bytes", a.key().len());
+        // Alike in what a toast shows of them, they are one problem.
+        assert_eq!(a.key(), b.key());
+        // Different within what it shows, they are two.
+        let c = block(NotifyEvent::Proc, "/a", "deny");
+        let d = block(NotifyEvent::Proc, "/b", "deny");
+        assert_ne!(c.key(), d.key());
     }
 }

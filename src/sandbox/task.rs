@@ -390,13 +390,12 @@ impl std::fmt::Display for TaskError {
 /// The announcement one refused admission makes.
 ///
 /// Split out because of what `name` is: the tail of a `RUN <name>` request line, chosen by the
-/// cage and bounded by the crossing socket only at that plane's `MAX_PAYLOAD_BYTES` — a mebibyte.
-/// A `Block`'s subject is not merely rendered and dropped: the notifier's coalescer keys its
-/// repeat memory on it, one entry per distinct problem and up to `notify::SEEN_MAX` of them,
-/// held for the session. So a cage asking over and over for tasks that do not exist could pin
-/// roughly a gibibyte of supervisor memory in keys nothing evicts — the same shape the invocation
-/// log ring was fixed for, one sink further along. The sink's own guard cannot close it: that one
-/// shapes what is *shown*, and by then the key is already stored.
+/// cage and bounded by the crossing socket only at that plane's `MAX_PAYLOAD_BYTES`, a mebibyte.
+/// The notifier keys its repeat memory on a subject as a toast shows it
+/// ([`crate::notify::Block::key`]), but it queues a block as it was made, up to its queue's
+/// capacity while a desktop is slow. A name taken whole, in the subject and again in the detail,
+/// would hold two mebibytes per queued refusal: some half a gibibyte of supervisor memory for a
+/// cage asking over and over for tasks that do not exist.
 ///
 /// [`super::sanitize`] is the crate's single answer to a value the cage chose — control characters
 /// (a newline that would forge a second line) to spaces, and the length capped. `detail` takes it
