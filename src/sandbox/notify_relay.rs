@@ -44,16 +44,19 @@
 //!   quantity they are about is rendered length rather than bytes; they are far above any real
 //!   notification, so what they refuse is only the shape that was never one.
 //!
-//!   `hints` is deliberately **not** cut, and that is the residual to state rather than imply: a
-//!   hint value is cage-authored and crosses whole, bounded only by the private bus's own message
-//!   ceiling. A size rule there would be wrong rather than merely absent — `image-data` carries a
-//!   notification's icon as raw pixel data, so "large" is what a legitimate hint looks like, and a
-//!   cap would refuse the real case while an attacker moved the same bytes into the next hint name.
-//!   What *is* ruled on is which hints cross at all — those that name a host file for the daemon to
-//!   open ([`HOST_PATH_HINTS`]) and those that name the application the daemon renders the toast as
-//!   ([`HOST_IDENTITY_HINTS`]) — and, for one of the rest, which value ([`capped_urgency`]). The
-//!   trigger to revisit: a hint the cage can make the host daemon persist or execute, or one that
-//!   decides something the arguments above were held to, where the question stops being size.
+//!   `hints` is not cut hint by hint, and the reason holds: `image-data` carries a notification's
+//!   icon as raw pixel data, so "large" is what a legitimate hint looks like, and a cap on one hint
+//!   would refuse the real case while an attacker moved the same bytes into the next hint name.
+//!   What bounds them is a ceiling on the **whole call**, weighed before any of it is decoded
+//!   ([`CALL_MESSAGE_MAX`]): no hint name carries bytes past it, and a call over it is answered
+//!   with `LimitsExceeded` and forwarded nowhere. The legitimate case it refuses is stated rather
+//!   than implied: an `image-data` icon of 512 by 512 RGBA pixels no longer fits, where a 256 by
+//!   256 one takes a quarter of the ceiling. What *is* ruled on hint by hint is which hints cross
+//!   at all: those that name a host file for the daemon to open ([`HOST_PATH_HINTS`]) and those
+//!   that name the application the daemon renders the toast as ([`HOST_IDENTITY_HINTS`]), and, for
+//!   one of the rest, which value ([`capped_urgency`]). The trigger to revisit: a hint the cage can
+//!   make the host daemon persist or execute, or one that decides something the arguments above
+//!   were held to, where the question stops being size.
 //! - **Insistence.** Two fields ask the desktop to keep a toast on screen until a person clicks it
 //!   away: `urgency = critical` and `expire_timeout = 0`. Neither is something sbx sends for its
 //!   own announcements — [`super::notify_sink`] writes the reason, that a toast which must be
@@ -67,8 +70,26 @@
 //!   sbx's own refusal toasts included; and the host's `ActionInvoked`/`NotificationClosed` cross
 //!   back onto the private bus only for those same ids, so the rest of the desktop's notification
 //!   traffic is not a stream the cage can subscribe to.
+//! - **The host's machine id.** The calls the relay answers itself (`Peer`, `Introspectable`,
+//!   `Properties`) answer for the relay's own connection, which runs on the host:
+//!   `Peer.GetMachineId` is refused rather than answered, because the id it would read is the
+//!   host's, the one the cage's own `/etc/machine-id` is synthesized to withhold.
 //!
-//! Lifecycle: [`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
+//! **What a call costs the supervisor.** The relay decodes the cage's calls in the supervisor,
+//! outside the cage's memory limit, so what they take is the host's. Calls are read off a queue
+//! [`CALLS_QUEUED`] deep and served one at a time; while the queue is full zbus stops reading the
+//! private bus, and what the cage sends next waits in the in-cage daemon, under the cage's own
+//! limit. A call is weighed whole before it is decoded ([`CALL_MESSAGE_MAX`]), and one forwarded to
+//! the host waits at most [`HOST_CALL_DEADLINE`] for its answer. That leaves a bound rather than
+//! nothing. The call being served decodes to as much as 64 times its size when its hints carry
+//! byte arrays, one value per byte. The messages queued ahead of the weighing, and the one zbus
+//! holds while the queue is full, are each as large as the bus lets through:
+//! [`super::portal::BUS_MESSAGE_MAX`] from the in-cage daemon. That ceiling is set on the cage's
+//! side, though: a cage that puts a server of its own at the socket before the relay dials it is
+//! held only by zbus's ceiling of 128 MiB per message, and the bound becomes [`CALLS_QUEUED`] plus
+//! two such messages.
+//!
+//! Lifecycle:[`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
 //! `async_io::block_on` (the pure-Rust async-io backend — no tokio, and the runtime never leaves this
 //! module). The thread waits for the in-cage `dbus-daemon` to create the private-bus socket (the
 //! portal's command wrap starts it before the app runs), then attaches. The guard's `Drop` closes a
@@ -86,12 +107,46 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use zbus::zvariant::OwnedValue;
-use zbus::{connection, fdo, interface, proxy};
+use zbus::message::{Flags, Header, Type};
+use zbus::zvariant::{DynamicDeserialize, DynamicType, OwnedValue};
+use zbus::{MatchRule, Message, MessageStream, connection, fdo, proxy};
 
 /// The notifications service name and object path (identical on the host and the private bus).
 const IFACE: &str = "org.freedesktop.Notifications";
 const OBJECT: &str = "/org/freedesktop/Notifications";
+/// The standard interfaces every object answers on D-Bus, which the relay answers itself.
+const PEER: &str = "org.freedesktop.DBus.Peer";
+const INTROSPECTABLE: &str = "org.freedesktop.DBus.Introspectable";
+const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
+
+/// The largest call from the private bus the relay decodes, in bytes, counted on the whole message
+/// before any of it is decoded.
+///
+/// A call's arguments are the cage's to write, and they are decoded in the supervisor, outside the
+/// cage's memory limit. A byte array inside a hint decodes to one value per byte, as much as 64
+/// times its encoded size, so this ceiling is also what holds the call being served to tens of
+/// mebibytes. A call over it is answered with `LimitsExceeded` and forwarded nowhere; the module
+/// header states the one legitimate case that refuses.
+const CALL_MESSAGE_MAX: usize = 1 << 20;
+
+/// How many calls from the private bus may wait for the relay at once.
+///
+/// While the queue is full zbus stops reading the private bus, so what the cage sends next stays
+/// in the in-cage daemon, under the cage's own memory limit, rather than in the supervisor. Calls
+/// are served one at a time and an application raises a notification at human pace, so two is
+/// ample. zbus's own object server queues 64 calls and cannot be told otherwise, which is why the
+/// relay reads its calls itself.
+const CALLS_QUEUED: usize = 2;
+
+/// The longest a call forwarded to the host daemon may wait for its answer.
+///
+/// The relay serves the cage's calls one at a time, so a host daemon slow to answer would otherwise
+/// hold every call behind it. Wide enough that a live daemon always answers inside it. What the
+/// bound gives up is stated rather than implied: a `Notify` that times out may still reach the
+/// screen, since the daemon may only have been slow, and the id it then hands out never enters
+/// [`OwnedIds`], so the cage can neither replace nor close that notification, and its signals do
+/// not cross back.
+const HOST_CALL_DEADLINE: Duration = Duration::from_secs(5);
 /// How long to wait for the in-cage `dbus-daemon` to create the private-bus socket before giving up
 /// (best-effort: the portal's wrap starts the daemon before the app, so the socket appears within
 /// milliseconds; this bound only guards against a portal that failed to come up).
@@ -162,11 +217,11 @@ struct NotifyCall {
 /// forwarding *decisions* — which `replaces_id` reaches the daemon, which `CloseNotification` is
 /// dropped — and behind a bare proxy those would be reachable only from a live session bus, so they
 /// would go untested on every machine that runs the suite. The one production implementation is
-/// [`HostNotificationsProxy`]; the tests drive [`Served`]'s own methods, which is what the private
-/// bus dispatches to, against a recording double.
+/// [`HostNotificationsProxy`]; the tests drive [`Served`]'s own methods, which is what [`answer`]
+/// routes the private bus's calls to, against a recording double.
 ///
-/// Boxed futures rather than a trait `async fn`: an interface served on a connection needs futures
-/// that are `Send`, which an `async fn` in a trait cannot promise for an arbitrary implementor.
+/// Boxed futures rather than a trait `async fn`: [`Served`] holds its host as a `dyn HostBus`, and a
+/// trait with an `async fn` cannot be made into one.
 trait HostBus: Send + Sync {
     /// Forward a `Notify`, answering with the id the host daemon assigned to it.
     fn notify(&self, call: NotifyCall) -> BoxFuture<'_, zbus::Result<u32>>;
@@ -400,9 +455,9 @@ fn bounded(s: String, max: usize) -> String {
     }
 }
 
-/// The interface served on the **private** bus: every method is forwarded to the host proxy. A
-/// forwarding error becomes an `fdo` error reply so the caged app sees a clean failure rather than a
-/// dropped call.
+/// What the relay answers on the **private** bus: each notifications call [`answer`] routes here is
+/// forwarded to the host daemon. A forwarding error becomes an `fdo` error reply so the caged app
+/// sees a clean failure rather than a dropped call.
 struct Served {
     host: Box<dyn HostBus>,
     /// Shared with the signal pump in [`run`], which rules the host's close signals on it and drops
@@ -440,10 +495,7 @@ impl Served {
         )
         .0
     }
-}
 
-#[interface(name = "org.freedesktop.Notifications")]
-impl Served {
     #[allow(clippy::too_many_arguments)]
     async fn notify(
         &self,
@@ -524,6 +576,239 @@ impl Served {
     }
 }
 
+/// The arguments of `Notify`, in the order the specification gives them.
+type NotifyArgs = (
+    String,
+    u32,
+    String,
+    String,
+    String,
+    Vec<String>,
+    HashMap<String, OwnedValue>,
+    i32,
+);
+
+/// The line every introspection document opens with.
+const INTROSPECTION_DOCTYPE: &str = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object \
+     Introspection 1.0//EN\"\n \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n";
+
+/// What the relay answers to `Introspect` on [`OBJECT`]: the interfaces it answers there, and only
+/// what it answers. `Peer` lists `Ping` alone, since `GetMachineId` is refused.
+const OBJECT_INTROSPECTION: &str = r#"<node>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping">
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg name="interface_name" type="s" direction="in"/>
+      <arg name="property_name" type="s" direction="in"/>
+      <arg type="v" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg name="interface_name" type="s" direction="in"/>
+      <arg name="property_name" type="s" direction="in"/>
+      <arg name="value" type="v" direction="in"/>
+    </method>
+    <method name="GetAll">
+      <arg name="interface_name" type="s" direction="in"/>
+      <arg type="a{sv}" direction="out"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg name="interface_name" type="s"/>
+      <arg name="changed_properties" type="a{sv}"/>
+      <arg name="invalidated_properties" type="as"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.Notifications">
+    <method name="Notify">
+      <arg name="app_name" type="s" direction="in"/>
+      <arg name="replaces_id" type="u" direction="in"/>
+      <arg name="app_icon" type="s" direction="in"/>
+      <arg name="summary" type="s" direction="in"/>
+      <arg name="body" type="s" direction="in"/>
+      <arg name="actions" type="as" direction="in"/>
+      <arg name="hints" type="a{sv}" direction="in"/>
+      <arg name="expire_timeout" type="i" direction="in"/>
+      <arg type="u" direction="out"/>
+    </method>
+    <method name="CloseNotification">
+      <arg name="id" type="u" direction="in"/>
+    </method>
+    <method name="GetCapabilities">
+      <arg type="as" direction="out"/>
+    </method>
+    <method name="GetServerInformation">
+      <arg type="s" direction="out"/>
+      <arg type="s" direction="out"/>
+      <arg type="s" direction="out"/>
+      <arg type="s" direction="out"/>
+    </method>
+  </interface>
+</node>
+"#;
+
+/// The introspection document for `path`: the notifications object in full, and each of its parents
+/// as a node that leads to it, so a client walking the tree from `/` finds the object. `None` for
+/// any other path.
+fn introspection(path: &str) -> Option<String> {
+    if path == OBJECT {
+        return Some(format!("{INTROSPECTION_DOCTYPE}{OBJECT_INTROSPECTION}"));
+    }
+    let below = if path == "/" {
+        OBJECT
+    } else {
+        OBJECT.strip_prefix(path)?
+    };
+    let child = below.strip_prefix('/')?.split('/').next()?;
+    Some(format!(
+        "{INTROSPECTION_DOCTYPE}<node>\n  <node name=\"{child}\"/>\n</node>\n"
+    ))
+}
+
+/// Whether a call from the private bus is small enough to be decoded: `LimitsExceeded` when the
+/// whole message is over [`CALL_MESSAGE_MAX`].
+fn within_call_ceiling(call: &Message) -> fdo::Result<()> {
+    let size = call.data().len();
+    if size > CALL_MESSAGE_MAX {
+        return Err(fdo::Error::LimitsExceeded(format!(
+            "a call of {size} bytes is over the relay's ceiling of {CALL_MESSAGE_MAX}"
+        )));
+    }
+    Ok(())
+}
+
+/// The arguments of `call`, or the `InvalidArgs` its caller is answered with.
+fn arguments<T>(call: &Message) -> fdo::Result<T>
+where
+    T: for<'b> DynamicDeserialize<'b>,
+{
+    call.body()
+        .deserialize()
+        .map_err(|e| fdo::Error::InvalidArgs(e.to_string()))
+}
+
+/// Send `outcome` back to the caller of `call`, unless the caller asked for no reply.
+async fn respond<B>(
+    conn: &zbus::Connection,
+    call: &Header<'_>,
+    outcome: fdo::Result<B>,
+) -> zbus::Result<()>
+where
+    B: serde::Serialize + DynamicType,
+{
+    if call.primary().flags().contains(Flags::NoReplyExpected) {
+        return Ok(());
+    }
+    match outcome {
+        Ok(body) => conn.reply(call, &body).await,
+        Err(e) => conn.reply_dbus_error(call, e).await,
+    }
+}
+
+/// Answer one call from the private bus.
+///
+/// The order is the bound: the call is weighed whole before any of it is decoded, so one over
+/// [`CALL_MESSAGE_MAX`] costs the supervisor nothing past what the bus already handed it. The
+/// notifications methods are forwarded through [`Served`]. The standard interfaces are answered
+/// here, for the relay's own connection, which is why `Peer.GetMachineId` is refused (see the
+/// module header). Anything else gets the error a D-Bus object answers it with.
+async fn answer(conn: &zbus::Connection, served: &Served, call: &Message) -> zbus::Result<()> {
+    let hdr = call.header();
+    if let Err(e) = within_call_ceiling(call) {
+        return respond(conn, &hdr, Err::<(), _>(e)).await;
+    }
+    let path = hdr.path().map_or("", |p| p.as_str());
+    let interface = hdr.interface().map(|i| i.as_str());
+    let member = hdr.member().map_or("", |m| m.as_str());
+    let unknown_method = || fdo::Error::UnknownMethod(format!("Unknown method '{member}'"));
+    let unknown_object = || fdo::Error::UnknownObject(format!("Unknown object '{path}'"));
+    match interface {
+        // `Peer` speaks for the connection rather than for an object, so it answers at any path.
+        Some(PEER) if member == "Ping" => respond(conn, &hdr, Ok(())).await,
+        Some(INTROSPECTABLE) if member == "Introspect" => {
+            respond(conn, &hdr, introspection(path).ok_or_else(unknown_object)).await
+        }
+        Some(PEER) => respond(conn, &hdr, Err::<(), _>(unknown_method())).await,
+        _ if path != OBJECT => respond(conn, &hdr, Err::<(), _>(unknown_object())).await,
+        Some(IFACE) => match member {
+            "Notify" => {
+                let outcome = async {
+                    let (app_name, replaces_id, app_icon, summary, body, actions, hints, expire) =
+                        arguments::<NotifyArgs>(call)?;
+                    served
+                        .notify(
+                            app_name,
+                            replaces_id,
+                            app_icon,
+                            summary,
+                            body,
+                            actions,
+                            hints,
+                            expire,
+                        )
+                        .await
+                };
+                respond(conn, &hdr, outcome.await).await
+            }
+            "CloseNotification" => {
+                let outcome = async { served.close_notification(arguments(call)?).await };
+                respond(conn, &hdr, outcome.await).await
+            }
+            "GetCapabilities" => respond(conn, &hdr, served.get_capabilities().await).await,
+            "GetServerInformation" => {
+                respond(conn, &hdr, served.get_server_information().await).await
+            }
+            _ => respond(conn, &hdr, Err::<(), _>(unknown_method())).await,
+        },
+        // The notifications object has no properties, which is what a client that loads them as it
+        // connects is told.
+        Some(PROPERTIES) => match member {
+            "GetAll" => {
+                let outcome = arguments::<String>(call).and_then(|asked| {
+                    if asked == IFACE {
+                        Ok(HashMap::<String, OwnedValue>::new())
+                    } else {
+                        Err(fdo::Error::UnknownInterface(format!(
+                            "Unknown interface '{asked}'"
+                        )))
+                    }
+                });
+                respond(conn, &hdr, outcome).await
+            }
+            "Get" | "Set" => {
+                let none = fdo::Error::UnknownProperty("this object has no properties".to_string());
+                respond(conn, &hdr, Err::<(), _>(none)).await
+            }
+            _ => respond(conn, &hdr, Err::<(), _>(unknown_method())).await,
+        },
+        Some(INTROSPECTABLE) | None => respond(conn, &hdr, Err::<(), _>(unknown_method())).await,
+        Some(other) => {
+            let unknown = fdo::Error::UnknownInterface(format!("Unknown interface '{other}'"));
+            respond(conn, &hdr, Err::<(), _>(unknown)).await
+        }
+    }
+}
+
+/// Serve the calls the private bus routes to the relay, one at a time and in order, until the bus
+/// goes or a reply cannot be written.
+///
+/// One at a time is the point: a call is taken off the queue only once the one before it has been
+/// answered, so what the cage has sent and the relay has not answered yet stays in the in-cage
+/// daemon rather than in the supervisor (see [`CALLS_QUEUED`]).
+async fn serve_calls(conn: &zbus::Connection, served: &Served, mut calls: MessageStream) {
+    while let Some(Ok(call)) = calls.next().await {
+        if answer(conn, served, &call).await.is_err() {
+            break;
+        }
+    }
+}
+
 /// A running notifications relay: the shutdown channel signalling its thread to stop, and the thread
 /// handle. Dropping it closes the channel (breaking the relay's loop) and joins the thread, so the
 /// relay disconnects before the portal's host directory is removed.
@@ -541,11 +826,21 @@ impl NotifyRelay {
         private_socket: PathBuf,
         needles: crate::sandbox::notify_sink::Needles,
     ) -> NotifyRelay {
+        NotifyRelay::start_on(private_socket, None, needles)
+    }
+
+    /// [`NotifyRelay::start`] towards the host daemon on the bus at `host_bus`, the session bus the
+    /// supervisor was given when `None`, so a test can stand a daemon of its own in for the user's.
+    fn start_on(
+        private_socket: PathBuf,
+        host_bus: Option<String>,
+        needles: crate::sandbox::notify_sink::Needles,
+    ) -> NotifyRelay {
         let (shutdown, rx) = async_channel::bounded::<()>(1);
         let handle = std::thread::Builder::new()
             .name("sbx-notify-relay".to_string())
             .spawn(move || {
-                if let Err(e) = async_io::block_on(run(private_socket, rx, needles)) {
+                if let Err(e) = async_io::block_on(run(private_socket, host_bus, rx, needles)) {
                     // A connection error to the private bus is almost always the cage tearing down
                     // (the in-cage dbus-daemon went away) — a benign teardown race on a short-lived
                     // launch, not worth alarming the user. Only a genuinely unexpected failure (e.g.
@@ -573,11 +868,13 @@ impl Drop for NotifyRelay {
         // `run` returns and the thread exits; then join it, so the relay has disconnected from the
         // private bus before the portal's host directory (holding the socket) is removed.
         //
-        // The loop's one blocking write is bounded, which is what can hold this join: a relayed
-        // signal is
-        // emitted onto the private bus with an `await` inside a branch, outside the select, so a
-        // cage that has stopped reading its end and filled the socket buffer would park the task
-        // there. The bound is on the emit rather than on this join (`EMIT_DEADLINE`), because
+        // Two kinds of write go to the private bus, and one of them can hold this join. A reply to
+        // a call is written inside the call loop, which is a future the shutdown branch races, so a
+        // reply parked on a cage that has stopped reading is dropped with the loop, and so is a
+        // call still waiting on the host daemon. A relayed signal is emitted with an `await` inside
+        // a branch, outside the select, so a cage that has stopped reading its end and filled the
+        // socket buffer would park the task there; that write is bounded instead. The bound is on
+        // the emit rather than on this join (`EMIT_DEADLINE`), because
         // detaching instead would leave the connection live while the directory holding its socket
         // is removed — the ordering this join exists to guarantee. An emit that times out ends the
         // loop rather than continuing it: an abandoned write may have left a partial message, and
@@ -641,10 +938,13 @@ async fn completes_within(
 }
 
 /// The relay body: wait for the private-bus socket, connect both buses, own the notifications name on
-/// the private bus, and pump the host's signals back onto it until shutdown — or until the cage
-/// stops reading its end, which [`emit_bounded`] turns into the same clean return.
+/// the private bus, serve its calls and pump the host's signals back onto it until shutdown, or
+/// until the private bus goes or the cage stops reading its end, which [`emit_bounded`] turns into
+/// the same clean return. `host_bus` is the address of the bus the host daemon is on, `None` for
+/// the session bus the supervisor was given.
 async fn run(
     private_socket: PathBuf,
+    host_bus: Option<String>,
     shutdown: async_channel::Receiver<()>,
     needles: crate::sandbox::notify_sink::Needles,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -664,29 +964,52 @@ async fn run(
     // the host (see `forward::dial_cage_socket`, which the forward's own sockets are dialed through).
     let private_stream = super::forward::dial_cage_socket(&private_socket)?;
 
-    // Host session bus (ambient $DBUS_SESSION_BUS_ADDRESS) and a proxy onto its notifications daemon.
-    let host_conn = zbus::Connection::session().await?;
+    // The host bus (the ambient $DBUS_SESSION_BUS_ADDRESS unless told otherwise) and a proxy onto
+    // its notifications daemon, every call to which gives up after `HOST_CALL_DEADLINE`.
+    let host_conn = match host_bus.as_deref() {
+        Some(address) => connection::Builder::address(address)?,
+        None => connection::Builder::session()?,
+    }
+    .method_timeout(HOST_CALL_DEADLINE)
+    .build()
+    .await?;
     let host = HostNotificationsProxy::new(&host_conn).await?;
 
-    // Private bus: own the notifications name and serve the forwarding interface. zbus dispatches the
-    // served interface's method calls on its own internal executor, so this future only pumps signals.
+    // Private bus. Its calls are read off a stream of the relay's own, `CALLS_QUEUED` deep, rather
+    // than served by zbus's object server, whose queue is 64 calls deep and which decodes a call
+    // before any method sees it. The stream listens with the rule that server uses, and is in place
+    // before the name is requested, so no call addressed to the name arrives with nothing to take it.
+    let private_conn = connection::Builder::async_io_unix_stream(private_stream)
+        .build()
+        .await?;
+    let unique = private_conn
+        .unique_name()
+        .ok_or("the private bus assigned the relay no unique name")?;
+    let to_relay = MatchRule::builder()
+        .msg_type(Type::MethodCall)
+        .destination(unique.as_str())?
+        .build();
+    let calls = MessageStream::for_match_rule(to_relay, &private_conn, Some(CALLS_QUEUED)).await?;
+    private_conn.request_name(IFACE).await?;
     let ours = Arc::new(OwnedIds::default());
     let served = Served {
         host: Box::new(host.clone()),
         ours: Arc::clone(&ours),
         needles,
     };
-    let private_conn = connection::Builder::async_io_unix_stream(private_stream)
-        .name(IFACE)?
-        .serve_at(OBJECT, served)?
-        .build()
-        .await?;
+    // A future of its own, polled beside the signal pump and raced with the shutdown, never awaited
+    // inside a branch: a call waiting on the host daemon holds neither the host's signals nor the
+    // teardown.
+    let serving = serve_calls(&private_conn, &served, calls).fuse();
+    futures_util::pin_mut!(serving);
 
     let mut actions = host.receive_action_invoked().await?;
     let mut closed = host.receive_notification_closed().await?;
     loop {
         futures_util::select! {
             _ = shutdown.recv().fuse() => break,
+            // The call loop ends once the private bus has gone, or a reply could not be written to it.
+            () = serving => break,
             sig = actions.next().fuse() => match sig {
                 Some(sig) => if let Ok(a) = sig.args() {
                     // Verbatim id → the app matches the signal to its own notification.
@@ -750,7 +1073,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = async_io::block_on(run(bus, shutdown, Default::default()));
+            let outcome = async_io::block_on(run(bus, None, shutdown, Default::default()));
             let _ = tx.send(outcome.map_err(|e| e.to_string()));
         });
         let err = rx
@@ -1321,5 +1644,321 @@ mod tests {
                 "and so is a theme name"
             );
         }
+    }
+
+    /// The arguments of a `Notify` as a caged app sends one, with one byte-array hint of
+    /// `hint_bytes` bytes, the shape an `image-data` icon has.
+    type NotifyCallArgs = (
+        &'static str,
+        u32,
+        &'static str,
+        &'static str,
+        &'static str,
+        Vec<&'static str>,
+        HashMap<&'static str, zbus::zvariant::Value<'static>>,
+        i32,
+    );
+
+    fn notify_args(hint_bytes: usize) -> NotifyCallArgs {
+        let mut hints = HashMap::new();
+        hints.insert("x-blob", zbus::zvariant::Value::from(vec![0u8; hint_bytes]));
+        ("caged-app", 0, "", "summary", "body", Vec::new(), hints, -1)
+    }
+
+    /// A `Notify` from `app`, answered.
+    async fn call_notify(app: &zbus::Connection, hint_bytes: usize) -> zbus::Result<Message> {
+        let args = notify_args(hint_bytes);
+        app.call_method(Some(IFACE), OBJECT, Some(IFACE), "Notify", &args)
+            .await
+    }
+
+    fn notify_message(hint_bytes: usize) -> Message {
+        Message::method_call(OBJECT, "Notify")
+            .and_then(|m| m.destination(IFACE))
+            .and_then(|m| m.interface(IFACE))
+            .and_then(|m| m.build(&notify_args(hint_bytes)))
+            .expect("a well-formed call")
+    }
+
+    /// A call is weighed whole: one whose single hint already carries the ceiling is refused, and
+    /// one well inside it is not. The weighing happens on the bytes the bus delivered, so no hint
+    /// name and no number of hints moves a call under it.
+    #[test]
+    fn a_call_is_weighed_whole_before_any_of_it_is_decoded() {
+        assert!(matches!(
+            within_call_ceiling(&notify_message(CALL_MESSAGE_MAX)),
+            Err(fdo::Error::LimitsExceeded(_))
+        ));
+        assert!(within_call_ceiling(&notify_message(CALL_MESSAGE_MAX - 4096)).is_ok());
+    }
+
+    /// The tree a client walks from `/` leads to the notifications object, the object advertises
+    /// what it answers and not the method it refuses, and no other path is answered.
+    #[test]
+    fn introspection_leads_from_the_root_to_the_object_and_nowhere_else() {
+        for (path, child) in [
+            ("/", "org"),
+            ("/org", "freedesktop"),
+            ("/org/freedesktop", "Notifications"),
+        ] {
+            let doc = introspection(path).expect("a parent of the object");
+            assert!(
+                doc.contains(&format!("<node name=\"{child}\"/>")),
+                "{path}: {doc}"
+            );
+        }
+        let object = introspection(OBJECT).expect("the object itself");
+        assert!(object.contains("<method name=\"Notify\">"), "{object}");
+        assert!(
+            !object.contains("GetMachineId"),
+            "a refused method is not advertised: {object}"
+        );
+        for path in ["/or", "/nowhere", "/org/freedesktop/Notifications/x"] {
+            assert_eq!(introspection(path), None, "{path}");
+        }
+    }
+
+    /// A `dbus-daemon` of the test's own, killed when the test ends however it ends.
+    struct TestBus(std::process::Child);
+
+    impl Drop for TestBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A session bus standing in for the host's, and the address it answers at; `None` when this
+    /// machine has no `dbus-daemon`.
+    fn host_bus() -> Option<(TestBus, String)> {
+        use std::io::BufRead as _;
+        let mut child = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--print-address", "--nofork"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        let out = child.stdout.take().expect("piped stdout");
+        let bus = TestBus(child);
+        let mut address = String::new();
+        std::io::BufReader::new(out)
+            .read_line(&mut address)
+            .expect("the bus prints its address");
+        Some((bus, address.trim().to_string()))
+    }
+
+    /// The cage's private bus, configured by the document the portal writes, listening at `sock`.
+    /// Started from that document rather than from one of the test's own, so a configuration the
+    /// daemon refuses fails here before it fails a launch.
+    fn private_bus(dir: &std::path::Path, sock: &std::path::Path) -> TestBus {
+        let conf = dir.join("session.conf");
+        let sock = sock.to_str().expect("a UTF-8 test path");
+        std::fs::write(&conf, super::super::portal::session_conf(sock, dir, dir))
+            .expect("the configuration is written");
+        TestBus(
+            std::process::Command::new("dbus-daemon")
+                .arg(format!("--config-file={}", conf.display()))
+                .arg("--nofork")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("dbus-daemon ran a moment ago"),
+        )
+    }
+
+    /// A host notifications daemon on the bus at `address` that counts every `Notify` as it
+    /// arrives, and answers it with an id or, `stalled`, never at all.
+    struct FakeDaemon {
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+        stalled: bool,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Notifications")]
+    impl FakeDaemon {
+        #[allow(clippy::too_many_arguments)]
+        async fn notify(
+            &self,
+            _app_name: String,
+            _replaces_id: u32,
+            _app_icon: String,
+            _summary: String,
+            _body: String,
+            _actions: Vec<String>,
+            _hints: HashMap<String, OwnedValue>,
+            _expire_timeout: i32,
+        ) -> u32 {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.stalled {
+                std::future::pending::<()>().await;
+            }
+            FIRST_ID
+        }
+    }
+
+    fn fake_daemon(
+        address: &str,
+        seen: &Arc<std::sync::atomic::AtomicUsize>,
+        stalled: bool,
+    ) -> zbus::Connection {
+        let daemon = FakeDaemon {
+            seen: Arc::clone(seen),
+            stalled,
+        };
+        async_io::block_on(
+            connection::Builder::address(address)
+                .and_then(|b| b.name(IFACE))
+                .and_then(|b| b.serve_at(OBJECT, daemon))
+                .expect("a well-formed daemon")
+                .build(),
+        )
+        .expect("the fake daemon owns the name")
+    }
+
+    /// A caged app's connection to the private bus at `sock`, once the relay owns the
+    /// notifications name there.
+    async fn cage_app(sock: &std::path::Path) -> zbus::Connection {
+        let started = Instant::now();
+        while !sock.exists() {
+            assert!(
+                started.elapsed() < SOCKET_WAIT,
+                "the private bus never came up"
+            );
+            async_io::Timer::after(POLL_INTERVAL).await;
+        }
+        let app = connection::Builder::address(format!("unix:path={}", sock.display()).as_str())
+            .expect("a well-formed address")
+            .build()
+            .await
+            .expect("the private bus accepts the app");
+        let bus = fdo::DBusProxy::new(&app).await.expect("the bus answers");
+        let name = zbus::names::BusName::try_from(IFACE).expect("a bus name");
+        while !bus.name_has_owner(name.clone()).await.unwrap_or(false) {
+            assert!(
+                started.elapsed() < SOCKET_WAIT,
+                "the relay never took the notifications name"
+            );
+            async_io::Timer::after(POLL_INTERVAL).await;
+        }
+        app
+    }
+
+    /// The relay serves a cage's calls one at a time, and its teardown does not wait on the one in
+    /// flight.
+    ///
+    /// zbus's own object server took every call the cage sent, up to 64 queued and as many in
+    /// flight as the cage cared to send, each decoded and held in the supervisor while the host
+    /// daemon took its time; a cage could hold gigabytes of the host's memory that way. Here the
+    /// host daemon never answers, so what the relay does with the calls behind the first is the
+    /// whole of what is measured: it must not forward a second one while the first waits. Driven
+    /// end to end, through the relay's own startup and the private bus's real configuration.
+    ///
+    /// The same run checks that the relay does not hand the cage the host's machine id, which the
+    /// object server's `Peer` interface read from the host's `/etc/machine-id` and answered with.
+    #[test]
+    fn the_relay_serves_one_call_at_a_time_and_its_teardown_does_not_wait_on_it() {
+        let Some((_host_bus, host_address)) = host_bus() else {
+            skip_incapable!("skipping: no dbus-daemon on PATH");
+            return;
+        };
+        let dir = crate::testutil::TmpDir::new();
+        let sock = dir.join("bus");
+        let _private_bus = private_bus(dir.path(), &sock);
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _daemon = fake_daemon(&host_address, &seen, true);
+        let relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
+
+        async_io::block_on(async {
+            let app = cage_app(&sock).await;
+            let asked = app
+                .call_method(Some(IFACE), OBJECT, Some(PEER), "GetMachineId", &())
+                .await
+                .expect_err("the relay must not answer with the machine id of the host it runs on");
+            assert!(
+                asked
+                    .to_string()
+                    .starts_with("org.freedesktop.DBus.Error.UnknownMethod"),
+                "{asked}"
+            );
+
+            for _ in 0..8 {
+                app.send(&notify_message(64))
+                    .await
+                    .expect("the call is sent");
+            }
+            let started = Instant::now();
+            while seen.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    started.elapsed() < SOCKET_WAIT,
+                    "no call ever reached the host daemon"
+                );
+                async_io::Timer::after(POLL_INTERVAL).await;
+            }
+            async_io::Timer::after(Duration::from_millis(500)).await;
+        });
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a call waiting on the host daemon must hold the ones behind it in the queue, not in \
+             flight beside it"
+        );
+
+        // Dropped on a thread of its own and waited for under a bound, so a teardown that waits on
+        // the call fails the test rather than hanging it.
+        let (torn_down, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(relay);
+            let _ = torn_down.send(());
+        });
+        done.recv_timeout(HOST_CALL_DEADLINE / 2)
+            .expect("the teardown waited on a call the host daemon never answered");
+    }
+
+    /// A call over the relay's ceiling is answered `LimitsExceeded` and forwarded nowhere, while an
+    /// ordinary one beside it is answered with the host's id. One past the private bus's own
+    /// ceiling never reaches the relay at all: the in-cage daemon drops the app that sent it.
+    #[test]
+    fn a_call_over_the_ceiling_is_refused_whole_and_forwarded_nowhere() {
+        let Some((_host_bus, host_address)) = host_bus() else {
+            skip_incapable!("skipping: no dbus-daemon on PATH");
+            return;
+        };
+        let dir = crate::testutil::TmpDir::new();
+        let sock = dir.join("bus");
+        let _private_bus = private_bus(dir.path(), &sock);
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _daemon = fake_daemon(&host_address, &seen, false);
+        let _relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
+
+        async_io::block_on(async {
+            let app = cage_app(&sock).await;
+
+            let id: u32 = call_notify(&app, 64)
+                .await
+                .expect("an ordinary call is forwarded")
+                .body()
+                .deserialize()
+                .expect("an id");
+            assert_eq!(id, FIRST_ID);
+
+            let refused = call_notify(&app, CALL_MESSAGE_MAX)
+                .await
+                .expect_err("a call over the ceiling must be refused");
+            assert!(
+                refused
+                    .to_string()
+                    .starts_with("org.freedesktop.DBus.Error.LimitsExceeded"),
+                "{refused}"
+            );
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            let dropped = call_notify(&app, super::super::portal::BUS_MESSAGE_MAX)
+                .await
+                .expect_err("a message over the bus's own ceiling must not be delivered");
+            // Dropped by the daemon, which closes the app's connection, rather than refused by the
+            // relay with a reply: the relay never saw it.
+            assert!(
+                matches!(dropped, zbus::Error::InputOutput(_)),
+                "{dropped:?}"
+            );
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
     }
 }

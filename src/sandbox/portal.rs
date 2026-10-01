@@ -225,11 +225,22 @@ pub(crate) fn env(gtk_root: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// The largest message the private bus carries, in bytes; the in-cage `dbus-daemon` disconnects a
+/// peer that sends a larger one.
+///
+/// Defense in depth for the notifications relay ([`super::notify_relay`]), which reads this bus from
+/// the supervisor and weighs each call whole before decoding it: this ceiling is what keeps the
+/// calls queued ahead of that check small. It is not the relay's own ceiling, because the portal's
+/// traffic crosses this bus too, and it cannot be the relay's only one either: the configuration
+/// is written inside the cage, which can start a server of its own in place of this daemon.
+pub(super) const BUS_MESSAGE_MAX: usize = 4 << 20;
+
 /// The private session-bus configuration: listen on the cage-tmpfs socket, activate the portal
-/// services from the two portal packages' `share/dbus-1/services`, and default-allow (every peer on
-/// this bus is the same uid inside the same cage — one trust domain). Every interpolated value is an
-/// sbx-controlled store path or a fixed literal, so the document carries nothing to escape. Pure.
-fn session_conf(sock: &str, xdp_root: &Path, gtk_root: &Path) -> String {
+/// services from the two portal packages' `share/dbus-1/services`, default-allow (every peer on
+/// this bus is the same uid inside the same cage — one trust domain), and refuse a message over
+/// [`BUS_MESSAGE_MAX`]. Every interpolated value is an sbx-controlled store path, a constant or a
+/// fixed literal, so the document carries nothing to escape. Pure.
+pub(super) fn session_conf(sock: &str, xdp_root: &Path, gtk_root: &Path) -> String {
     format!(
         "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \
          \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
@@ -243,6 +254,7 @@ fn session_conf(sock: &str, xdp_root: &Path, gtk_root: &Path) -> String {
          \x20   <allow send_destination=\"*\"/>\n\
          \x20   <allow receive_sender=\"*\"/>\n\
          \x20 </policy>\n\
+         \x20 <limit name=\"max_message_size\">{BUS_MESSAGE_MAX}</limit>\n\
          </busconfig>\n",
         xdp = xdp_root.display(),
         gtk = gtk_root.display(),
@@ -441,6 +453,8 @@ mod tests {
         // a session bus (not the system bus) with an internal default-allow policy
         assert!(conf.contains("<type>session</type>"));
         assert!(conf.contains("<allow own=\"*\"/>"));
+        // a message ceiling, so the calls queued for the notifications relay stay small
+        assert!(conf.contains("<limit name=\"max_message_size\">4194304</limit>"));
         // well-formed enough to be a single busconfig document
         assert!(conf.trim_start().starts_with("<!DOCTYPE busconfig"));
         assert!(conf.trim_end().ends_with("</busconfig>"));
