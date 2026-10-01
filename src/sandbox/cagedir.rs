@@ -1,16 +1,21 @@
 //! Making a directory inside a tree the **cage** can write, with symlinks refused.
 //!
 //! Several host-side steps place files under a directory that is bind-mounted read-write into the
-//! sandbox: the per-project nix store's skeleton, the mise plugin registration, the live-theme
-//! keyfile. The cage runs same-uid and those directories are `0700` owned by that uid, so
-//! everything *below* the bind's mount point is an entry untrusted in-cage code may replace with a
-//! symlink and leave behind for the next launch to walk into.
+//! sandbox: the per-project nix store's skeleton, the mise plugin registration, the parents of the
+//! files sbx pins into the cage's home. The cage runs same-uid and those directories are `0700`
+//! owned by that uid, so everything *below* the bind's mount point is an entry untrusted in-cage
+//! code may replace with a symlink and leave behind for the next launch to walk into.
 //!
 //! `create_dir_all` cannot see that: it stats through a link, finds a directory, and reports the
 //! parents as made. What follows then lands wherever the cage pointed — a seed copying the base
 //! closure, a `remove_dir_all` clearing a slot, a keyfile write. Each of those was found as its own
-//! defect before this module existed, which is why the rule lives in one place now rather than in
-//! each of them.
+//! defect before this module existed.
+//!
+//! The rule is not only here. This walk creates what is missing and hands back a path, and two
+//! others need something else, so each keeps its own copy: the live-theme keyfile write
+//! ([`super::theme_relay`]) keeps the descriptor it reached, to create its file and rename it
+//! there, and `open_beneath` ([`super::gc`](mod@super::gc)) creates nothing and hands its
+//! descriptor to a removal. A change to the rule is a change to all three.
 //!
 //! What is **not** here is the mount point itself. A bind's target is the one component the cage
 //! cannot exchange (from inside, it *is* the mount), so it is the anchor every walk starts from and
