@@ -4072,7 +4072,7 @@ mod tests {
     #[test]
     fn a_directory_swapped_for_a_link_mid_removal_does_not_carry_it_out_of_the_tree() {
         use std::os::unix::ffi::OsStrExt;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         const FILES: usize = 256;
         const TRIALS: usize = 20;
@@ -4086,6 +4086,7 @@ mod tests {
         let sub = std::ffi::CString::new(root.join("sub").as_os_str().as_bytes()).unwrap();
         let alt = std::ffi::CString::new(root.join("alt").as_os_str().as_bytes()).unwrap();
 
+        let exchanged = AtomicUsize::new(0);
         for trial in 0..TRIALS {
             std::fs::create_dir_all(root.join("sub")).unwrap();
             for i in 0..FILES {
@@ -4101,7 +4102,7 @@ mod tests {
                         // `AT_FDCWD`-relative paths and the `RENAME_EXCHANGE` flag; both `CString`s
                         // outlive the call and the kernel only reads them. A failure (one of the
                         // names already removed) is the race running its course.
-                        unsafe {
+                        let rc = unsafe {
                             libc::syscall(
                                 libc::SYS_renameat2,
                                 libc::AT_FDCWD,
@@ -4109,7 +4110,10 @@ mod tests {
                                 libc::AT_FDCWD,
                                 alt.as_ptr(),
                                 libc::RENAME_EXCHANGE,
-                            );
+                            )
+                        };
+                        if rc == 0 {
+                            exchanged.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 });
@@ -4127,6 +4131,12 @@ mod tests {
             // The swapper has stopped, so what is left of the tree has no other writer.
             let _ = std::fs::remove_dir_all(&root);
         }
+        // A filesystem that refuses `RENAME_EXCHANGE` (`EINVAL`) would leave the tree unswapped,
+        // and the canary intact for want of a race rather than because the removal held.
+        assert!(
+            exchanged.load(Ordering::Relaxed) > 0,
+            "no exchange succeeded: the fixture's filesystem may not support RENAME_EXCHANGE"
+        );
     }
 
     /// A directory whose mode refuses even its owner's reads is emptied all the same. The cage can
