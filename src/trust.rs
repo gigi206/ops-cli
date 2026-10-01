@@ -598,7 +598,24 @@ fn store_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> 
 /// Best effort by construction: a path with no existing ancestor at all — or one whose components
 /// cannot be walked, such as a trailing `..` — is returned unchanged, which is the same answer
 /// `canonicalize` refused to give.
+///
+/// The longest existing prefix is searched for, not reached by taking one component off per failed
+/// `canonicalize`: each call walks the whole prefix again, a link read per component, so the walk
+/// up would cost the product of the prefix and the missing tail, both of which a path the project
+/// names chooses.
 pub(crate) fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    resolve_existing_prefix(path, |prefix| prefix.canonicalize().ok())
+}
+
+/// [`canonicalize_existing_prefix`], with `resolve` standing for `canonicalize`.
+///
+/// The prefixes tried are `path`, then each parent in turn, down to the first one with no name to
+/// re-append. A prefix that resolves has every shorter one resolve too, since resolving it walks
+/// them, so the first that resolves is found by bisection.
+fn resolve_existing_prefix(
+    path: &Path,
+    mut resolve: impl FnMut(&Path) -> Option<PathBuf>,
+) -> PathBuf {
     // An empty path is what `Path::new("cfg.toml").parent()` yields, and it denotes the current
     // directory, which `canonicalize` will not resolve under that spelling. Naming it explicitly is
     // what keeps a relative path keyed by an absolute one.
@@ -608,29 +625,27 @@ pub(crate) fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
     } else {
         path
     };
-    let mut missing: Vec<&OsStr> = Vec::new();
+    let mut prefixes = vec![start];
     let mut cursor = start;
-    loop {
-        if let Ok(mut resolved) = cursor.canonicalize() {
-            for name in missing.iter().rev() {
-                resolved.push(name);
-            }
-            return resolved;
-        }
-        match (cursor.parent(), cursor.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name);
-                cursor = if parent.as_os_str().is_empty() {
-                    dot
-                } else {
-                    parent
-                };
-            }
-            // Nothing left to walk up to, or a component that carries no name to re-append (a
-            // trailing `.` or `..`): hand back what was asked for rather than a half-built path.
-            _ => return path.to_path_buf(),
-        }
+    // The last prefix is the first with nothing left to walk up to, or with no name to re-append
+    // (a trailing `.` or `..`): when not even it resolves, the answer is what was asked for rather
+    // than a half-built path.
+    while let (Some(parent), Some(_)) = (cursor.parent(), cursor.file_name()) {
+        cursor = if parent.as_os_str().is_empty() {
+            dot
+        } else {
+            parent
+        };
+        prefixes.push(cursor);
     }
+    let first = prefixes.partition_point(|prefix| resolve(prefix).is_none());
+    let Some(mut resolved) = prefixes.get(first).and_then(|prefix| resolve(prefix)) else {
+        return path.to_path_buf();
+    };
+    for prefix in prefixes[..first].iter().rev() {
+        resolved.push(prefix.file_name().unwrap_or_default());
+    }
+    resolved
 }
 
 /// Canonicalized path string used as the marker key, or `None` when that path is not valid UTF-8.
@@ -1639,6 +1654,108 @@ mod tests {
         );
         // A relative path is still keyed by an absolute one — the empty parent means "here".
         assert!(canonicalize_existing_prefix(Path::new("nowhere-at-all")).is_absolute());
+    }
+
+    /// The walk up from `path`, one component taken off per failed `canonicalize`: the reference
+    /// [`canonicalize_existing_prefix`] must answer as, by fewer calls.
+    fn existing_prefix_by_walking_up(path: &Path) -> PathBuf {
+        let dot = Path::new(".");
+        let mut missing: Vec<&OsStr> = Vec::new();
+        let mut cursor = if path.as_os_str().is_empty() {
+            dot
+        } else {
+            path
+        };
+        loop {
+            if let Ok(mut resolved) = cursor.canonicalize() {
+                for name in missing.iter().rev() {
+                    resolved.push(name);
+                }
+                return resolved;
+            }
+            match (cursor.parent(), cursor.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing.push(name);
+                    cursor = if parent.as_os_str().is_empty() {
+                        dot
+                    } else {
+                        parent
+                    };
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    }
+
+    /// The search answers as the walk up does on every shape a path's prefix can take: links, one
+    /// whose target climbs, a missing tail, one that climbs out of what is missing, a file with a
+    /// child, a directory that cannot be searched, `.` along the way, relative and empty paths.
+    #[test]
+    fn the_existing_prefix_is_the_one_the_walk_up_finds() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TmpDir::new();
+        std::fs::create_dir_all(tmp.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+        std::os::unix::fs::symlink("real/sub/..", tmp.join("climbs")).unwrap();
+        std::fs::write(tmp.join("file"), b"x").unwrap();
+        std::fs::create_dir(tmp.join("locked")).unwrap();
+        std::fs::set_permissions(tmp.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let base = tmp.path().display().to_string();
+        let deep = format!("{base}/real{}", "/a".repeat(64));
+        let paths = [
+            format!("{base}/link"),
+            format!("{base}/link/sbx/trusted"),
+            format!("{base}/climbs/sub/x"),
+            format!("{base}/missing/a/b"),
+            format!("{base}/missing/a/.."),
+            format!("{base}/missing/../real"),
+            format!("{base}/real/../real/x"),
+            format!("{base}/real/sub/.."),
+            format!("{base}/file/child"),
+            format!("{base}/locked/child"),
+            format!("{base}/./real/./x/."),
+            deep,
+            "/".to_string(),
+            "nowhere-at-all/a/b".to_string(),
+            "src/nowhere".to_string(),
+            String::new(),
+        ];
+        let answers: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                let p = Path::new(p);
+                (
+                    canonicalize_existing_prefix(p),
+                    existing_prefix_by_walking_up(p),
+                )
+            })
+            .collect();
+        std::fs::set_permissions(tmp.join("locked"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        for (path, (searched, walked)) in paths.iter().zip(answers) {
+            assert_eq!(searched, walked, "for {path:?}");
+        }
+    }
+
+    /// The prefix is searched for, not walked up to: a path with two thousand missing components
+    /// costs a few resolutions, not one per component.
+    #[test]
+    fn the_existing_prefix_costs_a_resolution_per_halving() {
+        let tmp = TmpDir::new();
+        let missing = 2000;
+        let path = PathBuf::from(format!("{}{}", tmp.path().display(), "/a".repeat(missing)));
+        let mut calls = 0u32;
+        let found = resolve_existing_prefix(&path, |prefix| {
+            calls += 1;
+            prefix.canonicalize().ok()
+        });
+        assert_eq!(found, existing_prefix_by_walking_up(&path));
+        let prefixes = u32::try_from(path.components().count()).unwrap();
+        assert!(
+            calls <= prefixes.ilog2() + 3,
+            "{calls} resolutions for {prefixes} prefixes"
+        );
     }
 
     #[test]
