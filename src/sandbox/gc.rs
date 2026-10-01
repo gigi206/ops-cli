@@ -964,9 +964,23 @@ fn contained_in(root: &Path, candidate: &Path) -> Option<PathBuf> {
 /// Open `name` as a directory, refusing a symlink at that component — relative to `parent` when one
 /// is given, and from the filesystem root otherwise.
 fn open_dir_nofollow(parent: Option<&OwnedFd>, name: &std::ffi::CStr) -> io::Result<OwnedFd> {
+    open_dir_as(libc::O_RDONLY, parent, name)
+}
+
+/// [`open_dir_nofollow`] as an `O_PATH` handle, which opens a directory whatever its mode: a
+/// removal can then make it writable through the handle before it reads it.
+fn open_dir_handle(parent: Option<&OwnedFd>, name: &std::ffi::CStr) -> io::Result<OwnedFd> {
+    open_dir_as(libc::O_PATH, parent, name)
+}
+
+fn open_dir_as(
+    access: libc::c_int,
+    parent: Option<&OwnedFd>,
+    name: &std::ffi::CStr,
+) -> io::Result<OwnedFd> {
     use std::os::fd::FromRawFd;
 
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `name` is NUL-terminated and valid for the call, and `parent` — when given — is a live
     // descriptor. The returned descriptor is taken ownership of immediately below.
     let fd = unsafe {
@@ -1026,9 +1040,11 @@ pub(super) fn open_beneath(home: &Path, rel: &Path) -> io::Result<OwnedFd> {
 /// Remove `name` from the directory `dir` refers to, whatever it holds.
 ///
 /// Every step goes through the descriptor: `fstatat` reads the entry's own type without following
-/// it, a directory is emptied through a descriptor of its own, and `unlinkat` removes the entry
-/// itself. Nothing here re-resolves the name from the root, so a component the cage swaps while this
-/// runs cannot move the removal — what was opened is what is emptied.
+/// it, a directory is opened from `dir` with `O_NOFOLLOW` and emptied through that handle by
+/// [`empty_dir`], which removes each of its entries here in turn, and `unlinkat` removes the entry
+/// itself. So at every depth a name is resolved once, from the descriptor of the directory that
+/// holds it, and never again as part of a longer path: a directory the cage swaps for a link while
+/// this runs is refused where it is met, and what was opened is what is emptied.
 ///
 /// A symlink is unlinked rather than followed, which is the rule [`force_remove_dir_all`] states for
 /// a root it is handed: what the caller named is gone, and what it pointed at is untouched.
@@ -1054,11 +1070,8 @@ fn remove_child(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
     }
     let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
     if is_dir {
-        // The tree is emptied through a descriptor for the directory itself. `/proc/self/fd/<n>`
-        // names the inode that descriptor holds rather than the path it was reached by, so the walk
-        // stays inside what was opened however the names above it change.
-        let child = open_dir_nofollow(Some(dir), &c)?;
-        empty_dir(Path::new(&format!("/proc/self/fd/{}", child.as_raw_fd())))?;
+        // A link swapped in since the `fstatat` fails this open rather than being followed.
+        empty_dir(&open_dir_handle(Some(dir), &c)?)?;
     }
     let flag = if is_dir { libc::AT_REMOVEDIR } else { 0 };
     // SAFETY: same descriptor and name as above.
@@ -1650,8 +1663,14 @@ fn project_is_gone(path: &Path) -> bool {
 
 /// Remove a directory tree, forcing each directory writable first. The nix store leaves its path
 /// directories read-only (`0555`), so a plain `remove_dir_all` cannot unlink their entries; this
-/// chmods each directory owner-writable before descending. Symlinks are unlinked, never followed —
-/// `file_type` reads the entry's own type without dereferencing.
+/// chmods each directory owner-writable before reading it. Symlinks are unlinked, never followed.
+///
+/// Below the root, the walk is [`remove_child`]'s: every directory is opened from the descriptor of
+/// the one holding it, so the tree may be one a cage can still write. The runtime sweep removes the
+/// portal's and the forwarder's directories, both bound read-write into a cage that can outlive its
+/// launcher, and a walk that re-resolved `sub/…` by path followed a `sub` swapped for a link between
+/// checking it and reading it. Above the root, nothing is checked: the components leading to `path`
+/// are resolved by path, so they must be directories no cage writes.
 ///
 /// **Including the one it is handed.** That sentence used to be true of the entries walked and
 /// false of the argument: `set_permissions` and `read_dir` both resolve the path they are given, so
@@ -1664,40 +1683,39 @@ fn project_is_gone(path: &Path) -> bool {
 /// A symlink root is therefore *unlinked*, which is what "never followed" means for an entry, and
 /// reported as done: what the caller asked to remove is gone, and nothing outside was touched.
 pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
     // `symlink_metadata` is the lstat: it reads the link itself where `metadata` would read its
-    // target. A root that is not a symlink falls through to exactly what this always did, and a
-    // root that does not exist at all falls through too, so the error still comes from `read_dir`
-    // and says what it always said.
+    // target. A root that does not exist at all falls through, so the error comes from the open
+    // and says what it always said. A link swapped in after the lstat fails that open, which
+    // refuses one at the last component.
     if let Ok(meta) = std::fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
     {
         return std::fs::remove_file(path);
     }
-    empty_dir(path)?;
+    let root = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    empty_dir(&open_dir_handle(None, &root)?)?;
     std::fs::remove_dir(path)
 }
 
-/// Take everything `path` holds, leaving the directory itself — [`force_remove_dir_all`] minus its
-/// last step.
+/// Take everything the directory `dir` holds, leaving the directory itself: [`force_remove_dir_all`]
+/// minus its last step, which each caller takes its own way (`rmdir` on the root it opened, or
+/// `unlinkat` from the parent's descriptor in [`remove_child`]).
 ///
-/// Split out for the caller that holds a descriptor: it removes the directory through that
-/// descriptor with `unlinkat`, and cannot use the `remove_dir` above, because the path it walks is a
-/// `/proc/self/fd/<n>` link and `rmdir` on a link fails `ENOTDIR`.
-///
-/// The descent is by path under the root it is handed, so what it reaches is confined by what that
-/// root resolves to rather than by the names below it. [`remove_child`] is what pins that root to a
-/// descriptor first.
-fn empty_dir(path: &Path) -> io::Result<()> {
+/// The directory is made owner-writable and listed through `/proc/self/fd/<n>`, which names the
+/// inode `dir` holds rather than a path, and each entry is removed by [`remove_child`] from `dir`
+/// itself. Each level keeps two descriptors open while it is walked, its handle and its listing, so
+/// a tree deeper than half the process's descriptor limit stops with `EMFILE` and is left in place.
+fn empty_dir(dir: &OwnedFd) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            force_remove_dir_all(&entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
-        }
+    let held = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    // `chmod` through the descriptor's own entry acts on the inode it holds, where `fchmod` refuses
+    // an `O_PATH` handle.
+    let _ = std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700));
+    for entry in std::fs::read_dir(&held)? {
+        remove_child(dir, &entry?.file_name())?;
     }
     Ok(())
 }
@@ -4038,6 +4056,94 @@ mod tests {
             outside.join("keep").exists(),
             "the recursion followed the root link and emptied its target"
         );
+    }
+
+    /// A tree a cage can still write is emptied while the cage swaps a directory in it for a link.
+    ///
+    /// The runtime sweep removes the portal's and the forwarder's directories once their launcher
+    /// is gone, and both are bound read-write into a cage that can outlive that launcher. The
+    /// swapper below plays that cage: it exchanges `sub`, a real directory, with `alt`, a link to a
+    /// canary beside the tree, as fast as `renameat2(RENAME_EXCHANGE)` allows. The canary holds
+    /// the same names as `sub`, so a removal that resolves `sub` by name at any step after it
+    /// checked it lands in the canary.
+    ///
+    /// What is asserted is the canary, not the removal's result: a removal raced this way may fail,
+    /// and failing is not escaping.
+    #[test]
+    fn a_directory_swapped_for_a_link_mid_removal_does_not_carry_it_out_of_the_tree() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const FILES: usize = 256;
+        const TRIALS: usize = 20;
+        let base = TmpDir::new();
+        let canary = base.path().join("canary");
+        std::fs::create_dir(&canary).unwrap();
+        for i in 0..FILES {
+            std::fs::write(canary.join(format!("f{i}")), b"keep").unwrap();
+        }
+        let root = base.path().join("tree");
+        let sub = std::ffi::CString::new(root.join("sub").as_os_str().as_bytes()).unwrap();
+        let alt = std::ffi::CString::new(root.join("alt").as_os_str().as_bytes()).unwrap();
+
+        for trial in 0..TRIALS {
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+            for i in 0..FILES {
+                std::fs::write(root.join(format!("sub/f{i}")), b"x").unwrap();
+            }
+            std::os::unix::fs::symlink(&canary, root.join("alt")).unwrap();
+
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        // SAFETY: the raw `renameat2` is given its documented argument list, two
+                        // `AT_FDCWD`-relative paths and the `RENAME_EXCHANGE` flag; both `CString`s
+                        // outlive the call and the kernel only reads them. A failure (one of the
+                        // names already removed) is the race running its course.
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_renameat2,
+                                libc::AT_FDCWD,
+                                sub.as_ptr(),
+                                libc::AT_FDCWD,
+                                alt.as_ptr(),
+                                libc::RENAME_EXCHANGE,
+                            );
+                        }
+                    }
+                });
+                let _ = force_remove_dir_all(&root);
+                stop.store(true, Ordering::Relaxed);
+            });
+
+            let kept = (0..FILES)
+                .filter(|i| canary.join(format!("f{i}")).exists())
+                .count();
+            assert_eq!(
+                kept, FILES,
+                "trial {trial}: the removal followed the swapped link into the canary"
+            );
+            // The swapper has stopped, so what is left of the tree has no other writer.
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A directory whose mode refuses even its owner's reads is emptied all the same. The cage can
+    /// leave one below a tree it writes, and a removal that opened it for reading before making it
+    /// writable would stop there and leave the tree behind.
+    #[test]
+    fn a_directory_left_mode_0000_below_the_root_is_still_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = TmpDir::new();
+        let tree = base.path().join("tree");
+        let shut = tree.join("a/shut");
+        std::fs::create_dir_all(shut.join("inner")).unwrap();
+        std::fs::write(shut.join("inner/file"), b"x").unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        force_remove_dir_all(&tree).expect("a mode-0000 directory is made writable, then emptied");
+        assert!(!tree.exists(), "the tree was left behind");
     }
 
     #[test]
