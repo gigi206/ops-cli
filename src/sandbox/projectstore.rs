@@ -790,12 +790,17 @@ fn hold_dir_chain(store_dir: &Path, rel: &str) -> io::Result<OwnedFd> {
     super::cagedir::hold_under(store_dir, &format!("nix/{rel}"), DIR_MODE)
 }
 
-/// The directories under `nix/` that `nix-store` writes into when it opens a store: the database,
-/// the gc roots, the temporary roots, the gc socket and the deduplication pool.
+/// The directories under `nix/` that `nix-store` creates or writes into when it opens a store: the
+/// database, the gc roots, the temporary roots, the gc socket and the deduplication pool, and the
+/// two `per-user` directories, which it creates and then sets to mode `0755` by path, following a
+/// link to wherever it points. The walk checks each ancestor, so `var/nix/profiles` is covered by
+/// its `per-user`.
 const NIX_STATE_DIRS: &[&str] = &[
     "store/.links",
     "var/nix/db",
     "var/nix/gcroots",
+    "var/nix/gcroots/per-user",
+    "var/nix/profiles/per-user",
     "var/nix/temproots",
     "var/nix/gc-socket",
 ];
@@ -823,8 +828,10 @@ const NIX_STATE_FILES: &[&str] = &[
 /// to see.
 ///
 /// A missing directory is created, as `nix-store` would create it. The names are checked, not held:
-/// the tree is still the cage's between this check and the `nix-store` run, which is why a live
-/// cage keeps `sbx gc` away from its store.
+/// the tree is still the cage's between this check and the `nix-store` run. `sbx gc` refuses a
+/// store a live cage of the project holds. A launch does not, since two launches of one project
+/// may run at once, so a cage of the project that is running while another launch seeds can
+/// replace a checked name before `nix-store` opens it.
 fn ensure_nix_state(store_dir: &Path) -> io::Result<()> {
     for rel in NIX_STATE_DIRS {
         ensure_dir_chain(store_dir, rel)?;
@@ -1183,13 +1190,16 @@ mod tests {
         let roots = [PathBuf::from(
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-base",
         )];
-        // Every directory `nix-store` writes into, with each ancestor below `nix/`.
+        // Every directory `nix-store` creates or writes into, with each ancestor below `nix/`.
         let dirs = [
             "store/.links",
             "var",
             "var/nix",
             "var/nix/db",
             "var/nix/gcroots",
+            "var/nix/gcroots/per-user",
+            "var/nix/profiles",
+            "var/nix/profiles/per-user",
             "var/nix/temproots",
             "var/nix/gc-socket",
         ];
@@ -1311,6 +1321,8 @@ mod tests {
             for dir in [
                 "store/.links",
                 "var/nix/db",
+                "var/nix/gcroots/per-user",
+                "var/nix/profiles/per-user",
                 "var/nix/temproots",
                 "var/nix/gc-socket",
             ] {
