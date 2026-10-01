@@ -13,7 +13,9 @@
 include!(concat!(env!("OUT_DIR"), "/mise_plugin_files.rs"));
 
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 /// The backend name mise registers the plugin under: a `nix:<pkg>` tool routes to
@@ -84,28 +86,42 @@ pub(crate) fn register(root: &Path, rel: &str) -> io::Result<()> {
     // cage's `$HOME`, or the per-project mise pool — and every component of `rel` below it is an
     // ordinary directory in-cage code owns and can replace. Two things here follow such a link:
     // the placement itself, which would register the plugin outside the pool; and worse, the
-    // `remove_dir_all(&link)` fallback below, which recursively deletes whatever sits at
-    // `<plugins_dir>/nix`. A cage that left `ln -s /home/user/somewhere ~/.local/share/mise/plugins`
-    // behind therefore had the *next* launch delete `/home/user/somewhere/nix` outright.
-    let plugins_dir = super::cagedir::ensure_under(root, rel, 0o700)?;
-    let plugins_dir = plugins_dir.as_path();
-    let link = plugins_dir.join(PLUGIN_NAME);
+    // fallback in [`place`], which recursively deletes whatever sits at `<plugins_dir>/nix`. A
+    // cage that left `ln -s /home/user/somewhere ~/.local/share/mise/plugins` behind therefore had
+    // the *next* launch delete `/home/user/somewhere/nix` outright.
+    //
+    // Held, not only walked: a cage of the same project can be running while this registers, and
+    // swap the directory for such a link after the walk checked it. The placement goes through
+    // the descriptor the walk reached, so it lands in the directory that was checked.
+    let plugins_dir = super::cagedir::hold_under(root, rel, 0o700)?;
+    place(&plugins_dir)
+}
+
+/// The placement behind [`register`], through the descriptor of the plugins directory its walk
+/// reached ([`super::cagedir::entry`] names each entry inside it). Split from the walk so a test
+/// can change the tree between the two, the way a running cage can.
+fn place(plugins_dir: &OwnedFd) -> io::Result<()> {
+    let link = super::cagedir::entry(plugins_dir, OsStr::new(PLUGIN_NAME))?;
     // The temp name carries the pid (like `stage`): `super::atomicfile::unique()` is a process-local counter starting
     // at 0, so without the pid two concurrent same-project launches would share `.nix.0.tmp` and one
     // could `remove_file` the other's temp mid-rename. A crashed launch's pid-tagged temp is then a
     // tiny dangling symlink the next launch does not match — the same self-healing GC class `stage`
     // already accepts.
-    let tmp = plugins_dir.join(register_temp_name(
-        std::process::id(),
-        super::atomicfile::unique(),
-    ));
+    let tmp = super::cagedir::entry(
+        plugins_dir,
+        OsStr::new(&register_temp_name(
+            std::process::id(),
+            super::atomicfile::unique(),
+        )),
+    )?;
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(INCAGE_DIR, &tmp)?;
     let placed = std::fs::rename(&tmp, &link).or_else(|_| {
         // `rename` replaces an existing symlink or file atomically, but not a real
         // directory — which only appears if an agent ran its own `mise plugins`
-        // command into the slot. Clear it and retry (best-effort, self-inflicted case).
-        let _ = std::fs::remove_dir_all(&link);
+        // command into the slot. Clear it and retry (best-effort, self-inflicted case),
+        // by descriptor, so the removal stays inside the directory that was checked.
+        let _ = super::gc::remove_child(plugins_dir, OsStr::new(PLUGIN_NAME));
         std::fs::rename(&tmp, &link)
     });
     if placed.is_err() {
@@ -261,6 +277,38 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the planted link must be reported, not replaced"
+        );
+    }
+
+    /// The same link, swapped in after the walk checked the directory rather than left behind
+    /// before it: a cage of the project that is running while another launch registers. The
+    /// placement goes through the descriptor the walk reached, so it lands in the directory that
+    /// was checked, and the directory behind the link keeps its contents.
+    ///
+    /// The descriptor is taken from the walk before the swap, as [`register`] takes it. A test that
+    /// opened its own after the swap would hold the link's target and prove nothing.
+    #[test]
+    fn a_plugins_dir_swapped_for_a_link_after_the_walk_is_not_written_through() {
+        let home = TmpDir::new();
+        const REL: &str = ".local/share/mise/plugins";
+        let outside = home.join("outside");
+        std::fs::create_dir_all(outside.join("nix").join("keep")).unwrap();
+
+        let held = super::super::cagedir::hold_under(home.path(), REL, 0o700).unwrap();
+        let real = home.join("plugins.real");
+        std::fs::rename(home.join(REL), &real).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(REL)).unwrap();
+
+        place(&held).expect("the placement lands in the directory it holds");
+
+        assert!(
+            outside.join("nix").join("keep").exists(),
+            "the directory behind the link was deleted"
+        );
+        assert_eq!(
+            std::fs::read_link(real.join("nix")).unwrap(),
+            Path::new(INCAGE_DIR),
+            "the registration did not land in the directory the walk checked"
         );
     }
 

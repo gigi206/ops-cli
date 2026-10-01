@@ -46,12 +46,12 @@ use std::path::{Component, Path, PathBuf};
 ///
 /// What remains open is the **path this returns**. A caller holds a name, not a descriptor, and the
 /// cage may exchange a component before the caller uses it. [`hold_under`] closes that window for
-/// what goes through its descriptor, and the project store's seed writes that way. The callers
-/// that keep the path give it to a mount or to `nix`, which open by name, create a mountpoint in
-/// an image tree no cage is running on, or, for the mise plugin registration
-/// ([`super::miseplugin::register`]), place a link by path. For them the window this removes is
-/// the one inside the walk, and the case that needs no race at all, a symlink left behind for the
-/// next launch to find, is removed with it.
+/// what goes through its descriptor, and the project store's seed and the mise plugin
+/// registration ([`super::miseplugin::register`]) write that way. The callers that keep the path
+/// give it to a mount or to `nix`, which open by name, or create a mountpoint in an image tree no
+/// cage is running on. For them the window this removes is the one inside the walk, and the case
+/// that needs no race at all, a symlink left behind for the next launch to find, is removed with
+/// it.
 pub(crate) fn ensure_under(root: &Path, rel: &str, mode: u32) -> io::Result<PathBuf> {
     walk(root, rel, mode).map(|(at, _)| at)
 }
