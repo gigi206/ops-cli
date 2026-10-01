@@ -16,8 +16,9 @@
 //! [`open_beneath`] creates nothing and hands back a descriptor for a listing or a removal
 //! ([`super::gc`](mod@super::gc)). The live-theme keyfile write ([`super::theme_relay`]), the
 //! project store's seed and the mise plugin registration take the descriptor and write through
-//! [`entry`]. The image unpack asks another question of a tree no cage holds (`distro::layers`):
-//! which component of a layer member is a link, so that member can be refused by name.
+//! [`entry`]; the seed opens each directory it makes through [`open_entry_dir`]. The image unpack
+//! asks another question of a tree no cage holds (`distro::layers`): which component of a layer
+//! member is a link, so that member can be refused by name.
 //!
 //! What is **not** here is the mount point itself. A bind's target is the one component the cage
 //! cannot exchange (from inside, it *is* the mount), so it is the anchor every walk starts from and
@@ -106,22 +107,39 @@ pub(crate) fn open_beneath(root: &Path, rel: &Path) -> io::Result<OwnedFd> {
 pub(crate) fn entry(dir: &OwnedFd, name: &OsStr) -> io::Result<PathBuf> {
     use std::os::fd::AsRawFd;
 
-    let mut parts = Path::new(name).components();
-    match (parts.next(), parts.next()) {
-        (Some(Component::Normal(one)), None) if one == name => {}
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "`{}` is not a single name inside a directory",
-                    Path::new(name).display()
-                ),
-            ));
-        }
-    }
+    one_name(name)?;
     let mut at = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
     at.push(name);
     Ok(at)
+}
+
+/// Refuse `name` unless it is exactly one component: a separator, `.` or `..` would walk away from
+/// the directory it is looked up in.
+fn one_name(name: &OsStr) -> io::Result<()> {
+    let mut parts = Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(one)), None) if one == name => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "`{}` is not a single name inside a directory",
+                Path::new(name).display()
+            ),
+        )),
+    }
+}
+
+/// The directory `name` of the directory `dir` holds, opened through `dir` and refused unless it is
+/// one, the way the walk refuses a component: a link is never followed, and what stands at `name`
+/// instead is reported by kind and by the path the user finds it at ([`shown`]). Opened read-only
+/// rather than `O_PATH`, so the caller can set the directory's mode through it.
+pub(crate) fn open_entry_dir(dir: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
+
+    one_name(name)?;
+    let cname = cstr(name.as_encoded_bytes())?;
+    open_dir(dir.as_raw_fd(), &cname, libc::O_RDONLY)
+        .map_err(|e| describe(&shown(dir, name), dir.as_raw_fd(), &cname, e))
 }
 
 /// The path a user finds the entry `name` of the directory `dir` holds at: the directory's own path,
@@ -434,5 +452,40 @@ mod tests {
         assert_eq!(ensure_under(&root, "a/b/c", 0o700).unwrap(), made);
         // An empty `rel` is the anchor itself, which is a legitimate ask.
         assert_eq!(ensure_under(&root, "", 0o700).unwrap(), root);
+    }
+
+    /// A directory opened by its name under a held one is refused by the path the user finds it at
+    /// when something else stands at that name: a link, never followed, or a plain file. A caller
+    /// that has just made the directory meets this when another process replaced it in between.
+    #[test]
+    fn an_entry_that_is_not_a_directory_is_refused_by_its_path() {
+        let tmp = TmpDir::new();
+        let parent = tmp.join("parent");
+        let elsewhere = tmp.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(parent.join("dir")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, parent.join("link")).unwrap();
+        std::fs::write(parent.join("file"), b"").unwrap();
+        let held = hold_under(&parent, "", 0o700).unwrap();
+        // The descriptor's path, as the kernel resolves it: the test's directory may sit behind a
+        // link.
+        let shown = std::fs::canonicalize(&parent).unwrap();
+
+        open_entry_dir(&held, OsStr::new("dir")).expect("a directory opens");
+        for (name, found) in [("link", "is a symlink"), ("file", "is not a directory")] {
+            let err = open_entry_dir(&held, OsStr::new(name)).expect_err(name);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name}: {err}");
+            let path = shown.join(name);
+            assert!(
+                err.to_string()
+                    .contains(&format!("`{}` {found}", path.display())),
+                "{name}: the refusal does not say `{}` {found}: {err}",
+                path.display()
+            );
+        }
+        assert!(
+            open_entry_dir(&held, OsStr::new("dir/..")).is_err(),
+            "a name that is not one component is opened"
+        );
     }
 }

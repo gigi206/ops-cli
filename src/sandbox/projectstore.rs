@@ -467,13 +467,8 @@ fn copy_recursive(from: &Path, dir: &OwnedFd, name: &OsStr, reflink_ok: bool) ->
             .create(&to)
             .map_err(|e| already_there(dir, name, e))?;
         // Opened, never re-entered by name: a link swapped in after the `mkdir` fails this open,
-        // and what is placed below goes into the directory it reached.
-        let made = OwnedFd::from(
-            fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(&to)?,
-        );
+        // by its path, and what is placed below goes into the directory it reached.
+        let made = super::cagedir::open_entry_dir(dir, name)?;
         let mut cloned = true;
         for entry in fs::read_dir(from)? {
             let entry = entry?;
