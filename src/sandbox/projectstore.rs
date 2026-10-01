@@ -28,6 +28,14 @@
 //! tops up what is missing without disturbing anything the project's own nix has
 //! since written.
 //!
+//! The seed writes into a tree a cage holds read-write: another launch of the same
+//! project may be running while this one seeds. So every write below `nix/` goes
+//! through a descriptor for the directory the walk checked, never through a path
+//! re-resolved at the write, and every entry is created exclusively, so a link the
+//! cage planted fails the seed instead of being written through (see
+//! [`hold_dir_chain`]). What this cannot cover is `nix-store` itself, which opens
+//! the same tree by name ([`ensure_nix_state`]).
+//!
 //! The cage's nix reads and writes only this self-contained store; sbx's own seed
 //! is the only reader of the shared store, and only ever reads its content paths
 //! (which stay byte-identical) — though `nix-store --dump-db` may checkpoint the
@@ -58,7 +66,8 @@ use crate::store::Layout;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,8 +80,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// A path's content hash does not cover directory modes, so neither the mode a
 /// directory is built at nor the one it is sealed to affects `nix-store --verify`;
-/// the copied *files* keep their own modes (`std::fs::copy` and the reflink path both
-/// preserve them).
+/// the copied *files* keep their own modes ([`place_file`] sets each to its source's,
+/// cloned or copied).
 const DIR_MODE: u32 = 0o700;
 
 /// A per-process counter feeding the unique temporary names the seed renames from
@@ -233,10 +242,11 @@ pub(crate) fn prepare(
     roots: &[PathBuf],
 ) -> io::Result<ProjectStore> {
     let store_dir = store_dir_for(layout, project_id);
-    // Component-wise rather than `create_dir_all`: everything under `store_dir/nix` is bound
-    // read-write into the cage, so a component may be a symlink the cage left pointing anywhere.
-    // See [`ensure_dir_chain`] — the seed below copies the whole base closure into this directory.
-    let project_paths = ensure_dir_chain(&store_dir, "store")?;
+    // Component-wise rather than `create_dir_all`, and held: everything under `store_dir/nix` is
+    // bound read-write into the cage, so a component may be a symlink the cage left pointing
+    // anywhere, or one it swaps in while this seed runs. See [`hold_dir_chain`]; the seed below
+    // copies the whole base closure into this directory.
+    let project_paths = hold_dir_chain(&store_dir, "store")?;
     // Before the first `nix-store` run, and before the early return below: `sbx gc` runs its own
     // `nix-store` calls on this store once this returns, so the check covers those too.
     ensure_nix_state(&store_dir)?;
@@ -321,69 +331,83 @@ fn closure_of(
         .collect())
 }
 
-/// Place one store path `name` from `shared_paths` into `project_paths` as a
-/// physically independent, atomically-placed copy. A path already present is left
-/// untouched (top-up only); otherwise it is copied into a unique temporary sibling
-/// and moved into place by [`place_atomically`], so a half-written tree only ever
-/// exists under the temporary name and a crash or a racing seed cannot leave a
+/// Place one store path `name` from `shared_paths` into the store directory
+/// `project_paths` holds, as a physically independent, atomically-placed copy. A path
+/// already present is left untouched (top-up only); otherwise it is copied into a unique
+/// temporary sibling and moved into place by [`place_atomically`], so a half-written tree
+/// only ever exists under the temporary name and a crash or a racing seed cannot leave a
 /// partial at the real store-path name.
 ///
 /// Returns whether every file placed was cloned rather than copied ([`place_file`]); a path
 /// already present places nothing, and answers `true`.
 fn seed_path(
     shared_paths: &Path,
-    project_paths: &Path,
+    project_paths: &OwnedFd,
     name: &OsStr,
     reflink_ok: bool,
 ) -> io::Result<bool> {
-    let dest = project_paths.join(name);
-    if dest.symlink_metadata().is_ok() {
+    if super::cagedir::entry(project_paths, name)?
+        .symlink_metadata()
+        .is_ok()
+    {
         return Ok(true);
     }
-    let mut tmp_name = std::ffi::OsString::from(format!(".tmp-{}-", unique()));
-    tmp_name.push(name);
-    let tmp = project_paths.join(tmp_name);
-    copy_into_place(&shared_paths.join(name), &dest, &tmp, reflink_ok)
+    let mut tmp = std::ffi::OsString::from(format!(".tmp-{}-", unique()));
+    tmp.push(name);
+    copy_into_place(
+        &shared_paths.join(name),
+        project_paths,
+        name,
+        &tmp,
+        reflink_ok,
+    )
 }
 
-/// Copy `src` into `dest` via the temporary sibling `tmp`, atomically. Any stale `tmp` a crashed
-/// seed left behind is cleared first: `unique()` is process-local, so two processes reuse temp
-/// names, and a leftover store-path temp is a *directory tree* — use the recursive `discard` (a
-/// no-op when absent), not `remove_file`, or `copy_recursive`'s non-recursive `DirBuilder::create`
-/// would fail EEXIST.
-fn copy_into_place(src: &Path, dest: &Path, tmp: &Path, reflink_ok: bool) -> io::Result<bool> {
-    discard(tmp);
-    let cloned = copy_recursive(src, tmp, reflink_ok)?;
-    place_atomically(tmp, dest)?;
+/// Copy `src` into the entry `dest` of the directory `dir` holds, via the temporary sibling `tmp`,
+/// atomically. Any stale `tmp` a crashed seed left behind is cleared first: `unique()` is
+/// process-local, so two processes reuse temp names, and a leftover store-path temp is a
+/// *directory tree*. So it goes through the recursive `discard` (a no-op when absent), or
+/// `copy_recursive`'s exclusive `mkdir` would fail EEXIST.
+fn copy_into_place(
+    src: &Path,
+    dir: &OwnedFd,
+    dest: &OsStr,
+    tmp: &OsStr,
+    reflink_ok: bool,
+) -> io::Result<bool> {
+    discard(dir, tmp);
+    let cloned = copy_recursive(src, dir, tmp, reflink_ok)?;
+    place_atomically(dir, tmp, dest)?;
     Ok(cloned)
 }
 
-/// Move the fully-copied `tmp` tree into place at its real store-path name `dest` by
-/// `rename` — atomic, so a reader only ever sees the complete tree or nothing at the
-/// real name. Losing a race is success: if the rename fails but `dest` now exists,
-/// another seed of the same project placed the identical, content-addressed path
-/// first, so the now-redundant temp is discarded and success reported. Any other
-/// failure discards the temp and propagates, leaving no partial behind.
-fn place_atomically(tmp: &Path, dest: &Path) -> io::Result<()> {
-    match fs::rename(tmp, dest) {
+/// Move the fully-copied `tmp` tree into place at its real store-path name `dest`, both entries of
+/// the directory `dir` holds, by `rename`: atomic, so a reader only ever sees the complete tree or
+/// nothing at the real name. Losing a race is success: if the rename fails but `dest` now exists,
+/// another seed of the same project placed the identical, content-addressed path first, so the
+/// now-redundant temp is discarded and success reported. Any other failure discards the temp and
+/// propagates, leaving no partial behind.
+fn place_atomically(dir: &OwnedFd, tmp: &OsStr, dest: &OsStr) -> io::Result<()> {
+    let at = super::cagedir::entry(dir, dest)?;
+    match fs::rename(super::cagedir::entry(dir, tmp)?, &at) {
         Ok(()) => Ok(()),
-        Err(_) if dest.symlink_metadata().is_ok() => {
-            discard(tmp);
+        Err(_) if at.symlink_metadata().is_ok() => {
+            discard(dir, tmp);
             Ok(())
         }
         Err(e) => {
-            discard(tmp);
+            discard(dir, tmp);
             Err(e)
         }
     }
 }
 
-/// Recursively copy `from` to a fresh `to`: directories are created owner-writable,
-/// recursed into, then sealed to the mode of the directory they were copied from;
-/// symlinks are recreated (never dereferenced); and regular files are copied as
-/// physically independent copies (reflinked when `reflink_ok`, else fully copied). `to`
-/// is assumed not to exist — the caller copies into a unique temporary, so there is no
-/// existing content to preserve here.
+/// Recursively copy `from` to a fresh entry `name` of the directory `dir` holds: directories are
+/// created owner-writable, filled through their own descriptor, then sealed to the mode of the
+/// directory they were copied from; symlinks are recreated (never dereferenced); and regular files
+/// are copied as physically independent copies ([`place_file`]). The entry must not exist yet: the
+/// caller copies into a unique temporary, and in this tree an entry already at a name is one the
+/// cage made, so it fails the copy rather than being written through.
 ///
 /// Sealing is what gives a seeded path the shape nix gives its own (`0555`), so a stray
 /// recursive delete meets the same refusal in a project's store as in the shared one,
@@ -393,45 +417,70 @@ fn place_atomically(tmp: &Path, dest: &Path) -> io::Result<()> {
 /// holds it — the copy is physically independent ([`place_file`]) — never a mode.
 ///
 /// Returns whether every regular file under `from` was cloned rather than copied.
-fn copy_recursive(from: &Path, to: &Path, reflink_ok: bool) -> io::Result<bool> {
+fn copy_recursive(from: &Path, dir: &OwnedFd, name: &OsStr, reflink_ok: bool) -> io::Result<bool> {
     // `symlink_metadata` does not follow symlinks, so a store symlink is recreated
     // rather than dereferenced.
     let meta = from.symlink_metadata()?;
     let file_type = meta.file_type();
+    let to = super::cagedir::entry(dir, name)?;
     if file_type.is_dir() {
-        DirBuilder::new().mode(DIR_MODE).create(to)?;
+        DirBuilder::new().mode(DIR_MODE).create(&to)?;
+        // Opened, never re-entered by name: a link swapped in after the `mkdir` fails this open,
+        // and what is placed below goes into the directory it reached.
+        let made = OwnedFd::from(
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&to)?,
+        );
         let mut cloned = true;
         for entry in fs::read_dir(from)? {
             let entry = entry?;
-            cloned &= copy_recursive(&entry.path(), &to.join(entry.file_name()), reflink_ok)?;
+            cloned &= copy_recursive(&entry.path(), &made, &entry.file_name(), reflink_ok)?;
         }
-        // After the entries, never before: a directory sealed read-only takes none.
-        fs::set_permissions(to, meta.permissions())?;
+        // After the entries, never before: a directory sealed read-only takes none. Through the
+        // descriptor, so the mode lands on the directory that was filled.
+        fs::File::from(made).set_permissions(meta.permissions())?;
         Ok(cloned)
     } else if file_type.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(from)?, to)?;
+        std::os::unix::fs::symlink(fs::read_link(from)?, &to)?;
         Ok(true)
     } else {
-        place_file(from, to, reflink_ok)
+        place_file(from, dir, name, reflink_ok)
     }
 }
 
-/// Place one regular file at `to` as a physically independent copy of `from`, so a
-/// later in-cage write to it can never reach `from` (the shared store). When
-/// `reflink_ok`, it is cloned copy-on-write — `from` and `to` share data extents
-/// until one is written, then only the changed extent is copied, leaving `from`
-/// untouched — costing no extra disk until a write. Otherwise (a filesystem without
-/// reflink, e.g. ext4) it is a full content copy. Either way `to` is a distinct
-/// inode with `from`'s mode.
+/// Place one regular file at the entry `name` of the directory `dir` holds, as a physically
+/// independent copy of `from`, so a later in-cage write to it can never reach `from` (the shared
+/// store). When `reflink_ok`, it is cloned copy-on-write: the two share data extents until one is
+/// written, then only the changed extent is copied, leaving `from` untouched, so the clone costs
+/// no extra disk until a write. Otherwise (a filesystem without reflink, e.g. ext4) it is a full
+/// content copy. Either way the result is a distinct inode with `from`'s mode.
+///
+/// The file is created exclusively (`O_CREAT | O_EXCL`), which fails on any entry already at that
+/// name, a link included, instead of opening what the link names. This tree is the cage's, and a
+/// create that followed a link the cage planted there would truncate and rewrite whatever file of
+/// the user's it pointed at.
 ///
 /// Returns `true` when the file was cloned, `false` when it was copied: a clone that fails on a
 /// filesystem that supports them falls back to the copy, and the seed records that it did.
-fn place_file(from: &Path, to: &Path, reflink_ok: bool) -> io::Result<bool> {
-    if reflink_ok && reflink(from, to).is_ok() {
-        return Ok(true);
+fn place_file(from: &Path, dir: &OwnedFd, name: &OsStr, reflink_ok: bool) -> io::Result<bool> {
+    let mut src = fs::File::open(from)?;
+    let mode = src.metadata()?.permissions();
+    let mut dst = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(super::cagedir::entry(dir, name)?)?;
+    let cloned = reflink_ok && clone_into(&src, &dst).is_ok();
+    if !cloned {
+        // Whatever a failed clone left is cut first; a plain copy is independent on every
+        // filesystem.
+        dst.set_len(0)?;
+        io::copy(&mut src, &mut dst)?;
     }
-    // a plain copy is independent on every filesystem and preserves the mode
-    fs::copy(from, to).map(|_| false)
+    dst.set_permissions(mode)?;
+    Ok(cloned)
 }
 
 /// The file under a project's store directory that records how its store paths were seeded,
@@ -475,53 +524,80 @@ fn record_seed_mode(store_dir: &Path, all_cloned: bool) -> io::Result<()> {
     super::atomicfile::write_atomic(&path, format!("{now}\n").as_bytes())
 }
 
-/// Clone `from` into a fresh `to` copy-on-write via the `FICLONE` ioctl, preserving
-/// the source mode (the ioctl clones contents only). Returns an error — and removes
-/// the empty `to` it created — when the filesystem does not support reflinks, so the
-/// caller can fall back to a plain copy.
-fn reflink(from: &Path, to: &Path) -> io::Result<()> {
-    use std::fs::File;
+/// Clone `src`'s contents into `dst` copy-on-write, via the `FICLONE` ioctl (contents
+/// only: the mode is the caller's to set). Fails when the filesystem does not support
+/// reflinks, so the caller can fall back to a plain copy.
+fn clone_into(src: &fs::File, dst: &fs::File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    let src = File::open(from)?;
-    let mode = src.metadata()?.permissions();
-    let dst = File::create(to)?;
     // SAFETY: both descriptors are valid for the call; FICLONE reads from `src` and
     // replaces `dst`'s contents, touching no Rust-owned memory.
     let rc = unsafe { libc::ioctl(dst.as_raw_fd(), libc::FICLONE, src.as_raw_fd()) };
     if rc != 0 {
-        let err = io::Error::last_os_error();
-        drop(dst);
-        let _ = fs::remove_file(to);
-        return Err(err);
+        return Err(io::Error::last_os_error());
     }
-    fs::set_permissions(to, mode)?;
     Ok(())
 }
 
-/// Whether `dir`'s filesystem supports reflinks, probed with a throwaway clone (both
-/// files on the same filesystem as the seed's destination). A probe that could not be
-/// carried out counts as "no", which is what a caller about to copy needs: it cannot
-/// reflink into a directory it cannot write to either. A caller that must tell the two
-/// apart wants [`reflink_verdict`].
-pub(crate) fn supports_reflink(dir: &Path) -> bool {
-    reflink_verdict(dir) == Some(true)
+/// Whether the filesystem of the directory `dir` holds supports reflinks, probed with a
+/// throwaway clone (both files on the same filesystem as the seed's destination). A probe
+/// that could not be carried out counts as "no", which is what a caller about to copy
+/// needs: it cannot reflink into a directory it cannot write to either. A caller that
+/// must tell the two apart wants [`reflink_verdict`].
+fn supports_reflink(dir: &OwnedFd) -> bool {
+    let (src, dst) = probe_names();
+    match (
+        super::cagedir::entry(dir, &src),
+        super::cagedir::entry(dir, &dst),
+    ) {
+        (Ok(src), Ok(dst)) => probe_reflink(&src, &dst) == Some(true),
+        _ => false,
+    }
 }
 
 /// Whether `dir`'s filesystem supports reflinks, or `None` when the probe could not be
 /// carried out at all — the directory is not writable, so nothing was learned about the
-/// filesystem. The probe names are unique per call (pid + counter) so a concurrent
-/// same-project seed never collides on them, and the probe files are removed before
-/// returning.
+/// filesystem.
 pub(crate) fn reflink_verdict(dir: &Path) -> Option<bool> {
-    let src = dir.join(format!(".reflink-probe-src-{}", unique()));
-    let dst = dir.join(format!(".reflink-probe-dst-{}", unique()));
-    // Only the write's failure is inconclusive: once the source exists, the clone's outcome
-    // is the filesystem's answer.
-    let verdict = fs::write(&src, b"probe")
+    let (src, dst) = probe_names();
+    probe_reflink(&dir.join(src), &dir.join(dst))
+}
+
+/// The two names a reflink probe writes, unique per call (pid + counter) so a concurrent
+/// same-project seed never collides on them.
+fn probe_names() -> (std::ffi::OsString, std::ffi::OsString) {
+    (
+        format!(".reflink-probe-src-{}", unique()).into(),
+        format!(".reflink-probe-dst-{}", unique()).into(),
+    )
+}
+
+/// The probe behind [`supports_reflink`] and [`reflink_verdict`]: write `src`, clone it into
+/// `dst`, and remove both before returning. Only the write's failure is inconclusive: once the
+/// source exists, the clone's outcome is the filesystem's answer.
+///
+/// Both files are created exclusively, so an entry already at either name, a link included, is
+/// never opened through. One a crashed probe of an earlier process left there (the counter is
+/// process-local) is removed first, which unlinks the entry itself and never what it names.
+fn probe_reflink(src: &Path, dst: &Path) -> Option<bool> {
+    use std::io::Write as _;
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(dst);
+    let exclusive = |write_only: bool| {
+        let mut options = fs::OpenOptions::new();
+        options.read(!write_only).write(true).create_new(true);
+        options
+    };
+    let verdict = exclusive(false)
+        .open(src)
+        .and_then(|mut f| f.write_all(b"probe").map(|()| f))
         .ok()
-        .map(|()| reflink(&src, &dst).is_ok());
-    let _ = fs::remove_file(&src);
-    let _ = fs::remove_file(&dst);
+        .map(|from| {
+            exclusive(true)
+                .open(dst)
+                .is_ok_and(|to| clone_into(&from, &to).is_ok())
+        });
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(dst);
     verdict
 }
 
@@ -535,18 +611,16 @@ fn unique() -> String {
     )
 }
 
-/// Remove a temporary placement, whether it ended up a directory tree or a single
-/// file/symlink. Goes through [`super::gc::force_remove_dir_all`], which adds write
-/// to each directory as it descends: a temp [`copy_recursive`] finished is sealed
-/// read-only like the store path it is about to become, and a plain
-/// `remove_dir_all` cannot empty such a directory. Best effort, since a leftover
-/// only wastes disk and never corrupts the store (it never carries a real
-/// store-path name) — but a leftover that survived *would* fail the next seed of
-/// that path, whose non-recursive dir-create meets it as `EEXIST`.
-fn discard(path: &Path) {
-    if super::gc::force_remove_dir_all(path).is_err() {
-        let _ = fs::remove_file(path);
-    }
+/// Remove the temporary placement `name` from the directory `dir` holds, whether it ended up a
+/// directory tree or a single file or symlink. Goes through [`super::gc::remove_child`], which
+/// removes by descriptor at every depth, unlinks a link rather than following it, and adds write
+/// to each directory as it descends: a temp [`copy_recursive`] finished is sealed read-only like
+/// the store path it is about to become, and a plain `remove_dir_all` cannot empty such a
+/// directory. Best effort, since a leftover only wastes disk and never corrupts the store (it never
+/// carries a real store-path name), but a leftover that survived *would* fail the next seed of
+/// that path, whose exclusive `mkdir` meets it as `EEXIST`.
+fn discard(dir: &OwnedFd, name: &OsStr) {
+    let _ = super::gc::remove_child(dir, name);
 }
 
 /// Register `closure` into the project store's database by piping the shared
@@ -704,6 +778,18 @@ fn ensure_dir_chain(store_dir: &Path, rel: &str) -> io::Result<PathBuf> {
     super::cagedir::ensure_under(store_dir, &format!("nix/{rel}"), DIR_MODE)
 }
 
+/// [`ensure_dir_chain`], holding the leaf: the descriptor the walk reached it with
+/// ([`super::cagedir::hold_under`]), for the seed to write through.
+///
+/// The path [`ensure_dir_chain`] returns is checked, not held. In-cage code that is live while a
+/// second launch of the same project seeds can swap `/nix/store` for a link between the check and
+/// the copy, or plant one inside a temporary tree as it is filled. So everything the seed writes
+/// below `nix/` goes through this descriptor and [`super::cagedir::entry`]: it lands in the
+/// directory that was checked, and a name the cage planted is refused rather than followed.
+fn hold_dir_chain(store_dir: &Path, rel: &str) -> io::Result<OwnedFd> {
+    super::cagedir::hold_under(store_dir, &format!("nix/{rel}"), DIR_MODE)
+}
+
 /// The directories under `nix/` that `nix-store` writes into when it opens a store: the database,
 /// the gc roots, the temporary roots, the gc socket and the deduplication pool.
 const NIX_STATE_DIRS: &[&str] = &[
@@ -787,21 +873,20 @@ fn refuse_unless_file(path: &Path) -> io::Result<()> {
 fn gcroot_roots(store_dir: &Path, roots: &[PathBuf]) -> io::Result<()> {
     // Same guard as the store directory, and for the same reason: `nix/var` is under the cage's
     // writable `/nix` too, so this walk refuses a component the cage repointed rather than writing
-    // its root symlinks wherever that led.
-    let dir = ensure_dir_chain(store_dir, "var/nix/gcroots")?;
-    debug_assert_eq!(dir, gcroots_dir(store_dir));
+    // its root symlinks wherever that led, and the links go through the descriptor it reached.
+    let dir = hold_dir_chain(store_dir, "var/nix/gcroots")?;
     for root in roots {
         let Some(name) = root.file_name() else {
             continue;
         };
-        let link = dir.join(name);
+        let link = super::cagedir::entry(&dir, name)?;
         // Already the right root: nothing to do (the common warm re-seed).
         if fs::read_link(&link).is_ok_and(|t| t == *root) {
             continue;
         }
         let mut tmp_name = std::ffi::OsString::from(format!(".tmp-{}-", unique()));
         tmp_name.push(name);
-        let tmp = dir.join(tmp_name);
+        let tmp = super::cagedir::entry(&dir, &tmp_name)?;
         // A stale temp from a crashed seed would block the symlink; clear it first.
         let _ = fs::remove_file(&tmp);
         std::os::unix::fs::symlink(root, &tmp)?;
@@ -864,6 +949,11 @@ mod tests {
         (m.dev(), m.ino())
     }
 
+    /// A descriptor for `dir`, the way the seed holds its store directory.
+    fn hold(dir: &Path) -> OwnedFd {
+        OwnedFd::from(std::fs::File::open(dir).unwrap())
+    }
+
     #[test]
     fn a_probe_that_could_not_run_is_not_an_answer_about_the_filesystem() {
         let base = TmpDir::new();
@@ -881,7 +971,7 @@ mod tests {
         std::fs::write(&closed, b"not a directory\n").unwrap();
         assert_eq!(reflink_verdict(&closed), None);
         // The seeding caller, about to copy into it, is right to read it as "no" all the same.
-        assert!(!supports_reflink(&closed));
+        assert!(!supports_reflink(&hold(&closed)));
     }
 
     #[test]
@@ -1284,7 +1374,7 @@ mod tests {
         std::fs::write(src.join("sub/data"), b"payload").unwrap();
         symlink("tool", src.join("link")).unwrap();
 
-        copy_recursive(&src, &dst, true).unwrap();
+        copy_recursive(&src, &hold(base.path()), OsStr::new("dst"), true).unwrap();
 
         // regular files are physically independent copies (distinct inodes), with
         // their content intact
@@ -1332,7 +1422,8 @@ mod tests {
             std::fs::set_permissions(src.join(d), std::fs::Permissions::from_mode(0o555)).unwrap();
         }
 
-        copy_recursive(&src, &dst, false).expect("a read-only source must still copy");
+        copy_recursive(&src, &hold(base.path()), OsStr::new("dst"), false)
+            .expect("a read-only source must still copy");
 
         assert_eq!(std::fs::read(dst.join("bin/tool")).unwrap(), b"payload");
         for d in ["", "bin"] {
@@ -1360,8 +1451,9 @@ mod tests {
         std::fs::write(project.join("aaa-old/file"), b"project-wrote-this").unwrap();
         let pre = ino(&project.join("aaa-old/file"));
 
-        seed_path(&shared, &project, OsStr::new("aaa-old"), true).unwrap();
-        seed_path(&shared, &project, OsStr::new("bbb-new"), true).unwrap();
+        let held = hold(&project);
+        seed_path(&shared, &held, OsStr::new("aaa-old"), true).unwrap();
+        seed_path(&shared, &held, OsStr::new("bbb-new"), true).unwrap();
 
         // the pre-existing path was left untouched (same inode, same content),
         // never overwritten — protecting whatever the project's nix has written
@@ -1405,8 +1497,14 @@ mod tests {
         // the leftover from a crashed seed: a non-empty directory tree at the temp name
         std::fs::create_dir_all(tmp.join("leftover")).unwrap();
 
-        copy_into_place(&src, &dest, &tmp, false)
-            .expect("a stale temp must be cleared, not fail EEXIST");
+        copy_into_place(
+            &src,
+            &hold(base.path()),
+            OsStr::new("dest"),
+            OsStr::new(".tmp-stale-dest"),
+            false,
+        )
+        .expect("a stale temp must be cleared, not fail EEXIST");
         assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"content");
         assert!(!tmp.exists(), "the temp was consumed by the atomic rename");
     }
@@ -1429,8 +1527,14 @@ mod tests {
             std::fs::set_permissions(tmp.join(d), std::fs::Permissions::from_mode(0o555)).unwrap();
         }
 
-        copy_into_place(&src, &dest, &tmp, false)
-            .expect("a sealed stale temp must be cleared, not fail EEXIST");
+        copy_into_place(
+            &src,
+            &hold(base.path()),
+            OsStr::new("dest"),
+            OsStr::new(".tmp-sealed-dest"),
+            false,
+        )
+        .expect("a sealed stale temp must be cleared, not fail EEXIST");
         assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"content");
         assert!(!tmp.exists(), "the temp was consumed by the atomic rename");
     }
@@ -1453,7 +1557,7 @@ mod tests {
         std::fs::set_permissions(shared.join("libc"), std::fs::Permissions::from_mode(0o444))
             .unwrap();
 
-        place_file(&shared.join("libc"), &proj.join("libc"), true).unwrap();
+        place_file(&shared.join("libc"), &hold(&proj), OsStr::new("libc"), true).unwrap();
 
         // the copy is a distinct inode...
         assert_ne!(ino(&shared.join("libc")), ino(&proj.join("libc")));
@@ -1486,7 +1590,12 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("file"), b"loser").unwrap();
 
-        place_atomically(&tmp, &dest).expect("a lost race is success, not an error");
+        place_atomically(
+            &hold(base.path()),
+            OsStr::new(".tmp-1-aaa-pkg"),
+            OsStr::new("aaa-pkg"),
+        )
+        .expect("a lost race is success, not an error");
 
         assert_eq!(
             std::fs::read(dest.join("file")).unwrap(),
@@ -1508,15 +1617,100 @@ mod tests {
         let tmp = base.join(".tmp-1-x");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("file"), b"payload").unwrap();
-        // renaming into a parent that does not exist fails (ENOENT) with the
+        // renaming onto a name no filesystem can hold fails (ENAMETOOLONG) with the
         // destination still absent — the propagating branch, not the race one
-        let dest = base.join("missing-parent").join("x");
+        let dest = "x".repeat(300);
 
-        place_atomically(&tmp, &dest).expect_err("a non-race failure must propagate");
+        place_atomically(
+            &hold(base.path()),
+            OsStr::new(".tmp-1-x"),
+            OsStr::new(&dest),
+        )
+        .expect_err("a non-race failure must propagate");
 
         assert!(
             !tmp.exists(),
             "the temp was not discarded after a hard placement failure"
+        );
+    }
+
+    /// A link the cage planted at a name the seed is about to create is refused, and the file it
+    /// names keeps its bytes.
+    ///
+    /// The seed fills its temporary tree inside the store the cage holds read-write, so in-cage
+    /// code watching that directory can put a link at a file's name before the file is made. A
+    /// create that follows it truncates the file the link names and writes the store's content
+    /// over it. Both branches are covered, the clone and the copy.
+    #[test]
+    fn a_link_planted_at_a_seeded_name_is_refused_and_not_written_through() {
+        for reflink_ok in [true, false] {
+            let base = TmpDir::new();
+            let src = base.join("src");
+            std::fs::write(&src, b"store content").unwrap();
+            let witness = base.join("witness");
+            std::fs::write(&witness, b"the user's file").unwrap();
+            let tree = base.join("tree");
+            std::fs::create_dir_all(&tree).unwrap();
+            symlink(&witness, tree.join("file")).unwrap();
+
+            let placed = place_file(&src, &hold(&tree), OsStr::new("file"), reflink_ok);
+
+            assert_eq!(
+                placed.map_err(|e| e.kind()).err(),
+                Some(io::ErrorKind::AlreadyExists),
+                "reflink_ok={reflink_ok}: a planted name must fail the placement"
+            );
+            assert_eq!(
+                std::fs::read(&witness).unwrap(),
+                b"the user's file",
+                "reflink_ok={reflink_ok}: the file the link names was written"
+            );
+            assert!(
+                std::fs::symlink_metadata(tree.join("file"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "reflink_ok={reflink_ok}: the planted link is left for the user to see"
+            );
+        }
+    }
+
+    /// A store directory the cage swaps for a link after the walk checked it does not redirect the
+    /// seed: what is placed lands in the directory the walk reached.
+    ///
+    /// The descriptor is taken from the walk before the swap, as [`prepare`] takes it. A test that
+    /// opened its own after the swap would hold the link's target and prove nothing.
+    #[test]
+    fn a_store_swapped_for_a_link_after_the_walk_is_not_written_through() {
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        let shared = base.join("shared");
+        std::fs::create_dir_all(shared.join("aaa-pkg")).unwrap();
+        std::fs::write(shared.join("aaa-pkg/file"), b"payload").unwrap();
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let held = hold_dir_chain(&store_dir, "store").unwrap();
+        let real = store_dir.join("nix/store.real");
+        std::fs::rename(store_dir.join("nix/store"), &real).unwrap();
+        symlink(&elsewhere, store_dir.join("nix/store")).unwrap();
+
+        seed_path(&shared, &held, OsStr::new("aaa-pkg"), false)
+            .expect("the seed places the path in the directory it holds");
+
+        let landed: Vec<_> = std::fs::read_dir(&elsewhere)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            landed.is_empty(),
+            "the seed wrote through the link: {landed:?}"
+        );
+        assert_eq!(
+            std::fs::read(real.join("aaa-pkg/file")).unwrap(),
+            b"payload",
+            "the path did not land in the directory the walk checked"
         );
     }
 

@@ -11,21 +11,22 @@
 //! closure, a `remove_dir_all` clearing a slot, a keyfile write. Each of those was found as its own
 //! defect before this module existed.
 //!
-//! The rule is not only here. This walk creates what is missing and hands back a path, and two
-//! others need something else, so each keeps its own copy: the live-theme keyfile write
-//! ([`super::theme_relay`]) keeps the descriptor it reached, to create its file and rename it
-//! there, and `open_beneath` ([`super::gc`](mod@super::gc)) creates nothing and hands its
-//! descriptor to a removal. A change to the rule is a change to all three.
+//! The rule is not only here. This walk creates what is missing and hands back the leaf's path, or
+//! its descriptor through [`hold_under`], and two others keep a copy of their own: the live-theme
+//! keyfile write ([`super::theme_relay`]), which creates its file and renames it in the directory
+//! it reached, and `open_beneath` ([`super::gc`](mod@super::gc)), which creates nothing and hands
+//! its descriptor to a removal. A change to the rule is a change to all three.
 //!
 //! What is **not** here is the mount point itself. A bind's target is the one component the cage
 //! cannot exchange (from inside, it *is* the mount), so it is the anchor every walk starts from and
 //! the caller's job to name correctly.
 
+use std::ffi::OsStr;
 use std::fs::DirBuilder;
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Make `root`'s descendant `rel` (slash-separated), one component at a time, refusing any that
 /// already exists and is **not a real directory**. Returns the path of the leaf.
@@ -44,11 +45,62 @@ use std::path::{Path, PathBuf};
 /// and the resolution that walked through it, and the cage owns every directory below the anchor.
 ///
 /// What remains open is the **path this returns**. A caller holds a name, not a descriptor, and the
-/// cage may exchange a component before the caller uses it; closing that needs descriptor-based I/O
-/// carried through every caller, several of which hand paths to `nix`. So the window this removes is
-/// the one inside the walk, and the case that needs no race at all — a symlink left behind for the
-/// next launch to find — is removed with it.
+/// cage may exchange a component before the caller uses it. [`hold_under`] closes that window for
+/// what goes through its descriptor, and the project store's seed writes that way. The callers
+/// that keep the path give it to a mount or to `nix`, which open by name, create a mountpoint in
+/// an image tree no cage is running on, or, for the mise plugin registration
+/// ([`super::miseplugin::register`]), place a link by path. For them the window this removes is
+/// the one inside the walk, and the case that needs no race at all, a symlink left behind for the
+/// next launch to find, is removed with it.
 pub(crate) fn ensure_under(root: &Path, rel: &str, mode: u32) -> io::Result<PathBuf> {
+    walk(root, rel, mode).map(|(at, _)| at)
+}
+
+/// [`ensure_under`], handing back the descriptor of the leaf it reached rather than its path.
+///
+/// For a caller that goes on to write below the leaf. The descriptor keeps naming the directory
+/// this walk checked, whatever the cage does to the names above it afterwards, and [`entry`] turns
+/// it and one name into a path that resolves through it. What is written that way lands in the
+/// checked directory, where a path re-resolved at each write would land wherever the cage pointed
+/// in between.
+pub(crate) fn hold_under(root: &Path, rel: &str, mode: u32) -> io::Result<OwnedFd> {
+    walk(root, rel, mode).map(|(_, dir)| dir)
+}
+
+/// The path naming `name` inside the directory `dir` holds: `/proc/self/fd/<n>/<name>`.
+///
+/// The kernel resolves `/proc/self/fd/<n>` to the directory the descriptor was opened on, not to a
+/// name that might lead there, so a path built here reaches that directory however the cage has
+/// renamed or replaced the names above it. `name` is the only component looked up, and it has to
+/// be exactly one: a separator, `.` or `..` would walk away from the directory, so each is refused.
+///
+/// Whether that last component is followed is the syscall's. `mkdir`, `symlink`, `rename`,
+/// `unlink`, `lstat`, `readlink` and an exclusive create (`create_new`) never follow it; any other
+/// open of it must carry `O_NOFOLLOW`.
+pub(crate) fn entry(dir: &OwnedFd, name: &OsStr) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+
+    let mut parts = Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(one)), None) if one == name => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}` is not a single name inside a directory",
+                    Path::new(name).display()
+                ),
+            ));
+        }
+    }
+    let mut at = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    at.push(name);
+    Ok(at)
+}
+
+/// The walk behind [`ensure_under`] and [`hold_under`]: the leaf's path, and the descriptor the
+/// walk reached it with.
+fn walk(root: &Path, rel: &str, mode: u32) -> io::Result<(PathBuf, OwnedFd)> {
     use std::os::fd::AsRawFd;
 
     DirBuilder::new().recursive(true).mode(mode).create(root)?;
@@ -88,7 +140,7 @@ pub(crate) fn ensure_under(root: &Path, rel: &str, mode: u32) -> io::Result<Path
             }
         };
     }
-    Ok(at)
+    Ok((at, dir))
 }
 
 /// Open `name` under `at` as a directory that is itself no symlink: `O_PATH` because nothing is read

@@ -1051,7 +1051,7 @@ pub(super) fn open_beneath(home: &Path, rel: &Path) -> io::Result<OwnedFd> {
 ///
 /// A symlink is unlinked rather than followed, which is the rule [`force_remove_dir_all`] states for
 /// a root it is handed: what the caller named is gone, and what it pointed at is untouched.
-fn remove_child(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
+pub(super) fn remove_child(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     let c = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
