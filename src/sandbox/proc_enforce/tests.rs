@@ -2059,6 +2059,65 @@ fn a_fifo_does_not_wedge_the_supervisor() {
     );
 }
 
+/// The same hazard on the exec side: an `execve` that names a FIFO is decided, not waited on.
+///
+/// The target's `#!` line is read before the call is answered, on the thread every notified open
+/// and `execve` of the cage is queued behind. A FIFO nobody writes to holds a reader's open until a
+/// writer comes, so naming one, by its path or by a descriptor held on it, stopped every later
+/// decision of that cage, and the teardown that joins the thread waited with them.
+#[test]
+fn an_execve_of_a_fifo_is_decided_not_waited_on() {
+    use std::os::unix::io::AsRawFd;
+    let dir = TmpDir::new();
+    let fifo = std::fs::canonicalize(dir.path())
+        .expect("canonical fixture root")
+        .join("pipe");
+    crate::testutil::make_fifo(&fifo);
+    let named = fifo.to_str().expect("utf-8 fixture path").to_string();
+    // A policy the read can change, with the target allowed: a `deny` would settle the call before
+    // the head is read, and so would a policy that governs nothing.
+    let policy = ProcPolicy::new(ProcMode::Confine, std::slice::from_ref(&named), &[]);
+    // Held `O_PATH`, so this test is no writer that would let a blocking open through.
+    let held = super::open_probe(&fifo).expect("hold the FIFO");
+    let me = std::process::id();
+    let decide = |dirfd: libc::c_int, path: &str, what: &str| {
+        let policy = policy.clone();
+        let path = std::ffi::CString::new(path).expect("a path without NUL");
+        crate::testutil::returns_within(Duration::from_secs(5), what, move || {
+            let parts = DecidingParts::new();
+            let addr = path.as_ptr() as u64;
+            decided(exec_verdict(
+                &parts.cx(&policy),
+                &[],
+                me,
+                dirfd,
+                addr,
+                0,
+                None,
+            ))
+        })
+    };
+
+    // Allowed, and left to the kernel, which answers `EACCES` to an `execve` of anything that is
+    // not a regular file: there is no `#!` line for a rule to be decided against.
+    assert_eq!(
+        decide(
+            libc::AT_FDCWD,
+            &named,
+            "an execve naming a FIFO by its path"
+        ),
+        (Verdict::Allow, named.clone())
+    );
+    assert_eq!(
+        decide(
+            held.as_raw_fd(),
+            "",
+            "an execve naming a FIFO by a descriptor"
+        ),
+        (Verdict::Allow, named.clone())
+    );
+}
+
 #[test]
 fn a_file_whose_content_does_not_match_is_read_normally() {
     need_host_programs!("/bin/cat");

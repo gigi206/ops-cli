@@ -97,7 +97,8 @@
 //! here. `execve("./script")` on a file whose first two bytes are `#!` is a single syscall — the
 //! kernel loads the named interpreter inside that same call — so the supervisor is notified of
 //! `./script` and never of `/bin/sh`. That one is closed: the target's first bytes are read through
-//! a vouched probe (the shape the open lens walks, [`exec_head`]), the `#!` line is parsed
+//! a vouched probe whose type is asked before it is read (the shape the open lens walks,
+//! [`exec_head`]), the `#!` line is parsed
 //! ([`crate::proc_policy::shebang_interpreter`]), and the interpreter is decided as well, on the
 //! stricter of the verdicts. Nor does the kernel stop at one such line: it re-enters its handler
 //! loop for the interpreter it has just loaded, so an interpreter that is itself a script hands the
@@ -957,6 +958,11 @@ fn read_binfmt_rules() -> Vec<crate::proc_policy::BinfmtRule> {
 /// inside the cage's root or it is an error here, because reading the *wrong* file is how a script
 /// gets its interpreter decided as something the cage chose.
 ///
+/// Read through [`script_head`], which opens nothing but a regular file and answers an empty head
+/// for anything else. This runs on the thread every notified open and `execve` of the cage waits
+/// behind, and that the teardown joins: a FIFO with no writer, named here and opened to read, would
+/// hold all three until a writer came.
+///
 /// The errno distinguishes two things for the caller. `ENOENT`/`ESRCH` mean this walk reached
 /// nothing -- the target is already gone, or the exec will fail on its own -- and the path's own
 /// verdict stands, once the caller has asked the cage whether the absence is the cage's too
@@ -970,9 +976,7 @@ fn exec_head(
     by_descriptor: bool,
     notif: Option<(libc::c_int, u64)>,
 ) -> Result<Vec<u8>, libc::c_int> {
-    use std::io::Read;
-    use std::os::unix::io::AsRawFd;
-    // An object the caller already holds is opened through the caller's **own** `/proc` entry, with
+    // An object the caller already holds is reached through the caller's **own** `/proc` entry, with
     // no mount asked to vouch for it -- the same exception the open lens makes for an anonymous
     // inode reached that way, and for the same reason: what `/proc/<pid>/fd/<n>` holds is what the
     // caller holds already, so reading it grants nothing. Two spellings reach it, and both were
@@ -998,31 +1002,18 @@ fn exec_head(
                         .into_owned()
                 })
         });
-    let mut file = if let Some(target) = held {
-        std::fs::File::open(target).map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?
+    // A probe on either side, never a plain open: what the caller holds can be a FIFO or a device as
+    // easily as what a path names, and [`script_head`] asks its type before anything opens it.
+    let probe = if let Some(target) = held {
+        open_probe(Path::new(&target))?
     } else {
         // `own` is the open lens's own question, asked the same way: a path that names the caller's
         // entry may land on an anonymous inode no mount can vouch for, and one the caller holds
         // grants nothing. It waives the mount check for such an inode only, never for a path.
         let own = caller_proc_path(pid, path).is_some();
-        let probe = probe_and_vouch(mounts, pid, &open_target_path(pid, dirfd, path), own)?;
-        // The probe is an `O_PATH` descriptor, which no read answers; reopening through it reads
-        // the object already resolved rather than whatever the path names a moment later -- and it
-        // is also where a file the cage may execute and not read says `EACCES`.
-        std::fs::File::open(format!("/proc/self/fd/{}", probe.as_raw_fd()))
-            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?
+        probe_and_vouch(mounts, pid, &open_target_path(pid, dirfd, path), own)?
     };
-    let mut head = vec![0u8; crate::proc_policy::SCRIPT_HEAD];
-    let mut filled = 0;
-    while filled < head.len() {
-        match file.read(&mut head[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.raw_os_error().unwrap_or(libc::EIO)),
-        }
-    }
-    head.truncate(filled);
+    let head = script_head(&probe)?;
     // Every path above named a pid, and a target reaped mid-decision can have its number reissued
     // under the read. Asked after it, like the argument list's own -- see [`target::open_target_mem`].
     if let Some((notif_fd, id)) = notif
