@@ -2051,10 +2051,6 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 /// [`super::lens::RECORD_KEEP`] are dropped. Neither name is identifiable by [`runtime_entry_pid`]
 /// anyway — the tail of both is not a bare number — so a prefix list that grew one could not sweep
 /// them by accident.
-///
-/// `dbus` is a legacy directory — the filtered host-bus proxy it belonged to was replaced by the
-/// private in-cage portal, so nothing writes there any more; sweeping it reclaims the residue an
-/// older version left behind, after which the directory simply stays empty.
 const RUNTIME_DIRS: &[(&str, &[&str])] = &[
     (
         "egress",
@@ -2073,7 +2069,6 @@ const RUNTIME_DIRS: &[(&str, &[&str])] = &[
     // decoys in (two entries, whatever the size of the policy).
     ("fs", &["control-", "mask-"]),
     ("tasks", &[""]),
-    ("dbus", &["proxy-"]),
 ];
 
 /// The launcher pid a runtime entry is keyed by, given the `prefixes` of its directory — or `None`
