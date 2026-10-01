@@ -795,8 +795,8 @@ impl Applier {
 /// or an address, with nothing in it that means anything to a shell or to a notification's
 /// markup, and no room for a sentence. Every refusal an honest proxy reports names such a host,
 /// taken from a request's authority by the parsers that require one, except the connection cap,
-/// which is refused before any request is read and names no host at all; that one is shown without
-/// one.
+/// which is refused before any request is read and names no host at all; that one is shown as
+/// `a connection`.
 ///
 /// The command that would allow the host is offered only where allowing is a sound suggestion, a
 /// host nothing allowed (`denied-default`), and spelled by the [`super::rule_destination`] and
@@ -824,7 +824,11 @@ fn announcement(
     };
     Some(Block {
         event: NotifyEvent::Network,
-        subject: format!("{host}:{port}"),
+        subject: if named {
+            format!("{host}:{port}")
+        } else {
+            "a connection".to_string()
+        },
         reason: reason.to_string(),
         detail: refusal_detail(reason).to_string(),
         fix,
@@ -856,6 +860,19 @@ fn refusal_detail(reason: &str) -> &'static str {
             "the supervisor's copy of the network policy refused it while a session rule changed"
         }
         "supervisor-busy" => "the supervisor was already opening as many connections as it opens",
+        "connection-cap" => {
+            "the proxy was already serving as many connections as `[network] max_connections` allows"
+        }
+        "body-buffer-cap" => {
+            "the proxy was already holding as much request-body data as it holds at once, so the \
+             request was not sent"
+        }
+        "signer-refused" => "a signer plugin did not sign the request, so it was not sent",
+        "signer-body-too-large" => {
+            "the body is above the ceiling for one a signer is told the digest of \
+             (`[network] body_max_mb` moves it)"
+        }
+        "bad-request" => "the request could not be forwarded as it was written",
         _ => "the network policy refused it",
     }
 }
@@ -1301,7 +1318,8 @@ mod tests {
                 "Blocked: leak.test:443|the request was carrying a configured secret out of the \
                  cage (credential leak refused)",
                 "Blocked: made-up.test:443|the network policy refused it",
-                "Blocked: :0|the network policy refused it",
+                "Blocked: a connection|the proxy was already serving as many connections as \
+                 `[network] max_connections` allows",
             ]
         );
     }
@@ -1361,9 +1379,9 @@ mod tests {
 
     #[test]
     fn every_refusal_category_the_proxy_emits_has_its_own_sentence() {
-        // A category with no sentence would announce a blank explanation. The list is the set of
-        // tokens the refusal sites record; the fallback covers one added later, but every token that
-        // exists today must be spelled out.
+        // A category with no sentence would announce the fallback's vague one. The list is the set
+        // of tokens a refusal reaching `ProxyCtx::outcome` carries, the announced ones; the
+        // fallback covers one added later, but every token that exists today must be spelled out.
         for reason in [
             "denied-default",
             "denied-by-rule",
@@ -1377,6 +1395,11 @@ mod tests {
             "http2-ask-unsupported",
             "supervisor-denied",
             "supervisor-busy",
+            "connection-cap",
+            "body-buffer-cap",
+            "signer-refused",
+            "signer-body-too-large",
+            "bad-request",
         ] {
             assert_ne!(
                 refusal_detail(reason),
