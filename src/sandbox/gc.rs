@@ -973,6 +973,9 @@ fn open_dir_handle(parent: Option<&OwnedFd>, name: &std::ffi::CStr) -> io::Resul
     open_dir_as(libc::O_PATH, parent, name)
 }
 
+/// The open behind [`open_dir_nofollow`] and [`open_dir_handle`], with `access` the one flag that
+/// tells them apart: a directory, never a link at `name`, and a descriptor that does not survive an
+/// `exec`.
 fn open_dir_as(
     access: libc::c_int,
     parent: Option<&OwnedFd>,
