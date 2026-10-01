@@ -144,8 +144,8 @@ they are not `[task.defaults]` knobs.
 A request is bounded before any of that is consulted. The plane runs in threads of the `sbx`
 process, not in the cage, so what a caller sends is host memory rather than cage memory and no
 cgroup ceiling applies to it: one parameter carries at most **1 MiB**, one whole request at most
-**8 MiB** counting its field names, and a request line that never ends is refused instead of being
-read. These are refusals of the framing, so they are answered before the quota is touched and
+**8 MiB** counting its field names and what each field costs to hold, and a request line that
+never ends is refused instead of being read. These are refusals of the framing, so they are answered before the quota is touched and
 before anything about the task is looked up. **At most 32 connections are served at once** on each
 of the plane's two sockets, since each one costs a host thread for as long as it lives; a caller
 past that is refused rather than queued. The two sockets have separate ceilings, so a cage filling

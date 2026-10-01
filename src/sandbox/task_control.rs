@@ -156,19 +156,38 @@ const MAX_CONCURRENT_CONNS: usize = 32;
 const CAGE_FIRST_REQUEST: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The most one request may make sbx hold, keys and values together, before anything about it has
-/// been validated. Held literally: [`read_payloads`] refuses a payload that is not valid UTF-8
-/// rather than expanding it, so what a field is charged is what a field costs.
+/// been validated. Each field is charged its bytes and the map entry it becomes
+/// ([`FIELD_ENTRY_BYTES`]), and [`read_payloads`] refuses a payload that is not valid UTF-8 rather
+/// than expanding it, so a field never costs more than it is charged.
 ///
 /// The per-payload ceiling alone does not bound a request: a caller sending a thousand empty
 /// payloads costs nothing per payload and a map entry each time. So what is bounded is the whole
-/// request — each field's own request line, framing included, plus its payload — which bounds the
-/// count as a consequence rather than by a second number. The line rather than the key, because a
-/// key is only what grows while a caller supplies one, and a field naming nothing is still a field.
+/// request — each field's own request line, framing included, plus its payload and its entry —
+/// which bounds the count as a consequence rather than by a second number. The line rather than the
+/// key, because a key is only what grows while a caller supplies one, and a field naming nothing is
+/// still a field.
 ///
 /// Eight payloads at the ceiling. A choice rather than a derivation, and the trigger for revisiting
 /// it is a task legitimately refused for it: a task declaring eight megabytes of parameters is not
 /// one this bound is in the way of.
 const MAX_REQUEST_BYTES: usize = 8 * MAX_PAYLOAD_BYTES;
+
+/// What each field of a request is charged on top of its own bytes, for the entry it becomes in
+/// the map [`read_payloads`] builds.
+///
+/// An entry of a `BTreeMap<String, String>` is two `String`s in a slot of a B-tree node, the share
+/// of that node its splits leave empty, and the allocations of the key and of a value that is not
+/// empty, each rounded up by the allocator. None of that grows with the field, so it weighs most on
+/// the smallest fields. Fields with keys of one to five characters, inserted in order or not, and
+/// values of none to eight bytes hold from about 105 to 160 bytes each, under glibc's allocator and
+/// under musl's, which the static build uses, against a line of about 13. Charged its line alone,
+/// a request within [`MAX_REQUEST_BYTES`] made sbx hold about ten times that ceiling, on each of
+/// [`MAX_CONCURRENT_CONNS`] connections at once.
+///
+/// 256 is above the most measured with room, so the map a request of small fields becomes, the
+/// shape that costs most for what it is charged, takes less than the request is charged. It
+/// changes nothing for a real task: a thousand fields are charged 256 KiB for their entries.
+const FIELD_ENTRY_BYTES: usize = 256;
 
 /// Read one request line, or `None` when the peer closed cleanly.
 ///
@@ -964,8 +983,13 @@ fn read_payloads(reader: &mut impl io::BufRead) -> io::Result<Result<Payloads, &
         // The **line** is charged, not the key alone. A key is what grows only while a caller
         // supplies one: `param  0` names nothing and declares nothing, so it cost zero and could be
         // repeated without end — the count this ceiling is supposed to bound as a consequence was
-        // not bounded at all. Charging the framing gives every field a floor, whatever it carries.
-        held = held.saturating_add(line.len()).saturating_add(len);
+        // not bounded at all. Charging the framing gives every field a floor, whatever it carries,
+        // and the entry the field becomes is charged with it: that entry, not the line, is most of
+        // what a small field costs to hold ([`FIELD_ENTRY_BYTES`]).
+        held = held
+            .saturating_add(line.len())
+            .saturating_add(len)
+            .saturating_add(FIELD_ENTRY_BYTES);
         if held > MAX_REQUEST_BYTES {
             return Ok(Err("request too large"));
         }

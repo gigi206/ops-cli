@@ -65,14 +65,14 @@ fn a_request_line_that_never_ends_is_refused_rather_than_buffered() {
     let _ = flood.join();
 }
 
-/// What a field is charged must be what a field costs.
+/// A payload must weigh what it is charged.
 ///
 /// `String::from_utf8_lossy` replaces every invalid byte with a three-byte U+FFFD, so a payload
 /// declared and charged `len` was retained as up to `3 * len`: [`MAX_REQUEST_BYTES`] — the one
 /// bound between the cage and a thread whose memory is sbx's, outside the cgroup bounding the
 /// cage's — admitted three times what its own doc says it admits, across all
 /// [`MAX_CONCURRENT_CONNS`] connections at once and with nothing recorded anywhere. Refusing the
-/// payload keeps the charge exact by construction; the second half pins that this is a refusal
+/// payload keeps its charge exact by construction; the second half pins that this is a refusal
 /// of bytes that are not text and not of text that is merely multi-byte.
 #[test]
 fn a_payload_that_is_not_utf8_is_refused_rather_than_expanded_past_the_ceiling() {
@@ -190,8 +190,9 @@ fn a_flood_of_empty_payloads_is_bounded_by_the_keys_it_is_made_of() {
 #[test]
 fn a_flood_of_fields_that_name_nothing_is_bounded_too() {
     let mut request = Vec::new();
-    // `param  0`: an empty key, a zero-length payload, and its closing newline. What it is
-    // charged is its request line, eight bytes, so that is what the count has to exceed.
+    // `param  0`: an empty key, a zero-length payload, and its closing newline. It is charged at
+    // least its request line, eight bytes, so this count exceeds the ceiling whatever else a
+    // field is charged.
     let field = b"param  0\n\n";
     let charged = b"param  0".len();
     for _ in 0..(MAX_REQUEST_BYTES / charged) + 1 {
@@ -201,6 +202,35 @@ fn a_flood_of_fields_that_name_nothing_is_bounded_too() {
     assert_eq!(
         read_payloads_of(request).expect("the read itself succeeds"),
         Err("request too large")
+    );
+}
+
+/// A field is charged the map entry it becomes, not only its line.
+///
+/// Its line is all a minimal field is made of, and a small part of what holding it costs (see
+/// [`FIELD_ENTRY_BYTES`]): charged its line alone, a request of such fields within
+/// [`MAX_REQUEST_BYTES`] held many times that ceiling, on each of [`MAX_CONCURRENT_CONNS`]
+/// connections at once. Each field here has a 13-byte line, so with the entry it is charged 269
+/// bytes: the 8 MiB hold 31 184 of them and refuse one more.
+#[test]
+fn a_field_is_charged_the_map_entry_it_becomes() {
+    let request = |count: usize| {
+        let mut request = Vec::new();
+        for i in 0..count {
+            request.extend_from_slice(format!("param {i:05} 0\n\n").as_bytes());
+        }
+        request.extend_from_slice(b"run\n");
+        request
+    };
+    let (params, _) = read_payloads_of(request(31_184))
+        .expect("the read itself succeeds")
+        .expect("the fields the ceiling holds are admitted");
+    assert_eq!(params.len(), 31_184);
+    assert_eq!(
+        read_payloads_of(request(31_185))
+            .expect("the read itself succeeds")
+            .err(),
+        Some("request too large")
     );
 }
 
