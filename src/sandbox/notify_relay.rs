@@ -1728,40 +1728,42 @@ mod tests {
         }
     }
 
-    /// A session bus standing in for the host's, and the address it answers at; `None` when this
+    /// A bus of the test's own listening at `sock`, up by the time it is returned; `None` when this
     /// machine has no `dbus-daemon`.
-    fn host_bus() -> Option<(TestBus, String)> {
-        use std::io::BufRead as _;
-        let mut child = std::process::Command::new("dbus-daemon")
-            .args(["--session", "--print-address", "--nofork"])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .ok()?;
-        let out = child.stdout.take().expect("piped stdout");
-        let bus = TestBus(child);
-        let mut address = String::new();
-        std::io::BufReader::new(out)
-            .read_line(&mut address)
-            .expect("the bus prints its address");
-        Some((bus, address.trim().to_string()))
-    }
-
-    /// The cage's private bus, configured by the document the portal writes, listening at `sock`.
-    /// Started from that document rather than from one of the test's own, so a configuration the
-    /// daemon refuses fails here before it fails a launch.
-    fn private_bus(dir: &std::path::Path, sock: &std::path::Path) -> TestBus {
-        let conf = dir.join("session.conf");
-        let sock = sock.to_str().expect("a UTF-8 test path");
-        std::fs::write(&conf, super::super::portal::session_conf(sock, dir, dir))
+    ///
+    /// Both sides of a relay run on one, the cage's private bus and the bus standing in for the
+    /// host's, and both are configured by the document the portal writes: a configuration the
+    /// daemon refuses fails here before it fails a launch, and the test reads no configuration of
+    /// the machine's own, which a `dbus-daemon` from the nix store would look for under `/etc`.
+    fn test_bus(sock: &std::path::Path) -> Option<TestBus> {
+        let dir = sock.parent().expect("a socket inside the test's directory");
+        let conf = sock.with_extension("conf");
+        let path = sock.to_str().expect("a UTF-8 test path");
+        std::fs::write(&conf, super::super::portal::session_conf(path, dir, dir))
             .expect("the configuration is written");
-        TestBus(
+        let bus = TestBus(
             std::process::Command::new("dbus-daemon")
                 .arg(format!("--config-file={}", conf.display()))
                 .arg("--nofork")
                 .stdout(std::process::Stdio::null())
                 .spawn()
-                .expect("dbus-daemon ran a moment ago"),
-        )
+                .ok()?,
+        );
+        let started = Instant::now();
+        while !sock.exists() {
+            assert!(
+                started.elapsed() < SOCKET_WAIT,
+                "the bus at {} never came up",
+                sock.display()
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        Some(bus)
+    }
+
+    /// The address of the bus listening at `sock`.
+    fn address_of(sock: &std::path::Path) -> String {
+        format!("unix:path={}", sock.display())
     }
 
     /// A host notifications daemon on the bus at `address` that counts every `Notify` as it
@@ -1816,14 +1818,7 @@ mod tests {
     /// notifications name there.
     async fn cage_app(sock: &std::path::Path) -> zbus::Connection {
         let started = Instant::now();
-        while !sock.exists() {
-            assert!(
-                started.elapsed() < SOCKET_WAIT,
-                "the private bus never came up"
-            );
-            async_io::Timer::after(POLL_INTERVAL).await;
-        }
-        let app = connection::Builder::address(format!("unix:path={}", sock.display()).as_str())
+        let app = connection::Builder::address(address_of(sock).as_str())
             .expect("a well-formed address")
             .build()
             .await
@@ -1854,13 +1849,13 @@ mod tests {
     /// object server's `Peer` interface read from the host's `/etc/machine-id` and answered with.
     #[test]
     fn the_relay_serves_one_call_at_a_time_and_its_teardown_does_not_wait_on_it() {
-        let Some((_host_bus, host_address)) = host_bus() else {
+        let dir = crate::testutil::TmpDir::new();
+        let (host, sock) = (dir.join("host"), dir.join("bus"));
+        let (Some(_host_bus), Some(_private_bus)) = (test_bus(&host), test_bus(&sock)) else {
             skip_incapable!("skipping: no dbus-daemon on PATH");
             return;
         };
-        let dir = crate::testutil::TmpDir::new();
-        let sock = dir.join("bus");
-        let _private_bus = private_bus(dir.path(), &sock);
+        let host_address = address_of(&host);
         let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let _daemon = fake_daemon(&host_address, &seen, true);
         let relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
@@ -1916,13 +1911,13 @@ mod tests {
     /// ceiling never reaches the relay at all: the in-cage daemon drops the app that sent it.
     #[test]
     fn a_call_over_the_ceiling_is_refused_whole_and_forwarded_nowhere() {
-        let Some((_host_bus, host_address)) = host_bus() else {
+        let dir = crate::testutil::TmpDir::new();
+        let (host, sock) = (dir.join("host"), dir.join("bus"));
+        let (Some(_host_bus), Some(_private_bus)) = (test_bus(&host), test_bus(&sock)) else {
             skip_incapable!("skipping: no dbus-daemon on PATH");
             return;
         };
-        let dir = crate::testutil::TmpDir::new();
-        let sock = dir.join("bus");
-        let _private_bus = private_bus(dir.path(), &sock);
+        let host_address = address_of(&host);
         let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let _daemon = fake_daemon(&host_address, &seen, false);
         let _relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
