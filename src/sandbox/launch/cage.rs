@@ -8,8 +8,9 @@
 //! The filters are not a step here: they belong to [`crate::sandbox::argv::compose`], so a path
 //! that never reaches this module still cannot produce an unfiltered cage.
 //!
-//! The memfds backing the seccomp filters are handed back rather than dropped: they are not
-//! close-on-exec, and closing one early would close the descriptor bubblewrap was told to read.
+//! The memfds backing the seccomp filters and the cage's environment travel inside the command
+//! ([`crate::sandbox::argv::CageCommand`]), which keeps them open until its exec and hands them to
+//! that exec alone: closing one early would close the descriptor bubblewrap was told to read.
 //!
 //! This is the part of a launch that the rest of the sandbox reaches into — the task engine, the
 //! task pool and the resolver each build a spec of their own and run it through the same argv.
@@ -86,8 +87,8 @@ pub(super) fn run_status(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
 ) -> i32 {
-    let (prog, args, keep_open) = match cage_command(bwrap, spec, limits) {
-        Ok(cmd) => cmd,
+    let mut command = match cage_command(bwrap, spec, limits) {
+        Ok(cage) => cage.into_command(),
         Err(e) => {
             // Not only the filter: this step also builds the descriptor carrying the cage's
             // environment, and naming the wrong one would send a reader looking at `[seccomp]`.
@@ -95,9 +96,6 @@ pub(super) fn run_status(
             return 1;
         }
     };
-    let mut command = Command::new(prog);
-    command.args(args);
-    crate::sandbox::memfd::inherit_across_exec(&mut command, &keep_open);
     match command.status() {
         Ok(status) => status_code(status),
         Err(e) => {
@@ -147,19 +145,16 @@ pub(super) fn run_captured(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
 ) -> (i32, String) {
-    let (prog, args, keep_open) = match cage_command(bwrap, spec, limits) {
-        Ok(cmd) => cmd,
+    let mut command = match cage_command(bwrap, spec, limits) {
+        Ok(cage) => cage.into_command(),
         Err(e) => return (1, format!("cannot prepare the sandbox: {e}")),
     };
-    let mut command = Command::new(prog);
     command
-        .args(args)
         // No stdin, as `output()` gave it: this path is non-interactive, and the terminal it
         // reports to is the operator's.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    crate::sandbox::memfd::inherit_across_exec(&mut command, &keep_open);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return (1, format!("failed to launch the sandbox: {e}")),
@@ -264,25 +259,25 @@ fn cage_output_line(line: &str) -> String {
 /// it routes the launch through the netns holder so the namespace carries a `dummy0` interface (see
 /// [`crate::sandbox::netns`]), and for every other spec `holder_wrap` is a byte-for-byte passthrough.
 ///
-/// The returned files are the memfds behind the seccomp filters and the cage's environment. They are
-/// close-on-exec in this process and bwrap reads them at the exec, so the caller prepares that exec
-/// with [`crate::sandbox::memfd::inherit_across_exec`] and keeps them alive until the process it
-/// starts has been replaced: dropping them early closes the descriptors bwrap is told to read.
+/// The memfds behind the seccomp filters and the cage's environment travel inside the returned
+/// command, through both wrappers, so whatever starts it hands them to bwrap
+/// ([`crate::sandbox::argv::CageCommand`]).
 pub(in crate::sandbox) fn cage_command(
     bwrap: &Path,
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
-) -> io::Result<(PathBuf, Vec<OsString>, Vec<File>)> {
-    let (argv, keep_open) = crate::sandbox::argv::compose(spec)?;
-    let (holder_prog, holder_argv) =
-        crate::sandbox::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
+) -> io::Result<crate::sandbox::argv::CageCommand> {
+    let cage = crate::sandbox::argv::compose(bwrap, spec)?.wrapped(|bwrap, argv| {
+        crate::sandbox::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref())
+    });
     // The launch's own decision when it took one, so the cage carries the limits its contract
     // names; otherwise the one `wrap` takes here.
-    let (prog, args) = match &spec.limit_scope {
-        Some(scope) => scope.wrap(&holder_prog, holder_argv, &spec.cage_slug),
-        None => crate::sandbox::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug),
-    };
-    Ok((prog, args, keep_open))
+    Ok(match &spec.limit_scope {
+        Some(scope) => cage.wrapped(|program, args| scope.wrap(program, args, &spec.cage_slug)),
+        None => cage.wrapped(|program, args| {
+            crate::sandbox::cgroup::wrap(program, args, limits, &spec.cage_slug)
+        }),
+    })
 }
 
 /// What the pty child exits with when the cage could not be entered at all — the descriptors could
@@ -319,17 +314,14 @@ pub(super) fn exec(
             "internal error: a private-tty sandbox must be launched through the pty supervisor",
         );
     }
-    // `keep_open` stays alive until the exec replaces this process (or, on failure, until this
-    // returns), so bwrap can read the inherited filter descriptors.
-    let (prog, args, keep_open) = match cage_command(bwrap, spec, limits) {
-        Ok(cmd) => cmd,
+    // The command owns the descriptors, so they stay open until the exec replaces this process,
+    // or on failure until this returns. `exec` runs the registered `pre_exec` closures too, since
+    // it reaches the same `do_exec` a spawn does, so they are cleared here exactly as they are on
+    // the forking paths.
+    let mut command = match cage_command(bwrap, spec, limits) {
+        Ok(cage) => cage.into_command(),
         Err(e) => return e,
     };
-    let mut command = Command::new(prog);
-    command.args(args);
-    // `exec` runs the registered `pre_exec` closures too — it reaches the same `do_exec` a spawn
-    // does — so the descriptors are cleared here exactly as they are on the forking paths.
-    crate::sandbox::memfd::inherit_across_exec(&mut command, &keep_open);
     command.exec()
 }
 
@@ -345,19 +337,16 @@ pub(super) fn supervise(
 ) -> io::Result<i32> {
     // The command is built *before* the fork — nothing between fork and exec may allocate, and the
     // anonymous files behind it (the seccomp filters and the cage's environment) must be created
-    // here so the child inherits their descriptors. `_keep_open` holds them through `pump`, so bwrap
-    // can still read them after the exec.
-    let (program, full_argv, _keep_open) = cage_command(bwrap, spec, limits)?;
-    // Recorded before the fork, for the child to clear between `fork` and `execv`. The parent keeps
-    // its copies close-on-exec, so nothing else this process launches inherits them — see
-    // [`crate::sandbox::memfd::write`] for what that window cost.
-    let inherit: Vec<libc::c_int> = {
-        use std::os::unix::io::AsRawFd;
-        _keep_open.iter().map(|f| f.as_raw_fd()).collect()
-    };
+    // here so the child inherits their descriptors. `cage` holds them through `pump`, so bwrap can
+    // still read them after the exec.
+    let cage = cage_command(bwrap, spec, limits)?;
+    // `inherit` is recorded before the fork, for the child to clear between `fork` and `execv`. The
+    // parent keeps its copies close-on-exec, so nothing else this process launches inherits them —
+    // see [`crate::sandbox::memfd::write`] for what that window cost.
+    let (program, full_argv, inherit) = cage.fork_parts();
     let program_c = cstring(program.as_os_str().as_bytes())?;
     let mut argv_owned = vec![program_c.clone()];
-    for arg in &full_argv {
+    for arg in full_argv {
         argv_owned.push(cstring(arg.as_bytes())?);
     }
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
@@ -394,7 +383,7 @@ pub(super) fn supervise(
             libc::_exit(CAGE_NEVER_STARTED)
         }
     };
-    // SAFETY: the closure honours the async-signal-safe contract above, and `_keep_open` holds the
+    // SAFETY: the closure honours the async-signal-safe contract above, and `cage` holds the
     // filter/environment descriptors open for the whole relay.
     unsafe { fork_with_pty(gui, in_child) }
 }

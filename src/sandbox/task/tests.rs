@@ -25,8 +25,8 @@ fn holds_open(dev: u64, ino: u64) -> bool {
 /// nothing (`memfd::tests::the_parents_own_copy_is_close_on_exec` pins that). What this pins is how
 /// long this process keeps it: no longer than the spawn that hands it to bwrap.
 ///
-/// The descriptors have done their whole job once `spawn` has forked, which is why they are
-/// taken by value here and the caller is handed back only the child.
+/// The descriptors have done their whole job once `spawn` has forked, which is why the command
+/// that holds them is taken by value here and the caller is handed back only the child.
 #[test]
 fn a_launchers_credential_memfds_do_not_outlive_the_fork_that_carries_them() {
     use std::os::unix::fs::MetadataExt;
@@ -40,15 +40,18 @@ fn a_launchers_credential_memfds_do_not_outlive_the_fork_that_carries_them() {
         "the fixture must start with the descriptor open"
     );
 
-    let mut child = spawn_launcher(
-        Command::new("/bin/sh")
-            .args(["-c", ":"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-        vec![args],
-    )
-    .expect("a launcher that exists");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", ":"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    super::super::memfd::inherit_across_exec(&mut command, vec![args]);
+    assert!(
+        holds_open(dev, ino),
+        "the prepared command holds the descriptor until it has spawned"
+    );
+    let mut child = spawn_launcher(command).expect("a launcher that exists");
 
     assert!(
         !holds_open(dev, ino),

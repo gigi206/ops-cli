@@ -21,7 +21,6 @@ use super::spec::{Mount, NetPolicy, SandboxSpec};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// What a live launch revealed about the sandbox. Each field is a fact the kernel
@@ -99,12 +98,9 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let spec = probe_spec(work.path(), script)?;
     // The composed list carries the mandatory seccomp filters, so `doctor` proves the real launch
     // path — hardening *and* filter — works on this host, not just the namespaces. The anonymous
-    // files behind it (the filters, and the cage's environment) stay alive until `output` returns,
-    // because bwrap reads them at startup.
-    let (argv, held) = super::argv::compose(&spec)?;
-    let mut command = Command::new(bwrap);
-    command.args(argv);
-    super::memfd::inherit_across_exec(&mut command, &held);
+    // files behind it (the filters, and the cage's environment) are the command's own, open for as
+    // long as it is, because bwrap reads them at startup.
+    let mut command = super::argv::compose(bwrap, &spec)?.into_command();
     // Spawned rather than run through `output()`, which waits without a deadline. The pipes are
     // asked for explicitly because `spawn` does not inherit `output()`'s: the probe writes a few
     // lines of `/proc` and never fills one.
@@ -116,7 +112,7 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let (_, timed_out) = super::cagewait::wait_capped(&mut child, deadline, PROBE_POLL)?;
     if timed_out {
-        drop(held);
+        drop(command);
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
@@ -126,7 +122,7 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
         ));
     }
     let out = child.wait_with_output()?;
-    drop(held);
+    drop(command);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     Ok(SmokeReport {

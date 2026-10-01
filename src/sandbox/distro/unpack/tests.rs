@@ -550,11 +550,12 @@ fn a_layer_unpacked_in_its_cage_lands_in_the_tree_and_reaches_nothing_else() {
         PROBE_HOST_FILE.to_string(),
         host_file.to_string_lossy().into_owned(),
     )];
-    let (mut command, files) = selfcage::command(&bwrap, &spec, binary).unwrap();
+    let mut command = selfcage::command(&bwrap, &spec, binary)
+        .unwrap()
+        .into_command();
     command.stdin(File::open(&layer).unwrap());
-    crate::sandbox::memfd::inherit_across_exec(&mut command, &files);
     let ran = crate::testutil::run_within(&mut command, "the probe in the unpack's cage");
-    drop(files);
+    drop(command);
     let stdout = &ran.stdout;
     let seen: Vec<&str> = stdout
         .lines()

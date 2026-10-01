@@ -40,7 +40,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use super::inspect::{self, InstalledTool};
@@ -657,19 +657,17 @@ fn run(
     limits: &super::cgroup::Limits,
     slug: &str,
 ) -> io::Result<InstallRun> {
-    let (argv, memfds) = super::argv::compose(spec)?;
-    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, slug);
-    // Through [`super::task::spawn_launcher`], which prepares the exec and closes this process's
-    // copies once bwrap holds its own: an install runs for minutes, and nothing here needs them
-    // past the spawn.
-    let mut child = super::task::spawn_launcher(
-        Command::new(prog)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-        memfds,
-    )?;
+    let mut command = super::argv::compose(bwrap, spec)?
+        .wrapped(|bwrap, argv| super::cgroup::wrap(bwrap, argv, limits, slug))
+        .into_command();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Through [`super::task::spawn_launcher`], which closes this process's copies of the
+    // descriptors once bwrap holds its own: an install runs for minutes, and nothing here needs
+    // them past the spawn.
+    let mut child = super::task::spawn_launcher(command)?;
 
     let mut out_pipe = child.stdout.take().expect("stdout piped");
     let mut err_pipe = child.stderr.take().expect("stderr piped");

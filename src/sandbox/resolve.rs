@@ -15,7 +15,6 @@ use crate::store::Layout;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The cage's scratch directory (also `HOME`): a private tmpfs, so a resolve command that writes a
 /// temp file has somewhere ephemeral without any host path.
@@ -236,15 +235,10 @@ pub(crate) fn resolve_url(
         ))
     })?;
     // Through the shared launch command rather than by composing an argv here: that is what carries
-    // the mandatory seccomp filters and the resource scope this cage is bounded by. `held` keeps the
-    // descriptors the composed list names — the filters and the cage's environment — open until
-    // bwrap has read them, and is read below to prepare the exec that inherits them.
-    let (prog, argv, held) = super::launch::cage_command(cage.bwrap, &spec, cage.limits)?;
-    let mut command = Command::new(prog);
-    command.args(argv);
-    // The descriptors are close-on-exec here; this is what carries them across the one exec that
-    // needs them. See [`super::memfd::write`].
-    super::memfd::inherit_across_exec(&mut command, &held);
+    // the mandatory seccomp filters and the resource scope this cage is bounded by, and the
+    // descriptors the composed list names (the filters and the cage's environment), which the
+    // command holds and hands to its exec.
+    let mut command = super::launch::cage_command(cage.bwrap, &spec, cage.limits)?.into_command();
     // Bounded like every other host-side step: the command is a profile's own — typically a `curl`
     // over a vendor API with no deadline of its own — and a plain `output()` waits as long as the
     // far end keeps the connection open without sending, which would hang the launch (and

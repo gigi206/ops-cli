@@ -49,9 +49,9 @@ pub(super) fn write(name: &CStr, bytes: &[u8]) -> io::Result<File> {
 /// Write `bytes` into an anonymous in-memory file, rewound, to be handed to another process over a
 /// socket rather than to an exec.
 ///
-/// The same file as [`write()`], under a name of its own because the guard over [`write()`] asks
-/// every caller to prepare the exec that inherits the file, and a file handed over a socket has no
-/// exec to prepare: the receiver gets its own copy with the message that carries it. It stays
+/// The same file as [`write()`], under a name of its own because the guard over [`write()`] admits
+/// only the composition of a cage among its callers, and a file handed over a socket has no exec to
+/// prepare: the receiver gets its own copy with the message that carries it. It stays
 /// close-on-exec here, and the caller drops it once it is sent, since it may hold a credential set.
 /// No seal: the receiver trusts the writer and copies the file once.
 pub(super) fn handed(name: &CStr, bytes: &[u8]) -> io::Result<std::os::fd::OwnedFd> {
@@ -65,20 +65,26 @@ pub(super) fn handed(name: &CStr, bytes: &[u8]) -> io::Result<std::os::fd::Owned
 /// `do_exec`. The parent's copies keep the flag, so a cage standing up while this one spawns
 /// inherits nothing.
 ///
-/// The caller must hold `files` alive across the spawn: this records descriptor **numbers**, and a
-/// file dropped before the fork would leave the child clearing the flag on whatever took its place.
-pub(crate) fn inherit_across_exec(command: &mut Command, files: &[File]) {
+/// `files` are **taken**: the closure owns them, so they stay open exactly as long as `command`
+/// does. The child clears the flag by descriptor number, and a file dropped before the fork would
+/// leave it clearing the flag on whatever took that number; owned by the command, none can be, and
+/// `std` never drops the closure in the child, which either execs or exits. Dropping `command` once
+/// it has spawned is what closes this process's copies.
+pub(crate) fn inherit_across_exec(command: &mut Command, files: Vec<File>) {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt as _;
 
     let fds: Vec<libc::c_int> = files.iter().map(|f| f.as_raw_fd()).collect();
     // SAFETY: the closure runs in the child between fork and exec, where only async-signal-safe
     // calls are allowed. It calls `fcntl` and, on failure, `Error::last_os_error`, which reads
-    // `errno` and allocates nothing.
+    // `errno` and allocates nothing. Naming `files` only moves them into the closure.
     unsafe {
-        command.pre_exec(move || match clear_cloexec(&fds) {
-            true => Ok(()),
-            false => Err(io::Error::last_os_error()),
+        command.pre_exec(move || {
+            let _owned = &files;
+            match clear_cloexec(&fds) {
+                true => Ok(()),
+                false => Err(io::Error::last_os_error()),
+            }
         });
     }
 }
@@ -89,8 +95,8 @@ pub(crate) fn inherit_across_exec(command: &mut Command, files: &[File]) {
 /// hand on. One that holds descriptors another exec of its own needs, without the flag, would pass
 /// them to this one too: every descriptor past the standard three is marked close-on-exec in the
 /// child first, then the flag is cleared on `files`. Registered before, so it runs before. The
-/// parent's copies are its own, and keep what they had.
-pub(crate) fn inherit_only(command: &mut Command, files: &[File]) {
+/// parent's copies are its own, and keep what they had. `files` are taken, as there.
+pub(crate) fn inherit_only(command: &mut Command, files: Vec<File>) {
     use std::os::unix::process::CommandExt as _;
     // SAFETY: the closure runs in the child between fork and exec, where only async-signal-safe
     // calls are allowed. `close_range`, `getrlimit` and `fcntl` are system calls that take no lock
@@ -153,95 +159,49 @@ mod tests {
     use std::io::Read;
     use std::process::Command;
 
-    /// Every file that stages one of these descriptors also prepares the exec that must inherit it.
+    /// Only the composition stages a descriptor for bwrap: every file [`super::write`] makes for
+    /// an exec is made by [`crate::sandbox::argv::compose`]'s own steps, the environment's in
+    /// `argv.rs` and the filters' in `seccomp.rs`, and leaves inside a
+    /// [`crate::sandbox::argv::CageCommand`], whose only ways out hand it to the exec.
     ///
-    /// Anchored on the **staging**, not on any one launch helper. The first form of this guard asked
-    /// which files call `cage_command`, and that was the wrong question by exactly the margin that
-    /// matters: two harnesses stage their own descriptors and spawn bwrap directly, so they were
-    /// invisible to it and broke on the change this guard exists to protect. What decides is who
-    /// creates a descriptor, since that is who owes the child a way to keep it.
+    /// This asked the other question before: whether every file that stages one also prepares the
+    /// exec that inherits it. That needed a list of the ways to stage one, and the list was short
+    /// twice, once missing two harnesses that spawned bubblewrap directly and once every plugin
+    /// cage; both times a suite that launches real cages found what reading did not. The type now
+    /// answers that question for every caller of `compose`, at compile time. What it cannot see is
+    /// a descriptor made outside it: [`super::write`] and the filters' own entry points are visible
+    /// to the whole of `sandbox`, and a file made there and handed to a `Command` by hand is the
+    /// mistake the type exists to rule out, back by another door.
     ///
-    /// The list of staging entry points is this guard's upkeep, and it has been short twice: keyed
-    /// on the shared launch command alone it missed two harnesses that stage their own descriptors
-    /// and spawn bubblewrap directly, and without the plugin path's own composition it missed every
-    /// plugin cage. Both times a suite that launches real cages found what reading did not. A new
-    /// way to stage a descriptor belongs in that list the day it is written.
-    ///
-    /// A scan of the source rather than a call graph, for the reason this crate's other
-    /// source-scanning guards exist: the failure is an **absence**, and nothing in the type system
-    /// makes a new spawn path ask for this. Its shape is quiet, too — bwrap reads these descriptors
-    /// by number off its own argument list, so a path that forgets the preparation hands it a
-    /// number that closed at the exec, and the cage refuses with `Bad file descriptor`, naming
-    /// neither this nor the filter it could not read.
+    /// Read on each file's production half, since a test that makes one to probe with starts
+    /// nothing a binary ships. The limit, since a text scan has one: a caller that imports
+    /// `write` under its bare name, or the module under another, is not seen.
     #[test]
-    fn every_file_that_stages_a_descriptor_prepares_its_exec() {
-        /// A call to one of the staging entry points, not a mention inside a longer name.
-        fn calls_it(text: &str) -> bool {
-            [
-                "cage_command(",
-                "memfd::write(",
-                "memfds(",
-                "argv::compose(",
-                "selfcage::command(",
-            ]
-            .iter()
-            .any(|needle| crate::testutil::calls_function(text, needle))
-        }
-        // Builds the command and hands its descriptors back beside it, starting nothing: each
-        // caller prepares the exec, and is held to that by `selfcage::command(` above.
-        const HANDS_THEM_BACK: &[&str] = &["src/sandbox/selfcage.rs"];
-        // Stages a descriptor as a file to probe the proxy's filters with, in this process, and
-        // starts no process at all.
-        const EXECS_NOTHING: &[&str] = &["src/sandbox/seccomp/proxy.rs"];
-        let listed = |path: &std::path::Path, list: &[&str]| list.iter().any(|l| path.ends_with(l));
-
-        let files = crate::testutil::crate_sources();
-
-        let mut callers = 0usize;
-        let mut offenders = Vec::new();
-        for path in &files {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            if !calls_it(&text) {
-                continue;
-            }
-            callers += 1;
-            // A listed file owes no preparation only while it starts nothing its way.
-            if listed(path, HANDS_THEM_BACK) || listed(path, EXECS_NOTHING) {
-                let starts = match listed(path, HANDS_THEM_BACK) {
-                    true => text.contains(".spawn("),
-                    false => text.contains("Command::new("),
-                };
-                if starts {
-                    offenders.push(path.display().to_string());
-                }
-                continue;
-            }
-            // `spawn_launcher` counts: it is the one launch helper that prepares on its caller's
-            // behalf, so a file handing it a command has already answered for its descriptors.
-            // `inherit_only` prepares through `inherit_across_exec`, after closing the rest.
-            let prepares = [
-                "inherit_across_exec",
-                "inherit_only",
-                "clear_cloexec",
-                "spawn_launcher(",
-            ]
-            .iter()
-            .any(|needle| text.contains(needle));
-            if !prepares {
-                offenders.push(path.display().to_string());
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "these stage a descriptor for bwrap and never prepare the exec that must inherit it, \
-             so bwrap is handed a number that closed at the exec: {offenders:?}"
-        );
-        // The scan itself has to keep finding something: a rename that made `calls_it` match
-        // nothing would leave this test green while guarding nothing at all.
-        assert!(
-            callers >= 4,
-            "the scan found {callers} files staging a descriptor, so it is no longer looking at \
-             the thing it guards"
+    fn only_the_composition_stages_a_descriptor_for_bwrap() {
+        const STAGES: &[&str] = &["src/sandbox/argv.rs", "src/sandbox/seccomp.rs"];
+        let stages_one = |text: &str| {
+            ["memfd::write(", "seccomp::memfds(", "ownership_noop_memfd("]
+                .iter()
+                .any(|needle| crate::testutil::calls_function(text, needle))
+        };
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+        let declared_test_only = crate::testutil::test_only_sources();
+        let mut staging: Vec<String> = crate::testutil::crate_sources()
+            .into_iter()
+            .filter(|file| {
+                !crate::testutil::is_test_only_source(file) && !declared_test_only.contains(file)
+            })
+            .filter(|file| {
+                let text = std::fs::read_to_string(file).unwrap_or_default();
+                stages_one(crate::testutil::production_half(&text))
+            })
+            .map(|file| file.display().to_string().replacen(&root, "", 1))
+            .collect();
+        staging.sort();
+        assert_eq!(
+            staging, STAGES,
+            "a descriptor for bwrap is made outside `compose`, where nothing hands it to the exec \
+             that must inherit it; build the command with `argv::compose` instead"
         );
     }
 
@@ -290,7 +250,7 @@ mod tests {
 
         let mut prepared = Command::new("/bin/sh");
         prepared.arg("-c").arg(&read_it);
-        super::inherit_across_exec(&mut prepared, std::slice::from_ref(&file));
+        super::inherit_across_exec(&mut prepared, vec![file]);
         let out = prepared.output().expect("the prepared child runs");
         assert_eq!(
             out.stdout, b"the-bytes",
@@ -309,6 +269,33 @@ mod tests {
         );
     }
 
+    /// The files a command is prepared with are the command's: open for as long as it is, and
+    /// closed with it. That is what lets no caller drop one before the spawn, and what closes this
+    /// process's copies once the command that spawned is gone.
+    #[test]
+    fn a_prepared_command_holds_its_files_open_until_it_is_dropped() {
+        use std::os::unix::fs::MetadataExt;
+        // Asked by identity rather than by number: a number freed by a close is reused at once,
+        // and other tests open descriptors on other threads.
+        let open = |dev: u64, ino: u64| {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("/proc/self/fd")
+                .flatten()
+                .any(|entry| {
+                    std::fs::metadata(entry.path()).is_ok_and(|m| m.dev() == dev && m.ino() == ino)
+                })
+        };
+        let file = super::write(c"sbx-test", b"held").expect("memfd");
+        let meta = file.metadata().expect("the anonymous file's identity");
+        let (dev, ino) = (meta.dev(), meta.ino());
+
+        let mut command = Command::new("/bin/true");
+        super::inherit_across_exec(&mut command, vec![file]);
+        assert!(open(dev, ino), "the command holds the file it was handed");
+        drop(command);
+        assert!(!open(dev, ino), "and closes it when it goes");
+    }
+
     /// A spawn prepared with `inherit_only` hands on the files it names and nothing else the
     /// spawning process holds without the flag, which `inherit_across_exec` alone lets through:
     /// the tap is started from a process holding the cage's descriptors for another exec.
@@ -319,7 +306,6 @@ mod tests {
         use std::os::unix::process::CommandExt as _;
         const HELD: libc::c_int = 50;
 
-        let handed = super::write(c"sbx-handed", b"handed").expect("memfd");
         let stray = super::write(c"sbx-stray", b"stray").expect("memfd");
         let raw = stray.as_raw_fd();
         // Held for another exec, the way a holder keeps the cage's descriptors: a copy without the
@@ -333,25 +319,31 @@ mod tests {
                 });
             }
         };
-        let read_both = format!(
-            "cat /proc/self/fd/{}; cat /proc/self/fd/{HELD}",
-            handed.as_raw_fd()
-        );
+        // One handed file per command, since each command takes the one it hands on.
+        let handed = || super::write(c"sbx-handed", b"handed").expect("memfd");
+        let read_both = |handed: &std::fs::File| {
+            format!(
+                "cat /proc/self/fd/{}; cat /proc/self/fd/{HELD}",
+                handed.as_raw_fd()
+            )
+        };
 
+        let handed_across = handed();
         let mut across = Command::new("/bin/sh");
-        across.arg("-c").arg(&read_both);
+        across.arg("-c").arg(read_both(&handed_across));
         hold(&mut across);
-        super::inherit_across_exec(&mut across, std::slice::from_ref(&handed));
+        super::inherit_across_exec(&mut across, vec![handed_across]);
         let out = across.output().expect("the child runs");
         assert_eq!(
             out.stdout, b"handedstray",
             "the control: the stray one crosses"
         );
 
+        let handed_only = handed();
         let mut only = Command::new("/bin/sh");
-        only.arg("-c").arg(&read_both);
+        only.arg("-c").arg(read_both(&handed_only));
         hold(&mut only);
-        super::inherit_only(&mut only, std::slice::from_ref(&handed));
+        super::inherit_only(&mut only, vec![handed_only]);
         let out = only.output().expect("the child runs");
         assert_eq!(out.stdout, b"handed");
     }

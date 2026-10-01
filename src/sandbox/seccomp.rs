@@ -519,10 +519,10 @@ fn programs(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
 }
 
 /// Write each compiled filter into an anonymous in-memory file, ready to hand to
-/// `bwrap --add-seccomp-fd`. The descriptors are close-on-exec and reach bwrap through
-/// [`super::memfd::inherit_across_exec`], which the caller must apply to the command it spawns;
-/// the caller must also keep the returned files alive until bwrap has read them. (No `memfd` seal
-/// is applied or needed — the file is written, rewound, and read once by bwrap.)
+/// `bwrap --add-seccomp-fd`. The descriptors are close-on-exec, and reach bwrap inside the command
+/// [`super::argv::compose`] builds, which holds them and hands them to the exec
+/// ([`super::argv::CageCommand`]). (No `memfd` seal is applied or needed — the file is written,
+/// rewound, and read once by bwrap.)
 pub(super) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
     programs(policy)
         .into_iter()
@@ -1380,7 +1380,6 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn run_probe(policy: &SeccompPolicy, probe: &str) -> Option<String> {
         use std::path::PathBuf;
-        use std::process::Command;
         let bwrap = sandbox_prereq()?;
         if !PathBuf::from("/usr/bin/python3").exists() {
             skip_incapable!("skipping seccomp cage test: no /usr/bin/python3 for the probe");
@@ -1390,15 +1389,12 @@ mod tests {
         // test also prefixed by hand would be loaded twice, and the mandatory denylist stacked
         // under a relaxation refuses what the relaxation was asked about.
         let spec = probe_spec(probe).with_seccomp(policy.clone());
-        let (argv, held) = super::super::argv::compose(&spec).expect("compose");
-        let mut command = Command::new(&bwrap);
-        command.args(argv);
-        // The filters and the cage's environment alike: a probe that skipped this would fail as
-        // `Bad file descriptor` rather than as a verdict about the policy.
-        super::super::memfd::inherit_across_exec(&mut command, &held);
-        let out = command.output().expect("launch bwrap");
-        // The anonymous files stay alive until bwrap has read the inherited descriptors.
-        drop(held);
+        // The command holds the filters and the cage's environment and hands them to bwrap.
+        let out = super::super::argv::compose(&bwrap, &spec)
+            .expect("compose")
+            .into_command()
+            .output()
+            .expect("launch bwrap");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
             out.status.success(),

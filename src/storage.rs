@@ -1166,13 +1166,14 @@ pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
     })
 }
 
-/// Build the command that formats `image`, taking its root's ownership from `seed`.
+/// Build the command that formats `image`, taking its root's ownership from `seed`. A caged one
+/// holds the descriptors its bwrap reads, and hands them to that exec.
 pub(crate) fn mkfs_command(
     mkfs: &Mkfs,
     image: &Path,
     seed: &Path,
     label: &str,
-) -> Result<(Command, Vec<std::fs::File>), String> {
+) -> Result<Command, String> {
     let args: Vec<OsString> = vec![
         OsString::from("-q"),
         OsString::from("-L"),
@@ -1186,7 +1187,7 @@ pub(crate) fn mkfs_command(
         Mkfs::Host(path) => {
             let mut c = Command::new(path);
             c.args(args);
-            Ok((c, Vec::new()))
+            Ok(c)
         }
         Mkfs::Owned {
             bwrap,
@@ -1229,15 +1230,9 @@ pub(crate) fn mkfs_command(
             .map_err(|e| format!("cannot build the mkfs cage: {e:?}"))?
             .with_cage_slug("mkfs".to_string());
             // The step every cage goes through, which compiles the mandatory syscall filters.
-            let (argv, held) = crate::sandbox::argv::compose(&spec)
-                .map_err(|e| format!("cannot build the mkfs cage: {e}"))?;
-            let mut c = Command::new(bwrap);
-            c.args(argv);
-            // Prepared here, where the descriptors and the command are both in hand: they are
-            // close-on-exec, and this is what carries them across the exec bwrap performs.
-            crate::sandbox::memfd::inherit_across_exec(&mut c, &held);
-            // Handed back rather than dropped here: bwrap reads them at the exec.
-            Ok((c, held))
+            crate::sandbox::argv::compose(bwrap, &spec)
+                .map(crate::sandbox::argv::CageCommand::into_command)
+                .map_err(|e| format!("cannot build the mkfs cage: {e}"))
         }
     }
 }
@@ -1323,7 +1318,7 @@ pub(crate) fn init(image: &Path, size_bytes: u64, label: &str, mkfs: &Mkfs) -> R
         f.set_len(size_bytes)
             .map_err(|e| format!("cannot size image: {e}"))?;
         drop(f);
-        let (mut cmd, _held) = mkfs_command(mkfs, image, &seed, label)?;
+        let mut cmd = mkfs_command(mkfs, image, &seed, label)?;
         run(&mut cmd).map(|_| ())
     });
     let _ = std::fs::remove_dir_all(&seed);
@@ -2603,17 +2598,14 @@ this line has no separator at all
         let image = Path::new("/data/vol/sbx-storage.btrfs");
         let seed = Path::new("/data/vol/sbx-storage.seed");
 
-        let (host, host_fds) = mkfs_command(
+        // The host's own tool runs uncaged: its whole argument list names no descriptor.
+        let host = mkfs_command(
             &Mkfs::Host(PathBuf::from("/usr/bin/mkfs.btrfs")),
             image,
             seed,
             "l",
         )
         .expect("the host's command");
-        assert!(
-            host_fds.is_empty(),
-            "the host's own tool runs uncaged, so there is nothing to keep open"
-        );
         assert_eq!(
             args(&host),
             vec![
@@ -2627,7 +2619,7 @@ this line has no separator at all
             ]
         );
 
-        let (owned, owned_fds) = mkfs_command(
+        let owned = mkfs_command(
             &Mkfs::Owned {
                 bwrap: PathBuf::from("/e/bwrap"),
                 store_nix: PathBuf::from("/d/store/nix"),
@@ -2646,7 +2638,20 @@ this line has no separator at all
             ("--add-seccomp-fd", "--add-seccomp-fd"),
             "{a:?}"
         );
-        assert_eq!(owned_fds.len(), 2, "one descriptor per filter, held open");
+        // One descriptor per filter, held open by the command: each number the list names is a
+        // filter this process still holds.
+        assert_eq!(
+            a.iter().filter(|x| *x == "--add-seccomp-fd").count(),
+            2,
+            "{a:?}"
+        );
+        for at in [2, 4] {
+            let held = std::fs::read_link(format!("/proc/self/fd/{}", a[at])).expect("held open");
+            assert!(
+                held.to_string_lossy().starts_with("/memfd:sbx-seccomp"),
+                "{held:?}"
+            );
+        }
         // Hardened like every other helper sbx runs, the network included: formatting an
         // image reaches nothing.
         for expected in [

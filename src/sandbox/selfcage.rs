@@ -49,7 +49,6 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 /// Where the binary is inside a helper's cage.
 pub(crate) const BINARY: &str = "/sbx";
@@ -111,18 +110,22 @@ pub(crate) fn spec(
         .map_err(|e| io::Error::other(format!("cannot build {who}'s cage: {e:?}")))
 }
 
-/// bwrap starting `spec`, and the descriptors it reads: the spec's own, then `binary`, the file the
-/// spec binds at [`BINARY`].
+/// bwrap starting `spec`, holding the descriptors it reads: the spec's own, then `binary`, the file
+/// the spec binds at [`BINARY`].
+///
+/// A [`CageCommand`](super::argv::CageCommand) rather than a `Command`, because the callers differ
+/// in how it becomes one: the netns holder's tap needs [`into_command_alone`], and the proxy hands
+/// it one more descriptor first. Each gives the process no standard input of the operator's.
+///
+/// [`into_command_alone`]: super::argv::CageCommand::into_command_alone
 pub(crate) fn command(
     bwrap: &Path,
     spec: &SandboxSpec,
     binary: File,
-) -> io::Result<(Command, Vec<File>)> {
-    let (argv, mut files) = super::argv::compose(spec)?;
-    files.push(binary);
-    let mut command = Command::new(bwrap);
-    command.args(argv).stdin(Stdio::null());
-    Ok((command, files))
+) -> io::Result<super::argv::CageCommand> {
+    let mut cage = super::argv::compose(bwrap, spec)?;
+    cage.hand(binary);
+    Ok(cage)
 }
 
 /// Whether the file `open` was opened on has been deleted since, as its `/proc` link says.

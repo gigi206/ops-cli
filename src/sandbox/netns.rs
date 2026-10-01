@@ -342,17 +342,17 @@ fn start_tap(tap: &TapWiring) -> io::Result<std::process::Child> {
     use std::os::fd::AsRawFd;
     let (binary, copy) = super::selfcage::running()?;
     let spec = tap_cage(binary.as_raw_fd(), copy, tap)?;
-    let (mut cmd, files) = super::selfcage::command(&tap.bwrap, &spec, binary)?;
     // This process holds the cage's own descriptors, its arguments and its environment with the
     // secrets in it, without the flag, for the exec of the cage's bubblewrap that follows: the tap
     // is handed its own files and none of those.
-    super::memfd::inherit_only(&mut cmd, &files);
+    let mut cmd = super::selfcage::command(&tap.bwrap, &spec, binary)?.into_command_alone();
     let child = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .pre_exec_pdeathsig()
         .spawn();
     // Read by bwrap by now, or never; closed here, so none reaches the cage this process becomes.
-    drop(files);
+    drop(cmd);
     child
 }
 

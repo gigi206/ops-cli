@@ -46,8 +46,8 @@ pub(crate) enum Mount {
     Tmpfs { dest: PathBuf },
     /// A copy of the file open as descriptor `fd` in the launcher, readable and executable at
     /// `dest`: what runs a program no path names any more (its file deleted since it was opened).
-    /// The descriptor must reach bwrap: the exec is prepared with
-    /// [`super::memfd::inherit_across_exec`].
+    /// The descriptor must reach bwrap: the command is handed it
+    /// ([`super::argv::CageCommand::hand`]), which hands it on to the exec.
     Copy {
         fd: std::os::fd::RawFd,
         dest: PathBuf,

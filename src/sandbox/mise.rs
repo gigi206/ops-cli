@@ -33,7 +33,6 @@ use crate::store::{self, Layout};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The nixpkgs attribute providing the mise engine.
 const MISE_ATTR: &str = "mise";
@@ -113,7 +112,8 @@ pub(crate) fn bin(root: &Path) -> PathBuf {
 /// isolated network namespace, and an environment cleared and rebuilt from exactly
 /// the keys mise needs. `project_binds` exposes the authorized project mise files
 /// (empty for a config-free invocation such as `--version`). Ensures the private
-/// home exists (owner-only) before returning the command.
+/// home exists (owner-only) before returning the command, which holds the descriptors bwrap reads
+/// ([`super::argv::CageCommand`]).
 ///
 /// `limits` and `slug` bound the cage and name it. mise is a program sbx did not write, run over
 /// files a project chose, so it is held to the ceilings the launch resolved like every other cage
@@ -127,7 +127,7 @@ fn command(
     args: &[OsString],
     limits: &super::cgroup::Limits,
     slug: &str,
-) -> io::Result<(Command, Vec<std::fs::File>)> {
+) -> io::Result<super::argv::CageCommand> {
     let home_src = ensure_home(layout)?;
     let store_nix = store::physical_path(layout, Path::new("/nix"));
     // The bundled `nix:` backend plugin, staged and registered for this helper's mise the way a
@@ -149,18 +149,10 @@ fn command(
     // The step every cage goes through: it compiles the mandatory syscall filters and puts the
     // environment on a descriptor. Nothing relaxes the filters here: `[seccomp] allow` is a
     // launch's grant to its own cage, not to a helper.
-    let (argv, held) = super::argv::compose(&spec)?;
-    // The resource scope. The launcher exec-chains into bwrap, so the descriptors below still
-    // reach it.
-    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, slug);
-    let mut cmd = Command::new(prog);
-    cmd.args(args);
-    // Prepared before the command leaves this function: the descriptors are close-on-exec, and the
-    // exec bwrap performs inherits them only because of this.
-    super::memfd::inherit_across_exec(&mut cmd, &held);
-    // Returned alongside, never dropped here: bwrap reads them at the exec, so closing one before
-    // the caller runs the command turns into `Invalid fd`.
-    Ok((cmd, held))
+    // Then the resource scope. The launcher exec-chains into bwrap, so the descriptors the command
+    // holds still reach it.
+    Ok(super::argv::compose(bwrap, &spec)?
+        .wrapped(|bwrap, argv| super::cgroup::wrap(bwrap, argv, limits, slug)))
 }
 
 /// Resolve a trusted project's mise `[env]` into sandbox environment variables.
@@ -187,7 +179,7 @@ pub(crate) fn resolve_env(
 ) -> io::Result<Vec<(String, String)>> {
     let binds = stage_files(stage_dir, files)?;
     let args = [OsString::from("env"), OsString::from("--json-extended")];
-    let (mut cmd, _seccomp) = command(
+    let mut cmd = command(
         bwrap,
         layout,
         mise_bin,
@@ -195,7 +187,8 @@ pub(crate) fn resolve_env(
         &args,
         limits,
         &format!("{slug}-mise"),
-    )?;
+    )?
+    .into_command();
     let out = cmd.output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
@@ -465,7 +458,7 @@ mod tests {
     fn the_cage_carries_the_mandatory_seccomp_denylist() {
         let dir = crate::testutil::TmpDir::new();
         let layout = Layout::under(&dir.path().join("sbx"));
-        let (cmd, keep_open) = command(
+        let cage = command(
             Path::new("/nix/store/abc-bwrap/bin/bwrap"),
             &layout,
             Path::new("/nix/store/abc-mise/bin/mise"),
@@ -475,9 +468,11 @@ mod tests {
             "demo-app-mise",
         )
         .expect("a cage command");
+        let keep_open = cage.files();
 
-        let argv: Vec<String> = cmd
-            .get_args()
+        let argv: Vec<String> = cage
+            .args()
+            .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         // Where the host can carry a scope, the launcher's prefix leads and bwrap is spliced in
@@ -541,7 +536,7 @@ mod tests {
             return;
         }
 
-        let (mut cmd, _seccomp) = command(
+        let mut cmd = command(
             &fake,
             &layout,
             Path::new("/nix/store/abc-mise/bin/mise"),
@@ -550,7 +545,8 @@ mod tests {
             &limits,
             "demo-app-mise",
         )
-        .expect("a cage command");
+        .expect("a cage command")
+        .into_command();
         cmd.status().expect("the recorded cage runs");
 
         let cgroup = std::fs::read_to_string(&seen).unwrap();
@@ -911,7 +907,7 @@ mod run_tests {
         assert!(rev_root.is_dir(), "per-revision mise gcroot missing");
 
         // run `mise --version` from sbx's store, hermetic and offline
-        let (mut cmd, _seccomp) = command(
+        let mut cmd = command(
             &bwrap,
             &layout,
             &mise_bin,
@@ -920,7 +916,8 @@ mod run_tests {
             &crate::sandbox::cgroup::Limits::default(),
             "demo-app-mise",
         )
-        .expect("build the mise command");
+        .expect("build the mise command")
+        .into_command();
         let out = cmd.output().expect("run mise");
         assert!(
             out.status.success(),

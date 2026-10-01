@@ -455,9 +455,6 @@ pub(crate) struct SignerProcess {
     channel: std::os::unix::net::UnixStream,
     /// The headers this plugin's manifest declared, which bound every answer it gives.
     sets: Vec<String>,
-    /// The descriptor the cage's environment was read from, held open for the child's whole life:
-    /// bwrap reads it at startup, and dropping it earlier would race that read.
-    _env: Vec<std::fs::File>,
 }
 
 impl SignerProcess {
@@ -491,7 +488,6 @@ impl SignerProcess {
             child,
             writer,
             reader_side,
-            env,
         } = super::resolver::spawn_caged_plugin(
             bwrap,
             &plan,
@@ -505,7 +501,6 @@ impl SignerProcess {
             child: Some(child),
             channel: writer,
             sets: plugin.signer.sets_headers.clone(),
-            _env: env,
         };
         me.handshake(plugin, host, credential, reader_side)?;
         Ok(me)
@@ -574,7 +569,6 @@ impl SignerProcess {
             child: None,
             channel: ours,
             sets: sets.iter().map(ToString::to_string).collect(),
-            _env: Vec::new(),
         };
         (me, theirs)
     }

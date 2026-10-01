@@ -139,9 +139,6 @@ pub(super) struct CagedPlugin {
     pub(super) writer: std::os::unix::net::UnixStream,
     /// The same connection, cloned, for the buffered reader that consumes answers.
     pub(super) reader_side: std::os::unix::net::UnixStream,
-    /// The descriptor files [`plugin_cage_command`] produced, held for as long as bwrap needs to
-    /// read them.
-    pub(super) env: Vec<std::fs::File>,
 }
 
 /// Spawn a plugin in its cage on a socket pair, with `deadline` on both directions of our end.
@@ -166,23 +163,18 @@ pub(super) fn spawn_caged_plugin(
     limits: &super::cgroup::Limits,
 ) -> io::Result<CagedPlugin> {
     use std::os::unix::net::UnixStream;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     let (ours, theirs) = UnixStream::pair()?;
     ours.set_read_timeout(Some(deadline))?;
     ours.set_write_timeout(Some(deadline))?;
-    let (prog, argv, env) = plugin_cage_command(bwrap, plan, limits)?;
+    let mut command = plugin_cage_command(bwrap, plan, limits)?.into_command();
 
     let reader_side = ours.try_clone()?;
-    let mut command = Command::new(prog);
     command
-        .args(argv)
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs.try_clone()?)))
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
         .stderr(Stdio::null());
-    // The descriptors the composition staged are close-on-exec; this is what carries them into the
-    // one exec that reads them. See [`super::memfd::write`].
-    super::memfd::inherit_across_exec(&mut command, &env);
     let child = command.spawn().map_err(|e| {
         io::Error::other(format!(
             "could not start the `{}` plugin: {e}",
@@ -190,11 +182,13 @@ pub(super) fn spawn_caged_plugin(
         ))
     })?;
 
+    // The descriptors bwrap read are the command's, and go with it: bwrap holds its own copies once
+    // `spawn` has returned, so nothing here needs them for the plugin's life.
+    drop(command);
     Ok(CagedPlugin {
         child,
         writer: ours,
         reader_side,
-        env,
     })
 }
 
@@ -344,14 +338,13 @@ pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
 /// The ceilings are the **host's** own ([`plugin_cage_limits`]): a plugin is sbx's machinery, not
 /// the project's, and a project must not be able to say how much of the host one may consume.
 ///
-/// The returned files are descriptors bwrap is told to read: the cage's environment, and the
-/// compiled seccomp filters. They must stay open until bwrap has read them — which for a
-/// long-running child means for as long as the child lives.
+/// The command holds the descriptors bwrap is told to read, the cage's environment and the compiled
+/// seccomp filters, and hands them to its exec ([`super::argv::CageCommand`]).
 pub(super) fn plugin_cage_command(
     bwrap: &Path,
     plan: &CagePlan<'_>,
     limits: &super::cgroup::Limits,
-) -> io::Result<(PathBuf, Vec<OsString>, Vec<std::fs::File>)> {
+) -> io::Result<super::argv::CageCommand> {
     super::launch::cage_command(bwrap, &cage_spec_for(plan)?, limits)
 }
 
@@ -639,12 +632,8 @@ fn run_within(
         args: vec![OsString::from(reff)],
         brokers,
     };
-    // `env` holds the descriptors open until bwrap has run, and prepares the exec that inherits
-    // them — they are close-on-exec until then.
-    let (prog, argv, env) = plugin_cage_command(bwrap, &plan, limits)?;
-    let mut cmd = Command::new(prog);
-    cmd.args(argv);
-    super::memfd::inherit_across_exec(&mut cmd, &env);
+    // The command holds the descriptors open until it is dropped, and hands them to its exec.
+    let mut cmd = plugin_cage_command(bwrap, &plan, limits)?.into_command();
     let out = match output_within(
         &mut cmd,
         deadline,
@@ -1458,7 +1447,8 @@ mod tests {
 
         let p = plugin_in(dir.path(), SandboxGrant::default());
         let spec = cage_spec_for(&plan_for(&p, "test://x")).expect("a cage spec");
-        let (argv, keep_open) = crate::sandbox::argv::compose(&spec).expect("a cage argv");
+        let cage = crate::sandbox::argv::compose(Path::new("/bwrap"), &spec).expect("a cage argv");
+        let (argv, keep_open) = (cage.args(), cage.files());
 
         // Two filters, each on its own descriptor, ahead of everything else — the same shape the
         // agent's launch emits.
@@ -1471,7 +1461,7 @@ mod tests {
         assert_eq!(fds, vec![0, 2], "{argv:?}");
         assert!(
             keep_open.len() >= 2,
-            "the descriptors bwrap is told to read are held open by the caller"
+            "the descriptors bwrap is told to read are held open by the command"
         );
         // ...and the namespace hardening is still there behind them.
         for flag in [

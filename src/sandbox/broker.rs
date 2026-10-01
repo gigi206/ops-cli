@@ -1027,9 +1027,6 @@ pub(crate) struct PluginProcess {
     /// Our end of the pair. The plugin has the other as both its stdin and its stdout.
     reader: io::BufReader<std::os::unix::net::UnixStream>,
     writer: std::os::unix::net::UnixStream,
-    /// The descriptor the cage's environment was read from, held open for the child's whole life:
-    /// bwrap reads it at startup, and dropping it earlier would race that read.
-    _env: Vec<std::fs::File>,
 }
 
 impl PluginProcess {
@@ -1062,7 +1059,6 @@ impl PluginProcess {
             child,
             writer,
             reader_side,
-            env,
         } = super::resolver::spawn_caged_plugin(
             bwrap,
             &plan,
@@ -1075,7 +1071,6 @@ impl PluginProcess {
             max_frame: plugin.broker.max_frame,
             reader: io::BufReader::new(reader_side),
             writer,
-            _env: env,
         };
         me.handshake(plugin, allow, marker)?;
         Ok(me)

@@ -337,14 +337,14 @@ mod process {
     ) -> io::Result<Ended> {
         let (binary, copy) = selfcage::running()?;
         let spec = cage(binary.as_raw_fd(), copy, rootfs, args)?;
-        let (mut command, files) = selfcage::command(bwrap, &spec, binary)?;
+        let mut command = selfcage::command(bwrap, &spec, binary)?.into_command();
         command
             .stdin(layer)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        crate::sandbox::memfd::inherit_across_exec(&mut command, &files);
         let started = command.spawn();
-        drop(files);
+        // Read by bwrap by now, or never: this process's copies go at once.
+        drop(command);
         collect(started?, deadline)
     }
 }

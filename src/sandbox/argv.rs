@@ -29,7 +29,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn lit(s: &str) -> OsString {
     OsString::from(s)
@@ -44,8 +44,8 @@ fn path(p: &Path) -> OsString {
 /// process happens to hold — bwrap refuses it loudly instead.
 const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
 
-/// The bubblewrap argument list for `spec`, ready to exec, plus the descriptors it must inherit to
-/// read what that list points at: the compiled seccomp filters, then the cage's environment.
+/// `bwrap` running `spec`: its argument list, and the descriptors that list makes it read, the
+/// compiled seccomp filters then the cage's environment, bound in one [`CageCommand`].
 ///
 /// This is the **one** place a spec becomes a runnable argument list, and that is why the filters
 /// are compiled here rather than by each caller. They are mandatory on every launch path, and a
@@ -55,12 +55,10 @@ const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
 /// relaxation a trusted `[seccomp] allow` grants travels on the spec ([`SandboxSpec::seccomp`]), so
 /// a cage that declared none gets the full mandatory denylist.
 ///
-/// **Hold the returned files** until bwrap has read them — dropping one closes a number the argv
-/// points at — and prepare the command with [`super::memfd::inherit_across_exec`]: the descriptors
-/// are close-on-exec in this process, so an exec that was not prepared reaches bwrap with those
-/// numbers already closed. Both kinds have that same lifetime, which is why they come back in one
-/// vector.
-pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
+/// The descriptors come back inside the command rather than beside it for the same reason: a step
+/// the caller has to take to keep them, and another to hand them to the exec, are steps some caller
+/// will not take ([`CageCommand`]).
+pub(crate) fn compose(bwrap: &Path, spec: &SandboxSpec) -> io::Result<CageCommand> {
     let mut argv = to_argv(spec);
     let mut filters = crate::sandbox::seccomp::memfds(&spec.seccomp)?;
     // A cage rooted in its own namespace holds one id, so a change of ownership can only fail
@@ -78,7 +76,105 @@ pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File
         held.push(file);
     }
     full.extend(argv);
-    Ok((full, held))
+    Ok(CageCommand {
+        program: bwrap.to_path_buf(),
+        args: full,
+        files: held,
+    })
+}
+
+/// A cage's launch command before it is a process: the program, its argument list, and the
+/// descriptors that list names by number (the compiled seccomp filters, the cage's environment,
+/// and whatever a caller [hands](CageCommand::hand) it).
+///
+/// The three travel together because none of them works alone. bwrap reads each descriptor by the
+/// number its argument list carries, and the descriptors are close-on-exec in this process
+/// ([`super::memfd::write`]). A command started from the list without them, or with them but
+/// without the preparation that clears the flag in its child, reaches bwrap with those numbers
+/// already closed, and the cage refuses with `Bad file descriptor` on whichever path that was. Here
+/// the only ways out carry the descriptors along, so neither mistake can be written:
+///
+/// - [`CageCommand::into_command`], a `Command` that owns the descriptors and hands them to its own
+///   exec and to no other;
+/// - [`CageCommand::into_command_alone`], the same for a process that holds inheritable descriptors
+///   of its own and must pass none of them on;
+/// - [`CageCommand::fork_parts`], the one place the raw numbers leave, for the pty supervisor's fork
+///   written by hand. The value it borrows from holds the descriptors, so that caller keeps it
+///   until its child has exec'd.
+///
+/// What this does **not** check: that the list carries the filters and the resource scope its
+/// launch owes, which the guard in this module's tests does, and that a number a caller wrote into
+/// the cage's own command is among the descriptors held here. Two such numbers exist: the proxy's
+/// `__proxy <fd>` and `selfcage`'s `/proc/self/fd/<binary>`.
+#[derive(Debug)]
+pub(crate) struct CageCommand {
+    program: PathBuf,
+    args: Vec<OsString>,
+    files: Vec<File>,
+}
+
+impl CageCommand {
+    /// The same command behind a wrapper that rewrites what is executed first: the netns holder,
+    /// the resource scope. `wrap` is handed the program and its arguments and never sees the
+    /// descriptors, which are the same after it, since a wrapper changes what runs bwrap and never
+    /// what bwrap reads.
+    pub(crate) fn wrapped(
+        self,
+        wrap: impl FnOnce(&Path, Vec<OsString>) -> (PathBuf, Vec<OsString>),
+    ) -> Self {
+        let (program, args) = wrap(&self.program, self.args);
+        Self {
+            program,
+            args,
+            files: self.files,
+        }
+    }
+
+    /// Hand the cage one more descriptor, one its spec already names by number: the binary
+    /// [`super::selfcage`] binds, the proxy's end of its link.
+    pub(crate) fn hand(&mut self, file: File) {
+        self.files.push(file);
+    }
+
+    /// The command, prepared: it owns the descriptors, so they stay open exactly as long as it does,
+    /// and its exec inherits them while no other does ([`super::memfd::inherit_across_exec`]). Once
+    /// it has spawned, dropping it closes this process's copies.
+    pub(crate) fn into_command(self) -> std::process::Command {
+        let mut command = std::process::Command::new(self.program);
+        command.args(self.args);
+        super::memfd::inherit_across_exec(&mut command, self.files);
+        command
+    }
+
+    /// [`Self::into_command`] for a process that holds inheritable descriptors of its own, as the
+    /// netns holder does: every descriptor past the standard three is marked close-on-exec in the
+    /// child before these are cleared ([`super::memfd::inherit_only`]).
+    pub(crate) fn into_command_alone(self) -> std::process::Command {
+        let mut command = std::process::Command::new(self.program);
+        command.args(self.args);
+        super::memfd::inherit_only(&mut command, self.files);
+        command
+    }
+
+    /// The program, its arguments, and the numbers its child clears close-on-exec on, for a fork
+    /// that cannot go through `Command`: the pty supervisor's. Borrowed, so the descriptors stay
+    /// open for as long as the caller holds this command.
+    pub(in crate::sandbox) fn fork_parts(&self) -> (&Path, &[OsString], Vec<libc::c_int>) {
+        let fds = self.files.iter().map(AsRawFd::as_raw_fd).collect();
+        (&self.program, &self.args, fds)
+    }
+
+    /// The argument list, for a test that asserts on it.
+    #[cfg(test)]
+    pub(crate) fn args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// The descriptors held, for a test that asserts on them.
+    #[cfg(test)]
+    pub(crate) fn files(&self) -> &[File] {
+        &self.files
+    }
 }
 
 /// The bwrap flags that load `filters` as seccomp filters, placed before the rest of the argv. Each
@@ -322,9 +418,7 @@ pub(in crate::sandbox) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     a
 }
 
-/// Launch `spec` through the real bwrap and wait for it. The one correct way to do that from a
-/// test: the descriptors stay open across the run, which a hand-assembled `Command` would drop —
-/// bwrap then reports `Invalid fd` instead of a result.
+/// Launch `spec` through the real bwrap and wait for it.
 ///
 /// Deliberately not the launch path: nothing here wraps the cage in a resource scope, because a
 /// scope's unit name has to be unique among live units and a test binary stands many cages up under
@@ -332,15 +426,7 @@ pub(in crate::sandbox) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
 /// what the callers of this helper are asking about.
 #[cfg(test)]
 pub(super) fn run_bwrap(bwrap: &Path, spec: &SandboxSpec) -> io::Result<std::process::Output> {
-    let (argv, held) = compose(spec)?;
-    let mut command = std::process::Command::new(bwrap);
-    command.args(argv);
-    // The descriptors are close-on-exec in this process, so this is what carries them across the one
-    // exec that has to read them.
-    super::memfd::inherit_across_exec(&mut command, &held);
-    let out = command.output();
-    drop(held);
-    out
+    compose(bwrap, spec)?.into_command().output()
 }
 
 /// The arguments the descriptor carries, read back as bwrap will parse them — the cage's
@@ -582,7 +668,8 @@ mod tests {
             vec![("FOO".to_string(), injected.clone())],
             NetPolicy::Shared,
         );
-        let e = compose(&plain).expect_err("a NUL-bearing value must refuse the launch");
+        let e = compose(Path::new("/bwrap"), &plain)
+            .expect_err("a NUL-bearing value must refuse the launch");
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
         assert!(e.to_string().contains("FOO"), "{e}");
         assert!(
@@ -594,13 +681,13 @@ mod tests {
         // stdout), and for a name — bwrap reads both off the same descriptor.
         let secret = spec(vec![], vec![], NetPolicy::Shared)
             .with_secret_env(vec![("TOKEN".to_string(), injected)]);
-        assert!(compose(&secret).is_err());
+        assert!(compose(Path::new("/bwrap"), &secret).is_err());
         let named = spec(
             vec![],
             vec![("A\0--bind".to_string(), "x".to_string())],
             NetPolicy::Shared,
         );
-        assert!(compose(&named).is_err());
+        assert!(compose(Path::new("/bwrap"), &named).is_err());
 
         // An ordinary environment is untouched by the check.
         let fine = spec(
@@ -608,7 +695,7 @@ mod tests {
             vec![("PATH".to_string(), "/bin".to_string())],
             NetPolicy::Shared,
         );
-        assert!(compose(&fine).is_ok());
+        assert!(compose(Path::new("/bwrap"), &fine).is_ok());
     }
 
     #[test]
@@ -728,7 +815,8 @@ mod tests {
             OsString::from("%s\n"),
             OsString::from(ENV_ARGS_PLACEHOLDER),
         ];
-        let (argv, held) = compose(&with_env).expect("compose");
+        let cage = compose(Path::new("/bwrap"), &with_env).expect("compose");
+        let (argv, held) = (cage.args(), cage.files());
 
         let args = argv
             .iter()
@@ -766,7 +854,9 @@ mod tests {
             vec![("API_KEY".to_string(), "a\0b".to_string())],
             NetPolicy::Shared,
         );
-        let err = compose(&poisoned_value).unwrap_err().to_string();
+        let err = compose(Path::new("/bwrap"), &poisoned_value)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("the value of `API_KEY`"),
             "a poisoned value is found by naming its key: {err}"
@@ -777,7 +867,9 @@ mod tests {
             vec![("PO\0ISON".to_string(), "harmless".to_string())],
             NetPolicy::Shared,
         );
-        let err = compose(&poisoned_name).unwrap_err().to_string();
+        let err = compose(Path::new("/bwrap"), &poisoned_name)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("a variable name contains a NUL byte"),
             "a poisoned name is described, not quoted: {err}"
@@ -814,7 +906,9 @@ mod tests {
         .expect("spec")
         .with_secret_env(vec![("PGPASSWORD".to_string(), SENTINEL.to_string())]);
 
-        let (argv, files) = compose(&spec).expect("argv");
+        let cage = compose(Path::new("/bwrap"), &spec).expect("argv");
+
+        let (argv, files) = (cage.args(), cage.files());
         let flat: Vec<String> = argv
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -881,7 +975,8 @@ mod tests {
             vec![OsString::from("/bin/true")],
         )
         .expect("spec");
-        let (argv, _files) = compose(&spec).expect("argv");
+        let cage = compose(Path::new("/bwrap"), &spec).expect("argv");
+        let (argv, _files) = (cage.args(), cage.files());
         assert!(
             !argv.iter().any(|a| a == "--args"),
             "an unused mechanism must leave no trace in the argv"
@@ -893,7 +988,12 @@ mod tests {
     /// a prefix pointing at a number this process does not hold is a cage bubblewrap refuses.
     #[test]
     fn every_composed_argument_list_loads_the_mandatory_seccomp_filters() {
-        let (argv, held) = compose(&spec(vec![], vec![], NetPolicy::Shared)).expect("compose");
+        let cage = compose(
+            Path::new("/bwrap"),
+            &spec(vec![], vec![], NetPolicy::Shared),
+        )
+        .expect("compose");
+        let (argv, held) = (cage.args(), cage.files());
         let named: Vec<i32> = argv
             .windows(2)
             .filter(|w| w[0] == "--add-seccomp-fd")
@@ -921,7 +1021,8 @@ mod tests {
     #[test]
     fn only_a_cage_rooted_in_its_namespace_ignores_ownership() {
         let count = |spec: &SandboxSpec| {
-            let (argv, _held) = compose(spec).expect("compose");
+            let cage = compose(Path::new("/bwrap"), spec).expect("compose");
+            let (argv, _held) = (cage.args(), cage.files());
             argv.iter().filter(|a| *a == "--add-seccomp-fd").count()
         };
         let launch = spec(vec![], vec![], NetPolicy::Shared);
@@ -937,10 +1038,10 @@ mod tests {
     /// loads the mandatory filters; and every cage that runs code sbx did not write also carries
     /// the resource scope.
     ///
-    /// The population is every file that spawns bubblewrap by name, plus every file calling
-    /// [`to_argv`] outside the one that defines it. The first criterion is the one that matters: a
-    /// list written by hand names no function, and the process it starts is the only trace it
-    /// leaves. Sorting the population into kinds is the whole point of the
+    /// The population is every file that holds a `bwrap` path and spawns a process or builds a
+    /// cage's command, plus every file calling [`to_argv`] outside the one that defines it. The
+    /// spawning half is the one that matters: a list written by hand names no function, and the
+    /// process it starts is the only trace it leaves. Sorting the population into kinds is the whole point of the
     /// guard: it asks a new file's author which kind it is, and each kind carries an obligation the
     /// guard then checks. Nothing in the type system asks that question, and the failure it
     /// prevents is an absence: an argument list assembled beside the one definition, running a cage
@@ -977,9 +1078,9 @@ mod tests {
         ];
         // The same, and outside the scope, because what runs is sbx's own and fixed. `doctor`'s
         // probe reports on the host rather than running anything for a project; `selfcage` builds
-        // the cage sbx's own binary runs in, the egress proxy's and the capture tap's, and that
-        // binary bounds its own memory (`[network] body_max_mb`, `max_connections`); and the storage
-        // helper formats an image sbx owns.
+        // the cage sbx's own binary runs in, the egress proxy's and the capture tap's, for the
+        // module that starts it, and that binary bounds its own memory (`[network] body_max_mb`,
+        // `max_connections`); and the storage helper formats an image sbx owns.
         const SPAWNS_THE_COMPOSED_LIST: &[&str] = &[
             "src/sandbox/selfcage.rs",
             "src/sandbox/smoke.rs",
@@ -1006,7 +1107,8 @@ mod tests {
             "src/sandbox/seccomp.rs",
         ];
 
-        /// Whether `text` holds a `bwrap` path in code **and** starts a process.
+        /// Whether `text` holds a `bwrap` path in code **and** starts a process or builds a cage's
+        /// command.
         ///
         /// Not "does the token `bwrap` sit between the parentheses of a `Command::new`", which is
         /// what this asked before and which is a question about a local variable's name:
@@ -1018,6 +1120,11 @@ mod tests {
         /// lines are dropped first: a file that only *mentions* bubblewrap in prose is talking about
         /// it, not running it.
         ///
+        /// Building counts as well as starting because a composed command carries its descriptors
+        /// ([`CageCommand`]) and becomes a process inside this module, so most launchers no longer
+        /// write `Command::new(` at all. What they write instead is a call to [`compose`] or to the
+        /// shared launch command, which is the only way to come by a cage's command.
+        ///
         /// The limit, since a text scan has one: a file that holds the path under a name of its own
         /// invention and never writes `bwrap` anywhere in its code is still invisible here. Closing
         /// that means carrying a type rather than a path through every launcher, which is the
@@ -1028,7 +1135,10 @@ mod tests {
                 .filter(|l| !l.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            code.contains("bwrap") && code.contains("Command::new(")
+            code.contains("bwrap")
+                && (code.contains("Command::new(")
+                    || crate::testutil::calls_function(&code, "argv::compose(")
+                    || crate::testutil::calls_function(&code, "cage_command("))
         }
 
         let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));

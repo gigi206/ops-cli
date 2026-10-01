@@ -1228,7 +1228,7 @@ impl TaskEngine {
         // The same assembly a launch makes, rather than a second spelling of it: a task cage never
         // carries a netns dummy, so the holder step the shared form adds is a no-op here — and stays
         // correct rather than silently absent if one ever does.
-        let (prog, args, memfds) = super::launch::cage_command(&self.bwrap, spec, &self.limits)?;
+        let cage = super::launch::cage_command(&self.bwrap, spec, &self.limits)?;
         // A stop that arrived while the credentials were resolving is honored by not starting the
         // command at all — the earliest point at which it can be, and the only one where "stopped"
         // means nothing ran.
@@ -1243,16 +1243,14 @@ impl TaskEngine {
                 stopped: true,
             });
         }
-        let mut child = spawn_launcher(
-            Command::new(prog)
-                .args(args)
-                // No stdin at all: a task is non-interactive, and an inherited stdin would be a
-                // channel into a credential-bearing command.
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-            memfds,
-        )?;
+        let mut command = cage.into_command();
+        command
+            // No stdin at all: a task is non-interactive, and an inherited stdin would be a
+            // channel into a credential-bearing command.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn_launcher(command)?;
         self.note_pid(invocation, child.id());
 
         // Read both streams on their own threads so neither can block the other by filling its pipe
@@ -2271,25 +2269,21 @@ impl RawOutput {
 }
 
 /// Spawn a cage launcher, then close this process's copies of the descriptors bwrap was told to
-/// read.
+/// read, which `command` owns ([`super::argv::CageCommand::into_command`]).
 ///
 /// [`super::argv::compose`] returns the compiled seccomp filters and the `--args` file as anonymous
-/// in-memory files, close-on-exec in this process ([`super::memfd::write`]). The preparation below
-/// clears the flag on the child's copies only, so a sibling cage spawned while these are open
-/// inherits none of them, however long they stay open.
+/// in-memory files, close-on-exec in this process ([`super::memfd::write`]). The preparation the
+/// command carries clears the flag on the child's copies only, so a sibling cage spawned while these
+/// are open inherits none of them, however long they stay open.
 ///
 /// What closing them here buys is a narrower lifetime, not a second barrier. The `--args` file of a
 /// task invocation holds its `--setenv <VAR> <plaintext>` credential pairs, and `spawn` has already
 /// forked and exec'd by the time it returns, so bwrap holds its own copies and these have done their
 /// whole job: this process keeps no descriptor to the plaintext for the rest of the run.
-pub(super) fn spawn_launcher(
-    command: &mut Command,
-    memfds: Vec<std::fs::File>,
-) -> io::Result<std::process::Child> {
-    super::memfd::inherit_across_exec(command, &memfds);
-    let child = command.spawn()?;
-    drop(memfds);
-    Ok(child)
+pub(super) fn spawn_launcher(mut command: Command) -> io::Result<std::process::Child> {
+    let child = command.spawn();
+    drop(command);
+    child
 }
 
 /// Read a stream up to `cap` bytes, reporting whether it was cut. Reading continues past the cap

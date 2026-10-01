@@ -248,13 +248,10 @@ fn one(
         .map_err(|e| io::Error::other(format!("building the cage for `{command}`: {e:?}")))?;
 
     // Through the shared launch command rather than by composing an argv here: that is what carries
-    // the mandatory seccomp filters and the resource scope, and what stages the descriptors the
-    // cage's environment travels on — a `Command` built without them fails at the exec with
-    // `bwrap: Invalid fd`.
-    let (prog, args, held) = crate::sandbox::launch::cage_command(ctx.bwrap, &spec, ctx.limits)?;
-    let mut cage = std::process::Command::new(prog);
-    cage.args(args);
-    crate::sandbox::memfd::inherit_across_exec(&mut cage, &held);
+    // the mandatory seccomp filters and the resource scope, and the descriptors the cage's
+    // environment travels on.
+    let mut cage =
+        crate::sandbox::launch::cage_command(ctx.bwrap, &spec, ctx.limits)?.into_command();
     let mut child = cage
         .stdin(std::process::Stdio::null())
         .spawn()
@@ -263,7 +260,7 @@ fn one(
     let deadline = Instant::now() + BUILD_TIMEOUT;
     let (status, timed_out) =
         crate::sandbox::cagewait::wait_capped(&mut child, deadline, POLL_INTERVAL)?;
-    drop(held);
+    drop(cage);
     if timed_out {
         return Err(io::Error::other(format!(
             "`{command}` passed its {}s ceiling and was killed",

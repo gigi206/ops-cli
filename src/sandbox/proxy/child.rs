@@ -270,22 +270,29 @@ fn stand_up(
     Ok((ctx, UnixListener::from(listener), reader))
 }
 
-/// The cage a proxy runs in, and the descriptors bwrap reads, the proxy's end of the link `link`
-/// among them.
-fn command(bwrap: &Path, link: wire::Socket) -> io::Result<(Command, Vec<File>)> {
+/// The cage a proxy runs in, holding the descriptors bwrap reads, the proxy's end of the link
+/// `link` among them.
+fn caged(bwrap: &Path, link: wire::Socket) -> io::Result<crate::sandbox::argv::CageCommand> {
     let (binary, copy) = selfcage::running()?;
     let spec = cage(
         binary.as_raw_fd(),
         copy,
         std::os::fd::AsFd::as_fd(&link).as_raw_fd(),
     )?;
-    let (mut command, mut files) = selfcage::command(bwrap, &spec, binary)?;
-    files.push(File::from(OwnedFd::from(link)));
-    // Its standard error is a pipe [`relay_stderr`] reads, never this process's own descriptor: a
-    // detached session starts its proxy before it moves its output to the session log, and a
-    // proxy holding the invoker's stderr would keep it open for the session's whole life.
-    command.stdout(Stdio::null()).stderr(Stdio::piped());
-    Ok((command, files))
+    let mut cage = selfcage::command(bwrap, &spec, binary)?;
+    cage.hand(File::from(OwnedFd::from(link)));
+    Ok(cage)
+}
+
+/// A proxy's standard streams, caged or stood in by a test binary: no input and no output, and its
+/// standard error a pipe [`relay_stderr`] reads, never this process's own descriptor. A detached
+/// session starts its proxy before it moves its output to the session log, and a proxy holding the
+/// invoker's stderr would keep it open for the session's whole life.
+fn streams(command: &mut Command) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
 }
 
 /// What a test binary starts as the proxy, holding `link`: `sbx __proxy` as the test binary runs it
@@ -294,18 +301,14 @@ fn command(bwrap: &Path, link: wire::Socket) -> io::Result<(Command, Vec<File>)>
 /// start. The process, the start, the bytes and everything the proxy stands up are its own; the cage
 /// is not.
 #[cfg(test)]
-fn stand_in(_bwrap: &Path, link: wire::Socket) -> (Command, Vec<File>) {
+fn stand_in(_bwrap: &Path, link: wire::Socket) -> Command {
     let fd = std::os::fd::AsFd::as_fd(&link).as_raw_fd();
     let mut command = crate::testutil::alone(
         concat!(module_path!(), "::tests::the_stand_in_proxys_process"),
         fd.to_string(),
     );
-    // Its streams as [`command`] sets the caged proxy's.
+    crate::sandbox::memfd::inherit_across_exec(&mut command, vec![File::from(OwnedFd::from(link))]);
     command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    (command, vec![File::from(OwnedFd::from(link))])
 }
 
 /// How long stopping a proxy waits for the relay to write what the proxy wrote last. The relay ends
@@ -356,31 +359,26 @@ fn cage(binary: RawFd, copy: bool, link: RawFd) -> io::Result<SandboxSpec> {
     )
 }
 
-/// A start the thread in [`spawn_lasting`] runs: the command, the descriptors it reads, and where
-/// the outcome goes.
+/// A start the thread in [`spawn_lasting`] runs: the command, holding the descriptors it reads, and
+/// where the outcome goes.
 struct Job {
     command: Command,
-    files: Vec<File>,
     done: Sender<io::Result<Child>>,
 }
 
-/// Start `command`, handing it `files`, from the one thread of this process that lives as long as
-/// the process does.
+/// Start `command`, which holds the descriptors it hands its exec, from the one thread of this
+/// process that lives as long as the process does.
 ///
 /// A cage dies with the thread that started it, not with the process: `--die-with-parent` arms the
 /// parent-death signal, which follows the thread (measured when a refresh started a signer). A task
 /// starts its proxy from the thread of its invocation, which ends with it, and a proxy started from
 /// there would die under a guard that still holds it. This thread starts every proxy instead, and
 /// never ends.
-fn spawn_lasting(command: Command, files: Vec<File>) -> io::Result<Child> {
+fn spawn_lasting(command: Command) -> io::Result<Child> {
     static LAUNCHER: Mutex<Option<Sender<Job>>> = Mutex::new(None);
     let gone = || io::Error::other("the thread that starts the egress proxy is gone");
     let (done, outcome) = channel();
-    let job = Job {
-        command,
-        files,
-        done,
-    };
+    let job = Job { command, done };
     let sender = {
         let mut launcher = crate::sandbox::locks::locked(&LAUNCHER);
         match launcher.as_ref() {
@@ -391,13 +389,9 @@ fn spawn_lasting(command: Command, files: Vec<File>) -> io::Result<Child> {
                     .name("sbx-launcher".into())
                     .spawn(move || {
                         for mut job in jobs {
-                            crate::sandbox::memfd::inherit_across_exec(
-                                &mut job.command,
-                                &job.files,
-                            );
                             let started = job.command.spawn();
                             // Read by bwrap by now, or never: this process's copies go at once.
-                            drop(job.files);
+                            drop(job.command);
                             let _ = job.done.send(started);
                         }
                     })?;
@@ -429,10 +423,11 @@ mod process {
         /// Start a proxy caged by `bwrap`, holding `link`; in a test binary, one out of any cage.
         pub(super) fn start(bwrap: &Path, link: wire::Socket) -> io::Result<Proxy> {
             #[cfg(not(test))]
-            let (command, files) = command(bwrap, link)?;
+            let mut command = caged(bwrap, link)?.into_command();
             #[cfg(test)]
-            let (command, files) = stand_in(bwrap, link);
-            let mut child = spawn_lasting(command, files)?;
+            let mut command = stand_in(bwrap, link);
+            streams(&mut command);
+            let mut child = spawn_lasting(command)?;
             let relayed = child.stderr.take().and_then(relay_stderr);
             Ok(Proxy {
                 child: Some(child),
@@ -926,10 +921,12 @@ mod tests {
             PROBE_HOST_FILE.to_string(),
             host_file.to_string_lossy().into_owned(),
         )];
-        let (mut command, files) = selfcage::command(&bwrap, &spec, binary).unwrap();
-        crate::sandbox::memfd::inherit_across_exec(&mut command, &files);
+        let mut command = selfcage::command(&bwrap, &spec, binary)
+            .unwrap()
+            .into_command();
+        command.stdin(Stdio::null());
         let ran = crate::testutil::run_within(&mut command, "the probe in the proxy's cage");
-        drop(files);
+        drop(command);
         let stdout = &ran.stdout;
         let seen: Vec<&str> = stdout
             .lines()
@@ -955,10 +952,11 @@ mod tests {
     fn the_command_hands_bwrap_every_descriptor_its_argv_names() {
         let (end, _other) = wire::Socket::pair().unwrap();
         let link = std::os::fd::AsFd::as_fd(&end).as_raw_fd();
-        let (command, files) = command(Path::new("/nonexistent/bwrap"), end).unwrap();
-        let handed: Vec<RawFd> = files.iter().map(AsRawFd::as_raw_fd).collect();
-        let argv: Vec<String> = command
-            .get_args()
+        let cage = caged(Path::new("/nonexistent/bwrap"), end).unwrap();
+        let handed: Vec<RawFd> = cage.files().iter().map(AsRawFd::as_raw_fd).collect();
+        let argv: Vec<String> = cage
+            .args()
+            .iter()
             .map(|w| w.to_string_lossy().into_owned())
             .collect();
         let mut named = Vec::new();
@@ -993,7 +991,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut child = std::thread::spawn(move || spawn_lasting(command, Vec::new()))
+        let mut child = std::thread::spawn(move || spawn_lasting(command))
             .join()
             .unwrap()
             .unwrap();
