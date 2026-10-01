@@ -251,7 +251,9 @@ from the cage was already refused, since it writes `.git/config`. The same holds
 `modules` directory of each submodule's repository and of each worktree.
 
 Each submodule adds a few mounts to the ceiling `[fs]` counts, so a superproject with many of
-them can reach it; the refusal says so. What no mount can hold is a repository that appears
+them can reach it; the refusal says so. sbx also looks at no more than 256 submodules whose
+directory holds a `.git`, nested ones included, and refuses the launch past that, even where a
+directory `[fs]` closes already covers their files and they cost no mount. What no mount can hold is a repository that appears
 during the session in a gitlink's directory: one the cage creates there, or adds to the index,
 is read by your next `git status` in the superproject. sbx names it once the cage has exited,
 as it names a `.git/commondir`, and so does an index the cage leaves in a form sbx cannot read

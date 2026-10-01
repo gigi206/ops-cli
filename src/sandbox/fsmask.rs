@@ -70,7 +70,9 @@ const MASK_WARN: usize = 64;
 
 /// How many mounts `[fs]` may cost a launch at all. Past this the wait is seconds and an argv
 /// ceiling bubblewrap shares with every other mount comes into view, so the launch refuses rather
-/// than quietly dropping the tail: a truncated mask list reads exactly like a complete one.
+/// than quietly dropping the tail: a truncated mask list reads exactly like a complete one. It
+/// also bounds the submodules with a `.git` a launch looks at ([`submodule_carrier`]) and the
+/// linked worktrees it reads.
 const MASK_MAX: usize = 256;
 
 /// The largest index, and shared index, read ([`read_git_index`]). git writes about a hundred bytes
@@ -509,6 +511,7 @@ pub(crate) fn expand(
                 &mut carrier,
                 &mut out.warnings,
                 &mut out.refused,
+                0,
             );
         }
     }
@@ -989,6 +992,10 @@ struct Carried {
     modules: Vec<PathBuf>,
     /// The submodules' repositories found inside one of them, to be reopened read-write.
     reopened: Vec<PathBuf>,
+    /// The gitlinks whose directory held a `.git` of any kind, counted from the project's own
+    /// repository down through every repository below it, the one this carrier was given
+    /// included: what [`submodule_carrier`] has looked at, whether or not it carried it.
+    looked: usize,
 }
 
 /// The carrier of `repo`, a repository the host's git reads for the project or a submodule, and of
@@ -1001,7 +1008,8 @@ struct Carried {
 /// its configuration includes, the files beside its configuration ([`git_worktree_files`]) and its
 /// submodules ([`submodule_carrier`]), and each of its other work trees the ones that are its own
 /// ([`other_work_trees`]). A mask the work trees share is found once per work tree, and the
-/// expansion keeps one.
+/// expansion keeps one. `looked` is how many gitlinks with a `.git` the expansion has looked at
+/// before this carrier, which the one it returns goes on counting from ([`Carried::looked`]).
 fn repo_carrier(
     reach: &Reach,
     repo: &GitRepo,
@@ -1009,6 +1017,7 @@ fn repo_carrier(
     masks: &mut Vec<Masked>,
     warnings: &mut Vec<String>,
     refused: &mut Option<String>,
+    looked: usize,
 ) -> Carried {
     if let Some(reason) = absent_config_refusal(reach, repo) {
         refused.get_or_insert(reason);
@@ -1020,11 +1029,13 @@ fn repo_carrier(
     let trees = other_work_trees(reach, repo, &found, masks, refused);
     let mut carried = Carried {
         worktrees: trees.len(),
+        looked,
         ..Carried::default()
     };
     submodule_carrier(reach, repo, depth, masks, &mut carried, warnings, refused);
     for tree in &trees {
-        if carried.submodules > MASK_MAX {
+        // Past the ceiling the launch is refused already ([`submodule_carrier`]).
+        if carried.looked > MASK_MAX {
             break;
         }
         masks.extend(git_hook_dirs(reach, tree, warnings, refused));
@@ -1146,6 +1157,15 @@ const SUBMODULE_DEPTH: usize = 8;
 /// An index this cannot read in full refuses the launch, whether or not the repository shows
 /// submodules: a gitlink needs no `.gitmodules`, and the cage writes the index, so it could add one
 /// and then grow the index past [`INDEX_MAX`], which the host's git still reads.
+///
+/// At most [`MASK_MAX`] gitlinks with a `.git` are looked at, nested ones included, and one more
+/// refuses the launch. Each is counted before what its `.git` names is resolved, whether it turns
+/// out a repository to protect or one out of the cage's reach to pass over: the cage writes the
+/// index and the work tree, and every one costs a resolution of a path it chose. The count is not
+/// the mount budget's: a submodule whose files a directory `[fs]` closes costs no mount, and
+/// stopping at the budget alone would leave the submodules past it unheld while the launch went
+/// on. A gitlink with no `.git` is passed over at the cost of one look and is not counted, since
+/// git reads no repository there.
 fn submodule_carrier(
     reach: &Reach,
     repo: &GitRepo,
@@ -1175,14 +1195,32 @@ fn submodule_carrier(
             refused.get_or_insert(reason);
             continue;
         }
-        let git_dir = match std::fs::symlink_metadata(&dot_git) {
+        let meta = match std::fs::symlink_metadata(&dot_git) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 refused.get_or_insert_with(|| visible(&git_unreadable("look at", &dot_git, &e)));
                 continue;
             }
-            Ok(meta) if meta.is_dir() => dot_git,
-            Ok(meta) if meta.is_file() => {
+            Ok(meta) => meta,
+        };
+        // Counted before anything is resolved, whatever comes of it: a gitlink this goes on to
+        // skip costs a resolution of the path its `.git` names all the same, and the cage writes
+        // both the index and the files.
+        carried.looked += 1;
+        if carried.looked > MASK_MAX {
+            refused.get_or_insert_with(|| {
+                visible(&format!(
+                    "the project holds more than {MASK_MAX} submodules with a `.git`, nested ones \
+                     included, more than sbx follows to protect their repositories; the first past \
+                     it is `{}`. {GIT_WRITABLE_HINT}",
+                    dir.display()
+                ))
+            });
+            return;
+        }
+        let git_dir = match meta {
+            meta if meta.is_dir() => dot_git,
+            meta if meta.is_file() => {
                 git_file(reach, &dot_git, None, refused, masks);
                 let target = match gitfile_target(&dot_git) {
                     Ok(Some(target)) => target,
@@ -1220,7 +1258,7 @@ fn submodule_carrier(
                 }
                 canon
             }
-            Ok(_) => continue,
+            _ => continue,
         };
         let sub = GitRepo::at(git_dir, dir);
         if let Some(reason) = git_repo_refusal(reach, &sub) {
@@ -1245,11 +1283,22 @@ fn submodule_carrier(
             });
             continue;
         }
-        let below = repo_carrier(reach, &sub, depth + 1, masks, warnings, refused);
+        let below = repo_carrier(
+            reach,
+            &sub,
+            depth + 1,
+            masks,
+            warnings,
+            refused,
+            carried.looked,
+        );
         carried.submodules += below.submodules;
         carried.modules.extend(below.modules);
         carried.reopened.extend(below.reopened);
-        if carried.submodules > MASK_MAX {
+        // Counted on from this one's count, so it is the total so far rather than a part of it.
+        carried.looked = below.looked;
+        // Past the ceiling the launch is refused already, below or here.
+        if carried.looked > MASK_MAX {
             break;
         }
     }
@@ -6850,6 +6899,126 @@ mod tests {
         assert!(
             !e.readonly.iter().any(|m| m.path.starts_with(&outside)),
             "nothing outside the project"
+        );
+    }
+
+    /// Gitlinks at each of `paths`, on the project's current commit, written into its index.
+    fn add_gitlinks(root: &Path, git: impl Fn(&[&str]) -> bool, paths: &[String]) {
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap();
+        let infos: Vec<String> = paths
+            .iter()
+            .map(|path| format!("160000,{},{path}", head.trim()))
+            .collect();
+        let mut args = vec!["update-index", "--add"];
+        for info in &infos {
+            args.extend(["--cacheinfo", info.as_str()]);
+        }
+        assert!(git(&args));
+    }
+
+    /// More submodules with a `.git` than sbx follows refuse the launch, a directory `[fs]` already
+    /// closes over their files notwithstanding: those cost no mount, and the one past them, which
+    /// that directory does not cover, would otherwise go unheld.
+    #[test]
+    fn more_submodules_than_are_followed_refuse_the_launch_where_a_directory_covers_them() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the submodule ceiling: no git on this host");
+            return;
+        };
+        let mut paths: Vec<String> = (0..=MASK_MAX).map(|i| format!("v/{i:04}")).collect();
+        paths.push("z/x".to_string());
+        add_gitlinks(&root, git, &paths);
+        for path in &paths {
+            let dot_git = root.join(path).join(".git");
+            std::fs::create_dir_all(&dot_git).unwrap();
+            std::fs::write(dot_git.join("config"), b"").unwrap();
+        }
+
+        let e = expand(&root, &policy(&[], &["v/"]), &[], None);
+        let why = e.refused.expect("refused");
+        assert!(
+            why.contains(&format!("more than {MASK_MAX} submodules with a `.git`")),
+            "{why}"
+        );
+        assert!(
+            why.contains(&format!("`{}`", root.join("v/0256").display())),
+            "{why}"
+        );
+    }
+
+    /// The ceiling counts a submodule's own submodules with the project's, as one total: the last
+    /// submodule here holds the gitlinks that take it past, and it is refused there rather than
+    /// let through for staying under the ceiling on its own.
+    #[test]
+    fn the_submodule_ceiling_counts_nested_ones_with_the_projects_own() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the submodule ceiling: no git on this host");
+            return;
+        };
+        let half = MASK_MAX / 2;
+        let above: Vec<String> = (0..half).map(|i| format!("v/{i:04}")).collect();
+        let sub = root.join("z");
+        assert!(git_repo_at(&sub, &[]));
+        let below: Vec<String> = (0..half).map(|i| format!("n/{i:04}")).collect();
+        let in_sub = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&sub)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        add_gitlinks(&sub, in_sub, &below);
+        add_gitlinks(&root, git, &[&above[..], &["z".to_string()]].concat());
+        let made = above
+            .iter()
+            .map(|path| root.join(path))
+            .chain(below.iter().map(|path| sub.join(path)));
+        for dir in made {
+            let dot_git = dir.join(".git");
+            std::fs::create_dir_all(&dot_git).unwrap();
+            std::fs::write(dot_git.join("config"), b"").unwrap();
+        }
+
+        let e = expand(&root, &policy(&[], &["v/", "z/n/"]), &[], None);
+        let why = e.refused.expect("refused");
+        let last = sub.join(format!("n/{:04}", half - 1));
+        assert!(why.contains(&format!("`{}`", last.display())), "{why}");
+    }
+
+    /// A gitlink is counted once its `.git` is there, before what that names is resolved: one whose
+    /// `.git` names a repository out of the cage's reach is passed over, its file held, and costs
+    /// the resolution all the same.
+    #[test]
+    fn a_gitlink_is_counted_whatever_its_git_names() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the submodule ceiling: no git on this host");
+            return;
+        };
+        let paths: Vec<String> = (0..=MASK_MAX).map(|i| format!("v/{i:04}")).collect();
+        add_gitlinks(&root, git, &paths);
+        let elsewhere = tmp.path().join("elsewhere/repo");
+        for path in &paths {
+            std::fs::create_dir_all(root.join(path)).unwrap();
+            std::fs::write(
+                root.join(path).join(".git"),
+                format!("gitdir: {}\n", elsewhere.display()),
+            )
+            .unwrap();
+        }
+
+        let e = expand(&root, &policy(&[], &["v/"]), &[], None);
+        let why = e.refused.expect("refused");
+        assert!(
+            why.contains(&format!("more than {MASK_MAX} submodules with a `.git`")),
+            "{why}"
         );
     }
 
