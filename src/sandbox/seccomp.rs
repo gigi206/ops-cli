@@ -791,7 +791,6 @@ impl SeccompPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
     /// One instruction, decoded from the serialized `struct sock_filter` bwrap reads.
     fn insn(bytes: &[u8], at: usize) -> (u16, u8, u8, u32) {
@@ -1358,6 +1357,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn probe_spec(probe: &str) -> super::super::spec::SandboxSpec {
         use super::super::spec::{NetPolicy, SandboxSpec};
+        use std::ffi::OsString;
         use std::path::PathBuf;
         let mounts = super::super::spec::minimal_userland_mounts();
         SandboxSpec::new(
