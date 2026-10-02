@@ -6578,14 +6578,31 @@ fn every_listing_verb_that_offers_json_emits_a_document_even_when_empty() {
     }
 }
 
-/// A `--json` answer whose reader has gone ends the verb, not the process. Rust ignores `SIGPIPE`,
-/// so a `println!` whose write fails panics, and `sbx net groups --json | head -c0` exited 101 on a
-/// pipeline the shell reports as fine. Each verb runs with its standard output a pipe whose
-/// reading end is already closed, so its one write fails every time rather than by a race.
-#[test]
-fn a_json_answer_to_a_closed_pipe_is_not_a_panic() {
+/// Run `sbx <args>` with its standard output a pipe whose reading end is already closed, so its
+/// first write fails every time rather than by a race.
+fn run_into_a_closed_pipe(p: &Project, args: &[&str]) -> std::process::Output {
     use std::os::fd::FromRawFd;
     use std::process::Stdio;
+    let mut ends = [0; 2];
+    // SAFETY: `pipe2` fills the two-element array it is handed.
+    assert_eq!(
+        unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    // SAFETY: the reading end was just opened here and nothing else holds it.
+    unsafe { libc::close(ends[0]) };
+    p.cmd(args)
+        // SAFETY: the writing end was just opened here, and the `Stdio` takes it over.
+        .stdout(unsafe { Stdio::from_raw_fd(ends[1]) })
+        .output()
+        .expect("spawn sbx")
+}
+
+/// A `--json` answer whose reader has gone ends the verb, not the process. Rust ignores `SIGPIPE`,
+/// so a `println!` whose write fails panics, and `sbx net groups --json | head -c0` exited 101 on a
+/// pipeline the shell reports as fine.
+#[test]
+fn a_json_answer_to_a_closed_pipe_is_not_a_panic() {
     let p = Project::new("jsonpipe");
     for verb in [
         vec!["bundle"],
@@ -6594,14 +6611,6 @@ fn a_json_answer_to_a_closed_pipe_is_not_a_panic() {
         vec!["net", "logs"],
         vec!["net", "stats"],
     ] {
-        let mut ends = [0; 2];
-        // SAFETY: `pipe2` fills the two-element array it is handed.
-        assert_eq!(
-            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
-            0
-        );
-        // SAFETY: the reading end was just opened here and nothing else holds it.
-        unsafe { libc::close(ends[0]) };
         let mut args = verb.clone();
         args.push("--json");
         // The verb writes a document when it is read, so the closed pipe below meets a write.
@@ -6613,16 +6622,47 @@ fn a_json_answer_to_a_closed_pipe_is_not_a_panic() {
                 String::from_utf8_lossy(&read.stderr)
             )
         });
-        let out = p
-            .cmd(&args)
-            // SAFETY: the writing end was just opened here, and the `Stdio` takes it over.
-            .stdout(unsafe { Stdio::from_raw_fd(ends[1]) })
-            .output()
-            .expect("spawn sbx");
+        let out = run_into_a_closed_pipe(&p, &args);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             out.status.success() && stderr.is_empty(),
             "`sbx {} --json` into a closed pipe ended with {}:\n{stderr}",
+            verb.join(" "),
+            out.status
+        );
+    }
+}
+
+/// What a person reads is held to the same rule as what a script parses. The listings wrote line by
+/// line with `println!`, and each of these exited 101 into a closed pipe, `sbx version` included:
+/// one verb per renderer that wrote that way, from the plugin listing to the storage status.
+#[test]
+fn a_human_answer_to_a_closed_pipe_is_not_a_panic() {
+    let p = Project::new("humanpipe");
+    for verb in [
+        vec!["version"],
+        vec!["app", "list"],
+        vec!["projects", "ls"],
+        vec!["plugins", "list"],
+        vec!["plugins", "store", "list"],
+        vec!["secret", "list"],
+        vec!["storage", "status"],
+        vec!["session", "ls"],
+        vec!["proc", "rules"],
+    ] {
+        // Something is written when the output is read, so the closed pipe below meets a write.
+        let read = p.run(&verb);
+        assert!(
+            read.status.success() && !read.stdout.is_empty(),
+            "`sbx {}` wrote nothing to fail on: {}",
+            verb.join(" "),
+            String::from_utf8_lossy(&read.stderr)
+        );
+        let out = run_into_a_closed_pipe(&p, &verb);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stderr.is_empty(),
+            "`sbx {}` into a closed pipe ended with {}:\n{stderr}",
             verb.join(" "),
             out.status
         );

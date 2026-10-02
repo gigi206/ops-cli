@@ -36,6 +36,15 @@
         clippy::unreachable
     )
 )]
+// Rust ignores `SIGPIPE`, so a `print!` or `println!` whose write fails panics: `sbx version` into a
+// pipe whose reader had gone ended in `failed printing to stdout` and exit 101, and so did eight
+// other verbs measured the same way, on a pipeline the shell reports as having worked. Standard
+// output goes through [`out!`] and [`outln!`], which hold the discipline `cli::print_document`
+// states. Warned here, which `-D warnings` turns into the gate, so a bare one is a red build
+// wherever it is written. It replaces a source scan that held only the verbs rendering a whole
+// document (`config show` is 63 KiB on an ordinary project), while the line-by-line renderers, 365
+// calls, went unchecked. Scoped to `not(test)`: a test prints to its own captured output.
+#![cfg_attr(not(test), warn(clippy::print_stdout))]
 
 // Declared before every other module, and only for that reason: `macro_rules!` are textually
 // scoped, so `#[macro_use]` lifts the skip macros into scope for the modules that follow. A module
@@ -43,6 +52,11 @@
 #[cfg(test)]
 #[macro_use]
 mod testskip;
+
+// Declared before every other module for the same reason: `out!` and `outln!` reach only the
+// modules that follow.
+#[macro_use]
+mod stdout;
 
 mod allowlist;
 #[cfg(test)]
@@ -1246,7 +1260,7 @@ fn removal_takes_no_session_flags(family: &str, verb: &str) -> String {
 fn report_rule_write(result: Result<String, (u8, String)>) -> ExitCode {
     match result {
         Ok(message) => {
-            println!(
+            outln!(
                 "{}",
                 style::prose(
                     &message,

@@ -218,7 +218,7 @@ fn init(args: Vec<OsString>) -> ExitCode {
             "       the volume will still be created; `sbx storage use` needs those to start using it.",
         );
     }
-    println!(
+    outln!(
         "creating {} ({} logical, sparse — it occupies only what is written)",
         image.display(),
         sandbox::human_bytes(size)
@@ -229,11 +229,11 @@ fn init(args: Vec<OsString>) -> ExitCode {
         Ok(m) => m,
         Err(e) => return fail(e),
     };
-    println!("  formatting with {}", mkfs.origin());
+    outln!("  formatting with {}", mkfs.origin());
     if let Err(e) = storage::init(&image, size, label, &mkfs) {
         return fail(e);
     }
-    println!(
+    outln!(
         "  {}created{} — {}",
         pal.ok,
         pal.reset,
@@ -259,7 +259,7 @@ fn up(args: Vec<OsString>) -> ExitCode {
         Err(e) => return fail(e),
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!("mounted at {}", shown_path(&mount_point));
+    outln!("mounted at {}", shown_path(&mount_point));
     // Mounting is not adopting. Say what the remaining step is, unless it is already done —
     // in which case `up` was only a manual nudge and there is nothing to suggest.
     let adopted = default_dir()
@@ -268,9 +268,10 @@ fn up(args: Vec<OsString>) -> ExitCode {
         .as_deref()
         == Some(image.as_path());
     if !adopted {
-        println!(
+        outln!(
             "\nsbx is not using it yet:\n  {}sbx storage use{}",
-            pal.head, pal.reset
+            pal.head,
+            pal.reset
         );
     }
     ExitCode::SUCCESS
@@ -303,7 +304,7 @@ fn down(args: Vec<OsString>) -> ExitCode {
     if let Err(e) = storage::down(&image) {
         return fail(e);
     }
-    println!("unmounted and detached");
+    outln!("unmounted and detached");
 
     // Unmounting a volume sbx is set to follow is temporary by design: the next command
     // mounts it again. Saying so beats leaving the user to wonder why it came back.
@@ -311,7 +312,7 @@ fn down(args: Vec<OsString>) -> ExitCode {
         && storage::read_pointer(&dir).ok().flatten().as_deref() == Some(image.as_path())
     {
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-        println!(
+        outln!(
             "\n{}",
             style::prose(
                 "note: sbx is still set to use this volume, so the next command will mount \
@@ -391,13 +392,13 @@ fn use_volume(args: Vec<OsString>) -> ExitCode {
         return fail(format!("cannot record the volume: {e}"));
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!(
+    outln!(
         "{}sbx now uses{} {}",
         pal.ok,
         pal.reset,
         shown_path(&mount_point)
     );
-    println!("it is mounted automatically from now on — no environment variable needed.");
+    outln!("it is mounted automatically from now on — no environment variable needed.");
     ExitCode::SUCCESS
 }
 
@@ -478,8 +479,8 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(format!("cannot read {}: {e}", dir.display())),
     };
-    println!("migrating {} → {}", dir.display(), shown_path(&mount_point));
-    println!(
+    outln!("migrating {} → {}", dir.display(), shown_path(&mount_point));
+    outln!(
         "  {} files ({} distinct), {} dirs, {} symlinks, {}",
         before.files,
         before.inodes,
@@ -488,7 +489,7 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
         sandbox::human_bytes(before.bytes)
     );
     if before.special > 0 {
-        println!(
+        outln!(
             "  {} runtime socket(s) are not carried across — a stopped launch's socket is dead",
             before.special
         );
@@ -507,7 +508,7 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
         ));
     }
 
-    println!("  copying (the original is untouched until this succeeds)…");
+    outln!("  copying (the original is untouched until this succeeds)…");
     // Read from the directory, not from `occupied` — see [`volume_is_empty`].
     let volume_was_empty = volume_is_empty(&mount_point);
     let copied = match storage::copy_tree(&dir, &mount_point, &skip) {
@@ -541,7 +542,7 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
             volume_after_failed_copy(swept)
         ));
     }
-    println!("  {}copy verified{}", pal.ok, pal.reset);
+    outln!("  {}copy verified{}", pal.ok, pal.reset);
 
     // The switch. A single atomic write: before it the old directory is authoritative, after
     // it the volume is, and there is no moment in between.
@@ -557,26 +558,26 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
     // cosmetic: sbx is already reading from the volume.
     match set_aside(&dir, &skip) {
         Ok(Some(old)) => {
-            println!(
+            outln!(
                 "\n{}sbx now uses{} {}",
                 pal.ok,
                 pal.reset,
                 shown_path(&mount_point)
             );
-            println!(
+            outln!(
                 "the previous data is kept at {} — delete it when you are satisfied:\n  rm -rf {}",
                 old.display(),
                 old.display()
             );
         }
-        Ok(None) => println!(
+        Ok(None) => outln!(
             "\n{}sbx now uses{} {}",
             pal.ok,
             pal.reset,
             shown_path(&mount_point)
         ),
         Err(e) => {
-            println!(
+            outln!(
                 "\n{}sbx now uses{} {}",
                 pal.ok,
                 pal.reset,
@@ -714,15 +715,15 @@ fn unuse_volume(args: Vec<OsString>) -> ExitCode {
     // Only a confirmed absence says "not using a volume": an unreadable pointer is precisely what
     // `unuse` should still be able to clear.
     if matches!(storage::read_pointer(&dir), Ok(None)) {
-        println!("sbx is not using a volume.");
+        outln!("sbx is not using a volume.");
         return ExitCode::SUCCESS;
     }
     if let Err(e) = storage::clear_pointer(&dir) {
         return fail(format!("cannot clear the volume record: {e}"));
     }
-    println!("sbx now uses {} again.", dir.display());
+    outln!("sbx now uses {} again.", dir.display());
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!(
+    outln!(
         "{}",
         style::prose(
             "the volume is untouched — `sbx storage use` goes back to it.",
@@ -935,35 +936,35 @@ fn status_next_step(mounted: bool, adopted: bool) -> StatusHint {
 fn render(v: &StatusView) {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, r, dim) = (pal.head, pal.reset, pal.dim);
-    println!("{h}sbx storage{r} — {}", v.image.display());
-    println!("  type        {}", v.kind);
-    println!("  state       {}", v.state);
+    outln!("{h}sbx storage{r} — {}", v.image.display());
+    outln!("  type        {}", v.kind);
+    outln!("  state       {}", v.state);
     if !v.exists {
-        println!(
+        outln!(
             "\n{}",
             style::prose("create one with `sbx storage init`.", &pal)
         );
         return;
     }
     if let (Some(host), Some(cap)) = (v.host_bytes, v.capacity_bytes) {
-        println!(
+        outln!(
             "  on host     {} {dim}of {} logical{r}",
             sandbox::human_bytes(host),
             sandbox::human_bytes(cap)
         );
     }
     if let Some(l) = &v.loop_device {
-        println!("  device      {l}");
+        outln!("  device      {l}");
     }
     if let Some(mp) = &v.mount_point {
-        println!("  mounted at  {}", shown_path(mp));
+        outln!("  mounted at  {}", shown_path(mp));
         // Read from the image's own root, as its maker left it.
-        println!(
+        outln!(
             "  compression {}",
             diag::visible(v.compression.as_deref().unwrap_or("off"))
         );
         if let (Some(a), Some(u)) = (v.allocated_bytes, v.used_bytes) {
-            println!(
+            outln!(
                 "  inside      {} used {dim}of {} the filesystem has claimed{r}",
                 sandbox::human_bytes(u),
                 sandbox::human_bytes(a)
@@ -979,13 +980,13 @@ fn render(v: &StatusView) {
             } else {
                 "the image carries beyond live data"
             };
-            println!("  reclaimable {} {dim}{note}{r}", sandbox::human_bytes(gap));
+            outln!("  reclaimable {} {dim}{note}{r}", sandbox::human_bytes(gap));
             // Deliberately unquantified: the kernel's queue counts free space it *may* discard,
             // which measurably exceeds what the image would give back — much of it has already
             // been punched out, as its own `discard_bytes_saved` counter records. So the queue
             // says only that the figure above can fall without being asked, never how far.
             if v.discard_queued {
-                println!("              {dim}some of it queued for automatic return{r}");
+                outln!("              {dim}some of it queued for automatic return{r}");
             }
         }
     }
@@ -994,10 +995,10 @@ fn render(v: &StatusView) {
     // adopt) — never `up`, which only mounts and leaves sbx still reading its old directory.
     match status_next_step(v.mount_point.is_some(), v.adopted) {
         StatusHint::InUse => {
-            println!("\n  {}sbx is reading its data from this volume.{r}", pal.ok);
+            outln!("\n  {}sbx is reading its data from this volume.{r}", pal.ok);
         }
         StatusHint::MountedNotAdopted => {
-            println!(
+            outln!(
                 "\n  {}",
                 style::dim_prose(
                     "mounted but not in use — start using it with `sbx storage use`",
@@ -1005,14 +1006,14 @@ fn render(v: &StatusView) {
                 )
             );
             if let Some(mp) = &v.mount_point {
-                println!(
+                outln!(
                     "    {dim}(or, for a one-off, export SBX_DATA_DIR={}){r}",
                     shown_path(mp)
                 );
             }
         }
         StatusHint::AdoptedUnmounted => {
-            println!(
+            outln!(
                 "\n{}",
                 style::prose(
                     "adopted — sbx mounts it automatically next command; \
@@ -1022,7 +1023,7 @@ fn render(v: &StatusView) {
             );
         }
         StatusHint::StartUse => {
-            println!(
+            outln!(
                 "\n{}",
                 style::prose("start using it with `sbx storage use`.", &pal)
             );
@@ -1035,7 +1036,7 @@ fn render(v: &StatusView) {
     const WORTH_TRIMMING: u64 = 1 << 30;
     let worth_trimming = v.reclaimable_bytes.is_some_and(|gap| gap >= WORTH_TRIMMING);
     if let Some(mp) = v.mount_point.as_ref().filter(|_| worth_trimming) {
-        println!(
+        outln!(
             "\n{}",
             style::dim_prose(
                 &format!(

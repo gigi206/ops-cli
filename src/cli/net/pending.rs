@@ -145,7 +145,7 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!(
+    out!(
         "{}",
         render_pending(&sessions, &context, app.as_deref(), &pal)
     );
@@ -614,7 +614,7 @@ pub(super) fn net_pending_answer(
             .unwrap_or_else(|| PathBuf::from("."));
         let rule = egress_rule_for(&host, port);
         match persist_egress_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &base) {
-            Ok(message) => println!(
+            Ok(message) => outln!(
                 "{}",
                 style::prose(
                     &message,
@@ -661,7 +661,7 @@ fn net_pending_answer_all(
         app_pids.as_ref().is_none_or(|pids| pids.contains(&pid))
     });
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!(
+    out!(
         "{}",
         render_drain(past, session, app, &drain, &context, &pal)
     );
@@ -970,7 +970,7 @@ fn net_pending_drain_and_save(
             out.push('\n');
         }
         write_left_parked_notes(&mut out, &drain, &pal);
-        print!("{out}");
+        out!("{out}");
         return drain.exit_code();
     }
 
@@ -1000,7 +1000,7 @@ fn net_pending_drain_and_save(
         }
     }
 
-    print!(
+    out!(
         "{}",
         render_drain(past, session, app, &drain, &context, &pal)
     );
@@ -1020,20 +1020,22 @@ fn net_pending_drain_and_save(
         });
     match save_error {
         None => {
-            println!(
+            outln!(
                 "  saved {saved} {verb} rule(s) to {target}{}",
                 if local { " (re-trusted)" } else { "" }
             );
-            println!(
+            outln!(
                 "{}  each rule names its host alone, which covers port 443 — a destination \
                  answered on another port needs `sbx net {verb} <host>:<port>` as well{}",
-                pal.dim, pal.reset
+                pal.dim,
+                pal.reset
             );
             if local {
-                println!(
+                outln!(
                     "{}  scoped to this project — other projects' sessions are untouched \
                      (use --global to widen){}",
-                    pal.dim, pal.reset
+                    pal.dim,
+                    pal.reset
                 );
             }
             drain.exit_code()

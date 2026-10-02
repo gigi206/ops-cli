@@ -223,7 +223,7 @@ fn finish_learn(name: &str, synth: &sandbox::Synthesis, w: &LearnWrite) -> ExitC
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     if synth.rules.is_empty() {
-        println!(
+        outln!(
             "{}",
             style::prose(
                 &format!(
@@ -236,7 +236,7 @@ fn finish_learn(name: &str, synth: &sandbox::Synthesis, w: &LearnWrite) -> ExitC
         return ExitCode::SUCCESS;
     }
     if w.dry_run {
-        println!(
+        outln!(
             "sbx {} ({}): {} {} rule(s) would be added to {} (dry run — nothing written):",
             w.label,
             w.gran,
@@ -249,10 +249,10 @@ fn finish_learn(name: &str, synth: &sandbox::Synthesis, w: &LearnWrite) -> ExitC
             // built from something the cage chose. The synthesizers already refuse a rule their own
             // gate rejects, so nothing reaches here carrying a control byte; sanitising anyway is
             // what keeps that true of this line rather than of the gate behind it.
-            println!("  allow {}", crate::sandbox::sanitize(rule));
+            outln!("  allow {}", crate::sandbox::sanitize(rule));
         }
         if let Some(also) = w.also {
-            println!("{}", style::prose(&format!("  ({also})"), &pal));
+            outln!("{}", style::prose(&format!("  ({also})"), &pal));
         }
         return ExitCode::SUCCESS;
     }
@@ -261,7 +261,7 @@ fn finish_learn(name: &str, synth: &sandbox::Synthesis, w: &LearnWrite) -> ExitC
     // on its third rule still wrote the first two, and reporting only the error would leave the
     // operator believing their config was untouched.
     for line in &written.lines {
-        println!("{}", style::prose(line, &pal));
+        outln!("{}", style::prose(line, &pal));
     }
     match &written.failure {
         None => ExitCode::SUCCESS,
@@ -646,7 +646,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let dest = &installed.dest;
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!(
+    outln!(
         "{}",
         render_app_imported(&name, dest, &preview.summary, &pal)
     );
@@ -852,7 +852,7 @@ fn write_deps(plan: &DepPlan) -> Result<(), ExitCode> {
         // Never `--force`: the plan holds only names nothing declares, and the pre-check above
         // proved each destination free.
         let installed = crate::cli::install_named_file(dir, name, bytes, false, noun)?;
-        println!("imported {noun} `{name}` into {}", installed.dest.display());
+        outln!("imported {noun} `{name}` into {}", installed.dest.display());
     }
     // The grant belongs to the bytes, not to the verb that wrote them: this is the one import where
     // a reader did not name the bundle themselves, so it is the one where an unannounced credential
@@ -1160,7 +1160,7 @@ fn app_rm_profiles(names: &[&str]) -> ExitCode {
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 drop_replaced_copy(name);
-                println!("{}", render_removed(Some("app profile"), name, &pal));
+                outln!("{}", render_removed(Some("app profile"), name, &pal));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 diag::error(&format!(
@@ -1248,9 +1248,9 @@ fn app_rm_purge(names: &[&str], gc: bool) -> ExitCode {
     // backs every app in a project. `--gc` sweeps the *current* project's store now; without it, the
     // reclamation is a separate manual step, and either way other projects need their own sweep.
     if gc {
-        println!();
+        outln!();
         let gc_code = sandbox::gc(true, false, false, &pal);
-        println!(
+        outln!(
             "{}",
             style::dim_prose(
                 "note: `--gc` swept this project's store; run `sbx gc --prune` in the apps' other \
@@ -1268,7 +1268,7 @@ fn app_rm_purge(names: &[&str], gc: bool) -> ExitCode {
         };
     }
 
-    println!(
+    outln!(
         "{}",
         style::dim_prose(
             "note: an app's nix:/flake: tool closures live in the shared per-project store; \
@@ -1356,7 +1356,7 @@ fn app_rm_purge_one(
         Some(path) => match std::fs::remove_file(&path) {
             Ok(()) => {
                 drop_replaced_copy(name);
-                println!("{}", render_removed(Some("app profile"), name, pal));
+                outln!("{}", render_removed(Some("app profile"), name, pal));
                 true
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -1374,7 +1374,7 @@ fn app_rm_purge_one(
     //    what it is rather than as a home the app never had.
     let report = sandbox::purge_app_homes(layout.data_dir(), name);
     for home in &report.removed {
-        println!(
+        outln!(
             "{ok}removed{r} {} {n}{}{r} {dim}({}){r}",
             if home.carried_home { "home" } else { "state" },
             home.path.display(),
@@ -1422,7 +1422,7 @@ fn app_rm_purge_one(
     } else {
         format!("{warn}purged with errors{r}")
     };
-    println!(
+    outln!(
         "{verb} app {n}{name}{r} — freed {n}{}{r} {dim}({removed_what}){r}",
         sandbox::human_bytes(report.freed())
     );
@@ -1512,7 +1512,7 @@ fn app_list(json: bool) -> ExitCode {
     }
 
     if profiles.is_empty() && installed.is_empty() {
-        println!(
+        outln!(
             "{dim}no imported app profiles and no installed app homes \
              (import one with: sbx app import <file>){r}"
         );
@@ -1524,12 +1524,12 @@ fn app_list(json: bool) -> ExitCode {
     let total_bytes: u64 = installed.iter().map(|a| a.total_bytes()).sum();
     let disk = sandbox::human_bytes(total_bytes);
     match &profiles_dir {
-        Some(dir) => println!(
+        Some(dir) => outln!(
             "{h}apps{r} {dim}({} app(s), {disk} on disk; profiles in {}){r}:",
             names.len(),
             dir.display()
         ),
-        None => println!(
+        None => outln!(
             "{h}apps{r} {dim}({} app(s), {disk} on disk){r}:",
             names.len()
         ),
@@ -1543,9 +1543,10 @@ fn app_list(json: bool) -> ExitCode {
         .unwrap_or(0)
         .max("NAME".len());
     let prof_w = "PROFILE".len();
-    println!(
+    outln!(
         "  {dim}{:<name_w$}  {:<prof_w$}  HOME{r}",
-        "NAME", "PROFILE"
+        "NAME",
+        "PROFILE"
     );
 
     for name in &names {
@@ -1564,17 +1565,17 @@ fn app_list(json: bool) -> ExitCode {
         };
         let name_pad = format!("{name:<name_w$}");
         let prof_pad = format!("{profile_cell:<prof_w$}");
-        println!("  {n}{name_pad}{r}  {dim}{prof_pad}  {home_cell}{r}");
+        outln!("  {n}{name_pad}{r}  {dim}{prof_pad}  {home_cell}{r}");
     }
 
-    println!(
+    outln!(
         "{dim}(remove a profile: sbx app rm <name>; also remove its home + tools: \
          sbx app rm <name> --purge){r}"
     );
     // The sizes above are what each home reads, which is not what removing it returns. Printed
     // whenever a size was, so the figure and its caveat are never read apart.
     if !installed.is_empty() {
-        println!(
+        outln!(
             "{}",
             style::dim_prose(
                 &format!(
@@ -2464,14 +2465,14 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             // Under `--all` the app has to be named, or a line cannot be attributed; named, the
             // heading would repeat what the command line already said.
             if all {
-                println!("{n}{app_name}{r} {dim}{location}:{r}");
+                outln!("{n}{app_name}{r} {dim}{location}:{r}");
             } else {
-                println!("{dim}{location}:{r}");
+                outln!("{dim}{location}:{r}");
             }
             for p in &pruned {
                 totals.tools += 1;
                 totals.bytes += p.bytes;
-                println!(
+                outln!(
                     "  {n}{}{r}  {dim}{}{r}",
                     p.token,
                     sandbox::human_bytes(p.bytes)
@@ -2480,7 +2481,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             for e in &taken {
                 totals.entries += 1;
                 totals.bytes += e.bytes;
-                println!(
+                outln!(
                     "  {n}{}{r}  {dim}{}{r}",
                     e.rel,
                     sandbox::human_bytes(e.bytes)
@@ -2499,14 +2500,14 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                 }
                 let location = format!("project {} mise pool", pool.project_id);
                 if all {
-                    println!("{n}{app_name}{r} {dim}{location}:{r}");
+                    outln!("{n}{app_name}{r} {dim}{location}:{r}");
                 } else {
-                    println!("{dim}{location}:{r}");
+                    outln!("{dim}{location}:{r}");
                 }
                 for e in &taken {
                     totals.entries += 1;
                     totals.bytes += e.bytes;
-                    println!(
+                    outln!(
                         "  {n}{}{r}  {dim}{}{r}",
                         e.rel,
                         sandbox::human_bytes(e.bytes)
@@ -2667,7 +2668,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         } else {
             "undeclared mise tools"
         };
-        println!("{h}sbx app prune{r} {dim}— {subject}: no {what} to prune.{r}");
+        outln!("{h}sbx app prune{r} {dim}— {subject}: no {what} to prune.{r}");
         return if had_error {
             ExitCode::FAILURE
         } else {
@@ -2678,9 +2679,9 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     let size = sandbox::human_bytes(totals.bytes);
     let subject = prune_subject(totals.tools, totals.versions, totals.entries);
     if apply {
-        println!("{ok}pruned {subject}, freeing {size} of data.{r}");
+        outln!("{ok}pruned {subject}, freeing {size} of data.{r}");
     } else {
-        println!(
+        outln!(
             "{}",
             style::dim_prose(
                 &format!("would prune {subject} ({size} of data) — re-run with `--yes` to apply."),
@@ -2692,7 +2693,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     // fact. What the disk gets back is another number: a compressing volume stored those bytes
     // smaller, and a block shared with another tree stays until its last reference goes. Only the
     // filesystem knows either, so the line points at the verb that asks it rather than guessing.
-    println!(
+    outln!(
         "{}",
         style::dim_prose(
             &format!("that is the size of the data; {}", sandbox::SIZE_CAVEAT),
@@ -2731,14 +2732,14 @@ fn report_stale(
     }
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
     if all {
-        println!("{n}{app_name}{r} {dim}{location}:{r}");
+        outln!("{n}{app_name}{r} {dim}{location}:{r}");
     } else {
-        println!("{dim}{location}:{r}");
+        outln!("{dim}{location}:{r}");
     }
     for v in versions {
         totals.versions += 1;
         totals.bytes += v.bytes;
-        println!(
+        outln!(
             "  {n}{}@{}{r}  {dim}{} (no activation asks for it){r}",
             v.token,
             v.version,

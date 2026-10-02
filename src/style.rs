@@ -167,8 +167,8 @@ pub(crate) fn print_table(headers: &[&str], align: &[Align], rows: &[Vec<String>
             .map_or(line.len(), |(i, _)| i);
         let (head, rest) = line.split_at(split);
         match i {
-            0 => println!("{}{line}{}", pal.head, pal.reset),
-            _ => println!("{}{head}{}{rest}", pal.name, pal.reset),
+            0 => outln!("{}{line}{}", pal.head, pal.reset),
+            _ => outln!("{}{head}{}{rest}", pal.name, pal.reset),
         }
     }
 }

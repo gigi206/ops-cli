@@ -129,7 +129,7 @@ fn runtime_housekeeping(
     let folded = crate::sandbox::gc::fold_egress_counters(layout.data_dir(), prune);
     if !folded.is_empty() {
         let verb = if prune { "folded" } else { "would be folded" };
-        println!(
+        outln!(
             "{h}sbx gc:{r} egress counters — {n}{}{r} finished session file(s) {verb} into one per \
              project; nothing is discarded (`sbx net stats --reset` is what discards).",
             folded.len()
@@ -142,7 +142,7 @@ fn runtime_housekeeping(
     if !trees.is_empty() {
         let bytes: u64 = trees.iter().map(|(_, b)| b).sum();
         let verb = if prune { "removed" } else { "would be removed" };
-        println!(
+        outln!(
             "{h}sbx gc:{r} distribution images — {n}{}{r} unpacked tree(s) {verb}, {n}{}{r} freed.",
             trees.len(),
             crate::sandbox::human_bytes(bytes)
@@ -154,12 +154,12 @@ fn runtime_housekeeping(
         return;
     }
     if prune {
-        println!(
+        outln!(
             "{h}sbx gc:{r} runtime files — removed {n}{}{r} left by launches that are gone.",
             stale.len()
         );
     } else {
-        println!(
+        outln!(
             "{h}sbx gc:{r} runtime files — {n}{}{r} left by launches that are gone would be removed.",
             stale.len()
         );
@@ -235,7 +235,7 @@ pub(in crate::sandbox) fn shared_store_gc(
     };
 
     if prune {
-        println!(
+        outln!(
             "{h}sbx gc:{r} shared store — dropped {} stale gc root(s), collected {} store path(s), freed {}.",
             stale.len(),
             report.paths,
@@ -245,7 +245,7 @@ pub(in crate::sandbox) fn shared_store_gc(
         // On a dry run the stale roots are not dropped, so their closures are still rooted and not
         // yet counted as collectable; the count of stale roots is the signal, and `--prune` frees
         // their closures on top of the orphans reported here (a lower bound).
-        println!(
+        outln!(
             "{}",
             crate::style::prose(
                 &format!(
@@ -278,9 +278,9 @@ fn report_optimise(
     let (h, r, ok) = (pal.head, pal.reset, pal.ok);
     match crate::sandbox::gc::optimise(store) {
         Ok(report) if report.inodes_freed == 0 && report.bytes_freed == 0 => {
-            println!("{h}sbx gc:{r} {label} — already deduplicated, nothing to reclaim.");
+            outln!("{h}sbx gc:{r} {label} — already deduplicated, nothing to reclaim.");
         }
-        Ok(report) => println!(
+        Ok(report) => outln!(
             "{h}sbx gc:{r} {label} — {ok}deduplicated{r}: freed {} across {} inode(s).",
             crate::sandbox::gc::human_bytes(report.bytes_freed),
             report.inodes_freed,
@@ -387,7 +387,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     if let Some((layout, (id, project))) = &early
         && !crate::sandbox::projectstore::store_exists(layout, id)
     {
-        println!(
+        outln!(
             "{h}sbx gc{r} — {n}{}{r}: {dim}no per-project store yet, nothing to reclaim.{r}",
             project.display()
         );
@@ -527,7 +527,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         0
     };
 
-    println!("{h}sbx gc{r} — {n}{}{r}", project.display());
+    outln!("{h}sbx gc{r} — {n}{}{r}", project.display());
     // In a cage of its own, like the registration the seed above ran: the store is the project's
     // cage's to write, and nix and SQLite read here what it wrote.
     let slug = crate::sandbox::naming::cage_slug(None, &prep.cwd);
@@ -556,7 +556,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         // The dropped roots' builds were unrooted before the sweep, so they are already counted in
         // `report.paths`; name how many roots this pass dropped — removed-package flakes plus
         // superseded seed builds — to explain where the collection came from.
-        println!(
+        outln!(
             "  {}collected{} {} store path(s) ({} from removed package(s), {} superseded build(s)), freed {}.",
             pal.ok,
             r,
@@ -568,7 +568,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     } else {
         // A dry run cannot size the roots it would drop (their builds are still held, so not yet in
         // the dead set), so report their counts separately from the currently-dead total.
-        println!(
+        outln!(
             "  {}",
             crate::style::dim_prose(
                 &format!(
@@ -580,7 +580,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
             )
         );
         if pruned > 0 || superseded > 0 {
-            println!(
+            outln!(
                 "  {dim}and {pruned} removed-package build(s) + {superseded} superseded build(s) would also be reclaimed.{r}"
             );
         }
@@ -644,7 +644,7 @@ pub(crate) fn superseded_reclaimable_hint(
     let keep = crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs);
     let n = crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, false).len();
     if n > 0 {
-        println!(
+        outln!(
             "  {}",
             crate::style::dim_prose(
                 &format!(

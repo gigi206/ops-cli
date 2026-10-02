@@ -89,7 +89,7 @@ pub(super) fn config_get(args: &[OsString]) -> ExitCode {
         };
     match config::manage::get(&path, &key) {
         Ok(Some(v)) => {
-            println!("{}", get_output(&v, std::io::stdout().is_terminal()));
+            outln!("{}", get_output(&v, std::io::stdout().is_terminal()));
             ExitCode::SUCCESS
         }
         Ok(None) => {
@@ -350,7 +350,7 @@ pub(super) fn config_set(args: &[OsString]) -> ExitCode {
             // Nothing was written, so the trust marker still matches and the gate is not re-armed —
             // the same reasoning (and the same silence about trust) as `add`/`rm` on a no-op.
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_config_same_value(&key, &path, &pal));
+            outln!("{}", render_config_same_value(&key, &path, &pal));
             ExitCode::SUCCESS
         }
         Ok(written) => {
@@ -360,7 +360,7 @@ pub(super) fn config_set(args: &[OsString]) -> ExitCode {
                 "updated"
             };
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_config_write(verb, &key, &path, &pal));
+            outln!("{}", render_config_write(verb, &key, &path, &pal));
             report_write_trust(
                 &path,
                 &key,
@@ -447,7 +447,7 @@ pub(super) fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
                 ListEdit::Add => ("added", "to"),
                 ListEdit::Remove => ("removed", "from"),
             };
-            println!(
+            outln!(
                 "{}",
                 render_list_edit(done, preposition, entry, &key, &path, &pal)
             );
@@ -470,7 +470,7 @@ pub(super) fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
                 ListEdit::Add => "is already in",
                 ListEdit::Remove => "is not in",
             };
-            println!("{}", render_list_unchanged(entry, why, &key, &path, &pal));
+            outln!("{}", render_list_unchanged(entry, why, &key, &path, &pal));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -519,7 +519,7 @@ pub(super) fn config_unset(args: &[OsString]) -> ExitCode {
     match config::manage::unset(&path, &key) {
         Ok(written) if written.outcome => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_config_write("unset", &key, &path, &pal));
+            outln!("{}", render_config_write("unset", &key, &path, &pal));
             report_write_trust(
                 &path,
                 &key,
@@ -535,7 +535,7 @@ pub(super) fn config_unset(args: &[OsString]) -> ExitCode {
         }
         Ok(_) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_config_unchanged(&key, &path, &pal));
+            outln!("{}", render_config_unchanged(&key, &path, &pal));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -589,7 +589,7 @@ pub(super) fn config_path_cmd(args: &[OsString]) -> ExitCode {
 
     match config::manage::scope_path(&scope, &cwd) {
         Ok(p) => {
-            println!("{}", p.display());
+            outln!("{}", p.display());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -976,7 +976,7 @@ fn record_trust(
         Some(dir) => match attest(dir) {
             Ok(()) => {
                 let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-                println!("{}", render_trusted_whole_file(path, &pal));
+                outln!("{}", render_trusted_whole_file(path, &pal));
                 Ok(())
             }
             Err(e) => {

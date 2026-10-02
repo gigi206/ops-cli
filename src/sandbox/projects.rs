@@ -51,7 +51,7 @@ fn reap_dead_trees(
         && report.reaped_unidentified.is_empty()
         && report.failed.is_empty()
     {
-        println!("{h}sbx projects rm:{r} {dim}no dead project trees to reclaim.{r}");
+        outln!("{h}sbx projects rm:{r} {dim}no dead project trees to reclaim.{r}");
         return;
     }
 
@@ -64,7 +64,7 @@ fn reap_dead_trees(
         } else {
             format!("{dim}reclaimable{r}")
         };
-        println!(
+        outln!(
             "  {verb}: {n}{}{r} ({})",
             tree.path.display(),
             super::gc::human_bytes(tree.bytes)
@@ -72,13 +72,13 @@ fn reap_dead_trees(
     }
     if !report.dead.is_empty() {
         if prune {
-            println!(
+            outln!(
                 "{h}sbx projects rm:{r} reclaimed {} dead project tree(s), freed up to {}.",
                 report.dead.len(),
                 super::gc::human_bytes(freed)
             );
         } else {
-            println!(
+            outln!(
                 "{}",
                 crate::style::prose(
                     &format!(
@@ -99,14 +99,14 @@ fn reap_dead_trees(
     let mut ufreed = 0u64;
     for tree in &report.reaped_unidentified {
         ufreed += tree.bytes;
-        println!(
+        outln!(
             "  {ok}reclaimed{r} {warn}(no marker, deadness unverified){r}: {n}{}{r} ({})",
             tree.dir.display(),
             super::gc::human_bytes(tree.bytes)
         );
     }
     if !report.reaped_unidentified.is_empty() {
-        println!(
+        outln!(
             "{h}sbx projects rm --markerless:{r} reclaimed {} markerless tree(s), freed up to {}.",
             report.reaped_unidentified.len(),
             super::gc::human_bytes(ufreed)
@@ -122,7 +122,7 @@ fn reap_dead_trees(
         } else {
             "remove by hand if unwanted"
         };
-        println!(
+        outln!(
             "  {warn}unidentified{r} (no marker, project path unknown): {n}{}{r} ({}) — {hint}",
             tree.dir.display(),
             super::gc::human_bytes(tree.bytes)
@@ -658,12 +658,12 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
 
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     if rows.is_empty() {
-        println!("{h}sbx projects{r} {dim}— no per-project runtime trees.{r}");
+        outln!("{h}sbx projects{r} {dim}— no per-project runtime trees.{r}");
         return ExitCode::SUCCESS;
     }
     let total: u64 = rows.iter().map(|row| row.own_bytes).sum();
     let apparent: u64 = rows.iter().map(|row| row.bytes).sum();
-    println!(
+    outln!(
         "{h}sbx projects{r} {dim}({} tree(s), {} own, {} counting the seeded stores){r}",
         rows.len(),
         super::gc::human_bytes(total),
@@ -680,13 +680,13 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
             String::new()
         };
         let path = row.project.as_deref().unwrap_or("(no marker)");
-        println!(
+        outln!(
             "  {n}{id}{r}  {state}  {size}  {dim}{last}{r}  {path}{mark}",
             id = row.id,
             last = row.last_used,
         );
     }
-    println!(
+    outln!(
         "{}",
         crate::style::dim_prose(
             &format!(
@@ -826,13 +826,13 @@ pub(crate) fn projects_rm(
                 } else {
                     format!("{dim}removable{r}")
                 };
-                println!(
+                outln!(
                     "  {verb}: {n}{}{r} ({})",
                     dir.display(),
                     super::gc::human_bytes(bytes)
                 );
                 if !apply {
-                    println!(
+                    outln!(
                         "{}",
                         crate::style::prose(
                             &format!(

@@ -201,13 +201,13 @@ pub(crate) fn upgrade_mise_packages(
     only: Option<&str>,
 ) -> bool {
     let (h, warn, dim, r, ok_c) = (pal.head, pal.warn, pal.dim, pal.reset, pal.ok);
-    println!("{h}sbx upgrade — mise packages{r}");
+    outln!("{h}sbx upgrade — mise packages{r}");
     let groups = mise_package_groups(cfg, only);
     // Surface withheld (untrusted) `mise:` packages so an untrusted project does not silently
     // read as "nothing declared" — parity with the `nix:` tools path, which warns the same.
     let withheld = withheld_mise_packages(cfg, only);
     if withheld > 0 {
-        println!(
+        outln!(
             "{}",
             crate::style::prose(
                 &format!(
@@ -233,7 +233,7 @@ pub(crate) fn upgrade_mise_packages(
 
     if groups.is_empty() && pool_tokens.is_empty() {
         if withheld == 0 {
-            println!("  {dim}no mise: packages to roll.{r}");
+            outln!("  {dim}no mise: packages to roll.{r}");
         }
         return true;
     }
@@ -275,7 +275,7 @@ pub(crate) fn upgrade_mise_packages(
         // `network = "none"` cannot fetch — the launch skips the equip there — so skip the roll
         // too (the tool stays at its persisted version). Not a failure: it is the declared posture.
         if matches!(cfg.network, crate::config::NetworkPolicy::Isolated) {
-            println!(
+            outln!(
                 "{}",
                 roll_line(
                     &name,
@@ -296,7 +296,7 @@ pub(crate) fn upgrade_mise_packages(
             match prepare_roll_cage(cwd, home.app()) {
                 Ok(p) => Some(p),
                 Err(_) => {
-                    println!(
+                    outln!(
                         "{}",
                         roll_line(&name, width, &format!("{warn}failed to prepare{r}"), pal)
                     );
@@ -329,7 +329,7 @@ pub(crate) fn upgrade_mise_packages(
         let (spec, guard, _, _store_lock) = match build(prep, runtime, cmd) {
             Ok(v) => v,
             Err(_) => {
-                println!(
+                outln!(
                     "{}",
                     roll_line(&name, width, &format!("{warn}failed to launch{r}"), pal)
                 );
@@ -348,14 +348,14 @@ pub(crate) fn upgrade_mise_packages(
         if code == 0 {
             match mise_transitions(&out).as_slice() {
                 [] if mise_up_to_date(&out) => {
-                    println!(
+                    outln!(
                         "{}",
                         roll_line(&name, width, &format!("{dim}up to date{r}"), pal)
                     );
                     up_to_date += 1;
                 }
                 [] => {
-                    println!(
+                    outln!(
                         "{}",
                         roll_line(&name, width, &format!("{ok_c}upgraded{r}"), pal)
                     );
@@ -366,7 +366,7 @@ pub(crate) fn upgrade_mise_packages(
                     let delta = only.split_once(' ').map_or(only.as_str(), |(_, v)| v);
                     match transition_regression(only) {
                         Some(reg) => {
-                            println!(
+                            outln!(
                                 "{}",
                                 roll_line(
                                     &name,
@@ -378,7 +378,7 @@ pub(crate) fn upgrade_mise_packages(
                             not_forward.push(name);
                         }
                         None => {
-                            println!(
+                            outln!(
                                 "{}",
                                 roll_line(&name, width, &format!("{ok_c}{delta}{r}"), pal)
                             );
@@ -400,11 +400,11 @@ pub(crate) fn upgrade_mise_packages(
                     } else {
                         format!("{ok_c}{} tools rolled{r}", many.len())
                     };
-                    println!("{}", roll_line(&name, width, &status, pal));
+                    outln!("{}", roll_line(&name, width, &status, pal));
                     for t in many {
                         match transition_regression(t) {
-                            Some(reg) => println!("       {warn}{t} — {}{r}", reg.describe()),
-                            None => println!("       {ok_c}{t}{r}"),
+                            Some(reg) => outln!("       {warn}{t} — {}{r}", reg.describe()),
+                            None => outln!("       {ok_c}{t}{r}"),
                         }
                     }
                     if back > 0 {
@@ -415,7 +415,7 @@ pub(crate) fn upgrade_mise_packages(
                 }
             }
         } else {
-            println!(
+            outln!(
                 "{}",
                 roll_line(
                     &name,
@@ -438,14 +438,14 @@ pub(crate) fn upgrade_mise_packages(
         // "nothing to roll" one line under a pool that rolled.
         match roll_task_pool(cwd, &mut prep, cfg) {
             Ok(true) => {
-                println!(
+                outln!(
                     "{}",
                     roll_line("task pool", width.max(9), &format!("{ok_c}rolled{r}"), pal)
                 );
                 rolled.push("task pool".to_string());
             }
             Ok(false) => {
-                println!(
+                outln!(
                     "{}",
                     roll_line(
                         "task pool",
@@ -457,7 +457,7 @@ pub(crate) fn upgrade_mise_packages(
                 up_to_date += 1;
             }
             Err(e) => {
-                println!(
+                outln!(
                     "{}",
                     roll_line("task pool", width.max(9), &format!("{warn}{e}{r}"), pal)
                 );
@@ -478,7 +478,7 @@ pub(crate) fn upgrade_mise_packages(
     } else {
         ok_c
     };
-    println!("  {hue}{recap}{r}");
+    outln!("  {hue}{recap}{r}");
     ok
 }
 
@@ -554,10 +554,10 @@ pub(crate) fn upgrade_provision_steps(
     force: bool,
 ) -> bool {
     let (h, warn, dim, r, ok_c) = (pal.head, pal.warn, pal.dim, pal.reset, pal.ok);
-    println!("{h}sbx upgrade — bundle install steps{r}");
+    outln!("{h}sbx upgrade — bundle install steps{r}");
     let groups = provision_groups(cfg, only);
     if groups.is_empty() {
-        println!("  {dim}no bundle install steps to re-run.{r}");
+        outln!("  {dim}no bundle install steps to re-run.{r}");
         return true;
     }
 
@@ -587,7 +587,7 @@ pub(crate) fn upgrade_provision_steps(
         // An isolated cage cannot fetch, and every install step fetches something. Skipping is the
         // declared posture, not a failure — the same call `upgrade_mise_packages` makes.
         if matches!(cfg.network, crate::config::NetworkPolicy::Isolated) {
-            println!(
+            outln!(
                 "{}",
                 roll_line(
                     &name,
@@ -608,7 +608,7 @@ pub(crate) fn upgrade_provision_steps(
             match prepare_roll_cage(cwd, home.app()) {
                 Ok(p) => Some(p),
                 Err(_) => {
-                    println!(
+                    outln!(
                         "{}",
                         roll_line(&name, width, &format!("{warn}failed to prepare{r}"), pal)
                     );
@@ -648,7 +648,7 @@ pub(crate) fn upgrade_provision_steps(
         let (spec, guard, _, _store_lock) = match build(prep, runtime, provision_only_cmd(&steps)) {
             Ok(v) => v,
             Err(_) => {
-                println!(
+                outln!(
                     "{}",
                     roll_line(&name, width, &format!("{warn}failed to launch{r}"), pal)
                 );
@@ -686,11 +686,11 @@ pub(crate) fn upgrade_provision_steps(
             } else {
                 format!("{ok_c}install step ran ({bundles}){r}")
             };
-            println!("{}", roll_line(&name, width, &verdict, pal));
+            outln!("{}", roll_line(&name, width, &verdict, pal));
             echo_cage_output(&out);
             ran.push(name);
         } else {
-            println!(
+            outln!(
                 "{}",
                 roll_line(
                     &name,
@@ -714,7 +714,7 @@ pub(crate) fn upgrade_provision_steps(
     } else {
         ok_c
     };
-    println!("  {hue}{recap}{r}");
+    outln!("  {hue}{recap}{r}");
     ok
 }
 

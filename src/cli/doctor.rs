@@ -80,9 +80,9 @@ impl<'a> Report<'a> {
                 _ => tag_fail(self.pal),
             };
             if detail.is_empty() {
-                println!("  {tag} {name}");
+                outln!("  {tag} {name}");
             } else {
-                println!("  {tag} {name:<18}{}", style::prose(detail, self.pal));
+                outln!("  {tag} {name:<18}{}", style::prose(detail, self.pal));
             }
         }
         self.checks.push(Check {
@@ -97,7 +97,7 @@ impl<'a> Report<'a> {
     /// silence, which cannot happen from this module: every note here follows a check.
     fn note(&mut self, text: &str) {
         if !self.json {
-            println!(
+            outln!(
                 "         {}",
                 style::dim_prose(&format!("· {text}"), self.pal)
             );
@@ -112,12 +112,12 @@ impl<'a> Report<'a> {
     /// document carries them in the same note, one per line.
     fn note_with_lines(&mut self, text: &str, lines: &[String]) {
         if !self.json {
-            println!(
+            outln!(
                 "         {}",
                 style::dim_prose(&format!("· {text}"), self.pal)
             );
             for line in lines {
-                println!("             {line}");
+                outln!("             {line}");
             }
         }
         if let Some(last) = self.checks.last_mut() {
@@ -173,7 +173,7 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal() && !json);
     let (h, r) = (pal.head, pal.reset);
     if !json {
-        println!("{h}sbx doctor{r} — runtime preflight\n");
+        outln!("{h}sbx doctor{r} — runtime preflight\n");
     }
     let mut rep = Report::new(json, &pal);
 
@@ -347,9 +347,9 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
         };
     }
 
-    println!();
+    outln!();
     if remediation.is_empty() {
-        println!("sbx: prerequisites OK.");
+        outln!("sbx: prerequisites OK.");
         ExitCode::SUCCESS
     } else {
         crate::diag::error_in(

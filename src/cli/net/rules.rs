@@ -555,7 +555,7 @@ fn net_inject_session(
         }
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!(
+    out!(
         "{}",
         render_inject(
             verb,

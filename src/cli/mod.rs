@@ -791,7 +791,7 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "version" => match reject_extra(&["version"], &rest) {
             Err(code) => code,
             Ok(()) => {
-                println!("sbx {}", env!("CARGO_PKG_VERSION"));
+                outln!("sbx {}", env!("CARGO_PKG_VERSION"));
                 ExitCode::SUCCESS
             }
         },
@@ -1623,68 +1623,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// A whole rendered document written with a bare `print!` panics when the reader has gone
-    /// away: Rust ignores `SIGPIPE`, so `sbx config show | head -1` ended in `failed printing to
-    /// stdout` and exit 101 on a pipeline the shell reports as fine. `config show` is the largest
-    /// thing sbx prints (63 KiB on an ordinary project, past the pipe buffer on any project with a
-    /// sizeable `[env]`), and it was one of seven verbs rendering a document that way.
-    ///
-    /// The population is found in the source rather than listed here, so the next verb that
-    /// renders a document is held to the rule without anyone remembering to add it. `eprint!` is
-    /// left alone: stderr is not what a `| head` closes.
-    #[test]
-    fn no_verb_writes_a_whole_document_to_stdout_with_a_bare_print() {
-        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
-        let mut offenders: Vec<String> = Vec::new();
-        for file in crate::testutil::crate_sources() {
-            if crate::testutil::is_test_only_source(&file) {
-                continue;
-            }
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
-            let production = crate::testutil::production_half(&text);
-            for (at, _) in production.match_indices("print!(\"{}\"") {
-                // `eprint!` ends in the same four characters; only the bare one is at issue.
-                if production[..at].ends_with('e') {
-                    continue;
-                }
-                let line = production[..at].matches('\n').count() + 1;
-                let relative = file.display().to_string().replacen(&root, "", 1);
-                offenders.push(format!("{relative}:{line}"));
-            }
-            // A `--json` answer is a whole document too, and six verbs wrote theirs with
-            // `println!`, which the scan above does not match. This one finds the calls whose own
-            // arguments build the value with `serde_json`, however many lines the call spans. A
-            // value built beforehand and printed by name, as `proc` printed its tree, is not seen.
-            for (at, _) in production.match_indices("println!(") {
-                if production[..at].ends_with('e') {
-                    continue;
-                }
-                let args = &production[at + "println!(".len()..];
-                let mut depth = 1usize;
-                let end = args
-                    .char_indices()
-                    .find(|&(_, c)| {
-                        match c {
-                            '(' => depth += 1,
-                            ')' => depth -= 1,
-                            _ => {}
-                        }
-                        depth == 0
-                    })
-                    .map_or(args.len(), |(i, _)| i);
-                if args[..end].contains("serde_json") {
-                    let line = production[..at].matches('\n').count() + 1;
-                    let relative = file.display().to_string().replacen(&root, "", 1);
-                    offenders.push(format!("{relative}:{line}"));
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "these panic on `| head`; write them with `cli::print_document`:\n  {}",
-            offenders.join("\n  ")
-        );
     }
 }

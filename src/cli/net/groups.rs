@@ -209,7 +209,7 @@ pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            println!(
+            outln!(
                 "exported {} egress group(s) to {}",
                 rendered.len(),
                 dir.display()
@@ -239,7 +239,7 @@ pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
 fn write_group_file(path: &Path, name: &str, text: &str) -> ExitCode {
     match config::manage::write_text(path, text, None) {
         Ok(()) => {
-            println!("exported egress group `{name}` to {}", path.display());
+            outln!("exported egress group `{name}` to {}", path.display());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -304,7 +304,7 @@ pub(super) fn net_groups_import(args: &[OsString]) -> ExitCode {
             Ok(i) => i,
             Err(code) => return code,
         };
-    println!(
+    outln!(
         "imported egress group `{name}` into {}",
         installed.dest.display()
     );

@@ -74,7 +74,7 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
             .as_ref()
             .map(|a| format!(" for app {a}"))
             .unwrap_or_default();
-        println!("reset {n} egress stat file(s){scope}");
+        outln!("reset {n} egress stat file(s){scope}");
         return ExitCode::SUCCESS;
     }
 

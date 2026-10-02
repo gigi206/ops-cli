@@ -93,7 +93,7 @@ fn bundle_rm(args: &[OsString]) -> ExitCode {
         let path = dir.join(format!("{name}.toml"));
         match std::fs::remove_file(&path) {
             Ok(()) => {
-                println!(
+                outln!(
                     "{}",
                     crate::cli::confirm::render_removed(Some("bundle"), name, &pal)
                 );
@@ -724,7 +724,7 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            println!("exported {} bundle(s) to {}", rendered.len(), dir.display());
+            outln!("exported {} bundle(s) to {}", rendered.len(), dir.display());
         }
         (None, Some(path)) => {
             // No mode of sbx's own: `sbx bundle export demo > demo.toml` and `--out <file>` are
@@ -736,7 +736,7 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
                 ));
                 return ExitCode::FAILURE;
             }
-            println!("exported bundle `{}` to {}", rendered[0].0, path.display());
+            outln!("exported bundle `{}` to {}", rendered[0].0, path.display());
         }
         (None, None) => crate::cli::print_document(&rendered[0].1),
     }
@@ -800,7 +800,7 @@ fn bundle_import(args: &[OsString]) -> ExitCode {
             Ok(i) => i,
             Err(code) => return code,
         };
-    println!("imported bundle `{name}` into {}", installed.dest.display());
+    outln!("imported bundle `{name}` into {}", installed.dest.display());
     // An overwrite is the one import that can LOSE something — a rule or a package added by hand on
     // this machine. Both sides are named: a fragment that only ADDS widens what an app that uses it
     // reaches, which is exactly as worth saying as a drop.

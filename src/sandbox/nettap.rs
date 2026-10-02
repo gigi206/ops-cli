@@ -894,7 +894,7 @@ pub(crate) fn run_tap(argv: &[OsString]) -> ! {
         stop(&e);
     }
     // Every listener is bound; the holder may now install the rules that point at them.
-    println!("{READY}");
+    outln!("{READY}");
     if let Err(e) = io::stdout().flush() {
         stop(&e);
     }

@@ -153,7 +153,7 @@ fn secret_list(args: &[OsString]) -> ExitCode {
     let mut any = false;
     for secret in &resolved.secrets {
         any = true;
-        println!("{}", wire_line(secret, "wire", sources, &palette));
+        outln!("{}", wire_line(secret, "wire", sources, &palette));
     }
     for task in &resolved.tasks {
         for secret in &task.secrets {
@@ -173,16 +173,16 @@ fn secret_list(args: &[OsString]) -> ExitCode {
             if let Some(desc) = &secret.description {
                 rest.push_str(&format!("  — {desc}"));
             }
-            println!("{}", inventory_line(&secret.var, &rest, &palette));
+            outln!("{}", inventory_line(&secret.var, &rest, &palette));
         }
         for injection in &task.injections {
             any = true;
             let scope = format!("wire of task `{}`", task.name);
-            println!("{}", wire_line(injection, &scope, sources, &palette));
+            outln!("{}", wire_line(injection, &scope, sources, &palette));
         }
     }
     if !any {
-        println!("no credentials are declared for this project");
+        outln!("no credentials are declared for this project");
     }
     ExitCode::SUCCESS
 }

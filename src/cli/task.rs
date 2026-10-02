@@ -83,7 +83,7 @@ impl Plane {
             return;
         };
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-        println!(
+        outln!(
             "{}session {pid} — {}{}",
             pal.dim,
             project.display(),
@@ -345,7 +345,7 @@ fn task_list(args: &[OsString]) -> ExitCode {
         plane.announce();
     }
     if all.is_empty() {
-        println!("no declared operations");
+        outln!("no declared operations");
         return ExitCode::SUCCESS;
     }
     let rows: Vec<(String, client::TaskRow)> = match &listing.operation {
@@ -584,7 +584,7 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
                 &format!("`{name}` carries no credentials"),
             ),
             None => {
-                println!("no credentials are carried by the declared operations");
+                outln!("no credentials are carried by the declared operations");
                 ExitCode::SUCCESS
             }
         };
@@ -771,7 +771,7 @@ fn run_detached(
     }
     // The id alone on stdout, so `id=$(sbx task run --detach <name>)` is the whole of it. Everything
     // else a person needs goes to stderr, where it cannot end up in that variable.
-    println!("{}", result.id);
+    outln!("{}", result.id);
     diag::note(&format!(
         "invocation {} is running detached — `sbx task status` watches it, `sbx task result {}` \
          collects what it produced",
@@ -887,7 +887,7 @@ fn render_result(verb: &str, name: &str, result: &client::RunResult, json: bool)
     }
     // Streams go to their own channels, so a caller can pipe stdout while still seeing stderr.
     if let Some(out) = &result.stdout {
-        print!("{out}");
+        out!("{out}");
     }
     if let Some(err) = &result.stderr {
         eprint!("{err}");
@@ -1101,13 +1101,13 @@ fn task_status(args: &[OsString]) -> ExitCode {
     };
     if rows.is_empty() {
         let Some(target) = &listing.operation else {
-            println!("no operation is running");
+            outln!("no operation is running");
             return ExitCode::SUCCESS;
         };
         // An id names an invocation, which either runs or is over — there is no inventory to check
         // it against, and where it went is a question the log answers.
         if target.parse::<u64>().is_ok() {
-            println!("invocation {target} is not running");
+            outln!("invocation {target} is not running");
             diag::hint("       `sbx task logs` holds it if it has already finished.");
             return ExitCode::SUCCESS;
         }
@@ -1293,11 +1293,14 @@ fn task_show(args: &[OsString]) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     for (key, value, from) in &shown {
         match from {
-            Some(from) => println!(
+            Some(from) => outln!(
                 "{}{key:<width$}{}  {value}  {}({from}){}",
-                pal.head, pal.reset, pal.dim, pal.reset
+                pal.head,
+                pal.reset,
+                pal.dim,
+                pal.reset
             ),
-            None => println!("{}{key:<width$}{}  {value}", pal.head, pal.reset),
+            None => outln!("{}{key:<width$}{}  {value}", pal.head, pal.reset),
         }
     }
     if !also.is_empty() {
@@ -1384,7 +1387,7 @@ fn task_stop(args: &[OsString]) -> ExitCode {
     };
     match sandbox::task_control::stop_invocation(&socket, id) {
         Ok(sandbox::task_control::StopReply::Stopped) => {
-            println!("stopped invocation {id}");
+            outln!("stopped invocation {id}");
             ExitCode::SUCCESS
         }
         // Accepted but not yet done, and said as exactly that: everything under way before the
@@ -1471,11 +1474,11 @@ fn task_logs(args: &[OsString]) -> ExitCode {
     }
     if rows.is_empty() {
         let Some(target) = &listing.operation else {
-            println!("no invocations recorded");
+            outln!("no invocations recorded");
             return ExitCode::SUCCESS;
         };
         if target.parse::<u64>().is_ok() {
-            println!("no invocation {target} recorded");
+            outln!("no invocation {target} recorded");
             return ExitCode::SUCCESS;
         }
         return empty_or_unknown(
@@ -1705,7 +1708,7 @@ fn empty_or_unknown(planes: &[Plane], verb: &str, operation: &str, empty: &str) 
     if let Some(code) = refuse_undeclared(planes, verb, operation) {
         return code;
     }
-    println!("{empty}");
+    outln!("{empty}");
     ExitCode::SUCCESS
 }
 

@@ -412,7 +412,7 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     if all {
         if sessions.is_empty() {
             let pal = crate::style::Palette::for_stream(io::stdout().is_terminal());
-            println!("{}", render_no_active_sessions(&pal));
+            outln!("{}", render_no_active_sessions(&pal));
             return ExitCode::SUCCESS;
         }
         // Sessions are independent cages (separate pid namespaces), so they are torn down one after

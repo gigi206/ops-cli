@@ -227,13 +227,13 @@ fn net_test(args: &[OsString]) -> ExitCode {
     };
     match &resolved.network {
         config::NetworkPolicy::Shared => {
-            println!(
+            outln!(
                 "{h}network{scope}:{r} shared (host network) — every URL is reachable; no allowlist to test"
             );
             ExitCode::SUCCESS
         }
         config::NetworkPolicy::Isolated => {
-            println!("{h}network{scope}:{r} none (isolated) — no URL is reachable");
+            outln!("{h}network{scope}:{r} none (isolated) — no URL is reachable");
             ExitCode::SUCCESS
         }
         config::NetworkPolicy::Allowlist(policy) => {
@@ -254,7 +254,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     "ask (an unmatched host parks for a live `sbx net pending` decision)"
                 }
             };
-            println!("{h}network{scope}:{r} {mode}");
+            outln!("{h}network{scope}:{r} {mode}");
             // A `tcp://` target is a raw-splice question, decided on host:port alone through the same
             // `l4_decision` the proxy uses (so the tester cannot drift from the wire). The L7 default
             // action above does not apply to it — a raw splice is strictly opt-in via a `tcp://` rule.
@@ -275,7 +275,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 if let allowlist::L4Decision::Splice(rule) = &l4
                     && let Some(refusal) = literal_addr_refusal(&host, Some(rule))
                 {
-                    print!(
+                    out!(
                         "{}",
                         render_addr_refusal(
                             target,
@@ -294,7 +294,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
             // rather than only the pieces it is built from.
             match render_url_verdict(&url, &effective, policy, &method, &resolved.secrets, &pal) {
                 Ok(out) => {
-                    print!("{out}");
+                    out!("{out}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -859,7 +859,7 @@ fn proc_test(args: &[OsString]) -> ExitCode {
     let policy = &resolved.proc;
     let mode = match policy.mode {
         crate::proc_policy::ProcMode::Off => {
-            println!("{h}proc{scope}:{r} off — nothing is enforced; every program runs");
+            outln!("{h}proc{scope}:{r} off — nothing is enforced; every program runs");
             return ExitCode::SUCCESS;
         }
         crate::proc_policy::ProcMode::Observe => {
@@ -876,7 +876,7 @@ fn proc_test(args: &[OsString]) -> ExitCode {
             "confine (allowlist — only a declared program runs)"
         }
     };
-    println!("{h}proc{scope}:{r} {mode}");
+    outln!("{h}proc{scope}:{r} {mode}");
 
     let verdict = policy.decide(&caller, program);
     let (word, hue) = match verdict {
@@ -884,9 +884,9 @@ fn proc_test(args: &[OsString]) -> ExitCode {
         crate::proc_policy::Verdict::Deny => ("DENIED", pal.err),
         crate::proc_policy::Verdict::Ask => ("PARKED", pal.warn),
     };
-    println!("  {hue}{word}{r}  {program}");
+    outln!("  {hue}{word}{r}  {program}");
     if !caller.is_empty() {
-        println!(
+        outln!(
             "  {dim}called by: {}{r}",
             caller.join(" -> "),
             dim = pal.dim
@@ -1081,7 +1081,7 @@ fn fs_test(args: &[OsString]) -> ExitCode {
         Some(name) => format!(" (app {name})"),
         None => String::new(),
     };
-    println!(
+    outln!(
         "{h}fs{scope}:{r} {} denied, {} read-only",
         expanded.denied.len(),
         expanded.readonly.len()
@@ -1104,7 +1104,7 @@ fn fs_test(args: &[OsString]) -> ExitCode {
     let in_bind = !path.starts_with(&root)
         && crate::sandbox::fsmask::Reach::of(&root, &resolved.binds, data).writes(&path);
     if !path.starts_with(&root) && !in_bind {
-        println!("  {dim}{}{r}", shown(&path), dim = pal.dim);
+        outln!("  {dim}{}{r}", shown(&path), dim = pal.dim);
         diag::error(
             "sbx: test fs: that path is outside the project and its read-write binds: `[fs]` \
              closes paths of the project it is declared in, and nothing else",
@@ -1119,11 +1119,11 @@ fn fs_test(args: &[OsString]) -> ExitCode {
         }
         None => ("OPEN", pal.ok, None),
     };
-    println!("  {hue}{word}{r}  {}", shown(&path));
+    outln!("  {hue}{word}{r}  {}", shown(&path));
     match why {
         // An entry sbx added itself is named as such: pointing at a `[fs]` line would send the
         // reader to look for, or remove, a line that is in no config.
-        Some((_, m)) if m.builtin => println!(
+        Some((_, m)) if m.builtin => outln!(
             "  {dim}by sbx itself: the project config, its mise files, and what the project's git \
              reads where the cage writes (its hooks, its configuration, a `.git` file, the \
              directory of its submodules' repositories) are \
@@ -1131,7 +1131,7 @@ fn fs_test(args: &[OsString]) -> ExitCode {
             dim = pal.dim
         ),
         Some((field, m)) if m.path == path => {
-            println!(
+            outln!(
                 "  {dim}by `[fs] {field}` entry `{}`{r}",
                 m.pattern,
                 dim = pal.dim
@@ -1147,18 +1147,18 @@ fn fs_test(args: &[OsString]) -> ExitCode {
             } else {
                 "protects"
             };
-            println!(
+            outln!(
                 "  {dim}by `[fs] {field}` entry `{}`, which {verb} `{}` above it{r}",
                 m.pattern,
                 shown(&m.path),
                 dim = pal.dim
             )
         }
-        None if in_bind => println!(
+        None if in_bind => outln!(
             "  {dim}in a read-write bind, which `[fs]` entries do not name: the cage writes it{r}",
             dim = pal.dim
         ),
-        None => println!("  {dim}no `[fs]` entry names it{r}", dim = pal.dim),
+        None => outln!("  {dim}no `[fs]` entry names it{r}", dim = pal.dim),
     }
 
     // The content lens is the part of the same table this verb cannot answer: it decides at each
@@ -1166,7 +1166,7 @@ fn fs_test(args: &[OsString]) -> ExitCode {
     // the launch that reads them. Named rather than left out, since a reader who declared `scan`
     // would otherwise take "OPEN" for the whole `[fs]` answer.
     if !policy.scan.is_empty() {
-        println!(
+        outln!(
             "  {dim}`[fs] scan` also closes files by content at each open ({} shape{}) — not \
              answered here{r}",
             policy.scan.len(),

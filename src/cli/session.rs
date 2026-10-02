@@ -119,7 +119,7 @@ fn list_sessions(json: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if sessions.is_empty() {
-        println!("sbx: no active sandbox sessions.");
+        outln!("sbx: no active sandbox sessions.");
         return ExitCode::SUCCESS;
     }
 

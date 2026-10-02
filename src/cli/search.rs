@@ -68,7 +68,7 @@ pub(crate) fn run(args: &[OsString]) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     match sandbox::search(&nix, &layout, query, &sandbox::current_system(), &pal) {
         Ok(report) => {
-            print!("{report}");
+            out!("{report}");
             ExitCode::SUCCESS
         }
         Err(e) => {

@@ -391,7 +391,7 @@ fn run_upgrade(
         if let Some(name) = only
             && cfg.apps.get(name).is_some_and(|a| !a.provisions.is_empty())
         {
-            println!("{}", install_step_notice(name, &cfg, &pal));
+            outln!("{}", install_step_notice(name, &cfg, &pal));
         }
         ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, only, force);
     }
@@ -741,7 +741,7 @@ fn store_moved_hint(
         return;
     };
     let (dim, r) = (pal.dim, pal.reset);
-    println!("{}", style::prose(&format!("  {dim}{note}{r}"), pal));
+    outln!("{}", style::prose(&format!("  {dim}{note}{r}"), pal));
 }
 
 /// The outcome of a roll: whether it succeeded, and whether it *replaced* a revision that was
@@ -865,7 +865,7 @@ fn upgrade_nix_channel(
         &upgrade,
         pal,
     ) {
-        println!("{line}");
+        outln!("{line}");
     }
     // The summary above reads as "the whole installation moved", and for an app pinned elsewhere
     // nothing did: the global lock is that app's seed, not its channel, and this roll left its
@@ -875,7 +875,7 @@ fn upgrade_nix_channel(
         && let Some(note) = own_pin_note(layout, cfg, &upgrade.revision)
     {
         let (dim, r) = (pal.dim, pal.reset);
-        println!("{}", style::prose(&format!("  {dim}{note}{r}"), pal));
+        outln!("{}", style::prose(&format!("  {dim}{note}{r}"), pal));
     }
     (Roll { ok: true, moved }, Some(target.scope()))
 }
@@ -972,7 +972,7 @@ fn upgrade_distro(
         }
     };
     for line in distro_upgrade_summary(cfg.distro_origin, &rolled, pal) {
-        println!("{line}");
+        outln!("{line}");
     }
     true
 }
@@ -1009,7 +1009,7 @@ fn upgrade_mise_engine(
         &upgrade,
         pal,
     ) {
-        println!("{line}");
+        outln!("{line}");
     }
     true
 }
@@ -1029,7 +1029,7 @@ fn upgrade_mise_tools(
 ) -> Roll {
     let Some(mise) = &cfg.mise else {
         for line in upgrade_tools_summary(&[], pal) {
-            println!("{line}");
+            outln!("{line}");
         }
         return Roll::CLEAN;
     };
@@ -1050,7 +1050,7 @@ fn upgrade_mise_tools(
             }
         };
     for line in upgrade_tools_summary(&outcomes, pal) {
-        println!("{line}");
+        outln!("{line}");
     }
     Roll {
         ok: !outcomes
@@ -1145,7 +1145,7 @@ fn upgrade_flake_packages(
         }
     };
     for line in flake_upgrade_summary(&outcomes, sandbox::withheld_flake_packages(cfg, only), pal) {
-        println!("{line}");
+        outln!("{line}");
     }
     Roll {
         ok: !outcomes
@@ -1264,7 +1264,7 @@ fn upgrade_deb_packages(
         sandbox::withheld_deb_packages(cfg, only),
         pal,
     ) {
-        println!("{line}");
+        outln!("{line}");
     }
     !outcomes
         .iter()
@@ -1370,7 +1370,7 @@ fn upgrade_appimage_packages(
         sandbox::withheld_appimage_packages(cfg, only),
         pal,
     ) {
-        println!("{line}");
+        outln!("{line}");
     }
     !outcomes
         .iter()
@@ -1401,7 +1401,7 @@ fn upgrade_binary_packages(
         sandbox::withheld_binary_packages(cfg, only),
         pal,
     ) {
-        println!("{line}");
+        outln!("{line}");
     }
     !outcomes
         .iter()
@@ -1432,7 +1432,7 @@ fn upgrade_tarball_packages(
         sandbox::withheld_tarball_packages(cfg, only),
         pal,
     ) {
-        println!("{line}");
+        outln!("{line}");
     }
     !outcomes
         .iter()

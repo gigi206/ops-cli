@@ -174,7 +174,7 @@ fn record_trust(path: &Path, yes: bool) -> ExitCode {
     match trust::trust_written(&store_dir, path, &sbx_bytes, &mise) {
         Ok(()) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_trust_recorded(path, &pal));
+            outln!("{}", render_trust_recorded(path, &pal));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -353,7 +353,7 @@ fn show_trust(path: &Path) -> ExitCode {
     };
     let state = trust::state(&store_dir, path);
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!("{}", render_trust_verdict(path, state, &pal));
+    outln!("{}", render_trust_verdict(path, state, &pal));
     ExitCode::SUCCESS
 }
 
@@ -419,7 +419,7 @@ pub(crate) fn untrust_cmd(args: Vec<OsString>) -> ExitCode {
         }
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!("{}", render_untrust_result(&path, result, &pal));
+    outln!("{}", render_untrust_result(&path, result, &pal));
     ExitCode::SUCCESS
 }
 

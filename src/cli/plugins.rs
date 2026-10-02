@@ -462,7 +462,7 @@ fn plugins_list(json: bool) -> ExitCode {
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
-    println!(
+    outln!(
         "{h}built-in schemes{r} (always resolve, never a plugin): {n}{}{r}",
         plugins::builtin_schemes().join(", ")
     );
@@ -476,49 +476,49 @@ fn plugins_list(json: bool) -> ExitCode {
         } else {
             " (none)"
         };
-        println!("{h}installed resolver plugins:{r}{why}");
+        outln!("{h}installed resolver plugins:{r}{why}");
     } else {
-        println!("{h}installed resolver plugins:{r}");
+        outln!("{h}installed resolver plugins:{r}");
         for p in registry.resolvers() {
             let net = if p.sandbox.network {
                 "network"
             } else {
                 "no-network"
             };
-            print!("  {n}{}://{r}  {n}{}{r}", p.scheme, p.name);
+            out!("  {n}{}://{r}  {n}{}{r}", p.scheme, p.name);
             if let Some(v) = &p.version {
-                print!("  v{v}");
+                out!("  v{v}");
             }
-            print!("  {dim}{net}{r}");
+            out!("  {dim}{net}{r}");
             print_health(&layout, p.dir_name(), p.check_exec(), &pal);
-            println!();
+            outln!();
             print_description(p.description.as_deref(), &pal);
             print_provenance(&layout, p.dir_name(), &pal);
         }
-        println!("{dim}(remove one with: sbx plugins rm <name>){r}");
+        outln!("{dim}(remove one with: sbx plugins rm <name>){r}");
     }
     // Brokers are listed apart from resolvers, and named by what reaches them. The two answer
     // different questions — a resolver is asked for a value, a broker stands in front of a host
     // resource — and folding them into one list would suggest a `scheme://` reaches a broker.
     if registry.brokers().next().is_some() {
-        println!("{h}installed broker plugins:{r}");
+        outln!("{h}installed broker plugins:{r}");
         for p in registry.brokers() {
-            print!("  {n}{}{r}", p.name);
+            out!("  {n}{}{r}", p.name);
             if let Some(v) = &p.version {
-                print!("  v{v}");
+                out!("  v{v}");
             }
-            print!(
+            out!(
                 "  {dim}{} frames, max {} bytes{r}",
                 p.broker.framing.token(),
                 p.broker.max_frame
             );
             if p.broker.inspect_replies {
-                print!("  {dim}rules on replies{r}");
+                out!("  {dim}rules on replies{r}");
             }
             print_health(&layout, p.dir_name(), p.check_exec(), &pal);
-            println!();
+            outln!();
             print_description(p.description.as_deref(), &pal);
-            println!(
+            outln!(
                 "    {dim}found in the cage: {}{r}",
                 how_the_cage_finds_it(p)
             );
@@ -529,24 +529,24 @@ fn plugins_list(json: bool) -> ExitCode {
     // What identifies one is the headers it may set: that is the whole of what it can put on a
     // request, and the line says it rather than making the reader open the manifest.
     if registry.signers().next().is_some() {
-        println!("{h}installed signer plugins:{r}");
+        outln!("{h}installed signer plugins:{r}");
         for p in registry.signers() {
-            print!("  {n}{}{r}", p.name);
+            out!("  {n}{}{r}", p.name);
             if let Some(v) = &p.version {
-                print!("  v{v}");
+                out!("  v{v}");
             }
-            print!("  {dim}sets {}{r}", p.signer.sets_headers.join(", "));
+            out!("  {dim}sets {}{r}", p.signer.sets_headers.join(", "));
             if p.signer.reads_secret {
-                print!("  {dim}reads the secret{r}");
+                out!("  {dim}reads the secret{r}");
             }
             print_health(&layout, p.dir_name(), p.check_exec(), &pal);
-            println!();
+            outln!();
             print_description(p.description.as_deref(), &pal);
             print_provenance(&layout, p.dir_name(), &pal);
         }
     }
     print_conflicts(&layout, &registry, None, &pal);
-    println!("{dim}(browse the configured stores with: sbx plugins store list){r}");
+    outln!("{dim}(browse the configured stores with: sbx plugins store list){r}");
     for w in &warnings {
         diag::warn_config(w);
     }
@@ -567,11 +567,11 @@ fn print_health(
 ) {
     let (err, r) = (pal.err, pal.reset);
     if let Err(why) = runnable {
-        print!("  {err}[not runnable: {why}]{r}");
+        out!("  {err}[not runnable: {why}]{r}");
     }
     match plugins::integrity(layout, dir_name) {
-        plugins::Integrity::Modified => print!("  {err}[modified since install]{r}"),
-        plugins::Integrity::Unreadable(_) => print!("  {err}[cannot be hashed]{r}"),
+        plugins::Integrity::Modified => out!("  {err}[modified since install]{r}"),
+        plugins::Integrity::Unreadable(_) => out!("  {err}[cannot be hashed]{r}"),
         plugins::Integrity::Intact | plugins::Integrity::Unrecorded => {}
     }
 }
@@ -587,7 +587,7 @@ fn print_health(
 fn print_description(description: Option<&str>, pal: &style::Palette) {
     if let Some(desc) = description {
         let desc = crate::sandbox::lens::sanitize_detail(desc);
-        println!("    {}{desc}{}", pal.dim, pal.reset);
+        outln!("    {}{desc}{}", pal.dim, pal.reset);
     }
 }
 
@@ -595,7 +595,7 @@ fn print_description(description: Option<&str>, pal: &style::Palette) {
 /// the only place the answer exists. Keyed on the directory name, which is what the install (and
 /// the record) uses and which may differ from the manifest's `name` for a hand-placed tree.
 fn print_provenance(layout: &store::Layout, dir_name: &str, pal: &style::Palette) {
-    println!(
+    outln!(
         "    {}from: {}{}",
         pal.dim,
         plugins::origin::read(layout, dir_name).label(),
@@ -622,7 +622,7 @@ fn print_conflicts(
     let (n, dim, err, r) = (pal.name, pal.dim, pal.err, pal.reset);
     let claimant_lines = |claimants: &[String]| {
         for dir_name in claimants {
-            println!(
+            outln!(
                 "    {n}{dir_name}{r}  {dim}from: {}{r}",
                 plugins::origin::read(layout, dir_name).label()
             );
@@ -634,19 +634,17 @@ fn print_conflicts(
             continue;
         }
         if !any {
-            println!("{err}scheme conflicts{r} (every claimant below is disabled):");
+            outln!("{err}scheme conflicts{r} (every claimant below is disabled):");
             any = true;
         }
-        println!(
+        outln!(
             "  {n}{scheme}://{r}  {err}claimed by {} plugins{r}",
             claimants.len()
         );
         claimant_lines(claimants);
     }
     if any {
-        println!(
-            "{dim}(a scheme must be unique: remove all but one with sbx plugins rm <name>){r}"
-        );
+        outln!("{dim}(a scheme must be unique: remove all but one with sbx plugins rm <name>){r}");
     }
     let mut any_name = false;
     for (name, claimants) in registry.name_conflicts() {
@@ -654,17 +652,17 @@ fn print_conflicts(
             continue;
         }
         if !any_name {
-            println!("{err}name conflicts{r} (every claimant below is disabled):");
+            outln!("{err}name conflicts{r} (every claimant below is disabled):");
             any_name = true;
         }
-        println!(
+        outln!(
             "  {n}{name}{r}  {err}claimed by {} plugins{r}",
             claimants.len()
         );
         claimant_lines(claimants);
     }
     if any_name {
-        println!(
+        outln!(
             "{dim}(a plugin's name must be unique: remove all but one with sbx plugins rm \
              <name>){r}"
         );
@@ -691,7 +689,7 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
     match plugins::install(&layout, Path::new(source)) {
         Ok(installed) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!(
+            outln!(
                 "{}",
                 render_plugin_installed(
                     &installed.name,
@@ -793,12 +791,12 @@ fn provision_configured_programs(layout: &store::Layout, plugin_name: &str) -> E
         Ok(done) => {
             for one in &done {
                 match one {
-                    plugins::programs::Provisioned::OnPath { path } => println!(
+                    plugins::programs::Provisioned::OnPath { path } => outln!(
                         "  {}: already on PATH at {} (the configured package is unused)",
                         plugin_name,
                         path.display()
                     ),
-                    plugins::programs::Provisioned::Built { program, path } => println!(
+                    plugins::programs::Provisioned::Built { program, path } => outln!(
                         "  {}: provisioned `{program}` at {}",
                         plugin_name,
                         path.display()
@@ -988,7 +986,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
                 .map(|(p, (what, version))| (p.as_str(), what.as_str(), version.as_str()))
                 .collect();
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            print!(
+            out!(
                 "{}",
                 render_store_configured(&added.name, cat.rev, &plugins, &pal)
             );
@@ -1168,7 +1166,7 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
                 .map(|(name, scheme)| (name.as_str(), scheme.as_str()))
                 .collect();
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!(
+            outln!(
                 "{}",
                 render_published(published.rev, &plugins, &pubkey, &pal)
             );
@@ -1233,7 +1231,7 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
             if all.is_empty() {
                 let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                 let (dim, r) = (pal.dim, pal.reset);
-                println!(
+                outln!(
                     "{dim}no remote stores are configured \
                      (add one with: sbx plugins store add --name <n> --url <git-url> --key <hex>){r}"
                 );
@@ -1249,7 +1247,7 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
     for name in &names {
         match stores::update(&layout, name, &git) {
             Ok(u) => {
-                println!(
+                outln!(
                     "{}",
                     render_store_updated(
                         &u.name,
@@ -1344,7 +1342,7 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
     match stores::install_plugin(&layout, store_name, plugin_name) {
         Ok(installed) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!(
+            outln!(
                 "{}",
                 render_plugin_installed(
                     &installed.name,
@@ -1388,31 +1386,31 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
-    println!("{h}store{r} {n}'{}'{r}", cfg.name);
-    println!("  url:      {}", cfg.url);
-    println!("  key:      {}", catalogue::to_hex(&cfg.pubkey));
+    outln!("{h}store{r} {n}'{}'{r}", cfg.name);
+    outln!("  url:      {}", cfg.url);
+    outln!("  key:      {}", catalogue::to_hex(&cfg.pubkey));
     if cfg.tofu {
         // Three facts a user has to hold together, so none is left implied: the catalogue *is*
         // checked, that check cannot establish whose key it is, and the pin still has teeth.
-        println!("  trust:    the key this store shipped, accepted on first use");
-        println!("            the catalogue verifies against it on every fetch, but nothing");
-        println!("            outside this store confirms the key is its author's");
-        println!("            (a later key change is still refused)");
-        println!(
+        outln!("  trust:    the key this store shipped, accepted on first use");
+        outln!("            the catalogue verifies against it on every fetch, but nothing");
+        outln!("            outside this store confirms the key is its author's");
+        outln!("            (a later key change is still refused)");
+        outln!(
             "            {dim}confirm it with: sbx plugins store verify {name} \
              --key <the key you obtained>{r}"
         );
     } else {
-        println!("  trust:    a key you supplied out of band, pinned");
+        outln!("  trust:    a key you supplied out of band, pinned");
     }
-    println!("  revision: {}", cfg.locked_rev);
+    outln!("  revision: {}", cfg.locked_rev);
     match stores::cached_catalogue(&layout, name) {
-        Ok(cat) if cat.plugins.is_empty() => println!("  plugins:  (none)"),
+        Ok(cat) if cat.plugins.is_empty() => outln!("  plugins:  (none)"),
         Ok(cat) => {
             // The same rows `store list` prints, including which are already in place and what
             // holds the name or scheme of those that are not — the catalogue alone cannot say.
             let installed = InstalledIndex::scan(&layout);
-            println!("  plugins:");
+            outln!("  plugins:");
             print_listed(
                 &listed_from_catalogue(&cat),
                 name,
@@ -1421,7 +1419,7 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
                 "    ",
                 &pal,
             );
-            println!("  {dim}(install one with: sbx plugins store install {name} <plugin>){r}");
+            outln!("  {dim}(install one with: sbx plugins store install {name} <plugin>){r}");
         }
         Err(why) => diag::warn(&format!("cannot read the cached catalogue: {why}")),
     }
@@ -1474,7 +1472,7 @@ fn plugins_store_verify(args: &[OsString]) -> ExitCode {
     match stores::verify_key(&layout, name, pubkey) {
         Ok(outcome) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!(
+            outln!(
                 "{}",
                 render_store_verified(name, outcome == stores::Verified::AlreadyPinned, &pal)
             );
@@ -1583,7 +1581,7 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
     match stores::rekey(&layout, name, &choice, &git) {
         Ok(done) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!(
+            outln!(
                 "{}",
                 render_store_rekeyed(
                     &done.name,
@@ -1621,7 +1619,7 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
     match stores::remove(&layout, name) {
         Ok(()) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_removed(Some("store"), name, &pal));
+            outln!("{}", render_removed(Some("store"), name, &pal));
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -1711,7 +1709,7 @@ fn print_listed(
             continue;
         }
         shown += 1;
-        print!(
+        out!(
             "{indent}{n}{}{r}  {dim}({}){r}",
             e.name,
             match e.scheme {
@@ -1720,17 +1718,17 @@ fn print_listed(
             }
         );
         if let Some(v) = e.version.filter(|v| !v.is_empty()) {
-            print!("  v{v}");
+            out!("  v{v}");
         }
         if let Some(i) = installed {
-            print!(
+            out!(
                 "{}",
                 i.marker(e.name, e.scheme, e.version, e.sha256, store, pal)
             );
         }
-        println!();
+        outln!();
         if let Some(d) = e.description.filter(|d| !d.is_empty()) {
-            println!("{indent}  {dim}{d}{r}");
+            outln!("{indent}  {dim}{d}{r}");
         }
     }
     shown
@@ -1751,9 +1749,9 @@ fn print_store_footer(
 ) {
     let (dim, r) = (pal.dim, pal.reset);
     if !only_installed {
-        println!("{indent}{dim}(install one with: sbx plugins store install {store} <plugin>){r}");
+        outln!("{indent}{dim}(install one with: sbx plugins store install {store} <plugin>){r}");
     } else if shown == 0 {
-        println!("{indent}{dim}(nothing from this store is installed){r}");
+        outln!("{indent}{dim}(nothing from this store is installed){r}");
     }
 }
 
@@ -1824,8 +1822,8 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>, json: bool
         return ExitCode::SUCCESS;
     }
     if names.is_empty() {
-        println!("{h}configured plugin stores:{r} (none)");
-        println!(
+        outln!("{h}configured plugin stores:{r} (none)");
+        outln!(
             "  {dim}(add one with: sbx plugins store add --name <n> --url <git-url> \
              --key <hex>){r}"
         );
@@ -1876,7 +1874,7 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>, json: bool
         }
         return ExitCode::SUCCESS;
     }
-    println!("{h}configured plugin stores{r} (update with: sbx plugins store update <name>):");
+    outln!("{h}configured plugin stores{r} (update with: sbx plugins store update <name>):");
     for name in &names {
         let cfg = match stores::read_configured(layout, name) {
             Ok(cfg) => cfg,
@@ -1902,12 +1900,12 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>, json: bool
         } else {
             String::new()
         };
-        println!(
+        outln!(
             "  {n}{name}{r}  {dim}(rev {}, {detail}){r}{marker}",
             cfg.locked_rev
         );
         if cfg.tofu {
-            println!(
+            outln!(
                 "    {dim}(confirm its key with: sbx plugins store verify {name} \
                  --key <the key you obtained>){r}"
             );
@@ -1981,7 +1979,7 @@ fn plugins_remove(args: &[OsString]) -> ExitCode {
     for name in &names {
         match plugins::remove(&layout, name) {
             Ok(left) => {
-                println!("{}", render_removed(None, name, &pal));
+                outln!("{}", render_removed(None, name, &pal));
                 // What could not be deleted is named. The plugin is gone from the registry either
                 // way (its tree was renamed aside first), but a leftover state directory holds
                 // what a `state = true` plugin persisted, which for a resolver is a live
@@ -2129,22 +2127,23 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
             // for by name, so a bare run is not a list of things it will never do.
             None => {
                 if name.is_some() {
-                    println!(
+                    outln!(
                         "  {n}{dir_name}{r}  {dim}installed from {} — no store to upgrade from{r}",
                         installed.origin.short()
                     );
                 }
             }
             Some(v) if v.unknown.is_some() => {
-                println!(
+                outln!(
                     "  {n}{dir_name}{r}  {warn}cannot be compared{r} {dim}({}){r}",
                     v.unknown.as_deref().unwrap_or_default()
                 );
             }
             Some(v) if v.current => {
-                println!(
+                outln!(
                     "  {n}{dir_name}{r}  {ok}already the build store '{}' lists{r} {dim}(rev {}){r}",
-                    v.store, v.rev
+                    v.store,
+                    v.rev
                 );
             }
             Some(v) => stale.push((dir_name.clone(), v)),
@@ -2154,7 +2153,7 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
     if stale.is_empty() {
         // The claim is only ever about the cached catalogue, so it says so rather than implying a
         // freshness nothing checked.
-        println!(
+        outln!(
             "{dim}(compared against the cached catalogues — `sbx plugins store update` re-fetches them){r}"
         );
         return ExitCode::SUCCESS;
@@ -2170,9 +2169,10 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
             .trim();
         let wording = drift_wording(have, v.listed_version.trim());
         if dry_run {
-            println!(
+            outln!(
                 "  {n}{dir_name}{r}  {warn}{wording}{r} {dim}(store '{}', rev {}){r}",
-                v.store, v.rev
+                v.store,
+                v.rev
             );
             continue;
         }
@@ -2189,7 +2189,7 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
                     format!("v{have} → v{listed}")
                 };
                 let verb = move_verb(have, listed);
-                println!("  {n}{dir_name}{r}  {ok}{verb}{r} {dim}({moved}){r}");
+                outln!("  {n}{dir_name}{r}  {ok}{verb}{r} {dim}({moved}){r}");
             }
             Err(why) => {
                 failed += 1;
@@ -2198,9 +2198,7 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
         }
     }
     if dry_run {
-        println!(
-            "{dim}(run without --dry-run to apply; compared against the cached catalogues){r}"
-        );
+        outln!("{dim}(run without --dry-run to apply; compared against the cached catalogues){r}");
     }
     if failed > 0 {
         ExitCode::FAILURE
@@ -2238,7 +2236,7 @@ fn plugins_verify(name: Option<&str>) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (n, dim, ok, warn, err, r) = (pal.name, pal.dim, pal.ok, pal.warn, pal.err, pal.reset);
     if names.is_empty() {
-        println!("no installed resolver plugins to verify");
+        outln!("no installed resolver plugins to verify");
         return ExitCode::SUCCESS;
     }
     let mut changed = 0usize;
@@ -2263,9 +2261,9 @@ fn plugins_verify(name: Option<&str>) -> ExitCode {
                 format!("{err}cannot be hashed{r} {dim}({}){r}", diag::visible(why))
             }
         };
-        println!("  {n}{dir_name}{r}  {line}");
+        outln!("  {n}{dir_name}{r}  {line}");
         if verdict == plugins::Integrity::Modified {
-            println!(
+            outln!(
                 "    {dim}from: {}{r}",
                 plugins::origin::read(&layout, dir_name).label()
             );
@@ -2313,7 +2311,7 @@ fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
         return ExitCode::from(2);
     };
     if plugins::builtin_schemes().contains(&key) {
-        println!("{key}: a built-in resolver (compiled into sbx, not a plugin)");
+        outln!("{key}: a built-in resolver (compiled into sbx, not a plugin)");
         return ExitCode::SUCCESS;
     }
     let (layout, registry, warnings) = match load_plugin_registry() {
@@ -2398,8 +2396,8 @@ fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
-    println!("{h}resolver plugin:{r} {n}{}{r}", p.name);
-    println!("  scheme:      {n}{}://{r}", p.scheme);
+    outln!("{h}resolver plugin:{r} {n}{}{r}", p.name);
+    outln!("  scheme:      {n}{}://{r}", p.scheme);
     print_about(
         &layout,
         &About {
@@ -2411,18 +2409,18 @@ fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
         p.check_exec(),
         &pal,
     );
-    println!("  sandbox grant:");
-    println!("    network:     {}", p.sandbox.network);
+    outln!("  sandbox grant:");
+    outln!("    network:     {}", p.sandbox.network);
     // Named even when absent, and named *loudly* when present: every other line of this grant is
     // read-only, so the one that is not is the line a reader most needs to find.
     match p.sandbox.state {
-        true => println!(
+        true => outln!(
             "    state:       yes — a private writable directory that survives the run ({})",
             crate::sandbox::resolver::state_dir(p)
                 .unwrap_or_default()
                 .display()
         ),
-        false => println!("    state:       no (nothing the plugin writes outlives the run)"),
+        false => outln!("    state:       no (nothing the plugin writes outlives the run)"),
     }
     print_shared_grant(
         &layout,
@@ -2467,13 +2465,13 @@ fn print_about(
         v.map(crate::sandbox::lens::sanitize_detail)
             .unwrap_or_else(|| absent.to_string())
     };
-    println!("  version:     {}", sanitized(about.version, "(unset)"));
-    println!("  description: {}", sanitized(about.description, "(none)"));
-    println!(
+    outln!("  version:     {}", sanitized(about.version, "(unset)"));
+    outln!("  description: {}", sanitized(about.description, "(none)"));
+    outln!(
         "  origin:      {}",
         plugins::origin::read(layout, about.dir_name).label()
     );
-    println!(
+    outln!(
         "  integrity:   {}",
         match plugins::integrity(layout, about.dir_name) {
             plugins::Integrity::Intact => "unchanged since install".to_string(),
@@ -2489,13 +2487,13 @@ fn print_about(
     );
     // The manifest names the program by a relative path held to no charset, so it is written as
     // text: below the integrity and origin lines, an escape in it could otherwise rewrite them.
-    print!(
+    out!(
         "  exec:        {}",
         diag::visible(&about.exec.display().to_string())
     );
     match runnable {
-        Ok(()) => println!(),
-        Err(why) => println!("  {err}[not runnable: {why}]{r}"),
+        Ok(()) => outln!(),
+        Err(why) => outln!("  {err}[not runnable: {why}]{r}"),
     }
 }
 
@@ -2539,7 +2537,7 @@ fn print_grant_programs(
     r: &str,
 ) {
     if programs.is_empty() {
-        println!("    programs:    (none)");
+        outln!("    programs:    (none)");
         return;
     }
     let configured: std::collections::BTreeMap<String, String> = std::env::current_dir()
@@ -2574,7 +2572,7 @@ fn print_grant_programs(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    println!("    programs:    {shown}");
+    outln!("    programs:    {shown}");
 }
 
 /// The `sbx plugins info` grant lines every kind of plugin shares.
@@ -2610,7 +2608,7 @@ fn print_shared_grant(
     // of the grant no manifest names, so it would otherwise be the largest thing a launch binds and
     // the only one a reader cannot see coming.
     if let Some(n) = crate::sandbox::resolver::nix_closure_paths(&grant.programs) {
-        println!("    nix closure: {n} store paths, so a store-installed program can run");
+        outln!("    nix closure: {n} store paths, so a store-installed program can run");
     }
 }
 
@@ -2621,7 +2619,7 @@ fn print_shared_grant(
 /// process that will stand in front of their credential is owed the whole rule. A resolver has no
 /// such line, having no such rule.
 fn print_kind_path_rule(kind: &str) {
-    println!(
+    outln!(
         "    grant paths: regular files only — a {kind} plugin's `allow_paths` and \
          `allow_env_paths` may not name a socket, a FIFO or a directory"
     );
@@ -2630,10 +2628,10 @@ fn print_kind_path_rule(kind: &str) {
 /// One `sbx plugins info` grant line listing read-only path binds, or `(none)`.
 fn print_grant_paths(label: &str, paths: &[PathBuf]) {
     if paths.is_empty() {
-        println!("    {label}:  (none)");
+        outln!("    {label}:  (none)");
     } else {
         let joined = visible_paths(paths);
-        println!("    {label}:  {joined}");
+        outln!("    {label}:  {joined}");
     }
 }
 
@@ -2645,11 +2643,11 @@ fn print_grant_paths(label: &str, paths: &[PathBuf]) {
 /// across two of them, and "nothing is hidden here" is itself the answer to a fair question.
 fn print_grant_masks(paths: &[PathBuf]) {
     if paths.is_empty() {
-        println!("    mask_paths:   (none)");
+        outln!("    mask_paths:   (none)");
         return;
     }
     let joined = visible_paths(paths);
-    println!("    mask_paths:   {joined} (hidden inside the grant above)");
+    outln!("    mask_paths:   {joined} (hidden inside the grant above)");
 }
 
 /// A manifest's path list for a grant line, joined, each path written as text by
@@ -2666,9 +2664,9 @@ fn visible_paths(paths: &[PathBuf]) -> String {
 /// One `sbx plugins info` grant line listing passed-through environment variables, or `(none)`.
 fn print_grant_env(label: &str, keys: &[String]) {
     if keys.is_empty() {
-        println!("    {label}:    (none)");
+        outln!("    {label}:    (none)");
     } else {
-        println!("    {label}:    {}", keys.join(", "));
+        outln!("    {label}:    {}", keys.join(", "));
     }
 }
 
@@ -2685,7 +2683,7 @@ fn info_broker(
     pal: &style::Palette,
 ) -> ExitCode {
     let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
-    println!("{h}broker plugin:{r} {n}{}{r}", p.name);
+    outln!("{h}broker plugin:{r} {n}{}{r}", p.name);
     print_about(
         layout,
         &About {
@@ -2697,29 +2695,29 @@ fn info_broker(
         p.check_exec(),
         pal,
     );
-    println!("  protocol:");
-    println!("    framing:     {}", p.broker.framing.token());
-    println!("    max frame:   {} bytes", p.broker.max_frame);
-    println!(
+    outln!("  protocol:");
+    outln!("    framing:     {}", p.broker.framing.token());
+    outln!("    max frame:   {} bytes", p.broker.max_frame);
+    outln!(
         "    host wait:   {} seconds for one exchange",
         p.broker.host_deadline.as_secs()
     );
-    println!("    found in the cage: {}", how_the_cage_finds_it(p));
-    println!(
+    outln!("    found in the cage: {}", how_the_cage_finds_it(p));
+    outln!(
         "    greeting:    {}",
         match p.broker.host_greets {
             true => "the host resource speaks first",
             false => "the cage speaks first",
         }
     );
-    println!(
+    outln!(
         "    replies:     {}",
         match p.broker.inspect_replies {
             true => "ruled on by the plugin",
             false => "passed through unseen",
         }
     );
-    println!(
+    outln!(
         "    credential:  {}",
         match p.broker.uses_secret {
             true => "may be handed a marker standing in for one (`[broker.<name>] secret`)",
@@ -2739,9 +2737,9 @@ fn info_broker(
         });
     match bound {
         Some((socket, allow)) => {
-            println!("  bound by the global config:");
-            println!("    socket:      {n}{socket}{r}");
-            println!(
+            outln!("  bound by the global config:");
+            outln!("    socket:      {n}{socket}{r}");
+            outln!(
                 "    allow:       {}",
                 match allow.is_empty() {
                     true => "(none — the plugin is handed an empty grant)".to_string(),
@@ -2755,16 +2753,16 @@ fn info_broker(
                 }
             );
         }
-        None => println!(
+        None => outln!(
             "  bound by the global config: no — add `[broker.{}] socket` to stand it up",
             p.name
         ),
     }
-    println!("  sandbox grant:");
+    outln!("  sandbox grant:");
     // Stated rather than left out, because "can the process fencing my credential reach the
     // network" is a fair question with a firm answer, and the answer is a rule of the type rather
     // than a choice this manifest made.
-    println!(
+    outln!(
         "    network:     no, and neither state nor a broker fence — a broker plugin may declare \
          none of the three"
     );
@@ -2783,7 +2781,7 @@ fn info_signer(
     pal: &style::Palette,
 ) -> ExitCode {
     let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
-    println!("{h}signer plugin:{r} {n}{}{r}", p.name);
+    outln!("{h}signer plugin:{r} {n}{}{r}", p.name);
     print_about(
         layout,
         &About {
@@ -2795,9 +2793,9 @@ fn info_signer(
         p.check_exec(),
         pal,
     );
-    println!("  auth point:");
-    println!("    sets:        {}", p.signer.sets_headers.join(", "));
-    println!(
+    outln!("  auth point:");
+    outln!("    sets:        {}", p.signer.sets_headers.join(", "));
+    outln!(
         "    sees:        {}",
         match p.signer.sees_headers.is_empty() {
             true => "the method, the host and the target only".to_string(),
@@ -2807,7 +2805,7 @@ fn info_signer(
             ),
         }
     );
-    println!(
+    outln!(
         "    credential:  {}",
         match p.signer.reads_secret {
             true => "the plaintext, which it needs to compute a signature from",
@@ -2818,13 +2816,13 @@ fn info_signer(
     // and not merely what the plugin is shown: a reader deciding whether to install this plugin is
     // deciding whether their request bodies are held before they leave.
     if let Some(algorithm) = p.signer.body_digest {
-        println!(
+        outln!(
             "    body:        its {} digest, which sbx holds the request body to compute",
             algorithm.name()
         );
     }
-    println!("  sandbox grant:");
-    println!(
+    outln!("  sandbox grant:");
+    outln!(
         "    network:     no, and neither state nor a broker fence — a signer plugin may declare \
          none of the three"
     );
@@ -2856,15 +2854,15 @@ fn print_plugin_host_config(name: &str, grant: &plugins::SandboxGrant, err: &str
     if raw.env.is_empty() {
         return;
     }
-    println!("  host config (`[plugin.{name}]`):");
+    outln!("  host config (`[plugin.{name}]`):");
     for (k, v) in &raw.env {
         let declared =
             grant.allow_env.iter().any(|d| d == k) || grant.allow_env_paths.iter().any(|d| d == k);
         // A config's key and value, held to no charset: shown as text, as `sbx config show` does.
         let (k, v) = (diag::visible(k), diag::visible(v));
         match declared {
-            true => println!("    {k}={v}"),
-            false => println!("    {k}={v}  {err}[ignored: the manifest does not declare it]{r}"),
+            true => outln!("    {k}={v}"),
+            false => outln!("    {k}={v}  {err}[ignored: the manifest does not declare it]{r}"),
         }
     }
 }
@@ -2901,7 +2899,7 @@ fn how_the_cage_finds_it(p: &crate::plugins::broker::BrokerPlugin) -> String {
 /// to agree.
 fn print_grant_brokers(names: &[String]) {
     if names.is_empty() {
-        println!("    brokers:     (none)");
+        outln!("    brokers:     (none)");
         return;
     }
     let bound: Vec<String> = std::env::current_dir()
@@ -2915,7 +2913,7 @@ fn print_grant_brokers(names: &[String]) {
             false => format!("{name} (no `[broker.{name}]` binds it — the plugin runs without it)"),
         })
         .collect();
-    println!("    brokers:     {}", shown.join(", "));
+    outln!("    brokers:     {}", shown.join(", "));
 }
 
 /// The `allow_env_paths` grant, resolved the way a launch would resolve it: each variable with the
@@ -2926,7 +2924,7 @@ fn print_grant_brokers(names: &[String]) {
 /// plainly. A relative value is called out, since a launch drops it.
 fn print_grant_env_paths(keys: &[String], err: &str, r: &str) {
     if keys.is_empty() {
-        println!("    allow_env_paths: (none)");
+        outln!("    allow_env_paths: (none)");
         return;
     }
     let shown: Vec<String> = keys
@@ -2937,7 +2935,7 @@ fn print_grant_env_paths(keys: &[String], err: &str, r: &str) {
             Err(_) => format!("{k} -> unset (the manifest's own paths apply)"),
         })
         .collect();
-    println!("    allow_env_paths: {}", shown.join(", "));
+    outln!("    allow_env_paths: {}", shown.join(", "));
 }
 
 #[cfg(test)]

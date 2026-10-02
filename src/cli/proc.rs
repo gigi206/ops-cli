@@ -230,7 +230,7 @@ fn proc_inject_session(
 
     if !loaded.is_empty() {
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-        println!(
+        outln!(
             "{}",
             style::prose(
                 &format!(
@@ -358,14 +358,14 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if rows.is_empty() {
-        println!("no live session rules");
+        outln!("no live session rules");
         return ExitCode::SUCCESS;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!("{}live session rules{}", pal.head, pal.reset);
+    outln!("{}live session rules{}", pal.head, pal.reset);
     for (pid, verdict, rule) in rows {
         let hue = if verdict == "deny" { pal.err } else { pal.ok };
-        println!(
+        outln!(
             "  {dim}{pid}{r}  {hue}{verdict}{r}  {rule}",
             dim = pal.dim,
             r = pal.reset,
@@ -433,17 +433,21 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
         let parked = sandbox::proc_control::read_pending(&socket).unwrap_or_default();
         for p in parked {
             if !any {
-                println!("{h}parked exec — awaiting a decision{r}");
+                outln!("{h}parked exec — awaiting a decision{r}");
                 any = true;
             }
-            println!(
+            outln!(
                 "  {}.{}  {dim}pid {} · {}s{r}  {}",
-                s.pid, p.id, p.pid, p.waiting_secs, p.path
+                s.pid,
+                p.id,
+                p.pid,
+                p.waiting_secs,
+                p.path
             );
         }
     }
     if !any {
-        println!("{dim}no exec is parked awaiting a decision.{r}");
+        outln!("{dim}no exec is parked awaiting a decision.{r}");
     }
     ExitCode::SUCCESS
 }
@@ -496,7 +500,7 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
         match sandbox::proc_control::answer_all_pending(&socket, allow) {
             Ok(paths) if !paths.is_empty() => {
                 for p in paths {
-                    println!("{verb} {p}");
+                    outln!("{verb} {p}");
                 }
                 ExitCode::SUCCESS
             }
@@ -522,7 +526,7 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
         };
         match sandbox::proc_control::answer_pending(&socket, notif_id, allow) {
             Ok(Some(path)) => {
-                println!("{verb} {path}");
+                outln!("{verb} {path}");
                 ExitCode::SUCCESS
             }
             Ok(None) => {
@@ -613,7 +617,7 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, r) = (pal.head, pal.reset);
-    println!(
+    outln!(
         "{h}process tree — session {} [{}] {}{r}",
         target.pid,
         target.label(),
@@ -731,7 +735,7 @@ fn proc_live(args: &[OsString]) -> ExitCode {
                 // The session ended: stop cleanly rather than spin on an empty tree.
                 drop(out);
                 if !parsed.json {
-                    println!("session {pid} ended.");
+                    outln!("session {pid} ended.");
                 }
                 return ExitCode::SUCCESS;
             }
