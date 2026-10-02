@@ -10,8 +10,11 @@
 
 use std::sync::Arc;
 
-use miniz_oxide::inflate::stream::{InflateState, inflate};
-use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
+use miniz_oxide::inflate::TINFLStatus;
+use miniz_oxide::inflate::core::inflate_flags::{
+    TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_IGNORE_ADLER32,
+};
+use miniz_oxide::inflate::core::{DecompressorOxide, TINFL_LZ_DICT_SIZE, decompress};
 
 use super::capture::CapBuf;
 use super::inject::SecretNeedle;
@@ -233,7 +236,14 @@ impl LeakScan {
 /// relay writes the frame on, as an uncompressed frame's payload is. Inflated only once whole, a
 /// message had every frame but its last relayed before any of it was read.
 struct Inflater {
-    state: Box<InflateState>,
+    /// The DEFLATE decoder's state between one stretch and the next.
+    decoder: Box<DecompressorOxide>,
+    /// The decoder's window: the last 32 KiB it produced, which a back-reference reads, and where
+    /// it writes what it decodes next. It is the whole of what a message costs in memory, however
+    /// far it inflates.
+    window: Box<[u8]>,
+    /// Where in [`Self::window`] the next decoded byte lands.
+    at: usize,
     /// Whether the peer resets its window per message, in which case so must this.
     no_context_takeover: bool,
     /// The most plaintext one message may inflate to, from [`MESSAGE_PLAINTEXT_CAP`].
@@ -244,9 +254,6 @@ struct Inflater {
     message_cap: usize,
     /// What the message in flight has inflated to so far.
     inflated: usize,
-    /// The one block every inflate writes into, reused for the tunnel's life: the memory a message
-    /// costs is this, however far it inflates.
-    block: Vec<u8>,
 }
 
 /// Why a compressed message's inflate stopped before its end. Either way the decoder is out of
@@ -261,11 +268,12 @@ enum Stop {
 impl Inflater {
     fn new(no_context_takeover: bool) -> Self {
         Inflater {
-            state: InflateState::new_boxed(DataFormat::Raw),
+            decoder: Box::default(),
+            window: vec![0u8; TINFL_LZ_DICT_SIZE].into_boxed_slice(),
+            at: 0,
             no_context_takeover,
             message_cap: MESSAGE_PLAINTEXT_CAP,
             inflated: 0,
-            block: vec![0u8; 16 * 1024],
         }
     }
 
@@ -276,48 +284,64 @@ impl Inflater {
 
     /// Inflate `rest`, the next stretch of the message in flight, handing every byte it yields to
     /// `plaintext` in stream order, the order the scan's carry across pieces relies on.
+    ///
+    /// Driven through the decoder itself rather than `miniz_oxide`'s stream wrapper, whose window
+    /// is the same one, for what the wrapper did with it. It copied what a call decoded into the
+    /// caller's buffer only as far as that buffer held, kept the rest back, and answered every call
+    /// after a fault with the fault, so the rest never came out. A stretch that decoded more than
+    /// the buffer before a corrupt byte lost the end of what it decoded, a secret included, while
+    /// the same bytes cut finer handed all of it on. Here the window is the output: whatever a call
+    /// decoded is handed on before its status is read, so what the scan reads up to a fault
+    /// depends on the stream and not on how it was cut.
     fn feed(&mut self, mut rest: &[u8], plaintext: &mut impl FnMut(&[u8])) -> Result<(), Stop> {
         loop {
-            let res = inflate(&mut self.state, rest, &mut self.block, MZFlush::None);
-            rest = &rest[res.bytes_consumed..];
-            // Handed on before the status is read: a call that fails can still have written what
-            // the stream decoded up to the fault, which a stretch cut elsewhere hands on in the
-            // call before. What the scan reads then depends on the stream, not on how it was cut.
-            plaintext(&self.block[..res.bytes_written]);
-            self.inflated = self.inflated.saturating_add(res.bytes_written);
-            match res.status {
-                Ok(MZStatus::Ok | MZStatus::StreamEnd) => {}
-                // Asked again with the input spent and every byte of it already out, the decoder
-                // answers `Buf`: it waits for more, which is where a stretch ends. That is the call
-                // made after the block fills exactly as the input runs out.
-                Err(MZError::Buf) if rest.is_empty() => return Ok(()),
-                Err(_) => return Err(Stop::Undecodable),
-                _ => {}
-            }
+            let (status, consumed, written) = decompress(
+                &mut self.decoder,
+                rest,
+                &mut self.window,
+                self.at,
+                TINFL_FLAG_HAS_MORE_INPUT | TINFL_FLAG_IGNORE_ADLER32,
+            );
+            rest = &rest[consumed..];
+            plaintext(&self.window[self.at..self.at + written]);
+            self.at = (self.at + written) & (TINFL_LZ_DICT_SIZE - 1);
+            self.inflated = self.inflated.saturating_add(written);
+            let ends = match status {
+                // The window's end was reached with output still to come, a back-reference going
+                // on unrolling after the few bits naming it were read: on from the window's start.
+                TINFLStatus::HasMoreOutput => false,
+                // The stretch is spent and everything it decodes to is out.
+                TINFLStatus::NeedsMoreInput => true,
+                // A final block, as a peer may send one, ends the stream: with nothing behind it in
+                // the stretch, that is where it ends.
+                TINFLStatus::Done | TINFLStatus::FailedCannotMakeProgress if rest.is_empty() => {
+                    true
+                }
+                // Bytes that do not decode, or bytes behind the stream's end: what came before them
+                // is already handed on.
+                _ => return Err(Stop::Undecodable),
+            };
             if self.inflated > self.message_cap {
                 return Err(Stop::TooLong);
             }
-            // Done only when the input is spent *and* the decoder stopped short of filling the
-            // block: a back-reference goes on unrolling after the few bits naming it are read, so a
-            // spent input with a full block still has output to come, and stopping there would
-            // leave that output, a secret included, to the next stretch or to nothing.
-            if rest.is_empty() && res.bytes_written < self.block.len() {
+            if ends {
                 return Ok(());
             }
-            // No progress with a whole empty block to write into: the stream is not what it claimed,
-            // or it has ended with input still behind it.
-            if res.bytes_consumed == 0 && res.bytes_written == 0 {
+            if consumed == 0 && written == 0 {
                 return Err(Stop::Undecodable);
             }
         }
     }
 
     /// The message's last frame is in: feed the empty block its sender elided, which brings out
-    /// what the decoder still held back, and start the window afresh where the peer does.
+    /// what the decoder still held back, and start the window afresh where the peer does, as
+    /// `miniz_oxide`'s full reset does: the decoder new, the window zeroed, writing from its start.
     fn finish(&mut self, plaintext: &mut impl FnMut(&[u8])) -> Result<(), Stop> {
         let ended = self.feed(&[0x00, 0x00, 0xff, 0xff], plaintext);
         if self.no_context_takeover {
-            self.state.reset(DataFormat::Raw);
+            *self.decoder = DecompressorOxide::new();
+            self.window.fill(0);
+            self.at = 0;
         }
         ended
     }
@@ -330,7 +354,7 @@ impl Inflater {
 /// be announced, one window carries across a direction's messages, and a message left partly
 /// inflated leaves every later one decoding to rubbish, which is a scan the cage switches off at
 /// will. There is no shortcut past a message's bytes, so the bound is on work rather than memory
-/// ([`Inflater::block`] is one block, reused). It is set far above any message a real peer sends
+/// ([`Inflater::window`] is the one buffer, reused). It is set far above any message a real peer sends
 /// and far below what one could be made to cost: DEFLATE's ratio tops out near 1000:1, so a few
 /// megabytes on the wire could otherwise ask for gigabytes of inflate. A message past it stops the
 /// direction, the answer a message that does not decode gets too.
@@ -990,6 +1014,47 @@ mod tests {
 
     /// A plaintext far past what any capture here keeps, which compresses to a few hundred bytes.
     const PAD: usize = 256 * 1024;
+
+    /// What a compressed message decoded before a byte that does not decode is scanned, however much
+    /// came before it in the read. The stream wrapper this decoder went through handed a call's
+    /// output on only as far as the caller's sixteen-kilobyte buffer held, kept the rest back, and
+    /// answered every call after the fault with the fault, so a secret decoded past that point of
+    /// one read, ahead of a corrupt byte, was never named, while the same bytes read in smaller
+    /// pieces named it. Each case is one read: the secret past the first sixteen kilobytes, and the
+    /// secret straddling the end of the decoder's 32 KiB window, where its output wraps.
+    #[test]
+    fn a_secret_decoded_before_a_corrupt_byte_is_named_however_much_came_before_it() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        const SECRET: &[u8] = b"SUPERSECRETVALUE0000";
+        let needle = SecretNeedle::named("test-secret", SECRET.to_vec());
+        for (lead, case) in [
+            (20 * 1024, "past the first sixteen kilobytes"),
+            (32 * 1024 - SECRET.len() / 2, "straddling the window's wrap"),
+        ] {
+            let mut text: Vec<u8> = (0..lead).map(|i| b'a' + (i % 23) as u8).collect();
+            text.extend_from_slice(SECRET);
+            text.extend_from_slice(&[b'z'; 64]);
+            let mut body = deflated(&text, &mut CompressorOxide::new(raw_deflate_flags()));
+            // The empty stored block the sync flush ends with, sent rather than elided, leaves the
+            // stream on a block boundary, where `0xff` opens a final block of the reserved type,
+            // which no decoder follows.
+            body.extend_from_slice(&[0x00, 0x00, 0xff, 0xff, 0xff]);
+            let mut message = frame(0x1, &body, None);
+            message[0] |= 0x40; // RSV1: the message is compressed
+
+            let mut t = scanning_tee(std::slice::from_ref(&needle), Some(false));
+            t.push(&message);
+            assert_eq!(
+                t.sightings(),
+                vec!["test-secret".to_string()],
+                "{case}: the secret decoded ahead of the fault must be named"
+            );
+            assert!(
+                t.newly_blinded(),
+                "{case}: and the direction stops at the fault"
+            );
+        }
+    }
 
     /// A secret sitting behind a compressible pad, in the same message, must still be seen.
     ///
