@@ -217,7 +217,7 @@ const PROBE_NAMESPACE_REFUSED: i32 = 3;
 /// [`PROBE_NAMESPACE_REFUSED`], refused rules exit 1.
 pub(crate) fn run_probe(argv: &[OsString]) -> ! {
     if let Err(e) = enter_user_and_net_ns() {
-        eprintln!("a private network namespace could not be created ({e})");
+        errln!("a private network namespace could not be created ({e})");
         std::process::exit(PROBE_NAMESPACE_REFUSED);
     }
     let Some(nft) = argv.first().map(PathBuf::from) else {
@@ -226,7 +226,7 @@ pub(crate) fn run_probe(argv: &[OsString]) -> ! {
     match super::nettap::install_redirect(&nft) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
-            eprintln!("{e}");
+            errln!("{e}");
             std::process::exit(1);
         }
     }
@@ -762,7 +762,7 @@ const EXEC_FAILED: i32 = 127;
 /// `127` had a namespace setup that failed report itself as bwrap being missing — the one reading
 /// that sends a caller after the wrong thing.
 fn die(code: i32, msg: &str) -> ! {
-    eprintln!("{msg}");
+    errln!("{msg}");
     std::process::exit(code);
 }
 

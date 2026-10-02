@@ -34,7 +34,7 @@ pub(crate) fn fs_cmd(args: &[OsString]) -> ExitCode {
         Some("readonly") => fs_add_mask(FsList::Readonly, &args[1..]),
         Some("unreadonly") => fs_remove_mask(FsList::Readonly, &args[1..]),
         None => {
-            eprint!("{}", help::page_usage(&["fs"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["fs"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(other) => {

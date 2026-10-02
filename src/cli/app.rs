@@ -47,7 +47,7 @@ pub(crate) fn app_cmd(args: &[OsString]) -> ExitCode {
             diag::error(
                 "sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`.",
             );
-            eprint!("{}", help::page_usage(&["app"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["app"]).unwrap_or_default());
             ExitCode::from(2)
         }
     }
@@ -443,7 +443,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
     let Some(name) = name else {
         // `sbx app run` with no name (or only flags): print the run page so its synopsis and
         // options guide, like bare `sbx net`/`sbx config`.
-        eprint!("{}", help::page_usage(&["app", "run"]).unwrap_or_default());
+        err!("{}", help::page_usage(&["app", "run"]).unwrap_or_default());
         return Err(ExitCode::from(2));
     };
     let learning = learn_gran.is_some() || proc_gran.is_some();
@@ -1045,7 +1045,7 @@ fn app_export(args: &[OsString]) -> ExitCode {
             // The confirmation goes to stderr (stdout is reserved for the profile bytes), so its
             // palette is decided from stderr's stream, not stdout's.
             let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
-            eprintln!("{}", render_app_exported(name, path, &epal));
+            errln!("{}", render_app_exported(name, path, &epal));
         }
     }
     ExitCode::SUCCESS

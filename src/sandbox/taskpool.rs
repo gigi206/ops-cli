@@ -387,7 +387,7 @@ pub(crate) fn ensure(
     }
     // Say what is happening before it takes minutes. A cold install is the one launch step that can
     // stall visibly, and an unannounced stall reads as a hang.
-    eprintln!("{}", installing_line(&missing));
+    errln!("{}", installing_line(&missing));
     let spec = install_spec(base_mounts, base_env, mise_bin, pool, &missing)?;
     let output = run(bwrap, &spec, limits, slug)?;
     // mise's own diagnostics are the only way to tell a registry outage from a typo'd token, so a

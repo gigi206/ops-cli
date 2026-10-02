@@ -43,7 +43,7 @@ pub(crate) fn proc_cmd(args: &[OsString]) -> ExitCode {
         Some("deny") => proc_add_rule(config::manage::ProcList::Deny, &args[1..]),
         Some("undeny") => proc_remove_rule(config::manage::ProcList::Deny, &args[1..]),
         None => {
-            eprint!("{}", help::page_usage(&["proc"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["proc"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(other) => {
@@ -579,7 +579,7 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
                     "sbx: proc ls: unexpected argument {:?}",
                     other.unwrap_or_default()
                 ));
-                eprint!("{}", help::page_usage(&["proc", "ls"]).unwrap_or_default());
+                err!("{}", help::page_usage(&["proc", "ls"]).unwrap_or_default());
                 return ExitCode::from(2);
             }
         }

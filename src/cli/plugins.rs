@@ -75,7 +75,7 @@ pub(crate) fn plugins_cmd(args: &[OsString]) -> ExitCode {
             if let Some(tok) = other {
                 diag::error(&format!("sbx: plugins: unknown subcommand {tok:?}"));
             }
-            eprint!("{}", help::page_usage(&["plugins"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["plugins"]).unwrap_or_default());
             ExitCode::from(2)
         }
     }
@@ -860,7 +860,7 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
             if let Some(tok) = other {
                 diag::error(&format!("sbx: plugins store: unknown subcommand {tok:?}"));
             }
-            eprint!(
+            err!(
                 "{}",
                 help::page_usage(&["plugins", "store"]).unwrap_or_default()
             );
@@ -896,12 +896,12 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
                 Some(Some(v)) => key = Some(v),
                 Some(None) => {
                     diag::error("sbx: --key: the key is not valid UTF-8 (expected <hex|@file>)");
-                    eprintln!("{usage}");
+                    errln!("{usage}");
                     return ExitCode::from(2);
                 }
                 None => {
                     diag::error("sbx: --key needs the key to pin (<hex|@file>)");
-                    eprintln!("{usage}");
+                    errln!("{usage}");
                     return ExitCode::from(2);
                 }
             },
@@ -911,13 +911,13 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
                     "sbx: unexpected argument '{}'",
                     other.unwrap_or("(non-UTF-8)")
                 ));
-                eprintln!("{usage}");
+                errln!("{usage}");
                 return ExitCode::from(2);
             }
         }
     }
     let (Some(name), Some(url)) = (name, url) else {
-        eprintln!("{usage}");
+        errln!("{usage}");
         return ExitCode::from(2);
     };
 
@@ -968,7 +968,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
             // palette is decided from the stream it actually goes to.
             if added.tofu {
                 let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
-                eprintln!(
+                errln!(
                     "{}",
                     render_store_tofu(&catalogue::to_hex(&added.pubkey), &added.name, &epal)
                 );
@@ -1013,14 +1013,17 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
 ///
 /// Declining is the default and costs nothing — the same command remains available later.
 fn offer_verification(layout: &store::Layout, name: &str) {
-    use std::io::{BufRead, Write};
+    use std::io::BufRead;
     if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
         return;
     }
     let pal = style::Palette::for_stream(true);
     let (dim, r) = (pal.dim, pal.reset);
-    eprint!("\n  do you have this key from a source this store does not control? {dim}[y/N]{r} ");
-    let _ = std::io::stderr().flush();
+    if !diag::prompt(&format!(
+        "\n  do you have this key from a source this store does not control? {dim}[y/N]{r} "
+    )) {
+        return;
+    }
     let mut line = String::new();
     if std::io::stdin().lock().read_line(&mut line).is_err() {
         return;
@@ -1028,8 +1031,11 @@ fn offer_verification(layout: &store::Layout, name: &str) {
     if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         return;
     }
-    eprint!("  paste it {dim}(hex, or @file — empty to skip){r}: ");
-    let _ = std::io::stderr().flush();
+    if !diag::prompt(&format!(
+        "  paste it {dim}(hex, or @file — empty to skip){r}: "
+    )) {
+        return;
+    }
     let mut key = String::new();
     if std::io::stdin().lock().read_line(&mut key).is_err() {
         return;
@@ -1049,7 +1055,7 @@ fn offer_verification(layout: &store::Layout, name: &str) {
         }
     };
     match stores::verify_key(layout, name, pubkey) {
-        Ok(outcome) => eprintln!(
+        Ok(outcome) => errln!(
             "{}",
             render_store_verified(name, outcome == stores::Verified::AlreadyPinned, &pal)
         ),
@@ -1083,7 +1089,7 @@ fn report_missing_trust_anchor(
     match stores::shipped_pubkey(layout, url, git) {
         Ok(pubkey) => {
             let pal = style::Palette::for_stream(std::io::stderr().is_terminal());
-            eprint!(
+            err!(
                 "{}",
                 render_store_needs_key(name, url, &catalogue::to_hex(&pubkey), &pal)
             );
@@ -1120,7 +1126,7 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
             Some("--key") => key = it.next().map(|v| v.as_os_str()),
             Some("--rev") => {
                 let Some(value) = it.next().and_then(|v| v.to_str()) else {
-                    eprintln!("{usage}");
+                    errln!("{usage}");
                     return ExitCode::from(2);
                 };
                 match value.parse::<u64>() {
@@ -1133,14 +1139,14 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
             }
             Some(flag) if flag.starts_with('-') => {
                 diag::error(&format!("sbx: unexpected argument '{flag}'"));
-                eprintln!("{usage}");
+                errln!("{usage}");
                 return ExitCode::from(2);
             }
             // Anything else (including a non-UTF-8 path) is the positional directory.
             _ => {
                 if dir.is_some() {
                     diag::error("sbx: publish takes a single directory");
-                    eprintln!("{usage}");
+                    errln!("{usage}");
                     return ExitCode::from(2);
                 }
                 dir = Some(arg.as_os_str());
@@ -1148,7 +1154,7 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
         }
     }
     let (Some(dir), Some(key)) = (dir, key) else {
-        eprintln!("{usage}");
+        errln!("{usage}");
         return ExitCode::from(2);
     };
 
@@ -1158,7 +1164,7 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
             // never treated as a throwaway. The public key, on stdout, is what consumers pin. Each
             // line's palette is decided from the stream it actually goes to.
             let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
-            eprintln!("{}", render_publish_key_warning(Path::new(key), &epal));
+            errln!("{}", render_publish_key_warning(Path::new(key), &epal));
             let pubkey = catalogue::to_hex(&published.pubkey);
             let plugins: Vec<(&str, &str)> = published
                 .plugins
@@ -1208,7 +1214,7 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
         Ok(only) => only,
         Err(bad) => {
             diag::error(&format!("sbx: unexpected argument '{bad}'"));
-            eprintln!(
+            errln!(
                 "sbx: usage: {}",
                 help::synopsis_of(&["plugins", "store", "update"])
             );
@@ -1321,7 +1327,7 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
         Ok(operands) => operands,
         Err(bad) => {
             diag::error(&format!("sbx: unexpected argument '{bad}'"));
-            eprintln!(
+            errln!(
                 "sbx: usage: {}",
                 help::synopsis_of(&["plugins", "store", "install"])
             );
@@ -1449,13 +1455,13 @@ fn plugins_store_verify(args: &[OsString]) -> ExitCode {
                     "sbx: unexpected argument '{}'",
                     other.unwrap_or("(non-UTF-8)")
                 ));
-                eprintln!("{usage}");
+                errln!("{usage}");
                 return ExitCode::from(2);
             }
         }
     }
     let (Some(name), Some(key)) = (name, key) else {
-        eprintln!("{usage}");
+        errln!("{usage}");
         return ExitCode::from(2);
     };
     let layout = match layout_or_fail() {
@@ -1512,13 +1518,13 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
                     "sbx: unexpected argument '{}'",
                     other.unwrap_or("(non-UTF-8)")
                 ));
-                eprintln!("{usage}");
+                errln!("{usage}");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(name) = name else {
-        eprintln!("{usage}");
+        errln!("{usage}");
         return ExitCode::from(2);
     };
     if key.is_some() && trust {
@@ -1568,7 +1574,7 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
         stores::TrustChoice::Pinned(k) => catalogue::to_hex(k),
         stores::TrustChoice::Tofu => "(whatever key the store now ships)".to_string(),
     };
-    eprint!(
+    err!(
         "{}",
         render_store_rekey_alert(name, &catalogue::to_hex(&cfg.pubkey), &new_shown, &epal)
     );
@@ -1639,7 +1645,7 @@ fn plugins_store_list_cmd(args: &[OsString]) -> ExitCode {
         Ok(parsed) => parsed,
         Err(bad) => {
             diag::error(&format!("sbx: unexpected argument '{bad}'"));
-            eprintln!(
+            errln!(
                 "sbx: usage: {}",
                 help::synopsis_of(&["plugins", "store", "list"])
             );
@@ -1801,7 +1807,7 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>, json: bool
         if !names.iter().any(|n| n == want) {
             diag::error(&format!("sbx: no configured plugin store named '{want}'"));
             if !names.is_empty() {
-                eprintln!("sbx: configured stores: {}", names.join(", "));
+                errln!("sbx: configured stores: {}", names.join(", "));
             }
             return ExitCode::from(2);
         }

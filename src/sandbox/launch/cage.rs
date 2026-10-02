@@ -248,7 +248,7 @@ fn drain_capped(pipe: &mut impl io::Read, cap: usize) -> (Vec<u8>, bool) {
 /// because `sanitize` replaces every control character — the newlines included — with a space.
 pub(super) fn echo_cage_output(out: &str) {
     for line in out.lines().map(cage_output_line) {
-        eprintln!("{line}");
+        errln!("{line}");
     }
 }
 

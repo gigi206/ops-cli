@@ -976,7 +976,8 @@ fn an_off_host_skip_is_never_written_with_the_enforceable_macro() {
 /// No test may give up in silence: a skip has to go through the macros, never through a bare
 /// print.
 ///
-/// A hand-written `eprintln!` plus `return` is what the harness counts as a pass and what it then
+/// A hand-written print plus `return` (`eprintln!`, or sbx's own `errln!` and `outln!`, which are
+/// `eprint!` and `print!` under test) is what the harness counts as a pass and what it then
 /// swallows, so a suite can report green for work it never did. The macros make that skip a
 /// recorded event and, for a host capability, an enforceable one. This sweep is what keeps the
 /// next one from being written by hand again.
@@ -988,7 +989,7 @@ fn an_off_host_skip_is_never_written_with_the_enforceable_macro() {
 fn no_test_gives_up_through_a_bare_print() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     // Built at runtime, so this file does not match its own needle.
-    let needles: Vec<String> = ["eprintln!", "println!"]
+    let needles: Vec<String> = ["eprintln!", "println!", "errln!", "outln!"]
         .iter()
         .map(|m| format!("{m}(\"skipping"))
         .collect();

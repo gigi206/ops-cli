@@ -25,11 +25,11 @@ pub(crate) fn projects_cmd(args: &[OsString]) -> ExitCode {
         // Bare `sbx projects`, or only flags (e.g. `--json`) with no subcommand: print the page so
         // its subcommand list guides, like bare `sbx app`/`sbx session`.
         None => {
-            eprint!("{}", help::page_usage(&["projects"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["projects"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(flag) if flag.starts_with('-') => {
-            eprint!("{}", help::page_usage(&["projects"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["projects"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(other) => {

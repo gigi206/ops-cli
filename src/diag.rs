@@ -86,11 +86,37 @@ pub(crate) fn one_line(text: &str) -> String {
     out
 }
 
+/// Write to stderr what `err!` and `errln!` formatted, dropping a write that fails.
+///
+/// stderr is where sbx says that something failed, so a write to it that fails has no channel left
+/// to be reported on, and the verb's answer is its exit code, which a diagnostic that could not be
+/// shown does not change: `sbx app show nope 2>/dev/full` still exits 2. That holds for every cause
+/// alike, a reader that has gone or a full disk, because none of them leaves a channel to say it on.
+/// The panic `eprintln!` raises instead replaced the verb's answer with 101. A question put to the
+/// user is the exception, and goes through [`prompt`].
+#[cfg(not(test))]
+pub(crate) fn emit(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = std::io::stderr().write_fmt(args);
+}
+
+/// Put `question` to the user on stderr, flushed, and say whether it was written.
+///
+/// Unlike [`emit`], a failure here is not dropped: an answer read after a question nobody saw is
+/// no answer to it, so a caller that gets `false` takes it as a no. The text is written as given.
+pub(crate) fn prompt(question: &str) -> bool {
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    err.write_all(question.as_bytes())
+        .and_then(|()| err.flush())
+        .is_ok()
+}
+
 /// Print `sbx: warning: <msg>` to stderr — the prefix in the caution hue, the message's
 /// `` `identifiers` `` in the identifier hue, when stderr is a terminal. The message must be the
 /// bare text (no `sbx: warning:` prefix — this adds it), so a slip cannot double the prefix.
 pub(crate) fn warn(msg: &str) {
-    eprintln!(
+    errln!(
         "{}",
         warning_line(msg, &Palette::for_stream(std::io::stderr().is_terminal()))
     );
@@ -118,7 +144,7 @@ pub(crate) fn warn_config(msg: &str) {
 /// note explains a silent no-op (e.g. why a security field did not apply), so it must stay visible
 /// without reading as a problem. Same `` `identifier` `` highlighting as [`warn`].
 pub(crate) fn note(msg: &str) {
-    eprintln!(
+    errln!(
         "{}",
         note_line(msg, &Palette::for_stream(std::io::stderr().is_terminal()))
     );
@@ -130,7 +156,7 @@ pub(crate) fn note(msg: &str) {
 /// prefix is added; the caller owns any indent (it is part of `line`), preserved verbatim in
 /// plain mode.
 pub(crate) fn hint(line: &str) {
-    eprintln!(
+    errln!(
         "{}",
         highlight(line, &Palette::for_stream(std::io::stderr().is_terminal()))
     );
@@ -138,10 +164,10 @@ pub(crate) fn hint(line: &str) {
 
 /// Print a bare stderr error line (a usage error, a refusal) with its `` `identifiers` ``
 /// highlighted. The message carries its own `sbx: …` prefix verbatim (unlike [`warn`]/[`note`],
-/// nothing is added), so converting a plain `eprintln!` here changes no byte of sbx's own text in
+/// nothing is added), so converting a bare `errln!` here changes no byte of sbx's own text in
 /// a captured stream, only lifts the spans when stderr is a terminal.
 pub(crate) fn error(msg: &str) {
-    eprintln!(
+    errln!(
         "{}",
         highlight(msg, &Palette::for_stream(std::io::stderr().is_terminal()))
     );
@@ -171,7 +197,7 @@ impl Hue {
 /// [`error`], the whole line in `hue`. The message is escaped as every diagnostic is, so the hue
 /// is the only escape sequence the line carries: a caller never colours the text it passes.
 pub(crate) fn error_in(hue: Hue, msg: &str) {
-    eprintln!(
+    errln!(
         "{}",
         hued_line(
             msg,
@@ -313,7 +339,7 @@ mod tests {
     #[test]
     fn an_error_line_is_the_bare_message_with_identifiers_lifted() {
         // `error` adds no prefix — the plain path is byte-identical to the message (a converted
-        // `eprintln!` changes nothing captured), and color only lifts the spans.
+        // `errln!` changes nothing captured), and color only lifts the spans.
         let plain = Palette::plain();
         assert_eq!(
             highlight("sbx: store: unknown argument `--bogus`", &plain),

@@ -16,7 +16,7 @@ pub(crate) fn ssh_agent_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("logs") | Some("log") => agent_logs(&args[1..]),
         None => {
-            eprint!("{}", help::page_usage(&["ssh-agent"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["ssh-agent"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(other) => {

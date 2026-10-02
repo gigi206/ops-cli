@@ -121,7 +121,7 @@ pub(crate) fn run<E: crate::sandbox::lens::Event>(
                     view.verb,
                     other.unwrap_or_default()
                 ));
-                eprint!("{}", help::page_usage(view.page).unwrap_or_default());
+                err!("{}", help::page_usage(view.page).unwrap_or_default());
                 return ExitCode::from(2);
             }
         }
@@ -247,12 +247,12 @@ fn resolve_source(
         }),
         [] => Err(list_records(verb, dirs, project)),
         many => {
-            eprintln!(
+            errln!(
                 "sbx: {session_verb}: {} live sessions — name one by its PID:",
                 many.len()
             );
             for s in many {
-                eprintln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
+                errln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
             }
             Err(ExitCode::from(2))
         }
@@ -264,7 +264,7 @@ fn resolve_source(
 /// texts differ in the only thing that matters, whether there is anything to ask for.
 fn list_records(verb: &str, dirs: &[PathBuf], project: &str) -> ExitCode {
     let records = crate::sandbox::lens::records_across(dirs, project);
-    eprint!("{}", records_listing(verb, &records));
+    err!("{}", records_listing(verb, &records));
     ExitCode::from(2)
 }
 
@@ -975,7 +975,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                     "sbx: logs: unexpected argument {:?}",
                     other.unwrap_or_default()
                 ));
-                eprint!("{}", help::page_usage(&["logs"]).unwrap_or_default());
+                err!("{}", help::page_usage(&["logs"]).unwrap_or_default());
                 return ExitCode::from(2);
             }
         }

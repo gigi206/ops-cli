@@ -129,7 +129,7 @@ pub(crate) fn reject_extra(path: &[&str], extra: &[OsString]) -> Result<(), Exit
             None => "such argument".to_string(),
         }
     ));
-    eprintln!("sbx: usage: {}", crate::help::synopsis_of(path));
+    errln!("sbx: usage: {}", crate::help::synopsis_of(path));
     Err(ExitCode::from(2))
 }
 
@@ -697,7 +697,7 @@ pub(crate) fn refuse_flag_value(
         return None;
     }
     diag::error(&format!("sbx: `{flag}` takes no value"));
-    eprintln!("sbx: usage: {}", crate::help::synopsis_of(path));
+    errln!("sbx: usage: {}", crate::help::synopsis_of(path));
     Some(ExitCode::from(2))
 }
 

@@ -151,7 +151,7 @@ fn absolute_override(env_key: &str) -> Option<PathBuf> {
     if path.is_absolute() {
         Some(path)
     } else {
-        eprintln!(
+        errln!(
             "sbx: ignoring {env_key}={} — an engine override must be an absolute path",
             path.display()
         );
@@ -288,7 +288,7 @@ impl EngineMiss {
 /// differently — and the caller gets [`EngineMiss::Refused`] rather than a bare "nothing found",
 /// which is what keeps the failure from being reported as a missing engine.
 fn refuse_override(env: &'static str, path: &Path) -> EngineMiss {
-    eprintln!(
+    errln!(
         "sbx: refusing {env}={} — sbx will not silently substitute another engine. Fix the \
          file's ownership or permissions, or unset the variable.",
         path.display()
@@ -423,7 +423,7 @@ fn engine_probe(path: &Path) -> EngineProbe {
             // dispose of an untrusted binary differently — the override is refused outright, a
             // lower tier is skipped in favour of the next. Each tier says which below, so neither
             // has to be implied by a word chosen here.
-            eprintln!("sbx: untrusted engine binary {}: {why}", path.display());
+            errln!("sbx: untrusted engine binary {}: {why}", path.display());
             EngineProbe::Untrusted
         }
     }

@@ -192,7 +192,7 @@ pub(in crate::sandbox) fn shared_store_gc(
 ) {
     let (h, r) = (pal.head, pal.reset);
     let Some(nix_store) = crate::store::resolve_nix_store(Some(layout)) else {
-        eprintln!("sbx gc: nix-store not found; skipping the shared-store gc.");
+        errln!("sbx gc: nix-store not found; skipping the shared-store gc.");
         return;
     };
 

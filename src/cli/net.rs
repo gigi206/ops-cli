@@ -77,7 +77,7 @@ pub(crate) fn net_cmd(args: &[OsString]) -> ExitCode {
             if let Some(tok) = other {
                 diag::error(&format!("sbx: net: unknown subcommand {tok:?}"));
             }
-            eprint!("{}", help::page_usage(&["net"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["net"]).unwrap_or_default());
             ExitCode::from(2)
         }
     }

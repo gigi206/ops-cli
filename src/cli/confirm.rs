@@ -18,15 +18,16 @@ use crate::{diag, style};
 /// unattended: the answer is no, with a hint that `--yes` is how a script says it meant it —
 /// `intent` completes that hint (`pass --yes if <intent>`). Anything but an explicit yes is a no.
 pub(crate) fn ask(question: &str, intent: &str) -> bool {
-    use std::io::{BufRead, Write};
+    use std::io::BufRead;
     if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
         diag::hint(&format!(
             "     pass --yes if {intent} (no terminal to confirm at)"
         ));
         return false;
     }
-    eprint!("  {question} [y/N] ");
-    let _ = std::io::stderr().flush();
+    if !diag::prompt(&format!("  {question} [y/N] ")) {
+        return false;
+    }
     let mut line = String::new();
     if std::io::stdin().lock().read_line(&mut line).is_err() {
         return false;

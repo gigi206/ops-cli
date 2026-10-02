@@ -186,7 +186,7 @@ pub(crate) fn attach(id: &str, cmd: &[OsString]) -> ExitCode {
     // like `sbx run`, so its stdout/stderr are exactly the command's.
     if cmd.is_empty() {
         let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
-        eprintln!("{}", render_attaching(target.pid, &target.label(), &epal));
+        errln!("{}", render_attaching(target.pid, &target.label(), &epal));
     }
 
     // A terminal on stdin drives the command through a pty (interactive, job control); a pipe or
@@ -505,7 +505,7 @@ fn stop_session(
     pal: &crate::style::Palette,
 ) -> bool {
     let outcome = target.stop(grace);
-    eprintln!(
+    errln!(
         "{}",
         render_stop_outcome(target.pid, &target.label(), &outcome, grace, pal)
     );

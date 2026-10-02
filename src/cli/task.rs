@@ -46,7 +46,7 @@ pub(crate) fn task_cmd(args: &[OsString]) -> ExitCode {
         Some("stop") => task_stop(&args[1..]),
         Some("logs") | Some("log") => task_logs(&args[1..]),
         None => {
-            eprint!("{}", help::page_usage(&["task"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["task"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(other) => {
@@ -696,14 +696,14 @@ fn task_run(args: &[OsString]) -> ExitCode {
                     "sbx: task run: unexpected argument {:?}",
                     other.unwrap_or_default()
                 ));
-                eprint!("{}", help::page_usage(&["task", "run"]).unwrap_or_default());
+                err!("{}", help::page_usage(&["task", "run"]).unwrap_or_default());
                 return ExitCode::from(2);
             }
         }
     }
     let Some(name) = name else {
         diag::error("sbx: task run: name the operation to run");
-        eprint!("{}", help::page_usage(&["task", "run"]).unwrap_or_default());
+        err!("{}", help::page_usage(&["task", "run"]).unwrap_or_default());
         return ExitCode::from(2);
     };
     if detach {
@@ -821,7 +821,7 @@ fn task_result(args: &[OsString]) -> ExitCode {
                     "sbx: task result: unexpected argument {:?}",
                     other.unwrap_or_default()
                 ));
-                eprint!(
+                err!(
                     "{}",
                     help::page_usage(&["task", "result"]).unwrap_or_default()
                 );
@@ -831,7 +831,7 @@ fn task_result(args: &[OsString]) -> ExitCode {
     }
     let Some(target) = target else {
         diag::error("sbx: task result: name the invocation to collect");
-        eprint!(
+        err!(
             "{}",
             help::page_usage(&["task", "result"]).unwrap_or_default()
         );
@@ -890,7 +890,7 @@ fn render_result(verb: &str, name: &str, result: &client::RunResult, json: bool)
         out!("{out}");
     }
     if let Some(err) = &result.stderr {
-        eprint!("{err}");
+        err!("{err}");
     }
     if result.timed_out {
         diag::warn(&format!(
@@ -923,8 +923,8 @@ fn render_result(verb: &str, name: &str, result: &client::RunResult, json: bool)
         // is already there.
         for refusal in &result.refused {
             match refusal.caller.is_empty() {
-                true => eprintln!("  {}", refusal.target),
-                false => eprintln!("  {}  →  {}", refusal.caller, refusal.target),
+                true => errln!("  {}", refusal.target),
+                false => errln!("  {}  →  {}", refusal.caller, refusal.target),
             }
         }
         diag::note(
@@ -1208,7 +1208,7 @@ fn task_show(args: &[OsString]) -> ExitCode {
     };
     let Some(target) = listing.operation else {
         diag::error("sbx: task show: name an invocation id or an operation");
-        eprint!(
+        err!(
             "{}",
             help::page_usage(&["task", "show"]).unwrap_or_default()
         );
@@ -1335,7 +1335,7 @@ fn task_stop(args: &[OsString]) -> ExitCode {
     };
     let Some(target) = listing.operation else {
         diag::error("sbx: task stop: name the invocation to stop, as `sbx task status` shows it");
-        eprint!(
+        err!(
             "{}",
             help::page_usage(&["task", "stop"]).unwrap_or_default()
         );
@@ -1603,7 +1603,7 @@ fn listing_args(args: &[OsString], verb: &str) -> Result<Listing, ExitCode> {
                     "sbx: task {verb}: unexpected argument {:?}",
                     other.unwrap_or_default()
                 ));
-                eprint!("{}", help::page_usage(&["task", verb]).unwrap_or_default());
+                err!("{}", help::page_usage(&["task", verb]).unwrap_or_default());
                 return Err(ExitCode::from(2));
             }
         }

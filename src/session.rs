@@ -294,12 +294,12 @@ pub(crate) fn answering<'a>(
 ///
 /// `verb` is the command as the operator typed it, so the line reads back as their own invocation.
 pub(crate) fn report_ambiguous_id(verb: &str, id: &str, many: &[&Session]) {
-    eprintln!(
+    errln!(
         "sbx: {verb}: {} live sessions answer to '{id}' — name one by its PID:",
         many.len()
     );
     for s in many {
-        eprintln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
+        errln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
     }
 }
 

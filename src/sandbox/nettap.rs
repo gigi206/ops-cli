@@ -886,7 +886,7 @@ pub(crate) fn serve_capture(
 /// holder takes it down with its cage.
 pub(crate) fn run_tap(argv: &[OsString]) -> ! {
     let Some((uds, report)) = parse_tap_args(argv) else {
-        eprintln!("__net-tap: usage: __net-tap <egress socket> [--report <socket>]");
+        errln!("__net-tap: usage: __net-tap <egress socket> [--report <socket>]");
         std::process::exit(2);
     };
     let listeners = Listeners::bind().unwrap_or_else(|e| stop(&e));
@@ -908,7 +908,7 @@ pub(crate) fn run_tap(argv: &[OsString]) -> ! {
 
 /// End the tap on `e`, which it says.
 fn stop(e: &io::Error) -> ! {
-    eprintln!("__net-tap: {e}");
+    errln!("__net-tap: {e}");
     std::process::exit(1)
 }
 
@@ -1065,7 +1065,7 @@ fn serve_captured(
                 // Without the original destination there is no name and nothing to dial. This is
                 // the shape a connection made *directly* to the tap's port takes — the redirect
                 // did not create it, so conntrack has nothing to report.
-                eprintln!("__net-tap: no original destination ({e}); connection dropped");
+                errln!("__net-tap: no original destination ({e}); connection dropped");
                 let _ = stream.shutdown(Shutdown::Both);
                 continue;
             }
@@ -1088,7 +1088,7 @@ fn serve_captured(
             // connection of a proxy-blind client twice. The record itself gets only what
             // [`Capture::report`] judges it is owed.
             if !matches!(outcome, Capture::Proxied { .. }) {
-                eprintln!("__net-tap: {}", outcome.describe());
+                errln!("__net-tap: {}", outcome.describe());
             }
             outcome.report(&reporter);
         });

@@ -45,6 +45,11 @@
 // document (`config show` is 63 KiB on an ordinary project), while the line-by-line renderers, 365
 // calls, went unchecked. Scoped to `not(test)`: a test prints to its own captured output.
 #![cfg_attr(not(test), warn(clippy::print_stdout))]
+// The same gate for standard error. An `eprint!` whose write fails panics like a `print!`: with
+// stderr on `/dev/full` or a closed pipe, `sbx app show nope` exited 101 instead of the refusal's 2,
+// and a verb that only warned on its way to a success exited 101 too. Diagnostics go through
+// [`err!`] and [`errln!`], which drop a write that failed and leave the exit code to the verb.
+#![cfg_attr(not(test), warn(clippy::print_stderr))]
 
 // Declared before every other module, and only for that reason: `macro_rules!` are textually
 // scoped, so `#[macro_use]` lifts the skip macros into scope for the modules that follow. A module
@@ -57,6 +62,11 @@ mod testskip;
 // modules that follow.
 #[macro_use]
 mod stdout;
+
+// Declared before every other module for the same reason: `err!` and `errln!` reach only the
+// modules that follow.
+#[macro_use]
+mod stderr;
 
 mod allowlist;
 #[cfg(test)]
@@ -115,7 +125,7 @@ fn run() -> ExitCode {
         // No command at all is a usage error; an explicit help request is not. Both render
         // the same command list — to stderr/exit 2 for the error, to stdout/exit 0 for help.
         None => {
-            eprint!("{}", help::top_level_usage());
+            err!("{}", help::top_level_usage());
             return ExitCode::from(2);
         }
         Some("help" | "--help" | "-h") => return help::dispatch(&rest),
@@ -281,19 +291,19 @@ fn resolve_session_target<'a>(
         None => match sessions_of_project(sessions, project).as_slice() {
             [one] => Ok(one),
             [] => {
-                eprintln!("sbx: {verb}: no live session in this project.");
-                eprintln!(
+                errln!("sbx: {verb}: no live session in this project.");
+                errln!(
                     "       `sbx session ls` lists every project's; name one of them by its PID."
                 );
                 Err(ExitCode::from(2))
             }
             many => {
-                eprintln!(
+                errln!(
                     "sbx: {verb}: {} live sessions — name one by its PID:",
                     many.len()
                 );
                 for s in many {
-                    eprintln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
+                    errln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
                 }
                 Err(ExitCode::from(2))
             }
@@ -591,7 +601,7 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("sbx: path: argument is not valid UTF-8");
+                errln!("sbx: path: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }

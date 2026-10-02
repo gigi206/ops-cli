@@ -33,7 +33,7 @@ pub(crate) fn test_cmd(args: &[OsString]) -> ExitCode {
             if let Some(tok) = other {
                 diag::error(&format!("sbx: test: unknown kind {tok:?}"));
             }
-            eprint!("{}", help::page_usage(&["test"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["test"]).unwrap_or_default());
             ExitCode::from(2)
         }
     }

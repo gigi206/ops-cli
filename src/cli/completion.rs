@@ -53,7 +53,7 @@ const FILES: &str = "__sbx_files__";
 /// and misbehave on.
 pub(crate) fn completion_cmd(args: &[OsString]) -> ExitCode {
     let Some(shell) = args.first() else {
-        eprint!("{}", help::page_usage(&["completion"]).unwrap_or_default());
+        err!("{}", help::page_usage(&["completion"]).unwrap_or_default());
         return ExitCode::from(2);
     };
     if let Err(code) = super::reject_extra(&["completion"], &args[1..]) {

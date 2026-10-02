@@ -1180,7 +1180,7 @@ fn mise_equip_lanes<'a>(
             }
             if !global_mise.is_empty() {
                 if !prep.in_batch {
-                    eprintln!("{}", equip_announcement(&global_mise));
+                    errln!("{}", equip_announcement(&global_mise));
                 }
                 wraps.push((
                     WrapLayer::MiseEquip,

@@ -164,7 +164,7 @@ fn record_trust(path: &Path, yes: bool) -> ExitCode {
         let was = before
             .as_ref()
             .map(|(sbx, mise)| contents_of(path, sbx, mise));
-        eprint!("{}", render_trust_review(path, was.as_deref(), &now, &epal));
+        err!("{}", render_trust_review(path, was.as_deref(), &now, &epal));
         if !yes && !crate::cli::confirm::ask("trust these contents?", "these contents are intended")
         {
             diag::error(&format!("sbx: not trusting {}", path.display()));
@@ -388,7 +388,7 @@ pub(crate) fn untrust_cmd(args: Vec<OsString>) -> ExitCode {
             "sbx: untrust takes no option '{}'",
             bad.to_string_lossy()
         ));
-        eprintln!("sbx: usage: {}", help::synopsis_of(&["untrust"]));
+        errln!("sbx: usage: {}", help::synopsis_of(&["untrust"]));
         return ExitCode::from(2);
     }
     if let Err(code) = crate::cli::reject_extra(&["untrust"], args.get(1..).unwrap_or_default()) {

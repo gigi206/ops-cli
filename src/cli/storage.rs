@@ -79,7 +79,7 @@ pub(crate) fn storage_cmd(args: &[OsString]) -> ExitCode {
         Some("migrate") => migrate(args[1..].to_vec()),
         Some("unuse") => unuse_volume(args[1..].to_vec()),
         None => {
-            eprint!("{}", help::page_usage(&["storage"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["storage"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(other) => {
@@ -1136,7 +1136,6 @@ pub(crate) fn maybe_propose_on_launch(name: &str, rest: &[OsString]) {
 /// non-blocking line pointing at `sbx storage migrate`, since copying it is slow and can fail on
 /// its own checks, and hijacking the launch the user typed with that is the wrong trade.
 fn propose(default_dir: &Path, pre: &storage::Preflight) {
-    use std::io::Write as _;
     let pal = style::Palette::for_stream(std::io::stderr().is_terminal());
     let fs = pre
         .host_fs
@@ -1160,13 +1159,16 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
     // copy, so this is the one place the blocking question is cheap and safe. The default stays
     // *no* — the safe answer for an unattended Enter — but the proposal only fires on a host where
     // a volume is genuinely worth it, so `y` is the recommended answer and the prompt says so.
-    eprint!(
+    // A question that could not be shown was not asked: no answer is read, and nothing is recorded,
+    // so the next launch asks again.
+    if !diag::prompt(&format!(
         "{}sbx:{} first launch on {fs}. sbx can keep its data in a compressed btrfs volume it \
          mounts itself — one host inode instead of thousands, about half the disk.\n     \
          Adopt one now? [y/N]  (recommended: y — N changes nothing) ",
         pal.head, pal.reset
-    );
-    let _ = std::io::stderr().flush();
+    )) {
+        return;
+    }
     let yes = read_yes();
     // Recorded whatever the answer, so the question is asked exactly once.
     storage::mark_offered(default_dir);

@@ -6708,6 +6708,68 @@ fn an_answer_that_cannot_be_written_is_a_failure() {
     }
 }
 
+/// A diagnostic that cannot be written leaves the verb's answer alone. stderr is where a failure
+/// is said, so a write to it that fails has nowhere left to go, and the exit code is what a script
+/// reads. A bare `eprintln!` panicked there instead: with stderr on `/dev/full` or on a pipe whose
+/// reader had gone, a refusal that answers 2, a success that warned on its way and a failure that
+/// answers 1 all exited 101.
+#[test]
+fn a_diagnostic_that_cannot_be_written_leaves_the_exit_code_alone() {
+    use std::os::fd::FromRawFd;
+    use std::process::Stdio;
+    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        skip_incapable!(
+            "skipping a_diagnostic_that_cannot_be_written_leaves_the_exit_code_alone: no /dev/full here"
+        );
+        return;
+    };
+    let p = Project::new("fullerr");
+    // Untrusted, so `config show` warns that the table is ignored and still succeeds.
+    p.write_project("[network]\nallow = [\"x.test\"]\n");
+    let closed_pipe = || {
+        let mut ends = [0; 2];
+        // SAFETY: `pipe2` fills the two-element array it is handed.
+        assert_eq!(
+            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: the reading end was just opened here and nothing else holds it.
+        unsafe { libc::close(ends[0]) };
+        // SAFETY: the writing end was just opened here, and the `Stdio` takes it over.
+        unsafe { Stdio::from_raw_fd(ends[1]) }
+    };
+    for (verb, code) in [
+        (vec!["app", "show", "nope"], 2),
+        (vec!["config", "show"], 0),
+        (vec!["task", "ls"], 1),
+    ] {
+        // The verb has something to say on stderr, so the streams below meet a write.
+        let said = p.run(&verb);
+        assert_eq!(
+            (said.status.code(), said.stderr.is_empty()),
+            (Some(code), false),
+            "`sbx {}` with its stderr read: {}",
+            verb.join(" "),
+            String::from_utf8_lossy(&said.stderr)
+        );
+        for (stream, stderr) in [
+            (
+                "/dev/full",
+                Stdio::from(full.try_clone().expect("dup /dev/full")),
+            ),
+            ("a closed pipe", closed_pipe()),
+        ] {
+            let out = p.cmd(&verb).stderr(stderr).output().expect("spawn sbx");
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "`sbx {}` with stderr on {stream}",
+                verb.join(" ")
+            );
+        }
+    }
+}
+
 /// An unreadable global config refuses a launch, and leaves the verbs that diagnose it working.
 ///
 /// The two halves are one decision, so they are asserted together. That layer is trusted by

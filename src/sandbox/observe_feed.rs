@@ -277,7 +277,7 @@ fn run_loop(
                     // correct here.
                     // Verbatim, never through the span painter: `cmd` is the agent's own
                     // argv, and a backtick pair inside it is command text, not markup.
-                    eprintln!("{}[sbx:exec]{} {}", pal.dim, pal.reset, cmd);
+                    errln!("{}[sbx:exec]{} {}", pal.dim, pal.reset, cmd);
                 }
             }
         }

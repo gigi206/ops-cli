@@ -356,7 +356,7 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
 /// A diagnostic sbx prints itself carries no interpolation: it goes through
 /// [`crate::diag::error`], which styles the identifiers in it.
 ///
-/// `diag::error` is `eprintln!` plus [`crate::style::paint_spans`] over the backticked spans of the
+/// `diag::error` is `errln!` plus [`crate::style::paint_spans`] over the backticked spans of the
 /// escaped message, and it adds no prefix, so routing a line through it changes sbx's own bytes
 /// only where a backtick already stood. That is what makes this rule cheap to hold: no message is
 /// reworded to satisfy it.
@@ -369,7 +369,7 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
 /// backticks inside that error, so the terminal received an unstyled identifier from a call this
 /// guard had passed. No reading of the source can settle what a value will render.
 ///
-/// So the rule is now a shape rather than a prediction: **a raw `eprintln!` whose format string
+/// So the rule is now a shape rather than a prediction: **a raw `errln!` whose format string
 /// begins with `sbx` may not interpolate.** A line that interpolates nothing renders identically
 /// through either path and stays as it is; a line that interpolates goes through `diag::error`,
 /// where whatever it turns out to carry is styled. That is decidable by reading, which the previous
@@ -381,7 +381,7 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
 /// Two residuals, named rather than implied. This reads **six files by name**, so the same shape in
 /// another module is not covered; the producers that embed backticks (`resolver`, `egress`,
 /// `broker`) have callers outside `launch/`. And a line assembled by a helper and printed as
-/// `eprintln!("{}", render_…(…, &pal))` does not begin with `sbx`, so it is not examined: those
+/// `errln!("{}", render_…(…, &pal))` does not begin with `sbx`, so it is not examined: those
 /// helpers take a palette and style themselves, which is the arrangement this rule exists to
 /// produce rather than one it needs to police.
 #[test]
@@ -399,7 +399,7 @@ fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
             .map_or(source, |(before, _)| before);
         let lines: Vec<&str> = production.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("eprintln!(") {
+            if !line.trim_start().starts_with("errln!(") {
                 continue;
             }
             let mut call = String::new();
@@ -412,7 +412,7 @@ fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
             }
             assert!(
                 !(call.contains("\"sbx") && call.contains('{')),
-                "{name}:{} interpolates into a raw `eprintln!`, so whatever the value turns out to \
+                "{name}:{} interpolates into a raw `errln!`, so whatever the value turns out to \
                  name reaches the terminal unstyled; use `diag::error` — {}",
                 i + 1,
                 line.trim()

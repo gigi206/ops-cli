@@ -923,7 +923,7 @@ fn launch_pty_supervised(
     // which is exactly what `sbx session ls` shows and `sbx session stop` accepts, so the hint names the real id.
     if let Some(name) = stop_hint {
         let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
-        eprintln!("{}", render_gui_stop_hint(&name, std::process::id(), &epal));
+        errln!("{}", render_gui_stop_hint(&name, std::process::id(), &epal));
     }
 
     let gui = matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland);

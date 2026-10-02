@@ -34,7 +34,7 @@ pub(crate) fn session_cmd(args: &[OsString]) -> ExitCode {
         Some("attach") => attach_cmd(&args[1..]),
         Some("stop") => stop_cmd(args[1..].to_vec()),
         None => {
-            eprint!("{}", help::page_usage(&["session"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["session"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(other) => {

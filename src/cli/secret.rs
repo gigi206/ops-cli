@@ -25,7 +25,7 @@ pub(crate) fn secret_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("list") | Some("ls") => secret_list(&args[1..]),
         None => {
-            eprint!("{}", help::page_usage(&["secret"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["secret"]).unwrap_or_default());
             ExitCode::from(2)
         }
         Some(other) => {
@@ -79,7 +79,7 @@ fn secret_list(args: &[OsString]) -> ExitCode {
                     "sbx: secret list: unexpected argument {:?}",
                     other.unwrap_or_default()
                 ));
-                eprint!(
+                err!(
                     "{}",
                     help::page_usage(&["secret", "list"]).unwrap_or_default()
                 );

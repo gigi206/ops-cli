@@ -70,7 +70,7 @@ pub(crate) fn config_cmd(args: &[OsString]) -> ExitCode {
                 Some(tok) => diag::error(&format!("sbx: config: unknown subcommand {tok:?}")),
                 None => {}
             }
-            eprint!("{}", help::page_usage(&["config"]).unwrap_or_default());
+            err!("{}", help::page_usage(&["config"]).unwrap_or_default());
             ExitCode::from(2)
         }
     }

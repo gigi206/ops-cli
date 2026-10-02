@@ -21,6 +21,17 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 | `128 + N` | the launched or attached command was terminated by signal `N` |
 | *other* | for a launch verb, the **launched command's** own exit status (a [learning run](#a-learning-run-answers-for-its-learning) answers for its learning instead) |
 
+## Output that cannot be written
+
+An answer that cannot be written to standard output turns a success into `1`, said once on
+standard error: what reached a full disk under `> file` is not what the verb produced. A reader
+that has gone away, the end of `sbx … | head`, is not a failure and changes nothing.
+
+A diagnostic that cannot be written to standard error changes nothing either, whatever the
+cause: standard error is where a failure would be reported, and the exit code is the answer.
+`sbx app show nope 2>/dev/full` still exits 2. The one exception is a `[y/N]` question: one
+that cannot be shown is answered no.
+
 ## A name that names nothing exits 2
 
 A verb handed the name of an app, a plugin, a plugin store, a bundle, an egress group, a
