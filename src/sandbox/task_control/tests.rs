@@ -1270,7 +1270,9 @@ fn info_shows_what_an_invocation_runs_and_never_what_it_carries() {
     }
     let id = id.expect("the invocation must be visible while it runs");
 
-    let fields = read_info(&host, &id.to_string()).expect("info");
+    let fields = read_info(&host, &id.to_string())
+        .expect("info")
+        .expect("a record");
     let field = |key: &str| {
         fields
             .iter()
@@ -1306,7 +1308,9 @@ fn info_shows_what_an_invocation_runs_and_never_what_it_carries() {
     let _ = caller.join().expect("the caller thread");
 
     // And it still answers once the invocation is over — the log's half, plus the declaration.
-    let after = read_info(&host, &id.to_string()).expect("info after");
+    let after = read_info(&host, &id.to_string())
+        .expect("info after")
+        .expect("a record after");
     let state = after
         .iter()
         .find(|(k, _)| k == "state")
@@ -1319,8 +1323,8 @@ fn info_shows_what_an_invocation_runs_and_never_what_it_carries() {
     );
 
     assert!(
-        read_info(&host, "no-such-thing").is_err(),
-        "a name nothing answers to is an error, not an empty record"
+        matches!(read_info(&host, "no-such-thing"), Ok(None)),
+        "a name nothing answers to is no record, not an empty one"
     );
 }
 

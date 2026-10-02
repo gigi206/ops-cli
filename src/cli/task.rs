@@ -859,6 +859,7 @@ fn task_result(args: &[OsString]) -> ExitCode {
     // leaves the field as the id, which is still true.
     let name = sandbox::task_control::read_info(&plane.socket, &target)
         .ok()
+        .flatten()
         .and_then(|fields| {
             fields
                 .iter()
@@ -1221,10 +1222,26 @@ fn task_show(args: &[OsString]) -> ExitCode {
     // Every plane that knows the target is asked before any of them is rendered: whether the first
     // answer may stand depends on how many others there are, and for an id it may not.
     let mut answers: Vec<(&Plane, Vec<(String, String)>)> = Vec::new();
+    let mut unread: Vec<(&Plane, std::io::Error)> = Vec::new();
     for plane in &planes {
-        if let Ok(fields) = sandbox::task_control::read_info(&plane.socket, &target) {
-            answers.push((plane, fields));
+        match sandbox::task_control::read_info(&plane.socket, &target) {
+            Ok(Some(fields)) => answers.push((plane, fields)),
+            Ok(None) => {}
+            Err(e) => unread.push((plane, e)),
         }
+    }
+    // A session that could not be asked is not one that holds nothing by that name: with no
+    // answer anywhere, that is a failure to read rather than a name that names nothing.
+    if answers.is_empty()
+        && let Some((_, e)) = unread.first()
+    {
+        return unreachable_plane(e);
+    }
+    for (plane, e) in &unread {
+        diag::warn(&format!(
+            "task show: session {} could not be read ({e}), so it is not among the answers",
+            plane.describe()
+        ));
     }
     if ambiguous_across_sessions(&target, answers.len()) {
         diag::error(&format!(
@@ -1840,6 +1857,64 @@ mod tests {
             "a declared operation that is not running is a state, not a typo"
         );
         assert_eq!(task_list(&args(&["probe"])), ExitCode::SUCCESS);
+    }
+
+    /// A session that could not be asked is not one that holds nothing by that name. `task show`
+    /// read every failure to ask a session as "nothing here is called", a usage error: a session
+    /// with no socket, and one that closed without answering, exited 2 like a typo, and one that read
+    /// the question and closed exited 0 with an empty record. Against stand-in planes, a live
+    /// process standing for the session, since a plane is judged live by its pid.
+    #[test]
+    fn a_session_that_could_not_be_read_is_a_failure_not_a_name_that_names_nothing() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let _cage = EnvVar::unset(TASK_SOCKET_ENV);
+        let mut session = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a live process for the session");
+        let pid = session.id();
+        std::fs::create_dir_all(sandbox::task_control::task_dir(data.path(), pid))
+            .expect("the session's plane directory");
+        let show = || task_show(&[OsString::from("x")]);
+
+        assert_eq!(
+            show(),
+            ExitCode::FAILURE,
+            "a session with no socket could not be asked"
+        );
+
+        let listener = UnixListener::bind(sandbox::task_control::log_socket(data.path(), pid))
+            .expect("bind the stand-in plane");
+        let answered = |reply: &'static [u8]| {
+            let listener = listener.try_clone().expect("share the listener");
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept the question");
+                let mut question = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut question);
+                let _ = (&stream).write_all(reply);
+            })
+        };
+        let plane = answered(b"");
+        assert_eq!(
+            show(),
+            ExitCode::FAILURE,
+            "a session that closed without answering said nothing"
+        );
+        plane.join().expect("the stand-in plane");
+        let plane = answered(b"err nothing here is called `x`\n");
+        assert_eq!(
+            show(),
+            ExitCode::from(2),
+            "a session that answered that nothing is called `x` is a name that names nothing"
+        );
+        plane.join().expect("the stand-in plane");
+        let _ = session.kill();
+        let _ = session.wait();
     }
 
     /// A column every row answers the same way is not information. The default case — nothing

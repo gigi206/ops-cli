@@ -1608,18 +1608,31 @@ pub(crate) fn read_status(socket: &Path) -> io::Result<Vec<StatusRow>> {
         .collect())
 }
 
-/// Everything one invocation (or one operation) has to say about itself, in reading order.
-pub(crate) fn read_info(socket: &Path, target: &str) -> io::Result<Vec<(String, String)>> {
+/// Everything one invocation (or one operation) has to say about itself, in reading order, or
+/// `None` when the session answered that nothing there is called `target`.
+///
+/// The two failures are kept apart from that answer, because a caller tells a name that names
+/// nothing from a session it could not ask: a session that could not be reached, and one whose
+/// answer ended before its `ok`, which said nothing rather than an empty record.
+pub(crate) fn read_info(socket: &Path, target: &str) -> io::Result<Option<Vec<(String, String)>>> {
     let lines = ask_host(socket, &format!("INFO {target}"))?;
-    if let Some(reason) = lines.iter().find_map(|l| l.strip_prefix("err ")) {
-        return Err(io::Error::other(reason.to_string()));
+    if lines.iter().any(|l| l.starts_with("err ")) {
+        return Ok(None);
     }
-    Ok(lines
-        .iter()
-        .filter_map(|l| l.strip_prefix("field "))
-        .filter_map(|rest| rest.split_once('\t'))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect())
+    if lines.last().map(String::as_str) != Some("ok") {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the session's answer ended before its `ok`",
+        ));
+    }
+    Ok(Some(
+        lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("field "))
+            .filter_map(|rest| rest.split_once('\t'))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    ))
 }
 
 /// What a stop achieved, as the plane reports it. The plane is the authority on this: it is the side

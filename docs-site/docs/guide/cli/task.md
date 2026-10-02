@@ -24,7 +24,9 @@ socket sbx binds there) **and on the host**, so an operation is testable exactly
 it, down to the `<operation>` filter: `sbx task list build` narrows the listing on either side, and
 a name nothing declares is refused on either side with the names that are declared, at exit 2 like
 any [name that names nothing](../reference/exit-codes#a-name-that-names-nothing-exits-2), and so is
-a `--session` no live session answers to. `--session` is host-only, since a cage reaches exactly
+a `--session` no live session answers to. A session that could not be asked is not such a name:
+`sbx task show <name>` exits 1 when no session answered and one could not be read, its socket
+gone or its answer cut off before its end. `--session` is host-only, since a cage reaches exactly
 one plane, its own (the plane address travels as `SBX_TASK_SOCKET`, which is also how `--session` is refused inside a cage rather than
 silently dropped). `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
 rather than by check: they live on a second socket that is never bound into a cage. The record is not
