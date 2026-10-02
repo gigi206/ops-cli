@@ -92,7 +92,8 @@ pub(crate) const ROOTS_DIR: &str = "roots";
 ///
 /// `lock_path` is where this launch's pin is recorded — the project's own lock under a project
 /// declaration, the shared one otherwise. It is written on every call, not only when it changes, so
-/// that a tree provisioned before the lock existed still ends up pinned.
+/// that a tree provisioned before the lock existed still ends up pinned, unless it moved while this
+/// call provisioned ([`pin_unless_moved`]).
 ///
 /// `bwrap` starts the cage each layer is unpacked in ([`super::unpack`]).
 ///
@@ -123,6 +124,8 @@ pub(crate) fn provision(
         ))
     })?;
 
+    // What the lock said before anything else happens, compared again before it is written.
+    let read = crate::store::read_lock_lines(lock_path);
     let digest = match &image.reference {
         // A digest names the image itself, so there is nothing to resolve and nothing a registry
         // could answer differently.
@@ -158,8 +161,48 @@ pub(crate) fn provision(
     let roots = dir.join(ROOTS_DIR);
     std::fs::create_dir_all(&roots)?;
     std::fs::File::create(roots.join(holder))?;
-    crate::store::write_lock(lock_path, locator, &key)?;
+    pin_unless_moved(lock_path, locator, &key, &read)?;
     Ok(rootfs)
+}
+
+/// What a lock read as before a provision: its source line and its key line, as
+/// [`crate::store::read_lock_lines`] answers them.
+type LockRead = Option<(String, Option<String>)>;
+
+/// Record `key` for `locator` in the lock, unless the lock moved since it was `read`; whether the
+/// lock now pins `key`.
+///
+/// A launch reads the lock first, may spend up to an hour unpacking, and then pins what it
+/// provisioned. An `sbx upgrade` that rolled the image in between has written the digest it
+/// resolved, and writing here put the older one back without a word, so every later launch stayed
+/// on it. A lock that no longer reads as it did is left to whoever wrote it, and the launch says
+/// so: it still runs on the tree it provisioned, which its holder marker keeps from a sweep, and
+/// the next launch takes the newer pin. A lock unchanged since the read is written, which is what
+/// pins a tree provisioned before the lock existed. The comparison and the write are two steps, so
+/// a writer landing between them is not seen: that window is one read long, where it was the
+/// length of the provision.
+fn pin_unless_moved(
+    lock_path: &Path,
+    locator: &str,
+    key: &str,
+    read: &LockRead,
+) -> io::Result<bool> {
+    let now = crate::store::read_lock_lines(lock_path);
+    if now == Some((locator.to_string(), Some(key.to_string()))) {
+        return Ok(true);
+    }
+    if now != *read {
+        crate::diag::note(&format!(
+            "the image lock `{}` changed while this launch provisioned `{}`, as when `sbx \
+             upgrade` rolls the image meanwhile: this launch runs on what it provisioned and \
+             leaves the lock as it now reads, which the next launch follows",
+            lock_path.display(),
+            crate::diag::visible(locator)
+        ));
+        return Ok(false);
+    }
+    crate::store::write_lock(lock_path, locator, key)?;
+    Ok(true)
 }
 
 /// What a roll of the distribution lock did: the image it names, the digest it now records, and

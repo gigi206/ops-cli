@@ -241,6 +241,11 @@ A lock is rewritten atomically (temp + rename), so a concurrent reader sees old-
 never a torn file, and a failed resolution returns before the write rather than
 truncating a known-good lock.
 
+A launch that provisions a distribution image while `sbx upgrade distro` rolls it does not
+put the older digest back: it checks the lock again before pinning what it unpacked, and a
+lock that moved in the meantime is left as the upgrade wrote it. The launch says so and
+runs on the tree it provisioned; the next launch takes the newer one.
+
 ## Examples
 
 ```sh

@@ -167,3 +167,39 @@ fn a_provisioned_image_lands_with_its_lock_and_its_mountpoints() {
         assert!(roots.join(holder).is_file(), "`{holder}` holds the tree");
     }
 }
+
+/// A launch reads the lock, provisions (up to an hour unpacking), then pins what it provisioned. An
+/// `sbx upgrade` that rolled the image in between has written its newer digest, and the launch put
+/// the older one back without a word, so every later launch stayed on it. A lock that no longer
+/// reads as it did is left to whoever wrote it.
+#[test]
+fn a_launch_leaves_a_lock_that_moved_while_it_provisioned() {
+    let tmp = crate::testutil::TmpDir::new();
+    let lock = tmp.join("distro.lock");
+    let locator = "oci:docker.io/library/debian:12";
+    let older = format!("sha256:{}", "a".repeat(64));
+    let newer = format!("sha256:{}", "b".repeat(64));
+
+    // Nothing pinned before, nothing since: the launch pins what it provisioned.
+    assert!(pin_unless_moved(&lock, locator, &older, &None).unwrap());
+    let read = crate::store::read_lock_lines(&lock);
+    assert_eq!(read, Some((locator.to_string(), Some(older.clone()))));
+
+    // An upgrade rolls the image while the launch provisions what it read.
+    crate::store::write_lock(&lock, locator, &newer).unwrap();
+    assert!(!pin_unless_moved(&lock, locator, &older, &read).unwrap());
+    assert_eq!(
+        crate::store::read_lock_lines(&lock),
+        Some((locator.to_string(), Some(newer.clone()))),
+        "the newer pin stands"
+    );
+
+    // Unmoved since the read: the launch writes what it resolved, a re-pin included.
+    let read = crate::store::read_lock_lines(&lock);
+    let newest = format!("sha256:{}", "c".repeat(64));
+    assert!(pin_unless_moved(&lock, locator, &newest, &read).unwrap());
+    assert_eq!(
+        crate::store::read_lock_lines(&lock),
+        Some((locator.to_string(), Some(newest)))
+    );
+}
