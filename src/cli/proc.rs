@@ -607,7 +607,7 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
             // counting processes can tell a small tree from a truncated one.
             "deeper": tree.deeper,
         });
-        println!("{obj}");
+        crate::cli::print_document(&format!("{obj}\n"));
         return ExitCode::SUCCESS;
     }
 

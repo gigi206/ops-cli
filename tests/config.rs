@@ -6546,6 +6546,57 @@ fn every_listing_verb_that_offers_json_emits_a_document_even_when_empty() {
     }
 }
 
+/// A `--json` answer whose reader has gone ends the verb, not the process. Rust ignores `SIGPIPE`,
+/// so a `println!` whose write fails panics, and `sbx net groups --json | head -c0` exited 101 on a
+/// pipeline the shell reports as fine. Each verb runs with its standard output a pipe whose
+/// reading end is already closed, so its one write fails every time rather than by a race.
+#[test]
+fn a_json_answer_to_a_closed_pipe_is_not_a_panic() {
+    use std::os::fd::FromRawFd;
+    use std::process::Stdio;
+    let p = Project::new("jsonpipe");
+    for verb in [
+        vec!["bundle"],
+        vec!["net", "groups"],
+        vec!["net", "pending"],
+        vec!["net", "logs"],
+        vec!["net", "stats"],
+    ] {
+        let mut ends = [0; 2];
+        // SAFETY: `pipe2` fills the two-element array it is handed.
+        assert_eq!(
+            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: the reading end was just opened here and nothing else holds it.
+        unsafe { libc::close(ends[0]) };
+        let mut args = verb.clone();
+        args.push("--json");
+        // The verb writes a document when it is read, so the closed pipe below meets a write.
+        let read = p.run(&args);
+        serde_json::from_slice::<serde_json::Value>(&read.stdout).unwrap_or_else(|e| {
+            panic!(
+                "`sbx {} --json` wrote no document to fail on ({e}): {}",
+                verb.join(" "),
+                String::from_utf8_lossy(&read.stderr)
+            )
+        });
+        let out = p
+            .cmd(&args)
+            // SAFETY: the writing end was just opened here, and the `Stdio` takes it over.
+            .stdout(unsafe { Stdio::from_raw_fd(ends[1]) })
+            .output()
+            .expect("spawn sbx");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stderr.is_empty(),
+            "`sbx {} --json` into a closed pipe ended with {}:\n{stderr}",
+            verb.join(" "),
+            out.status
+        );
+    }
+}
+
 /// An unreadable global config refuses a launch, and leaves the verbs that diagnose it working.
 ///
 /// The two halves are one decision, so they are asserted together. That layer is trusted by

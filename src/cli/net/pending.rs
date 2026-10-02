@@ -140,7 +140,7 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
                     .collect::<Vec<_>>()
             })
             .collect();
-        println!("{}", serde_json::json!({ "pending": rows }));
+        crate::cli::print_document(&format!("{}\n", serde_json::json!({ "pending": rows })));
         return ExitCode::SUCCESS;
     }
 

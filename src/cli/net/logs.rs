@@ -271,10 +271,10 @@ pub(super) fn net_logs(args: &[OsString]) -> ExitCode {
                 (n > 0).then(|| serde_json::json!({ "pid": s.pid, "count": n }))
             })
             .collect();
-        println!(
-            "{}",
+        crate::cli::print_document(&format!(
+            "{}\n",
             serde_json::json!({ "logs": rows, "evicted": evicted })
-        );
+        ));
         return ExitCode::SUCCESS;
     }
 

@@ -103,8 +103,8 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
         // Present on the same terms as the fold above: absent when the tap answered nothing, so a
         // session that never ran one renders the shape it always rendered.
         let resolutions = (tally.resolutions > 0).then_some(tally.resolutions);
-        println!(
-            "{}",
+        crate::cli::print_document(&format!(
+            "{}\n",
             serde_json::json!({
                 "project": project,
                 "app": app,
@@ -112,7 +112,7 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
                 "overflow": overflow,
                 "resolutions": resolutions,
             })
-        );
+        ));
         return ExitCode::SUCCESS;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());

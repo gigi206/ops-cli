@@ -1632,6 +1632,33 @@ mod tests {
                 let relative = file.display().to_string().replacen(&root, "", 1);
                 offenders.push(format!("{relative}:{line}"));
             }
+            // A `--json` answer is a whole document too, and six verbs wrote theirs with
+            // `println!`, which the scan above does not match. This one finds the calls whose own
+            // arguments build the value with `serde_json`, however many lines the call spans. A
+            // value built beforehand and printed by name, as `proc` printed its tree, is not seen.
+            for (at, _) in production.match_indices("println!(") {
+                if production[..at].ends_with('e') {
+                    continue;
+                }
+                let args = &production[at + "println!(".len()..];
+                let mut depth = 1usize;
+                let end = args
+                    .char_indices()
+                    .find(|&(_, c)| {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        depth == 0
+                    })
+                    .map_or(args.len(), |(i, _)| i);
+                if args[..end].contains("serde_json") {
+                    let line = production[..at].matches('\n').count() + 1;
+                    let relative = file.display().to_string().replacen(&root, "", 1);
+                    offenders.push(format!("{relative}:{line}"));
+                }
+            }
         }
         assert!(
             offenders.is_empty(),

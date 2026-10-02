@@ -88,7 +88,7 @@ pub(super) fn net_groups_list(args: &[OsString]) -> ExitCode {
                 serde_json::json!({ "name": name, "entries": rows })
             })
             .collect();
-        println!("{}", serde_json::json!({ "groups": obj }));
+        crate::cli::print_document(&format!("{}\n", serde_json::json!({ "groups": obj })));
         return ExitCode::SUCCESS;
     }
 

@@ -171,7 +171,7 @@ fn bundle_list(args: &[OsString]) -> ExitCode {
             .iter()
             .map(|(name, b)| bundle_json(name, b))
             .collect();
-        println!("{}", serde_json::json!({ "bundles": obj }));
+        crate::cli::print_document(&format!("{}\n", serde_json::json!({ "bundles": obj })));
         return ExitCode::SUCCESS;
     }
 
