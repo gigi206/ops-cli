@@ -4242,31 +4242,12 @@ fn a_net_learn_run_whose_cage_bubblewrap_refused_says_it_never_reached_its_comma
         cache_reachable(),
         "skipping refused-setup net-learn e2e: the binary cache is unreachable"
     );
-    let Some(real) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|dir| dir.join("bwrap"))
-        .find(|candidate| candidate.is_file())
-    else {
+    let Some(stand_in) = bwrap_refusing_the_learning_cage(engine.path()) else {
         skip_incapable!(
             "skipping refused-setup net-learn e2e: no bwrap on PATH for the stand-in to run"
         );
         return;
     };
-    let stand_in = engine.path().join("bwrap");
-    std::fs::write(
-        &stand_in,
-        format!(
-            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --json-status-fd ]; then\n    \
-             exec '{}' --ro-bind /sbx-e2e-no-such-source /sbx-e2e-mnt \"$@\"\n  fi\ndone\n\
-             exec '{}' \"$@\"\n",
-            real.display(),
-            real.display()
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
     let trusted = sbx_in(
         project.path(),
         data.path(),
@@ -4312,6 +4293,184 @@ fn a_net_learn_run_whose_cage_bubblewrap_refused_says_it_never_reached_its_comma
     assert!(
         !learn_out.contains("no new") && !learn_out.contains("refused nothing"),
         "a cage never set up must not be reported as having learned nothing new: {learn_out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap(),
+        config,
+        "nothing is written for a run that learned nothing"
+    );
+}
+
+/// A bubblewrap stand-in, written in `dir`, that makes the real bubblewrap refuse the setup of the
+/// one cage that asks for a setup report, the learning cage's, by adding a bind with no source to
+/// that call. Every other call runs the real bubblewrap untouched. `None` when `PATH` holds no
+/// bubblewrap for it to run.
+fn bwrap_refusing_the_learning_cage(dir: &Path) -> Option<PathBuf> {
+    let real = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("bwrap"))
+        .find(|candidate| candidate.is_file())?;
+    let stand_in = dir.join("bwrap");
+    std::fs::write(
+        &stand_in,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --json-status-fd ]; then\n    \
+             exec '{}' --ro-bind /sbx-e2e-no-such-source /sbx-e2e-mnt \"$@\"\n  fi\ndone\n\
+             exec '{}' \"$@\"\n",
+            real.display(),
+            real.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+    Some(stand_in)
+}
+
+/// Run `command` with a fresh terminal as its stdin, stdout and stderr, which is what makes a
+/// launch interactive (`isatty(0)`), and drain the terminal until the command and everything it
+/// started let it go, or `limit` passes. Returns the exit code, `None` for a signal or for a
+/// terminal still held at the limit (the command is killed then), and everything written, both
+/// streams together as a terminal shows them.
+fn on_a_terminal(mut command: Command, limit: std::time::Duration) -> (Option<i32>, String) {
+    use std::os::fd::FromRawFd;
+    use std::process::Stdio;
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: `openpty` fills the two descriptors it is handed and is given no name, settings or
+    // size to read.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
+    let mut child = command
+        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .spawn()
+        .expect("spawn sbx on a terminal");
+    // The command keeps the three copies it was handed for as long as it lives, and so would this
+    // process, which would keep the master from ever reading EIO: they go with it, here.
+    drop(command);
+    // SAFETY: closes this process's own copy of the slave, so the master reads EIO once the child
+    // and everything it started have let theirs go.
+    unsafe { libc::close(slave) };
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut let_go = false;
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one `pollfd` this frame owns, then a read into a buffer of the length given.
+        if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                let_go = true;
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+    }
+    // SAFETY: the master this function opened, closed once.
+    unsafe { libc::close(master) };
+    if !let_go {
+        let _ = child.kill();
+    }
+    let status = child.wait().expect("reap sbx");
+    let code = if let_go { status.code() } else { None };
+    (code, String::from_utf8_lossy(&out).into_owned())
+}
+
+#[test]
+fn a_net_learn_run_on_a_terminal_reads_bubblewraps_report_through_the_pty_supervisor() {
+    // The interactive learning run: stdin is a terminal, so the launch goes through the pty
+    // supervisor, which hands bubblewrap the report pipe across its own fork. Two runs of one app
+    // whose command ends 3. Through the real bubblewrap, the report says the cage was set up, so
+    // the run was refused nothing and ends 0: a report lost on the way would read as a refused
+    // setup and end 3. Through the stand-in that refuses the learning cage's setup, the run says it
+    // never reached its command and ends with bubblewrap's 1. Nothing is written either way.
+    // Skips (never fails) when the host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::prefixed("r", "ttylearn-proj");
+    let data = TmpDir::prefixed("r", "ttylearn-data");
+    let state = TmpDir::prefixed("r", "ttylearn-state");
+    let engine = TmpDir::prefixed("r", "ttylearn-engine");
+    let config = "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
+         [app.probe]\ncmd = [\"sh\", \"-c\", \"exit 3\"]\n";
+    std::fs::write(project.path().join(".sbx.toml"), config).unwrap();
+
+    probe_or_skip!(
+        "terminal net-learn e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping terminal net-learn e2e: the binary cache is unreachable"
+    );
+    let Some(stand_in) = bwrap_refusing_the_learning_cage(engine.path()) else {
+        skip_incapable!(
+            "skipping terminal net-learn e2e: no bwrap on PATH for the stand-in to run"
+        );
+        return;
+    };
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let learn = ["app", "run", "probe", "--net-learn", "--local"];
+    let limit = std::time::Duration::from_secs(300);
+
+    let mut through_bwrap = sbx_session_in(project.path(), data.path(), state.path());
+    through_bwrap.args(learn);
+    let (code, text) = on_a_terminal(through_bwrap, limit);
+    assert!(
+        !text.contains("never reached"),
+        "a cage bubblewrap set up reached its command, whatever the command ended with: {text}"
+    );
+    assert!(
+        text.contains("no new"),
+        "a run that was refused nothing says it learned nothing new: {text}"
+    );
+    assert_eq!(code, Some(0), "a run that learned nothing ends 0: {text}");
+
+    let mut through_the_stand_in = sbx_session_in(project.path(), data.path(), state.path());
+    through_the_stand_in
+        .env("SBX_BWRAP_BIN", &stand_in)
+        .args(learn);
+    let (code, text) = on_a_terminal(through_the_stand_in, limit);
+    assert!(
+        text.contains("bwrap: Can't find source path /sbx-e2e-no-such-source"),
+        "bubblewrap itself must refuse the learning cage's setup: {text}"
+    );
+    assert!(
+        text.contains("never reached its command"),
+        "the learning run must say it never got there: {text}"
+    );
+    assert!(
+        !text.contains("no new"),
+        "a cage never set up must not be reported as having learned nothing new: {text}"
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "the run ends with bubblewrap's own 1, not the 0 of a run that learned nothing: {text}"
     );
     assert_eq!(
         std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap(),
