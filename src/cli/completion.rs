@@ -2110,6 +2110,12 @@ mod tests {
 
     #[test]
     fn no_page_offers_a_malformed_candidate() {
+        // The walk reaches the pending pages, whose ids are asked of every live session's control
+        // socket. Pinned to an empty data directory under the lock the binary shares, so it asks
+        // neither the host's sessions nor the stand-ins another test registered.
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_dir = EnvVar::set("SBX_DATA_DIR", data.path());
         for path in help::all_paths() {
             // A flag candidate is a bare flag: never a metavariable, an alternation, or
             // the `--` separator.
@@ -2245,6 +2251,12 @@ mod tests {
 
     #[test]
     fn every_candidate_renders_as_one_clean_line() {
+        // The walk reaches the pending pages, whose ids are asked of every live session's control
+        // socket. Pinned to an empty data directory under the lock the binary shares, so it asks
+        // neither the host's sessions nor the stand-ins another test registered.
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_dir = EnvVar::set("SBX_DATA_DIR", data.path());
         // The protocol is line-and-tab delimited, so a description with either would
         // split a candidate in two or graft onto the wrong name.
         for path in help::all_paths() {
