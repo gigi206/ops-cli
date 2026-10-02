@@ -59,6 +59,23 @@ const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
 /// the caller has to take to keep them, and another to hand them to the exec, are steps some caller
 /// will not take ([`CageCommand`]).
 pub(crate) fn compose(bwrap: &Path, spec: &SandboxSpec) -> io::Result<CageCommand> {
+    compose_with(bwrap, spec, None)
+}
+
+/// [`compose`], with bubblewrap also asked to report on `status` (`--json-status-fd`), the write end
+/// of a pipe the caller reads once the cage has been reaped.
+///
+/// What it writes there is bubblewrap's own word on whether it set the cage up: an `exit-code` line
+/// comes only once its setup reached the `execvp` and that call succeeded, and not when the setup
+/// failed or the program could not be run (`report_child_exit_status`, which reads the byte the
+/// child writes just before its `execvp`). The sandboxed child closes the descriptor before its
+/// setup, so the cage never holds it. A duplicate travels in the command like the other
+/// descriptors, and `None` builds exactly what [`compose`] builds.
+pub(crate) fn compose_with(
+    bwrap: &Path,
+    spec: &SandboxSpec,
+    status: Option<&File>,
+) -> io::Result<CageCommand> {
     let mut argv = to_argv(spec);
     let mut filters = crate::sandbox::seccomp::memfds(&spec.seccomp)?;
     // A cage rooted in its own namespace holds one id, so a change of ownership can only fail
@@ -70,6 +87,12 @@ pub(crate) fn compose(bwrap: &Path, spec: &SandboxSpec) -> io::Result<CageComman
     // environment's descriptor joins them: the two kinds share a lifetime, not a meaning.
     let mut full = argv_prefix(&filters);
     let mut held = filters;
+    if let Some(status) = status {
+        let status = status.try_clone()?;
+        full.push(lit("--json-status-fd"));
+        full.push(OsString::from(status.as_raw_fd().to_string()));
+        held.push(status);
+    }
     if let Some(file) = env_fd(spec)? {
         let at = env_args_slot(&argv)?;
         argv[at] = OsString::from(file.as_raw_fd().to_string());
@@ -1140,6 +1163,7 @@ mod tests {
             code.contains("bwrap")
                 && (code.contains("Command::new(")
                     || crate::testutil::calls_function(&code, "argv::compose(")
+                    || crate::testutil::calls_function(&code, "argv::compose_with(")
                     || crate::testutil::calls_function(&code, "cage_command("))
         }
 
@@ -1172,6 +1196,9 @@ mod tests {
                 continue;
             }
             let calls = |needle: &str| crate::testutil::calls_function(production, needle);
+            // `compose_with` is `compose` with bubblewrap's setup report asked for, the same
+            // compile of the filters behind either name.
+            let composes = calls("argv::compose(") || calls("argv::compose_with(");
             // What each kind owes. A cage run through the shared launch command owes that call,
             // which carries the filters and the scope; a composed list owes the call that compiles
             // the filters, and the scope's own call too where the kind says so; a file that only
@@ -1180,13 +1207,13 @@ mod tests {
             let honoured = if RUNS_THE_SHARED_LAUNCH_COMMAND.contains(&relative.as_str()) {
                 calls("cage_command(")
             } else if SPAWNS_THE_COMPOSED_LIST_IN_A_SCOPE.contains(&relative.as_str()) {
-                calls("argv::compose(") && calls("cgroup::wrap(")
+                composes && calls("cgroup::wrap(")
             } else if SPAWNS_THE_COMPOSED_LIST.contains(&relative.as_str()) {
-                calls("argv::compose(")
+                composes
             } else if HANDS_THE_PATH_ON.contains(&relative.as_str()) {
                 // Nothing to check in the text: the claim is that no cage starts here, and the
                 // two calls above are what starting one looks like.
-                !calls("argv::compose(") && !calls("cage_command(")
+                !composes && !calls("cage_command(")
             } else {
                 !spawns
             };
@@ -1215,6 +1242,44 @@ mod tests {
             owes.is_empty(),
             "these start a cage without the mandatory seccomp filters, without the resource scope \
              their kind owes, or read the list and spawn from it: {owes:?}"
+        );
+    }
+
+    /// bubblewrap is asked for its setup report only when a caller hands a pipe for it, so every
+    /// other launch builds the argument list it built before. The flag names a descriptor the
+    /// command carries, and comes before the cage's own command, where bubblewrap reads its options.
+    #[test]
+    fn the_setup_report_is_asked_for_only_with_a_pipe_and_travels_with_the_command() {
+        let spec = spec(vec![], vec![], NetPolicy::Shared);
+        let plain = compose(Path::new("/bwrap"), &spec).expect("compose");
+        assert!(
+            index_of(plain.args(), "--json-status-fd").is_none(),
+            "no report unless asked"
+        );
+
+        let (_read, write) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        let write = File::from(std::os::fd::OwnedFd::from(write));
+        let asked = compose_with(Path::new("/bwrap"), &spec, Some(&write)).expect("compose");
+        let at = index_of(asked.args(), "--json-status-fd").expect("the report is asked for");
+        let named: libc::c_int = asked.args()[at + 1]
+            .to_str()
+            .and_then(|n| n.parse().ok())
+            .expect("a descriptor number");
+        assert!(
+            asked.files().iter().any(|f| f.as_raw_fd() == named),
+            "the number names a descriptor the command carries"
+        );
+        assert_ne!(
+            named,
+            write.as_raw_fd(),
+            "a duplicate travels, the caller keeps its own"
+        );
+        let command = index_of(asked.args(), "/bin/sh").expect("the cage's command");
+        assert!(at < command, "an option, ahead of the command");
+        assert_eq!(
+            asked.files().len(),
+            plain.files().len() + 1,
+            "one descriptor more, and nothing else changes"
         );
     }
 }

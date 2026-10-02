@@ -185,21 +185,163 @@ fn a_cage_that_could_not_be_spawned_is_not_a_cage_that_exited_1() {
     let limits = crate::sandbox::cgroup::Limits::default();
     let missing = crate::testutil::TmpDir::new().path().join("no-bwrap-here");
     assert_eq!(
-        try_run_status(&missing, &spec, &limits),
+        try_run_status(&missing, &spec, &limits, None),
         Err(NotStarted),
         "a program that is not there never started"
     );
     assert_eq!(
-        try_run_status(Path::new("/bin/false"), &spec, &limits),
+        try_run_status(Path::new("/bin/false"), &spec, &limits, None),
         Ok(1)
     );
     assert_eq!(
-        try_run_status(Path::new("/bin/true"), &spec, &limits),
+        try_run_status(Path::new("/bin/true"), &spec, &limits, None),
         Ok(0)
     );
     assert_eq!(
         run_status(&missing, &spec, &limits),
         1,
         "the other callers keep their 1"
+    );
+}
+
+/// bubblewrap's `--json-status-fd` output says the cage was set up only with an `exit-code` line;
+/// the `child-pid` it writes as soon as the child is cloned says nothing about the setup.
+#[test]
+fn only_an_exit_code_line_says_bubblewrap_set_the_cage_up() {
+    let started = "{ \"child-pid\": 4242, \"cgroup-namespace\": 1 }\n";
+    for (status, set_up, case) in [
+        (
+            format!("{started}{{ \"exit-code\": 0 }}\n"),
+            true,
+            "a run that ended 0",
+        ),
+        (
+            format!("{started}{{ \"exit-code\": 3 }}\n"),
+            true,
+            "a run that ended 3",
+        ),
+        (started.to_string(), false, "cloned, never set up"),
+        (String::new(), false, "nothing written at all"),
+        ("garbage\n".to_string(), false, "a line that is no report"),
+    ] {
+        assert_eq!(reports_exit_code(&status), set_up, "{case}");
+    }
+}
+
+/// The report is read off the pipe once the cage is reaped, without waiting for an end the pipe will
+/// not reach: this process holds a copy of the write end. What bubblewrap wrote is all there.
+#[test]
+fn a_setup_report_reads_what_was_written_without_waiting_for_the_end() {
+    use std::io::Write as _;
+    let set_up = SetupReport::new().expect("a pipe");
+    set_up
+        .write_end()
+        .write_all(b"{ \"child-pid\": 7 }\n{ \"exit-code\": 1 }\n")
+        .expect("write the report");
+    assert_eq!(set_up.finished_setup(), Some(true));
+
+    let refused = SetupReport::new().expect("a pipe");
+    refused
+        .write_end()
+        .write_all(b"{ \"child-pid\": 7 }\n")
+        .expect("write the report");
+    assert_eq!(
+        refused.finished_setup(),
+        Some(false),
+        "cloned, then refused"
+    );
+
+    let silent = SetupReport::new().expect("a pipe");
+    assert_eq!(
+        silent.finished_setup(),
+        Some(false),
+        "nothing written, and no wait"
+    );
+}
+
+/// bubblewrap's report, calibrated on bubblewrap itself: a cage it set up reports an `exit-code`
+/// whatever the command answered, and a setup it refused, or a program it could not run, reports
+/// none while ending 1 exactly as a failing command does. That 1 is why the runner alone cannot
+/// tell them apart. bwrap and a user namespace are enough; no userland is built.
+#[test]
+fn bubblewraps_report_tells_a_refused_setup_from_a_command_that_failed() {
+    use crate::sandbox::spec::Mount;
+    let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
+        skip_incapable!("skipping bubblewrap's setup report: need bwrap");
+        return;
+    };
+    if !matches!(crate::probe_userns(), crate::Userns::Ok) {
+        skip_incapable!("skipping bubblewrap's setup report: need a user namespace");
+        return;
+    }
+    let base = || {
+        vec![
+            Mount::RoBind {
+                src: "/usr".into(),
+                dest: "/usr".into(),
+            },
+            Mount::Symlink {
+                target: "usr/bin".into(),
+                dest: "/bin".into(),
+            },
+            Mount::Symlink {
+                target: "usr/lib".into(),
+                dest: "/lib".into(),
+            },
+            Mount::Symlink {
+                target: "usr/lib64".into(),
+                dest: "/lib64".into(),
+            },
+            Mount::RoBindTry {
+                src: "/etc/ld.so.cache".into(),
+                dest: "/etc/ld.so.cache".into(),
+            },
+        ]
+    };
+    let run = |mounts: Vec<Mount>, command: &str| {
+        let spec = SandboxSpec::new(
+            PathBuf::from("/"),
+            mounts,
+            vec![],
+            NetPolicy::Shared,
+            vec![OsString::from(command)],
+        )
+        .expect("a valid spec")
+        .with_limit_scope(crate::sandbox::cgroup::Scope::unlimited());
+        let report = SetupReport::new().expect("a pipe");
+        let code = try_run_status(
+            &bwrap,
+            &spec,
+            &crate::sandbox::cgroup::Limits::default(),
+            Some(report.write_end()),
+        );
+        (code, report.finished_setup())
+    };
+
+    assert_eq!(
+        run(base(), "/bin/true"),
+        (Ok(0), Some(true)),
+        "set up, and it ran"
+    );
+    assert_eq!(
+        run(base(), "/bin/false"),
+        (Ok(1), Some(true)),
+        "set up, and the command failed: an exit-code beside the command's own 1"
+    );
+    let missing = crate::testutil::TmpDir::new().path().join("not-there");
+    let mut refused = base();
+    refused.push(Mount::RoBind {
+        src: missing,
+        dest: "/not-there".into(),
+    });
+    assert_eq!(
+        run(refused, "/bin/true"),
+        (Ok(1), Some(false)),
+        "a bind with no source: bubblewrap refuses its setup, ends 1, and reports no exit-code"
+    );
+    assert_eq!(
+        run(base(), "/no/such/program"),
+        (Ok(1), Some(false)),
+        "a program bubblewrap cannot run: it ends 1 and reports no exit-code"
     );
 }

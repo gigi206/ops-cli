@@ -99,24 +99,97 @@ pub(super) fn run_status(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
 ) -> i32 {
-    try_run_status(bwrap, spec, limits).unwrap_or(1)
+    try_run_status(bwrap, spec, limits, None).unwrap_or(1)
 }
 
 /// A cage the launcher could not start: nothing ran in it, and the cause is already on stderr.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct NotStarted;
 
+/// What bubblewrap says, on `--json-status-fd`, about whether it set a cage up: the pipe a runner
+/// hands it ([`try_run_status`], [`supervise`]) and reads once the cage has been reaped.
+///
+/// bubblewrap writes `exit-code` only when its setup reached the `execvp` of the cage's argv and
+/// that call succeeded; a setup it refused, and a program it could not run, end in its own `die`
+/// with no such line ([`crate::sandbox::argv::compose_with`]). That is the one signal on the host
+/// side that tells a cage bubblewrap never finished from a command that ran and failed: both end in
+/// a code the command could have chosen.
+pub(super) struct SetupReport {
+    read: std::fs::File,
+    write: std::fs::File,
+}
+
+impl SetupReport {
+    /// A fresh pipe, both ends close-on-exec. The read end is non-blocking: it is read once the
+    /// cage is reaped, and never to its end, since this process keeps a copy of the write end, and
+    /// so does any process that forked while it was open.
+    pub(super) fn new() -> io::Result<SetupReport> {
+        use std::os::fd::FromRawFd;
+        let mut ends = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2` fills the two-element array it is handed.
+        if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both ends were just opened here, and each `File` takes over one of them.
+        let (read, write) = unsafe {
+            (
+                std::fs::File::from_raw_fd(ends[0]),
+                std::fs::File::from_raw_fd(ends[1]),
+            )
+        };
+        // SAFETY: `fcntl` on the read end this value owns, with integer arguments only.
+        let flags = unsafe { libc::fcntl(ends[0], libc::F_GETFL) };
+        // SAFETY: as above.
+        if flags < 0 || unsafe { libc::fcntl(ends[0], libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(SetupReport { read, write })
+    }
+
+    /// The end bubblewrap is handed.
+    pub(super) fn write_end(&self) -> &std::fs::File {
+        &self.write
+    }
+
+    /// Whether bubblewrap set the cage up, read after the cage was reaped: `Some(true)` when it
+    /// reported an `exit-code`, `Some(false)` when it reported none, `None` when the pipe could not
+    /// be read and so says nothing either way.
+    pub(super) fn finished_setup(&self) -> Option<bool> {
+        use std::io::Read as _;
+        // Far above the two short lines bubblewrap writes, and a bound on a pipe anything could fill.
+        const MAX: u64 = 64 * 1024;
+        let mut text = Vec::new();
+        match (&self.read).take(MAX).read_to_end(&mut text) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => return None,
+        }
+        Some(reports_exit_code(&String::from_utf8_lossy(&text)))
+    }
+}
+
+/// Whether bubblewrap's `--json-status-fd` output holds the `exit-code` it writes only for a cage it
+/// set up. Its other line (`child-pid`, written as soon as the child is cloned) says nothing about
+/// the setup.
+fn reports_exit_code(status: &str) -> bool {
+    status.lines().any(|line| line.contains("\"exit-code\""))
+}
+
 /// [`run_status`], telling a cage that never started from one that ran: [`NotStarted`] when the
 /// sandbox could not be prepared or spawned, the cage's own code otherwise.
 ///
 /// A learning run needs the difference, which `1` erases: only a cage that ran has anything to
 /// learn from, and one that never started must not be reported as having been refused nothing.
+///
+/// `status` asks bubblewrap to say whether it set the cage up ([`SetupReport`]).
 pub(super) fn try_run_status(
     bwrap: &Path,
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
+    status: Option<&std::fs::File>,
 ) -> Result<i32, NotStarted> {
-    let mut command = match cage_command(bwrap, spec, limits) {
+    let mut command = match cage_command_with(bwrap, spec, limits, status) {
         Ok(cage) => cage.into_command(),
         Err(e) => {
             // Not only the filter: this step also builds the descriptor carrying the cage's
@@ -296,7 +369,19 @@ pub(in crate::sandbox) fn cage_command(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
 ) -> io::Result<crate::sandbox::argv::CageCommand> {
-    let cage = crate::sandbox::argv::compose(bwrap, spec)?.wrapped(|bwrap, argv| {
+    cage_command_with(bwrap, spec, limits, None)
+}
+
+/// [`cage_command`], with bubblewrap reporting on `status` whether it set the cage up
+/// ([`crate::sandbox::argv::compose_with`]). The flag is bubblewrap's own, so it is written before
+/// either wrapper, and its descriptor crosses both like the others.
+fn cage_command_with(
+    bwrap: &Path,
+    spec: &SandboxSpec,
+    limits: &crate::sandbox::cgroup::Limits,
+    status: Option<&std::fs::File>,
+) -> io::Result<crate::sandbox::argv::CageCommand> {
+    let cage = crate::sandbox::argv::compose_with(bwrap, spec, status)?.wrapped(|bwrap, argv| {
         crate::sandbox::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref())
     });
     // The launch's own decision when it took one, so the cage carries the limits its contract
@@ -363,12 +448,13 @@ pub(super) fn supervise(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
     gui: bool,
+    status: Option<&std::fs::File>,
 ) -> Result<i32, PtyFailure> {
     // The command is built *before* the fork — nothing between fork and exec may allocate, and the
     // anonymous files behind it (the seccomp filters and the cage's environment) must be created
     // here so the child inherits their descriptors. `cage` holds them through `pump`, so bwrap can
     // still read them after the exec.
-    let cage = cage_command(bwrap, spec, limits).map_err(PtyFailure::BeforeFork)?;
+    let cage = cage_command_with(bwrap, spec, limits, status).map_err(PtyFailure::BeforeFork)?;
     // `inherit` is recorded before the fork, for the child to clear between `fork` and `execv`. The
     // parent keeps its copies close-on-exec, so nothing else this process launches inherits them —
     // see [`crate::sandbox::memfd::write`] for what that window cost.

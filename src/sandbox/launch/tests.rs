@@ -820,65 +820,39 @@ fn the_launch_gate_asks_bwrap_before_refusing_a_namespace_sbx_was_denied() {
     );
 }
 
-/// A learning run whose cage never reached its command has nothing to learn from, and only the exec
-/// record can say so: it holds the command the shim execs whenever the cage got that far.
+/// A learning run whose cage never reached its command has nothing to learn from. Two witnesses can
+/// say so: bubblewrap's report (no `exit-code`, with a code it or the netns holder ends with), and,
+/// under `--proc-learn`, an empty exec record with a failing code. Anything else stands as a run.
 #[test]
-fn only_an_empty_exec_record_and_a_failure_say_the_command_was_never_reached() {
+fn only_bubblewraps_report_or_an_empty_exec_record_say_the_command_was_never_reached() {
     use crate::sandbox::proclearn::Record;
     let ran = Record {
         targets: ["/usr/bin/agent".to_string()].into_iter().collect(),
         truncated: false,
     };
     let empty = Record::default();
-    let failed = ExitCode::FAILURE;
-    let refused_setup = ExitCode::from(1);
-    let ok = ExitCode::SUCCESS;
-    for (code, learn_exec, execs, reached, case) in [
-        (
-            &failed,
-            true,
-            Some(&empty),
-            false,
-            "an empty record and a failure",
-        ),
-        (
-            &refused_setup,
-            true,
-            None,
-            false,
-            "no record at all and a failure",
-        ),
-        (
-            &failed,
-            true,
-            Some(&ran),
-            true,
-            "a command that ran and failed",
-        ),
-        (
-            &ok,
-            true,
-            Some(&empty),
-            true,
-            "a success, whatever the record holds",
-        ),
-        (
-            &ok,
-            true,
-            Some(&ran),
-            true,
-            "a command that ran and succeeded",
-        ),
-        (
-            &failed,
-            false,
-            None,
-            true,
-            "no --proc-learn, so no record to read",
-        ),
-    ] {
+    // The code, bubblewrap's report, whether `--proc-learn` asked for the run, the exec record,
+    // the expected answer, and the case.
+    type Case<'a> = (i32, Option<bool>, bool, Option<&'a Record>, bool, &'a str);
+    #[rustfmt::skip]
+    let cases: [Case; 13] = [
+        (1, None, true, Some(&empty), false, "an empty record and a failure"),
+        (1, None, true, None, false, "no record at all and a failure"),
+        (1, None, true, Some(&ran), true, "a command that ran and failed"),
+        (0, None, true, Some(&empty), true, "a success, whatever the record holds"),
+        (0, None, true, Some(&ran), true, "a command that ran and succeeded"),
+        (1, None, false, None, true, "no --proc-learn, so no record to read"),
+        (1, Some(false), false, None, false, "bubblewrap refused its setup"),
+        (125, Some(false), false, None, false, "the netns holder never ran bubblewrap"),
+        (127, Some(false), false, None, false, "nothing could be executed"),
+        (1, Some(true), false, None, true, "bubblewrap set the cage up and the command failed"),
+        (130, Some(false), false, None, true, "a signal may have cut the report short"),
+        (0, Some(false), false, None, true, "a success stands whatever the report says"),
+        (1, Some(true), true, Some(&empty), false, "set up, but the command was never reached"),
+    ];
+    for (code, setup, learn_exec, execs, reached, case) in cases {
         assert_eq!(
-            reached_its_command(code, learn_exec, execs),
+            reached_its_command(code, setup, learn_exec, execs),
             reached,
             "{case}"
         );

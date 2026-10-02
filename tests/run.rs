@@ -4214,6 +4214,113 @@ fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under(
 }
 
 #[test]
+fn a_net_learn_run_whose_cage_bubblewrap_refused_says_it_never_reached_its_command() {
+    // A full launch under `--net-learn` alone, the case only bubblewrap's own report can tell:
+    // bubblewrap refuses the cage's setup and ends 1, as a command that ran and failed would, and
+    // with no exec record to read, the run must still not be reported as having learned nothing.
+    //
+    // sbx drops a bind whose source does not resolve before bubblewrap sees it, so nothing a
+    // config can say makes bubblewrap itself refuse. The engine override does: it names a shell
+    // stand-in that runs the real bubblewrap, and adds a bind with no source to the one call that
+    // asks for a setup report, the learning cage's. The plain launch, the probes and the proxy's own
+    // cage run the real bubblewrap untouched, and the refusal comes in bubblewrap's own words,
+    // through sbx's whole launch chain. Skips (never fails) when the host cannot sandbox or the
+    // cache is unreachable.
+    let project = TmpDir::prefixed("r", "refused-proj");
+    let data = TmpDir::prefixed("r", "refused-data");
+    let state = TmpDir::prefixed("r", "refused-state");
+    let engine = TmpDir::prefixed("r", "refused-engine");
+    let config = "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
+         [app.probe]\ncmd = [\"true\"]\n";
+    std::fs::write(project.path().join(".sbx.toml"), config).unwrap();
+
+    probe_or_skip!(
+        "refused-setup net-learn e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping refused-setup net-learn e2e: the binary cache is unreachable"
+    );
+    let Some(real) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("bwrap"))
+        .find(|candidate| candidate.is_file())
+    else {
+        skip_incapable!(
+            "skipping refused-setup net-learn e2e: no bwrap on PATH for the stand-in to run"
+        );
+        return;
+    };
+    let stand_in = engine.path().join("bwrap");
+    std::fs::write(
+        &stand_in,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --json-status-fd ]; then\n    \
+             exec '{}' --ro-bind /sbx-e2e-no-such-source /sbx-e2e-mnt \"$@\"\n  fi\ndone\n\
+             exec '{}' \"$@\"\n",
+            real.display(),
+            real.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let through_the_stand_in = |args: &[&str]| {
+        sbx_session_in(project.path(), data.path(), state.path())
+            .env("SBX_BWRAP_BIN", &stand_in)
+            .args(args)
+            .output()
+            .expect("spawn sbx")
+    };
+
+    // The plain launch asks for no report, so the stand-in is the real bubblewrap for it.
+    let plain = through_the_stand_in(&["app", "run", "probe"]);
+    assert!(
+        plain.status.success(),
+        "the plain launch runs the real bubblewrap untouched: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let learn = through_the_stand_in(&["app", "run", "probe", "--net-learn", "--local"]);
+    let learn_err = String::from_utf8_lossy(&learn.stderr);
+    let learn_out = String::from_utf8_lossy(&learn.stdout);
+    assert!(
+        learn_err.contains("bwrap: Can't find source path /sbx-e2e-no-such-source"),
+        "bubblewrap itself must refuse the learning cage's setup: {learn_err}"
+    );
+    assert_eq!(
+        learn.status.code(),
+        Some(1),
+        "the run ends with bubblewrap's own 1, not the 0 of a run that learned nothing: {learn_err}"
+    );
+    assert!(
+        learn_err.contains("never reached its command"),
+        "the learning run must say it never got there: {learn_err}"
+    );
+    assert!(
+        !learn_out.contains("no new") && !learn_out.contains("refused nothing"),
+        "a cage never set up must not be reported as having learned nothing new: {learn_out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap(),
+        config,
+        "nothing is written for a run that learned nothing"
+    );
+}
+
+#[test]
 fn a_proc_learn_run_that_never_reached_its_command_keeps_the_launchs_code() {
     // The other side of the run above: a command the `PATH` walk finds nowhere is never reached.
     // Every candidate the walk tries is absolute, so each is probed and none is recorded, and the

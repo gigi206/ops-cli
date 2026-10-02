@@ -76,7 +76,7 @@ mod roll;
 mod session;
 
 use build::{LaunchGuard, build};
-use cage::{NotStarted, exec, register, run_supervised, supervise, try_run_status};
+use cage::{NotStarted, SetupReport, exec, register, run_supervised, supervise, try_run_status};
 use detach::launch_detached;
 use session::{launch_display_name, render_gui_stop_hint};
 
@@ -770,25 +770,30 @@ fn launch_foreground_learning(
 
     // A cage that was never started answers as a plain launch would, and is not handed on to be
     // reported as a run that was refused nothing. The two runners say so where it is certain: a
-    // sandbox that could not be prepared or spawned, and a pty failure from before the fork.
-    let code = if interactive {
+    // sandbox that could not be prepared or spawned, and a pty failure from before the fork. And
+    // bubblewrap is asked to say whether it set the cage up; a pipe that could not be made leaves
+    // that unasked, and the run is read as it was before.
+    let report = SetupReport::new().ok();
+    let status = report.as_ref().map(SetupReport::write_end);
+    let code: i32 = if interactive {
         let gui = matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland);
-        match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
-            Ok(c) => ExitCode::from(c as u8),
+        match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui, status) {
+            Ok(c) => c,
             Err(e) => {
                 crate::diag::error(&format!("sbx: sandbox session failed: {e}"));
                 if !e.started() {
                     return Err(ExitCode::FAILURE);
                 }
-                ExitCode::FAILURE
+                1
             }
         }
     } else {
-        match try_run_status(&prep.bwrap, &spec, &prep.cfg.limits) {
-            Ok(c) => ExitCode::from(c as u8),
+        match try_run_status(&prep.bwrap, &spec, &prep.cfg.limits, status) {
+            Ok(c) => c,
             Err(NotStarted) => return Err(ExitCode::FAILURE),
         }
     };
+    let setup = report.as_ref().and_then(SetupReport::finished_setup);
 
     let run = LearningRun {
         events: guard
@@ -798,38 +803,44 @@ fn launch_foreground_learning(
         execs: guard.as_ref().and_then(LaunchGuard::learned_execs),
     };
     drop(guard);
-    if !reached_its_command(&code, prep.learn_exec, run.execs.as_ref()) {
+    let exit = ExitCode::from(code as u8);
+    if !reached_its_command(code, setup, prep.learn_exec, run.execs.as_ref()) {
         crate::diag::error(
             "sbx: the cage never reached its command, so this run has nothing to learn from",
         );
-        return Err(code);
+        return Err(exit);
     }
-    Ok((code, run))
+    Ok((exit, run))
 }
 
-/// Whether a learning run's cage reached its command, as far as the run can tell.
+/// Whether a learning run's cage reached its command, as far as the run can tell. Two witnesses can
+/// say no, and neither runner can, since every way a cage fails to start ends in a code the command
+/// could have chosen.
 ///
-/// Only the exec record can say no. The supervisor decides the `execve` the shim makes of the
-/// command, and records it, so a cage that got there holds at least one target. An empty record
-/// and a code that is not a success is a cage that never did: bubblewrap refusing its own setup, the
-/// pty child's `execv` failing, the shim stopping fail-closed, a command the `PATH` walk finds
-/// nowhere. Neither runner can tell those from a command that ran and failed, since all of them end
-/// in a code the command could have chosen. A relative `./x` that is not there is the exception the
-/// record cannot see: it is recorded as named, unprobed, so it reads as reached. A success is taken
-/// as a run whatever the record holds, because a target the supervisor could not resolve is left
-/// out of it.
+/// **bubblewrap's report** (`setup`, [`SetupReport`]): no `exit-code` from it, and a code in
+/// `1..=127`, is a setup it refused, a program it could not run, or the netns holder failing before
+/// it ran bubblewrap at all (125, 127). A code of 128 or more is a signal that may have cut the
+/// report short, and a report that could not be read says nothing, so both stand as a run.
 ///
-/// Without `--proc-learn` there is no record, and the answer is yes: a run that reached nothing on
-/// the network looks the same as one that never started, and the runners' own failures are the
-/// only part of that told apart.
+/// **The exec record**, under `--proc-learn`: the supervisor decides the `execve` the shim makes of
+/// the command, and records it, so a cage that got there holds at least one target. An empty record
+/// and a failing code is a cage that never did: also past bubblewrap's setup, the shim stopping
+/// fail-closed, or a command the `PATH` walk finds nowhere. A relative `./x` that is not there is
+/// the exception the record cannot see: it is recorded as named, unprobed, so it reads as reached.
+///
+/// A success is taken as a run whatever either says. What neither witness covers is a startup
+/// step bubblewrap did run that failed before the command (a tool being equipped, a bundle's
+/// install, a declared service): under `--net-learn` alone that still reads as a run.
 fn reached_its_command(
-    code: &ExitCode,
+    code: i32,
+    setup: Option<bool>,
     learn_exec: bool,
     execs: Option<&super::proclearn::Record>,
 ) -> bool {
-    !(learn_exec
-        && *code != ExitCode::SUCCESS
-        && execs.is_none_or(|record| record.targets.is_empty()))
+    let setup_never_finished = setup == Some(false) && (1..=127).contains(&code);
+    let nothing_recorded =
+        learn_exec && code != 0 && execs.is_none_or(|record| record.targets.is_empty());
+    !(setup_never_finished || nothing_recorded)
 }
 
 /// What one learning launch recorded, snapshotted from the guard before it is dropped: the egress
@@ -967,7 +978,7 @@ fn launch_pty_supervised(
     }
 
     let gui = matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland);
-    match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
+    match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui, None) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             crate::diag::error(&format!("sbx: sandbox session failed: {e}"));
