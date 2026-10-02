@@ -262,15 +262,28 @@ pub fn maybe_help(cmd: &str, rest: &[OsString]) -> Option<ExitCode> {
 /// the page for the full command path given after the verb. Each token is folded to the
 /// canonical name it stands for, against the path resolved so far; a token that names no
 /// command is kept as typed, so an unknown path is reported in the words the user used.
+///
+/// A token shaped like an option is refused, save `--help`/`-h`, which asks for what this already
+/// does. Reading stopped at the first such token, so `sbx help --foo` printed the command list at
+/// exit 0: an answer that looks right to a command line that was mistyped.
 pub fn dispatch(args: &[OsString]) -> ExitCode {
     let mut path: Vec<&str> = Vec::new();
-    for tok in args
-        .iter()
-        .map_while(|a| a.to_str())
-        .take_while(|t| !t.starts_with('-'))
-    {
-        let name = canonical(&path, tok);
-        path.push(name);
+    for arg in args {
+        let Some(tok) = arg.to_str() else {
+            crate::diag::error("sbx: help: an argument is not valid UTF-8");
+            return ExitCode::from(2);
+        };
+        match tok {
+            "--help" | "-h" => {}
+            flag if flag.starts_with('-') => {
+                crate::diag::error(&format!(
+                    "sbx: help: unknown option `{flag}`; run `sbx --help` for the list of \
+                     commands."
+                ));
+                return ExitCode::from(2);
+            }
+            _ => path.push(canonical(&path, tok)),
+        }
     }
     if path.is_empty() {
         let pal = Palette::for_stream(std::io::stdout().is_terminal());

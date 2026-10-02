@@ -215,6 +215,44 @@ fn an_option_is_never_taken_as_another_options_value() {
     }
 }
 
+/// `help` refuses an option it does not know, like every other verb. It stopped reading at the
+/// first token shaped like a flag, so `sbx help --foo` printed the command list at exit 0 and `sbx
+/// help app --foo` the `app` page, an answer that looks right to a command that was mistyped. The
+/// one flag it takes is the one that says what it already does.
+#[test]
+fn help_refuses_an_option_it_does_not_know() {
+    let home = TmpDir::new("argv");
+    for args in [
+        &["help", "--zzz-not-a-flag"][..],
+        &["help", "app", "--zzz-not-a-flag"],
+        &["--help", "--zzz-not-a-flag"],
+        &["-h", "app", "--zzz-not-a-flag"],
+    ] {
+        let (code, out) = run(args, home.path());
+        assert_eq!(
+            code,
+            2,
+            "`sbx {}` took an unknown option:\n{out}",
+            args.join(" ")
+        );
+        assert!(out.contains("--zzz-not-a-flag"), "{out}");
+    }
+    for args in [
+        &["help"][..],
+        &["--help"],
+        &["help", "app"],
+        &["help", "app", "--help"],
+    ] {
+        let (code, out) = run(args, home.path());
+        assert_eq!(
+            code,
+            0,
+            "`sbx {}` is a help request:\n{out}",
+            args.join(" ")
+        );
+    }
+}
+
 /// A verb whose page documents no option refuses one in its name slot the same way it refuses one
 /// after it — `sbx plugins install --json` and `sbx plugins install foo --json` are the same
 /// mistake, and used to exit 1 and 2 respectively.
