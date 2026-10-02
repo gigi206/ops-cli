@@ -295,8 +295,12 @@ enum ValueKind {
     Groups,
     /// A key of the runtime's own config files.
     ConfigKeys,
-    /// A parked-request id (`<session-pid>.<seq>`) of a live observe session.
-    PendingIds,
+    /// A parked `execve`'s id (`<session-pid>.<notif-id>`), from each live session's `[proc]`
+    /// control socket: what `sbx proc pending allow|deny` answers.
+    PendingExecs,
+    /// A parked network request's id (`<pid>.<seq>@<ticks>`), from each session's egress control
+    /// socket: what `sbx net pending allow|deny` answers.
+    PendingRequests,
     /// A rule already written to a config file, for the verb that takes one back out.
     Rules {
         which: RuleList,
@@ -502,7 +506,7 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
                 }
             }
         }
-        PendingIds => {
+        PendingExecs => {
             // A parked request's id is `<session-pid>.<n>`, held by each live session's
             // own control plane; ask it as `sbx proc pending` does — but on a glance
             // budget, since this runs on a keystroke and every live session is asked. A
@@ -519,6 +523,20 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
                             out.push((format!("{}.{}", s.pid, p.id), p.path));
                         }
                     }
+                }
+            }
+        }
+        PendingRequests => {
+            // The egress plane's queue, found as `sbx net pending` finds it: every control socket
+            // in the data directory, a session with no registry record included, each asked on the
+            // same glance budget as the execs above.
+            let budget = proc_control::GLANCE_TIMEOUT;
+            for s in crate::sandbox::control::list_all_within(layout.data_dir(), budget) {
+                for row in s.rows {
+                    out.push((
+                        crate::sandbox::control::format_id(s.pid, row.seq, s.incarnation),
+                        format!("{}:{}{}", row.host, row.port, row.path),
+                    ));
                 }
             }
         }
@@ -804,17 +822,22 @@ fn kind_of_metavar(name: &str, path: &[&str]) -> Option<ValueKind> {
         _ => return None,
     };
     // On the pending pages the `<id>` answers a parked request, not a session.
-    if matches!(base, ValueKind::Sessions) && is_pending_page(path) {
-        return Some(ValueKind::PendingIds);
+    if matches!(base, ValueKind::Sessions)
+        && let Some(pending) = pending_kind(path)
+    {
+        return Some(pending);
     }
     Some(base)
 }
 
-/// The request-plane pages, whose `<pid>`/`<id>` is a parked-request id.
-fn is_pending_page(path: &[&str]) -> bool {
-    path == ["proc", "pending"]
-        || path == ["net", "pending", "allow"]
-        || path == ["net", "pending", "deny"]
+/// The pages whose `<pid>`/`<id>` is a parked id rather than a session, and the queue the id is in.
+/// The two planes park apart and number apart, so an id read from one names nothing in the other.
+fn pending_kind(path: &[&str]) -> Option<ValueKind> {
+    match path {
+        ["proc", "pending"] => Some(ValueKind::PendingExecs),
+        ["net", "pending", "allow" | "deny"] => Some(ValueKind::PendingRequests),
+        _ => None,
+    }
 }
 
 // -----------------------------------------------------------------------------------
@@ -1656,7 +1679,7 @@ mod tests {
         );
         assert_eq!(
             cursor_value_kind(&["proc", "pending"], &words(&["allow"])),
-            Some(ValueKind::PendingIds)
+            Some(ValueKind::PendingExecs)
         );
     }
 
@@ -1822,6 +1845,51 @@ mod tests {
         );
         // The add verb takes a rule that is *not* there yet, so it offers none of them.
         assert!(!names_at(&["net", "allow"], "").contains(&"api.example.com".to_string()));
+    }
+
+    /// `net pending allow|deny <TAB>` offers the network requests parked for an answer, read from
+    /// each session's egress control socket as `sbx net pending` lists them, and in the id form
+    /// those verbs take back (`<pid>.<seq>@<ticks>`). The `[proc]` plane's parked execs are another
+    /// queue, answered by `sbx proc pending`, and an id of theirs names nothing here.
+    #[test]
+    fn the_net_pending_pages_offer_the_parked_network_requests() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_dir = EnvVar::set("SBX_DATA_DIR", data.path());
+        // No registry record: as for `sbx net pending`, the control socket is the whole session.
+        let pid = 424_242u32;
+        let socket = crate::sandbox::control::control_socket(data.path(), pid);
+        std::fs::create_dir_all(socket.parent().unwrap()).expect("create the control directory");
+        let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
+        let session = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.expect("accept a control connection");
+                let mut cmd = String::new();
+                BufReader::new(&stream)
+                    .read_line(&mut cmd)
+                    .expect("read the command");
+                if cmd.trim_end() != "LIST" {
+                    return;
+                }
+                let _ = (&stream).write_all(
+                    b"pending seq=3 inc=77 port=443 waiting=2 host=api.test path=/v1/x\nok\n",
+                );
+            }
+        });
+
+        let offered: Vec<_> = ["allow", "deny"]
+            .map(|verb| names_at(&["net", "pending", verb], ""))
+            .into();
+        let _ = (&UnixStream::connect(&socket).expect("poke the stand-in")).write_all(b"QUIT\n");
+        session.join().expect("the stand-in session thread");
+        for names in offered {
+            assert!(
+                names.contains(&"424242.3@77".to_string()),
+                "the parked network request is not offered: {names:?}"
+            );
+        }
     }
 
     #[test]

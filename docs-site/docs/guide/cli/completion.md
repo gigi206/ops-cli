@@ -85,7 +85,9 @@ the value. Two kinds:
 - **Read from this machine**, fresh on every request: the live sessions' ids, the configured
   stores and their catalogue plugins, the installed resolver plugins, the app profiles, the
   per-project trees, and the table names and `[task.<name>]` sections of the config files in
-  front of you.
+  front of you. A parked request's id is offered on the page that answers it, each queue on
+  its own: `sbx proc pending allow <TAB>` offers the execs parked by `[proc]`, and
+  `sbx net pending allow <TAB>` the network requests parked by the egress proxy.
 - **Spelled out by the grammar itself**: a `bash` or `zsh` for this page, an upgrade target,
   a `--net` posture, a `--gui` or `--notify` mode, a `--verdict`.
 

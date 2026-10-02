@@ -61,9 +61,16 @@ pub(crate) fn parse_id(id: &str) -> Option<(u32, u64, Option<u64>)> {
 /// file from a crashed launch) is skipped — so a dead session never blocks the listing. Sessions
 /// are returned ordered by pid for stable output.
 pub(crate) fn list_all(data_dir: &Path) -> Vec<SessionPending> {
+    list_all_within(data_dir, Duration::from_secs(10))
+}
+
+/// [`list_all`] with each session given `timeout` to answer, for a caller that must not wait on a
+/// slow one: the completion oracle, which runs on a keystroke. A session that does not answer in
+/// time is left out, as a dead one is.
+pub(crate) fn list_all_within(data_dir: &Path, timeout: Duration) -> Vec<SessionPending> {
     let mut sessions = Vec::new();
     for pid in session_pids(data_dir) {
-        if let Ok((rows, incarnation)) = query(&control_socket(data_dir, pid)) {
+        if let Ok((rows, incarnation)) = query(&control_socket(data_dir, pid), timeout) {
             sessions.push(SessionPending {
                 pid,
                 incarnation,
@@ -106,10 +113,10 @@ fn pid_from_socket(name: &str) -> Option<u32> {
 /// the field meets a key it does not know on a line it already parses key-by-key — and ignores it —
 /// instead of a terminator it no longer recognises. Every line of one answer carries the same
 /// value; the first one seen is the session's.
-fn query(socket: &Path) -> io::Result<(Vec<PendingRow>, Option<u64>)> {
+fn query(socket: &Path, timeout: Duration) -> io::Result<(Vec<PendingRow>, Option<u64>)> {
     let stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     (&stream).write_all(b"LIST\n")?;
     (&stream).flush()?;
     let mut rows = Vec::new();
