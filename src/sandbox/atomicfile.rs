@@ -10,7 +10,9 @@
 //! answers were once given eight times over, at which point they had already diverged. The callers
 //! are the cage's synthetic identity and in-cage contract ([`super::binds`]), the per-project pin
 //! locks ([`super::flake`], [`super::nixhub`], [`super::prebuilt`]), the staged audio shim
-//! ([`super::audio`]), the desktop mark ([`super::notify_sink`]), the snapshot an overwrite keeps
+//! ([`super::audio`]), the desktop mark ([`super::notify_sink`]), the mise config `sbx app prune`
+//! rewrites in a cage's home, through the descriptor of its directory
+//! ([`super::gc`](mod@super::gc)), the snapshot an overwrite keeps
 //! ([`crate::cli::keep_replaced_file`]), the profile an import writes ([`crate::cli::app`]) and the
 //! pointer to a storage volume ([`crate::storage::write_pointer`]). The last three arrived by
 //! deletion rather than by design: each had its own copy of this staging, and each named its temp

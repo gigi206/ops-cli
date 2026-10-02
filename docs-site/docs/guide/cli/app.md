@@ -417,10 +417,14 @@ Read-only: no trust gate, no launch, no network. `--json` emits the same model f
 `sbx app prune <name>` removes the `installed (undeclared)` mise tools `show` surfaces: a
 tool from a former profile, or one added by hand: from every home the app has. Each is
 deleted from the home's `mise/installs/` and dropped from that home's `mise/config.toml`
-`[tools]` so a later launch does not re-equip it. It **previews by default** (listing what
-would go, with sizes) and applies only with `-y` / `--yes`. The app's declared tools, its
-login/session state, and any `nix:`/`deb:`/`flake:` build are left untouched: to remove the
-whole home instead, use [`sbx app rm --purge`](#removing-an-app).
+`[tools]` so a later launch does not re-equip it. That file is rewritten whole or not at all,
+and never through a link: when it cannot be (a link in its place or on the way to it,
+anything there but a file of the size mise writes, a failed write), the tools are removed all
+the same and a warning names the file, since the next launch installs them again. It
+**previews by default** (listing what would go, with sizes) and applies only with `-y` /
+`--yes`. The app's declared tools, its login/session state, and any `nix:`/`deb:`/`flake:`
+build are left untouched: to remove the whole home instead, use
+[`sbx app rm --purge`](#removing-an-app).
 
 `--yes` (`-y`) is **refused while a session of that app is running**: the tools are in the home
 that session is using, so deleting them takes an interpreter or a `PATH` entry out from
