@@ -41,10 +41,11 @@ the exception the other way: they answer an unknown operation or invocation with
 every refusal of theirs gets, because 2 is a code the command they wrap can return itself.
 
 An `--app` that filters live sessions is not a name to look up. `sbx net pending`, `sbx net
-logs`, `sbx net stats`, `sbx net live`, `sbx proc rules` and `sbx net rules --source session`
-show what the sessions of that app hold, so an app with none running, whatever its name, is an
-empty answer at 0. Where `--app` reads the config instead, as `sbx net rules` and `sbx config show`
-do, it names a declared app, and one that is not declared exits 2.
+logs`, `sbx net stats`, `sbx proc rules` and `sbx net rules --source session` show what the
+sessions of that app hold, so an app with none running, whatever its name, is an empty answer at
+0, and `sbx net live --json` streams empty snapshots for it until it is stopped. Where `--app`
+reads the config instead, as `sbx net rules` and `sbx config show` do, it names a declared app,
+and one that is not declared exits 2.
 
 ## Launch verbs propagate the command's status
 
