@@ -1333,7 +1333,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("config/fspolicy.rs", "glob_walk"),
     ("config/schema.rs", "NetworkField"),
     ("config/view.rs", "NetworkView"),
-    ("main.rs", "main"),
     ("main.rs", "read_sysctl"),
     ("pathfind.rs", "is_executable"),
     ("paths.rs", "BaseView"),

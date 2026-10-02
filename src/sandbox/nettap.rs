@@ -893,9 +893,11 @@ pub(crate) fn run_tap(argv: &[OsString]) -> ! {
     if let Err(e) = crate::sandbox::seccomp::tap::confine() {
         stop(&e);
     }
-    // Every listener is bound; the holder may now install the rules that point at them.
-    outln!("{READY}");
-    if let Err(e) = io::stdout().flush() {
+    // Every listener is bound; the holder may now install the rules that point at them. A line the
+    // holder waits on rather than output for a person, so its write is checked here instead of
+    // going through `outln!`, which discards a failed one: a tap that could not announce itself
+    // stops rather than serve unannounced.
+    if let Err(e) = writeln!(io::stdout(), "{READY}").and_then(|()| io::stdout().flush()) {
         stop(&e);
     }
     let table = Arc::new(Mutex::new(FakeIps::new()));

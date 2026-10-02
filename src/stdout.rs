@@ -3,10 +3,10 @@
 //! Rust ignores `SIGPIPE`, so a `print!` or `println!` whose write fails **panics**: `sbx version`
 //! into a pipe whose reader had already gone ended in `failed printing to stdout` and exit 101, on a
 //! pipeline the shell reports as having worked. `out!` and `outln!` format the same way and
-//! write through [`crate::cli::print_document`], so every line sbx prints keeps the one rule that
-//! function states: a failed write is discarded, and whatever the command still has to say goes to
-//! stderr. The `clippy::print_stdout` gate in `main.rs` is what keeps a bare `print!` from coming
-//! back.
+//! write through [`crate::cli::print_document`], so every line sbx prints keeps the rule that
+//! function states: a reader that has gone ends the write, not the process, and any other failure
+//! is reported once and makes the exit 1. The `clippy::print_stdout` gate in `main.rs` is what
+//! keeps a bare `print!` from coming back.
 //!
 //! Under `cfg(test)` both write with `print!` instead, which the test harness captures: a unit test
 //! that calls a renderer keeps its output out of the run's own report, as it always has. What the

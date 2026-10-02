@@ -13,7 +13,7 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | a runtime failure, an operation that ran but did not succeed (e.g. `sbx config get` on an unset key, a store/network operation that failed) |
+| `1` | a runtime failure, an operation that ran but did not succeed (e.g. `sbx config get` on an unset key, a store/network operation that failed, an answer that could not be written to standard output) |
 | `2` | a **usage or fail-closed** error, a bad argument, a missing operand, a name that names nothing (an app, a plugin, a store, a bundle, an egress group, a project tree, a session, a declared operation, a task invocation), or a rejected [one-shot override](../configuration/overrides) value |
 | `125` | nothing was run, deliberately: [`sbx task run`](../cli/task#run) refused the invocation, or [`sbx session attach`](../cli/session#attach) could not re-apply the cage's confinement |
 | `126` | [`sbx session attach`](../cli/session#attach) could not join the running cage, or could not reap the shell it started |

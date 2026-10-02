@@ -6669,6 +6669,43 @@ fn a_human_answer_to_a_closed_pipe_is_not_a_panic() {
     }
 }
 
+/// A write that fails for any other reason than the reader leaving is a failure, said once. With
+/// standard output on `/dev/full`, every write is `ENOSPC`: what a `> file` on a full disk meets. A
+/// bare `println!` ended there in a panic (101), and discarding the write as a closed pipe is
+/// discarded would have left an export cut short behind exit 0.
+#[test]
+fn an_answer_that_cannot_be_written_is_a_failure() {
+    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        eprintln!("skipping: this host has no /dev/full");
+        return;
+    };
+    let p = Project::new("fullout");
+    for verb in [
+        vec!["version"],
+        vec!["config", "show"],
+        vec!["net", "groups", "--json"],
+    ] {
+        let out = p
+            .cmd(&verb)
+            .stdout(full.try_clone().expect("dup /dev/full"))
+            .output()
+            .expect("spawn sbx");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "`sbx {}` onto a full disk: {stderr}",
+            verb.join(" ")
+        );
+        assert_eq!(
+            stderr.matches("cannot write to standard output").count(),
+            1,
+            "`sbx {}` must say it once: {stderr}",
+            verb.join(" ")
+        );
+    }
+}
+
 /// An unreadable global config refuses a launch, and leaves the verbs that diagnose it working.
 ///
 /// The two halves are one decision, so they are asserted together. That layer is trusted by

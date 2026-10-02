@@ -91,7 +91,14 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// The process entry: [`run`] the command, then let what happened to its output have the last word
+/// on the exit code ([`cli::output_verdict`]).
 fn main() -> ExitCode {
+    cli::output_verdict(run())
+}
+
+/// Route argv to the command it names and return that command's exit code.
+fn run() -> ExitCode {
     restore_child_reaping();
     // `args_os`, not `args`: a command run via `sbx run` may carry non-UTF-8
     // arguments, and panicking on them would be wrong.

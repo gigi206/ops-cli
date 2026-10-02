@@ -39,15 +39,13 @@ use std::process::ExitCode;
 /// this discipline from the start and say so in [`logs`]'s own module documentation; the verbs
 /// that render one document and return had not, and `config show` is the largest thing sbx prints.
 ///
-/// A failed write is discarded here rather than acted on, which is the opposite of what a follow
-/// loop must do and right for the same reason: a document is written once, so there is nothing
-/// left to stop. Whatever the command still has to say goes to stderr, which the reader closing
-/// stdout did not ask to lose.
+/// A reader that has gone away is the end of the write rather than something to act on, which is
+/// the opposite of what a follow loop must do and right for the same reason: a document is written
+/// once, so there is nothing left to stop. Whatever the command still has to say goes to stderr,
+/// which the reader closing stdout did not ask to lose. Any other failure is not a reader leaving,
+/// and [`note_output_failure`] says what becomes of it.
 pub(crate) fn print_document(text: &str) {
-    use std::io::Write as _;
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(text.as_bytes());
-    let _ = out.flush();
+    print_bytes(text.as_bytes());
 }
 
 /// [`print_document`] for a document that is not text: the exported profile `sbx app export`
@@ -60,8 +58,41 @@ pub(crate) fn print_document(text: &str) {
 pub(crate) fn print_bytes(bytes: &[u8]) {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(bytes);
-    let _ = out.flush();
+    if let Err(e) = out.write_all(bytes).and_then(|()| out.flush()) {
+        note_output_failure(&e);
+    }
+}
+
+/// Set once a write to standard output has failed for a reason other than its reader leaving.
+static OUTPUT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Account for a write to standard output that failed.
+///
+/// A reader that has gone (`EPIPE`, the end of `… | head`) is said nowhere. Anything else, a full
+/// disk under `> file` or a descriptor that is not writable, means what reached the destination is
+/// not what the verb produced: an export cut short, a listing missing its tail. It is reported once,
+/// on stderr, and [`output_verdict`] turns the verb's success into a failure. The panic a bare
+/// `println!` raised there had at least ended the process non-zero, and a script testing the exit
+/// code must still learn that its file is incomplete.
+fn note_output_failure(e: &std::io::Error) {
+    use std::sync::atomic::Ordering;
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        return;
+    }
+    if !OUTPUT_FAILED.swap(true, Ordering::Relaxed) {
+        diag::error(&format!("sbx: cannot write to standard output: {e}"));
+    }
+}
+
+/// The exit code a verb ends with once its output has been accounted for: a success whose output
+/// could not be written exits 1 (see [`note_output_failure`]). Any other code is the verb's own
+/// answer and stands.
+pub(crate) fn output_verdict(code: ExitCode) -> ExitCode {
+    use std::sync::atomic::Ordering;
+    match code == ExitCode::SUCCESS && OUTPUT_FAILED.load(Ordering::Relaxed) {
+        true => ExitCode::FAILURE,
+        false => code,
+    }
 }
 
 /// The epoch-millisecond stamp a `--json` row carries, saturated into the width JSON numbers are
