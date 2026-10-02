@@ -418,7 +418,7 @@ fn total_size(store: &StoreAt<'_>, paths: &[String]) -> io::Result<u64> {
         args.extend(paths[i..end].iter().map(std::ffi::OsStr::new));
         let out = store.command(&args, false)?.output()?;
         let (bytes, consumed) = parse_size_batch(&String::from_utf8_lossy(&out.stdout));
-        total += bytes;
+        total = total.saturating_add(bytes);
         if out.status.success() {
             i = end;
         } else {
@@ -436,6 +436,11 @@ fn total_size(store: &StoreAt<'_>, paths: &[String]) -> io::Result<u64> {
 /// invalid path, so the line count is exactly the number of leading paths consumed — which locates
 /// the rejected path (the next one) when the batch failed. A non-integer line still counts as a
 /// consumed path but contributes no bytes, so a stray line never skews the resume offset.
+///
+/// The sum saturates, as does [`total_size`]'s. The sizes are read from the store's database, and a
+/// project's is written by its cage: a size registered as `-1` is printed as `u64::MAX`, and two of
+/// them would otherwise overflow, which `overflow-checks` turns into a panic of `sbx gc`, a dry run
+/// included.
 fn parse_size_batch(stdout: &str) -> (u64, usize) {
     let mut bytes = 0u64;
     let mut consumed = 0usize;
@@ -446,7 +451,7 @@ fn parse_size_batch(stdout: &str) -> (u64, usize) {
         }
         consumed += 1;
         if let Ok(size) = trimmed.parse::<u64>() {
-            bytes += size;
+            bytes = bytes.saturating_add(size);
         }
     }
     (bytes, consumed)
@@ -3717,6 +3722,17 @@ mod tests {
         // no bytes, keeping the skip offset aligned with nix's argv position
         assert_eq!(parse_size_batch("5\n\n7\n"), (12, 2));
         assert_eq!(parse_size_batch("5\ngarbage\n7\n"), (12, 3));
+    }
+
+    #[test]
+    fn a_size_the_database_holds_as_negative_saturates_the_sum() {
+        // `nix-store --query --size` prints a `narSize` registered as -1 as `u64::MAX`, and a
+        // project's database is the cage's to write.
+        let max = u64::MAX.to_string();
+        assert_eq!(
+            parse_size_batch(&format!("{max}\n{max}\n7\n")),
+            (u64::MAX, 3)
+        );
     }
 
     #[test]
