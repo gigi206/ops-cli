@@ -109,8 +109,17 @@ fn exec_refuses_a_private_tty_spec() {
 
 /// A launch lets the project's store lock go when it records its session, and the record is
 /// there by then: an `sbx gc` of the project that waited on the lock finds the session.
+///
+/// The gc is allowed to wait a moment, not to wait for good. A `flock` belongs to the open file,
+/// and a process that another test's thread forks in that instant holds a copy of the descriptor
+/// until its `exec` closes it, so the lock can outlive the launch's own `drop` by that window. A
+/// gc that refused to wait at all would fail whenever that window opens, which the other tests
+/// spawning processes beside this one open often. A launch that kept the lock still fails here, at
+/// the bound.
 #[test]
 fn recording_the_session_lets_the_project_store_lock_go() {
+    use std::sync::mpsc;
+    use std::time::Duration;
     let data = crate::testutil::TmpDir::new();
     let layout = crate::store::Layout::under(data.path());
     let lock = crate::sandbox::projectstore::hold_project_store(&layout, "p", &|_| {
@@ -136,10 +145,18 @@ fn recording_the_session_lets_the_project_store_lock_go() {
     );
 
     assert!(recorded.is_some(), "the session was recorded");
-    let gc = crate::sandbox::projectstore::lock_project_store(&layout, "p", &|_| {
-        panic!("gc waited: the launch still held the lock after recording its session")
-    })
-    .unwrap();
+    let (got, granted) = mpsc::channel();
+    let path = data.path().to_path_buf();
+    // Detached rather than joined: on the failure this test exists for, the thread stays blocked
+    // on the lock, and the assertion below must still be reached.
+    std::thread::spawn(move || {
+        let layout = crate::store::Layout::under(&path);
+        let gc = crate::sandbox::projectstore::lock_project_store(&layout, "p", &|_| {}).unwrap();
+        let _ = got.send(gc);
+    });
+    let gc = granted
+        .recv_timeout(Duration::from_secs(10))
+        .expect("gc never got the lock: the launch still held it after recording its session");
     let live = crate::session::Registry::at(layout.data_dir())
         .list()
         .unwrap();
