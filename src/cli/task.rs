@@ -132,7 +132,11 @@ fn planes_for(id: Option<&str>, verb: &str, side: Side) -> Result<Vec<Plane>, Ex
     }
     let layout = layout_or_fail()?;
     if let Some(id) = id {
-        return Ok(vec![one_plane(&layout, resolve_named(id, verb)?, side)]);
+        return Ok(vec![one_plane(
+            &layout,
+            resolve_named(layout.data_dir(), id, verb)?,
+            side,
+        )]);
     }
     let pids = sandbox::task_control::session_pids(layout.data_dir());
     if pids.is_empty() {
@@ -182,14 +186,35 @@ fn one_plane(layout: &store::Layout, pid: u32, side: Side) -> Plane {
     }
 }
 
-fn resolve_named(id: &str, verb: &str) -> Result<u32, ExitCode> {
-    id.parse::<u32>().map_err(|_| {
+/// The session a `--session` value names.
+///
+/// A number no live session answers to is a usage error (2), the exit every verb gives a name that
+/// names nothing: it was read as a pid and handed to the plane, whose missing socket then reported
+/// "cannot reach the task plane" at 1, the answer for a session that is there and declares no
+/// operation. That second case still goes through: the session is live, so what is missing is its
+/// plane, and [`unreachable_plane`] says so. A registry that cannot be read refuses nothing, since
+/// "no such session" is not something it has said.
+fn resolve_named(data_dir: &std::path::Path, id: &str, verb: &str) -> Result<u32, ExitCode> {
+    let pid = id.parse::<u32>().map_err(|_| {
         diag::error(&format!("sbx: task {verb}: `{id}` is not a session id"));
         diag::hint("       `sbx session ls` lists them; the id is the session's PID.");
         ExitCode::from(2)
-    })
+    })?;
+    if sandbox::task_control::session_pids(data_dir).contains(&pid) {
+        return Ok(pid);
+    }
+    let live = crate::session::Registry::at(data_dir).live();
+    if live.is_ok_and(|sessions| sessions.iter().all(|s| s.pid != pid)) {
+        diag::error(&format!("sbx: task {verb}: no live session '{id}'"));
+        diag::hint("       `sbx session ls` lists them; the id is the session's PID.");
+        return Err(ExitCode::from(2));
+    }
+    Ok(pid)
 }
 
+/// No session offers a plane at all. A failure (1) rather than a usage error: nothing the caller
+/// typed names something absent, and the same command succeeds once a session declaring
+/// `[task.<name>]` is running.
 fn no_sessions(verb: &str) -> ExitCode {
     diag::error(&format!(
         "sbx: task {verb}: no session is offering declared operations"
@@ -256,7 +281,7 @@ fn resolve_task_session(
     verb: &str,
 ) -> Result<u32, ExitCode> {
     if let Some(id) = id {
-        return resolve_named(id, verb);
+        return resolve_named(data_dir, id, verb);
     }
     let pids = sandbox::task_control::session_pids(data_dir);
     match pids.as_slice() {
@@ -1219,7 +1244,8 @@ fn task_show(args: &[OsString]) -> ExitCode {
         diag::hint(
             "       `sbx task status` lists what is running, `sbx task ls` what is declared.",
         );
-        return ExitCode::FAILURE;
+        // A name or an id that names nothing, so a usage error like every other verb's.
+        return ExitCode::from(2);
     };
     // Only an operation name reaches here with more than one answer, so the note below is about a
     // name declared in several sessions — an id that collided was refused above.
@@ -1316,7 +1342,7 @@ fn task_stop(args: &[OsString]) -> ExitCode {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let socket = plane.socket;
+    let socket = plane.socket.clone();
     let id = match target.parse::<u64>() {
         Ok(id) => id,
         Err(_) => {
@@ -1327,6 +1353,13 @@ fn task_stop(args: &[OsString]) -> ExitCode {
             let matching = filter_by_operation(&running, Some(&target));
             match matching.as_slice() {
                 [] => {
+                    // A name the session does not declare names nothing (2); one it declares that is
+                    // not running right now is a state, answered as a failure (1).
+                    if let Some(code) =
+                        refuse_undeclared(std::slice::from_ref(&plane), "stop", &target)
+                    {
+                        return code;
+                    }
                     diag::error(&format!("sbx: task stop: `{target}` is not running"));
                     diag::hint("       `sbx task status` lists what is.");
                     return ExitCode::FAILURE;
@@ -1366,6 +1399,12 @@ fn task_stop(args: &[OsString]) -> ExitCode {
         Ok(sandbox::task_control::StopReply::Finished) => {
             diag::note(&format!("invocation {id} had already finished"));
             ExitCode::SUCCESS
+        }
+        // An id that names nothing, so a usage error like every other verb's.
+        Ok(sandbox::task_control::StopReply::Unknown) => {
+            diag::error(&format!("sbx: task stop: no invocation {id} here"));
+            diag::hint("       `sbx task status` lists what is running.");
+            ExitCode::from(2)
         }
         Ok(sandbox::task_control::StopReply::Refused(reason)) => {
             diag::error(&format!("sbx: task stop: {reason}"));
@@ -1571,6 +1610,9 @@ fn listing_args(args: &[OsString], verb: &str) -> Result<Listing, ExitCode> {
 
 /// Report a filter that matched nothing, naming what *is* there — the answer to "did I misspell it
 /// or is it not running?" is the list, and a bare "no match" leaves the reader to go and ask.
+///
+/// A usage error (2), the exit every verb gives a name that names nothing: an operation no session
+/// declares is a typo or a wrong session, never a run that failed.
 fn no_match(verb: &str, operation: &str, known: &[String]) -> ExitCode {
     diag::error(&format!(
         "sbx: task {verb}: no operation `{operation}` here"
@@ -1578,7 +1620,7 @@ fn no_match(verb: &str, operation: &str, known: &[String]) -> ExitCode {
     if !known.is_empty() {
         diag::hint(&format!("       this session offers: {}", known.join(", ")));
     }
-    ExitCode::FAILURE
+    ExitCode::from(2)
 }
 
 /// Read one listing from every plane, keeping each answer beside the plane that gave it.
@@ -1660,6 +1702,17 @@ fn with_session_column(
 /// is what separates them, so it is asked for **only** on the empty path, where the answer changes
 /// what to say.
 fn empty_or_unknown(planes: &[Plane], verb: &str, operation: &str, empty: &str) -> ExitCode {
+    if let Some(code) = refuse_undeclared(planes, verb, operation) {
+        return code;
+    }
+    println!("{empty}");
+    ExitCode::SUCCESS
+}
+
+/// Refuse `operation` through [`no_match`] when the planes declare operations and none of them is
+/// it. `None` lets the caller give its own answer: the operation is declared and simply not there
+/// right now, or no plane could list what it declares, which is not a "no" either.
+fn refuse_undeclared(planes: &[Plane], verb: &str, operation: &str) -> Option<ExitCode> {
     let mut known: Vec<String> = planes
         .iter()
         .filter_map(|p| client::list(&p.inventory).ok())
@@ -1668,11 +1721,8 @@ fn empty_or_unknown(planes: &[Plane], verb: &str, operation: &str, empty: &str) 
         .collect();
     known.sort();
     known.dedup();
-    if !known.is_empty() && !known.iter().any(|n| n == operation) {
-        return no_match(verb, operation, &known);
-    }
-    println!("{empty}");
-    ExitCode::SUCCESS
+    (!known.is_empty() && !known.iter().any(|n| n == operation))
+        .then(|| no_match(verb, operation, &known))
 }
 
 /// Split a `KEY=VALUE` argument. A missing `=` is an error rather than an empty value: a parameter a
@@ -1734,6 +1784,59 @@ mod tests {
         // The crossing side is what a cage may reach, and both entry points still give it.
         assert!(plane_for(None, "run", Side::Cage).is_ok());
         assert!(planes_for(None, "ls", Side::Cage).is_ok());
+    }
+
+    /// A name the task plane does not know is a usage error (2), the exit every verb gives a name
+    /// that names nothing: an operation no session declares, on each verb that takes one, and a
+    /// `--session` no live session answers to. Each of them exited 1, the code a failed run gives.
+    /// An operation that is declared and simply not running is what is there, and stays a failure.
+    ///
+    /// Against the production plane, stood up in this process, so what is declared comes from the
+    /// plane's own inventory rather than from the test.
+    #[test]
+    fn a_name_the_task_plane_does_not_know_is_a_usage_error() {
+        use crate::sandbox::task_control::tests::{plane_and_client, probe_task};
+        use crate::testutil::{EnvVar, env_lock};
+        let Some((data, _plane, _client)) = plane_and_client(vec![probe_task()]) else {
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let _lock = env_lock();
+        let _data = EnvVar::set("SBX_DATA_DIR", data.path());
+        let _cage = EnvVar::unset(TASK_SOCKET_ENV);
+        let args = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+
+        type Verb = fn(&[OsString]) -> ExitCode;
+        let verbs: [(&str, Verb); 5] = [
+            ("ls", task_list),
+            ("status", task_status),
+            ("logs", task_logs),
+            ("show", task_show),
+            ("stop", task_stop),
+        ];
+        for (verb, run) in verbs {
+            assert_eq!(
+                run(&args(&["nope"])),
+                ExitCode::from(2),
+                "`sbx task {verb} nope` names an operation no session declares"
+            );
+        }
+        assert_eq!(
+            task_stop(&args(&["4242"])),
+            ExitCode::from(2),
+            "an invocation id the session holds no record of names nothing"
+        );
+        assert_eq!(
+            task_list(&args(&["--session", "4000000000"])),
+            ExitCode::from(2),
+            "a `--session` no live session answers to names nothing"
+        );
+        assert_eq!(
+            task_stop(&args(&["probe"])),
+            ExitCode::FAILURE,
+            "a declared operation that is not running is a state, not a typo"
+        );
+        assert_eq!(task_list(&args(&["probe"])), ExitCode::SUCCESS);
     }
 
     /// A column every row answers the same way is not information. The default case — nothing

@@ -1260,7 +1260,7 @@ fn serve_result(
                 "invocation {id} did not run detached, so its result went to the caller that waited \
                  for it"
             ),
-            None => format!("no invocation {id}"),
+            None => format!("{NO_INVOCATION} {id}"),
         }
     };
     writeln!(writer, "err {reason}")
@@ -1503,7 +1503,7 @@ fn serve_host(
             // "there is no such invocation" are different things to be told.
             super::task::StopOutcome::NotRunning if log.recorded(id) => format!("finished {id}"),
             super::task::StopOutcome::NotRunning => {
-                return writeln!(writer, "err no invocation {id}");
+                return writeln!(writer, "err {NO_INVOCATION} {id}");
             }
         };
         writeln!(writer, "{line}")?;
@@ -1629,14 +1629,26 @@ pub(crate) enum StopReply {
     Stopped,
     Stopping,
     Finished,
+    /// The session holds no invocation by that id: it never issued one, or its log has since let
+    /// it go. Kept apart from [`Refused`](Self::Refused) because the caller answers it differently,
+    /// as an id that names nothing rather than a stop that failed.
+    Unknown,
     Refused(String),
 }
+
+/// How the plane says an id names no invocation it holds, on the stop and on the result. One
+/// spelling, so the client that reads it apart from every other refusal cannot drift from the
+/// server that writes it.
+const NO_INVOCATION: &str = "no invocation";
 
 /// Stop one invocation by id, host-side.
 pub(crate) fn stop_invocation(socket: &Path, id: u64) -> io::Result<StopReply> {
     let lines = ask_host(socket, &format!("STOP {id}"))?;
     for line in &lines {
         if let Some(reason) = line.strip_prefix("err ") {
+            if reason.starts_with(NO_INVOCATION) {
+                return Ok(StopReply::Unknown);
+            }
             return Ok(StopReply::Refused(reason.to_string()));
         }
         if line.starts_with("stopped ") {
@@ -1936,5 +1948,6 @@ pub(crate) mod client {
     }
 }
 
+// Reached from the CLI's tests, which drive `sbx task` against a plane this module stands up.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

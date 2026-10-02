@@ -22,9 +22,10 @@ an ephemeral sibling cage, with a credential the caller never holds. Declared as
 `list`, `secrets` and `run` work **both inside the cage** (where the agent uses them, through the
 socket sbx binds there) **and on the host**, so an operation is testable exactly as the agent sees
 it, down to the `<operation>` filter: `sbx task list build` narrows the listing on either side, and
-a name nothing declares is refused on either side with the names that are declared. `--session` is
-host-only, since a cage reaches exactly one plane, its own (the plane address travels as
-`SBX_TASK_SOCKET`, which is also how `--session` is refused inside a cage rather than
+a name nothing declares is refused on either side with the names that are declared, at exit 2 like
+any [name that names nothing](../reference/exit-codes#a-name-that-names-nothing-exits-2), and so is
+a `--session` no live session answers to. `--session` is host-only, since a cage reaches exactly
+one plane, its own (the plane address travels as `SBX_TASK_SOCKET`, which is also how `--session` is refused inside a cage rather than
 silently dropped). `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
 rather than by check: they live on a second socket that is never bound into a cage. The record is not
 for the recorded party to read, and an invocation id is per session: a cage able to stop one could
@@ -482,7 +483,10 @@ returns:
 | `stopped invocation <id>` | it ended | 0 |
 | `<id> was asked to stop and is still finishing` | accepted, not yet done | 1 |
 | `invocation <id> had already finished` | too late, and nothing to do | 0 |
-| `no invocation <id>` | this session never issued that id | 1 |
+| `no invocation <id> here` | this session holds no record of that id | 2 |
+
+A name is held to the same rule: one the session does not declare exits 2, and one it declares that
+is not running exits 1.
 
 An artifact in an [`output = true`](../tasks/output#producing-a-file-output) directory stays
 as the stopped command left it: partial, and only the next invocation clears it.

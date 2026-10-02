@@ -500,7 +500,7 @@ fn a_silent_caller_on_the_host_socket_is_given_up_on_rather_than_holding_its_slo
 /// (which a client counting characters instead of bytes would under-announce).
 const AWKWARD: &str = "SELECT 1\nFROM caf\u{e9}";
 
-fn probe_task() -> TaskSpec {
+pub(crate) fn probe_task() -> TaskSpec {
     TaskSpec {
         unmask: Vec::new(),
         name: "probe".into(),
@@ -540,7 +540,7 @@ fn probe_task() -> TaskSpec {
 /// client is written by the production generator. Only the programs differ: the shipped client
 /// names the cage's shell and `socat`, and here it names the host's, because that is what a test
 /// process can execute. That the launcher passes the cage's own is a separate, static fact.
-fn plane_and_client(tasks: Vec<TaskSpec>) -> Option<(TmpDir, TaskPlane, PathBuf)> {
+pub(crate) fn plane_and_client(tasks: Vec<TaskSpec>) -> Option<(TmpDir, TaskPlane, PathBuf)> {
     plane_and_client_inner(tasks, None)
 }
 
@@ -1336,7 +1336,7 @@ fn a_stop_tells_a_finished_invocation_from_an_unknown_one() {
     assert!(
         matches!(
             stop_invocation(&host, 4242).expect("stop"),
-            StopReply::Refused(_)
+            StopReply::Unknown
         ),
         "an id this session never issued is not something to report as stopped"
     );
