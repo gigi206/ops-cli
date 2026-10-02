@@ -261,6 +261,15 @@ pub(crate) fn lock_exclusive(layout: &Layout) -> io::Result<SharedGcLock> {
 /// another sbx run's on the store: nix names its temporary-roots file after its pid, which is the
 /// same in every such cage ([`HeldStore`]).
 ///
+/// What neither the lock nor that refusal sees is a cage that outlives the process its session
+/// record names. A record lives as long as that process does ([`crate::session::Registry::list`]),
+/// and a launch lets the lock go once its record is written (the launch path's `register`). A
+/// supervisor can die and leave its cage running: [`crate::session::Session::stop`] calls the
+/// parent-death cascade racy inside a systemd scope, and
+/// [`crate::sandbox::cgroup::sweep_stale_scopes`] keeps a scope whose launcher is gone for as long
+/// as its cgroup lists a process. `sbx gc` then reads the session as over and collects a store
+/// that cage still uses.
+///
 /// The file is beside the store in the project's runtime tree, where the project's marker is. No
 /// cage writes there, but one whose project holds sbx's data directory sees it read-only (the
 /// control-plane pins), and `flock` asks no write access: such a cage can hold the lock and keep

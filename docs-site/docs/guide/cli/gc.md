@@ -61,6 +61,13 @@ do not wait for each other. The side that waits names the lock file,
 `<data>/projects/<id>/store.lock`: a cage whose project holds sbx's data directory sees it
 read-only, which is enough to hold it, and would keep both sides waiting while it runs.
 
+A session counts as live for as long as the process its record names runs: the sbx that
+supervises the cage, or bubblewrap itself when sbx handed the launch over to it. A cage that
+outlives that process, its launcher killed while the cage runs on, holds no session and no
+lock, so `sbx gc` collects its project's store as if nothing ran there. Where sbx runs its
+cages in systemd scopes, `systemctl --user list-units 'sbx-*.scope'` lists the ones still
+there.
+
 ## When the store holds an entry nix did not make
 
 A project's store is writable from inside its cage, and `nix-store` runs on it at each
