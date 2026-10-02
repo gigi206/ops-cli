@@ -880,13 +880,21 @@ fn dropped_path(notice: &str) -> &str {
 /// checked through the resolver's own function, whose warning already names the entry and the
 /// reason, so no copy of those rules lives here either.
 ///
+/// The values the resolver reads out of a fixed set are the sixth ([`admit_known_values`]): a
+/// `network`, `proc`, `gui` or `notify` posture and an app's `home_scope`. `sbx config set
+/// network.mode bogus` answered `set`, and the next launch refused to start over it.
+///
 /// What the list does not yet reach, so that the next field added is added knowingly rather than
 /// assumed covered: a `binds` entry is checked below for the command line's `:ro`/`:rw` spelling
 /// and not for the absoluteness [`super::apply_binds`] requires, so `sbx config add binds
 /// relative/dir` still commits and is still dropped at the next load; an `[open]` key is not held
 /// to the URI scheme [`super::validate::validate_open`] reads it as; and a `[packages]` name is
-/// not held to the charset [`super::tools::apply_packages`] admits. Each of those writes reports
-/// success and changes nothing, which is what a check here would end.
+/// not held to the charset [`super::tools::apply_packages`] admits; and a global app profile's
+/// `home_scope` is not held to the set [`admit_known_values`] holds a project's `[app.<name>]` one
+/// to, because `apps/<name>.toml` carries it at its top level and the layer is read here as a
+/// config layer, where that key names nothing, so `sbx config set home_scope projet --app <name>
+/// -g` still commits. Each of those writes reports success and changes nothing, which is what a
+/// check here would end.
 fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
     // The drops the layer already had are not this edit's doing. A `before` that does not parse at
     // all leaves the list empty, so an edit over an unrecoverable layer is judged on its result
@@ -947,6 +955,7 @@ fn admit_entries(raw: &super::schema::RawConfig) -> Result<(), String> {
         super::parse_shared_credential(&mut dropped, "", t.shared_credential.clone());
         refuse_dropped_entry(dropped)?;
     }
+    admit_known_values(raw)?;
     let app_procs = raw.app.values().filter_map(|a| a.proc.as_ref());
     for field in raw.proc.iter().chain(app_procs) {
         let super::schema::ProcField::Table(t) = field else {
@@ -1073,6 +1082,62 @@ fn admit_entries(raw: &super::schema::RawConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The values the resolver reads out of a fixed set, each held to the resolver's own reading of it,
+/// baseline and per app: the half of [`admit_entries`] for scalars.
+///
+/// A `network`, `proc` or `gui` posture the resolver does not know stops a launch, and a `notify`
+/// mode, event or period it cannot read, or an app's `home_scope`, is dropped for the layer below.
+/// Either way the write reported a value that never applied. Each is read against a default layer
+/// below, which none of these refusals depends on, and only what the resolver refuses or drops
+/// counts: its notes on a value it does apply are not this check's business.
+fn admit_known_values(raw: &super::schema::RawConfig) -> Result<(), String> {
+    let mut refused = Vec::new();
+    let mut dropped = Vec::new();
+    let baseline = (&raw.network, &raw.proc, &raw.gui, &raw.notify);
+    let apps = raw
+        .app
+        .values()
+        .map(|a| (&a.network, &a.proc, &a.gui, &a.notify));
+    for (network, proc, gui, notify) in std::iter::once(baseline).chain(apps) {
+        if let Some(field) = network {
+            let _ = super::validate::validate_network(
+                &mut Vec::new(),
+                &mut refused,
+                "",
+                field.clone(),
+                &super::NetGroups::default(),
+                &super::NetworkPolicy::default(),
+            );
+        }
+        if let Some(field) = proc {
+            let _ = super::validate::validate_proc(
+                &mut Vec::new(),
+                &mut refused,
+                "",
+                field.clone(),
+                &crate::proc_policy::ProcPolicy::default(),
+            );
+        }
+        if let Some(value) = gui {
+            let _ = super::validate::validate_gui(&mut Vec::new(), &mut refused, "", value);
+        }
+        if let Some(field) = notify {
+            let _ = super::validate::validate_notify(
+                &mut dropped,
+                "",
+                field.clone(),
+                &crate::notify::NotifyPolicy::default(),
+            );
+        }
+    }
+    for scope in raw.app.values().filter_map(|a| a.home_scope.as_deref()) {
+        let _ = super::validate::validate_home_scope(&mut dropped, "", scope);
+    }
+    dropped.retain(|note| note.trim_start_matches(':').trim().starts_with("ignoring "));
+    refuse_dropped_entry(refused)?;
+    refuse_dropped_entry(dropped)
 }
 
 /// Remove a dotted key. Returns whether it existed, with the document text a caller re-trusts
@@ -2675,6 +2740,59 @@ mod tests {
             ("seccomp.allow", r#"["unshare,clone3"]"#),
         ] {
             let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+            set(&p, key, value).unwrap_or_else(|e| panic!("`{key} = {value}` is valid: {e}"));
+        }
+    }
+
+    /// A value the resolver reads out of a fixed set was written whatever it was. `sbx config set
+    /// network.mode bogus` answered `set`, and the next launch refused to start over it; a
+    /// misspelled `notify` mode or `home_scope` was dropped with a warning and the layer below
+    /// applied, so `home_scope = "projet"` left the app's home shared between projects. Each is
+    /// held at the write to the resolver's own reading of it, as the lists above are.
+    #[test]
+    fn a_value_outside_the_set_the_resolver_reads_is_refused_at_the_write() {
+        let tmp = crate::testutil::TmpDir::new();
+        for (key, value) in [
+            ("network", "bogus"),
+            ("network.mode", "bogus"),
+            ("gui", "wayand"),
+            ("proc", "enforec"),
+            ("proc.mode", "enforec"),
+            ("notify", "loud"),
+            ("notify.mode", "loud"),
+            ("app.demo.network.mode", "bogus"),
+            ("app.demo.gui", "wayand"),
+            ("app.demo.proc", "enforec"),
+            ("app.demo.notify", "loud"),
+            ("app.demo.home_scope", "projet"),
+        ] {
+            let p = doc_at(tmp.path(), "");
+            let before = std::fs::read_to_string(&p).unwrap();
+            let err = set(&p, key, value)
+                .err()
+                .unwrap_or_else(|| panic!("`{key} = {value}` must be refused"));
+            assert!(
+                matches!(err, ManageError::InvalidValue(_, _)),
+                "`{key}`: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&p).unwrap(),
+                before,
+                "`{key}`: a refused set leaves the file byte-for-byte unchanged"
+            );
+        }
+        // The witness: each field still takes the values the resolver reads.
+        for (key, value) in [
+            ("network", "none"),
+            ("network.mode", "ask"),
+            ("gui", "wayland"),
+            ("proc", "enforce"),
+            ("proc.mode", "observe"),
+            ("notify", "once"),
+            ("app.demo.notify", "always"),
+            ("app.demo.home_scope", "project"),
+        ] {
+            let p = doc_at(tmp.path(), "");
             set(&p, key, value).unwrap_or_else(|e| panic!("`{key} = {value}` is valid: {e}"));
         }
     }
