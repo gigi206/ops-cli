@@ -100,9 +100,13 @@ a program it could not run, says it never reached its command and exits with the
 code (1). Under `--proc-learn` the exec record tells the rest: a run that recorded no program
 and ended in a failure never reached its command either (the command is nowhere on the cage's
 `PATH`, the exec supervisor stopped it), says so, and exits with that code. What neither
-witness sees is a startup step inside the cage, a tool being equipped, a bundle's install or
-a declared service, failing before the app: under `--net-learn` alone that still reads as a
-run that learned nothing, and exits 0, with the step's own message above it on standard error.
+witness sees is a startup step inside the cage failing before the app, a tool being equipped
+or a bundle's install: under `--net-learn` alone either still reads as a run that learned
+nothing, and exits 0, with the step's own message above it on standard error. Under
+`--proc-learn` a tool being equipped is seen, since it runs ahead of the exec supervisor and
+records nothing, but a bundle's install runs under it: its programs are recorded, and the run
+reads as one that ran. A declared service never stops the app, since it starts in the
+background.
 
 ## Fail-closed overrides exit 2
 
