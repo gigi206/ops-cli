@@ -1108,8 +1108,18 @@ mod tests {
         );
 
         drop(held);
+        // Free once no process another test's thread forked in this instant still holds a copy of
+        // the lock's descriptor, which its `exec` closes: the fold is asked again until then.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let folded = loop {
+            let folded = compact(egress, true);
+            if !folded.is_empty() || Instant::now() > deadline {
+                break folded;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(
-            compact(egress, true).len(),
+            folded.len(),
             1,
             "once the lock is free the fold proceeds as always"
         );
