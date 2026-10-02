@@ -463,16 +463,16 @@ pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<Written<SetOutcom
     // right and behaves wrong.
     if let Some(array) = parsed_array(val) {
         let created = put_value(&mut doc, key, array)?;
-        return match validate_layer(&before, &doc) {
+        return match validate_layer(&before, &doc, is_profile(path)) {
             Ok(()) => commit(path, &doc, &before, created),
             Err(detail) => Err(ManageError::InvalidValue(key.to_string(), detail)),
         };
     }
     let created = put_value(&mut doc, key, scalar_value(val))?;
-    if validate_layer(&before, &doc).is_err() {
+    if validate_layer(&before, &doc, is_profile(path)).is_err() {
         // The natural type broke the layer — write the value as a string instead.
         put_value(&mut doc, key, Value::from(val))?;
-        if let Err(detail) = validate_layer(&before, &doc) {
+        if let Err(detail) = validate_layer(&before, &doc, is_profile(path)) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
@@ -537,14 +537,14 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, 
     // way in at all. The guess is validated below and retried as a string, so an over-eager one
     // (a host that looks like a number) is never committed.
     append_entry(list, scalar_value(entry));
-    if validate_layer(&before, &doc).is_err() {
+    if validate_layer(&before, &doc, is_profile(path)).is_err() {
         // Replace the slot rather than take it out and append again: it already carries the decor
         // [`append_entry`] gave it, and a second append would move the trailing comment a second
         // time. `Array::replace` keeps the existing element's decor, which is exactly that slot's.
         let list = list_at(&mut doc, key)?;
         let last = list.len() - 1;
         list.replace(last, entry);
-        if let Err(detail) = validate_layer(&before, &doc) {
+        if let Err(detail) = validate_layer(&before, &doc, is_profile(path)) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
@@ -575,7 +575,7 @@ pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool
         });
     };
     remove_entry(list, idx);
-    match validate_layer(&before, &doc) {
+    match validate_layer(&before, &doc, is_profile(path)) {
         Ok(()) => {
             let text = write_doc(path, &doc)?;
             Ok(Written {
@@ -884,18 +884,18 @@ fn dropped_path(notice: &str) -> &str {
 /// `network`, `proc`, `gui` or `notify` posture and an app's `home_scope`. `sbx config set
 /// network.mode bogus` answered `set`, and the next launch refused to start over it.
 ///
+/// A global app's profile is the seventh ([`admit_profile`]): the loader reads it as one app,
+/// whole or not at all, so it is also read that way here. `sbx config set contract bogus --app
+/// <name> -g` answered `set`, and the loader then dropped the profile and the app with it.
+///
 /// What the list does not yet reach, so that the next field added is added knowingly rather than
 /// assumed covered: a `binds` entry is checked below for the command line's `:ro`/`:rw` spelling
 /// and not for the absoluteness [`super::apply_binds`] requires, so `sbx config add binds
 /// relative/dir` still commits and is still dropped at the next load; an `[open]` key is not held
 /// to the URI scheme [`super::validate::validate_open`] reads it as; and a `[packages]` name is
-/// not held to the charset [`super::tools::apply_packages`] admits; and a global app profile's
-/// `home_scope` is not held to the set [`admit_known_values`] holds a project's `[app.<name>]` one
-/// to, because `apps/<name>.toml` carries it at its top level and the layer is read here as a
-/// config layer, where that key names nothing, so `sbx config set home_scope projet --app <name>
-/// -g` still commits. Each of those writes reports success and changes nothing, which is what a
-/// check here would end.
-fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
+/// not held to the charset [`super::tools::apply_packages`] admits. Each of those writes reports
+/// success and changes nothing, which is what a check here would end.
+fn validate_layer(before: &str, doc: &DocumentMut, profile: bool) -> Result<(), String> {
     // The drops the layer already had are not this edit's doing. A `before` that does not parse at
     // all leaves the list empty, so an edit over an unrecoverable layer is judged on its result
     // alone — repairing such a file stays possible, and leaving it broken stays refused.
@@ -918,7 +918,33 @@ fn validate_layer(before: &str, doc: &DocumentMut) -> Result<(), String> {
     }) {
         return refuse_dropped_entry(vec![notice.clone()]).map_err(|e| crate::diag::visible(&e));
     }
-    admit_entries(&raw).map_err(|e| crate::diag::visible(&e))
+    admit_entries(&raw).map_err(|e| crate::diag::visible(&e))?;
+    if profile {
+        admit_profile(doc).map_err(|e| crate::diag::visible_lines(&e))?;
+    }
+    Ok(())
+}
+
+/// Whether `path` is an app profile: a file of the profiles directory, the one place the loader
+/// reads profiles from ([`super::load::profiles_dir`]).
+fn is_profile(path: &Path) -> bool {
+    super::load::profiles_dir().is_some_and(|dir| path.parent() == Some(dir.as_path()))
+}
+
+/// The half of [`validate_layer`] for a profile, which the loader reads as one app, whole or not at
+/// all ([`super::schema::parse_app`]), where the rest of this check reads a config layer. A field
+/// only an app has (`cmd`, `contract`, `use`) means nothing to that reading, so a value of the
+/// wrong shape in one was written and the loader then dropped the whole profile, the app with it;
+/// and `home_scope`, the one such field read out of a fixed set, is held to it here.
+fn admit_profile(doc: &DocumentMut) -> Result<(), String> {
+    let app = super::schema::parse_app(doc.to_string().as_bytes()).map_err(|e| {
+        format!("the profile would no longer read as an app, and the loader would drop it: {e}")
+    })?;
+    let mut dropped = Vec::new();
+    if let Some(scope) = app.home_scope.as_deref() {
+        let _ = super::validate::validate_home_scope(&mut dropped, "", scope);
+    }
+    refuse_dropped_entry(dropped)
 }
 
 /// Each entry of a parsed layer held to the rule the resolver reads it by, the half of
@@ -1175,7 +1201,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError
             text: doc.to_string(),
         });
     }
-    if let Err(detail) = validate_layer(&before, &doc) {
+    if let Err(detail) = validate_layer(&before, &doc, is_profile(path)) {
         return Err(ManageError::InvalidValue(key.to_string(), detail));
     }
     let text = write_doc(path, &doc)?;
@@ -1678,7 +1704,7 @@ pub(crate) fn add_fs_mask(
         Some(_) => return Err(ManageError::MalformedFs("not a table".into())),
     };
 
-    if let Err(detail) = validate_layer(&before, &doc) {
+    if let Err(detail) = validate_layer(&before, &doc, is_profile(path)) {
         return Err(ManageError::InvalidValue(
             format!("[fs] {}", list.key()),
             detail,

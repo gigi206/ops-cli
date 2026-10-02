@@ -5263,6 +5263,38 @@ fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
     );
 }
 
+/// A global app's profile is read by the loader as one app, whole or not at all, and a write to it
+/// is held to that reading. It was held to a config layer's instead, where the fields only an app
+/// has mean nothing: `config set contract bogus --app demo -g` answered `set` and the loader then
+/// dropped the profile, the app with it, and a misspelled `home_scope` was written for the next
+/// launch to ignore.
+#[test]
+fn a_write_to_a_profile_is_held_to_how_the_loader_reads_one() {
+    let fx = Project::new("cfg");
+    let set = |args: &[&str]| {
+        let mut all = vec!["config", "set"];
+        all.extend_from_slice(args);
+        all.extend_from_slice(&["--app", "demo", "-g"]);
+        fx.run(&all)
+    };
+    assert!(set(&["cmd", "agent"]).status.success());
+    for (key, value) in [("contract", "bogus"), ("home_scope", "projet")] {
+        let out = set(&[key, value]);
+        assert!(
+            !out.status.success(),
+            "`{key} = {value}` must be refused:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let shown = fx.run(&["config", "show", "--app", "demo"]);
+    assert!(
+        shown.status.success(),
+        "the app is still there:\n{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(set(&["home_scope", "project"]).status.success());
+}
+
 /// A parent that ignores `SIGCHLD` hands that disposition down through `execve`, and under it the
 /// kernel reaps each child the moment it exits: a wait for it then answers `ECHILD`, so sbx would
 /// lose how every process it starts ended. The editor is that child here, the one a verb runs

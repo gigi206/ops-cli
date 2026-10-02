@@ -195,10 +195,11 @@ success is one the next launch honours. That covers the egress and `proc` rule l
 not in sbx's denylist is refused at the write rather than committed and dropped, since a
 config claiming a syscall is reopened and a kernel that still denies it is the worst of
 the two outcomes. It also covers the values read out of a fixed set: a `network`, `proc`,
-`gui` or `notify` posture, and the `home_scope` of an app declared in a project, so `set
-network.mode bogus` is refused rather than written for the next launch to stop on. A global
-app profile's own `home_scope` is not checked yet: a misspelled one is written, then
-dropped with a warning at the next launch, which keeps the shared home.
+`gui` or `notify` posture and an app's `home_scope`, so `set network.mode bogus` is
+refused rather than written for the next launch to stop on. A write to a global app's
+profile (`--app <name> -g`) is also held to how the loader reads a profile, one app whole or
+not at all, so a value that would make it drop the profile, such as a malformed
+`contract`, is refused instead of costing you the app.
 
 `add` and `rm` are the safe half: they never restate a list, so nothing is lost by
 omission. Adding an entry already present, or removing one that is not there, changes
