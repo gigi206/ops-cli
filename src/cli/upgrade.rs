@@ -108,8 +108,14 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
             // an app name is validated against a narrow character set before it can ever name a
             // profile, so a non-UTF-8 word here cannot be one.
             Some("--app" | "-a") => {
-                let Some(val) = args.get(i + 1).and_then(|a| a.to_str()) else {
-                    return ParsedArgs::Error("sbx: upgrade: --app needs an app name.".into());
+                let val = match crate::cli::option_value(
+                    args.get(i + 1),
+                    "upgrade",
+                    "--app",
+                    "an app name",
+                ) {
+                    Ok(val) => val,
+                    Err(why) => return ParsedArgs::Error(why),
                 };
                 if app.is_some() {
                     return ParsedArgs::Error("sbx: upgrade: --app given more than once.".into());

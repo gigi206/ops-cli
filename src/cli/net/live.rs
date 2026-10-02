@@ -35,8 +35,7 @@ fn parse_live_args(args: &[OsString]) -> Result<LiveArgs, String> {
         match a.to_str() {
             Some("-i") | Some("--interval") => interval_secs = interval_seconds(it.next())?,
             Some("-a") | Some("--app") => {
-                let name = it.next().ok_or("`--app` needs an app name")?;
-                app = Some(name.to_string_lossy().into_owned());
+                app = Some(crate::cli::option_text(it.next(), "--app", "an app name")?.to_string());
             }
             Some("--json") => json = true,
             _ => return Err(format!("usage: {}", help::synopsis_of(&["net", "live"]))),

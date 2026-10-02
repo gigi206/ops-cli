@@ -141,9 +141,8 @@ fn parse_net_test_args(args: &[OsString]) -> Result<NetTestArgs<'_>, Vec<String>
     while let Some(a) = it.next() {
         match a.to_str() {
             Some("--app") | Some("-a") => {
-                let Some(name) = it.next().and_then(|n| n.to_str()) else {
-                    return Err(vec!["sbx: test net: `--app` needs an app name".to_string()]);
-                };
+                let name = crate::cli::option_value(it.next(), "test net", "--app", "an app name")
+                    .map_err(|why| vec![why])?;
                 app = Some(name.to_string());
             }
             Some("--method") | Some("-X") => {
@@ -755,18 +754,23 @@ fn parse_proc_test_args(args: &[OsString]) -> Result<ProcTestArgs<'_>, Vec<Strin
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str() {
-            Some("-a") | Some("--app") => match args.get(i + 1).and_then(|a| a.to_str()) {
-                Some(name) if !name.is_empty() => {
-                    app = Some(name.to_string());
-                    i += 2;
+            Some("-a") | Some("--app") => {
+                match crate::cli::option_value(args.get(i + 1), "test proc", "--app", "an app name")
+                {
+                    Ok(name) if !name.is_empty() => {
+                        app = Some(name.to_string());
+                        i += 2;
+                    }
+                    refused => {
+                        return Err(vec![
+                            refused.err().unwrap_or_else(|| {
+                                "sbx: test proc: `--app` needs an app name".to_string()
+                            }),
+                            format!("sbx: usage: {}", help::synopsis_of(&["test", "proc"])),
+                        ]);
+                    }
                 }
-                _ => {
-                    return Err(vec![
-                        "sbx: test proc: --app needs an app name".to_string(),
-                        format!("sbx: usage: {}", help::synopsis_of(&["test", "proc"])),
-                    ]);
-                }
-            },
+            }
             Some("--caller") => match args.get(i + 1).and_then(|a| a.to_str()) {
                 Some(path) if !path.is_empty() => {
                     caller.push(path.to_string());
@@ -921,18 +925,22 @@ fn parse_fs_test_args(args: &[OsString]) -> Result<FsTestArgs<'_>, Vec<String>> 
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str() {
-            Some("-a") | Some("--app") => match args.get(i + 1).and_then(|a| a.to_str()) {
-                Some(name) if !name.is_empty() => {
-                    app = Some(name.to_string());
-                    i += 2;
+            Some("-a") | Some("--app") => {
+                match crate::cli::option_value(args.get(i + 1), "test fs", "--app", "an app name") {
+                    Ok(name) if !name.is_empty() => {
+                        app = Some(name.to_string());
+                        i += 2;
+                    }
+                    refused => {
+                        return Err(vec![
+                            refused.err().unwrap_or_else(|| {
+                                "sbx: test fs: `--app` needs an app name".to_string()
+                            }),
+                            usage(),
+                        ]);
+                    }
                 }
-                _ => {
-                    return Err(vec![
-                        "sbx: test fs: --app needs an app name".to_string(),
-                        usage(),
-                    ]);
-                }
-            },
+            }
             // Refused rather than taken for the path, like its siblings: a mistyped flag must not
             // silently become the thing under test.
             Some(flag) if flag.starts_with('-') => {

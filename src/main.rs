@@ -331,20 +331,12 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
                 scope_explicit = true;
             }
             "-c" | "--config" => {
-                let file = it
-                    .next()
-                    .ok_or_else(|| "`-c` needs a file path".to_string())?;
+                let file = cli::option_os(it.next(), text, "a file path")?;
                 scope = Scope::File(PathBuf::from(file));
                 scope_explicit = true;
             }
             "--app" | "-a" => {
-                let name = it
-                    .next()
-                    .ok_or_else(|| "`--app` needs an app name".to_string())?;
-                let Some(name) = name.to_str() else {
-                    return Err(not_utf8("the app name", name));
-                };
-                app = Some(name.to_string());
+                app = Some(cli::option_text(it.next(), text, "an app name")?.to_string());
             }
             "--trust" => trust = true,
             flag if flag.starts_with('-') && flag != "-" => {

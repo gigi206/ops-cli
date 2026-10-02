@@ -148,18 +148,38 @@ pub(crate) fn option_value<'a>(
     flag: &str,
     what: &str,
 ) -> Result<&'a str, String> {
-    let Some(tok) = next else {
-        return Err(format!("sbx: {verb}: `{flag}` needs {what}"));
+    option_text(next, flag, what).map_err(|why| format!("sbx: {verb}: {why}"))
+}
+
+/// [`option_value`]'s rule, its refusal without the `sbx: <verb>:` head, for a parser that reports
+/// under a head of its own or serves several verbs.
+pub(crate) fn option_text<'a>(
+    next: Option<&'a OsString>,
+    flag: &str,
+    what: &str,
+) -> Result<&'a str, String> {
+    option_os(next, flag, what)?
+        .to_str()
+        .ok_or_else(|| format!("`{flag}` needs {what}, and its value is not valid UTF-8"))
+}
+
+/// [`option_text`] for a value that names a file: held to the same rule about what follows the
+/// flag, and handed back as it was typed, since a filename on Linux need not be UTF-8.
+pub(crate) fn option_os<'a>(
+    next: Option<&'a OsString>,
+    flag: &str,
+    what: &str,
+) -> Result<&'a OsStr, String> {
+    let Some(value) = next else {
+        return Err(format!("`{flag}` needs {what}"));
     };
-    let Some(text) = tok.to_str() else {
-        return Err(format!("sbx: {verb}: `{flag}`'s value is not valid UTF-8"));
-    };
-    if text.starts_with('-') {
+    if value.as_encoded_bytes().starts_with(b"-") {
         return Err(format!(
-            "sbx: {verb}: `{flag}` needs {what}, and `{text}` is an option"
+            "`{flag}` needs {what}, and `{}` is an option",
+            value.to_string_lossy()
         ));
     }
-    Ok(text)
+    Ok(value)
 }
 
 /// What parsing a `<verb> <name> [switch]` command line yielded: show the verb's page, run with the
@@ -289,10 +309,10 @@ pub(crate) fn import_args(args: &[OsString], path: &[&str]) -> Result<ImportArgs
     while let Some(arg) = it.next() {
         match arg.to_str() {
             Some("-f") | Some("--force") => force = true,
-            Some("--as") => match it.next().and_then(|v| v.to_str()) {
-                Some(n) => as_name = Some(n.to_string()),
-                None => {
-                    diag::error(&format!("sbx: {}: `--as` needs a name", path.join(" ")));
+            Some("--as") => match option_value(it.next(), &path.join(" "), "--as", "a name") {
+                Ok(n) => as_name = Some(n.to_string()),
+                Err(why) => {
+                    diag::error(&why);
                     return Err(ExitCode::from(2));
                 }
             },

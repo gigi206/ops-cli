@@ -227,6 +227,9 @@ run_task() {{
             --session)
                 # One plane is reachable from here, so the id is accepted and ignored.
                 [ $# -ge 2 ] || die 'task run: `--session` needs a session id' 2
+                case $2 in
+                    -*) die "task run: \`--session\` needs a session id, and \`$2\` is an option" 2 ;;
+                esac
                 shift 2
                 ;;
             -*) die "task run: unexpected argument \"$1\"" 2 ;;
@@ -571,6 +574,17 @@ mod tests {
                 && err.contains("deploy"),
             "the refusal must name what is declared here: {err}"
         );
+    }
+
+    /// `--session` takes a value the cage ignores, and a flag standing in that slot went with it:
+    /// `task run build --session --json` answered in text with its `--json` gone. Refused, as the
+    /// host refuses the same line.
+    #[test]
+    fn the_client_refuses_an_option_as_the_sessions_value() {
+        let (_dir, client) = client_answering("ok\n");
+        let (code, _, err) = run_client(&client, &["task", "run", "build", "--session", "--json"]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("is an option"), "{err}");
     }
 
     /// The other listing verb names its operation in a field rather than in the first column, which

@@ -180,6 +180,24 @@ fn an_option_is_never_taken_as_another_options_value() {
         &["net", "pending", "--app", "--json"],
         &["net", "pending", "watch", "--app", "--json"],
         &["task", "list", "--session", "--json"],
+        // The scope parser behind the writing verbs, where a swallowed flag was the costliest:
+        // `net allow --app --global` wrote the rule under an app named `--global` in the project's
+        // file, re-trusted it and exited 0, and `-c --global` wrote a file named `--global`.
+        &["config", "set", "--app", "--global", "env.X", "1"],
+        &["config", "set", "-c", "--global", "env.X", "1"],
+        &["net", "allow", "--app", "--global", "api.example.com"],
+        &["net", "stats", "--app", "--reset"],
+        &["net", "live", "--app", "--json"],
+        &["net", "logs", "--app", "--json"],
+        &["test", "net", "--app", "--json", "example.com"],
+        &["test", "proc", "--app", "--json", "/bin/true"],
+        &["test", "fs", "--app", "--json", "src"],
+        &["upgrade", "--app", "--json"],
+        &["task", "run", "build", "--session", "--json"],
+        &["task", "result", "x", "--session", "--json"],
+        &["app", "import", "p.toml", "--as", "--force"],
+        &["bundle", "import", "p.toml", "--as", "--force"],
+        &["net", "groups", "import", "p.toml", "--as", "--force"],
     ];
     for args in cases {
         let (code, out) = run(args, home.path());

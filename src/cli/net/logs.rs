@@ -92,8 +92,8 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
             Some("--follow") | Some("-f") => v.follow = true,
             Some("-i") | Some("--interval") => v.interval_secs = interval_seconds(it.next())?,
             Some("-a") | Some("--app") => {
-                let name = it.next().ok_or("`--app` needs an app name")?;
-                v.app = Some(name.to_string_lossy().into_owned());
+                v.app =
+                    Some(crate::cli::option_text(it.next(), "--app", "an app name")?.to_string());
             }
             Some("--host") => {
                 let h = it.next().ok_or("`--host` needs a hostname")?;

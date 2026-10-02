@@ -26,11 +26,13 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
             Some("--json") => json = true,
             Some("--reset") => reset = true,
             Some("--app") | Some("-a") => {
-                let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    diag::error("sbx: net stats: `--app` needs an app name");
-                    return ExitCode::from(2);
-                };
-                app = Some(v.to_string());
+                match crate::cli::option_value(it.next(), "net stats", "--app", "an app name") {
+                    Ok(v) => app = Some(v.to_string()),
+                    Err(why) => {
+                        diag::error(&why);
+                        return ExitCode::from(2);
+                    }
+                }
             }
             _ => {
                 diag::error(&format!(

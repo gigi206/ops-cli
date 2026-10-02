@@ -513,13 +513,15 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
-            Some("--as") => match it.next().and_then(|a| a.to_str()) {
-                Some(n) => as_name = Some(n.to_string()),
-                None => {
-                    diag::error("sbx: --as needs a name");
-                    return ExitCode::from(2);
+            Some("--as") => {
+                match crate::cli::option_value(it.next(), "app import", "--as", "a name") {
+                    Ok(n) => as_name = Some(n.to_string()),
+                    Err(why) => {
+                        diag::error(&why);
+                        return ExitCode::from(2);
+                    }
                 }
-            },
+            }
             Some("--force") => force = true,
             Some("--with-deps") => with_deps = true,
             Some(flag) if flag.starts_with("--") => {

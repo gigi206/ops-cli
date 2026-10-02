@@ -645,16 +645,23 @@ fn task_run(args: &[OsString]) -> ExitCode {
                 detach = true;
                 i += 1;
             }
-            Some("--session") => match args.get(i + 1).and_then(|a| a.to_str()) {
-                Some(v) => {
-                    id = Some(v.to_string());
-                    i += 2;
+            Some("--session") => {
+                match crate::cli::option_value(
+                    args.get(i + 1),
+                    "task run",
+                    "--session",
+                    "a session id",
+                ) {
+                    Ok(v) => {
+                        id = Some(v.to_string());
+                        i += 2;
+                    }
+                    Err(why) => {
+                        diag::error(&why);
+                        return ExitCode::from(2);
+                    }
                 }
-                None => {
-                    diag::error("sbx: task run: `--session` needs a session id");
-                    return ExitCode::from(2);
-                }
-            },
+            }
             Some(s) if !s.starts_with('-') && name.is_none() => {
                 name = Some(s.to_string());
                 i += 1;
@@ -763,16 +770,23 @@ fn task_result(args: &[OsString]) -> ExitCode {
                 json = true;
                 i += 1;
             }
-            Some("--session") => match args.get(i + 1).and_then(|a| a.to_str()) {
-                Some(v) => {
-                    session = Some(v.to_string());
-                    i += 2;
+            Some("--session") => {
+                match crate::cli::option_value(
+                    args.get(i + 1),
+                    "task result",
+                    "--session",
+                    "a session id",
+                ) {
+                    Ok(v) => {
+                        session = Some(v.to_string());
+                        i += 2;
+                    }
+                    Err(why) => {
+                        diag::error(&why);
+                        return ExitCode::from(2);
+                    }
                 }
-                None => {
-                    diag::error("sbx: task result: `--session` needs a session id");
-                    return ExitCode::from(2);
-                }
-            },
+            }
             Some(s) if !s.starts_with('-') && target.is_none() => {
                 target = Some(s.to_string());
                 i += 1;
