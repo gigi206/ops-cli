@@ -96,22 +96,19 @@ pub(crate) fn embedded_proc_shim() -> &'static [u8] {
     proc_shim_blob::PROC_SHIM_BIN
 }
 
-/// Place `bytes` at `target` as an executable file, atomically: `tmp` (a per-pid sibling of the
-/// target) is written, made executable, then renamed over the target.
+/// Place `bytes` at `target` as an executable file, atomically and durably, through
+/// [`write_atomic_mode`](crate::sandbox::atomicfile::write_atomic_mode) at `0755`: a unique temp
+/// sibling written, flushed to the device, made executable and renamed over the target, then the
+/// directory flushed.
 ///
-/// The temp is removed whenever any of the three steps fails, so a run that dies partway — a full
-/// disk during the write is the usual way — leaves nothing behind. Each attempt carries a fresh pid
-/// in its name and these payloads are tens of megabytes, so a temp left in place would never be
-/// reused, only added to.
-fn place_executable(tmp: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let placed = std::fs::write(tmp, bytes)
-        .and_then(|()| std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o755)))
-        .and_then(|()| std::fs::rename(tmp, target));
-    if placed.is_err() {
-        let _ = std::fs::remove_file(tmp);
-    }
-    placed
+/// Durably because each caller stamps a marker after it, and the marker is what the next launch
+/// trusts in place of the bytes. A rename that reached the device before the binary's blocks did
+/// would leave, after a power loss, a file of the right name and size holding zeros, under a marker
+/// that calls it current until the next sbx. The temp is removed whenever a step fails, so a run
+/// that dies partway (a full disk during the write is the usual way) leaves nothing behind, which
+/// matters for payloads of tens of megabytes that a later attempt would never reuse.
+fn place_executable(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::sandbox::atomicfile::write_atomic_mode(target, bytes, Some(0o755))
 }
 
 /// Materialize the embedded exec shim into the owned engine directory and return its path.
@@ -138,9 +135,9 @@ pub(crate) fn ensure_proc_shim(layout: &Layout) -> io::Result<PathBuf> {
         .recursive(true)
         .mode(0o700)
         .create(&dir)?;
-    let tmp = dir.join(format!(".{PROC_SHIM_NAME}.tmp.{}", std::process::id()));
-    place_executable(&tmp, &shim, proc_shim_blob::PROC_SHIM_BIN)?;
-    std::fs::write(&marker, sha)?;
+    place_executable(&shim, proc_shim_blob::PROC_SHIM_BIN)?;
+    // Whole and durable like the binary it vouches for, and after it.
+    crate::sandbox::atomicfile::write_atomic(&marker, sha.as_bytes())?;
     Ok(shim)
 }
 
@@ -218,8 +215,7 @@ fn ensure_owned_engine(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()>
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let tmp = dir.join(format!(".nix.tmp.{}", std::process::id()));
-    place_executable(&tmp, &nix, bytes)?;
+    place_executable(&nix, bytes)?;
     // Place the sibling atomically too: a unique temp link renamed over `nix-store` leaves
     // no window where it is absent (a concurrent first launch would otherwise see a removed
     // link); a lost race simply discards an identical link.
@@ -229,7 +225,7 @@ fn ensure_owned_engine(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()>
     std::fs::rename(&tmp_link, &store_link)?;
     // Stamp the version last: an interrupted run leaves a stale/absent marker and
     // re-materializes next time rather than trusting a half-written engine.
-    std::fs::write(&marker, sha256)?;
+    crate::sandbox::atomicfile::write_atomic(&marker, sha256.as_bytes())?;
     Ok(())
 }
 
@@ -634,11 +630,10 @@ fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> 
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let tmp = dir.join(format!(".bwrap.tmp.{}", std::process::id()));
-    place_executable(&tmp, &bwrap, bytes)?;
+    place_executable(&bwrap, bytes)?;
     // Stamp the version last: an interrupted run leaves a stale/absent marker and
     // re-materializes next time rather than trusting a half-written engine.
-    std::fs::write(&marker, sha256)?;
+    crate::sandbox::atomicfile::write_atomic(&marker, sha256.as_bytes())?;
     Ok(())
 }
 
@@ -708,6 +703,15 @@ pub(crate) fn resolve_git() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// Whether `dir` holds no entry named like a temp of the placement (`prefix` and anything after
+    /// it): the temp's name carries a sequence number now, so the old exact name proves nothing.
+    fn no_temp_left(dir: &Path, prefix: &str) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().starts_with(prefix))
+    }
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1063,8 +1067,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join(".sha256")).unwrap(), sha);
         // no temp artifact is left behind
         assert!(
-            !dir.join(format!(".nix.tmp.{}", std::process::id()))
-                .exists()
+            no_temp_left(&dir, ".nix.tmp."),
+            "a temp of the engine was left"
         );
     }
 
@@ -1272,8 +1276,8 @@ mod tests {
             "bwrap must not write nix's marker"
         );
         assert!(
-            !dir.join(format!(".bwrap.tmp.{}", std::process::id()))
-                .exists()
+            no_temp_left(&dir, ".bwrap.tmp."),
+            "a temp of bwrap was left"
         );
 
         // Idempotent at the same hash: a sentinel overwrite survives a re-call.
