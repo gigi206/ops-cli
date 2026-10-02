@@ -221,7 +221,12 @@ pub(in crate::sandbox) fn shared_store_gc(
         prune,
     );
 
-    let report = match crate::sandbox::gc::collect(&nix_store, &layout.store_dir(), prune) {
+    let shared_dir = layout.store_dir();
+    let shared = crate::sandbox::gc::StoreAt::Host {
+        nix_store: &nix_store,
+        store_dir: &shared_dir,
+    };
+    let report = match crate::sandbox::gc::collect(&shared, prune) {
         Ok(r) => r,
         Err(e) => {
             crate::diag::error(&format!("sbx gc: shared-store gc failed: {e}"));
@@ -259,20 +264,19 @@ pub(in crate::sandbox) fn shared_store_gc(
     // After the collection, so nothing about to be deleted is deduplicated first. Still under the
     // exclusive lock, which is what keeps a concurrent seed from reading a file mid-relink.
     if optimise {
-        report_optimise(&nix_store, &layout.store_dir(), "shared store", pal);
+        report_optimise(&shared, "shared store", pal);
     }
 }
 
 /// Deduplicate one store and report the gain, naming which store it was. Best-effort: a failure is
 /// reported and does not fail the surrounding collection, since nothing was reclaimed either way.
 fn report_optimise(
-    nix_store: &std::path::Path,
-    store_dir: &std::path::Path,
+    store: &crate::sandbox::gc::StoreAt<'_>,
     label: &str,
     pal: &crate::style::Palette,
 ) {
     let (h, r, ok) = (pal.head, pal.reset, pal.ok);
-    match crate::sandbox::gc::optimise(nix_store, store_dir) {
+    match crate::sandbox::gc::optimise(store) {
         Ok(report) if report.inodes_freed == 0 && report.bytes_freed == 0 => {
             println!("{h}sbx gc:{r} {label} — already deduplicated, nothing to reclaim.");
         }
@@ -338,15 +342,16 @@ fn gc_live_session_refusal(
 /// The agent self-equips into a per-project store — `flake:` builds, in-cage installs — and over
 /// time a flake revision rolled forward by `sbx upgrade` (or a package removed outright)
 /// leaves the previous build behind. This reclaims it. Everything the project still needs is
-/// gc-rooted by a **host-resolvable** root (one whose target is a `/nix/store/<hash>` path, which
-/// the relocated store reads both in-cage and host-side): the seeded base and `nix:` tools are
+/// gc-rooted by a root whose target is a `/nix/store/<hash>` path, which the relocated store reads
+/// as one of its own wherever nix runs on it: the seeded base and `nix:` tools are
 /// rooted at seed time, mise installs root themselves the same way, and each `flake:` build
 /// registers a root keyed by package name that a roll re-points — so the current build survives and
 /// the rolled-away one, now unrooted, is collected. A removed package's lingering root (which a
 /// roll's overwrite cannot reach) is dropped first, by name, against the set the current config
-/// still declares across every runtime. A plain host-side `nix-store --gc` then does the rest with
-/// no per-home enumeration: the rooting lives in the store, keyed by build, not in any home — which
-/// is why a `flake:` package in an app's own `$HOME` needs no special handling.
+/// still declares across every runtime. A plain `nix-store --gc`, in a cage of its own
+/// ([`crate::sandbox::projectstore::HeldStore`]), then does the rest with no per-home enumeration:
+/// the rooting lives in the store, keyed by build, not in any home — which is why a `flake:` package
+/// in an app's own `$HOME` needs no special handling.
 ///
 /// A dry run by default — it reports what would be freed and changes nothing; `--prune` sweeps the
 /// dead paths. It refuses while a live sandbox holds the project (its store is in use). Like a
@@ -355,10 +360,12 @@ fn gc_live_session_refusal(
 /// Returns `Err(code)` when it cannot run (not a project, no sandbox capability, a nix failure),
 /// which the caller treats as fatal — except under `--all`, where the reap has already run.
 ///
-/// Limitation (a follow-up): a build the agent roots only by an in-cage path — a raw `nix build
-/// --out-link <non-store-path>` it runs itself, outside the supported self-equip paths (`sbx mise`,
-/// `nix profile`, declared `flake:` packages) — is not seen host-side and would be collected. The
-/// supported self-equip paths all root by store path, so they survive.
+/// Limitation (a follow-up): a build the agent roots only by an out-link at a path that exists in
+/// its cage alone — a raw `nix build --out-link` into its home or its `/tmp`, outside the supported
+/// self-equip paths (`sbx mise`, `nix profile`, declared `flake:` packages) — is not seen: the
+/// collection answers for an out-link from the host ([`crate::sandbox::projectstore::HeldStore`]),
+/// where that path is not the cage's, and the build would be collected. The supported self-equip
+/// paths all root by store path, so they survive.
 fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Result<(), ExitCode> {
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
 
@@ -499,7 +506,24 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     };
 
     println!("{h}sbx gc{r} — {n}{}{r}", project.display());
-    let report = match crate::sandbox::gc::collect(&prep.nix_store, &store_dir, prune) {
+    // In a cage of its own, like the registration the seed above ran: the store is the project's
+    // cage's to write, and nix and SQLite read here what it wrote.
+    let slug = crate::sandbox::naming::cage_slug(None, &prep.cwd);
+    let engine = crate::sandbox::projectstore::Engine {
+        nix_store: &prep.nix_store,
+        bwrap: &prep.bwrap,
+        limits: &prep.cfg.limits,
+        slug: &slug,
+    };
+    let held = match crate::sandbox::projectstore::HeldStore::hold(&engine, &store_dir) {
+        Ok(held) => held,
+        Err(e) => {
+            crate::diag::error(&format!("sbx gc: {e}"));
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let caged = crate::sandbox::gc::StoreAt::Project(&held);
+    let report = match crate::sandbox::gc::collect(&caged, prune) {
         Ok(r) => r,
         Err(e) => {
             crate::diag::error(&format!("sbx gc: {e}"));
@@ -548,7 +572,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // a running cage holds, and this rides that same check, with the same window between it and the
     // work that `--prune` already has here.
     if optimise {
-        report_optimise(&prep.nix_store, &store_dir, "this project's store", pal);
+        report_optimise(&caged, "this project's store", pal);
     }
     Ok(())
 }

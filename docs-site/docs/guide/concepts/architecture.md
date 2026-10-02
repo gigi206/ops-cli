@@ -519,7 +519,7 @@ A cage writes the project, its store, its home and its pools, and a later comman
 | `src/sandbox/mise.rs` | what mise answers for the project's environment, from a cage of its own, over the approved bytes | a launch of a trusted project that has a mise file |
 | `src/sandbox/fsmask.rs` | the git configuration of the project and of its submodules, through the host's `git`, their git indexes, and the `.git` files that point at their repositories, at launch and again when a session that protects `.git` ends | a launch in a git repository, or with `[fs]` entries |
 | `src/sandbox/contract.rs` | the names of project files a mask matched, written into the in-cage contract | a launch with masks |
-| `src/sandbox/projectstore.rs` | the state of the project's store, checked before the host's `nix-store` loads it | every launch, and `sbx gc` |
+| `src/sandbox/projectstore.rs` | the state of the project's store, checked before `nix-store` opens it in a cage of its own, and where its gc roots lead, answered from the host for the collection's cage | every launch, and `sbx gc` |
 | `src/sandbox/gc.rs`, `src/sandbox/launch/reclaim.rs` | the project's store, the app homes and pools, a task's output | `sbx gc`, `sbx app prune`, `sbx app rm --purge` |
 | `src/sandbox/taskpool.rs` | the pool the tasks' tools are installed into | a launch that declares tasks, and each invocation |
 | `src/sandbox/miseplugin.rs`, `src/sandbox/cagedir.rs`, `src/sandbox/binds.rs` | the directories of a home, a pool or a declared userland that a launch places a mount in | every launch |

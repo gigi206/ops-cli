@@ -33,16 +33,15 @@
 //! through a descriptor for the directory the walk checked, never through a path
 //! re-resolved at the write, and every entry is created exclusively, so a link the
 //! cage planted fails the seed instead of being written through (see
-//! [`hold_dir_chain`]). `nix-store` opens the same tree by name, so the registration
-//! every seed runs on it does so in a cage of its own ([`load_cage`]), where a link in
-//! the tree reaches nothing of the host's. `sbx gc` still runs its collection and
-//! deduplication there on the host, behind its refusal of a store a live cage holds
-//! ([`ensure_nix_state`]). That refusal and the check keep a link from being followed;
-//! they leave nix and SQLite reading, on the host, a database the project's cage wrote.
-//! The collection stays out of a cage because it must see the project's indirect roots
-//! (`gcroots/auto`, the `result` links a build in the cage leaves in the project): a
-//! cage that does not mount the project at its own path finds them stale, unlinks them
-//! and collects their builds, even on a dry run.
+//! [`hold_dir_chain`]). `nix-store` opens the same tree by name, so every run of it on
+//! the tree is in a cage of its own, where a link in the tree reaches nothing of the
+//! host's and nix and SQLite read the database the project's cage wrote with nothing
+//! else of the host's in reach: the registration every seed runs ([`load_cage`]), and
+//! `sbx gc`'s collection and deduplication ([`HeldStore`]). The collection searches the
+//! store's roots, and some lead out of it (`gcroots/auto`, the `result` links a build in
+//! the cage leaves in the project): what nix asks of the host about those is answered on
+//! the host and staged in its cage ([`collection_standins`]). The project itself is not
+//! mounted there, since its cage sees it through masks this one would not apply.
 //!
 //! The cage's nix reads and writes only this self-contained store; sbx's own seed
 //! is the only reader of the shared store, and only ever reads its content paths
@@ -826,7 +825,17 @@ fn load_command(engine: &Engine<'_>, nix_dir: &OwnedFd) -> io::Result<std::proce
     use std::os::fd::AsRawFd;
     let held = fs::File::from(nix_dir.try_clone()?);
     let spec = load_cage(engine.nix_store, held.as_raw_fd())?;
-    let mut cage = super::argv::compose(engine.bwrap, &spec)?.wrapped(|bwrap, argv| {
+    caged_command(engine, held, &spec)
+}
+
+/// `spec` ready to start: composed with the mandatory syscall filters, in the launch's resource
+/// scope, and holding `held`, the project's `nix/` the spec binds, until bwrap has it.
+fn caged_command(
+    engine: &Engine<'_>,
+    held: fs::File,
+    spec: &super::spec::SandboxSpec,
+) -> io::Result<std::process::Command> {
+    let mut cage = super::argv::compose(engine.bwrap, spec)?.wrapped(|bwrap, argv| {
         super::cgroup::wrap(
             bwrap,
             argv,
@@ -838,20 +847,40 @@ fn load_command(engine: &Engine<'_>, nix_dir: &OwnedFd) -> io::Result<std::proce
     Ok(cage.into_command())
 }
 
-/// The cage the registration into a project's store runs in: no network, the host's userland and
-/// `/nix/store` read-only for an engine that loads its libraries from either, `nix_store` at
-/// [`LOAD_ENGINE`], and the project's `nix/`, open as `nix_dir`, the one writable thing of the
-/// host's, at [`LOAD_ROOT`].
+/// The cage the registration into a project's store runs in ([`store_cage`]), with the store at
+/// [`LOAD_ROOT`].
 ///
 /// What a link the project's cage planted in that tree can reach is decided by this mount
 /// namespace: an absolute target, or a relative one that climbs out of the tree, resolves in here,
 /// where nothing else of the host's is writable. The descriptor fixes `nix/` itself, which the
-/// project's cage cannot replace, being where its own `/nix` is mounted. nix needs a home of its
-/// own; a private tmpfs is enough.
+/// project's cage cannot replace, being where its own `/nix` is mounted.
 fn load_cage(
     nix_store: &Path,
     nix_dir: std::os::fd::RawFd,
 ) -> io::Result<super::spec::SandboxSpec> {
+    store_cage(
+        nix_store,
+        nix_dir,
+        Path::new(LOAD_ROOT),
+        Vec::new(),
+        &[OsStr::new("--load-db")],
+    )
+    .map_err(|e| io::Error::other(format!("cannot build the store registration's cage: {e}")))
+}
+
+/// A cage `nix_store` runs in against a project's store, given `args` after `--store`: no network,
+/// the host's userland and `/nix/store` read-only for an engine that loads its libraries from
+/// either, `nix_store` at [`LOAD_ENGINE`], and the project's `nix/`, open as `nix_dir`, the one
+/// writable thing of the host's, at `root`'s `nix`. That bind comes after the private `/tmp`, so a
+/// store under `/tmp` is not hidden by it, and `standins` come last ([`collection_standins`]). nix
+/// needs a home of its own; the private tmpfs is enough.
+fn store_cage(
+    nix_store: &Path,
+    nix_dir: std::os::fd::RawFd,
+    root: &Path,
+    standins: Vec<super::spec::Mount>,
+    args: &[&OsStr],
+) -> Result<super::spec::SandboxSpec, String> {
     use super::spec::{Mount, NetPolicy, SandboxSpec};
     let mut mounts = super::selfcage::userland();
     mounts.extend([
@@ -863,11 +892,6 @@ fn load_cage(
             src: nix_store.into(),
             dest: LOAD_ENGINE.into(),
         },
-        // Through the descriptor's own link, which names the directory it was opened on.
-        Mount::Bind {
-            src: format!("/proc/self/fd/{nix_dir}").into(),
-            dest: format!("{LOAD_ROOT}/nix").into(),
-        },
         Mount::Proc {
             dest: "/proc".into(),
         },
@@ -877,16 +901,328 @@ fn load_cage(
         Mount::Tmpfs {
             dest: "/tmp".into(),
         },
+        // Through the descriptor's own link, which names the directory it was opened on.
+        Mount::Bind {
+            src: format!("/proc/self/fd/{nix_dir}").into(),
+            dest: root.join("nix"),
+        },
     ]);
+    mounts.extend(standins);
     let env = vec![
         ("HOME".to_string(), "/tmp".to_string()),
         ("NIX_REMOTE".to_string(), String::new()),
     ];
-    let cmd = [LOAD_ENGINE, "--store", LOAD_ROOT, "--load-db"]
-        .map(std::ffi::OsString::from)
-        .to_vec();
+    let mut cmd = vec![
+        std::ffi::OsString::from(LOAD_ENGINE),
+        std::ffi::OsString::from("--store"),
+        root.as_os_str().to_os_string(),
+    ];
+    cmd.extend(args.iter().map(|arg| arg.to_os_string()));
     SandboxSpec::new("/".into(), mounts, env, NetPolicy::Isolated, cmd)
-        .map_err(|e| io::Error::other(format!("cannot build the store registration's cage: {e:?}")))
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// A project's store held for `sbx gc`'s `nix-store` runs, each in a cage of its own
+/// ([`HeldStore::command`]): its `nix/` is open here, so every run binds the directory that was
+/// checked rather than whatever the name holds by then.
+///
+/// The cage is the registration's, with the store at its own path rather than at [`LOAD_ROOT`]: a
+/// root whose target is relative is resolved by nix against the root's own directory, and the
+/// answer must be the one the host would give. What the search for roots asks of the host outside
+/// the store is staged in the cage ([`collection_standins`]).
+///
+/// Two answers differ from a run on the host. The runtime roots nix finds in `/proc` are the
+/// cage's own processes rather than the host's, which counted only while a session of the project
+/// ran, and `sbx gc` refuses that. And nix names its temporary-roots file after its pid, which is
+/// the same in every such cage, so creating one unlinks another of that name as stale.
+pub(crate) struct HeldStore<'a> {
+    engine: &'a Engine<'a>,
+    store_dir: &'a Path,
+    nix_dir: OwnedFd,
+}
+
+impl<'a> HeldStore<'a> {
+    /// Hold `store_dir`'s `nix/`, refusing a link on the way to it.
+    pub(crate) fn hold(engine: &'a Engine<'a>, store_dir: &'a Path) -> io::Result<Self> {
+        let nix_dir = super::cagedir::open_beneath(store_dir, Path::new("nix"))?;
+        Ok(Self {
+            engine,
+            store_dir,
+            nix_dir,
+        })
+    }
+
+    /// The store's directory, the `--store` every run names.
+    pub(crate) fn store_dir(&self) -> &Path {
+        self.store_dir
+    }
+
+    /// `nix-store --store <store> <args>` ready to start in the collection's cage, with the
+    /// stand-ins for what the search for roots asks of the host when `roots`
+    /// ([`collection_standins`]): a run that searches them and does not have them finds the
+    /// indirect roots stale, unlinks them, and collects their builds, a dry run included.
+    pub(crate) fn command(
+        &self,
+        args: &[&OsStr],
+        roots: bool,
+    ) -> io::Result<std::process::Command> {
+        use std::os::fd::AsRawFd;
+        let standins = if roots {
+            collection_standins(self.store_dir)?
+        } else {
+            Vec::new()
+        };
+        let held = fs::File::from(self.nix_dir.try_clone()?);
+        let spec = store_cage(
+            self.engine.nix_store,
+            held.as_raw_fd(),
+            self.store_dir,
+            standins,
+            args,
+        )
+        .map_err(|e| io::Error::other(format!("cannot build the store collection's cage: {e}")))?;
+        caged_command(self.engine, held, &spec)
+    }
+}
+
+/// How many entries [`collection_standins`] reads under a project's `gcroots/` and `profiles/`, and
+/// how deep it goes. nix lays them out a few levels deep (`gcroots/auto/<name>`,
+/// `profiles/per-user/<user>/<profile>`) and a seed adds one root per path it roots.
+const ROOTS_READ_MAX: usize = 65_536;
+const ROOTS_DEPTH_MAX: usize = 16;
+
+/// How many stand-ins the collection's cage takes: each is a few arguments to bwrap, and one that
+/// stands for something other than a link is a mount.
+const STANDINS_MAX: usize = 1024;
+
+/// What a stand-in for a link the host holds points at when the host's own does not name a store
+/// path: any name that is none gives nix the answer the host's gave.
+const NOT_A_STORE_PATH: &str = "/.sbx-not-a-store-path";
+
+/// Where the collection's cage keeps something of its own, and so cannot stand in for the host:
+/// a root whose target falls there refuses the collection.
+const CAGE_OWN: &[&str] = &[
+    "/proc",
+    "/dev",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/etc/ld.so.cache",
+];
+
+/// What the collection's cage holds from the host unchanged: a target there gets the host's answer
+/// without a stand-in.
+const CAGE_FROM_HOST: &[&str] = &["/usr", "/nix/store"];
+
+/// Where [`store_cage`] mounts something, the store's own `nix/` aside: a target on the way to one
+/// of them is a directory in the cage, made by bwrap.
+const CAGE_MOUNTS: &[&str] = &[
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/etc/ld.so.cache",
+    "/nix/store",
+    LOAD_ENGINE,
+    "/proc",
+    "/dev",
+    "/tmp",
+];
+
+/// The answers to what nix's search for gc roots asks of the host outside the project's store,
+/// staged as mounts for the collection's cage, so its nix decides as one on the host would with
+/// nothing of the host's in reach but those answers.
+///
+/// The search (`LocalStore::findRoots`, nix 2.34) walks `gcroots/` and `profiles/` without following
+/// a linked directory. For each link it makes the link's target absolute against the link's own
+/// directory and normalises it lexically; a target naming a store path is a root and asks nothing
+/// more. Otherwise the target is looked at without being followed: missing, and the link is under
+/// `gcroots/auto`, nix unlinks the link as stale; a link itself, its own target is a root when it
+/// names a store path; anything else, nothing. Those are the answers staged: a link to the same
+/// target where it names a store path and to [`NOT_A_STORE_PATH`] otherwise, an empty directory
+/// for anything else that is there, and nothing for what is missing. A target inside the store
+/// needs none, since the cage holds the store at its own path, nor one under [`CAGE_FROM_HOST`].
+///
+/// Refused, rather than staged from a view nix on the host would not have: a target under
+/// [`CAGE_OWN`], one on the way to what the cage mounts that is not a directory on the host, one
+/// below another target the host holds as a link, an answer the host gives as an error other than
+/// "missing", more entries than [`ROOTS_READ_MAX`] or deeper than [`ROOTS_DEPTH_MAX`], and more
+/// stand-ins than [`STANDINS_MAX`]. A root left out would be a live build collected. The walk goes
+/// through descriptors ([`super::cagedir::open_beneath`], [`super::cagedir::open_entry_dir`]), so a
+/// link the project's cage left on the way refuses it too.
+fn collection_standins(store_dir: &Path) -> io::Result<Vec<super::spec::Mount>> {
+    use super::spec::Mount;
+    use std::os::fd::AsRawFd;
+    let tree = store_dir.join("nix");
+    let mut found: std::collections::BTreeMap<PathBuf, Option<PathBuf>> =
+        std::collections::BTreeMap::new();
+    let mut read = 0usize;
+    for top in ["var/nix/gcroots", "var/nix/profiles"] {
+        let dir = match super::cagedir::open_beneath(store_dir, &Path::new("nix").join(top)) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let mut pending = vec![(dir, tree.join(top), 0usize)];
+        while let Some((dir, at, depth)) = pending.pop() {
+            for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+                let entry = entry?;
+                read += 1;
+                if read > ROOTS_READ_MAX {
+                    return Err(roots_refusal(&format!(
+                        "`{}` and `{}` hold more than {ROOTS_READ_MAX} entries",
+                        tree.join("var/nix/gcroots").display(),
+                        tree.join("var/nix/profiles").display()
+                    )));
+                }
+                let name = entry.file_name();
+                let path = at.join(&name);
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    if depth == ROOTS_DEPTH_MAX {
+                        return Err(roots_refusal(&format!(
+                            "`{}` lies more than {ROOTS_DEPTH_MAX} directories deep",
+                            path.display()
+                        )));
+                    }
+                    let below = super::cagedir::open_entry_dir(&dir, &name)?;
+                    pending.push((below, path, depth + 1));
+                } else if kind.is_symlink() {
+                    let target = fs::read_link(super::cagedir::entry(&dir, &name)?)?;
+                    if let Some((at, standin)) = standin_for(&tree, &path, &target)? {
+                        found.insert(at, standin);
+                    }
+                }
+            }
+        }
+    }
+    let mut mounts = Vec::new();
+    for (at, standin) in &found {
+        let holds_another = found
+            .range::<Path, _>((
+                std::ops::Bound::Excluded(at.as_path()),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(next, _)| next.starts_with(at));
+        match standin {
+            Some(_) if holds_another => {
+                return Err(roots_refusal(&format!(
+                    "`{}` is a link on the host, and another root's target lies below it",
+                    at.display()
+                )));
+            }
+            Some(target) => mounts.push(Mount::Symlink {
+                target: target.clone(),
+                dest: at.clone(),
+            }),
+            // The directories bwrap makes on the way to the stand-ins below give the same answer.
+            None if holds_another => {}
+            None => mounts.push(Mount::Tmpfs { dest: at.clone() }),
+        }
+    }
+    if mounts.len() > STANDINS_MAX {
+        return Err(roots_refusal(&format!(
+            "the roots of `{}` lead to more than {STANDINS_MAX} places outside it",
+            tree.display()
+        )));
+    }
+    Ok(mounts)
+}
+
+/// The stand-in the root `link`, a link to `target` under the store's `tree`, needs: `None` for
+/// none, otherwise where it goes and what it is, a link to that target or, as `None`, something
+/// that is not a link ([`collection_standins`]).
+fn standin_for(
+    tree: &Path,
+    link: &Path,
+    target: &Path,
+) -> io::Result<Option<(PathBuf, Option<PathBuf>)>> {
+    let at = lexical(&link.parent().unwrap_or(tree).join(target));
+    if at.starts_with(tree) || CAGE_FROM_HOST.iter().any(|from| at.starts_with(from)) {
+        return Ok(None);
+    }
+    if let Some(own) = CAGE_OWN.iter().find(|own| at.starts_with(own)) {
+        return Err(roots_refusal(&format!(
+            "`{}` leads to `{}`, under `{own}`, which the collection's cage keeps for itself",
+            link.display(),
+            at.display()
+        )));
+    }
+    let meta = match fs::symlink_metadata(&at) {
+        Ok(meta) => meta,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(roots_refusal(&format!(
+                "`{}` leads to `{}`, which cannot be looked at ({e})",
+                link.display(),
+                at.display()
+            )));
+        }
+    };
+    let on_the_way = CAGE_MOUNTS
+        .iter()
+        .map(Path::new)
+        .chain(std::iter::once(tree))
+        .any(|mounted| mounted.starts_with(&at));
+    if on_the_way {
+        return if meta.is_dir() {
+            Ok(None)
+        } else {
+            Err(roots_refusal(&format!(
+                "`{}` leads to `{}`, on the way to what the collection's cage mounts, and it is \
+                 not a directory on the host",
+                link.display(),
+                at.display()
+            )))
+        };
+    }
+    if !meta.file_type().is_symlink() {
+        return Ok(Some((at, None)));
+    }
+    let named = fs::read_link(&at)?;
+    let names_the_store = {
+        let mut parts = named.components();
+        parts.next() == Some(std::path::Component::RootDir)
+            && parts.next() == Some(std::path::Component::Normal(OsStr::new("nix")))
+            && parts.next() == Some(std::path::Component::Normal(OsStr::new("store")))
+    };
+    let standin = if names_the_store {
+        named
+    } else {
+        PathBuf::from(NOT_A_STORE_PATH)
+    };
+    Ok(Some((at, Some(standin))))
+}
+
+/// `path` with `.` dropped and `..` taken back lexically, never above the root: how nix makes a
+/// root's target absolute (`absPath`, `canonPath`), without following a link.
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::from("/");
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => out.push(name),
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
+/// The refusal a root the collection's cage cannot stand in for earns, `why` naming it.
+fn roots_refusal(why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{why}: the collection runs in a cage of its own and cannot answer for it as the host \
+             would, so nothing is collected rather than a build still in use. This tree is \
+             writable by a cage of this project: remove that root by hand, then run again"
+        ),
+    )
 }
 
 /// Retry `op` while it fails with an error `transient` deems worth retrying, up to `attempts` total
@@ -993,7 +1329,7 @@ const NIX_STATE_FILES: &[&str] = &[
 
 /// Check the part of `store_dir`'s tree that `nix-store` writes, before any `nix-store` runs on it.
 ///
-/// `nix-store` runs on the host, as the user, against a tree the cage rewrites at will (see
+/// `nix-store` runs as the user against a tree the cage rewrites at will (see
 /// [`ensure_dir_chain`]), and it opens each name below by path. So each directory of
 /// [`NIX_STATE_DIRS`] must be a real directory, each file of [`NIX_STATE_FILES`] that exists must
 /// be a regular file, and so must every entry of `temproots`, which `nix-store` names after its
@@ -1007,8 +1343,8 @@ const NIX_STATE_FILES: &[&str] = &[
 /// replace a checked name before `nix-store` opens it. The registration a launch runs answers that
 /// with its cage ([`load_cage`]), and this check, made again when the registration fails
 /// ([`retry_load`]), is then what makes a name the cage planted a refusal that names it rather than
-/// a failure inside that cage; `sbx gc`'s own runs on the host are the ones it still guards, against
-/// links only: SQLite there still reads a database the cage wrote.
+/// a failure inside that cage. `sbx gc` runs its own in a cage too ([`HeldStore`]), and there the
+/// check names a planted entry before the collection starts.
 fn ensure_nix_state(store_dir: &Path) -> io::Result<()> {
     for rel in NIX_STATE_DIRS {
         ensure_dir_chain(store_dir, rel)?;
@@ -2066,6 +2402,198 @@ mod tests {
             "the planted link is left for the user to see"
         );
     }
+
+    /// The collection's cage is given what nix's search for roots reads of the host and nothing
+    /// more: a link standing in for an out-link that names a store path, one naming no store path
+    /// for one that names something else, an empty directory for something that is not a link, and
+    /// nothing for a target that is missing, inside the store, or under what the cage binds
+    /// unchanged. A relative target is resolved against the root's own directory.
+    #[test]
+    fn the_collection_stands_in_for_what_its_roots_ask_of_the_host() {
+        use super::super::spec::Mount;
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        ensure_nix_state(&store_dir).unwrap();
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let gcroots = gcroots_dir(&store_dir);
+        let auto = gcroots.join("auto");
+        std::fs::create_dir_all(&auto).unwrap();
+        let built = PathBuf::from("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-built");
+        let other = PathBuf::from("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-other");
+
+        symlink(&built, proj.join("result")).unwrap();
+        symlink(proj.join("result"), auto.join("in-store")).unwrap();
+        symlink("/etc/hostname", proj.join("elsewhere")).unwrap();
+        symlink(proj.join("elsewhere"), auto.join("not-in-store")).unwrap();
+        symlink(proj.join("absent"), auto.join("missing")).unwrap();
+        std::fs::write(proj.join("file"), b"").unwrap();
+        symlink(proj.join("file"), auto.join("not-a-link")).unwrap();
+        symlink(&other, proj.join("rel")).unwrap();
+        symlink("../../../../../../proj/rel", auto.join("relative")).unwrap();
+        symlink(&other, gcroots.join("direct")).unwrap();
+        symlink(store_dir.join("nix/var/nix/db"), auto.join("inside")).unwrap();
+        symlink("/usr", auto.join("from-host")).unwrap();
+        let profiles = store_dir.join("nix/var/nix/profiles");
+        symlink(&built, profiles.join("profile")).unwrap();
+
+        let mut staged = collection_standins(&store_dir).unwrap();
+        staged.sort_by(|a, b| a.dest().cmp(b.dest()));
+        assert_eq!(
+            staged,
+            [
+                Mount::Symlink {
+                    target: NOT_A_STORE_PATH.into(),
+                    dest: proj.join("elsewhere"),
+                },
+                Mount::Tmpfs {
+                    dest: proj.join("file"),
+                },
+                Mount::Symlink {
+                    target: other,
+                    dest: proj.join("rel"),
+                },
+                Mount::Symlink {
+                    target: built,
+                    dest: proj.join("result"),
+                },
+            ]
+        );
+    }
+
+    /// A root whose answer the collection's cage cannot give as the host does refuses the
+    /// collection, by name, rather than leaving it out: one under what the cage keeps for itself,
+    /// one below another the host holds as a link, and more of them, or deeper, than it reads.
+    #[test]
+    fn a_root_the_collections_cage_cannot_stand_in_for_refuses_it() {
+        let refused = |store_dir: &Path, why: &str| {
+            let err = collection_standins(store_dir).expect_err(why);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{why}: {err}");
+            err.to_string()
+        };
+
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        ensure_nix_state(&store_dir).unwrap();
+        let auto = gcroots_dir(&store_dir).join("auto");
+        std::fs::create_dir_all(&auto).unwrap();
+        symlink("/proc/self/root/result", auto.join("own")).unwrap();
+        let why = refused(&store_dir, "under the cage's /proc");
+        assert!(why.contains("under `/proc`"), "{why}");
+        std::fs::remove_file(auto.join("own")).unwrap();
+
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join("real")).unwrap();
+        symlink(proj.join("real"), proj.join("link")).unwrap();
+        symlink(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+            proj.join("real/result"),
+        )
+        .unwrap();
+        symlink(proj.join("link"), auto.join("outer")).unwrap();
+        symlink(proj.join("link/result"), auto.join("inner")).unwrap();
+        let why = refused(
+            &store_dir,
+            "a target below another the host holds as a link",
+        );
+        assert!(
+            why.contains(&format!(
+                "`{}` is a link on the host",
+                proj.join("link").display()
+            )),
+            "{why}"
+        );
+        std::fs::remove_file(auto.join("outer")).unwrap();
+        collection_standins(&store_dir).expect("the inner root alone is staged");
+        std::fs::remove_file(auto.join("inner")).unwrap();
+
+        let many = base.join("many");
+        std::fs::create_dir_all(&many).unwrap();
+        for i in 0..=STANDINS_MAX {
+            std::fs::write(many.join(i.to_string()), b"").unwrap();
+            symlink(many.join(i.to_string()), auto.join(format!("r{i}"))).unwrap();
+        }
+        let why = refused(&store_dir, "more stand-ins than the cage takes");
+        assert!(
+            why.contains(&format!("more than {STANDINS_MAX} places")),
+            "{why}"
+        );
+        std::fs::remove_dir_all(&auto).unwrap();
+
+        let mut deep = gcroots_dir(&store_dir);
+        for _ in 0..=ROOTS_DEPTH_MAX {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let why = refused(&store_dir, "deeper than it reads");
+        assert!(
+            why.contains(&format!("more than {ROOTS_DEPTH_MAX} directories deep")),
+            "{why}"
+        );
+    }
+
+    /// The collection's cage binds nothing of the host's but its store, read-write from the
+    /// descriptor at the store's own path, and what every engine needs read-only: no project, no
+    /// home. It has no network, runs the arguments it is given, and takes the stand-ins last.
+    #[test]
+    fn the_collections_cage_binds_nothing_of_the_host_but_its_store() {
+        use super::super::spec::{Mount, NetPolicy};
+        let standin = Mount::Symlink {
+            target: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x".into(),
+            dest: "/work/proj/result".into(),
+        };
+        let spec = store_cage(
+            Path::new("/opt/engine/nix-store"),
+            7,
+            Path::new("/data/projects/p/store"),
+            vec![standin.clone()],
+            &[OsStr::new("--gc"), OsStr::new("--print-dead")],
+        )
+        .unwrap();
+        let from_host: Vec<(&Path, &Path)> = spec
+            .mounts
+            .iter()
+            .filter_map(|m| match m {
+                Mount::Bind { src, dest }
+                | Mount::RoBind { src, dest }
+                | Mount::RoBindTry { src, dest }
+                | Mount::DevBind { src, dest } => Some((src.as_path(), dest.as_path())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            from_host,
+            [
+                (Path::new("/usr"), Path::new("/usr")),
+                (Path::new("/etc/ld.so.cache"), Path::new("/etc/ld.so.cache")),
+                (Path::new("/nix/store"), Path::new("/nix/store")),
+                (
+                    Path::new("/opt/engine/nix-store"),
+                    Path::new("/bin/nix-store")
+                ),
+                (
+                    Path::new("/proc/self/fd/7"),
+                    Path::new("/data/projects/p/store/nix")
+                ),
+            ]
+        );
+        assert!(
+            matches!(spec.mounts.last(), Some(m) if *m == standin),
+            "the stand-ins come last"
+        );
+        assert_eq!(spec.net, NetPolicy::Isolated);
+        assert_eq!(
+            spec.cmd,
+            [
+                "/bin/nix-store",
+                "--store",
+                "/data/projects/p/store",
+                "--gc",
+                "--print-dead"
+            ]
+            .map(std::ffi::OsString::from)
+        );
+    }
 }
 
 /// Proving the seed in isolation needs a real nix store, so this is a live smoke
@@ -2455,5 +2983,262 @@ mod smoke {
                 String::from_utf8_lossy(&host.stderr)
             );
         }
+    }
+
+    /// `sbx gc`'s collection runs in its cage and keeps a build whose only root is a `result` link
+    /// outside the store, the way nix on the host keeps it, and the sweep collects what nothing
+    /// roots.
+    ///
+    /// The control arm runs the same search in the same cage without the stand-ins: the build is
+    /// then dead and its root unlinked as stale, even on a dry run. So what keeps it in the first
+    /// arm is the stand-ins, and the cage alone would collect a build still in use.
+    #[test]
+    fn the_collection_runs_in_its_cage_and_keeps_a_build_rooted_outside_the_store() {
+        use std::process::Stdio;
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            skip_incapable!(
+                "skipping the collection's cage: no bwrap or no capability-bearing userns"
+            );
+            return;
+        };
+        let Some(nix_store) = crate::store::resolve_nix_store(None) else {
+            skip_incapable!("skipping the collection's cage: no nix-store");
+            return;
+        };
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        ensure_nix_state(&store_dir).unwrap();
+        let add = |name: &str| {
+            let file = base.join(name);
+            std::fs::write(&file, format!("{name}\n")).unwrap();
+            let out = Command::new(&nix_store)
+                .env("NIX_REMOTE", "")
+                .arg("--store")
+                .arg(&store_dir)
+                .arg("--add")
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+        };
+        let built = add("built");
+        let orphan = add("orphan");
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(&built, proj.join("result")).unwrap();
+        let auto = gcroots_dir(&store_dir).join("auto");
+        std::fs::create_dir_all(&auto).unwrap();
+        std::os::unix::fs::symlink(proj.join("result"), auto.join("r")).unwrap();
+
+        let engine = Engine::for_tests(&nix_store, &bwrap);
+        let held = HeldStore::hold(&engine, &store_dir).unwrap();
+        let dead = |roots: bool| {
+            let out = held
+                .command(&[OsStr::new("--gc"), OsStr::new("--print-dead")], roots)
+                .unwrap()
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "the search failed in its cage: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let named = |listed: &str, path: &Path| listed.lines().any(|l| Path::new(l) == path);
+
+        let listed = dead(true);
+        assert!(named(&listed, &orphan), "the orphan is not dead: {listed}");
+        assert!(
+            !named(&listed, &built),
+            "the rooted build is dead: {listed}"
+        );
+        assert!(
+            auto.join("r").symlink_metadata().is_ok(),
+            "the root was unlinked as stale"
+        );
+
+        let report =
+            crate::sandbox::gc::collect(&crate::sandbox::gc::StoreAt::Project(&held), true)
+                .unwrap();
+        assert_eq!(report.paths, 1);
+        assert!(
+            present(&store_dir, &built),
+            "the sweep took the rooted build"
+        );
+        assert!(!present(&store_dir, &orphan), "the sweep left the orphan");
+
+        let listed = dead(false);
+        assert!(
+            named(&listed, &built),
+            "the control arm kept the build without the stand-ins, so this test shows nothing \
+             about them: {listed}"
+        );
+        assert!(
+            auto.join("r").symlink_metadata().is_err(),
+            "the control arm left the root, so the cage did not find it stale"
+        );
+    }
+
+    /// The collection in its cage decides as `nix-store` on the host does, for every shape of
+    /// root the stand-ins answer for: two stores built alike, one searched on the host and one in
+    /// the cage, leave the same paths dead and the same `gcroots/auto` links in place.
+    ///
+    /// The shapes are those nix was traced on: a `result` link to a store path, a missing one, one
+    /// reached through a linked directory, a direct root that is a link to such a link, a profile,
+    /// a link to something that is no store path, a regular file, and a relative target.
+    #[test]
+    fn the_collection_in_its_cage_decides_as_nix_on_the_host() {
+        use std::process::Stdio;
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            skip_incapable!(
+                "skipping the collection's parity: no bwrap or no capability-bearing userns"
+            );
+            return;
+        };
+        let Some(nix_store) = crate::store::resolve_nix_store(None) else {
+            skip_incapable!("skipping the collection's parity: no nix-store");
+            return;
+        };
+        let base = TmpDir::new();
+        let proj = base.join("proj");
+        let real = base.join("real");
+        let ext = base.join("ext");
+        for dir in [&proj, &real, &ext] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, base.join("linked")).unwrap();
+        let names = ["a", "b", "c", "d", "e", "f", "g"];
+        for name in names {
+            std::fs::write(base.join(name), format!("parity {name}\n")).unwrap();
+        }
+        // One store per arm, at the same depth below `base`, so a relative target leads to the
+        // same place from either.
+        let build = |arm: &str| -> (PathBuf, Vec<PathBuf>) {
+            let store_dir = base.join(arm).join("store");
+            ensure_nix_state(&store_dir).unwrap();
+            let paths = names
+                .iter()
+                .map(|name| {
+                    let out = Command::new(&nix_store)
+                        .env("NIX_REMOTE", "")
+                        .arg("--store")
+                        .arg(&store_dir)
+                        .arg("--add")
+                        .arg(base.join(name))
+                        .output()
+                        .unwrap();
+                    assert!(
+                        out.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+                })
+                .collect();
+            (store_dir, paths)
+        };
+        let (host_store, paths) = build("host");
+        let (cage_store, same) = build("cage");
+        assert_eq!(paths, same, "both stores hold the same paths");
+
+        let link = |target: &Path, at: &Path| {
+            if at.symlink_metadata().is_err() {
+                std::os::unix::fs::symlink(target, at).unwrap();
+            }
+        };
+        link(&paths[0], &proj.join("result"));
+        link(&paths[2], &real.join("result"));
+        link(&paths[3], &ext.join("out"));
+        link(Path::new("/etc/hostname"), &proj.join("elsewhere"));
+        std::fs::write(proj.join("file"), b"").unwrap();
+        link(&paths[6], &proj.join("rel"));
+        for store_dir in [&host_store, &cage_store] {
+            let gcroots = gcroots_dir(store_dir);
+            let auto = gcroots.join("auto");
+            std::fs::create_dir_all(&auto).unwrap();
+            link(&proj.join("result"), &auto.join("result"));
+            link(&proj.join("absent"), &auto.join("missing"));
+            link(&base.join("linked/result"), &auto.join("through-a-link"));
+            link(&ext.join("out"), &gcroots.join("direct"));
+            link(&paths[4], &store_dir.join("nix/var/nix/profiles/profile"));
+            link(&proj.join("elsewhere"), &auto.join("elsewhere"));
+            link(&proj.join("file"), &auto.join("file"));
+            link(
+                Path::new("../../../../../../../proj/rel"),
+                &auto.join("relative"),
+            );
+        }
+
+        let dead = |out: std::process::Output| {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let mut dead: Vec<String> = String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            dead.sort();
+            dead
+        };
+        let left = |store_dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(gcroots_dir(store_dir).join("auto"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let on_host = dead(
+            Command::new(&nix_store)
+                .env("NIX_REMOTE", "")
+                .arg("--store")
+                .arg(&host_store)
+                .args(["--gc", "--print-dead"])
+                .stdin(Stdio::null())
+                .output()
+                .unwrap(),
+        );
+        let engine = Engine::for_tests(&nix_store, &bwrap);
+        let held = HeldStore::hold(&engine, &cage_store).unwrap();
+        let in_cage = dead(
+            held.command(&[OsStr::new("--gc"), OsStr::new("--print-dead")], true)
+                .unwrap()
+                .stdin(Stdio::null())
+                .output()
+                .unwrap(),
+        );
+
+        let expected: Vec<String> = [&paths[1], &paths[5]]
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(on_host, expected, "the host arm: only b and f are unrooted");
+        assert_eq!(
+            in_cage, on_host,
+            "the cage left other paths dead than the host"
+        );
+        assert_eq!(
+            left(&cage_store),
+            left(&host_store),
+            "the cage left other auto roots than the host"
+        );
+        assert!(
+            !left(&host_store).contains(&"missing".to_string()),
+            "the host arm kept the stale root, so this test shows nothing about its removal"
+        );
     }
 }

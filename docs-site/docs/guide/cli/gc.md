@@ -51,9 +51,9 @@ tree, with the state `unknown` in place of a `live`/`idle` finding nothing estab
 ## When the store holds an entry nix did not make
 
 A project's store is writable from inside its cage, and `nix-store` runs on it at each
-launch and in `sbx gc`. Both register the seed in a cage of its own, which sees nothing of
-the host's but that store, so a link inside the store leads nowhere on the host; `sbx gc`
-then collects and deduplicates on the host. Either way, before `nix-store` starts, what it
+launch and in `sbx gc`, always in a cage of its own that sees nothing of the host's but that
+store, so a link inside the store leads nowhere on the host: the registration of the seed,
+and `sbx gc`'s collection and deduplication. Either way, before `nix-store` starts, what it
 writes to is checked: its database directory, its lock, root and profile directories, its
 temporary roots and its deduplication pool must be real directories, and the database files,
 its locks and the temporary roots must be regular files. A symlink or anything else in their
@@ -62,6 +62,22 @@ run. The check runs again when the registration fails, so an entry a running cag
 project put there in the meantime is reported the same way. The copy of the seed creates
 each of its entries afresh, and one already at its name is reported by its path too. The
 entry is left where it is, so you can see it: remove it by hand, then run again.
+
+The collection's cage does not see the project either. Some of the store's roots lead out of
+it, such as the `result` link a `nix build` in the cage leaves in the project, and what nix
+asks of the host about them (whether the link is there, and what it points to) is answered
+on the host and staged in the cage, so a build such a link still points to is kept, as it
+was when the collection ran on the host. A root it cannot answer for that way refuses the
+collection with that root's path rather than collecting a build still in use: one leading
+under `/proc`, `/dev`, `/bin`, `/lib`, `/lib64` or to `/etc/ld.so.cache`, one below another
+root's target that is a link on the host, one on the way to what the cage mounts that is not
+a directory on the host, one whose target the host cannot look at, roots
+leading to more than 1024 places outside the store, and root directories holding more than
+65 536 entries or nested more than 16 deep. Like nix
+on the host, even a dry run removes a `gcroots/auto` link whose target is gone. The
+collection reads none of the host's nix configuration (`/etc/nix/nix.conf`, `NIX_CONFIG`),
+so a setting there such as `keep-outputs` applies to the shared store and not to a
+project's.
 
 ## Runtime files
 

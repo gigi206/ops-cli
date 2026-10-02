@@ -14,10 +14,13 @@
 //! carries a data-dir out-link that [`prune_project_package_roots`] drops on removal, while
 //! [`prune_superseded_roots`] reconciles the per-project seed roots a roll supersedes. Then a plain
 //! `nix-store --gc` against the project store sweeps: every live build carries a root whose target is
-//! a `/nix/store/<hash>` path, which the relocated store resolves host-side, so the sweep keeps the
-//! live set and collects the rest — no per-home enumeration. The default is a dry run: it reports
-//! what would be freed with `--print-dead`, summed by `--query --size`, and only changes anything
-//! when the caller asks.
+//! a `/nix/store/<hash>` path, which the relocated store resolves as one of its own, so the sweep
+//! keeps the live set and collects the rest — no per-home enumeration. The default is a dry run: it
+//! reports what would be freed with `--print-dead`, summed by `--query --size`, and only changes
+//! anything when the caller asks.
+//!
+//! A project's store is the project's cage's to write, so `nix-store` runs on it in a cage of its
+//! own ([`StoreAt::Project`]); the shared store, which no cage writes, is collected on the host.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -31,6 +34,47 @@ use crate::sandbox::cagedir::open_beneath;
 // Aliased: `crate::store` — the locks and the `Layout` — is read in this file too, and two
 // modules spelled `store` a line apart read as one.
 use crate::sandbox::distro::store as distro_store;
+
+/// Where a store's `nix-store` runs.
+pub(crate) enum StoreAt<'a> {
+    /// On the host: the shared store, which no cage writes.
+    Host {
+        nix_store: &'a Path,
+        store_dir: &'a Path,
+    },
+    /// In a cage of its own: a project's store, which the project's cage writes
+    /// ([`super::projectstore::HeldStore`]).
+    Project(&'a super::projectstore::HeldStore<'a>),
+}
+
+impl StoreAt<'_> {
+    /// The store's directory, the `--store` nix is given.
+    fn store_dir(&self) -> &Path {
+        match self {
+            StoreAt::Host { store_dir, .. } => store_dir,
+            StoreAt::Project(held) => held.store_dir(),
+        }
+    }
+
+    /// `nix-store --store <store> <args>`, daemonless (`NIX_REMOTE` empty). `roots` says the run
+    /// searches the store's gc roots, which a project's cage must be given the host's answers for.
+    fn command(&self, args: &[&std::ffi::OsStr], roots: bool) -> io::Result<Command> {
+        match self {
+            StoreAt::Host {
+                nix_store,
+                store_dir,
+            } => {
+                let mut cmd = Command::new(nix_store);
+                cmd.env("NIX_REMOTE", "")
+                    .arg("--store")
+                    .arg(store_dir)
+                    .args(args);
+                Ok(cmd)
+            }
+            StoreAt::Project(held) => held.command(args, roots),
+        }
+    }
+}
 
 /// What a gc pass reclaimed (or would reclaim, in a dry run).
 pub(crate) struct GcReport {
@@ -295,14 +339,10 @@ pub(crate) struct OptimiseReport {
 /// The gain is measured by walking the tree before and after rather than parsing nix's summary, so
 /// the inode count — the figure that matters on a filesystem whose inode table cannot grow — is
 /// reported alongside the bytes.
-pub(crate) fn optimise(nix_store: &Path, store_dir: &Path) -> io::Result<OptimiseReport> {
+pub(crate) fn optimise(store: &StoreAt<'_>) -> io::Result<OptimiseReport> {
+    let store_dir = store.store_dir();
     let before = tree_usage(store_dir);
-    let out = Command::new(nix_store)
-        .env("NIX_REMOTE", "")
-        .arg("--store")
-        .arg(store_dir)
-        .arg("--optimise")
-        .output()?;
+    let out = store.command(&["--optimise".as_ref()], false)?.output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "nix-store --optimise failed: {}",
@@ -321,12 +361,13 @@ pub(crate) fn optimise(nix_store: &Path, store_dir: &Path) -> io::Result<Optimis
 /// Garbage-collect `store_dir`'s store: compute the dead paths and their size, and delete them
 /// when `prune`. The dead set is found with `--gc --print-dead` (the mark phase without the
 /// sweep), so a dry run measures exactly what a prune would remove. Daemonless (`NIX_REMOTE`
-/// empty), like every other store operation.
-pub(crate) fn collect(nix_store: &Path, store_dir: &Path, prune: bool) -> io::Result<GcReport> {
-    let dead = print_dead(nix_store, store_dir)?;
-    let bytes = total_size(nix_store, store_dir, &dead)?;
+/// empty), like every other store operation. A dry run is not without effect: nix unlinks the
+/// `gcroots/auto` links whose target is gone, on either pass.
+pub(crate) fn collect(store: &StoreAt<'_>, prune: bool) -> io::Result<GcReport> {
+    let dead = print_dead(store)?;
+    let bytes = total_size(store, &dead)?;
     if prune && !dead.is_empty() {
-        sweep(nix_store, store_dir)?;
+        sweep(store)?;
     }
     Ok(GcReport {
         paths: dead.len(),
@@ -336,13 +377,9 @@ pub(crate) fn collect(nix_store: &Path, store_dir: &Path, prune: bool) -> io::Re
 
 /// The store paths `nix-store --gc` would collect, without deleting them. Only lines that are
 /// store paths are kept; nix prints its progress ("finding roots…") on stderr.
-fn print_dead(nix_store: &Path, store_dir: &Path) -> io::Result<Vec<String>> {
-    let out = Command::new(nix_store)
-        .env("NIX_REMOTE", "")
-        .arg("--store")
-        .arg(store_dir)
-        .arg("--gc")
-        .arg("--print-dead")
+fn print_dead(store: &StoreAt<'_>) -> io::Result<Vec<String>> {
+    let out = store
+        .command(&["--gc".as_ref(), "--print-dead".as_ref()], true)?
         .output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
@@ -368,7 +405,7 @@ fn print_dead(nix_store: &Path, store_dir: &Path) -> io::Result<Vec<String>> {
 /// so a failing batch is not fatal: the sizes printed before the abort are summed, the single
 /// rejected path is skipped, and sizing resumes after it. The figure is only a report — `sweep`
 /// still deletes every dead entry regardless.
-fn total_size(nix_store: &Path, store_dir: &Path, paths: &[String]) -> io::Result<u64> {
+fn total_size(store: &StoreAt<'_>, paths: &[String]) -> io::Result<u64> {
     // Query in bounded windows: passing every dead path as one argv overflows the kernel's argv
     // limit (E2BIG) on a large store, which would abort the whole GC (including `--prune`). Store
     // paths are ~100 bytes each, so a few thousand per call stays well under any ARG_MAX.
@@ -377,14 +414,9 @@ fn total_size(nix_store: &Path, store_dir: &Path, paths: &[String]) -> io::Resul
     let mut i = 0;
     while i < paths.len() {
         let end = (i + BATCH).min(paths.len());
-        let out = Command::new(nix_store)
-            .env("NIX_REMOTE", "")
-            .arg("--store")
-            .arg(store_dir)
-            .arg("--query")
-            .arg("--size")
-            .args(&paths[i..end])
-            .output()?;
+        let mut args: Vec<&std::ffi::OsStr> = vec!["--query".as_ref(), "--size".as_ref()];
+        args.extend(paths[i..end].iter().map(std::ffi::OsStr::new));
+        let out = store.command(&args, false)?.output()?;
         let (bytes, consumed) = parse_size_batch(&String::from_utf8_lossy(&out.stdout));
         total += bytes;
         if out.status.success() {
@@ -421,12 +453,9 @@ fn parse_size_batch(stdout: &str) -> (u64, usize) {
 }
 
 /// Delete every dead path in `store_dir`'s store.
-fn sweep(nix_store: &Path, store_dir: &Path) -> io::Result<()> {
-    let status = Command::new(nix_store)
-        .env("NIX_REMOTE", "")
-        .arg("--store")
-        .arg(store_dir)
-        .arg("--gc")
+fn sweep(store: &StoreAt<'_>) -> io::Result<()> {
+    let status = store
+        .command(&["--gc".as_ref()], true)?
         .stdout(std::process::Stdio::null())
         .status()?;
     if !status.success() {
