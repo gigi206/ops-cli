@@ -178,7 +178,8 @@ pub(crate) fn exit_code(status: libc::c_int) -> i32 {
 
 /// Force-terminate a supervised cage and reap it, returning its exit-status code — `SIGTERM`, a
 /// brief grace for a clean shutdown, then `SIGKILL`, the same escalation `sbx session stop` uses. Invoked
-/// from the pty relay when a graphical session is force-quit with a double Ctrl+C.
+/// from the pty relay when a graphical session is force-quit with a double Ctrl+C, and by
+/// [`fork_with_pty`] when the terminal cannot be put in raw mode once the child has started.
 fn terminate_and_reap(child: libc::pid_t) -> io::Result<i32> {
     // SAFETY: `child` has not been reaped — this function is what reaps it — so the pid still names
     // the forked cage; `kill` takes two integers and no pointer.
@@ -506,7 +507,18 @@ pub(super) unsafe fn fork_with_pty(
     // SAFETY: only the parent reaches this line — the child branch above never returns — and its
     // `slave` is its own copy of the descriptor, still open and used nowhere else here.
     unsafe { libc::close(slave) };
-    let _raw = RawMode::enable(0).map_err(PtyFailure::AfterFork)?;
+    let _raw = match RawMode::enable(0) {
+        Ok(raw) => raw,
+        Err(e) => {
+            // The child is running and nothing will relay its terminal: stop it as a force-quit
+            // does, and reap it, rather than leave a cage on a pty no one reads.
+            // SAFETY: the parent has held `master` since `openpty` and nothing reads it now; this
+            // is its only close.
+            unsafe { libc::close(master) };
+            let _ = terminate_and_reap(pid);
+            return Err(PtyFailure::AfterFork(e));
+        }
+    };
     // Install the resize relay *after* the fork so the child never inherits the handler. sbx keeps
     // the real controlling terminal (only the child `setsid`'d, via `login_tty` or the attach
     // entry), so it receives `SIGWINCH` from the launching terminal naturally; the handler wakes
@@ -566,6 +578,101 @@ impl std::fmt::Display for PtyFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child started under a pty whose terminal then cannot go raw is stopped and reaped, not
+    /// left running on a pty no one reads. Run alone, in a process whose stdin is `/dev/null`, so
+    /// `RawMode::enable(0)` fails once the fork has happened whatever terminal this run has.
+    #[test]
+    fn a_terminal_that_cannot_go_raw_stops_and_reaps_the_started_child() {
+        let ran = crate::testutil::run_within(
+            crate::testutil::alone(
+                concat!(module_path!(), "::a_pty_whose_terminal_cannot_go_raw"),
+                "",
+            )
+            .stdin(std::process::Stdio::null()),
+            "the pty whose terminal cannot go raw",
+        );
+        assert!(
+            ran.ended_well(),
+            "the process ended with {}: {}{}",
+            ran.status,
+            ran.stdout,
+            ran.stderr
+        );
+    }
+
+    /// The pty run by [`a_terminal_that_cannot_go_raw_stops_and_reaps_the_started_child`];
+    /// anywhere else it does nothing. The child writes its pid and waits; SIGTERM is blocked in it
+    /// (inherited from this thread's mask), so the pid is always written before the escalation to
+    /// SIGKILL ends it.
+    #[test]
+    #[ignore = "run alone by the test that reads how it ended, with stdin off any terminal"]
+    fn a_pty_whose_terminal_cannot_go_raw() {
+        crate::testutil::when_run_alone(|_| {
+            let mut ends = [0 as libc::c_int; 2];
+            // SAFETY: `pipe2` fills the two-element array it is handed.
+            assert_eq!(
+                unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let (read_fd, write_fd) = (ends[0], ends[1]);
+            // SAFETY: both are plain `sigset_t` operations on a local set, and `pthread_sigmask`
+            // changes this thread's mask only, restored below.
+            let previous = unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                let mut previous: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGTERM);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
+                previous
+            };
+            let child = move |_slave: libc::c_int| -> std::convert::Infallible {
+                // SAFETY: `getpid`, `write` and `pause` are async-signal-safe, and the bytes are a
+                // local array; nothing here allocates.
+                unsafe {
+                    let pid = libc::getpid().to_ne_bytes();
+                    libc::write(write_fd, pid.as_ptr().cast(), pid.len());
+                    loop {
+                        libc::pause();
+                    }
+                }
+            };
+            // SAFETY: the child above honours the async-signal-safe contract and never returns.
+            let result = unsafe { fork_with_pty(false, child) };
+            // SAFETY: restores the mask saved above, on this same thread; then closes this side's
+            // write end, so the read below ends once the child's copy is gone.
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+                libc::close(write_fd);
+            }
+            let mut pid = [0u8; 4];
+            // SAFETY: `read_fd` is this test's own pipe end and `pid` a local buffer of its length.
+            let got = unsafe { libc::read(read_fd, pid.as_mut_ptr().cast(), pid.len()) };
+            let pid = libc::pid_t::from_ne_bytes(pid);
+            assert_eq!(got, 4, "the child wrote its pid before it was stopped");
+            // SAFETY: `kill` with signal 0 only asks whether `pid` names a process.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if alive {
+                // SAFETY: the child this test forked, still there; stopped and reaped so the test
+                // leaves nothing behind whatever it asserts.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+            }
+            // SAFETY: closes this test's own read end.
+            unsafe { libc::close(read_fd) };
+            assert!(
+                matches!(result, Err(PtyFailure::AfterFork(_))),
+                "a failure after the fork says so: {result:?}"
+            );
+            assert!(
+                !alive,
+                "the child must be stopped and reaped, not left running or a zombie"
+            );
+            Ok(())
+        });
+    }
 
     #[test]
     fn double_ctrl_c_escalates_only_within_the_window() {
