@@ -4327,10 +4327,13 @@ fn bwrap_refusing_the_learning_cage(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Run `command` with a fresh terminal as its stdin, stdout and stderr, which is what makes a
-/// launch interactive (`isatty(0)`), and drain the terminal until the command and everything it
-/// started let it go, or `limit` passes. Returns the exit code, `None` for a signal or for a
-/// terminal still held at the limit (the command is killed then), and everything written, both
-/// streams together as a terminal shows them.
+/// launch interactive (`isatty(0)`), and drain the terminal until the command has exited and the
+/// terminal has gone quiet, or `limit` passes. Returns the exit code, `None` for a signal or for a
+/// command still running at the limit (killed then), and everything written, both streams together
+/// as a terminal shows them.
+///
+/// The command's exit is what ends the drain, not the terminal's last copy closing: a process the
+/// command left behind, or one another test spawned while a copy was open, may hold a copy longer.
 fn on_a_terminal(mut command: Command, limit: std::time::Duration) -> (Option<i32>, String) {
     use std::os::fd::FromRawFd;
     use std::process::Stdio;
@@ -4348,22 +4351,36 @@ fn on_a_terminal(mut command: Command, limit: std::time::Duration) -> (Option<i3
         )
     };
     assert_eq!(rc, 0, "openpty failed");
-    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
+    // `openpty` opens both ends without close-on-exec, and the suite runs its tests side by side:
+    // a launch another test spawned while they were open would carry a copy through its exec.
+    for fd in [master, slave] {
+        // SAFETY: `fcntl` on a descriptor `openpty` just returned, with an integer argument.
+        let set = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        assert_ne!(set, -1, "cannot make the terminal close-on-exec");
+    }
+    // One close-on-exec copy of the slave per stream. The spawn moves each onto 0, 1 or 2, which
+    // clears the flag for the child alone.
+    let copy = || {
+        // SAFETY: duplicates the slave this function holds, with an integer argument.
+        let fd = unsafe { libc::fcntl(slave, libc::F_DUPFD_CLOEXEC, 0) };
+        assert_ne!(fd, -1, "cannot copy the terminal");
+        // SAFETY: the copy was just made here, and the Stdio takes it over.
+        unsafe { Stdio::from_raw_fd(fd) }
+    };
     let mut child = command
-        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stdin(copy())
+        .stdout(copy())
+        .stderr(copy())
         .spawn()
         .expect("spawn sbx on a terminal");
-    // The command keeps the three copies it was handed for as long as it lives, and so would this
-    // process, which would keep the master from ever reading EIO: they go with it, here.
+    // The command keeps the three copies it was handed for as long as it lives: they go with it.
     drop(command);
-    // SAFETY: closes this process's own copy of the slave, so the master reads EIO once the child
-    // and everything it started have let theirs go.
+    // SAFETY: closes this process's own copy of the slave.
     unsafe { libc::close(slave) };
 
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
+    let mut exited = None;
     let mut let_go = false;
     let deadline = std::time::Instant::now() + limit;
     while std::time::Instant::now() < deadline {
@@ -4372,24 +4389,35 @@ fn on_a_terminal(mut command: Command, limit: std::time::Duration) -> (Option<i3
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: one `pollfd` this frame owns, then a read into a buffer of the length given.
-        if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
+        // SAFETY: one `pollfd` this frame owns.
+        if unsafe { libc::poll(&mut pfd, 1, 200) } > 0 {
+            // SAFETY: a read into a buffer of the length given.
             let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 let_go = true;
                 break;
             }
             out.extend_from_slice(&buf[..n as usize]);
+        } else if exited.is_some() {
+            // Quiet once the command is gone: what it wrote is all in.
+            break;
+        } else {
+            exited = child.try_wait().expect("poll sbx");
         }
     }
     // SAFETY: the master this function opened, closed once.
     unsafe { libc::close(master) };
-    if !let_go {
+    // Every copy closed: the command has exited or is about to. Neither, and the limit passed.
+    let ended = exited.is_some() || let_go;
+    if !ended {
         let _ = child.kill();
     }
+    // Once `try_wait` has seen the exit, `wait` hands back the same status.
     let status = child.wait().expect("reap sbx");
-    let code = if let_go { status.code() } else { None };
-    (code, String::from_utf8_lossy(&out).into_owned())
+    (
+        status.code().filter(|_| ended),
+        String::from_utf8_lossy(&out).into_owned(),
+    )
 }
 
 #[test]
