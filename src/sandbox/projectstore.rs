@@ -265,10 +265,10 @@ pub(crate) fn lock_exclusive(layout: &Layout) -> io::Result<SharedGcLock> {
 /// record names. A record lives as long as that process does ([`crate::session::Registry::list`]),
 /// and a launch lets the lock go once its record is written (the launch path's `register`). A
 /// supervisor can die and leave its cage running: [`crate::session::Session::stop`] calls the
-/// parent-death cascade racy inside a systemd scope, and
-/// [`crate::sandbox::cgroup::sweep_stale_scopes`] keeps a scope whose launcher is gone for as long
-/// as its cgroup lists a process. `sbx gc` then reads the session as over and collects a store
-/// that cage still uses.
+/// parent-death cascade racy inside a systemd scope. The scope sweep
+/// ([`crate::sandbox::cgroup::sweep_stale_scopes`]) runs only as a launch starts, never in
+/// `sbx gc`, and keeps a scope whose launcher is gone for as long as bubblewrap's monitor still
+/// runs in it. `sbx gc` then reads the session as over and collects a store that cage still uses.
 ///
 /// The file is beside the store in the project's runtime tree, where the project's marker is. No
 /// cage writes there, but one whose project holds sbx's data directory sees it read-only (the
