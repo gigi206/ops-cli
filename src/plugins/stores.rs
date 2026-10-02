@@ -825,7 +825,9 @@ fn place_plugin(
     };
 
     // The content gate: the directory must reproduce the digest the signed catalogue pinned, so the
-    // bytes about to be installed are exactly what was listed and signed.
+    // bytes about to be installed are exactly what was listed and signed. The claim below carries
+    // the same digest, and the install checks it again on the copy it places, since an update of
+    // this store can replace the checkout between this check and that copy.
     crate::plugins::catalogue::verify_entry(entry, &plugin_dir)?;
 
     // The store's URL is carried into the record so a later listing still names where the plugin
@@ -845,6 +847,7 @@ fn place_plugin(
                 name: plugin_name,
                 kind: entry.kind,
                 scheme: entry.scheme.as_deref(),
+                sha256: entry.sha256.clone(),
             },
             origin,
         )
@@ -856,6 +859,7 @@ fn place_plugin(
                 name: plugin_name,
                 kind: entry.kind,
                 scheme: entry.scheme.as_deref(),
+                sha256: entry.sha256.clone(),
             },
             origin,
         )

@@ -964,6 +964,9 @@ pub(crate) struct StoreClaim<'a> {
     pub(crate) kind: PluginKind,
     /// The scheme the listing advertises, for a resolver. `None` for a broker.
     pub(crate) scheme: Option<&'a str>,
+    /// The digest the signed catalogue pins the plugin's tree to
+    /// ([`catalogue::dir_digest_hex`]).
+    pub(crate) sha256: String,
 }
 
 /// A validated plugin of any type. They are indexed differently (a resolver by the scheme it
@@ -1499,8 +1502,10 @@ pub(crate) fn install(layout: &crate::store::Layout, source: &Path) -> Result<In
 /// plugin must install under the name the catalogue advertised (`expected_name`) and claim the
 /// scheme it advertised (`expected_scheme`) — or the install is refused fail-closed, so a catalogue
 /// that misrepresents what it pins can never install something other than what was listed. The
-/// content itself was already pinned to the catalogue by the caller's
-/// [`crate::plugins::catalogue::verify_entry`]; this adds the identity half of that reconciliation. The
+/// content is pinned to the catalogue twice: by the caller's
+/// [`crate::plugins::catalogue::verify_entry`] on the checkout, and here on the staged copy against
+/// the claim's digest, so a checkout replaced between the two places nothing; this adds the
+/// identity half of that reconciliation. The
 /// store checkout's file modes (umask-dependent after a `git` fetch) are canonicalized during the
 /// install, so the placed plugin's permissions are deterministic regardless of how it was fetched.
 pub(crate) fn install_from_store(
@@ -1737,6 +1742,26 @@ fn install_inner(
     if let Err(e) = staged_ok {
         let _ = std::fs::remove_dir_all(&stage);
         return Err(e);
+    }
+    // A store install is held to the catalogue's digest once more, on the staged copy, the bytes
+    // that get placed. The caller checked the checkout, but `sbx plugins store update` replaces
+    // that checkout in one rename and takes no lock an install waits on, so the tree copied need
+    // not be the tree checked. The modes canonicalized above do not move the digest: it reads the
+    // executable bit, which they keep.
+    if let Some(claim) = &expect {
+        let refusal = match catalogue::dir_digest_hex(&stage) {
+            Ok(got) if got == claim.sha256 => None,
+            Ok(got) => Some(format!(
+                "the staged plugin does not match the catalogue (expected {}, got {got}), as \
+                 when the store's checkout is replaced during the install; run it again",
+                claim.sha256
+            )),
+            Err(e) => Some(format!("the staged plugin cannot be hashed: {e}")),
+        };
+        if let Some(refusal) = refusal {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(refusal);
+        }
     }
 
     // A replacement moves the old tree aside first — `rename` cannot overwrite a non-empty
@@ -3526,12 +3551,14 @@ mod tests {
         assert!(p.check_exec().unwrap_err().contains("group or other"));
     }
 
-    /// The claim a store makes about a resolver, as its catalogue would carry it.
-    fn resolver_claim<'a>(name: &'a str, scheme: &'a str) -> StoreClaim<'a> {
+    /// The claim a store makes about a resolver, as its catalogue would carry it: pinned to the
+    /// digest of `source`, the tree its checkout holds.
+    fn resolver_claim<'a>(source: &Path, name: &'a str, scheme: &'a str) -> StoreClaim<'a> {
         StoreClaim {
             name,
             kind: PluginKind::Resolver,
             scheme: Some(scheme),
+            sha256: catalogue::dir_digest_hex(source).expect("a digest of the source"),
         }
     }
 
@@ -3751,7 +3778,7 @@ mod tests {
         install_from_store(
             &layout,
             &from_store,
-            resolver_claim("vault", "secret-store"),
+            resolver_claim(&from_store, "vault", "secret-store"),
             store_origin(),
         )
         .expect("install from the store");
@@ -3856,7 +3883,7 @@ mod tests {
         let installed = install_from_store(
             &layout,
             &source,
-            resolver_claim("pass", "secret-store"),
+            resolver_claim(&source, "pass", "secret-store"),
             store_origin(),
         )
         .expect("install");
@@ -3880,7 +3907,7 @@ mod tests {
         let err = install_from_store(
             &layout,
             &source,
-            resolver_claim("other", "secret-store"),
+            resolver_claim(&source, "other", "secret-store"),
             store_origin(),
         )
         .unwrap_err();
@@ -3904,7 +3931,7 @@ mod tests {
         let err = install_from_store(
             &layout,
             &source,
-            resolver_claim("pass", "vault"),
+            resolver_claim(&source, "pass", "vault"),
             store_origin(),
         )
         .unwrap_err();
@@ -4003,6 +4030,7 @@ mod tests {
                 name: "gpg-agent",
                 kind: PluginKind::Broker,
                 scheme: None,
+                sha256: catalogue::dir_digest_hex(&source).expect("a digest of the source"),
             },
             store_origin(),
         )
@@ -4025,7 +4053,7 @@ mod tests {
         let err = install_from_store(
             &layout,
             &source,
-            resolver_claim("gpg-agent", "gpg"),
+            resolver_claim(&source, "gpg-agent", "gpg"),
             store_origin(),
         )
         .unwrap_err();
@@ -4152,7 +4180,7 @@ mod tests {
         install_from_store(
             &layout,
             &from_store,
-            resolver_claim("pass", "secret-store"),
+            resolver_claim(&from_store, "pass", "secret-store"),
             store_origin(),
         )
         .expect("install");
@@ -4176,19 +4204,34 @@ mod tests {
         let layout = crate::store::Layout::under(data.path());
         let manifest = "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n";
         let first = source_plugin(src_root.path(), "v1", manifest, 0o755);
-        install_from_store(&layout, &first, resolver_claim("kp", "kp"), store_origin())
-            .expect("install");
+        install_from_store(
+            &layout,
+            &first,
+            resolver_claim(&first, "kp", "kp"),
+            store_origin(),
+        )
+        .expect("install");
         assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
 
         // A second tree under the same name: a fresh install refuses it, a replacement is what the
         // upgrade verb needs.
         let second = source_plugin(src_root.path(), "v2", manifest, 0o755);
         fs::write(second.join("resolve"), "#!/bin/sh\necho newer\n").unwrap();
-        let err = install_from_store(&layout, &second, resolver_claim("kp", "kp"), store_origin())
-            .unwrap_err();
+        let err = install_from_store(
+            &layout,
+            &second,
+            resolver_claim(&second, "kp", "kp"),
+            store_origin(),
+        )
+        .unwrap_err();
         assert!(err.contains("already installed"), "{err}");
-        replace_from_store(&layout, &second, resolver_claim("kp", "kp"), store_origin())
-            .expect("replace");
+        replace_from_store(
+            &layout,
+            &second,
+            resolver_claim(&second, "kp", "kp"),
+            store_origin(),
+        )
+        .expect("replace");
 
         // The placed tree is the new one, and the record follows it — otherwise the next `verify`
         // would call a correctly-upgraded plugin modified.
@@ -4220,8 +4263,13 @@ mod tests {
             "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
             0o755,
         );
-        install_from_store(&layout, &good, resolver_claim("kp", "kp"), store_origin())
-            .expect("install");
+        install_from_store(
+            &layout,
+            &good,
+            resolver_claim(&good, "kp", "kp"),
+            store_origin(),
+        )
+        .expect("install");
 
         // A candidate whose manifest disagrees with the catalogue's advertised identity — the same
         // reconciliation an install runs, refused just as hard.
@@ -4231,14 +4279,63 @@ mod tests {
             "name=\"impostor\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
             0o755,
         );
-        let err = replace_from_store(&layout, &bad, resolver_claim("kp", "kp"), store_origin())
-            .unwrap_err();
+        let err = replace_from_store(
+            &layout,
+            &bad,
+            resolver_claim(&bad, "kp", "kp"),
+            store_origin(),
+        )
+        .unwrap_err();
         assert!(err.contains("refusing the mismatch"), "{err}");
 
         // Still installed, still the tree that was there, still matching its record.
         let (reg, _w) = load(&layout.plugins_dir());
         assert_eq!(reg.resolver("kp").map(|p| p.name.as_str()), Some("kp"));
         assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
+    }
+
+    /// The catalogue's digest is checked again on the staged copy, the bytes that get placed. The
+    /// caller checks the checkout first, but `sbx plugins store update` swaps the checkout in one
+    /// rename and takes no lock an install waits on, so the tree copied afterwards need not be the
+    /// tree that was checked. Placed, it would be recorded under its own digest and read as intact
+    /// from then on. Both placements are held to it, the install's and the upgrade's.
+    #[test]
+    fn a_tree_other_than_the_one_the_catalogue_pinned_is_not_placed() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let manifest = "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n";
+        let checked = source_plugin(src_root.path(), "checked", manifest, 0o755);
+        let swapped = source_plugin(src_root.path(), "swapped", manifest, 0o755);
+        fs::write(swapped.join("extra"), "not in the catalogue\n").unwrap();
+        let place = [install_from_store, replace_from_store];
+        for (placement, place) in ["install", "upgrade"].into_iter().zip(place) {
+            let err = place(
+                &layout,
+                &swapped,
+                resolver_claim(&checked, "kp", "kp"),
+                store_origin(),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("does not match the catalogue"),
+                "{placement}: {err}"
+            );
+            assert!(
+                !layout.plugins_dir().join("kp").exists(),
+                "{placement}: the tree was placed"
+            );
+        }
+        let leaked: Vec<_> = fs::read_dir(data.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".plugin-stage-")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "a stage leaked: {leaked:?}");
     }
 
     #[test]

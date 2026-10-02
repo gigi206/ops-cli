@@ -58,7 +58,9 @@ not claim:
   republishes different bytes under the same `rev` is fetched and installed like
   any other update; `store update` says the cache was refetched and the revision
   did not move. What pins a *plugin*'s bytes is the per-entry `sha256`, checked
-  at every install and upgrade.
+  at every install and upgrade, on the store's copy and again on the copy about to
+  be placed, so a `store update` that replaces the cache during an install places
+  nothing.
 - It protects the **catalogue**, not the plugins already in place. Dropping an
   entry stops it being installed again and leaves `plugins upgrade` unable to
   compare it, but the copy under `<data>/plugins/` keeps resolving. A store has
