@@ -704,6 +704,50 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
 
+    /// The exec shim keeps its own exit code when stderr cannot take its message. The code is what
+    /// the launcher reads (126 a refused payload, 127 one that could not run, 96 and 97 a filter
+    /// that never stood up), and a panic on the write replaced every one of them with an abort, the
+    /// release profile's answer to a panic. Driven through the binary sbx embeds, on its usage
+    /// refusal: that comes before any filter is installed, so nothing here needs a cage.
+    #[test]
+    fn the_exec_shim_keeps_its_code_when_stderr_cannot_take_its_message() {
+        use std::os::fd::FromRawFd;
+        use std::process::{Command, Stdio};
+        let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+            skip_incapable!(
+                "skipping the_exec_shim_keeps_its_code_when_stderr_cannot_take_its_message: no /dev/full here"
+            );
+            return;
+        };
+        let data = TmpDir::new();
+        let shim = ensure_proc_shim(&Layout::under(data.path())).expect("place the shim");
+        let said = crate::testutil::output_past_etxtbsy(&mut Command::new(&shim));
+        assert_eq!(said.status.code(), Some(2), "the usage refusal answers 2");
+        assert!(
+            String::from_utf8_lossy(&said.stderr).starts_with("sbx-proc-shim: usage:"),
+            "and says so: {}",
+            String::from_utf8_lossy(&said.stderr)
+        );
+        let mut ends = [0; 2];
+        // SAFETY: `pipe2` fills the two-element array it is handed.
+        assert_eq!(
+            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: the reading end was just opened here and nothing else holds it.
+        unsafe { libc::close(ends[0]) };
+        // SAFETY: the writing end was just opened here, and the `Stdio` takes it over.
+        let closed = unsafe { Stdio::from_raw_fd(ends[1]) };
+        for (stream, stderr) in [("/dev/full", Stdio::from(full)), ("a closed pipe", closed)] {
+            let out = crate::testutil::output_past_etxtbsy(Command::new(&shim).stderr(stderr));
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "with stderr on {stream}, the shim must still answer 2"
+            );
+        }
+    }
+
     /// Whether `dir` holds no entry named like a temp of the placement (`prefix` and anything after
     /// it): the temp's name carries a sequence number now, so the old exact name proves nothing.
     fn no_temp_left(dir: &Path, prefix: &str) -> bool {

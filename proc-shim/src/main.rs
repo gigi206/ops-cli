@@ -33,7 +33,9 @@
 // The same panic gate the launcher carries, and here it costs nothing to hold: this binary has no
 // `unwrap`, `expect`, `panic!` or `unreachable!` of its own, so the lints are a floor rather than a
 // cleanup. They are worth stating on the half that runs *inside* the cage, where a panic is the
-// payload's supervisor dying with the filter still installed. Scoped to `not(test)` for the reason
+// payload's supervisor dying with the filter still installed. The print macros are in it for the
+// same reason as the launcher's: a `print!` or `eprint!` whose write fails panics, and the exit
+// code the panic replaces is the answer the launcher reads. Scoped to `not(test)` for the reason
 // the launcher scopes it: a test asserts by panicking.
 #![cfg_attr(
     not(test),
@@ -41,7 +43,9 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
-        clippy::unreachable
+        clippy::unreachable,
+        clippy::print_stdout,
+        clippy::print_stderr
     )
 )]
 // Every `unsafe` block here states the invariant it rests on: this binary is what sbx binds
@@ -72,8 +76,14 @@ mod exit {
     pub const NOT_EXECUTABLE: i32 = 127;
 }
 
+/// Say why the shim stops, then exit with `code`.
+///
+/// The line is dropped if stderr cannot take it: the code is what the launcher reads, and the panic
+/// an `eprintln!` raises there would replace it with none of the codes above (an abort, under the
+/// release profile sbx embeds).
 fn fail(message: &str, code: i32) -> ! {
-    eprintln!("sbx-proc-shim: {message}");
+    use std::io::Write as _;
+    let _ = writeln!(io::stderr(), "sbx-proc-shim: {message}");
     std::process::exit(code)
 }
 
