@@ -111,7 +111,7 @@ fn detached_child(
         Ok(v) => v,
         // `build` already printed the cause to the terminal; close the pipe (no readiness byte)
         // so the parent reports failure.
-        Err(_) => fail_detached(write_fd),
+        Err(_) => fail_detached(write_fd, None),
     };
     register(
         prep.layout.data_dir(),
@@ -132,7 +132,7 @@ fn detached_child(
                 "sbx: cannot open the session log {}: {e}",
                 log_path.display()
             ));
-            fail_detached(write_fd);
+            fail_detached(write_fd, guard);
         }
     };
 
@@ -153,7 +153,7 @@ fn detached_child(
     // is what the ordering is really for.
     if !redirect_to_log(&log) {
         crate::diag::error("sbx: cannot hand the detached session's output to its log file.");
-        fail_detached(write_fd);
+        fail_detached(write_fd, guard);
     }
     // Ready: tell the parent, and drop the pipe.
     signal_detach_ready(write_fd);
@@ -494,15 +494,23 @@ fn trust_drop_notes(
 
 /// Close the readiness pipe without a success byte and exit non-zero — the daemon failed to set
 /// up. The parent sees the pipe close as failure.
-fn fail_detached(write_fd: libc::c_int) -> ! {
+///
+/// The launch's guard is handed in and dropped first, as the supervised exit drops it: a bare
+/// `process::exit` runs no destructors, so a failure after `build` left the proxy's sockets, the
+/// CA and the other runtime files in place until a later launch swept them by pid.
+fn fail_detached(write_fd: libc::c_int, guard: Option<LaunchGuard>) -> ! {
+    drop(guard);
     // SAFETY: `write_fd` is the readiness pipe's write end, owned by this daemon since the fork and
     // not yet closed; the process exits on the next line, so nothing can use it afterwards.
     unsafe { libc::close(write_fd) };
     std::process::exit(1);
 }
 
-/// Write the readiness byte to the pipe. A short or failed write is non-fatal: the parent then
-/// observes the pipe close as failure, which is the safe interpretation.
+/// Write the readiness byte to the pipe. A failed write does not stop this daemon, so the session
+/// runs whatever the parent concludes. One byte into a fresh pipe nothing else writes fails only
+/// when the reading end is gone (`EPIPE`), that is when the parent is no longer there to conclude
+/// anything; a parent that were still reading would take the closed pipe for a failure to start,
+/// say so, and wait for this daemon, which is to say for the session to end.
 fn signal_detach_ready(write_fd: libc::c_int) {
     let byte = [DETACH_READY];
     // SAFETY: writing one byte to a pipe end we own.
