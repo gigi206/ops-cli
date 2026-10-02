@@ -452,6 +452,12 @@ pub(super) use crate::sandbox::deadline::Deadlined;
 pub(super) const RELAY_CHUNK: usize = 64 * 1024;
 
 /// Copy exactly `n` bytes from `r` to `w`; a short read is an error (a truncated body).
+///
+/// Bounded by size, and in time only read by read: the readers handed in carry the socket's
+/// per-read timeout and no deadline for the whole body, so a peer that sends a byte just inside
+/// each timeout holds this thread, and its connection slot, for as long as it keeps sending. The
+/// slots are the launch's own (`[network] max_connections`), so what a slow body exhausts is its
+/// own session's proxy. The chunked path has the same property, said at [`TRAILER_LINES_MAX`].
 pub(crate) fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) -> io::Result<()> {
     let mut buf = vec![0u8; RELAY_CHUNK];
     while n > 0 {

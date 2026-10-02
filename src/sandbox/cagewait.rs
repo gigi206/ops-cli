@@ -42,6 +42,11 @@ pub(in crate::sandbox) fn ended_on_our_kill(status: ExitStatus) -> bool {
 
 /// Wait for `child` to exit, killing it once `deadline` has passed, polling every `poll`.
 ///
+/// An error from the wait itself is handed back as it is, the child neither killed nor reaped:
+/// `waitpid` fails on a child of this process only when the kernel reaps it unasked, under an
+/// ignored `SIGCHLD`, and sbx takes the default disposition back before it starts anything
+/// (`restore_child_reaping` in `main`).
+///
 /// Answers the exit status and whether the ceiling is what ended the run. That second half is not
 /// readable from the first alone — a cage killed here exits on a signal, which is exactly what a
 /// cage signalled for any other reason reports too — so it is read through [`ended_on_our_kill`],
