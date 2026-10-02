@@ -64,6 +64,12 @@ none or a session refused the rule, since the rule is then not in force where it
 be. A session whose proxy kept an egress rule without confirming it exits 2, as the
 [`sbx net pending`](../cli/net#sbx-net-pending) answers do.
 
+A view given no session id reads the session of the project it runs in: `sbx logs`, `sbx proc
+ls|live|logs`, `sbx fs logs` and `sbx ssh-agent logs`. When that project has no session to
+read (none live and, for the log views, no record of a finished one), or several live ones to
+choose between, the view has nothing it was named to show and exits 2, as a name that names
+nothing does; name one by the PID [`sbx session ls`](../cli/session#ls) shows.
+
 ## Launch verbs propagate the command's status
 
 [`sbx run`](../cli/run) and [`sbx app`](../cli/app)

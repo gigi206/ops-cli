@@ -435,6 +435,13 @@ Leave it alone otherwise: the direction that matters is up, and raising it raise
 what the cap bounds. Zero is warned and ignored; a cage that should reach nothing is
 `network = "none"`.
 
+A connection is held for as long as its client keeps sending. A request body is bounded by
+size (`body_max_mb`) and each read of it by a timeout, but the body as a whole has no
+deadline, so a caller that sends a byte just inside each timeout keeps its connection, and
+its slot, for as long as it likes. Every launch starts a proxy of its own, so what such a
+caller ties up is its own cage's slots and nobody else's; a deadline on the whole body would
+cut off an upload that is slow for an honest reason.
+
 Like the rest of the table this is trusted and global-only, so a global config can set it for
 a project that has no way to observe it: nothing in the cage can tell whether a connection
 was reused. Whenever a layer turns it off, [`sbx config`](../cli/config) says so.

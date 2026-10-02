@@ -141,6 +141,15 @@ That refusal, and the one for a program that is nowhere in the cage, arrives **w
 is invoked**, not at load: which binary a name reaches is a fact about the cage, and there is no cage
 until then. So a task can list cleanly and refuse on its first run, naming the program either way.
 
+Two scripts become one caller the same way, and this form sbx cannot warn about. A script's
+caller is the interpreter its `#!` line names, the program the kernel loaded, so two scripts
+whose `#!` lines name one interpreter are the same caller. A script in the project can be
+rewritten by the session's own agent: two sections whose scripts name different interpreters
+pass the check above, and if the scripts are aligned after it, they arrive as one caller when
+the operation runs. The bound is the same, the programs the declaration admits; telling them
+apart would mean addressing a caller by the `execve` it came from rather than by the program
+it is.
+
 **A refusal names who reached and what for**, because under this model the target alone misleads: a
 program can be declared and still refused, to whoever reached for it:
 
