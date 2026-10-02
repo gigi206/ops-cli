@@ -435,10 +435,10 @@ Leave it alone otherwise: the direction that matters is up, and raising it raise
 what the cap bounds. Zero is warned and ignored; a cage that should reach nothing is
 `network = "none"`.
 
-A connection is held for as long as its client keeps sending. A request body is bounded by
-size (`body_max_mb`) and each read of it by a timeout, but the body as a whole has no
-deadline, so a caller that sends a byte just inside each timeout keeps its connection, and
-its slot, for as long as it likes. Every launch starts a proxy of its own, so what such a
+A connection is held for as long as its client keeps sending. A body the proxy holds is capped
+by `body_max_mb`, a streamed one by the length it declared, and every read of either has a
+timeout, but no body has a deadline as a whole: a caller that sends a byte just inside each
+timeout keeps its connection, and its slot, for as long as it likes. Every launch starts a proxy of its own, so what such a
 caller ties up is its own cage's slots and nobody else's; a deadline on the whole body would
 cut off an upload that is slow for an honest reason.
 
