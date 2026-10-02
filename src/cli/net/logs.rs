@@ -217,7 +217,11 @@ fn display_log_path(path: &str, with_query: bool) -> &str {
 /// hundreds of events it still had. Counted over the merged rings the number is what it claims to
 /// be: how many events the session recorded before the oldest one it still holds.
 fn snapshot_evicted(snapshot: &sandbox::control::LogSnapshot) -> u64 {
-    snapshot.events.first().map(|e| e.seq - 1).unwrap_or(0)
+    snapshot
+        .events
+        .first()
+        .map(|e| e.seq.saturating_sub(1))
+        .unwrap_or(0)
 }
 
 /// `sbx net logs [-a|--app <name>] [--host <h>] [--verdict …] [-n <N>] [--with-query] [--json]`:
@@ -877,7 +881,7 @@ fn log_event_json(
         "seq": e.seq,
         "project": project,
         "label": label,
-        "at_epoch_ms": e.at_epoch_ms as u64,
+        "at_epoch_ms": crate::cli::json_epoch_ms(e.at_epoch_ms),
         "host": e.host,
         "port": e.port,
         "method": e.method,

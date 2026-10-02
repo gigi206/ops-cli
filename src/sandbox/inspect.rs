@@ -1550,7 +1550,8 @@ pub(crate) fn home_composition(home: &Path) -> Vec<HomeEntry> {
                 })
                 .collect(),
         );
-        if whole.bytes == 0 || leader_bytes * 100 / whole.bytes < PASSTHROUGH_PERCENT {
+        if whole.bytes == 0 || leader_bytes.saturating_mul(100) / whole.bytes < PASSTHROUGH_PERCENT
+        {
             break;
         }
         let next = dir.join(&leader);

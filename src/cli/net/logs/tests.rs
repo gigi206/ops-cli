@@ -893,6 +893,23 @@ fn render_logs_surfaces_ring_eviction_rather_than_truncating_silently() {
     );
 }
 
+/// A `seq` of 0 counts no eviction rather than panicking. The ring numbers from 1, but this reads
+/// the number off the control socket, and `overflow-checks` turns the subtraction into a panic of
+/// `sbx net logs` for whatever sent it.
+#[test]
+fn a_zero_seq_counts_no_eviction() {
+    use sandbox::control::LogVerdict::Allow;
+    let snapshot = sandbox::control::LogSnapshot {
+        events: vec![log_event(0, "api.test", None, None, Allow, "allowed")],
+        dropped: 0,
+        head: 0,
+        amend_head: 0,
+        captures: Vec::new(),
+        capture_evicted: 0,
+    };
+    assert_eq!(snapshot_evicted(&snapshot), 0);
+}
+
 #[test]
 fn a_muted_event_is_neither_shown_nor_counted_as_an_eviction() {
     use sandbox::control::{LogVerdict::*, SessionLog};

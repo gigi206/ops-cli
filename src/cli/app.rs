@@ -2017,14 +2017,17 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
             );
             // Percentages are of the home rather than of the app directory the total covers, so a
             // level's shares add up to what the reader sees listed.
-            let held: u64 = home
+            let held = home
                 .entries
                 .iter()
                 .filter(|e| e.depth == 0)
-                .map(|e| e.bytes)
-                .sum();
+                .fold(0u64, |sum, e| sum.saturating_add(e.bytes));
             for entry in &home.entries {
-                let share = (entry.bytes * 100).checked_div(held).unwrap_or(0);
+                let share = entry
+                    .bytes
+                    .saturating_mul(100)
+                    .checked_div(held)
+                    .unwrap_or(0);
                 // The indent is part of the name column rather than added before it, so the sizes
                 // stay in one column however deep the view went.
                 let name = format!("{:indent$}{}", "", entry.rel, indent = entry.depth * 2);
