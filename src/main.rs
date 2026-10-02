@@ -975,6 +975,26 @@ fn in_scope(pid: u32, project_pids: &ScopeFilter, app_pids: &ScopeFilter) -> boo
     passes(project_pids) && passes(app_pids)
 }
 
+/// The exit code a `--session` rule load ends with, from how many sessions in scope `held` the rule,
+/// `refused` it, or kept it without their proxy confirming it decides requests (`unconfirmed`).
+///
+/// A load succeeds only when every session it reached holds the rule, and it reached at least one.
+/// A session that refused it, one running an sbx too old to load a live rule, goes on without it,
+/// and a load that reached none applied nothing: both exit 1, so `sbx net deny X --session && …`
+/// does not go on as if X were denied there. An unconfirmed session exits 2, the code the answer by
+/// id and the drain give the same state. Shared by `sbx net allow|deny|mute --session` and `sbx proc
+/// allow|deny --session` for the reason [`session_scope_pids`] is: two copies of when a live rule
+/// counts as loaded would come to disagree.
+fn session_load_code(held: usize, refused: usize, unconfirmed: usize) -> ExitCode {
+    if unconfirmed > 0 {
+        ExitCode::from(2)
+    } else if refused > 0 || held == 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 /// An event's wall-clock time of day as local `hh:mm:ss` — a stable, correlatable stamp for a log
 /// (the JSON keeps the absolute `at_epoch_ms`). Local time comes from the process timezone via the C
 /// library (`localtime_r`, the reentrant/thread-safe form); a conversion failure (an implausible
@@ -2143,6 +2163,19 @@ mod tests {
         assert_eq!(path, explicit);
         assert_eq!(key, None);
         assert_eq!(target, "/etc/sbx.toml");
+    }
+
+    /// A `--session` load succeeds only when it reached a session and every one it reached holds
+    /// the rule; an unconfirmed session keeps the code the answer by id gives it.
+    #[test]
+    fn a_session_load_succeeds_only_when_every_session_it_reached_holds_the_rule() {
+        assert_eq!(session_load_code(2, 0, 0), ExitCode::SUCCESS);
+        // Reached none, every one refused, or one of several refused: the rule is not in force.
+        assert_eq!(session_load_code(0, 0, 0), ExitCode::FAILURE);
+        assert_eq!(session_load_code(0, 1, 0), ExitCode::FAILURE);
+        assert_eq!(session_load_code(1, 1, 0), ExitCode::FAILURE);
+        assert_eq!(session_load_code(1, 0, 1), ExitCode::from(2));
+        assert_eq!(session_load_code(0, 1, 1), ExitCode::from(2));
     }
 
     #[test]

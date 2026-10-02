@@ -214,6 +214,7 @@ fn proc_inject_session(
     };
     let mut loaded: Vec<u32> = Vec::new();
     let mut inert: Vec<u32> = Vec::new();
+    let mut refused: Vec<u32> = Vec::new();
     for s in sessions {
         let pid = s.pid;
         if !in_scope(pid, &project_pids, &app_pids) {
@@ -223,8 +224,9 @@ fn proc_inject_session(
         match sandbox::proc_control::inject_proc_rule(&socket, verdict, rule) {
             Ok(sandbox::proc_control::InjectOutcome::Loaded) => loaded.push(pid),
             Ok(sandbox::proc_control::InjectOutcome::Inert) => inert.push(pid),
-            // Refused (an older server) or a dead/non-enforcing socket — skip it.
-            Ok(sandbox::proc_control::InjectOutcome::Refused) | Err(_) => {}
+            Ok(sandbox::proc_control::InjectOutcome::Refused) => refused.push(pid),
+            // A dead socket, or a session that does not enforce `[proc]`: nothing to load into.
+            Err(_) => {}
         }
     }
 
@@ -258,14 +260,24 @@ fn proc_inject_session(
                 .join(", ")
         ));
     }
-    if loaded.is_empty() && inert.is_empty() {
+    if !refused.is_empty() {
+        diag::error(&format!(
+            "sbx: session(s) {} refused the rule (an older sbx without --session rule support, or a \
+             rule its server cannot load): it is not in force there",
+            refused
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    } else if loaded.is_empty() && inert.is_empty() {
         diag::error(
             "sbx: no enforcing session in scope to load the rule into — launch one with `[proc] mode \
              = \"enforce\"`/`\"ask\"`, or write it to config (drop --session)",
         );
-        return ExitCode::from(1);
     }
-    ExitCode::SUCCESS
+    // An inert `allow` holds its effect already: under `enforce` everything not denied runs.
+    crate::session_load_code(loaded.len() + inert.len(), refused.len(), 0)
 }
 
 /// `sbx proc rules [-a <app>] [--all]`: list the live `--session` rule overlay of the running
@@ -863,5 +875,71 @@ mod tests {
             parse_proc_live_args(&osv(&["1", "2"])).is_err(),
             "at most one id"
         );
+    }
+
+    /// The `[proc]` twin of the egress load: a session in scope that refused a `--session` rule does
+    /// not hold it, so the load exits 1 even though another session took it.
+    #[test]
+    fn a_session_rule_a_session_refused_exits_1() {
+        use crate::session::{self, Kind, Registry, Session, SessionRuntime};
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+        // Two live sessions: this process, and a child that outlives the load.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("start a second live process");
+        let me = Session::current(PathBuf::from("/test"), Kind::Run, SessionRuntime::Project)
+            .expect("read this process's session identity");
+        let other = Session {
+            pid: child.id(),
+            start_ticks: session::read_start_ticks(child.id()).expect("the child's start time"),
+            ..me.clone()
+        };
+        let registry = Registry::at(data.path());
+        let mut stand_ins = Vec::new();
+        for (s, reply) in [(&me, "ok"), (&other, "err unknown command")] {
+            registry.register(s).expect("register the session");
+            let socket = sandbox::proc_control::proc_control_socket(data.path(), s.pid);
+            std::fs::create_dir_all(socket.parent().unwrap())
+                .expect("create the control directory");
+            let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
+            let session = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept the rule load");
+                let mut cmd = String::new();
+                BufReader::new(&stream)
+                    .read_line(&mut cmd)
+                    .expect("read the command");
+                (&stream)
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .expect("write the reply");
+                cmd.trim_end().to_string()
+            });
+            stand_ins.push((socket, session));
+        }
+
+        let code = proc_inject_session(
+            config::manage::ProcList::Deny,
+            "curl",
+            true,
+            None,
+            data.path(),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        for (socket, session) in stand_ins {
+            // Unblock a stand-in the load never reached, so a failure reports itself.
+            if let Ok(poke) = UnixStream::connect(&socket) {
+                let _ = (&poke).write_all(b"QUIT\n");
+            }
+            let received = session.join().expect("the stand-in session thread");
+            assert_eq!(received, "REMEMBER DENY curl");
+        }
+        assert_eq!(code, ExitCode::FAILURE);
     }
 }

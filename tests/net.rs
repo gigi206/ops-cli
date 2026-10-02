@@ -566,12 +566,21 @@ fn net_mute_with_no_posture_is_refused() {
         "the refusal must point at setting a posture:\n{}",
         String::from_utf8_lossy(&refused.stderr)
     );
-    // `--session` mute is supported (a live log filter): with no running session it is a benign
-    // no-op — it must be accepted (exit 0), not refused, and never touch a config file.
+    // `--session` mute is supported (a live log filter): it is a load, not the posture refusal above.
+    // With no running session it reaches none and exits 1 like every `--session` load that applied
+    // nothing, says so, and never touches a config file.
     let sess = fx.run(&["net", "mute", "x.test", "--session"]);
+    assert_eq!(
+        sess.status.code(),
+        Some(1),
+        "a --session mute that reached no session applied nothing:\n{}",
+        String::from_utf8_lossy(&sess.stderr)
+    );
     assert!(
-        sess.status.success(),
-        "a --session mute with no live session is a benign no-op, not an error:\n{}",
+        String::from_utf8_lossy(&sess.stdout).contains("no reachable session")
+            && !String::from_utf8_lossy(&sess.stderr).contains("posture"),
+        "a --session mute must be taken as a load, not refused for its posture:\n{}{}",
+        String::from_utf8_lossy(&sess.stdout),
         String::from_utf8_lossy(&sess.stderr)
     );
     assert!(
@@ -2971,10 +2980,15 @@ fn net_allow_session_validates_flags_and_reports_when_no_session_is_reachable() 
         "--all without --session must be refused"
     );
 
-    // With no live ask-mode session, a `--session` load is a clean no-op (exit 0) that says so for
-    // the scope and points at the persistent alternative — it must NOT write the config.
+    // With no live session in scope, a `--session` load applied nothing: it exits 1, says so for the
+    // scope and points at the persistent alternative, and it must NOT write the config.
     let out = fx.run(&["net", "allow", "github.com", "--session"]);
-    assert!(out.status.success(), "a no-session load is a clean success");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a load that reached no session is not a success: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("no reachable session with egress filtering for this project")

@@ -255,7 +255,9 @@ sbx proc allow git --session -a claude-code   # un-park `git` in that app's ask 
 It writes **no config** (so, unlike a config write, it never re-trusts the project) and scopes to the
 current project by default; `-a <app>` / `--all` widen it, and the config-scope flags (`-l`/`-g`) do
 not apply. A `--session allow` only loads into an `ask` session (it is inert under `enforce`, and is
-reported as such). It governs **future** execs: it does not un-park (`allow`) or retroactively
+reported as such). A load that reached no enforcing session in scope, or that a session refused,
+exits 1: the rule is not in force there. An inert `allow` does not fail it, since under `enforce`
+everything not denied already runs. It governs **future** execs: it does not un-park (`allow`) or retroactively
 refuse (`deny`) an `execve` already parked; decide those with [`pending`](#pending).
 
 ## `unallow` / `undeny`

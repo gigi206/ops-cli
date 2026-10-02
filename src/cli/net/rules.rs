@@ -499,7 +499,8 @@ pub(super) fn net_remove_rule(list: config::manage::EgressList, args: &[OsString
 /// `--all` widens to every reachable session. The proxy folds the overlay into its effective policy
 /// in every filtering posture (allowlist, denylist, `ask`), so a loaded rule decides immediately
 /// wherever it lands; a session running an sbx whose control server predates `REMEMBER` refuses the
-/// load and is named in the report rather than silently skipped.
+/// load and is named in the report rather than silently skipped. The exit code is
+/// [`crate::session_load_code`]'s.
 fn net_inject_session(
     list: config::manage::EgressList,
     rule: &str,
@@ -569,12 +570,9 @@ fn net_inject_session(
             &pal
         )
     );
-    // A rule a session's proxy did not confirm may not be deciding its requests: a script must not
-    // go on as if it were.
-    match unconfirmed.is_empty() {
-        true => ExitCode::SUCCESS,
-        false => ExitCode::from(2),
-    }
+    // A session in scope that does not hold the rule, or a load that reached none, is not a success
+    // a script may go on from.
+    crate::session_load_code(loaded.len(), refused.len(), unconfirmed.len())
 }
 
 /// Render a `--session` rule load: which live sessions took the rule (with their agent/project
@@ -717,19 +715,17 @@ fn persist_egress_removal(
 mod tests {
     use super::*;
 
-    /// A `--session` rule that a session's proxy did not confirm exits 2, so a script does not go
-    /// on as if the rule decided its requests there.
-    #[test]
-    fn a_session_rule_the_proxy_did_not_confirm_exits_2() {
-        use crate::testutil::{EnvVar, TmpDir, env_lock};
+    /// A stand-in for session `pid` under `data`: its egress control socket answers the one rule
+    /// load it accepts with `reply`, and the thread hands back the command it received.
+    fn stand_in_session(
+        data: &Path,
+        pid: u32,
+        reply: String,
+    ) -> (PathBuf, std::thread::JoinHandle<String>) {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
-        let _lock = env_lock();
-        let data = TmpDir::new();
-        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
-        let pid = 424_244u32;
-        let egress = data.path().join("egress");
+        let egress = data.join("egress");
         std::fs::create_dir_all(&egress).expect("create the control directory");
         let socket = egress.join(format!("control-{pid}.sock"));
         let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
@@ -739,12 +735,38 @@ mod tests {
             BufReader::new(&stream)
                 .read_line(&mut cmd)
                 .expect("read the command");
-            let reply = format!("{}\n", sandbox::control::UNCONFIRMED);
             (&stream)
-                .write_all(reply.as_bytes())
+                .write_all(format!("{reply}\n").as_bytes())
                 .expect("write the reply");
             cmd.trim_end().to_string()
         });
+        (socket, session)
+    }
+
+    /// The command a stand-in session received. A stand-in still waiting on `accept` (the load never
+    /// reached it) is unblocked first, so a failure reports itself instead of hanging the suite.
+    fn received(socket: &Path, session: std::thread::JoinHandle<String>) -> String {
+        use std::io::Write;
+        if let Ok(poke) = std::os::unix::net::UnixStream::connect(socket) {
+            let _ = (&poke).write_all(b"QUIT\n");
+        }
+        session.join().expect("the stand-in session thread")
+    }
+
+    /// A `--session` rule that a session's proxy did not confirm exits 2, so a script does not go
+    /// on as if the rule decided its requests there.
+    #[test]
+    fn a_session_rule_the_proxy_did_not_confirm_exits_2() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+        let (socket, session) = stand_in_session(
+            data.path(),
+            424_244,
+            sandbox::control::UNCONFIRMED.to_string(),
+        );
 
         let code = net_inject_session(
             config::manage::EgressList::Deny,
@@ -753,14 +775,38 @@ mod tests {
             None,
             data.path(),
         );
-        // Unblock a stand-in still waiting on `accept` (the load never reached it), so a failure
-        // reports itself instead of hanging the suite.
-        if let Ok(poke) = std::os::unix::net::UnixStream::connect(&socket) {
-            let _ = (&poke).write_all(b"QUIT\n");
-        }
-        let loaded = session.join().expect("the stand-in session thread");
-        assert_eq!(loaded, "REMEMBER DENY api.test");
+        assert_eq!(received(&socket, session), "REMEMBER DENY api.test");
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+    }
+
+    /// A session in scope that refused a `--session` rule does not hold it, whether the others took
+    /// it or there were none: the load exits 1, so `sbx net deny X --session && …` does not go on as
+    /// if X were denied in a session whose sbx is too old to load it.
+    #[test]
+    fn a_session_rule_a_session_refused_exits_1() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+
+        let _lock = env_lock();
+        for replies in [&["err unknown command"][..], &["ok", "err unknown command"]] {
+            let data = TmpDir::new();
+            let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+            let sessions: Vec<_> = (424_250u32..)
+                .zip(replies)
+                .map(|(pid, reply)| stand_in_session(data.path(), pid, reply.to_string()))
+                .collect();
+
+            let code = net_inject_session(
+                config::manage::EgressList::Deny,
+                "api.test",
+                true,
+                None,
+                data.path(),
+            );
+            for (socket, session) in sessions {
+                assert_eq!(received(&socket, session), "REMEMBER DENY api.test");
+            }
+            assert_eq!(code, ExitCode::FAILURE, "sessions answering {replies:?}");
+        }
     }
 
     #[test]

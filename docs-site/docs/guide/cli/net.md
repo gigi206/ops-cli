@@ -85,7 +85,9 @@ proactive sibling of [`sbx net pending allow <id> --session`](../networking/ask)
 a request that already parked. The command returns once each session's proxy has confirmed it
 holds the rule, so the next request there is decided by it; a session whose proxy did not
 confirm it is named as such, the command exits with code 2, and running it again pushes the
-rule once more. It writes no file (so it never re-trusts the project) and dies with the
+rule once more. A load that reached no session in scope, or that a session refused (one
+running an sbx too old to load a live rule), exits 1: the rule is not in force there. It
+writes no file (so it never re-trusts the project) and dies with the
 session. By default it scopes to the current project's session(s); `-a <app>` narrows to one
 app, `--all` widens to every reachable session. The config-scope flags (`-l`/`-g`) do not apply
 with `--session`; only a filtering posture runs the proxy, so a `shared`/`none` session has

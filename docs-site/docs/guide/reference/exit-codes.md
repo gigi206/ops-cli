@@ -47,6 +47,12 @@ sessions of that app hold, so an app with none running, whatever its name, is an
 reads the config instead, as `sbx net rules` and `sbx config show` do, it names a declared app,
 and one that is not declared exits 2.
 
+A `--session` rule load is not a name either. `sbx net allow|deny|mute --session` and `sbx proc
+allow|deny --session` load a rule into the live sessions in scope, and exit 1 when that reached
+none or a session refused the rule, since the rule is then not in force where it was meant to
+be. A session whose proxy kept an egress rule without confirming it exits 2, as the
+[`sbx net pending`](../cli/net#sbx-net-pending) answers do.
+
 ## Launch verbs propagate the command's status
 
 [`sbx run`](../cli/run) and [`sbx app`](../cli/app)
