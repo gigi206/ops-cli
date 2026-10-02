@@ -6676,7 +6676,9 @@ fn a_human_answer_to_a_closed_pipe_is_not_a_panic() {
 #[test]
 fn an_answer_that_cannot_be_written_is_a_failure() {
     let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
-        eprintln!("skipping: this host has no /dev/full");
+        skip_incapable!(
+            "skipping an_answer_that_cannot_be_written_is_a_failure: no /dev/full here"
+        );
         return;
     };
     let p = Project::new("fullout");
