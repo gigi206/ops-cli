@@ -1336,7 +1336,9 @@ const NIX_STATE_FILES: &[&str] = &[
 /// own pid. Anything else is refused before `nix-store` is started, and left in place for the user
 /// to see.
 ///
-/// A missing directory is created, as `nix-store` would create it. The names are checked, not held:
+/// A missing directory is created, as `nix-store` would create it, and one the owner can no longer
+/// write to or enter is given those bits back ([`restore_owner_access`]). The names are checked, not
+/// held:
 /// the tree is still the cage's between this check and the `nix-store` run. `sbx gc` refuses a
 /// store a live cage of the project holds. A launch does not, since two launches of one project
 /// may run at once, so a cage of the project that is running while another launch seeds can
@@ -1346,6 +1348,7 @@ const NIX_STATE_FILES: &[&str] = &[
 /// a failure inside that cage. `sbx gc` runs its own in a cage too ([`HeldStore`]), and there the
 /// check names a planted entry before the collection starts.
 fn ensure_nix_state(store_dir: &Path) -> io::Result<()> {
+    restore_owner_access(store_dir)?;
     for rel in NIX_STATE_DIRS {
         ensure_dir_chain(store_dir, rel)?;
     }
@@ -1355,6 +1358,44 @@ fn ensure_nix_state(store_dir: &Path) -> io::Result<()> {
     }
     for entry in fs::read_dir(nix.join("var/nix/temproots"))? {
         refuse_unless_file(&entry?.path())?;
+    }
+    Ok(())
+}
+
+/// Give the owner back read, write and search on `nix/`, its `store`, and each directory on the way
+/// to [`NIX_STATE_DIRS`]: `nix-store` writes into every one of them and fails with `Permission
+/// denied` where it cannot, a deduplication in a `.links` the owner may not write to included. The
+/// cage runs as the owner and may take those bits away, and nothing else is changed: the other
+/// bits are kept, a directory that has them is not touched, and the store paths, read-only by
+/// design, are not on the way. Top down and through a descriptor each, so a directory is searchable
+/// before the walk enters it and a link on the way refuses the store as the walk does
+/// ([`super::cagedir::hold_beneath`]). A directory not there yet is left to [`ensure_dir_chain`].
+fn restore_owner_access(store_dir: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    let mut done = std::collections::BTreeSet::new();
+    for rel in std::iter::once("store").chain(NIX_STATE_DIRS.iter().copied()) {
+        let mut at = PathBuf::from("nix");
+        for part in std::iter::once(None).chain(Path::new(rel).components().map(Some)) {
+            if let Some(part) = part {
+                at.push(part);
+            }
+            if !done.insert(at.clone()) {
+                continue;
+            }
+            let dir = match super::cagedir::hold_beneath(store_dir, &at) {
+                Ok(dir) => dir,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e),
+            };
+            // Through the descriptor's own link: an `O_PATH` descriptor takes no `fchmod`, and the
+            // link names the directory it was opened on, not a name the cage could repoint.
+            let held = format!("/proc/self/fd/{}", dir.as_raw_fd());
+            let mode = fs::metadata(&held)?.permissions().mode() & 0o7777;
+            if mode & 0o700 != 0o700 {
+                fs::set_permissions(&held, fs::Permissions::from_mode(mode | 0o700))?;
+            }
+        }
     }
     Ok(())
 }
@@ -2593,6 +2634,38 @@ mod tests {
             ]
             .map(std::ffi::OsString::from)
         );
+    }
+
+    /// What `nix-store` writes into is given back to its owner when the cage took the write or the
+    /// search away, the other bits kept, and nothing else changes: a store path keeps its read-only
+    /// mode, and a directory that has its owner's bits is left as it is.
+    #[test]
+    fn the_owner_gets_back_what_nix_store_writes_into() {
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        ensure_nix_state(&store_dir).unwrap();
+        let nix = store_dir.join("nix");
+        let path = nix.join("store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x");
+        std::fs::create_dir(&path).unwrap();
+        let set = |rel: &Path, mode: u32| {
+            std::fs::set_permissions(rel, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let mode = |at: &Path| std::fs::symlink_metadata(at).unwrap().mode() & 0o7777;
+        set(&path, 0o555);
+        set(&nix.join("var/nix/gcroots"), 0o750);
+        set(&nix.join("store/.links"), 0o555);
+        set(&nix.join("var/nix/db"), 0o500);
+        set(&nix.join("var/nix"), 0o100);
+        set(&nix.join("store"), 0o500);
+
+        ensure_nix_state(&store_dir).unwrap();
+
+        assert_eq!(mode(&nix.join("store")), 0o700);
+        assert_eq!(mode(&nix.join("store/.links")), 0o755);
+        assert_eq!(mode(&nix.join("var/nix")), 0o700);
+        assert_eq!(mode(&nix.join("var/nix/db")), 0o700);
+        assert_eq!(mode(&nix.join("var/nix/gcroots")), 0o750);
+        assert_eq!(mode(&path), 0o555, "a store path is read-only by design");
     }
 }
 

@@ -58,7 +58,9 @@ writes to is checked: its database directory, its lock, root and profile directo
 temporary roots and its deduplication pool must be real directories, and the database files,
 its locks and the temporary roots must be regular files. A symlink or anything else in their
 place stops the launch or the collection with that entry's path, and `nix-store` does not
-run. The check runs again when the registration fails, so an entry a running cage of the
+run. One of those directories that its owner can no longer write to or enter, such as a
+deduplication pool made read-only, gets those permissions back first, since `nix-store`
+fails on it otherwise. The check runs again when the registration fails, so an entry a running cage of the
 project put there in the meantime is reported the same way. The copy of the seed creates
 each of its entries afresh, and one already at its name is reported by its path too. The
 entry is left where it is, so you can see it: remove it by hand, then run again.

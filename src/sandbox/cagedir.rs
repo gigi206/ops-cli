@@ -14,7 +14,8 @@
 //! The rule lives here, in one walk, for the trees a cage holds through a bind. [`ensure_under`]
 //! and [`hold_under`] create what is missing and hand back the leaf's path or its descriptor;
 //! [`open_beneath`] creates nothing and hands back a descriptor for a listing or a removal
-//! ([`super::gc`](mod@super::gc)). The live-theme keyfile write ([`super::theme_relay`]), the
+//! ([`super::gc`](mod@super::gc)), and [`hold_beneath`] holds one by `O_PATH`, for a mode to be set
+//! through it (the project store's state directories). The live-theme keyfile write ([`super::theme_relay`]), the
 //! project store's seed and the mise plugin registration take the descriptor and write through
 //! [`entry`]; the seed opens each directory it makes through [`open_entry_dir`]. The image unpack
 //! asks another question of a tree no cage holds (`distro::layers`): which component of a layer
@@ -94,6 +95,13 @@ pub(crate) fn open_beneath(root: &Path, rel: &Path) -> io::Result<OwnedFd> {
     walk(root, rel, None, libc::O_RDONLY).map(|(_, dir)| dir)
 }
 
+/// [`open_beneath`], holding the leaf by `O_PATH` rather than open for reading: nothing is created,
+/// the same names are refused, and a directory its owner may not read is reached all the same, for
+/// its mode to be set through `/proc/self/fd/<n>`.
+pub(crate) fn hold_beneath(root: &Path, rel: &Path) -> io::Result<OwnedFd> {
+    walk(root, rel, None, libc::O_PATH).map(|(_, dir)| dir)
+}
+
 /// The path naming `name` inside the directory `dir` holds: `/proc/self/fd/<n>/<name>`.
 ///
 /// The kernel resolves `/proc/self/fd/<n>` to the directory the descriptor was opened on, not to a
@@ -163,7 +171,8 @@ pub(crate) fn shown(dir: &OwnedFd, name: &OsStr) -> PathBuf {
         .join(name)
 }
 
-/// The walk behind [`ensure_under`], [`hold_under`] and [`open_beneath`]: the leaf's path, and the
+/// The walk behind [`ensure_under`], [`hold_under`], [`open_beneath`] and [`hold_beneath`]: the
+/// leaf's path, and the
 /// descriptor the walk reached it with, each component opened with `access` (`O_PATH` or
 /// `O_RDONLY`). `make` is the mode a missing component is created with, the anchor included; with
 /// `None` nothing is created, and a missing component is the error it is.

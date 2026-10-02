@@ -361,11 +361,11 @@ fn gc_live_session_refusal(
 /// which the caller treats as fatal — except under `--all`, where the reap has already run.
 ///
 /// Limitation (a follow-up): a build the agent roots only by an out-link at a path that exists in
-/// its cage alone — a raw `nix build --out-link` into its home or its `/tmp`, outside the supported
-/// self-equip paths (`sbx mise`, `nix profile`, declared `flake:` packages) — is not seen: the
-/// collection answers for an out-link from the host ([`crate::sandbox::projectstore::HeldStore`]),
-/// where that path is not the cage's, and the build would be collected. The supported self-equip
-/// paths all root by store path, so they survive.
+/// its cage alone is not seen, such as a raw `nix build --out-link` into its home or its `/tmp`,
+/// outside the supported self-equip paths (`sbx mise`, `nix profile`, declared `flake:` packages).
+/// The collection answers for an out-link from the host
+/// ([`crate::sandbox::projectstore::HeldStore`]), where that path is not the cage's, and the build
+/// would be collected. The supported self-equip paths all root by store path, so they survive.
 fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Result<(), ExitCode> {
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
 
