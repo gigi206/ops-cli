@@ -2920,10 +2920,12 @@ fn resolve(
                     plugins,
                 );
             } else {
-                let n = count_host_secrets(&section.hosts);
-                if n > 0 {
-                    gate.refuse(&format!("{n} secret(s)"), &mut warnings);
-                }
+                gate.refuse_section(
+                    count_host_secrets(&section.hosts),
+                    "secret(s)",
+                    section.defaults.is_some().then_some("`[secret.defaults]`"),
+                    &mut warnings,
+                );
             }
         }
         // The `[task]` section is a security field, and the strongest one a project could reach for:
@@ -2950,8 +2952,13 @@ fn resolve(
                     &project_secret_defaults,
                     plugins,
                 );
-            } else if !section.tasks.is_empty() {
-                gate.refuse(&format!("{} task(s)", section.tasks.len()), &mut warnings);
+            } else {
+                gate.refuse_section(
+                    section.tasks.len(),
+                    "task(s)",
+                    section.defaults.is_some().then_some("`[task.defaults]`"),
+                    &mut warnings,
+                );
             }
         }
     }

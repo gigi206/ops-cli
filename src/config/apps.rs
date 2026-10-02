@@ -1024,10 +1024,12 @@ fn resolve_app(
                     plugins,
                 );
             } else {
-                let n = count_host_secrets(&section.hosts);
-                if n > 0 {
-                    gate.refuse(&format!("{n} secret(s)"), &mut warnings);
-                }
+                gate.refuse_section(
+                    count_host_secrets(&section.hosts),
+                    "secret(s)",
+                    section.defaults.is_some().then_some("`[secret.defaults]`"),
+                    &mut warnings,
+                );
             }
         }
         // A project layer's tasks mirror its secrets: a trusted project may declare tasks on its own
@@ -1048,8 +1050,13 @@ fn resolve_app(
                     project_secret_defaults,
                     plugins,
                 );
-            } else if !section.tasks.is_empty() {
-                gate.refuse(&format!("{} task(s)", section.tasks.len()), &mut warnings);
+            } else {
+                gate.refuse_section(
+                    section.tasks.len(),
+                    "task(s)",
+                    section.defaults.is_some().then_some("`[task.defaults]`"),
+                    &mut warnings,
+                );
             }
         }
         // The contract rides with `cmd`: a layer allowed to set the command sets the contract with

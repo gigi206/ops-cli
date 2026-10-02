@@ -131,7 +131,8 @@ The `[secret]` section is a **security field**: it is honored from the global
 config or a **trusted** project, and dropped from an untrusted one: the same
 gate that governs `binds`, `network`, and `nixpkgs`. An untrusted project can
 declare a `[secret]` section all it likes; the whole section is discarded before
-any resolver scheme is even looked up. See
+any resolver scheme is even looked up, and a warning names what went: the count of
+its secrets, its `[secret.defaults]`, or both. See
 [Security model](../concepts/security-model) and
 [The trust gate](../concepts/trust).
 

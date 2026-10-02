@@ -12058,6 +12058,48 @@ fn an_untrusted_project_secret_section_steers_nothing() {
     }
 }
 
+/// An untrusted project's `[secret]` and `[task]` sections are dropped whole, `defaults` included,
+/// and the warning names what went, on the project's own sections and on an app's alike. A section
+/// holding only its `defaults` (resolver bindings, task ceilings) used to go without a word, the
+/// count being taken over the entries alone, so the person who wrote them had nothing saying they
+/// were not in force.
+#[test]
+fn an_untrusted_projects_defaults_alone_are_named_when_dropped() {
+    const DEFAULTS_ONLY: &str = "[secret.defaults]\norder = [\"env\", \"sops\"]\n\
+         [task.defaults]\ntimeout = \"2m\"\n\
+         [app.demo]\ncmd = [\"true\"]\n\
+         [app.demo.secret.defaults]\norder = [\"env\"]\n\
+         [app.demo.task.defaults]\ntimeout = \"2m\"\n";
+    for state in [TrustState::Untrusted, TrustState::Changed] {
+        let proj: RawConfig = toml::from_str(DEFAULTS_ONLY).unwrap();
+        let r = resolve_no_plugins(RawConfig::default(), Some((proj, state)));
+        for (layer, dropped) in [
+            (PROJECT_CONFIG, "ignoring `[secret.defaults]`"),
+            (PROJECT_CONFIG, "ignoring `[task.defaults]`"),
+            ("[app.demo]", "ignoring `[secret.defaults]`"),
+            ("[app.demo]", "ignoring `[task.defaults]`"),
+        ] {
+            let said = |w: &String| {
+                w.contains(dropped) && (layer != PROJECT_CONFIG || w.starts_with(PROJECT_CONFIG))
+            };
+            let warnings = r.warnings.iter().chain(
+                r.apps
+                    .get("demo")
+                    .map(|a| &a.warnings)
+                    .into_iter()
+                    .flatten(),
+            );
+            assert!(
+                warnings
+                    .clone()
+                    .any(|w| said(w) && (layer == PROJECT_CONFIG || w.contains(layer))),
+                "{state:?}: no warning from {layer} says {dropped:?}: {:#?}",
+                warnings.collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 #[test]
 fn two_headers_to_one_host_both_survive() {
     // the array form (`[[secret."host"]]`) keeps several credentials for one host: a different

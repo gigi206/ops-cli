@@ -43,6 +43,28 @@ impl Gate<'_> {
         refuse_untrusted(warnings, self.source, what, self.state);
     }
 
+    /// Refuse a whole `[secret]` or `[task]` section in one warning that names what it loses: the
+    /// count of its `entries`, its `defaults` table, or both. A section that carried neither says
+    /// nothing, since nothing in it would have applied.
+    ///
+    /// The `defaults` are named because they go with the rest, and a section holding only them
+    /// (resolver bindings, task ceilings) was otherwise dropped without a word.
+    pub(super) fn refuse_section(
+        &self,
+        entries: usize,
+        noun: &str,
+        defaults: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) {
+        let what = match (entries, defaults) {
+            (0, None) => return,
+            (0, Some(table)) => table.to_string(),
+            (n, None) => format!("{n} {noun}"),
+            (n, Some(table)) => format!("{n} {noun} and {table}"),
+        };
+        self.refuse(&what, warnings);
+    }
+
     /// Take `value` outright when the layer is trusted, and record the layer as where it came from.
     ///
     /// For a posture that needs no validation past parsing.
