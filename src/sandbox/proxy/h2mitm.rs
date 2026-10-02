@@ -906,7 +906,8 @@ impl From<h2::Error> for RelayEnd {
 /// How long a relay waits for its peer to grant flow-control capacity, and the destination named
 /// if that wait runs out.
 ///
-/// The two synchronous planes hold a peer to `[network] timeout` for every read and every write,
+/// The two synchronous planes hold a peer to the upstream timeout, a fixed 30 seconds
+/// ([`UPSTREAM_TIMEOUT`](super::ctx::UPSTREAM_TIMEOUT)), for every read and every write,
 /// through `SO_RCVTIMEO`/`SO_SNDTIMEO` on the client socket. This plane puts the same socket in
 /// nonblocking mode and hands it to tokio, which drops those bounds, and the tunnel's idle timer is
 /// armed only while no stream is open. So an established stream had no bound of any kind, and a
@@ -919,7 +920,7 @@ impl From<h2::Error> for RelayEnd {
 /// nothing at all, which is a peer that is not reading. A stream that moves never reaches it.
 #[derive(Clone)]
 struct CapacityBound {
-    /// The wait a peer gets, from `[network] timeout` ([`ProxyCtx::timeout`]).
+    /// The wait a peer gets: [`ProxyCtx::timeout`], the fixed upstream timeout.
     within: std::time::Duration,
     /// `host:port`, for the report the expiry writes.
     dest: Arc<str>,

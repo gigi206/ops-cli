@@ -131,10 +131,11 @@ pub(crate) fn reject_option_as_name(
 /// One rule for the whole surface, because the surface disagreed with itself: `sbx config show
 /// --app --json` bound the app name to `--json` and then failed downstream as "no app named
 /// `--json`" at exit **1**, `sbx net pending --app --json` reported "none for app `--json`" and
-/// exited **0**, and the neighbouring parsers (`sbx test net`, `sbx logs -n`) refused the same
-/// shape outright. An option consumed as a value is never what the caller meant: the flag it
-/// swallowed does not take effect either, so the command quietly answers a different question
-/// than the one asked.
+/// exited **0**, `sbx logs -n --json` refused the same shape outright, since a count cannot be a
+/// flag, and `sbx test net --app --json` took the flag for a name and failed only downstream, as
+/// "no app named `--json`" at exit **2**. An option consumed as a value is never what the caller
+/// meant: the flag it swallowed does not take effect either, so the command quietly answers a
+/// different question than the one asked.
 ///
 /// The value's own validity stays with the caller — this says only that what followed the flag is
 /// not another flag, and that it is text. Non-UTF-8 is refused here rather than carried through

@@ -653,8 +653,9 @@ pub(crate) fn answer_query(
     } else {
         None
     };
-    // Reported after the lock is released: the report dials a socket, and holding the table across
-    // that would serialise every other resolution behind one report's round trip.
+    // Reported after the lock is released. The report is only queued for the reporter's own thread,
+    // which dials the socket, so it costs this one no round trip; it stays outside the table's lock
+    // all the same, which guards the table and nothing else.
     if let Some((_, fresh)) = allocated
         && fresh
     {
