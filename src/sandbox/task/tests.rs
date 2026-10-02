@@ -1465,7 +1465,9 @@ fn an_output_claim_refuses_a_name_that_addresses_the_tree_holding_it() {
         .to_path_buf();
     std::fs::write(parent.join("witness"), b"kept").expect("something beside the output tree");
 
-    for name in [".", ".."] {
+    // The empty name is the third spelling of the tree itself: `Path::join("")` answers the path
+    // it is joined onto, so the claim would empty every task's artifacts, as `.` would.
+    for name in [".", "..", ""] {
         let mut task = task();
         task.name = name.into();
         task.output = true;

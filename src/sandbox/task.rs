@@ -1430,9 +1430,12 @@ impl TaskEngine {
     /// through the validator — the tests build them directly, and so would a caller added later.
     ///
     /// The test asks the separator question rather than the `..` one, because a guard that named
-    /// only the two spellings it was written for is how this arrived here in the first place.
+    /// only the two spellings it was written for is how this arrived here in the first place. The
+    /// empty name is the third spelling of the tree itself: `Path::join("")` answers the path it is
+    /// joined onto.
     fn claim_output(&self, task: &TaskSpec) -> Result<OutputClaim, String> {
-        if task.name == "." || task.name == ".." || task.name.contains('/') {
+        if task.name.is_empty() || task.name == "." || task.name == ".." || task.name.contains('/')
+        {
             return Err(format!(
                 "`{}` cannot name an output directory — it addresses a place outside the tree that \
                  holds them rather than one inside it",
