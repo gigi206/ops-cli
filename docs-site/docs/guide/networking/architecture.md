@@ -561,9 +561,10 @@ built-in entry matches. **Cloud-metadata and link-local** addresses are *always*
 refused (no exception, ever). "Private" covers the
 RFC 1918 ranges, loopback, the CGNAT shared range `100.64.0.0/10`, the TEST-NET
 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), the
-benchmarking range `198.18.0.0/15`, the reserved `240.0.0.0/4`, ULA `fc00::/7` and
-documentation `2001:db8::/32`; link-local, multicast, unspecified and broadcast are
-blocked outright and never reachable. A dial is bounded by the socket timeout, trying
+benchmarking range `198.18.0.0/15`, the reserved `240.0.0.0/4`, "this network"
+`0.0.0.0/8`, ULA `fc00::/7`, the deprecated site-local `fec0::/10` and documentation
+`2001:db8::/32`; link-local, multicast, unspecified and broadcast are blocked outright
+and never reachable. A dial is bounded by the socket timeout, trying
 the permitted addresses in order and reporting the last error; a connection whose TLS
 handshake fails moves on to the next address the same way.
 

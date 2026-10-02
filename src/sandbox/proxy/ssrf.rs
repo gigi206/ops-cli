@@ -22,7 +22,8 @@ enum IpClass {
     /// A routable public address — reachable subject to the policy.
     Public,
     /// An address that is not the public Internet's: loopback, RFC1918, ULA, CGNAT, and the ranges
-    /// IANA set aside for something else (TEST-NET, benchmarking, documentation, reserved).
+    /// IANA set aside for something else (TEST-NET, benchmarking, documentation, reserved, "this
+    /// network", the deprecated v6 site-local prefix).
     ///
     /// Reachable only when the policy explicitly named this exact host (an intentional internal
     /// target).
@@ -62,7 +63,10 @@ fn classify_v4(v4: Ipv4Addr) -> IpClass {
         return IpClass::Private;
     }
     // The ranges IANA set aside for something other than the public Internet: TEST-NET-1/2/3
-    // (RFC 5737), the RFC 2544 benchmarking range 198.18.0.0/15, and the reserved 240.0.0.0/4.
+    // (RFC 5737), the RFC 2544 benchmarking range 198.18.0.0/15, the reserved 240.0.0.0/4, and
+    // "this network" 0.0.0.0/8 (RFC 6890), a source-only range that Linux nonetheless routes as
+    // unicast, so a dial to it leaves through the default route. Its bottom address is the
+    // unspecified one, refused above.
     // Falling through to `Public` said they were ordinary destinations, which is a wrong answer in
     // the one place a wrong answer is read out loud: `sbx test net` shares this decision, so it
     // predicted `198.18.0.0/15` reachable while a real request to it dies at the dial with
@@ -71,7 +75,11 @@ fn classify_v4(v4: Ipv4Addr) -> IpClass {
     //
     // Written by octets, like the CGNAT range beside it, because `is_benchmarking` and
     // `is_reserved` are still unstable; `is_documentation` is not, so TEST-NET uses it.
-    if v4.is_documentation() || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || o[0] >= 240 {
+    if v4.is_documentation()
+        || o[0] == 0
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        || o[0] >= 240
+    {
         return IpClass::Private;
     }
     IpClass::Public
@@ -83,9 +91,14 @@ fn classify_v6(v6: Ipv6Addr) -> IpClass {
     if v6.is_unspecified() || v6.is_multicast() || (s[0] & 0xffc0) == 0xfe80 {
         return IpClass::Blocked;
     }
-    // loopback ::1, unique-local fc00::/7, and the documentation prefix 2001:db8::/32 — the v6
-    // half of the same rule the v4 classifier applies to TEST-NET.
-    if v6.is_loopback() || (s[0] & 0xfe00) == 0xfc00 || (s[0] == 0x2001 && s[1] == 0x0db8) {
+    // loopback ::1, unique-local fc00::/7, the site-local fec0::/10 that unique-local replaced
+    // (RFC 3879), and the documentation prefix 2001:db8::/32: the v6 half of the same rule the v4
+    // classifier applies to TEST-NET.
+    if v6.is_loopback()
+        || (s[0] & 0xfe00) == 0xfc00
+        || (s[0] & 0xffc0) == 0xfec0
+        || (s[0] == 0x2001 && s[1] == 0x0db8)
+    {
         return IpClass::Private;
     }
     IpClass::Public
@@ -615,12 +628,11 @@ mod tests {
     }
 
     /// `::` and `::1` match the IPv4-compatible shape and must **not** be unwrapped: they denote
-    /// the unspecified and loopback addresses themselves. The teeth are on `::1`. Unwrapping it
-    /// yields `0.0.0.1`, which is not loopback, not private and not unspecified, so the v4
-    /// classifier calls it `Public` — swapping `to_ipv4_mapped` for `to_ipv4` to close the
-    /// compatible-form gap would have opened the loopback in the same edit, and both assertions
-    /// below would read `Public`. `::` survives that swap by accident (`0.0.0.0` is unspecified on
-    /// both sides), which is exactly why it cannot be the case the guard is trusted on.
+    /// the unspecified and loopback addresses themselves. Unwrapped, `::1` reads as `0.0.0.1`, and
+    /// it lands in the loopback's class only because "this network" is private: before that range
+    /// was, `0.0.0.1` read `Public`, and swapping `to_ipv4_mapped` for `to_ipv4` to close the
+    /// compatible-form gap would have opened the loopback in the same edit. The carve-out keeps the
+    /// loopback's class its own rather than a consequence of the v4 table.
     #[test]
     fn the_two_addresses_that_look_ipv4_compatible_keep_their_own_class() {
         let c = |s: &str| classify_ip(s.parse::<IpAddr>().unwrap());
@@ -633,8 +645,9 @@ mod tests {
             "the unspecified address is blocked"
         );
         // The neighbour on either side of the carve-out is unwrapped normally, so the exclusion is
-        // exactly two addresses wide and not a hole in the range.
-        assert!(matches!(c("::2"), IpClass::Public));
+        // exactly two addresses wide and not a hole in the range: `::2` reads as `0.0.0.2`, private,
+        // where the v6 classifier alone would call it public.
+        assert!(matches!(c("::2"), IpClass::Private));
     }
 
     /// The ranges IANA set aside for something other than the public Internet are not public
@@ -656,7 +669,11 @@ mod tests {
             "198.19.255.254",     // ...and its high half
             "240.0.0.1",          // reserved
             "255.255.255.254",    // reserved, one below the broadcast address
+            "0.0.0.1",            // "this network", one above the unspecified address
+            "0.255.255.255",      // ...and its top
             "2001:db8::1",        // the v6 documentation prefix
+            "fec0::1",            // the deprecated v6 site-local prefix
+            "feff:ffff::1",       // ...and its top
             "::ffff:203.0.113.9", // and a set-aside v4 wearing a v6 spelling
         ] {
             assert!(
@@ -665,14 +682,17 @@ mod tests {
             );
         }
         // The broadcast address is in the last range and stays refused outright, because the
-        // never-reachable test runs first.
+        // never-reachable test runs first; so does the unspecified address at the bottom of
+        // "this network".
         assert!(matches!(c("255.255.255.255"), IpClass::Blocked));
+        assert!(matches!(c("0.0.0.0"), IpClass::Blocked));
         // The neighbours of each range are ordinary public addresses and must stay that way.
         for public in [
             "198.17.255.255",
             "198.20.0.1",
             "192.0.3.1",
             "203.0.114.1",
+            "1.0.0.1",
             "2001:db9::1",
         ] {
             assert!(
@@ -685,5 +705,9 @@ mod tests {
         // between the two cannot be observed from here. It is written as the range's own, from
         // RFC 1112, rather than as whatever number happens to be indistinguishable.
         assert!(matches!(c("239.255.255.254"), IpClass::Blocked));
+        // The site-local prefix is the same: link-local `fe80::/10` lies just below it and
+        // multicast `ff00::/8` just above, both refused outright.
+        assert!(matches!(c("febf:ffff::1"), IpClass::Blocked));
+        assert!(matches!(c("ff00::1"), IpClass::Blocked));
     }
 }
