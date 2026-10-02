@@ -432,6 +432,49 @@ fn a_profile_with_no_command_is_told_where_the_command_goes() {
     );
 }
 
+/// A learning flag does not soften a refusal. A learning run that ran exits with what its learning
+/// did, whatever the app's status, but a launch refused before its app ran learned nothing, and
+/// the refusal's own code is the answer. All three exited 0 with the refusal on stderr, so
+/// `sbx app run nope --net-learn && …` carried on as though rules had been reviewed.
+#[test]
+fn a_learning_run_refused_before_its_app_ran_keeps_the_refusals_code() {
+    let fx = Project::new("app");
+    fx.write_profile("ghost", "[network]\nmode = \"deny\"\n");
+
+    for (args, code, said) in [
+        (
+            &["app", "run", "nope", "--net-learn"][..],
+            2,
+            "no app named `nope`",
+        ),
+        (
+            &["app", "run", "nope", "--proc-learn", "--dry-run"][..],
+            2,
+            "no app named `nope`",
+        ),
+        (
+            &["app", "run", "ghost", "--proc-learn"][..],
+            1,
+            "declares no command",
+        ),
+    ] {
+        let out = fx.run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "`sbx {}` must keep its refusal's code:\n{stderr}",
+            args.join(" ")
+        );
+        assert!(
+            stderr.contains(said) && out.stdout.is_empty(),
+            "`sbx {}` must be refused for its own reason, with nothing learned on stdout:\n{}",
+            args.join(" "),
+            text(&out)
+        );
+    }
+}
+
 /// A demo-app fixture with one declared mise tool installed and one undeclared leftover, plus a home
 /// mise config listing both — the shape `sbx app prune` acts on.
 fn fixture_with_a_leftover() -> Project {

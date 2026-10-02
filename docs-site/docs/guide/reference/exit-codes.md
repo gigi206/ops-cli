@@ -19,7 +19,7 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 | `126` | [`sbx session attach`](../cli/session#attach) could not join the running cage, or could not reap the shell it started |
 | `127` | [`sbx session attach`](../cli/session#attach) reached the cage but could not start the shell in it |
 | `128 + N` | the launched or attached command was terminated by signal `N` |
-| *other* | for a launch verb, the **launched command's** own exit status |
+| *other* | for a launch verb, the **launched command's** own exit status (a [learning run](#a-learning-run-answers-for-its-learning) answers for its learning instead) |
 
 ## A name that names nothing exits 2
 
@@ -60,6 +60,15 @@ sbx run -- false            # sbx exits 1
 
 So a non-zero exit from a launch verb is the tool's result, not an `sbx` error: unless
 it is `2` from an argument/override problem `sbx` caught before launching.
+
+### A learning run answers for its learning
+
+`sbx app run <name> --net-learn` or `--proc-learn` launches the app to find out what it
+reaches for, so an app that fails on what it has no rule for is expected, and its status
+is not the run's result. Once the app is launched, the run exits 0 unless writing what
+it learned failed. A learning run stopped before its launch learned nothing, and exits
+with the code the same launch without the flag stops with (2 for an undeclared app, 1 for
+an app that declares no command), or with 2 for a posture the flag cannot learn under.
 
 ## Fail-closed overrides exit 2
 

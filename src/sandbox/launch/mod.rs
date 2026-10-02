@@ -469,17 +469,17 @@ fn launch_foreground(
     }
 }
 
-/// The result of an `sbx app <name>` launch: the exit code, plus — for a `--net-learn` run — the
-/// rules synthesized from the egress the run was refused. The caller (`app_cmd`) writes them to the
-/// chosen profile (or prints them under `--dry-run`); keeping the write in `main` keeps the trust
-/// gating and re-trust out of the sandbox module.
+/// The result of an `sbx app <name>` launch: the exit code, plus, for a learning run, the rules
+/// synthesized from what the run did. The caller (`app_run`) writes them to the chosen profile (or
+/// prints them under `--dry-run`); keeping the write in the CLI keeps the trust gating and re-trust
+/// out of the sandbox module.
 pub(crate) struct AppOutcome {
     pub(crate) code: ExitCode,
-    pub(crate) learned: Option<super::Synthesis>,
-    /// The `[proc] allow` rules a `--proc-learn` run synthesized, written by the same caller through
-    /// the same path. Separate from `learned` rather than one field of a sum: the two flags are
-    /// independent, a run may carry both, and each lands in its own list.
-    pub(crate) proc_learned: Option<super::Synthesis>,
+    /// What a `--net-learn`/`--proc-learn` run learned, once its launch was attempted. `None` for a
+    /// launch with no learning flag, and for a learning run that stopped before that point (an
+    /// undeclared app, a posture it cannot learn under, a build that failed): it learned nothing,
+    /// and `code` is the answer.
+    pub(crate) learned: Option<Learned>,
 }
 
 impl AppOutcome {
@@ -487,9 +487,18 @@ impl AppOutcome {
         AppOutcome {
             code,
             learned: None,
-            proc_learned: None,
         }
     }
+}
+
+/// The rules one learning run synthesized, a list per learning flag, each `None` when its flag was
+/// not given. Two fields rather than one of a sum: the two flags are independent, a run may carry
+/// both, and each lands in its own list.
+pub(crate) struct Learned {
+    /// The egress allow rules `--net-learn` synthesized from what the run was refused.
+    pub(crate) net: Option<super::Synthesis>,
+    /// The `[proc] allow` rules `--proc-learn` synthesized from what the app ran.
+    pub(crate) proc: Option<super::Synthesis>,
 }
 
 /// The argv an app launch runs: the declared `cmd`, then its contract option and the summary's
@@ -688,19 +697,18 @@ pub(crate) fn app(
             };
         // Subsume against the SAME effective policy the proxy enforced — the config allowlist unioned
         // with the always-on built-in allow-set — so a built-in-allowed host is never re-proposed.
-        let learned = net_learn.zip(policy).map(|(gran, policy)| {
+        let net = net_learn.zip(policy).map(|(gran, policy)| {
             let effective = super::union_with_builtin((*policy).clone());
             super::netlearn::synthesize(&run.events, &effective, gran)
         });
         // Subsumed against the project's own `[proc]` rules, read as rules rather than as a posture:
         // what a learned rule has to add to is the list, whatever mode the run happened to be in.
-        let proc_learned = proc_learn
+        let proc = proc_learn
             .zip(run.execs)
             .map(|(gran, record)| super::proclearn::synthesize(&record, &prep.cfg.proc, gran));
         return AppOutcome {
             code,
-            learned,
-            proc_learned,
+            learned: Some(Learned { net, proc }),
         };
     }
 

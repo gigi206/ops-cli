@@ -143,6 +143,12 @@ sbx app run claude-code --proc-learn             # write the list, and move to `
 Both learning flags compose. `sbx app run <name> --net-learn --proc-learn` learns an
 app's egress and its programs in one launch, writing both to the same profile.
 
+A learning run's exit status is its own, not the app's: once the app is launched, it
+exits 0 unless writing what it learned failed. A run stopped before its launch (an
+undeclared app, a posture the flag cannot learn under) learned nothing and keeps the
+refusal's code;
+see [Exit codes](../reference/exit-codes#a-learning-run-answers-for-its-learning).
+
 ## Advancing an app
 
 `sbx app upgrade <name>` moves one app forward without making you work out which

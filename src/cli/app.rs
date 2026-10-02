@@ -73,9 +73,11 @@ fn app_run(args: &[OsString]) -> ExitCode {
                 launch.learn.as_ref().and_then(|l| l.net),
                 launch.learn.as_ref().and_then(|l| l.proc),
             );
-            match &launch.learn {
-                Some(learn) => finish_learning(&launch.name, &outcome, learn),
-                None => outcome.code,
+            match (&launch.learn, &outcome.learned) {
+                (Some(learn), Some(learned)) => finish_learning(&launch.name, learned, learn),
+                // No learning flag, or a learning run that stopped before its launch: there is
+                // nothing to review or write, and the code it stopped with is the answer.
+                _ => outcome.code,
             }
         }
         Err(code) => code,
@@ -85,15 +87,16 @@ fn app_run(args: &[OsString]) -> ExitCode {
 /// Apply what a learning run synthesized: the egress rules, the exec rules, or both, each through
 /// the same review-then-write path. The exit code reflects the *learning* outcome, not the agent's —
 /// a learning run is expected to hit things it has no rule for, so its non-zero exit is not this
-/// command's failure; only a write error is.
-fn finish_learning(name: &str, outcome: &sandbox::AppOutcome, learn: &Learning) -> ExitCode {
+/// command's failure; only a write error is. A run that stopped before its launch never gets here:
+/// [`sandbox::app`] hands back nothing learned for it, and the code it stopped with stands.
+fn finish_learning(name: &str, learned: &sandbox::Learned, learn: &Learning) -> ExitCode {
     use config::manage::EgressList;
     let cwd = match config_cwd() {
         Ok(c) => c,
         Err(code) => return code,
     };
     let mut code = ExitCode::SUCCESS;
-    if let Some((synth, gran)) = outcome.learned.as_ref().zip(learn.net) {
+    if let Some((synth, gran)) = learned.net.as_ref().zip(learn.net) {
         // Written one rule at a time: each re-trusts a gated project write, and the messages are
         // joined so the whole list is reported in one place.
         let persist = |rules: &[String]| {
@@ -132,7 +135,7 @@ fn finish_learning(name: &str, outcome: &sandbox::AppOutcome, learn: &Learning) 
             },
         );
     }
-    if let Some((synth, gran)) = outcome.proc_learned.as_ref().zip(learn.proc) {
+    if let Some((synth, gran)) = learned.proc.as_ref().zip(learn.proc) {
         // One call for the whole list, so a gated project config is re-trusted once: either every
         // rule landed or none did, and there is no half-written list to name.
         let persist = |rules: &[String]| match crate::persist_learned_proc_rules(
