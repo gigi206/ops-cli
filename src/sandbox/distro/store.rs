@@ -366,8 +366,22 @@ fn unpack_into(
         let _ = std::fs::remove_dir_all(&partial);
         return outcome;
     }
+    // The tree reaches the device before its name does. Thousands of files are written above and
+    // none is flushed, so a rename that reached the device first would leave, after a power loss, a
+    // tree under the digest's name whose files hold zeros, and every later launch of the image
+    // would take it as unpacked: its name and a handful of paths are all that is checked. One
+    // `syncfs` on the tree's filesystem flushes them all, where a walk would `fsync` each file.
+    if let Err(e) = sync_filesystem_of(&partial) {
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(io::Error::other(format!(
+            "cannot flush the unpacked root filesystem for {digest}: {e}"
+        )));
+    }
     match std::fs::rename(&partial, dir) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            crate::sandbox::atomicfile::sync_dir(parent);
+            Ok(())
+        }
         // Another launch provisioned the same digest first. Its tree is this one's tree — the
         // digest says so — so the loser drops what it built rather than overwriting a directory a
         // running cage may already be reading.
@@ -381,6 +395,18 @@ fn unpack_into(
                 "cannot place the unpacked root filesystem for {digest}: {e}"
             )))
         }
+    }
+}
+
+/// Flush every write pending on the filesystem that holds `path` to its device.
+fn sync_filesystem_of(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let dir = std::fs::File::open(path)?;
+    // SAFETY: `syncfs` takes a descriptor this function holds open for the length of the call.
+    if unsafe { libc::syncfs(dir.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
