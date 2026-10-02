@@ -403,12 +403,19 @@ fn launch_foreground(
     cmd: Vec<OsString>,
     observe: bool,
 ) -> ExitCode {
-    let (spec, guard, record) = match build(prep, runtime, cmd) {
+    let (spec, guard, record, store_lock) = match build(prep, runtime, cmd) {
         Ok(v) => v,
         Err(code) => return code,
     };
 
-    register(prep.layout.data_dir(), &spec, kind, runtime, false);
+    register(
+        prep.layout.data_dir(),
+        &spec,
+        kind,
+        runtime,
+        false,
+        store_lock,
+    );
 
     // Decided before the match: the same pair drives both the exec/supervise choice and the
     // observer below, so a config-declared `[proc] mode = "observe"` cannot be seen by one and
@@ -735,15 +742,22 @@ fn launch_foreground_learning(
 ) -> Result<(ExitCode, LearningRun), ExitCode> {
     // The learning path starts no observation lens of its own, so the session record `build`
     // resolved has no ring to attach to here; the four lenses inside `build` already hold it.
-    let (spec, guard, _) = match build(prep, runtime, cmd) {
-        Ok((s, g, rec)) if interactive => (s.with_private_tty(), g, rec),
-        Ok((s, g, rec)) => (s, g, rec),
+    let (spec, guard, _, store_lock) = match build(prep, runtime, cmd) {
+        Ok((s, g, rec, lock)) if interactive => (s.with_private_tty(), g, rec, lock),
+        Ok(v) => v,
         Err(code) => return Err(code),
     };
 
     // A pty session unlinks its record on exit (RecordGuard); a supervised one persists it
     // (liveness-pruned), matching `launch_pty_supervised` and `launch_foreground` respectively.
-    let record = register(prep.layout.data_dir(), &spec, kind, runtime, false);
+    let record = register(
+        prep.layout.data_dir(),
+        &spec,
+        kind,
+        runtime,
+        false,
+        store_lock,
+    );
     let _record = interactive.then(|| record.map(RecordGuard::new));
 
     let code = if interactive {
@@ -866,13 +880,20 @@ fn launch_pty_supervised(
         && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland))
     .then(|| launch_display_name(&runtime, &cmd));
 
-    let (spec, guard, record) = match build(prep, runtime, cmd) {
-        Ok((s, g, rec)) => (s.with_private_tty(), g, rec),
+    let (spec, guard, record, store_lock) = match build(prep, runtime, cmd) {
+        Ok((s, g, rec, lock)) => (s.with_private_tty(), g, rec, lock),
         Err(code) => return code,
     };
 
-    let _record =
-        register(prep.layout.data_dir(), &spec, kind, runtime, false).map(RecordGuard::new);
+    let _record = register(
+        prep.layout.data_dir(),
+        &spec,
+        kind,
+        runtime,
+        false,
+        store_lock,
+    )
+    .map(RecordGuard::new);
     // Hold the guard (egress proxy / forward forwarder threads) for the whole pty session.
     let _guard = guard;
     // With observation on, populate the exec ring + control socket so `sbx proc logs`/`sbx proc live`

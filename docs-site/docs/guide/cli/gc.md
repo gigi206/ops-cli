@@ -48,6 +48,19 @@ an empty one. So `sbx gc` fails closed, differently per scope, and says which on
 The verbs that only report are not gated: [`sbx projects`](projects) still lists every
 tree, with the state `unknown` in place of a `live`/`idle` finding nothing established.
 
+## A launch and `sbx gc` at the same time
+
+A launch of a project and `sbx gc` on it take turns on its store. A collection that ran
+while a launch copies the store's paths in would delete what the launch has copied and not
+yet registered, and the cage it then starts would run on a store being collected. So a
+launch that starts while `sbx gc` works on its project waits for it to finish, and says so.
+The other way round, `sbx gc` waits for a launch that is still preparing the store, then
+finds its session and refuses, as above. It also waits for an [`sbx upgrade`](upgrade)
+step running in a cage of the project, which records no session. Launches of one project
+do not wait for each other. The side that waits names the lock file,
+`<data>/projects/<id>/store.lock`: a cage whose project holds sbx's data directory sees it
+read-only, which is enough to hold it, and would keep both sides waiting while it runs.
+
 ## When the store holds an entry nix did not make
 
 A project's store is writable from inside its cage, and `nix-store` runs on it at each

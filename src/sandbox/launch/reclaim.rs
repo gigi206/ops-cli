@@ -354,7 +354,9 @@ fn gc_live_session_refusal(
 /// in an app's own `$HOME` needs no special handling.
 ///
 /// A dry run by default — it reports what would be freed and changes nothing; `--prune` sweeps the
-/// dead paths. It refuses while a live sandbox holds the project (its store is in use). Like a
+/// dead paths. It refuses while a live sandbox holds the project (its store is in use), and works
+/// under the project's store lock, exclusive ([`crate::sandbox::projectstore::ProjectStoreLock`]):
+/// a launch of the project still preparing is waited for, and one that comes later waits. Like a
 /// launch it provisions the current tools and re-seeds first, which re-establishes the base/tool
 /// roots on a store seeded before rooting existed, so a sweep can never delete the unrooted base.
 /// Returns `Err(code)` when it cannot run (not a project, no sandbox capability, a nix failure),
@@ -403,6 +405,26 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
             return Err(ExitCode::FAILURE);
         }
     };
+
+    // The project's store lock, exclusive, for the rest of the sweep and before the registry is
+    // read: a launch of the project still provisioning or seeding holds it shared until its session
+    // is recorded, so the check below sees every launch that went ahead, and a launch that comes
+    // later waits until this sweep is done. A cage no session records (an `sbx upgrade` step)
+    // holds it for its whole run, and this waits for it.
+    let _store_lock =
+        match crate::sandbox::projectstore::lock_project_store(&prep.layout, &id, &|lock| {
+            crate::diag::note(&format!(
+                "waiting for the project's store lock `{}`, which a launch of the project holds \
+                 until its session is recorded, and an `sbx upgrade` step until it ends",
+                lock.display()
+            ))
+        }) {
+            Ok(lock) => lock,
+            Err(e) => {
+                crate::diag::error(&format!("sbx gc: cannot lock the project's store: {e}"));
+                return Err(ExitCode::FAILURE);
+            }
+        };
 
     // Refuse if a live sandbox holds this project: collecting a store a running cage reads and
     // writes could drop a path it still needs. The registry list prunes dead records as it goes.
@@ -567,10 +589,8 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // After the collection, so nothing about to be deleted is deduplicated first. This is the store
     // where deduplication pays: a seeded per-project store arrives as fresh inodes by construction.
     //
-    // Unlike the shared store's pass this takes no exclusive lock — a per-project store has none.
-    // What guards it is the live-session refusal above: the sweep already declines to touch a store
-    // a running cage holds, and this rides that same check, with the same window between it and the
-    // work that `--prune` already has here.
+    // Under the project's store lock taken above, like the collection, and behind the same
+    // live-session refusal.
     if optimise {
         report_optimise(&caged, "this project's store", pal);
     }

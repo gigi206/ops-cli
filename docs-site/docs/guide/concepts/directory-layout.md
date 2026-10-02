@@ -73,7 +73,9 @@ The **per-project** directory `projects/<id>/` holds the project's own writable 
 store (seeded from the shared store) plus its resolution locks, `nixpkgs.lock` (a project pin), `tools.lock` (resolved `nix:` mise tools), and
 `flake-packages.lock` (pinned `flake:` packages), and, under `apps/<name>/mise/`, a
 global app's [per-project mise pool](../apps/home#two-mise-pools-keep-a-global-apps-self-equips-aligned)
-(its `nix:`-via-mise self-equips, kept aligned with this project's store). See
+(its `nix:`-via-mise self-equips, kept aligned with this project's store). Beside the store,
+`store.lock` has a launch of the project and its
+[`sbx gc`](../cli/gc#a-launch-and-sbx-gc-at-the-same-time) take turns on it. See
 [Provisioning](provisioning) for how the per-project store works.
 
 ## State: the trust records

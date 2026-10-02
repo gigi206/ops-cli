@@ -107,13 +107,20 @@ fn detached_child(
     // terminal through build/register so provisioning progress and any error are seen live.
     redirect_stdin_to_null();
 
-    let (spec, guard, record) = match build(&prep, runtime, cmd) {
+    let (spec, guard, record, store_lock) = match build(&prep, runtime, cmd) {
         Ok(v) => v,
         // `build` already printed the cause to the terminal; close the pipe (no readiness byte)
         // so the parent reports failure.
         Err(_) => fail_detached(write_fd),
     };
-    register(prep.layout.data_dir(), &spec, kind, runtime, true);
+    register(
+        prep.layout.data_dir(),
+        &spec,
+        kind,
+        runtime,
+        true,
+        store_lock,
+    );
 
     // Open the session log before signalling ready: a daemon whose output we cannot capture is
     // not ready. Its name is keyed by this process's pid — the session id the parent reports.

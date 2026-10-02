@@ -325,7 +325,8 @@ pub(crate) fn upgrade_mise_packages(
             &tokens,
         );
 
-        let (spec, guard, _) = match build(prep, runtime, cmd) {
+        // The project's store lock is held to the end of the group: no session records this cage.
+        let (spec, guard, _, _store_lock) = match build(prep, runtime, cmd) {
             Ok(v) => v,
             Err(_) => {
                 println!(
@@ -643,7 +644,8 @@ pub(crate) fn upgrade_provision_steps(
         }
         prep.cfg = cfg;
 
-        let (spec, guard, _) = match build(prep, runtime, provision_only_cmd(&steps)) {
+        // The project's store lock is held to the end of the group: no session records this cage.
+        let (spec, guard, _, _store_lock) = match build(prep, runtime, provision_only_cmd(&steps)) {
             Ok(v) => v,
             Err(_) => {
                 println!(
@@ -771,7 +773,8 @@ fn roll_task_pool(
     // each group cleared for the same reason, so the pool's cage does not print the set once more.
     prep.cfg = cfg.clone();
     prep.cfg.warnings.clear();
-    let (spec, guard, _) = build(
+    // The project's store lock is held while the pool upgrades: no session records its cages.
+    let (spec, guard, _, _store_lock) = build(
         prep,
         binds::Runtime::ProjectDefault,
         vec![OsString::from("/bin/true")],

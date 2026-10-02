@@ -2297,6 +2297,17 @@ fn task_socket(prep: &Prepared, extra_binds: &mut Vec<binds::ExtraBind>) -> Task
     }
 }
 
+/// What [`build()`] hands its caller: the cage's spec, the guard of what must outlive the cage, the
+/// wiring of its session record, and the project's store lock, which the caller lets go when it
+/// records the session ([`super::cage::register`]), or holds until a cage no session records has
+/// ended.
+pub(super) type Built = (
+    SandboxSpec,
+    Option<LaunchGuard>,
+    Option<crate::sandbox::lens::RecordWiring>,
+    Option<crate::sandbox::projectstore::ProjectStoreLock>,
+);
+
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
@@ -2308,14 +2319,7 @@ pub(super) fn build(
     prep: &Prepared,
     runtime: binds::Runtime,
     cmd: Vec<OsString>,
-) -> Result<
-    (
-        SandboxSpec,
-        Option<LaunchGuard>,
-        Option<crate::sandbox::lens::RecordWiring>,
-    ),
-    ExitCode,
-> {
+) -> Result<Built, ExitCode> {
     for warning in &prep.cfg.warnings {
         crate::diag::warn_config(warning);
     }
@@ -2333,6 +2337,32 @@ pub(super) fn build(
     crate::sandbox::gc::sweep_runtime_dirs(prep.layout.data_dir(), true);
     crate::sandbox::gc::fold_egress_counters(prep.layout.data_dir(), true);
 
+    let identity = binds::project_identity(&prep.cwd);
+
+    // The project's store lock, shared, before anything is provisioned: an `sbx gc` of this
+    // project that has started finishes first, and one that starts later finds this launch's
+    // session once the caller records it ([`super::cage::register`], which lets the lock go), or
+    // waits for a cage no session records, which holds it until it ends. A project that cannot be
+    // identified holds none, and its seed below fails on that.
+    let store_lock = match &identity {
+        Ok((id, _)) => {
+            match crate::sandbox::projectstore::hold_project_store(&prep.layout, id, &|lock| {
+                crate::diag::note(&format!(
+                    "waiting for the project's store lock `{}`, which `sbx gc` takes while it \
+                     works on the store",
+                    lock.display()
+                ))
+            }) {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    crate::diag::error(&format!("sbx: cannot lock the project's store: {e}"));
+                    return Err(ExitCode::FAILURE);
+                }
+            }
+        }
+        Err(_) => None,
+    };
+
     // The project's marker, before anything is provisioned rather than after the seed. A
     // provisioner registers its out-links under `gcroots/projects/<id>/` from its first build,
     // and `sbx gc --prune` reads a project as gone when `projects/<id>` does not exist: between
@@ -2341,8 +2371,8 @@ pub(super) fn build(
     // has nothing holding those builds. Idempotent, and best-effort as it was: a housekeeping
     // marker never fails a launch, and a launch that dies before the seed leaves a directory
     // holding only the marker, which is the shape the reaper exists to recognise.
-    if let Ok((id, canonical)) = binds::project_identity(&prep.cwd)
-        && let Err(e) = crate::sandbox::projectstore::write_marker(&prep.layout, &id, &canonical)
+    if let Ok((id, canonical)) = &identity
+        && let Err(e) = crate::sandbox::projectstore::write_marker(&prep.layout, id, canonical)
     {
         crate::diag::warn(&format!("could not record the project marker: {e}"));
     }
@@ -3125,7 +3155,7 @@ pub(super) fn build(
     };
     #[cfg(debug_assertions)]
     debug_dump_spec(&spec, guard.as_ref());
-    Ok((spec, guard, record))
+    Ok((spec, guard, record, store_lock))
 }
 
 /// Whether this launch runs behind the netns holder, and with what.

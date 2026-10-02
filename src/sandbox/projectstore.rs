@@ -48,8 +48,8 @@
 //! (which stay byte-identical) — though `nix-store --dump-db` may checkpoint the
 //! shared database's write-ahead log, a benign fold-in that mutates no store path.
 //!
-//! Concurrency needs no lock of sbx's own. Two sandboxes of the same project can
-//! seed at once: each path is placed by atomic rename, so a lost race is just a
+//! Between launches, concurrency needs no lock of sbx's own. Two sandboxes of the same
+//! project can seed at once: each path is placed by atomic rename, so a lost race is just a
 //! redundant copy discarded — the winner's identical, content-addressed path is
 //! already in place — and the database registration goes through `nix-store
 //! --load-db`, whose concurrent merges serialise on the project database's own
@@ -63,6 +63,10 @@
 //! seed copies the closure before its rename, so the losers' copies are thrown away
 //! — bounded by the base closure, and only on a project's first, cold launches (a
 //! per-project seed lock is a possible future optimisation).
+//!
+//! Between a launch and `sbx gc` there is one ([`ProjectStoreLock`]): a collection deletes what a
+//! seed has copied and not yet registered, so a launch holds it shared until its session is
+//! recorded, and the collection holds it exclusive.
 //!
 //! This module owns the per-project store's layout and its seed. The launcher seeds
 //! it with the closure of the base userland and the project's tools, then binds it
@@ -185,32 +189,49 @@ fn shared_gc_lock_path(layout: &Layout) -> PathBuf {
 }
 
 fn acquire_shared_gc_lock(layout: &Layout, exclusive: bool) -> io::Result<SharedGcLock> {
+    flock_at(&shared_gc_lock_path(layout), exclusive, None).map(SharedGcLock)
+}
+
+/// Open the lock file `path`, creating it owner-only and its parent with it, and `flock` it shared
+/// or exclusive, blocking until the lock is granted. When it is busy and `waiting` is given, that
+/// is called once with `path` before the wait, for the caller to say what it waits for.
+fn flock_at(path: &Path, exclusive: bool, waiting: Option<&dyn Fn(&Path)>) -> io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
-    let path = shared_gc_lock_path(layout);
     if let Some(parent) = path.parent() {
         DirBuilder::new()
             .recursive(true)
             .mode(DIR_MODE)
             .create(parent)?;
     }
-    let file = std::fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(&path)?;
+        .open(path)?;
     let op = if exclusive {
         libc::LOCK_EX
     } else {
         libc::LOCK_SH
     };
+    if let Some(waiting) = waiting {
+        // SAFETY: `flock` on a valid owned fd; with `LOCK_NB` it returns at once, 0 when granted.
+        if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let busy = io::Error::last_os_error();
+        if busy.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(busy);
+        }
+        waiting(path);
+    }
     // SAFETY: `flock` on a valid owned fd; it blocks until the lock is granted and returns 0 on
-    // success. The fd lives in the returned guard, so the lock is held until the guard drops.
+    // success. The fd lives in the returned file, so the lock is held until the file is dropped.
     if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(SharedGcLock(file))
+    Ok(file)
 }
 
 /// Take the shared-store gc lock **shared** — for a seed's read of the shared store. Many seeds may
@@ -224,6 +245,70 @@ pub(crate) fn lock_shared(layout: &Layout) -> io::Result<SharedGcLock> {
 /// hold, and blocks new seeds until the collection finishes.
 pub(crate) fn lock_exclusive(layout: &Layout) -> io::Result<SharedGcLock> {
     acquire_shared_gc_lock(layout, true)
+}
+
+/// An advisory lock on one project's store, between the sbx runs that use it: a launch of the
+/// project holds it shared ([`hold_project_store`]), `sbx gc` exclusive ([`lock_project_store`]).
+///
+/// A collection that runs while a launch seeds deletes what the seed has copied into the store and
+/// not yet registered (`nix-store --gc` removes a path of the store directory nix does not hold
+/// valid), and a cage started while it runs writes into a store being collected. `sbx gc` refuses
+/// a store a live session of the project holds, but a session is recorded only once its launch
+/// has seeded, so that refusal alone left the window open. With this lock, a collection that has
+/// started finishes before a launch goes on, and one that starts later finds the launch's session
+/// recorded, and refuses, or waits for a cage no session records (an `sbx upgrade` step), which
+/// holds the lock for its whole run. It also keeps the collection's cages from running beside
+/// another sbx run's on the store: nix names its temporary-roots file after its pid, which is the
+/// same in every such cage ([`HeldStore`]).
+///
+/// The file is beside the store in the project's runtime tree, where the project's marker is. No
+/// cage writes there, but one whose project holds sbx's data directory sees it read-only (the
+/// control-plane pins), and `flock` asks no write access: such a cage can hold the lock and keep
+/// the project's launches and its collection waiting, as it can the shared store's. So the side
+/// that waits names the file rather than guessing who holds it. Dropping the guard closes the
+/// file, releasing the lock.
+pub(crate) struct ProjectStoreLock(
+    // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.
+    #[allow(dead_code)] fs::File,
+);
+
+/// The project store lock file of `project_id`.
+fn project_store_lock_path(layout: &Layout, project_id: &str) -> PathBuf {
+    project_dir(layout, project_id).join("store.lock")
+}
+
+/// Take `project_id`'s store lock **shared**, for a launch: from before it provisions until its
+/// session is recorded, or for the whole run of a cage no session records. Launches of one project
+/// hold it together; a running `sbx gc` on it makes this wait, after `waiting` is given the lock
+/// file.
+pub(crate) fn hold_project_store(
+    layout: &Layout,
+    project_id: &str,
+    waiting: &dyn Fn(&Path),
+) -> io::Result<ProjectStoreLock> {
+    flock_at(
+        &project_store_lock_path(layout, project_id),
+        false,
+        Some(waiting),
+    )
+    .map(ProjectStoreLock)
+}
+
+/// Take `project_id`'s store lock **exclusive**, for `sbx gc`: from before it looks for a live
+/// session of the project until its work on the store is done. It waits, after `waiting` is given
+/// the lock file, for every launch still holding the lock shared, and every launch that comes
+/// after waits for it.
+pub(crate) fn lock_project_store(
+    layout: &Layout,
+    project_id: &str,
+    waiting: &dyn Fn(&Path),
+) -> io::Result<ProjectStoreLock> {
+    flock_at(
+        &project_store_lock_path(layout, project_id),
+        true,
+        Some(waiting),
+    )
+    .map(ProjectStoreLock)
 }
 
 /// Record the project's canonical path in a durable marker beside its store, so a later `sbx gc`
@@ -934,7 +1019,10 @@ fn store_cage(
 /// Two answers differ from a run on the host. The runtime roots nix finds in `/proc` are the
 /// cage's own processes rather than the host's, which counted only while a session of the project
 /// ran, and `sbx gc` refuses that. And nix names its temporary-roots file after its pid, which is
-/// the same in every such cage, so creating one unlinks another of that name as stale.
+/// the same in every such cage, so creating one unlinks another of that name as stale. `sbx gc`
+/// holds the project's store lock exclusive while these run ([`lock_project_store`]), so no other
+/// sbx run on the store has such a file then: a launch waits, an `sbx upgrade` step has ended, a
+/// session is refused. A cage that outlived the record of its session is the writer left.
 pub(crate) struct HeldStore<'a> {
     engine: &'a Engine<'a>,
     store_dir: &'a Path,
@@ -1337,10 +1425,10 @@ const NIX_STATE_FILES: &[&str] = &[
 /// to see.
 ///
 /// A missing directory is created, as `nix-store` would create it, and one the owner can no longer
-/// write to or enter is given those bits back ([`restore_owner_access`]). The names are checked, not
-/// held:
-/// the tree is still the cage's between this check and the `nix-store` run. `sbx gc` refuses a
-/// store a live cage of the project holds. A launch does not, since two launches of one project
+/// write to or enter is given those bits back ([`restore_owner_access`]). The names are checked,
+/// not held: the tree is still the cage's between this check and the `nix-store` run. `sbx gc`
+/// refuses a store a live cage of the project holds, under a lock a launch holds until its session
+/// is recorded ([`ProjectStoreLock`]). A launch does not, since two launches of one project
 /// may run at once, so a cage of the project that is running while another launch seeds can
 /// replace a checked name before `nix-store` opens it. The registration a launch runs answers that
 /// with its cage ([`load_cage`]), and this check, made again when the registration fails
@@ -1583,6 +1671,88 @@ mod tests {
             "the exclusive acquire did not proceed after the shared hold was released"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn launches_share_the_project_store_lock_and_gc_waits_for_each_of_them() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+
+        // Two launches of one project hold it together, and neither waits.
+        let first =
+            hold_project_store(&layout, "p", &|_| panic!("a launch waited on a launch")).unwrap();
+        let second =
+            hold_project_store(&layout, "p", &|_| panic!("a launch waited on a launch")).unwrap();
+        // Another project's lock is its own.
+        let other =
+            lock_project_store(&layout, "q", &|_| panic!("gc waited on another project")).unwrap();
+        drop(other);
+
+        let (said, waiting) = mpsc::channel();
+        let (got, granted) = mpsc::channel();
+        let path = data.path().to_path_buf();
+        let gc = std::thread::spawn(move || {
+            let layout = Layout::under(&path);
+            let lock = lock_project_store(&layout, "p", &|_| said.send(()).unwrap()).unwrap();
+            got.send(()).unwrap();
+            drop(lock);
+        });
+
+        assert!(
+            waiting.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "gc did not say it waits"
+        );
+        assert!(
+            granted.recv_timeout(Duration::from_millis(300)).is_err(),
+            "gc took the lock while two launches held it"
+        );
+        drop(first);
+        assert!(
+            granted.recv_timeout(Duration::from_millis(300)).is_err(),
+            "gc took the lock while a launch still held it"
+        );
+        drop(second);
+        assert!(
+            granted.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "gc did not go on once the launches let go"
+        );
+        gc.join().unwrap();
+    }
+
+    #[test]
+    fn a_launch_waits_for_gc_on_the_project_store_and_says_so() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let gc = lock_project_store(&layout, "p", &|_| panic!("nothing else holds it")).unwrap();
+
+        let (said, waiting) = mpsc::channel();
+        let (got, granted) = mpsc::channel();
+        let path = data.path().to_path_buf();
+        let launch = std::thread::spawn(move || {
+            let layout = Layout::under(&path);
+            let lock = hold_project_store(&layout, "p", &|_| said.send(()).unwrap()).unwrap();
+            got.send(()).unwrap();
+            drop(lock);
+        });
+
+        assert!(
+            waiting.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the launch did not say it waits"
+        );
+        assert!(
+            granted.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the launch went on while gc held the lock"
+        );
+        drop(gc);
+        assert!(
+            granted.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the launch did not go on once gc let go"
+        );
+        launch.join().unwrap();
     }
 
     #[test]

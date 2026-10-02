@@ -106,3 +106,46 @@ fn exec_refuses_a_private_tty_spec() {
         "exec must refuse a private-tty spec; got: {err}"
     );
 }
+
+/// A launch lets the project's store lock go when it records its session, and the record is
+/// there by then: an `sbx gc` of the project that waited on the lock finds the session.
+#[test]
+fn recording_the_session_lets_the_project_store_lock_go() {
+    let data = crate::testutil::TmpDir::new();
+    let layout = crate::store::Layout::under(data.path());
+    let lock = crate::sandbox::projectstore::hold_project_store(&layout, "p", &|_| {
+        panic!("nothing else holds it")
+    })
+    .unwrap();
+    let spec = SandboxSpec::new(
+        data.path().to_path_buf(),
+        vec![],
+        vec![],
+        NetPolicy::Isolated,
+        vec![std::ffi::OsString::from("true")],
+    )
+    .expect("a valid spec");
+
+    let recorded = register(
+        layout.data_dir(),
+        &spec,
+        Kind::Run,
+        binds::Runtime::ProjectDefault,
+        false,
+        Some(lock),
+    );
+
+    assert!(recorded.is_some(), "the session was recorded");
+    let gc = crate::sandbox::projectstore::lock_project_store(&layout, "p", &|_| {
+        panic!("gc waited: the launch still held the lock after recording its session")
+    })
+    .unwrap();
+    let live = crate::session::Registry::at(layout.data_dir())
+        .list()
+        .unwrap();
+    assert!(
+        live.iter().any(|s| s.pid == std::process::id()),
+        "the session is in the registry gc reads"
+    );
+    drop(gc);
+}

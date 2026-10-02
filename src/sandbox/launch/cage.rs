@@ -33,22 +33,34 @@ use super::*;
 /// infer from the other fields: a detached session's stdout/stderr is redirected to
 /// [`detach_log_path`], a foreground one's stays on the launching terminal. Only
 /// the `--detach` child in [`mod@super::detach`] passes `true`.
+///
+/// `store_lock` is the project's store lock [`super::build()`] took: let go once the record is
+/// written, and not before, so an `sbx gc` of the project that waited on it finds this session and
+/// refuses rather than collecting a store this cage is about to use. A record that could not be
+/// written lets it go all the same.
 pub(super) fn register(
     data_dir: &Path,
     spec: &SandboxSpec,
     kind: Kind,
     runtime: binds::Runtime,
     detached: bool,
+    store_lock: Option<crate::sandbox::projectstore::ProjectStoreLock>,
 ) -> Option<PathBuf> {
-    let session = Session::current(spec.workdir.clone(), kind, session_runtime(runtime)).ok()?;
-    let session = if detached {
-        session.detached()
-    } else {
-        session
-    };
-    crate::session::Registry::at(data_dir)
-        .register(&session)
+    let recorded = Session::current(spec.workdir.clone(), kind, session_runtime(runtime))
         .ok()
+        .and_then(|session| {
+            let session = if detached {
+                session.detached()
+            } else {
+                session
+            };
+            crate::session::Registry::at(data_dir)
+                .register(&session)
+                .ok()
+        });
+    // Let go only now: an `sbx gc` of the project waiting on it finds this session and refuses.
+    drop(store_lock);
+    recorded
 }
 
 /// The owned [`crate::session::SessionRuntime`] for a launch's borrowing [`binds::Runtime`], so the
