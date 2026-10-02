@@ -555,45 +555,35 @@ fn net_inject_session(
             Err(_) => {}
         }
     }
+    // What was loaded is the answer, on stdout; what was not is said on stderr, as the `[proc]` load
+    // and a config write say it, so a script reading stdout never takes a shortfall for a load.
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    out!(
-        "{}",
-        render_inject(
-            verb,
-            rule,
-            all,
-            app,
-            &loaded,
-            &refused,
-            &unconfirmed,
-            &context,
-            &pal
-        )
-    );
+    out!("{}", render_inject(verb, rule, &loaded, &context, &pal));
+    let (errors, hint) = inject_shortfall(verb, rule, all, app, &loaded, &refused, &unconfirmed);
+    for error in &errors {
+        diag::error(error);
+    }
+    if let Some(hint) = hint {
+        diag::hint(&hint);
+    }
     // A session in scope that does not hold the rule, or a load that reached none, is not a success
     // a script may go on from.
     crate::session_load_code(loaded.len(), refused.len(), unconfirmed.len())
 }
 
-/// Render a `--session` rule load: which live sessions took the rule (with their agent/project
-/// context, so a cross-agent reach is visible), which an older server refused, and which kept it
-/// without their proxy confirming it decides requests. When no session in scope took it, it says so
-/// and points at the config write as the persistent alternative. A pure presenter — its palette
+/// Render what a `--session` rule load loaded: the live sessions that took the rule, with their
+/// agent/project context so a cross-agent reach is visible, and where the rule can be seen. Empty
+/// when none took it; what was not applied is [`inject_shortfall`]'s. A pure presenter, its palette
 /// comes from the caller.
-#[allow(clippy::too_many_arguments)]
 fn render_inject(
     verb: &str,
     rule: &str,
-    all: bool,
-    app: Option<&str>,
     loaded: &[u32],
-    refused: &[u32],
-    unconfirmed: &[u32],
     context: &[(u32, PathBuf, String)],
     pal: &style::Palette,
 ) -> String {
     use std::fmt::Write as _;
-    let (h, dim, warn, r) = (pal.head, pal.dim, pal.warn, pal.reset);
+    let (h, r) = (pal.head, pal.reset);
     let mut o = String::new();
     if !loaded.is_empty() {
         let _ = writeln!(
@@ -623,54 +613,63 @@ fn render_inject(
             )
         );
     }
-    if !refused.is_empty() {
-        let pids = refused
-            .iter()
+    o
+}
+
+/// What a `--session` rule load did not apply, as the errors and the hint stderr carries: the
+/// sessions an older server refused it in, the ones that kept it without their proxy confirming it
+/// decides requests, and, when no session in scope took it at all, that fact and the config write
+/// that persists the rule instead. The hint carries the `--app <name>` scope when one was given, so
+/// it can be pasted as it is.
+fn inject_shortfall(
+    verb: &str,
+    rule: &str,
+    all: bool,
+    app: Option<&str>,
+    loaded: &[u32],
+    refused: &[u32],
+    unconfirmed: &[u32],
+) -> (Vec<String>, Option<String>) {
+    let pids = |pids: &[u32]| {
+        pids.iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(
-            o,
-            "{warn}session(s) {pids} refused the rule (an older sbx without --session rule \
-             support).{r}"
-        );
+            .join(", ")
+    };
+    let mut errors = Vec::new();
+    if !refused.is_empty() {
+        errors.push(format!(
+            "sbx: session(s) {} refused the rule (an older sbx without --session rule support).",
+            pids(refused)
+        ));
     }
     if !unconfirmed.is_empty() {
-        let pids = unconfirmed
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(
-            o,
-            "{warn}session(s) {pids} kept the rule, but their proxy did not confirm it decides \
-             requests — run the command again to push it once more.{r}"
-        );
+        errors.push(format!(
+            "sbx: session(s) {} kept the rule, but their proxy did not confirm it decides requests \
+             — run the command again to push it once more.",
+            pids(unconfirmed)
+        ));
     }
-    // Nothing took the rule: no session with egress filtering is running in scope. Point at the
-    // persistent path (which pre-decides the host for the next launch), carrying the `--app <name>`
-    // scope when one was given so the hint is copy-pasteable.
-    if loaded.is_empty() {
-        if refused.is_empty() && unconfirmed.is_empty() {
-            let scope = match (app, all) {
-                (Some(a), _) => format!("app `{a}`"),
-                (None, true) => "any session".to_string(),
-                (None, false) => "this project".to_string(),
-            };
-            let _ = writeln!(
-                o,
-                "{dim}no reachable session with egress filtering for {scope} — nothing to load the \
-                 rule into.{r}"
-            );
-        }
-        let app_flag = app.map(|a| format!(" --app {a}")).unwrap_or_default();
-        let _ = writeln!(
-            o,
-            "  {dim}to pre-decide it for the next launch, persist it: sbx net {verb} \
-             {rule}{app_flag}{r}"
-        );
+    if !loaded.is_empty() {
+        return (errors, None);
     }
-    o
+    // Nothing took the rule: no session with egress filtering is running in scope.
+    if refused.is_empty() && unconfirmed.is_empty() {
+        let scope = match (app, all) {
+            (Some(a), _) => format!("app `{a}`"),
+            (None, true) => "any session".to_string(),
+            (None, false) => "this project".to_string(),
+        };
+        errors.push(format!(
+            "sbx: no reachable session with egress filtering for {scope} — nothing to load the \
+             rule into."
+        ));
+    }
+    let app_flag = app.map(|a| format!(" --app {a}")).unwrap_or_default();
+    let hint = format!(
+        "     to pre-decide it for the next launch, persist it: sbx net {verb} {rule}{app_flag}"
+    );
+    (errors, Some(hint))
 }
 
 /// The removal verb and the rule noun for one egress list: `sbx net unallow` takes an `allow` rule
@@ -777,6 +776,51 @@ mod tests {
         );
         assert_eq!(received(&socket, session), "REMEMBER DENY api.test");
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+    }
+
+    /// What a `--session` load did not apply goes to stderr and what it loaded to stdout, so a
+    /// script reading the answer never takes a shortfall for a load. The hint to persist the rule
+    /// comes only when no session took it, and carries the `--app` scope it was given.
+    #[test]
+    fn a_session_load_says_on_stderr_what_it_did_not_apply() {
+        // Loaded everywhere: nothing to say on stderr.
+        assert_eq!(
+            inject_shortfall("allow", "a.test", false, None, &[7], &[], &[]),
+            (Vec::new(), None)
+        );
+        // Loaded in one, refused and unconfirmed in others: both named, no hint.
+        let (errors, hint) = inject_shortfall("deny", "a.test", true, None, &[7], &[8], &[9]);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].starts_with("sbx: session(s) 8 refused the rule"));
+        assert!(errors[1].starts_with("sbx: session(s) 9 kept the rule"));
+        assert_eq!(hint, None);
+        // Reached none: the scope it looked in, then the config write that persists the rule.
+        let (errors, hint) =
+            inject_shortfall("mute", "a.test", false, Some("agent"), &[], &[], &[]);
+        assert_eq!(
+            errors,
+            [
+                "sbx: no reachable session with egress filtering for app `agent` — nothing to load \
+              the rule into."
+            ]
+        );
+        assert_eq!(
+            hint.as_deref(),
+            Some(
+                "     to pre-decide it for the next launch, persist it: sbx net mute a.test --app agent"
+            )
+        );
+        // Refused everywhere it reached: the refusal stands for "no session", the hint still follows.
+        let (errors, hint) = inject_shortfall("allow", "a.test", false, None, &[], &[8], &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(hint.is_some());
+        // Stdout carries the load alone, and nothing when none took the rule.
+        let plain = style::Palette::plain();
+        assert_eq!(render_inject("allow", "a.test", &[], &[], &plain), "");
+        assert!(
+            render_inject("allow", "a.test", &[7], &[], &plain)
+                .starts_with("loaded allow rule `a.test` into 1 live session(s):")
+        );
     }
 
     /// A session in scope that refused a `--session` rule does not hold it, whether the others took

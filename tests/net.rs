@@ -576,12 +576,16 @@ fn net_mute_with_no_posture_is_refused() {
         "a --session mute that reached no session applied nothing:\n{}",
         String::from_utf8_lossy(&sess.stderr)
     );
+    // What a load did not apply is said on stderr, and nothing reaches stdout: it loaded nothing.
+    let sess_err = String::from_utf8_lossy(&sess.stderr);
     assert!(
-        String::from_utf8_lossy(&sess.stdout).contains("no reachable session")
-            && !String::from_utf8_lossy(&sess.stderr).contains("posture"),
-        "a --session mute must be taken as a load, not refused for its posture:\n{}{}",
-        String::from_utf8_lossy(&sess.stdout),
-        String::from_utf8_lossy(&sess.stderr)
+        sess_err.contains("no reachable session") && !sess_err.contains("posture"),
+        "a --session mute must be taken as a load, not refused for its posture:\n{sess_err}"
+    );
+    assert!(
+        sess.stdout.is_empty(),
+        "a load that applied nothing has nothing to answer on stdout:\n{}",
+        String::from_utf8_lossy(&sess.stdout)
     );
     assert!(
         !fx.proj.path().join(".sbx.toml").exists(),
@@ -2989,11 +2993,16 @@ fn net_allow_session_validates_flags_and_reports_when_no_session_is_reachable() 
         "a load that reached no session is not a success: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("no reachable session with egress filtering for this project")
-            && stdout.contains("sbx net allow github.com"),
-        "the no-session load must explain and point at the config write: {stdout}"
+        stderr.contains("no reachable session with egress filtering for this project")
+            && stderr.contains("sbx net allow github.com"),
+        "the no-session load must explain and point at the config write, on stderr: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a load that applied nothing has nothing to answer on stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
     assert!(
         !fx.proj.path().join(".sbx.toml").exists(),
