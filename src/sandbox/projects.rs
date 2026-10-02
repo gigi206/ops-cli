@@ -343,7 +343,8 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
         crate::diag::error(&format!(
             "sbx projects show: no runtime tree `{id}` — run `sbx projects list` to see them."
         ));
-        return ExitCode::FAILURE;
+        // A name that names nothing is a usage error, the exit every verb gives it.
+        return ExitCode::from(2);
     }
 
     let live_ids = registry_or_note(
@@ -781,6 +782,7 @@ pub(crate) fn projects_rm(
     // Probed once for every id named, before any removal: what each gives back is sized first.
     let reclaim = super::gc::Reclaim::for_layout(&layout);
     let mut had_error = false;
+    let mut absent = false;
 
     for id in ids {
         if !super::gc::is_safe_tree_id(id) {
@@ -808,7 +810,7 @@ pub(crate) fn projects_rm(
                     "sbx projects rm: no project tree for id `{id}` under {}.",
                     projects_dir.display()
                 ));
-                had_error = true;
+                absent = true;
             }
             super::gc::ReapOneOutcome::Live => {
                 crate::diag::error(&format!(
@@ -875,8 +877,12 @@ pub(crate) fn projects_rm(
         }
     }
 
+    // An id with no tree under it is a usage error (2); a removal refused or failed is a run that
+    // failed (1), and it is the one that says so when a batch holds both.
     if had_error {
         ExitCode::FAILURE
+    } else if absent {
+        ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
     }

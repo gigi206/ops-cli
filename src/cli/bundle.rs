@@ -84,6 +84,7 @@ fn bundle_rm(args: &[OsString]) -> ExitCode {
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut had_error = false;
+    let mut absent = false;
     for name in &names {
         // Asked BEFORE the file goes away: the answer is read out of the profiles, and a reader
         // would still get it afterwards, but naming the apps in the same breath as the removal is
@@ -110,7 +111,7 @@ fn bundle_rm(args: &[OsString]) -> ExitCode {
                     "sbx: no bundle '{name}' (a bundle lives as a file under \
                      bundles/<name>.toml; `sbx bundle` lists the declared ones)"
                 ));
-                had_error = true;
+                absent = true;
             }
             Err(e) => {
                 diag::error(&format!("sbx: cannot remove {}: {e}", path.display()));
@@ -118,8 +119,12 @@ fn bundle_rm(args: &[OsString]) -> ExitCode {
             }
         }
     }
+    // A name with nothing to remove is a usage error (2); a removal that failed is a run that failed
+    // (1), and it is the one that says so when a batch holds both.
     if had_error {
         ExitCode::FAILURE
+    } else if absent {
+        ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
     }

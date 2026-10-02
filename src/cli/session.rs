@@ -759,6 +759,7 @@ fn explain_missing_log(data_dir: &Path, id: u32, path: &Path) -> ExitCode {
         .live()
         .ok()
         .and_then(|sessions| sessions.into_iter().find(|s| s.pid == id));
+    let known = record.is_some();
     match record {
         Some(s) if !s.detached => {
             diag::error(&format!(
@@ -778,7 +779,13 @@ fn explain_missing_log(data_dir: &Path, id: u32, path: &Path) -> ExitCode {
             );
         }
     }
-    ExitCode::FAILURE
+    // An id no session answers to is a usage error (2), the exit every verb gives a name that
+    // names nothing; a session that is there and has no log is an answer about it (1).
+    if known {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::from(2)
+    }
 }
 
 /// Stream a running session's log until the session exits.

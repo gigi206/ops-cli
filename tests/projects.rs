@@ -311,7 +311,11 @@ fn show_of_a_dead_tree_reports_realized_state_only() {
 fn show_of_an_unknown_tree_fails() {
     let fx = Project::new("projects");
     let out = fx.run(&["projects", "show", "deadbeefdeadbeef"]);
-    assert_eq!(out.status.code(), Some(1), "unknown tree should fail 1");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unknown tree is a usage error"
+    );
     assert!(
         text(&out).contains("no runtime tree"),
         "missing not-found message:\n{}",
@@ -744,7 +748,7 @@ fn rm_an_unknown_id_fails_without_touching_other_trees() {
     let fx = Project::new("projects");
     let keep = fx.make_tree("keepkeepkeepkeep", Some(fx.proj.path()));
     let out = fx.run(&["projects", "rm", "0000000000000000"]);
-    assert_eq!(out.status.code(), Some(1), "an unknown id is a failure");
+    assert_eq!(out.status.code(), Some(2), "an unknown id is a usage error");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("no project tree for id"),
         "should report the missing id:\n{}",

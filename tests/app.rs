@@ -393,8 +393,8 @@ fn show_of_an_unknown_app_fails_and_lists_the_declared_ones() {
     let out = fx.run(&["app", "show", "nope"]);
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "unknown app should fail: {}",
+        Some(2),
+        "an unknown app is a usage error: {}",
         text(&out)
     );
     let s = text(&out);

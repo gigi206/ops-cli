@@ -629,6 +629,12 @@ struct RawStoreToml {
     trust: Option<String>,
 }
 
+/// Whether a store is configured under `name`: the question [`read_configured`] and [`remove`] ask
+/// first, answered alone so a caller can tell a name that names no store from a store that failed.
+pub(crate) fn is_configured(layout: &crate::store::Layout, name: &str) -> bool {
+    crate::plugins::validate_install_name(name).is_ok() && layout.store_path(name).exists()
+}
+
 /// Read a configured store's origin, pinned key, and accepted revision from its cache. The
 /// cache is trusted by location (owner-only under the data dir), so this does not re-verify a
 /// signature — but the two bookkeeping files degrade oppositely and deliberately. `store.toml`

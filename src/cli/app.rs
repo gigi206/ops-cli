@@ -1004,7 +1004,12 @@ fn app_export(args: &[OsString]) -> ExitCode {
         Err(code) => return code,
     };
     let bytes = match config::export_profile(&cwd, name) {
-        Ok(b) => b,
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            diag::error(&format!("sbx: {}", config::nothing_to_export(name)));
+            // A name that names nothing is a usage error, the exit every verb gives it.
+            return ExitCode::from(2);
+        }
         Err(e) => {
             diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
@@ -1149,6 +1154,7 @@ fn app_rm_profiles(names: &[&str]) -> ExitCode {
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut had_error = false;
+    let mut absent = false;
     for name in names {
         let path = dir.join(format!("{name}.toml"));
         match std::fs::remove_file(&path) {
@@ -1162,7 +1168,7 @@ fn app_rm_profiles(names: &[&str]) -> ExitCode {
                      project's .sbx.toml — edit it there). To also remove an app's home/tools, use \
                      `sbx app rm {name} --purge`."
                 ));
-                had_error = true;
+                absent = true;
             }
             Err(e) => {
                 diag::error(&format!("sbx: cannot remove {}: {e}", path.display()));
@@ -1170,8 +1176,12 @@ fn app_rm_profiles(names: &[&str]) -> ExitCode {
             }
         }
     }
+    // A name with nothing to remove is a usage error (2); a removal that failed is a run that failed
+    // (1), and it is the one that says so when a batch holds both.
     if had_error {
         ExitCode::FAILURE
+    } else if absent {
+        ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
     }
@@ -1611,7 +1621,8 @@ fn open_app(verb: &str, name: &str) -> Result<AppTarget, ExitCode> {
         } else {
             diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
         }
-        return Err(ExitCode::FAILURE);
+        // A name that names nothing is a usage error, the exit every verb gives it.
+        return Err(ExitCode::from(2));
     }
     Ok(AppTarget {
         resolved,

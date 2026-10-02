@@ -6511,10 +6511,10 @@ fn bundle_rm_names_the_app_profiles_that_still_use_it() {
 #[test]
 fn bundle_rm_refuses_an_absent_name_and_a_bad_one() {
     let p = Project::new("brm");
-    // Absent: an error, never a silent success — otherwise a typo reads as a removal.
+    // Absent: a usage error, never a silent success — otherwise a typo reads as a removal.
     let out = p.run(&["bundle", "rm", "nope"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("no bundle"), "stderr: {stderr}");
 
     // A name that could not key a file is refused before anything is touched.

@@ -1245,6 +1245,7 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut failed = false;
+    let mut absent = false;
     for name in &names {
         match stores::update(&layout, name, &git) {
             Ok(u) => {
@@ -1261,14 +1262,33 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
             }
             Err(why) => {
                 diag::error(&format!("sbx: cannot update store '{name}': {why}"));
-                failed = true;
+                if stores::is_configured(&layout, name) {
+                    failed = true;
+                } else {
+                    absent = true;
+                }
             }
         }
     }
+    // A name with no store under it is a usage error (2); an update that failed is a run that
+    // failed (1), and it is the one that says so when a batch holds both.
     if failed {
         ExitCode::FAILURE
+    } else if absent {
+        ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// The exit for a store operation that failed on `name`: a name no store is configured under is a
+/// usage error (2), the exit every verb gives a name that names nothing; anything else is a run
+/// that failed (1).
+fn store_failure(layout: &crate::store::Layout, name: &str) -> ExitCode {
+    if stores::is_configured(layout, name) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::from(2)
     }
 }
 
@@ -1362,7 +1382,7 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
         Ok(cfg) => cfg,
         Err(why) => {
             diag::error(&format!("sbx: {why}"));
-            return ExitCode::FAILURE;
+            return store_failure(&layout, name);
         }
     };
 
@@ -1529,7 +1549,7 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
         Ok(cfg) => cfg,
         Err(why) => {
             diag::error(&format!("sbx: {why}"));
-            return ExitCode::FAILURE;
+            return store_failure(&layout, name);
         }
     };
     let choice = match key {
@@ -1606,7 +1626,7 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
         }
         Err(why) => {
             diag::error(&format!("sbx: cannot remove store: {why}"));
-            ExitCode::FAILURE
+            store_failure(&layout, name)
         }
     }
 }
@@ -1947,7 +1967,7 @@ fn plugins_remove(args: &[OsString]) -> ExitCode {
     for name in &names {
         if let Err(why) = plugins::validate_install_name(name) {
             diag::error(&format!("sbx: cannot remove plugin: {why}"));
-            return ExitCode::FAILURE;
+            return ExitCode::from(2);
         }
     }
     crate::cli::dedupe_names(&mut names);
@@ -1957,6 +1977,7 @@ fn plugins_remove(args: &[OsString]) -> ExitCode {
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut had_error = false;
+    let mut absent = false;
     for name in &names {
         match plugins::remove(&layout, name) {
             Ok(left) => {
@@ -1975,12 +1996,19 @@ fn plugins_remove(args: &[OsString]) -> ExitCode {
             }
             Err(why) => {
                 diag::error(&format!("sbx: cannot remove plugin: {why}"));
-                had_error = true;
+                match why {
+                    plugins::RemoveError::Unknown(_) => absent = true,
+                    plugins::RemoveError::Failed(_) => had_error = true,
+                }
             }
         }
     }
+    // A name with nothing to remove is a usage error (2); a removal that failed is a run that failed
+    // (1), and it is the one that says so when a batch holds both.
     if had_error {
         ExitCode::FAILURE
+    } else if absent {
+        ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
     }
@@ -2333,7 +2361,8 @@ fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
         }
         diag::error(&nothing_answers(key));
         diag::hint("       `sbx plugins list` shows every installed plugin.");
-        return ExitCode::FAILURE;
+        // A name that names nothing is a usage error, the exit every verb gives it.
+        return ExitCode::from(2);
     };
     if json {
         // The grant is the reason this verb exists, so it is the part the document carries whole:

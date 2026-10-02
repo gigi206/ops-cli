@@ -711,7 +711,10 @@ fn plugins_rm_takes_several_names_and_one_failure_spares_the_rest() {
         &["plugins", "rm", "demo-one", "demo-absent", "demo-two"],
         home.path(),
     );
-    assert_eq!(code, 1, "an absent plugin must colour the exit code: {err}");
+    assert_eq!(
+        code, 2,
+        "an absent plugin colours the exit code as a usage error: {err}"
+    );
     assert!(
         err.contains("no installed plugin named `demo-absent`"),
         "the failing name is not the one reported: {err}"
@@ -737,7 +740,10 @@ fn plugins_rm_rejects_an_unsafe_name_before_removing_anything() {
     // A path-shaped name is refused, and the valid name ahead of it is left installed: a removal is
     // destructive, so a typo at the end must not cost the names before it.
     let (code, err) = run_failing(&["plugins", "rm", "demo-one", "../escape"], home.path());
-    assert_eq!(code, 1, "an unsafe plugin name must be refused: {err}");
+    assert_eq!(
+        code, 2,
+        "an unsafe plugin name is refused as a usage error: {err}"
+    );
     assert!(
         err.contains("must not start with a dot"),
         "the refusal must be the name check, not a removal that failed at the sink: {err}"

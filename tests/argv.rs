@@ -215,6 +215,47 @@ fn an_option_is_never_taken_as_another_options_value() {
     }
 }
 
+/// A name that names nothing (an app, a plugin, a bundle, a group, a session) is a usage error, and
+/// a usage error exits 2, as `exit-codes.md` says. The verbs disagreed: the same "no app named"
+/// left `config show --app` and `app show` at 1 and `test net --app` and `app upgrade` at 2, so a
+/// script could not tell a typo from a run that failed by asking the code.
+#[test]
+fn a_name_that_names_nothing_is_a_usage_error() {
+    let home = TmpDir::new("argv");
+    for args in [
+        &["config", "show", "--app", "nope"][..],
+        &["app", "show", "nope"],
+        &["app", "prune", "nope"],
+        &["app", "upgrade", "nope"],
+        &["app", "rm", "nope"],
+        &["upgrade", "--app", "nope"],
+        &["test", "net", "--app", "nope", "example.com"],
+        &["plugins", "info", "nope"],
+        &["plugins", "rm", "nope"],
+        &["bundle", "nope"],
+        &["bundle", "rm", "nope"],
+        &["net", "groups", "nope"],
+        &["net", "groups", "export", "nope"],
+        &["net", "groups", "rm", "nope"],
+        &["session", "stop", "999999"],
+        &["session", "logs", "nope"],
+        &["session", "logs", "999999"],
+        &["session", "attach", "999999"],
+        &["app", "export", "nope"],
+        &["bundle", "export", "nope"],
+        &["plugins", "verify", "nope"],
+        &["plugins", "upgrade", "nope"],
+        &["plugins", "store", "info", "nope"],
+        &["plugins", "store", "rm", "nope"],
+        &["plugins", "store", "update", "nope"],
+        &["projects", "rm", "nope"],
+        &["projects", "show", "0000000000000000"],
+    ] {
+        let (code, out) = run(args, home.path());
+        assert_eq!(code, 2, "`sbx {}`:\n{out}", args.join(" "));
+    }
+}
+
 /// `help` refuses an option it does not know, like every other verb. It stopped reading at the
 /// first token shaped like a flag, so `sbx help --foo` printed the command list at exit 0 and `sbx
 /// help app --foo` the `app` page, an answer that looks right to a command that was mistyped. The

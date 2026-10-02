@@ -2090,12 +2090,17 @@ pub(super) fn merge_profile_apps(
 /// user to resolve — so `sbx app export <name>` may emit the profile while `sbx app <name>` would
 /// launch the profile (the inline is inert). Exporting the inline is itself the migration path off
 /// the forbidden form. Keep at most one definition per name.
-pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> {
+///
+/// `Ok(None)` when no app of that name is there to export, which the caller reports as a name that
+/// names nothing ([`nothing_to_export`]); `Err` when one is and could not be read or serialized.
+pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
     // 1. An imported profile: emit it verbatim (fidelity over re-serialization).
     if let Some(dir) = profiles_dir() {
         let path = dir.join(format!("{name}.toml"));
         if path.exists() {
-            return safety::read_safe_bytes(&path).map_err(|e| e.to_string());
+            return safety::read_safe_bytes(&path)
+                .map(Some)
+                .map_err(|e| e.to_string());
         }
     }
     // 2. An inline app: serialize its raw definition. The project layer is preferred over the
@@ -2104,16 +2109,21 @@ pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> 
     if let Ok(Some((mut project, _, _))) = read_project(cwd, &mut warnings)
         && let Some(app) = project.app.remove(name)
     {
-        return schema::serialize_app(&app).map(String::into_bytes);
+        return schema::serialize_app(&app).map(|s| Some(s.into_bytes()));
     }
     let (mut global, _refused) = read_global(&mut warnings);
     if let Some(app) = global.app.remove(name) {
-        return schema::serialize_app(&app).map(String::into_bytes);
+        return schema::serialize_app(&app).map(|s| Some(s.into_bytes()));
     }
-    Err(format!(
+    Ok(None)
+}
+
+/// What `sbx app export` says when [`export_profile`] finds no app of that name.
+pub(crate) fn nothing_to_export(name: &str) -> String {
+    format!(
         "no app `{name}` to export (not an imported profile, nor an inline [app.{name}] in \
          {PROJECT_CONFIG} or {GLOBAL_CONFIG})"
-    ))
+    )
 }
 
 #[cfg(test)]

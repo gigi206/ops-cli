@@ -14,12 +14,26 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 |---|---|
 | `0` | success |
 | `1` | a runtime failure, an operation that ran but did not succeed (e.g. `sbx config get` on an unset key, a store/network operation that failed) |
-| `2` | a **usage or fail-closed** error, a bad argument, a missing operand, or a rejected [one-shot override](../configuration/overrides) value |
+| `2` | a **usage or fail-closed** error, a bad argument, a missing operand, a name that names nothing (an app, a plugin, a store, a bundle, an egress group, a project tree, a session), or a rejected [one-shot override](../configuration/overrides) value |
 | `125` | nothing was run, deliberately: [`sbx task run`](../cli/task#run) refused the invocation, or [`sbx session attach`](../cli/session#attach) could not re-apply the cage's confinement |
 | `126` | [`sbx session attach`](../cli/session#attach) could not join the running cage, or could not reap the shell it started |
 | `127` | [`sbx session attach`](../cli/session#attach) reached the cage but could not start the shell in it |
 | `128 + N` | the launched or attached command was terminated by signal `N` |
 | *other* | for a launch verb, the **launched command's** own exit status |
+
+## A name that names nothing exits 2
+
+A verb handed the name of an app, a plugin, a plugin store, a bundle, an egress group, a
+project tree or a session that does not exist refuses it as a usage error and exits 2: `sbx
+app show nope`, `sbx config show --app nope`, `sbx plugins info nope` and `sbx bundle rm nope`
+exit 2 like `sbx net groups nope` and `sbx session stop 999999`. A script can tell a mistyped
+name from a run that failed by the code alone. A batch that names several things keeps the
+stronger answer: when one name is unknown and another one's removal fails, it exits 1.
+
+Two answers about a name stay at 1, because they are about what is there rather than about
+a typo. `sbx app rm <name> --purge` exits 1 when nothing came off disk, which covers a name
+with nothing under it and an app whose live session refused the purge alike. `sbx plugins
+info <name>` exits 1 when several installed plugins claim the name.
 
 ## Launch verbs propagate the command's status
 

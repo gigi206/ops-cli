@@ -214,7 +214,8 @@ fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCod
         } else {
             diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
         }
-        return ExitCode::FAILURE;
+        // A name that names nothing is a usage error, the exit every verb gives it.
+        return ExitCode::from(2);
     };
 
     if json {

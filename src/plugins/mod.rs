@@ -1921,32 +1921,59 @@ fn forget_state(layout: &crate::store::Layout, name: &str) -> Option<PathBuf> {
     }
 }
 
+/// Why [`remove`] removed nothing. The two answer different questions for the caller: a name no
+/// plugin is installed under is a mistake in the command line, and the verb exits as for one; a
+/// plugin that is there and could not be taken out is a run that failed.
+#[derive(Debug)]
+pub(crate) enum RemoveError {
+    /// No plugin is installed under the name, or the name is one no plugin can carry.
+    Unknown(String),
+    /// What is under the name is not a plugin, or could not be inspected or moved.
+    Failed(String),
+}
+
+impl std::fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// Remove an installed resolver plugin by name. The name is validated as a safe path component
 /// first (so `..`/`/` can never escape the plugins directory), and the target must actually look
 /// like a plugin (carry a `plugin.toml`) so a typo cannot delete an unrelated directory. The
 /// directory is renamed aside atomically — leaving the registry at once — then removed.
-pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<Vec<PathBuf>, String> {
-    validate_install_name(name)?;
+pub(crate) fn remove(
+    layout: &crate::store::Layout,
+    name: &str,
+) -> Result<Vec<PathBuf>, RemoveError> {
+    validate_install_name(name).map_err(RemoveError::Unknown)?;
     let dest = layout.plugins_dir().join(name);
     let meta = match std::fs::symlink_metadata(&dest) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!("no installed plugin named `{name}`"));
+            return Err(RemoveError::Unknown(format!(
+                "no installed plugin named `{name}`"
+            )));
         }
-        Err(e) => return Err(format!("cannot inspect `{name}`: {e}")),
+        Err(e) => return Err(RemoveError::Failed(format!("cannot inspect `{name}`: {e}"))),
     };
     if !meta.is_dir() {
-        return Err(format!("`{name}` is not an installed plugin"));
+        return Err(RemoveError::Failed(format!(
+            "`{name}` is not an installed plugin"
+        )));
     }
     if !dest.join("plugin.toml").is_file() {
-        return Err(format!(
+        return Err(RemoveError::Failed(format!(
             "`{name}` carries no plugin.toml — refusing to remove (it is not a resolver plugin)"
-        ));
+        )));
     }
     let trash = layout
         .data_dir()
         .join(format!(".plugin-rm-{}-{}", std::process::id(), unique()));
-    std::fs::rename(&dest, &trash).map_err(|e| format!("cannot remove `{name}`: {e}"))?;
+    std::fs::rename(&dest, &trash)
+        .map_err(|e| RemoveError::Failed(format!("cannot remove `{name}`: {e}")))?;
     let mut left = Vec::new();
     if crate::sandbox::gc::force_remove_dir_all(&trash).is_err() {
         left.push(trash);
@@ -4452,7 +4479,11 @@ mod tests {
         let data = crate::testutil::TmpDir::new();
         let layout = crate::store::Layout::under(data.path());
         let err = remove(&layout, "ghost").unwrap_err();
-        assert!(err.contains("no installed plugin named"), "{err}");
+        // Unknown, not failed: the caller exits on it as on a mistake in the command line.
+        assert!(
+            matches!(&err, RemoveError::Unknown(why) if why.contains("no installed plugin named")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -4464,7 +4495,11 @@ mod tests {
         fs::create_dir_all(&stray).unwrap();
         fs::write(stray.join("note.txt"), "not a plugin").unwrap();
         let err = remove(&layout, "stray").unwrap_err();
-        assert!(err.contains("no plugin.toml"), "{err}");
+        // Something is there under the name, so this is a failure rather than an unknown name.
+        assert!(
+            matches!(&err, RemoveError::Failed(why) if why.contains("no plugin.toml")),
+            "{err:?}"
+        );
         assert!(stray.exists(), "a non-plugin directory must be left intact");
     }
 }
