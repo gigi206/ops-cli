@@ -1741,6 +1741,10 @@ mod tests {
     /// compositor, and restarting it to find out would take the session down.
     #[test]
     fn the_desktop_sink_reconnects_when_the_daemon_is_replaced() {
+        // The mark is written to the data directory the environment names, which is the point of
+        // this test, and is read once per process. Under the lock the binary shares, so that is the
+        // ambient directory and never one another test pinned for its own run.
+        let _lock = crate::testutil::env_lock();
         let Ok(bus) = std::process::Command::new("dbus-daemon")
             .args(["--session", "--print-address", "--nofork"])
             .stdout(std::process::Stdio::piped())
@@ -1874,6 +1878,10 @@ mod tests {
     /// two deliveries is what distinguishes "read once and remembered" from "read every time".
     #[test]
     fn the_fill_sent_follows_the_portal_and_is_re_read_per_announcement() {
+        // The mark is written to the data directory the environment names, which is the point of
+        // this test, and is read once per process. Under the lock the binary shares, so that is the
+        // ambient directory and never one another test pinned for its own run.
+        let _lock = crate::testutil::env_lock();
         let Ok(bus) = std::process::Command::new("dbus-daemon")
             .args(["--session", "--print-address", "--nofork"])
             .stdout(std::process::Stdio::piped())
