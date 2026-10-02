@@ -99,33 +99,51 @@ pub(crate) fn prune_flake_roots(
     current: &BTreeSet<String>,
     prune: bool,
 ) -> Vec<PathBuf> {
-    let dir = super::projectstore::gcroots_dir(store_dir);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut stale = Vec::new();
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name
+    prune_gcroots(store_dir, prune, |entry| {
+        entry
+            .file_name()
             .to_str()
             .and_then(|n| n.strip_prefix("sbx-flake-"))
-        else {
-            continue;
-        };
-        if current.contains(name) {
+            .is_some_and(|name| !current.contains(name))
+    })
+}
+
+/// Remove, or in a dry run list, the entries of a project store's `gcroots` directory that `stale`
+/// picks, returning the paths a user finds them at.
+///
+/// That directory is in the tree the project's cage writes, so it is opened by [`open_beneath`]
+/// from the store directory, following nothing, and listed and pruned through that descriptor: a
+/// link the cage puts on the way, before or during the pass, never has a directory of the host
+/// listed or its links removed. A directory that cannot be opened that way, absent or reached
+/// through a link, yields nothing, which leaves every root in place; the collection that follows
+/// refuses a store whose roots are reached through a link on its own
+/// ([`super::projectstore::HeldStore`]).
+fn prune_gcroots(
+    store_dir: &Path,
+    prune: bool,
+    stale: impl Fn(&std::fs::DirEntry) -> bool,
+) -> Vec<PathBuf> {
+    let Ok(held) = open_beneath(store_dir, Path::new("nix/var/nix/gcroots")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", held.as_raw_fd())) else {
+        return Vec::new();
+    };
+    let shown = super::projectstore::gcroots_dir(store_dir);
+    let mut pruned = Vec::new();
+    for entry in entries.flatten() {
+        if !stale(&entry) {
             continue;
         }
-        let path = entry.path();
-        if prune {
-            if std::fs::remove_file(&path).is_ok() {
-                stale.push(path);
-            }
-        } else {
-            stale.push(path);
+        let name = entry.file_name();
+        if prune
+            && !super::cagedir::entry(&held, &name).is_ok_and(|at| std::fs::remove_file(at).is_ok())
+        {
+            continue;
         }
+        pruned.push(shown.join(name));
     }
-    stale
+    pruned
 }
 
 /// Remove — or, in a dry run, list — the **data-dir** `<data>/gcroots/projects/<id>/<name>`
@@ -280,38 +298,18 @@ pub(crate) fn prune_superseded_roots(
     keep: &BTreeSet<OsString>,
     prune: bool,
 ) -> Vec<PathBuf> {
-    let dir = super::projectstore::gcroots_dir(store_dir);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut removed = Vec::new();
-    for entry in entries.flatten() {
+    prune_gcroots(store_dir, prune, |entry| {
         let name = entry.file_name();
         // nix's own indirect-root directory, and the flake roots `prune_flake_roots` owns, are
         // off-limits — this pass reconciles only the seed roots.
         if name == "auto" || name.to_str().is_some_and(|n| n.starts_with("sbx-flake-")) {
-            continue;
+            return false;
         }
         // A seed root's file name is the store-path basename it roots; keep it while a current
-        // out-link still points at that build.
-        if keep.contains(&name) {
-            continue;
-        }
-        // A seed root is a symlink; never remove a stray directory or regular file that landed here.
-        if !entry.file_type().is_ok_and(|t| t.is_symlink()) {
-            continue;
-        }
-        let path = entry.path();
-        if prune {
-            if std::fs::remove_file(&path).is_ok() {
-                removed.push(path);
-            }
-        } else {
-            removed.push(path);
-        }
-    }
-    removed
+        // out-link still points at that build. A seed root is a symlink; never remove a stray
+        // directory or regular file that landed here.
+        !keep.contains(&name) && entry.file_type().is_ok_and(|t| t.is_symlink())
+    })
 }
 
 /// What deduplicating a store reclaimed.
@@ -3591,6 +3589,39 @@ mod tests {
         assert!(gcroots.join("bbb-mise-2026.7.5").symlink_metadata().is_ok());
         assert!(gcroots.join("sbx-flake-hello").symlink_metadata().is_ok());
         assert!(gcroots.join("auto").is_dir());
+    }
+
+    #[test]
+    fn a_link_the_cage_put_on_the_way_to_gcroots_has_nothing_it_leads_to_pruned() {
+        // The project's cage writes its store. A link at `gcroots`, or above it at `var`, leads to a
+        // directory of the host: neither pass lists it or removes the links it holds.
+        for linked in ["nix/var/nix/gcroots", "nix/var"] {
+            let store = TmpDir::new();
+            let elsewhere = TmpDir::new();
+            let held = if linked == "nix/var" {
+                elsewhere.path().join("nix/gcroots")
+            } else {
+                elsewhere.path().to_path_buf()
+            };
+            std::fs::create_dir_all(&held).unwrap();
+            for name in ["sbx-flake-gone", "ccc-mise-2026.6.0"] {
+                std::os::unix::fs::symlink("/nix/store/x", held.join(name)).unwrap();
+            }
+            let at = store.path().join(linked);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(elsewhere.path(), &at).unwrap();
+
+            for prune in [false, true] {
+                assert!(prune_flake_roots(store.path(), &BTreeSet::new(), prune).is_empty());
+                assert!(prune_superseded_roots(store.path(), &BTreeSet::new(), prune).is_empty());
+            }
+            for name in ["sbx-flake-gone", "ccc-mise-2026.6.0"] {
+                assert!(
+                    held.join(name).symlink_metadata().is_ok(),
+                    "{name}, reached through `{linked}`, is still there"
+                );
+            }
+        }
     }
 
     #[test]
