@@ -87,6 +87,16 @@ it learned failed. A learning run stopped before its launch learned nothing, and
 with the code the same launch without the flag stops with (2 for an undeclared app, 1 for
 an app that declares no command), or with 2 for a posture the flag cannot learn under.
 
+A cage that never started is no launch either. When the sandbox could not be prepared or
+spawned, or its terminal could not be set up, the run exits 1 as the launch without the
+flag does. Under `--proc-learn` the exec record tells the rest: a run that recorded no
+program and ended in a failure never reached its command (bubblewrap refused its own setup,
+the command is nowhere on the cage's `PATH`), says so, and exits with that failure's code. Under `--net-learn`
+alone, a cage that was started but never reached its command, bubblewrap refusing its own
+setup for one, cannot be told from an app that made no request and failed: such a run
+reports that it learned nothing and exits 0, with bubblewrap's own message above it on
+standard error.
+
 ## Fail-closed overrides exit 2
 
 A [one-shot override](../configuration/overrides) with a **set-but-invalid** security

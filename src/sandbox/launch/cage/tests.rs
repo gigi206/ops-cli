@@ -166,3 +166,40 @@ fn recording_the_session_lets_the_project_store_lock_go() {
     );
     drop(gc);
 }
+
+/// A cage the runner could not spawn is told apart from one that ran and exited 1, which the
+/// plain `1` of [`run_status`] cannot do and a learning run needs. The program stands in for
+/// bubblewrap: one that is not there cannot be spawned, `false` runs and exits 1, `true` runs and
+/// exits 0. The spec carries no limit scope, so no `systemd-run` is put in front of it.
+#[test]
+fn a_cage_that_could_not_be_spawned_is_not_a_cage_that_exited_1() {
+    let spec = SandboxSpec::new(
+        PathBuf::from("/work"),
+        vec![],
+        vec![],
+        NetPolicy::Shared,
+        vec![OsString::from("/bin/true")],
+    )
+    .unwrap()
+    .with_limit_scope(crate::sandbox::cgroup::Scope::unlimited());
+    let limits = crate::sandbox::cgroup::Limits::default();
+    let missing = crate::testutil::TmpDir::new().path().join("no-bwrap-here");
+    assert_eq!(
+        try_run_status(&missing, &spec, &limits),
+        Err(NotStarted),
+        "a program that is not there never started"
+    );
+    assert_eq!(
+        try_run_status(Path::new("/bin/false"), &spec, &limits),
+        Ok(1)
+    );
+    assert_eq!(
+        try_run_status(Path::new("/bin/true"), &spec, &limits),
+        Ok(0)
+    );
+    assert_eq!(
+        run_status(&missing, &spec, &limits),
+        1,
+        "the other callers keep their 1"
+    );
+}

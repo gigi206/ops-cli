@@ -91,28 +91,45 @@ pub(super) fn run_supervised(
 }
 
 /// Fork the cage, wait, and return its exit status code (shell convention). The fork-and-wait
-/// core of [`run_supervised`], shared with the multi-cage upgrade roll: both run a series of
-/// cages and need the code of each rather than exec-replacing the launcher. A failure to
-/// prepare or spawn surfaces a pointed error and yields `1`, matching the supervised path.
+/// core of [`run_supervised`], shared with the detached session's daemon: both keep sbx alive
+/// beside the cage rather than exec-replacing the launcher. A failure to prepare or spawn
+/// surfaces a pointed error and yields `1`, matching the supervised path.
 pub(super) fn run_status(
     bwrap: &Path,
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
 ) -> i32 {
+    try_run_status(bwrap, spec, limits).unwrap_or(1)
+}
+
+/// A cage the launcher could not start: nothing ran in it, and the cause is already on stderr.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct NotStarted;
+
+/// [`run_status`], telling a cage that never started from one that ran: [`NotStarted`] when the
+/// sandbox could not be prepared or spawned, the cage's own code otherwise.
+///
+/// A learning run needs the difference, which `1` erases: only a cage that ran has anything to
+/// learn from, and one that never started must not be reported as having been refused nothing.
+pub(super) fn try_run_status(
+    bwrap: &Path,
+    spec: &SandboxSpec,
+    limits: &crate::sandbox::cgroup::Limits,
+) -> Result<i32, NotStarted> {
     let mut command = match cage_command(bwrap, spec, limits) {
         Ok(cage) => cage.into_command(),
         Err(e) => {
             // Not only the filter: this step also builds the descriptor carrying the cage's
             // environment, and naming the wrong one would send a reader looking at `[seccomp]`.
             crate::diag::error(&format!("sbx: cannot prepare the sandbox: {e}"));
-            return 1;
+            return Err(NotStarted);
         }
     };
     match command.status() {
-        Ok(status) => status_code(status),
+        Ok(status) => Ok(status_code(status)),
         Err(e) => {
             crate::diag::error(&format!("sbx: failed to launch the sandbox: {e}"));
-            1
+            Err(NotStarted)
         }
     }
 }
@@ -346,20 +363,20 @@ pub(super) fn supervise(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
     gui: bool,
-) -> io::Result<i32> {
+) -> Result<i32, PtyFailure> {
     // The command is built *before* the fork — nothing between fork and exec may allocate, and the
     // anonymous files behind it (the seccomp filters and the cage's environment) must be created
     // here so the child inherits their descriptors. `cage` holds them through `pump`, so bwrap can
     // still read them after the exec.
-    let cage = cage_command(bwrap, spec, limits)?;
+    let cage = cage_command(bwrap, spec, limits).map_err(PtyFailure::BeforeFork)?;
     // `inherit` is recorded before the fork, for the child to clear between `fork` and `execv`. The
     // parent keeps its copies close-on-exec, so nothing else this process launches inherits them —
     // see [`crate::sandbox::memfd::write`] for what that window cost.
     let (program, full_argv, inherit) = cage.fork_parts();
-    let program_c = cstring(program.as_os_str().as_bytes())?;
+    let program_c = cstring(program.as_os_str().as_bytes()).map_err(PtyFailure::BeforeFork)?;
     let mut argv_owned = vec![program_c.clone()];
     for arg in full_argv {
-        argv_owned.push(cstring(arg.as_bytes())?);
+        argv_owned.push(cstring(arg.as_bytes()).map_err(PtyFailure::BeforeFork)?);
     }
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
     argv.push(std::ptr::null());

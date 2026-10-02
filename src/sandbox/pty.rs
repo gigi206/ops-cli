@@ -425,6 +425,9 @@ impl Drop for RawMode {
 ///
 /// `gui` is passed on to [`pump`]: a graphical cage reads a doubled Ctrl+C as the way out.
 ///
+/// A failure says which side of the fork it came from ([`PtyFailure`]): before it no child exists,
+/// after it the child was started.
+///
 /// # Safety
 ///
 /// `child` runs between `fork` and `exec` and must therefore touch only async-signal-safe code — no
@@ -433,7 +436,7 @@ impl Drop for RawMode {
 pub(super) unsafe fn fork_with_pty(
     gui: bool,
     child: impl FnOnce(libc::c_int) -> std::convert::Infallible,
-) -> io::Result<i32> {
+) -> Result<i32, PtyFailure> {
     // Carry the real terminal's window size onto the pty so the inner shell wraps correctly from
     // the start.
     // SAFETY: all-zero is a valid `winsize` (four `c_ushort`s), and it is handed to `openpty` only
@@ -461,7 +464,7 @@ pub(super) unsafe fn fork_with_pty(
         )
     } != 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(PtyFailure::BeforeFork(io::Error::last_os_error()));
     }
 
     // The master must never reach the sandbox. The parent keeps it (and never execs), so
@@ -484,7 +487,7 @@ pub(super) unsafe fn fork_with_pty(
             libc::close(master);
             libc::close(slave);
         }
-        return Err(e);
+        return Err(PtyFailure::BeforeFork(e));
     }
     if pid == 0 {
         // SAFETY: this is the child, between `fork` and `exec`, and `close` is a raw syscall.
@@ -503,7 +506,7 @@ pub(super) unsafe fn fork_with_pty(
     // SAFETY: only the parent reaches this line — the child branch above never returns — and its
     // `slave` is its own copy of the descriptor, still open and used nowhere else here.
     unsafe { libc::close(slave) };
-    let _raw = RawMode::enable(0)?;
+    let _raw = RawMode::enable(0).map_err(PtyFailure::AfterFork)?;
     // Install the resize relay *after* the fork so the child never inherits the handler. sbx keeps
     // the real controlling terminal (only the child `setsid`'d, via `login_tty` or the attach
     // entry), so it receives `SIGWINCH` from the launching terminal naturally; the handler wakes
@@ -521,7 +524,43 @@ pub(super) unsafe fn fork_with_pty(
     // SAFETY: the parent has held `master` since `openpty` and `pump` has returned, so nothing is
     // still reading it; this is its only close.
     unsafe { libc::close(master) };
-    status
+    status.map_err(PtyFailure::AfterFork)
+}
+
+/// Why [`fork_with_pty`] has no exit code to give, by the side of the fork the failure came from.
+///
+/// The fork is the line a caller that learns from the session needs drawn: before it nothing ran,
+/// so there is nothing to learn from; after it the child was started, and what it did stands even
+/// though the relay under it failed.
+#[derive(Debug)]
+pub(super) enum PtyFailure {
+    /// The pty could not be opened, or the fork failed, or the caller could not prepare the child:
+    /// no child exists.
+    BeforeFork(io::Error),
+    /// The child was started, and the terminal or the relay failed under it.
+    AfterFork(io::Error),
+}
+
+impl PtyFailure {
+    /// Whether a child was started before the failure.
+    pub(super) fn started(&self) -> bool {
+        matches!(self, PtyFailure::AfterFork(_))
+    }
+
+    /// The I/O error, for a caller that answers both sides the same way.
+    pub(super) fn into_io(self) -> io::Error {
+        match self {
+            PtyFailure::BeforeFork(e) | PtyFailure::AfterFork(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for PtyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PtyFailure::BeforeFork(e) | PtyFailure::AfterFork(e) => e.fmt(f),
+        }
+    }
 }
 
 #[cfg(test)]

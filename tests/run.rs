@@ -4097,8 +4097,9 @@ fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under(
     //
     // And one negative: the app declares `deny = ["git"]`, so `git` ran into a refusal it was meant
     // to. It must be reported and never turned into an allow, because deny wins in the matcher and
-    // the rule would be inert beside it. Skips (never fails) when the host cannot sandbox or the
-    // cache is unreachable.
+    // the rule would be inert beside it. The script then exits 3, as an agent failing on what it
+    // has no rule for does: the run reached its command, so it still answers for its learning.
+    // Skips (never fails) when the host cannot sandbox or the cache is unreachable.
     let project = TmpDir::prefixed("r", "proclearn-proj");
     let data = TmpDir::prefixed("r", "proclearn-data");
     let state = TmpDir::prefixed("r", "proclearn-state");
@@ -4109,7 +4110,7 @@ fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under(
     let script = project.path().join("probe.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\ncurl --version >/dev/null 2>&1\ngit --version >/dev/null 2>&1\ntrue\n",
+        "#!/bin/sh\ncurl --version >/dev/null 2>&1\ngit --version >/dev/null 2>&1\nexit 3\n",
     )
     .unwrap();
     {
@@ -4209,6 +4210,83 @@ fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under(
     assert!(
         write_out.contains("ask") && write_out.contains("enforce"),
         "the write must say which posture it left and which it set: {write_out}"
+    );
+}
+
+#[test]
+fn a_proc_learn_run_that_never_reached_its_command_keeps_the_launchs_code() {
+    // The other side of the run above: a command the `PATH` walk finds nowhere is never reached.
+    // Every candidate the walk tries is absolute, so each is probed and none is recorded, and the
+    // exec record stays empty. Such a run must not be reported as one that was refused nothing and
+    // exit 0: it says it never got there and ends with the code the same launch without the flag
+    // ends with. Both go through the shim (`[proc] mode = "enforce"`), so the code is the same
+    // failure either way. A relative `./x` would not do here: it is recorded as named, unprobed, so
+    // it reads as reached. Skips (never fails) when the host cannot sandbox or the cache is
+    // unreachable.
+    let project = TmpDir::prefixed("r", "nolearn-proj");
+    let data = TmpDir::prefixed("r", "nolearn-data");
+    let state = TmpDir::prefixed("r", "nolearn-state");
+    let config = "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
+         [app.ghost]\ncmd = [\"sbx-e2e-not-on-any-path\"]\n\n\
+         [app.ghost.proc]\nmode = \"enforce\"\n";
+    std::fs::write(project.path().join(".sbx.toml"), config).unwrap();
+
+    probe_or_skip!(
+        "never-reached proc-learn e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
+    need_reachable!(
+        cache_reachable(),
+        "skipping never-reached proc-learn e2e: the binary cache is unreachable"
+    );
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", "--yes", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let plain = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "ghost"],
+    );
+    let learn = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "ghost", "--proc-learn", "--local"],
+    );
+    let learn_err = String::from_utf8_lossy(&learn.stderr);
+    assert!(
+        !plain.status.success(),
+        "a command that is not there must fail the plain launch: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        learn.status.code(),
+        plain.status.code(),
+        "the learning run must end with the plain launch's code: {learn_err}"
+    );
+    assert!(
+        learn_err.contains("never reached its command"),
+        "the learning run must say it never got there: {learn_err}"
+    );
+    let learn_out = String::from_utf8_lossy(&learn.stdout);
+    assert!(
+        !learn_out.contains("no new") && !learn_out.contains("refused nothing"),
+        "a run that never started must not be reported as having learned nothing new: {learn_out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap(),
+        config,
+        "nothing is written for a run that learned nothing"
     );
 }
 

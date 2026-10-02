@@ -819,3 +819,68 @@ fn the_launch_gate_asks_bwrap_before_refusing_a_namespace_sbx_was_denied() {
         "no user namespace and a failed launch leave nothing to run a cage in"
     );
 }
+
+/// A learning run whose cage never reached its command has nothing to learn from, and only the exec
+/// record can say so: it holds the command the shim execs whenever the cage got that far.
+#[test]
+fn only_an_empty_exec_record_and_a_failure_say_the_command_was_never_reached() {
+    use crate::sandbox::proclearn::Record;
+    let ran = Record {
+        targets: ["/usr/bin/agent".to_string()].into_iter().collect(),
+        truncated: false,
+    };
+    let empty = Record::default();
+    let failed = ExitCode::FAILURE;
+    let refused_setup = ExitCode::from(1);
+    let ok = ExitCode::SUCCESS;
+    for (code, learn_exec, execs, reached, case) in [
+        (
+            &failed,
+            true,
+            Some(&empty),
+            false,
+            "an empty record and a failure",
+        ),
+        (
+            &refused_setup,
+            true,
+            None,
+            false,
+            "no record at all and a failure",
+        ),
+        (
+            &failed,
+            true,
+            Some(&ran),
+            true,
+            "a command that ran and failed",
+        ),
+        (
+            &ok,
+            true,
+            Some(&empty),
+            true,
+            "a success, whatever the record holds",
+        ),
+        (
+            &ok,
+            true,
+            Some(&ran),
+            true,
+            "a command that ran and succeeded",
+        ),
+        (
+            &failed,
+            false,
+            None,
+            true,
+            "no --proc-learn, so no record to read",
+        ),
+    ] {
+        assert_eq!(
+            reached_its_command(code, learn_exec, execs),
+            reached,
+            "{case}"
+        );
+    }
+}

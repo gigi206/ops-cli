@@ -44,7 +44,7 @@ use super::broker;
 use super::contract::TextDelivery;
 use super::egress;
 use super::forward;
-use super::pty::fork_with_pty;
+use super::pty::{PtyFailure, fork_with_pty};
 use super::spec::{NetPolicy, SandboxSpec, TerminalPolicy};
 use super::sshagent;
 use crate::config::ends_with_shell_payload;
@@ -76,7 +76,7 @@ mod roll;
 mod session;
 
 use build::{LaunchGuard, build};
-use cage::{exec, register, run_supervised, supervise};
+use cage::{NotStarted, exec, register, run_supervised, supervise, try_run_status};
 use detach::launch_detached;
 use session::{launch_display_name, render_gui_stop_hint};
 
@@ -768,17 +768,26 @@ fn launch_foreground_learning(
     );
     let _record = interactive.then(|| record.map(RecordGuard::new));
 
+    // A cage that was never started answers as a plain launch would, and is not handed on to be
+    // reported as a run that was refused nothing. The two runners say so where it is certain: a
+    // sandbox that could not be prepared or spawned, and a pty failure from before the fork.
     let code = if interactive {
         let gui = matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland);
         match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
             Ok(c) => ExitCode::from(c as u8),
             Err(e) => {
                 crate::diag::error(&format!("sbx: sandbox session failed: {e}"));
+                if !e.started() {
+                    return Err(ExitCode::FAILURE);
+                }
                 ExitCode::FAILURE
             }
         }
     } else {
-        run_supervised(&prep.bwrap, &spec, &prep.cfg.limits)
+        match try_run_status(&prep.bwrap, &spec, &prep.cfg.limits) {
+            Ok(c) => ExitCode::from(c as u8),
+            Err(NotStarted) => return Err(ExitCode::FAILURE),
+        }
     };
 
     let run = LearningRun {
@@ -789,7 +798,38 @@ fn launch_foreground_learning(
         execs: guard.as_ref().and_then(LaunchGuard::learned_execs),
     };
     drop(guard);
+    if !reached_its_command(&code, prep.learn_exec, run.execs.as_ref()) {
+        crate::diag::error(
+            "sbx: the cage never reached its command, so this run has nothing to learn from",
+        );
+        return Err(code);
+    }
     Ok((code, run))
+}
+
+/// Whether a learning run's cage reached its command, as far as the run can tell.
+///
+/// Only the exec record can say no. The supervisor decides the `execve` the shim makes of the
+/// command, and records it, so a cage that got there holds at least one target. An empty record
+/// and a code that is not a success is a cage that never did: bubblewrap refusing its own setup, the
+/// pty child's `execv` failing, the shim stopping fail-closed, a command the `PATH` walk finds
+/// nowhere. Neither runner can tell those from a command that ran and failed, since all of them end
+/// in a code the command could have chosen. A relative `./x` that is not there is the exception the
+/// record cannot see: it is recorded as named, unprobed, so it reads as reached. A success is taken
+/// as a run whatever the record holds, because a target the supervisor could not resolve is left
+/// out of it.
+///
+/// Without `--proc-learn` there is no record, and the answer is yes: a run that reached nothing on
+/// the network looks the same as one that never started, and the runners' own failures are the
+/// only part of that told apart.
+fn reached_its_command(
+    code: &ExitCode,
+    learn_exec: bool,
+    execs: Option<&super::proclearn::Record>,
+) -> bool {
+    !(learn_exec
+        && *code != ExitCode::SUCCESS
+        && execs.is_none_or(|record| record.targets.is_empty()))
 }
 
 /// What one learning launch recorded, snapshotted from the guard before it is dropped: the egress

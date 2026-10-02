@@ -454,6 +454,13 @@ impl Scope {
         Scope(limiter(limits).ok())
     }
 
+    /// The decision of a host with no limiter: the cage is run as composed, with no scope in front.
+    /// For a test that runs the composed command and must not depend on this host's `systemd-run`.
+    #[cfg(test)]
+    pub(crate) fn unlimited() -> Self {
+        Scope(None)
+    }
+
     /// The unit properties this launch will carry, or empty when it carries none.
     pub(crate) fn properties(&self) -> &[String] {
         self.0.as_ref().map_or(&[], |(_, props)| props.as_slice())

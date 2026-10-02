@@ -145,8 +145,8 @@ app's egress and its programs in one launch, writing both to the same profile.
 
 A learning run's exit status is its own, not the app's: once the app is launched, it
 exits 0 unless writing what it learned failed. A run stopped before its launch (an
-undeclared app, a posture the flag cannot learn under) learned nothing and keeps the
-refusal's code;
+undeclared app, a posture the flag cannot learn under), or whose cage never started,
+learned nothing and keeps the code the launch without the flag would end with;
 see [Exit codes](../reference/exit-codes#a-learning-run-answers-for-its-learning).
 
 ## Advancing an app

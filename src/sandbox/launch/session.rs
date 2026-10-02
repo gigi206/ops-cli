@@ -283,7 +283,7 @@ fn supervise_attach(
     // SAFETY: the closure honours the async-signal-safe contract above, and the parent is
     // single-threaded here (attach starts no egress proxy thread). No GUI double-Ctrl+C on this
     // path, so the relay runs with `gui` false.
-    unsafe { fork_with_pty(false, in_child) }
+    unsafe { fork_with_pty(false, in_child) }.map_err(PtyFailure::into_io)
 }
 
 /// Run an attach command with **inherited** stdio (no pty): fork a child that joins the cage's
