@@ -5263,6 +5263,48 @@ fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
     );
 }
 
+/// A parent that ignores `SIGCHLD` hands that disposition down through `execve`, and under it the
+/// kernel reaps each child the moment it exits: a wait for it then answers `ECHILD`, so sbx would
+/// lose how every process it starts ended. The editor is that child here, the one a verb runs
+/// without a cage, and sbx must still read that it ran and exited 0.
+#[test]
+fn config_edit_reads_the_editors_exit_under_an_ignored_sigchld() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    let fx = Project::new("cfg");
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    let editor = fx.scratch().join("fake-editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"yes\"\\n' >> \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut command = fx.cmd(&["config", "edit"]);
+    command.env("EDITOR", &editor).env_remove("VISUAL");
+    // SAFETY: `signal` is async-signal-safe, and nothing else runs between the fork and the exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command.output().expect("spawn sbx");
+    assert!(
+        out.status.success(),
+        "edit should exit 0 under an inherited SIG_IGN for SIGCHLD:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        after.contains("EDITED = \"yes\""),
+        "the editor ran:\n{after}"
+    );
+}
+
 #[test]
 fn config_edit_global_trust_writes_no_marker_and_says_why() {
     use std::os::unix::fs::PermissionsExt;

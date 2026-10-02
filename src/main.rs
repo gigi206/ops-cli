@@ -78,6 +78,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    restore_child_reaping();
     // `args_os`, not `args`: a command run via `sbx run` may carry non-UTF-8
     // arguments, and panicking on them would be wrong.
     let mut args = std::env::args_os().skip(1);
@@ -117,6 +118,19 @@ fn main() -> ExitCode {
     }
 
     cli::dispatch(name, rest)
+}
+
+/// Take back the default disposition of `SIGCHLD`, whatever the invoker left it at.
+///
+/// An ignored `SIGCHLD` is inherited across `execve`, and under it the kernel reaps each child the
+/// moment it exits, so a wait for that child answers `ECHILD`: every exit status sbx reads (the
+/// editor's, nix's, a cage's) would be lost, and a capped wait would give up on a cage that ended
+/// on its own. The disposition would also cross each `exec` sbx makes and reach the cage, where the
+/// agent's own waits would fail the same way. sbx installs no handler for the signal and reaps its
+/// children itself, so the default is the disposition it is written for.
+fn restore_child_reaping() {
+    // SAFETY: `signal` with `SIG_DFL` replaces a disposition and installs no handler.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
 }
 
 /// Close every descriptor this process was started with past the standard three, before it opens
