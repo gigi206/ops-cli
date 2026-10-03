@@ -62,6 +62,20 @@ pub(crate) const MAX_QUERIES_PER_FRAME: u32 = 4;
 /// well above any real answer, because reaching it is a refusal and not a truncation.
 pub(crate) const MAX_REPLY_FRAMES: u32 = 1024;
 
+/// How many bytes one exchange may hold for the cage before sbx gives up on it.
+///
+/// [`MAX_REPLY_FRAMES`] counts frames, and a frame may be as large as the manifest's `max_frame`,
+/// so on its own it lets one exchange hold `MAX_REPLY_FRAMES` × [`MAX_FRAME_CEILING`] in the
+/// supervisor, outside the cage's cgroup, before any of it reaches the cage. This bounds the bytes.
+/// What it counts is what the exchange holds for the cage, never what the host sent: a plugin's
+/// rewrite turns a one-byte frame into a `max_frame` one, so counting the host's bytes would leave
+/// the same total reachable. Set where a broker whose `max_frame` is 4 KiB or less meets the frame
+/// ceiling first, and never below two maximal frames, so a frame and its terminator always fit.
+/// Reaching it is a refusal, never a truncation. The answers a broker holds at once reach this
+/// times [`MAX_CONCURRENT_CONNS`]; the number is not measured against a real protocol.
+const MAX_REPLY_BYTES: usize = MAX_REPLY_FRAMES as usize * 4096;
+const _: () = assert!(MAX_REPLY_BYTES >= 2 * MAX_FRAME_CEILING);
+
 /// Which side of the channel a frame came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
@@ -675,6 +689,7 @@ fn collect_reply<H: Read + Write>(
     deadline: std::time::Instant,
 ) -> Result<Collected, String> {
     let mut out = Vec::new();
+    let mut held = 0usize;
     let mut label = None;
     let mut taken = 0u32;
     let mut pending = first;
@@ -715,7 +730,7 @@ fn collect_reply<H: Read + Write>(
         // Without the grant the plugin never sees what the host answered, so one frame is the
         // whole answer — the only reading available when nothing can say otherwise.
         if !spec.inspect_replies {
-            out.push(frame);
+            hold_for_cage(&mut out, &mut held, frame)?;
             return Ok(done(out, label));
         }
         let answer = decider.ask(&Ask {
@@ -729,7 +744,7 @@ fn collect_reply<H: Read + Write>(
         match answer.verdict {
             // Pass it on, as it stands or rebuilt. Rebuilding is what keeps something withheld
             // from ever being spelled toward the cage.
-            Verdict::Forward(None) => out.push(frame),
+            Verdict::Forward(None) => hold_for_cage(&mut out, &mut held, frame)?,
             Verdict::Forward(Some(rewritten)) | Verdict::Reply(rewritten) => {
                 // Guard: neither the marker nor the secret may travel toward the cage. The first
                 // would teach the cage the marker; the second is the invariant itself.
@@ -741,7 +756,7 @@ fn collect_reply<H: Read + Write>(
                             .to_string(),
                     );
                 }
-                out.push(rewritten);
+                hold_for_cage(&mut out, &mut held, rewritten)?;
             }
             // Refused on the way back. The outcome is a refusal, not a forward: what the host
             // said is not delivered because the plugin was shown it, and a record calling it a
@@ -774,6 +789,21 @@ fn collect_reply<H: Read + Write>(
             return Ok(done(out, label));
         }
     }
+}
+
+/// Add one frame to what an exchange holds for the cage, `held` being the bytes it already holds.
+/// The exchange ends as an error, before the frame is kept, once it would pass
+/// [`MAX_REPLY_BYTES`]. Every frame [`collect_reply`] keeps comes through here, so no path can hold
+/// more than that.
+fn hold_for_cage(out: &mut Vec<Vec<u8>>, held: &mut usize, frame: Vec<u8>) -> Result<(), String> {
+    *held += frame.len();
+    if *held > MAX_REPLY_BYTES {
+        return Err(format!(
+            "the answer to one exchange passed {MAX_REPLY_BYTES} bytes held for the cage"
+        ));
+    }
+    out.push(frame);
+    Ok(())
 }
 
 /// One frame's worth of relay: ask, honour the verdict, and say what happened.
@@ -2750,6 +2780,58 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let mut plugin = ScriptedPlugin::new(answers);
         let err = relay(b"GO", &mut plugin, &mut host, &inspecting).expect_err("must be refused");
         assert!(err.contains("without the broker calling it done"), "{err}");
+    }
+
+    /// Each frame within `max_frame`, far fewer of them than [`MAX_REPLY_FRAMES`], and still more
+    /// bytes than one exchange may hold for the cage. The bytes end the exchange, not the count.
+    #[test]
+    fn a_long_answer_is_refused_at_the_byte_budget() {
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            max_frame: MAX_FRAME_CEILING,
+            ..spec(None)
+        };
+        let frames = MAX_REPLY_BYTES / MAX_FRAME_CEILING + 2;
+        assert!(
+            frames < MAX_REPLY_FRAMES as usize,
+            "the count must not be what refuses"
+        );
+        let mut host = FakeHost::with_runs(vec![vec![vec![b'D'; MAX_FRAME_CEILING]; frames]]);
+        let answers = std::iter::once(ScriptedPlugin::forward())
+            .chain((0..frames).map(|_| Answer {
+                verdict: Verdict::Forward(None),
+                expect_reply: true,
+                more: true,
+                label: None,
+            }))
+            .collect();
+        let mut plugin = ScriptedPlugin::new(answers);
+        let err = relay(b"GO", &mut plugin, &mut host, &inspecting).expect_err("must be refused");
+        assert!(err.contains("bytes held for the cage"), "{err}");
+    }
+
+    /// The budget counts what is held for the cage, not what the host sent: a plugin that rebuilds
+    /// every short host frame into a `max_frame` one fills it from a few bytes of host traffic.
+    #[test]
+    fn a_rebuilt_answer_is_held_to_the_byte_budget() {
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            max_frame: MAX_FRAME_CEILING,
+            ..spec(None)
+        };
+        let frames = MAX_REPLY_BYTES / MAX_FRAME_CEILING + 2;
+        let mut host = FakeHost::with_runs(vec![vec![b"D x".to_vec(); frames]]);
+        let answers = std::iter::once(ScriptedPlugin::forward())
+            .chain((0..frames).map(|_| Answer {
+                verdict: Verdict::Reply(vec![b'D'; MAX_FRAME_CEILING]),
+                expect_reply: true,
+                more: true,
+                label: None,
+            }))
+            .collect();
+        let mut plugin = ScriptedPlugin::new(answers);
+        let err = relay(b"GO", &mut plugin, &mut host, &inspecting).expect_err("must be refused");
+        assert!(err.contains("bytes held for the cage"), "{err}");
     }
 
     /// The grant `inspect_replies` buys: what the host answered goes back to the plugin, which may

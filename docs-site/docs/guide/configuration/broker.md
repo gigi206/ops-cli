@@ -167,7 +167,9 @@ consequences a manifest has to live with:
   cannot know when to stop reading;
 - a ceiling bounds what one exchange may take from the host resource, so a resource that
   never stops talking ends the exchange as a refusal rather than holding the cage's
-  connection open;
+  connection open. It counts frames (1024) and the bytes held for the cage (4 MiB),
+  since `sbx` keeps a run whole until it ends; a broker whose `max_frame` is 4 KiB or
+  less reaches the frame count first;
 - a run the plugin refuses partway through ends the connection once the cage has the
   refusal: the rest of the run is still on its way from the host, and no later exchange
   could tell it from its own answer.
