@@ -76,8 +76,8 @@ fn optional_layer<T>(
 }
 
 /// The binds a launch pins its control plane against, in the order they are mounted: the config's
-/// own, then the project root, in the mode it is mounted in (`project_writable`, read-only at or
-/// under one of sbx's roots).
+/// binds the launch keeps, then the project root, in the mode it is mounted in (`project_writable`,
+/// read-only at or under one of sbx's roots).
 ///
 /// The project is the one that used to be missing, and it is the one most likely to contain a
 /// control-plane root. `binds::build_spec` binds it at its own path *structurally* — it
@@ -2813,6 +2813,34 @@ pub(super) fn build(
     // The `[fs]` masks, staged and bound over the project paths they close.
     let fs = stage_fs_masks(prep, project_writable, &mut extra_binds)?;
 
+    // The config binds this launch can establish. The fold already dropped a bind holding one of the
+    // fixed structural mounts; what it could not know is what the launcher mounts on this launch
+    // alone, so a read-only bind holding one of those, missing on the host, is dropped here with the
+    // same note rather than failing in bwrap. Decided before the control-plane pins, which are
+    // computed from what survives: a read-only bind decides pins too, its roots and the
+    // intermediates it spares, so one dropped after them would leave a writable directory unpinned.
+    // The pins cannot trigger the drop, each being created on the host before it is bound, and the
+    // binds appended after them land under sbx's own structural mounts.
+    let config_binds: Vec<crate::config::Bind> = prep
+        .cfg
+        .binds
+        .iter()
+        .filter(|b| {
+            match binds::launch_unestablishable_bind_warning(
+                &b.path,
+                b.writable,
+                extra_binds.iter().map(|e| e.dest.as_path()),
+            ) {
+                Some(note) => {
+                    crate::diag::warn_config(&note);
+                    false
+                }
+                None => true,
+            }
+        })
+        .cloned()
+        .collect();
+
     // Pin sbx's own control plane in place whenever a bind or the project contains it: each root's
     // host path is frozen as a mountpoint chain (read-write intermediates where the cage writes, a
     // read-only leaf), so in-cage code cannot rename a writable parent to move a control-plane root
@@ -2856,7 +2884,7 @@ pub(super) fn build(
     // Canonicalized to match: `sbx_control_plane_roots` resolves symlinks, and a bind is compared
     // against them canonicalized, so a symlinked `$HOME` component would otherwise walk past the
     // containment test.
-    let sources = pin_sources(&prep.cfg.binds, &prep.cwd, project_writable);
+    let sources = pin_sources(&config_binds, &prep.cwd, project_writable);
     let pins = crate::config::control_plane_pins(&sources);
     match pin_decoy(prep.layout.data_dir(), fs.decoys.as_ref(), &pins, &sources)
         .and_then(|decoy| establish_control_plane_pins(&pins, &sources, decoy.as_deref()))
@@ -2921,30 +2949,6 @@ pub(super) fn build(
         &prep.cfg.packages,
         &prep.cfg.accepts_fresh_releases,
     );
-    // The config binds this launch can establish. The fold already dropped a bind holding one of the
-    // fixed structural mounts; what it could not know is what the launcher mounts on this launch
-    // alone, so a read-only bind holding one of those, missing on the host, is dropped here with the
-    // same note rather than failing in bwrap. Only read-only binds are dropped, so the control-plane
-    // pins above, which serve read-write ones, never outlive the bind they protect.
-    let config_binds: Vec<crate::config::Bind> = prep
-        .cfg
-        .binds
-        .iter()
-        .filter(|b| {
-            match binds::launch_unestablishable_bind_warning(
-                &b.path,
-                b.writable,
-                extra_binds.iter().map(|e| e.dest.as_path()),
-            ) {
-                Some(note) => {
-                    crate::diag::warn_config(&note);
-                    false
-                }
-                None => true,
-            }
-        })
-        .cloned()
-        .collect();
     let overlay = binds::Overlay {
         env: &extra_env,
         binds: &config_binds,

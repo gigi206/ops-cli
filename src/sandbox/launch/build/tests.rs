@@ -104,6 +104,26 @@ fn the_project_root_is_one_of_the_binds_the_control_plane_is_pinned_against() {
     );
 }
 
+/// The pins are computed from the config binds the launch keeps, decided before them. A read-only
+/// bind decides pins (its roots, and the intermediates it spares), and the filter that drops a
+/// read-only bind the launch cannot establish used to run after them: a bind dropped there left
+/// the directories it had spared writable and unpinned. Nothing on this path is observable without
+/// a launch, so the order is pinned against the source.
+#[test]
+fn the_pins_are_computed_from_the_binds_the_launch_keeps() {
+    let source = crate::testutil::production_half(include_str!("../build.rs"));
+    let kept = source
+        .find("let config_binds: Vec<crate::config::Bind> = prep")
+        .expect("the filter this test orders against");
+    let pinned = source
+        .find("pin_sources(&config_binds, &prep.cwd, project_writable)")
+        .expect("the pin sources must be the binds the launch keeps");
+    assert!(
+        kept < pinned,
+        "the binds the launch keeps must be decided before the pins"
+    );
+}
+
 /// It arrives in the mode it is mounted in, last, as it is mounted after the config's binds. A
 /// project inside one of sbx's roots is mounted read-only, and passed as read-write it had the
 /// directories between it and a root nested inside it pinned read-write, inside sbx's own tree.
