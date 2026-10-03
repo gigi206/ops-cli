@@ -714,6 +714,104 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     );
 }
 
+// sbx's three roots inside a fabricated `$HOME`, for the e2es that put its control plane under a
+// bind. Single letters, not `.local/share` and friends, and the budget is why rather than taste: a
+// launch binds `<data dir>/forward/fwd-<pid>/p-<port>.sock` and `sun_path` caps the whole path at
+// 107 bytes, so sbx refuses a data directory over 74. These are the only e2es that nest sbx's
+// roots inside their own fixture, and the conventional names spend eleven bytes they do not have
+// on an ordinary checkout. They buy nothing here either: sbx reads the three variables, and the
+// pins follow what those resolve to, never the XDG defaults.
+const DATA_REL: &str = "d";
+const STATE_REL: &str = "s";
+const CONFIG_REL: &str = "c";
+
+/// A fabricated `$HOME` for an e2e that puts sbx's control plane under a bind, and its canonical
+/// path, under which the roots go at [`DATA_REL`], [`STATE_REL`] and [`CONFIG_REL`]. Canonical,
+/// because `load` canonicalizes the bind sources and the roots.
+///
+/// Fails, never skips, when the fixture itself is what does not fit. The launch would refuse the
+/// data directory, the capability probe would read that refusal as "the host cannot sandbox" — a
+/// lie about a host that cages perfectly well — and `SBX_REQUIRE_CAPABLE=1` would turn the lie into
+/// a failure naming the wrong cause. The bound is written as a literal because an integration test
+/// cannot see the binary's own constant, and a net that recomputes its expectation measures
+/// nothing.
+fn control_plane_home(tag: &str) -> (TmpDir, PathBuf) {
+    let home = TmpDir::prefixed("r", tag);
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let data_dir = h.join(DATA_REL).join("sbx");
+    assert!(
+        data_dir.as_os_str().len() <= 74,
+        "this fixture's data directory is {} bytes ({}) and a launch accepts at most 74, because it \
+         binds sockets under it and a Unix socket path cannot exceed 107. Point SBX_TEST_TMPDIR at a \
+         shorter fixture root (e.g. /tmp/sbx-t) and rerun.",
+        data_dir.as_os_str().len(),
+        data_dir.display()
+    );
+    (home, h)
+}
+
+/// Writes the global config under the config home `config`, trusted by location, declaring
+/// `binds` in this order, each a host path and its mode.
+fn global_binds(config: &Path, binds: &[(&Path, &str)]) {
+    let list: Vec<String> = binds
+        .iter()
+        .map(|(path, mode)| format!("{{ path = \"{}\", mode = \"{mode}\" }}", path.display()))
+        .collect();
+    std::fs::create_dir_all(config.join("sbx")).unwrap();
+    std::fs::write(
+        config.join("sbx/sbx.toml"),
+        format!("binds = [{}]\n", list.join(", ")),
+    )
+    .unwrap();
+}
+
+/// Places a trust marker in the trust store under the state home `state` and returns its path:
+/// finding it unchanged after a launch proves the cage did not substitute the store.
+fn trust_marker(state: &Path) -> PathBuf {
+    let marker = state.join("sbx/trusted/sentinel");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, b"REAL").unwrap();
+    marker
+}
+
+/// `sbx run -- sh -c <script>` from `cwd`, with sbx's data, state and config homes at the given
+/// paths, in that order.
+fn sh_with_roots(cwd: &Path, [data, state, config]: [&Path; 3], script: &str) -> Output {
+    sbx()
+        .arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .current_dir(cwd)
+        .env("XDG_DATA_HOME", data)
+        .env("XDG_STATE_HOME", state)
+        .env("XDG_CONFIG_HOME", config)
+        .output()
+        .expect("spawn sbx run")
+}
+
+/// Whether this host can sandbox at all, asked with sbx's data home at `data` and none of its roots
+/// under a bind: the state and config homes in a fresh directory, so no global config declares a
+/// bind, and `cwd` a project that contains no root. A probe in the shape under test would read
+/// sbx's own refusal to protect its control plane as "the host cannot sandbox", and the test would
+/// skip where it must fail. Sharing the data home and the project seeds the stores the launch
+/// under test reads.
+fn probe_without_pins(cwd: &Path, data: &Path) -> Output {
+    let elsewhere = TmpDir::prefixed("r", "cpq");
+    let (state, config) = (elsewhere.path().join("s"), elsewhere.path().join("c"));
+    sh_with_roots(cwd, [data, &state, &config], "true")
+}
+
+/// The lines of `want` that `stdout` does not print, each compared whole, so one failing launch
+/// names every expectation it broke.
+fn missing_lines<'a>(stdout: &str, want: &[&'a str]) -> Vec<&'a str> {
+    want.iter()
+        .copied()
+        .filter(|w| !stdout.lines().any(|l| l == *w))
+        .collect()
+}
+
 #[test]
 fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // The security teeth of the mountpoint-chain protection. A whole-home read-write bind that
@@ -734,72 +832,21 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // membership + enforcement tests); the base cage carries no `umount` binary, so this e2e
     // exercises the reachable filesystem attack (rename/remove), not a raw syscall. Skips (never
     // fails) where the host cannot sandbox.
-    let home = TmpDir::prefixed("r", "cp");
-    // A fabricated `$HOME` with sbx's XDG roots inside it, so the control plane lives under the
-    // read-write bind. Canonical, because `load` canonicalizes the bind source and the roots.
-    //
-    // Single letters, not `.local/share` and friends, and the budget is why rather than taste: a
-    // launch binds `<data dir>/forward/fwd-<pid>/p-<port>.sock` and `sun_path` caps the whole path
-    // at 107 bytes, so sbx refuses a data directory over 74. This is the only e2e that nests sbx's
-    // roots inside its own fixture, and the conventional names spend eleven bytes it does not have
-    // on an ordinary checkout. They buy nothing here either: sbx reads the three variables, and the
-    // pins follow what those resolve to, never the XDG defaults.
-    const DATA_REL: &str = "d";
-    const STATE_REL: &str = "s";
-    const CONFIG_REL: &str = "c";
-    let h = std::fs::canonicalize(home.path()).unwrap();
+    let (_home, h) = control_plane_home("cp");
     let data = h.join(DATA_REL);
     let state = h.join(STATE_REL);
     let config = h.join(CONFIG_REL);
     let project = h.join("project");
-    // Fail, never skip, when the fixture itself is what does not fit. The launch would refuse the
-    // data directory, the capability probe below would read that refusal as "the host cannot
-    // sandbox" — a lie about a host that cages perfectly well — and `SBX_REQUIRE_CAPABLE=1` would
-    // turn the lie into a failure naming the wrong cause. The bound is written as a literal because
-    // an integration test cannot see the binary's own constant, and a net that recomputes its
-    // expectation measures nothing.
-    let data_dir = data.join("sbx");
-    assert!(
-        data_dir.as_os_str().len() <= 74,
-        "this fixture's data directory is {} bytes ({}) and a launch accepts at most 74, because it \
-         binds sockets under it and a Unix socket path cannot exceed 107. Point SBX_TEST_TMPDIR at a \
-         shorter fixture root (e.g. /tmp/sbx-t) and rerun.",
-        data_dir.as_os_str().len(),
-        data_dir.display()
-    );
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::create_dir_all(config.join("sbx")).unwrap();
     // The global config (trusted by location) binds the whole fabricated home read-write.
-    std::fs::write(
-        config.join("sbx/sbx.toml"),
-        format!(
-            "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-            h.display()
-        ),
-    )
-    .unwrap();
+    global_binds(&config, &[(&h, "rw")]);
     // A pre-placed trust marker whose survival proves the pin defeats path substitution.
-    let sentinel = state.join("sbx/trusted/sentinel");
-    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
-    std::fs::write(&sentinel, b"REAL").unwrap();
+    let sentinel = trust_marker(&state);
 
-    let run = |script: &str| {
-        sbx()
-            .arg("run")
-            .arg("--")
-            .arg("sh")
-            .arg("-c")
-            .arg(script)
-            .current_dir(&project)
-            .env("XDG_DATA_HOME", &data)
-            .env("XDG_STATE_HOME", &state)
-            .env("XDG_CONFIG_HOME", &config)
-            .output()
-            .expect("spawn sbx run")
-    };
+    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script);
 
-    // capability probe (also seeds the base store and exercises the pin path); skip if incapable.
-    probe_or_skip!("control-plane pin e2e", run("true"));
+    // capability probe, outside the shape under test (seeds the base store); skip if incapable.
+    probe_or_skip!("control-plane pin e2e", probe_without_pins(&project, &data));
 
     let script = format!(
         r#"H="{h}"
@@ -870,20 +917,11 @@ fn an_fs_mask_under_a_pinned_directory_stays_closed_when_launched_from_home() {
     // path, sbx's data dir must stay read-only, and the rest of the config home writable. Only a
     // real launch lays the two emitters in their real order. Skips (never fails) where the host
     // cannot sandbox.
-    let home = TmpDir::prefixed("r", "cpm");
-    // Single-letter roots, for the socket-path budget the test above explains.
-    let h = std::fs::canonicalize(home.path()).unwrap();
-    let data = h.join("d");
-    let state = h.join("s");
-    let config = h.join("c");
+    let (_home, h) = control_plane_home("cpm");
+    let data = h.join(DATA_REL);
+    let state = h.join(STATE_REL);
+    let config = h.join(CONFIG_REL);
     let data_dir = data.join("sbx");
-    assert!(
-        data_dir.as_os_str().len() <= 74,
-        "this fixture's data directory is {} bytes ({}) and a launch accepts at most 74. Point \
-         SBX_TEST_TMPDIR at a shorter fixture root (e.g. /tmp/sbx-t) and rerun.",
-        data_dir.as_os_str().len(),
-        data_dir.display()
-    );
     std::fs::create_dir_all(config.join("gh")).unwrap();
     std::fs::write(config.join("gh/hosts.yml"), b"HOSTS\n").unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -894,21 +932,13 @@ fn an_fs_mask_under_a_pinned_directory_stays_closed_when_launched_from_home() {
     )
     .unwrap();
 
-    let run = |script: &str| {
-        sbx()
-            .arg("run")
-            .arg("--")
-            .arg("sh")
-            .arg("-c")
-            .arg(script)
-            .current_dir(&h)
-            .env("XDG_DATA_HOME", &data)
-            .env("XDG_STATE_HOME", &state)
-            .env("XDG_CONFIG_HOME", &config)
-            .output()
-            .expect("spawn sbx run")
-    };
-    probe_or_skip!("home-launch fs-mask e2e", run("true"));
+    let run = |script: &str| sh_with_roots(&h, [&data, &state, &config], script);
+    // The project here is the directory that holds the roots, so the probe runs from another.
+    let elsewhere = TmpDir::prefixed("r", "cpmp");
+    probe_or_skip!(
+        "home-launch fs-mask e2e",
+        probe_without_pins(elsewhere.path(), &data)
+    );
 
     let out = run(
         r#"echo "M1:$(cat c/gh/hosts.yml 2>/dev/null || echo CLOSED)"
@@ -924,17 +954,238 @@ echo "W:$(touch c/new 2>/dev/null && echo OK || echo FAIL)"
         out.status.success(),
         "the launch failed: {stderr}\nstdout: {stdout}"
     );
-    for line in ["M1:CLOSED", "M2:CLOSED", "H:HELD", "R:RO", "W:OK"] {
-        assert!(
-            stdout.lines().any(|l| l == line),
-            "expected `{line}`: {stdout}\nstderr: {stderr}"
-        );
-    }
+    let missing = missing_lines(
+        &stdout,
+        &["M1:CLOSED", "M2:CLOSED", "H:HELD", "R:RO", "W:OK"],
+    );
+    assert!(
+        missing.is_empty(),
+        "expected {missing:?}: {stdout}\nstderr: {stderr}"
+    );
     assert_eq!(
         std::fs::read(config.join("gh/hosts.yml")).unwrap(),
         b"HOSTS\n",
         "the host file is untouched"
     );
+}
+
+#[test]
+fn a_read_only_bind_under_a_read_write_home_keeps_refusing_writes_beside_the_pins() {
+    // Each pin lands right after the mount that covers its path, not after every mount. A
+    // read-write bind of the home holds sbx's roots, so the directories above them are pinned
+    // read-write, each bound from itself; a read-only bind under one of them (`c/gh`, under the
+    // config home) and the project inside it are mounted after the home, and a pin laid after
+    // them would cover both with the host directory, read-write. The state home is bound
+    // read-only, so the trust store sits under a read-only bind that a read-write intermediate
+    // laid over it would reopen; the data home is bound too, before the home that covers it, so
+    // the pins land on the home, the last bind mounted over them. Teeth: both read-only binds
+    // refuse writes, the three roots list empty and the data dir keeps its path, the project and
+    // its `.git` keep theirs, the rest of the home stays writable, and the host files are
+    // untouched. Skips (never fails) where the host cannot sandbox.
+    let (_home, h) = control_plane_home("cpa");
+    let data = h.join(DATA_REL);
+    let state = h.join(STATE_REL);
+    let config = h.join(CONFIG_REL);
+    let gh = config.join("gh");
+    let project = config.join("repo");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&gh).unwrap();
+    std::fs::write(gh.join("hosts.yml"), b"HOSTS\n").unwrap();
+    std::fs::create_dir_all(project.join(".git/hooks")).unwrap();
+    std::fs::write(project.join(".git/config"), b"[core]\n").unwrap();
+    std::fs::write(project.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    let sentinel = trust_marker(&state);
+    global_binds(
+        &config,
+        &[(&data, "rw"), (&h, "rw"), (&state, "ro"), (&gh, "ro")],
+    );
+
+    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script);
+    probe_or_skip!(
+        "read-only bind beside the pins e2e",
+        probe_without_pins(&project, &data)
+    );
+
+    let out = run(&format!(
+        r#"H="{h}"
+echo "G:$(touch "$H/c/gh/new" 2>/dev/null && echo WRITABLE || echo RO)"
+echo "S:$(touch "$H/s/new" 2>/dev/null && echo WRITABLE || echo RO)"
+echo "V:$(ls -A "$H/d/sbx" | wc -l)"
+echo "T:$(ls -A "$H/s/sbx/trusted" | wc -l)"
+echo "C:$(ls -A "$H/c/sbx" | wc -l)"
+if mv "$H/d/sbx" "$H/d/moved" 2>/dev/null; then echo "D:MOVED"; mv "$H/d/moved" "$H/d/sbx"; else echo "D:HELD"; fi
+if mv .git .git.moved 2>/dev/null; then echo "GIT:MOVED"; mv .git.moved .git; else echo "GIT:HELD"; fi
+if mv "$H/c/repo" "$H/c/moved" 2>/dev/null; then echo "P:MOVED"; mv "$H/c/moved" "$H/c/repo"; else echo "P:HELD"; fi
+echo "A:$(touch "$H/new" "$H/c/new" 2>/dev/null && echo OK || echo FAIL)"
+"#,
+        h = h.display()
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the launch failed: {stderr}\nstdout: {stdout}"
+    );
+    let missing = missing_lines(
+        &stdout,
+        &[
+            "G:RO", "S:RO", "V:0", "T:0", "C:0", "D:HELD", "GIT:HELD", "P:HELD", "A:OK",
+        ],
+    );
+    assert!(
+        missing.is_empty(),
+        "expected {missing:?}: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !gh.join("new").exists() && !state.join("new").exists(),
+        "a read-only bind let the cage create a host file"
+    );
+    assert_eq!(std::fs::read(gh.join("hosts.yml")).unwrap(), b"HOSTS\n");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"REAL");
+}
+
+#[test]
+fn a_read_only_home_bind_shows_sbx_roots_empty() {
+    // A read-only bind of the home holds sbx's roots. Read-only refuses writes but shows what is
+    // there, and the data dir holds the control sockets of every session, so each root is pinned
+    // and bound from the empty decoy. Nothing under a read-only bind can be renamed, so no
+    // directory above a root is pinned, and none reopens what the bind closed. The project lies
+    // outside the home, so the bind and the pins are all that decide what the cage sees there.
+    // Teeth: the three roots list empty, and the rest of the home reads and refuses writes, the
+    // directories above the roots included. Skips (never fails) where the host cannot sandbox.
+    let (_home, h) = control_plane_home("cpb");
+    let project = TmpDir::prefixed("r", "cpbp");
+    let data = h.join(DATA_REL);
+    let state = h.join(STATE_REL);
+    let config = h.join(CONFIG_REL);
+    std::fs::write(h.join("readme"), b"HOME\n").unwrap();
+    let sentinel = trust_marker(&state);
+    global_binds(&config, &[(&h, "ro")]);
+
+    let run = |script: &str| sh_with_roots(project.path(), [&data, &state, &config], script);
+    probe_or_skip!(
+        "read-only home bind e2e",
+        probe_without_pins(project.path(), &data)
+    );
+
+    let out = run(&format!(
+        r#"H="{h}"
+echo "R:$(cat "$H/readme" 2>/dev/null || echo UNREAD)"
+echo "W:$(touch "$H/new" 2>/dev/null && echo WRITABLE || echo RO)"
+echo "WC:$(touch "$H/c/new" "$H/d/new" 2>/dev/null && echo WRITABLE || echo RO)"
+echo "V:$(ls -A "$H/d/sbx" | wc -l)"
+echo "T:$(ls -A "$H/s/sbx/trusted" | wc -l)"
+echo "C:$(ls -A "$H/c/sbx" | wc -l)"
+"#,
+        h = h.display()
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the launch failed: {stderr}\nstdout: {stdout}"
+    );
+    let missing = missing_lines(&stdout, &["R:HOME", "W:RO", "WC:RO", "V:0", "T:0", "C:0"]);
+    assert!(
+        missing.is_empty(),
+        "expected {missing:?}: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"REAL");
+}
+
+#[test]
+fn a_bind_inside_sbx_data_dir_stays_visible_under_the_pin() {
+    // A read-only bind declared inside sbx's data dir, under a read-write bind of the home that
+    // holds the data dir. The data dir is pinned like every root, but bound from itself rather
+    // than from the empty decoy, which would cover the bind, and the bind is mounted after the
+    // pin, on top of it. Teeth: the bound file reads, the bind and the data dir refuse writes, the
+    // data dir keeps its path, and the trust store, which no bind lies in, still lists empty.
+    // Skips (never fails) where the host cannot sandbox.
+    let (_home, h) = control_plane_home("cpc");
+    let data = h.join(DATA_REL);
+    let state = h.join(STATE_REL);
+    let config = h.join(CONFIG_REL);
+    let project = h.join("project");
+    let shared = data.join("sbx/shared");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("f"), b"SHARED\n").unwrap();
+    trust_marker(&state);
+    global_binds(&config, &[(&h, "rw"), (&shared, "ro")]);
+
+    let run = |script: &str| sh_with_roots(&project, [&data, &state, &config], script);
+    probe_or_skip!(
+        "bind inside the data dir e2e",
+        probe_without_pins(&project, &data)
+    );
+
+    let out = run(&format!(
+        r#"H="{h}"
+echo "B:$(cat "$H/d/sbx/shared/f" 2>/dev/null || echo UNREAD)"
+echo "BW:$(touch "$H/d/sbx/shared/new" 2>/dev/null && echo WRITABLE || echo RO)"
+echo "R:$(touch "$H/d/sbx/new" 2>/dev/null && echo WRITABLE || echo RO)"
+if mv "$H/d/sbx" "$H/d/moved" 2>/dev/null; then echo "D:MOVED"; mv "$H/d/moved" "$H/d/sbx"; else echo "D:HELD"; fi
+echo "T:$(ls -A "$H/s/sbx/trusted" | wc -l)"
+"#,
+        h = h.display()
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the launch failed: {stderr}\nstdout: {stdout}"
+    );
+    let missing = missing_lines(&stdout, &["B:SHARED", "BW:RO", "R:RO", "D:HELD", "T:0"]);
+    assert!(
+        missing.is_empty(),
+        "expected {missing:?}: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_trust_store_inside_the_config_home_launches_hidden_with_it() {
+    // `XDG_STATE_HOME` set to the config home puts the trust store inside sbx's global-config
+    // directory, one root inside another. Under a read-write bind of the home, the outer root is
+    // bound from the empty decoy, and the inner one is not pinned: there is no directory in the
+    // decoy to mount it on, and the decoy already hides and holds it. Teeth: the launch runs, the
+    // config root lists empty, refuses writes and keeps its path, the rest of the home stays
+    // writable, and the trust marker on the host is untouched. Skips (never fails) where the host
+    // cannot sandbox.
+    let (_home, h) = control_plane_home("cpd");
+    let data = h.join(DATA_REL);
+    let config = h.join(CONFIG_REL);
+    let project = h.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let sentinel = trust_marker(&config);
+    global_binds(&config, &[(&h, "rw")]);
+
+    let run = |script: &str| sh_with_roots(&project, [&data, &config, &config], script);
+    probe_or_skip!(
+        "trust store inside the config home e2e",
+        probe_without_pins(&project, &data)
+    );
+
+    let out = run(&format!(
+        r#"H="{h}"
+echo "C:$(ls -A "$H/c/sbx" | wc -l)"
+echo "CW:$(touch "$H/c/sbx/new" 2>/dev/null && echo WRITABLE || echo RO)"
+if mv "$H/c/sbx" "$H/c/moved" 2>/dev/null; then echo "M:MOVED"; mv "$H/c/moved" "$H/c/sbx"; else echo "M:HELD"; fi
+echo "A:$(touch "$H/new" "$H/c/new" 2>/dev/null && echo OK || echo FAIL)"
+"#,
+        h = h.display()
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the launch failed: {stderr}\nstdout: {stdout}"
+    );
+    let missing = missing_lines(&stdout, &["C:0", "CW:RO", "M:HELD", "A:OK"]);
+    assert!(
+        missing.is_empty(),
+        "expected {missing:?}: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"REAL");
 }
 
 #[test]
