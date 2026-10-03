@@ -283,9 +283,9 @@ Three differences from a native host are worth knowing before they surprise you:
   PulseAudio socket, so a stock cloud image, which runs no sound server in the user
   session, has no socket for it to bind. Install and start one in the guest (PipeWire with
   `pipewire-pulse`, or PulseAudio) and the posture behaves as it does on any Linux host.
-- **There is no GPU.** `vmType: vz` presents no GPU to the guest, so `gpu = true` finds no
-  render node and falls back to software rendering, which is the documented degradation
-  rather than a failure. The scope this template commits to is CLI plus GUI, and the two
+- **There is no GPU acceleration.** `vmType: vz` gives the guest a virtio-GPU device without
+  3D acceleration. `gpu = true` grants its render node, and mesa renders in software
+  (`llvmpipe`) behind it; the launch proceeds. The scope this template commits to is CLI plus GUI, and the two
   halves cannot currently be had together: the virtio-GPU route that does expose a GPU to a
   Linux guest on Apple Silicon opens no screen. CUDA is out of reach by any route on a Mac,
   because Apple Silicon carries no NVIDIA hardware.
