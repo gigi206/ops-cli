@@ -296,8 +296,15 @@ pub(super) fn find_cage_target(session_pid: u32, project: &Path) -> Option<CageT
 /// own absolute path (a structural mount of `binds::build_spec`, and the same path the session
 /// record stores), while a plugin fence's mounts are fixed by `resolver::cage_spec` — the host
 /// `/usr`, `/proc`, `/dev`, a `/tmp` tmpfs, the plugin's own directory and its manifest's grant
-/// paths — and carry no workspace. The probe goes through `/proc/<pid>/root`, so the rest of the
-/// path is resolved inside that process's own mount namespace.
+/// paths — and carry no workspace.
+///
+/// So the mark is the project itself, not something at its path. A fence's root is a writable
+/// tmpfs, where its plugin can make a directory at any path, and a link planted there pointing at
+/// the project's absolute path would, followed through `/proc/<pid>/root`, resume at this process's
+/// root and land on the host's project. The probe therefore resolves the path inside that process's
+/// root without ever leaving it ([`project_inside`]), and compares what it finds with the project
+/// by device and inode: a bind of the project is the same directory, and nothing a fence can make
+/// is.
 ///
 /// In-cage code cannot forge or drop the mark: creating a mount namespace needs `unshare`, adding a
 /// mount needs `mount`, and removing this one needs `umount2` — the cage's seccomp denylist refuses
@@ -305,15 +312,83 @@ pub(super) fn find_cage_target(session_pid: u32, project: &Path) -> Option<CageT
 /// containing the project; its fence would then also carry the mark, which is a plugin the operator
 /// chose to trust with the workspace.
 fn in_session_cage(pid: u32, project: &Path) -> bool {
-    let mut probe = PathBuf::from(format!("/proc/{pid}/root"));
-    // Component-wise: `project` is absolute, and pushing an absolute path would replace the
-    // `/proc/<pid>/root` prefix instead of extending it.
-    probe.extend(
-        project
-            .components()
-            .filter(|c| matches!(c, Component::Normal(_))),
-    );
-    std::fs::metadata(probe).is_ok_and(|m| m.is_dir())
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(host) = std::fs::metadata(project) else {
+        return false;
+    };
+    project_inside(pid, project).is_some_and(|inside| inside == (host.dev(), host.ino()))
+}
+
+/// The device and inode of the directory at `project` inside `pid`'s own root, resolved without
+/// leaving that root: `openat2` with `RESOLVE_IN_ROOT` reads `..` and an absolute link as that
+/// root's, which is how the process itself would read them, and refuses the `/proc` links that
+/// jump elsewhere. A kernel without `openat2` (before 5.6) has the path walked one component at a
+/// time instead, and any link on it refused. `None` when the path is not there, not a directory,
+/// or cannot be read.
+fn project_inside(pid: u32, project: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    const DIR: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let root = CString::new(format!("/proc/{pid}/root")).ok()?;
+    // SAFETY: `open` reads the NUL-terminated path and returns a fresh descriptor or -1.
+    let root = unsafe { libc::open(root.as_ptr(), DIR) };
+    if root < 0 {
+        return None;
+    }
+    // SAFETY: the descriptor `open` returned above, owned from here on.
+    let root = unsafe { OwnedFd::from_raw_fd(root) };
+    let components: Vec<&std::ffi::OsStr> = project
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    let relative = match components.is_empty() {
+        true => PathBuf::from("."),
+        false => components.iter().collect(),
+    };
+    let relative = CString::new(relative.as_os_str().as_bytes()).ok()?;
+    // `struct open_how`: the open flags, the mode, the resolution flags.
+    let how: [u64; 3] = [
+        DIR as u64,
+        0,
+        libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS,
+    ];
+    // SAFETY: `openat2` reads the path and the three-word `open_how` it is handed with that
+    // structure's size, and returns a fresh descriptor or -1.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            how.as_ptr(),
+            std::mem::size_of_val(&how),
+        )
+    };
+    let dir = if fd >= 0 {
+        // SAFETY: the descriptor `openat2` returned, owned from here on.
+        unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }
+    } else if io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
+        let mut dir = root;
+        for name in components {
+            let name = CString::new(name.as_bytes()).ok()?;
+            // SAFETY: `openat` reads the NUL-terminated component beneath the live `dir` and
+            // returns a fresh descriptor or -1; `O_NOFOLLOW` with `O_DIRECTORY` refuses a link.
+            let next =
+                unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), DIR | libc::O_NOFOLLOW) };
+            if next < 0 {
+                return None;
+            }
+            // SAFETY: the descriptor `openat` returned, owned from here on.
+            dir = unsafe { OwnedFd::from_raw_fd(next) };
+        }
+        dir
+    } else {
+        return None;
+    };
+    let meta = std::fs::File::from(dir).metadata().ok()?;
+    Some((meta.dev(), meta.ino()))
 }
 
 /// Pick the cage process from the candidates: skip any in the host user namespace (`host_userns`)
@@ -708,6 +783,97 @@ mod tests {
             candidate(300, None, None, false),
         ];
         assert_eq!(choose_cage_pid(&candidates, host), None);
+    }
+
+    /// The mark is the project itself. Of three processes with roots of their own, only the one the
+    /// project is bound into carries it: a directory made at the project's path on a writable root,
+    /// as a plugin fence's root is, does not, and neither does a link there naming that same path,
+    /// which read from this process's root would have landed on the host's project.
+    #[test]
+    fn only_the_project_bound_at_its_path_marks_the_session_cage() {
+        use std::io::BufRead as _;
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
+            skip_incapable!("skipping the session-cage mark: no bwrap on PATH");
+            return;
+        };
+        let dir = crate::testutil::TmpDir::new();
+        let project = std::fs::canonicalize(dir.path()).expect("the project's canonical path");
+        let first = project
+            .components()
+            .find_map(|c| match c {
+                Component::Normal(name) => Some(Path::new("/").join(name)),
+                _ => None,
+            })
+            .expect("a project under some directory");
+        let (p, f) = (project.display().to_string(), first.display().to_string());
+        let shapes: [(&str, Vec<String>, String, bool); 3] = [
+            (
+                "bound",
+                vec!["--bind".into(), p.clone(), p.clone()],
+                String::new(),
+                true,
+            ),
+            ("made", Vec::new(), format!("mkdir -p '{p}' && "), false),
+            (
+                "linked",
+                Vec::new(),
+                format!("ln -s '{f}' '{f}' && "),
+                false,
+            ),
+        ];
+        for (shape, binds, setup, carries) in shapes {
+            let mut cage = std::process::Command::new(&bwrap);
+            cage.args(["--unshare-user", "--die-with-parent"])
+                .args([
+                    "--ro-bind",
+                    "/usr",
+                    "/usr",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                ])
+                .args([
+                    "--symlink",
+                    "usr/bin",
+                    "/bin",
+                    "--symlink",
+                    "usr/lib",
+                    "/lib",
+                ])
+                .args(["--symlink", "usr/lib64", "/lib64"])
+                .args(&binds)
+                .args([
+                    "/bin/sh",
+                    "-c",
+                    &format!("{setup}echo ready && exec sleep 20"),
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            let Ok(mut outer) = cage.spawn() else {
+                skip_incapable!("skipping the session-cage mark: bwrap could not start");
+                return;
+            };
+            let mut ready = String::new();
+            let _ = std::io::BufReader::new(outer.stdout.take().expect("its output"))
+                .read_line(&mut ready);
+            // The shell is the outer bwrap's one child, and `exec` keeps its pid.
+            let children =
+                std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", outer.id()))
+                    .unwrap_or_default();
+            let inner = children
+                .split_whitespace()
+                .next()
+                .and_then(|p| p.parse().ok());
+            let marked = inner.map(|pid| in_session_cage(pid, &project));
+            let _ = outer.kill();
+            let _ = outer.wait();
+            if ready.trim() != "ready" || inner.is_none() {
+                skip_incapable!("skipping the session-cage mark: the {shape} cage did not come up");
+                return;
+            }
+            assert_eq!(marked, Some(carries), "the {shape} cage");
+        }
     }
 
     /// A plugin fence is never mistaken for the agent's cage.
