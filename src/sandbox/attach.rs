@@ -900,10 +900,7 @@ mod tests {
     #[test]
     fn both_tty_arms_leave_the_launching_session() {
         // The production half only: this test quotes the shapes it looks for.
-        let source = include_str!("attach.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the file has a production half");
+        let source = crate::testutil::production_half(include_str!("attach.rs"));
         assert!(
             source.contains("if libc::setsid() < 0 {"),
             "the inherited-stdio arm must leave the session; the pty arm's `login_tty` does it \
@@ -923,10 +920,7 @@ mod tests {
     #[test]
     fn the_process_born_in_the_cage_is_not_dumpable_before_the_join() {
         // The production half only: this test quotes the shapes it looks for.
-        let source = include_str!("attach.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the file has a production half");
+        let source = crate::testutil::production_half(include_str!("attach.rs"));
         let cleared = source
             .find("if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {")
             .expect(
@@ -952,10 +946,7 @@ mod tests {
     fn the_capability_drops_the_join_makes_necessary_are_checked_not_attempted() {
         // The production half only: this test quotes the shapes it looks for, and would otherwise
         // find its own assertions.
-        let source = include_str!("attach.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the file has a production half");
+        let source = crate::testutil::production_half(include_str!("attach.rs"));
         assert!(
             source.contains("if libc::prctl(libc::PR_CAPBSET_DROP"),
             "the bounding-set drop bounds `X` in `pP' = X & fP`: its return decides whether the \
