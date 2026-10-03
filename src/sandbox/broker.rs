@@ -624,7 +624,7 @@ pub(crate) fn write_frame(
 ///
 /// **An implementation must bound its own wait.** The deadline is not in this signature because a
 /// test's decider answers from a script and has nothing to wait on; the one that drives a real
-/// plugin sets a read timeout on the socket it holds. A decider that can block forever holds a
+/// plugin gives each line it reads or writes one budget, over a socket that also has a timeout. A decider that can block forever holds a
 /// cage connection, a host connection and a thread with it, and no ceiling elsewhere bounds that:
 /// [`MAX_QUERIES_PER_FRAME`] bounds a *talkative* plugin, never a silent one.
 pub(crate) trait Decider {
@@ -1012,12 +1012,17 @@ pub(crate) fn relay_one<H: Read + Write>(
 // The decider that is a real plugin.
 // -----------------------------------------------------------------------------------
 
-/// How long sbx waits for one verdict before treating the plugin as gone.
+/// How long sbx waits for one verdict before treating the plugin as gone, and how long it gives the
+/// plugin to take one question.
 ///
 /// A decision here is a computation, not a conversation with a human: nothing in this exchange
 /// asks the user anything, so a plugin that has not answered in this long is stuck rather than
 /// slow. The wait must be bounded at all, because a silent plugin otherwise holds a cage
-/// connection, a host connection and a thread for as long as the session lives.
+/// connection, a host connection and a thread for as long as the session lives. It bounds the
+/// whole line, not each read of it ([`super::deadline::Deadlined`]): the socket's own timeout
+/// restarts on every read, so a plugin writing a byte just inside it would hold the read for as
+/// long as an answer may be long, and one taking its question a byte at a time would hold the
+/// write the same way.
 const PLUGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The largest answer line sbx will buffer from a broker plugin.
@@ -1078,6 +1083,8 @@ pub(crate) struct PluginProcess {
     /// Our end of the pair. The plugin has the other as both its stdin and its stdout.
     reader: io::BufReader<std::os::unix::net::UnixStream>,
     writer: std::os::unix::net::UnixStream,
+    /// The budget of one line either way: [`PLUGIN_DEADLINE`], a field so a test can shorten it.
+    budget: std::time::Duration,
 }
 
 impl PluginProcess {
@@ -1122,6 +1129,7 @@ impl PluginProcess {
             max_frame: plugin.broker.max_frame,
             reader: io::BufReader::new(reader_side),
             writer,
+            budget: PLUGIN_DEADLINE,
         };
         me.handshake(plugin, allow, marker)?;
         Ok(me)
@@ -1140,8 +1148,7 @@ impl PluginProcess {
             secret_marker: marker.map(SecretMarker::token),
             inspect_replies: plugin.broker.inspect_replies,
         };
-        self.writer.write_all(hello.line().as_bytes())?;
-        self.writer.flush()?;
+        self.write_line(&hello.line())?;
         let line = self.read_line()?;
         parse_hello_reply(&line).map_err(|why| {
             io::Error::new(
@@ -1151,18 +1158,28 @@ impl PluginProcess {
         })
     }
 
-    /// One line from the plugin, or an error when it says nothing in time, closes, or says more
-    /// than an answer can be.
+    /// One line from the plugin, or an error when it does not finish it in time, closes, or says
+    /// more than an answer can be.
     fn read_line(&mut self) -> io::Result<String> {
-        read_bounded_line(&mut self.reader, MAX_ANSWER_LINE)
+        let deadline = std::time::Instant::now() + self.budget;
+        read_bounded_line(
+            &mut super::deadline::Deadlined::new(&mut self.reader, deadline),
+            MAX_ANSWER_LINE,
+        )
+    }
+
+    /// One line to the plugin, or an error when it does not take all of it in time.
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + self.budget;
+        let mut writer = super::deadline::Deadlined::new(&mut self.writer, deadline);
+        writer.write_all(line.as_bytes())?;
+        writer.flush()
     }
 }
 
 impl Decider for PluginProcess {
     fn ask(&mut self, ask: &Ask<'_>) -> Result<Answer, String> {
-        self.writer
-            .write_all(ask.line().as_bytes())
-            .and_then(|()| self.writer.flush())
+        self.write_line(&ask.line())
             .map_err(|e| format!("cannot reach the plugin: {e}"))?;
         let line = self
             .read_line()
@@ -3341,6 +3358,55 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         for line in ["", "not json", "{}", "{\"ok\":\"yes\"}"] {
             parse_hello_reply(line).expect_err("anything but an acceptance is a refusal");
         }
+    }
+
+    /// A plugin that answers a byte at a time, each well inside the socket's timeout, is cut off
+    /// at the budget for the whole line rather than read for as long as an answer may be long.
+    #[test]
+    fn a_plugin_trickling_its_verdict_is_cut_off_at_the_budget() {
+        use std::os::unix::net::UnixStream;
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("a read timeout");
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("a stand-in plugin process");
+        let mut plugin = PluginProcess {
+            child,
+            max_frame: 64,
+            reader: io::BufReader::new(ours.try_clone().expect("a second handle")),
+            writer: ours,
+            budget: std::time::Duration::from_millis(300),
+        };
+        let trickle = std::thread::spawn(move || {
+            let mut theirs = theirs;
+            for _ in 0..60 {
+                if theirs.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let started = std::time::Instant::now();
+        let err = plugin
+            .ask(&Ask {
+                seq: 1,
+                dir: Direction::Up,
+                data: b"hi",
+            })
+            .expect_err("no verdict");
+        let took = started.elapsed();
+        drop(plugin);
+        let _ = trickle.join();
+        assert!(
+            err.contains(super::super::deadline::READ_DEADLINE_PASSED),
+            "{err}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "cut off near the budget, not after the trickle: {took:?}"
+        );
     }
 
     /// What the plugin writes in its handshake reaches the error cleaned and cut short: a reason
