@@ -57,8 +57,10 @@ Three properties hold across all seven. Each lives in the **supervisor's memory*
 gone when the session exits, unless [`record = true`](../configuration/observe) also
 appends it to a file under the data directory ([`sbx net stats`](../cli/net#sbx-net-stats)
 is apart, a durable per-host counter). Each is
-read over a per-session control socket that is **never bound into the cage**, so the
-agent can neither read the record of what it did nor amend it. And none is a fence: where an
+read over a per-session control socket that is **never bound into the cage**, and that refuses
+a connection from one, so the agent can neither read the record of what it did nor amend it (a
+[bind that shows the data directory](../configuration/observe#what-is-written-and-where) shows
+the files `record = true` writes, read-only). And none is a fence: where an
 event records a decision, the decision was made elsewhere, by
 [`[proc] mode`](../configuration/proc) for exec, [`[network]`](../configuration/network) for
 egress, the [`[ssh_agent]`](../configuration/ssh-agent) grant, the plugin a broker or signer line

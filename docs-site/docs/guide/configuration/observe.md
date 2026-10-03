@@ -29,10 +29,16 @@ directory (`proc/`, `fs/`, `ssh-agent/`, `broker/`, `signer/`, `egress/`, `tasks
 the session ran for, then carries one line per event, in the order the events happened. The lines
 are the ones the live view already shows.
 
-The file is mode `0600` inside a `0700` directory, and that directory is **never** bound into the
+The file is mode `0600` inside a `0700` directory, and `sbx` never binds that directory into the
 cage. This is the property the record rests on: not that events are unwritten, but that the
 recorded party cannot reach the record. An agent under `enforce` can no more read its own exec
 record than it can read the live ring behind the control socket.
+
+The one exception is one you configure: a [`binds`](binds) entry aimed at or inside the data
+directory, or a launch from inside it, shows the cage what it covers, read-only, as the
+[security model](../concepts/security-model#the-control-plane-is-pinned) names. The records are
+among what it shows, so there the agent can read the record of what it did, though not amend it.
+The live ring stays out of reach, since its socket refuses a connection from the cage.
 
 ## Reading one back
 

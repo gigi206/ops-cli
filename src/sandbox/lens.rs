@@ -34,7 +34,10 @@
 //! shows the data dir read-only with its contents, sockets included, the pin too when a broader bind
 //! contains it, and a read-only mount does not refuse `connect()`. What holds there is [`serve`]'s
 //! check of the peer: a connection from outside the supervisor's own PID namespace, as every cage's
-//! is, is closed unanswered before it is read ([`super::peer`]).
+//! is, is closed unanswered before it is read ([`super::peer`]). That check covers the sockets and
+//! not the [`Recorder`] files beside them: there those are shown read-only too, so the agent can read
+//! the record of what it did, though not amend it, which is the residual the security model names
+//! for such a bind.
 //!
 //! The wire is line-based and minimal, one command per connection: `LOG` returns the retained events
 //! (a `dropped=` line when a `--follow` cursor fell behind the ring, a `head=` cursor, then one

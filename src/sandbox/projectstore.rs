@@ -1377,9 +1377,11 @@ pub(crate) fn gcroots_dir(store_dir: &Path) -> PathBuf {
 /// leave it for the next launch. The seed below then copies the whole base closure, gigabytes of
 /// it, into wherever the cage pointed, and `gcroot_roots` writes its symlinks there.
 ///
-/// `store_dir` itself sits under `<data>/projects/<id>/`, which the cage never sees, so it is a
-/// sound anchor; `nix` is the bind's own source, which from inside the cage is the mount point and
-/// so cannot be exchanged either.
+/// `store_dir` itself sits under `<data>/projects/<id>/`, which no mount gives the cage write
+/// access to: a bind at or under the data directory and a project root there are mounted read-only,
+/// and a bind that contains the data directory shows it from an empty decoy. So nothing in the cage
+/// can move it, and it is a sound anchor; `nix` is the bind's own source, which from inside the
+/// cage is the mount point and so cannot be exchanged either.
 fn ensure_dir_chain(store_dir: &Path, rel: &str) -> io::Result<PathBuf> {
     super::cagedir::ensure_under(store_dir, &format!("nix/{rel}"), DIR_MODE)
 }
