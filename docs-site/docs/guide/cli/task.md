@@ -28,10 +28,11 @@ a `--session` no live session answers to. A session that could not be asked is n
 `sbx task show <name>` exits 1 when no session answered and one could not be read, its socket
 gone or its answer cut off before its end. `--session` is host-only, since a cage reaches exactly
 one plane, its own (the plane address travels as `SBX_TASK_SOCKET`, which is also how `--session` is refused inside a cage rather than
-silently dropped). `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
-rather than by check: they live on a second socket that is never bound into a cage. The record is not
+silently dropped). `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, by
+construction first: they live on a second socket that is never bound into a cage, and that socket
+also refuses a caller outside `sbx`'s own PID namespace, should a mount show it to a cage. The record is not
 for the recorded party to read, and an invocation id is per session: a cage able to stop one could
-stop the invocation *you* started, and same-uid leaves no way to tell the two callers apart. Starting
+stop the invocation *you* started, and same-uid leaves no credential to tell the two callers apart. Starting
 a detached invocation is on that socket for the same reason: it is only reachable through those
 verbs, so a caller that could start one without being able to watch or end it would be creating
 invocations nobody owns.

@@ -11,7 +11,9 @@
 //! stays host-only. What a session recorded is for the human, and the recorded party does not get to
 //! read (or trim) it; what a session is *running* is for the human too, because an invocation id is
 //! per session and a cage reaching those verbs could watch and end an invocation the human started.
-//! Same-uid leaves no way to tell the two callers apart, so the socket does it.
+//! Same-uid leaves no credential to tell the two callers apart, so the socket does it; the host-only
+//! one also refuses a peer outside the supervisor's PID namespace, for a launch whose mounts show it
+//! to a cage ([`super::peer`]).
 //!
 //! # The residual to be honest about
 //!
@@ -62,7 +64,7 @@
 //! stopped and collected through the host-only verbs — putting the start of it within reach of a cage
 //! would let a caller create invocations it cannot then see or end, and let it hold several at once,
 //! which having to wait is what prevents today. It is also why `RUN` is not merely given a flag: the
-//! crossing socket has no way to tell a host caller from an in-cage one.
+//! crossing socket does not tell a host caller from an in-cage one.
 //!
 //! Any refusal is a single `err <message>` line. A message never echoes a caller's value back: a
 //! value can carry the very secret a caller is probing for.
@@ -792,6 +794,7 @@ pub(crate) fn start(
         let quota = Arc::clone(&quota);
         let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
         std::thread::spawn(move || {
+            let mut gate = super::peer::PeerGate::new("task control (logs)");
             for stream in log_listener.incoming() {
                 let stream = match stream {
                     Ok(s) => s,
@@ -802,6 +805,12 @@ pub(crate) fn start(
                         continue;
                     }
                 };
+                // The crossing socket has two rightful kinds of caller and passes no gate; this one
+                // has only the host's, so a peer outside this process's PID namespace, as every cage
+                // is, is closed unanswered before it can take a slot. See [`super::peer`].
+                if !gate.admits(&stream) {
+                    continue;
+                }
                 // Its own ceiling rather than a share of the crossing socket's: a cage filling the
                 // one must not be able to lock the user out of the other, which is where `sbx task
                 // status` and `sbx task stop` are answered.

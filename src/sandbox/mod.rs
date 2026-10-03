@@ -31,6 +31,8 @@ pub(crate) mod memfd;
 // `sbx-` prefix has one definition rather than a literal per cage.
 pub(crate) mod naming;
 mod openuri;
+// Whether a control socket's peer runs in the supervisor's own PID namespace, which no cage does.
+mod peer;
 mod pty;
 mod smoke;
 mod spec;

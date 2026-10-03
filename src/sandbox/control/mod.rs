@@ -1649,7 +1649,8 @@ pub(crate) fn serve(
     planes: Planes,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
-    accept_each(listener, &stop, "egress control", None, move |cmd| {
+    let gate = Some(super::peer::PeerGate::new("egress control"));
+    accept_each(listener, &stop, "egress control", None, gate, move |cmd| {
         dispatch(
             cmd,
             &planes.state,
@@ -1675,6 +1676,11 @@ const REPORT_CONNS: usize = 8;
 /// remember rules, so a flaw in the tap would have been a way to decide egress. This server is
 /// handed the event ring and the durable counters and nothing else: the owner's verbs are not
 /// refused here, they are out of its reach.
+///
+/// For the same reason this socket passes no [`super::peer::PeerGate`]: its peer runs in a cage of
+/// its own, in a PID namespace beside the agent's, and nothing here could tell the two apart. What
+/// a cage that can see this socket could do through it is add `RESOLVED` and `BYPASSED` events to
+/// the record and the counters.
 pub(crate) fn serve_reports(
     listener: UnixListener,
     log: Arc<LogRing>,
@@ -1682,20 +1688,27 @@ pub(crate) fn serve_reports(
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     let cap = super::conncap::ConnCap::new(REPORT_CONNS);
-    accept_each(listener, &stop, "egress reports", Some(cap), move |cmd| {
-        report(cmd, &log, stats.as_deref())
-    });
+    accept_each(
+        listener,
+        &stop,
+        "egress reports",
+        Some(cap),
+        None,
+        move |cmd| report(cmd, &log, stats.as_deref()),
+    );
     Ok(())
 }
 
 /// The accept loop of both of this module's sockets: each connection on a thread of its own,
 /// answered by `dispatch`, until `stop` is set. With a `cap`, a connection past the ceiling is
-/// closed unanswered.
+/// closed unanswered; with a `gate`, so is one whose peer runs outside this process's PID
+/// namespace, before it takes a slot.
 fn accept_each<F>(
     listener: UnixListener,
     stop: &std::sync::atomic::AtomicBool,
     who: &'static str,
     cap: Option<super::conncap::ConnCap>,
+    mut gate: Option<super::peer::PeerGate>,
     dispatch: F,
 ) where
     F: Fn(&str) -> String + Send + Sync + 'static,
@@ -1725,6 +1738,11 @@ fn accept_each<F>(
                 continue;
             }
         };
+        if let Some(gate) = gate.as_mut()
+            && !gate.admits(&stream)
+        {
+            continue;
+        }
         let slot = match &cap {
             Some(cap) => match cap.take() {
                 Some(slot) => Some(slot),

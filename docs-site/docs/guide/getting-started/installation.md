@@ -72,6 +72,12 @@ Run [`sbx doctor`](doctor) to check all of these at once. On a restricted
 Ubuntu 24.04+ host, user namespaces may exist but be stripped of capabilities;
 `doctor` checks specifically for the capability-bearing case.
 
+A session's control sockets, which `sbx net`, `sbx proc`, `sbx task status` and the
+logs commands talk to, need **Linux 5.5 or later**, which `doctor` does not check.
+They answer only a caller in `sbx`'s own PID namespace, never a cage's, and an older
+kernel cannot tell them which namespace a caller runs in, so there they refuse every
+connection. A launch runs without it. See [the security model](../concepts/security-model).
+
 ## Running under WSL2
 
 `sbx` runs inside a WSL2 distribution without adaptation. The shipping binary is

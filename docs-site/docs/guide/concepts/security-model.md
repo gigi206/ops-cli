@@ -160,6 +160,17 @@ connecting to a socket. When a broader bind also contains that directory, the pi
 shows the whole directory the same way rather than hide what you asked for. Neither
 is something to do with an agent you do not trust.
 
+What answers on those sockets is narrower than what is shown. The control sockets,
+which serve each session's records, `sbx net` and `sbx proc` decisions and
+`sbx task status` and `stop`, close a connection from any process outside `sbx`'s
+own PID namespace, and every cage has a PID namespace of its own. The `sbx` command
+run from another PID namespace, such as from outside a container a session runs in,
+is refused the same way. The check needs Linux 5.5 or later; on an older kernel those
+sockets refuse every connection. The sockets a cage is meant to reach, its brokers
+and its task socket, take no such check, nor does the capture tap's report socket,
+whose own peer runs in a cage: a cage that can see it can add events to the
+session's egress record.
+
 ## What the trust gate protects
 
 An untrusted project's `.sbx.toml` **cannot** touch security-relevant fields: binds,

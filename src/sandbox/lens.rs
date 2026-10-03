@@ -30,10 +30,11 @@
 //! Not binding the socket is half of it, since the data dir can lie inside what the cage mounts:
 //! under a project root of `$HOME`, or a bind of it in either mode. The launcher pins the data dir
 //! there from an empty decoy (`config::control_plane_pins`), so the cage finds nothing at that path.
-//! The servers check no peer, so what keeps them unreachable is that pin alone, and it does not
-//! cover a bind aimed at or inside the data dir or a launch from inside it: each shows the data dir
-//! read-only with its contents, sockets included, the pin too when a broader bind contains it, and
-//! a read-only mount does not refuse `connect()`.
+//! The pin does not cover a bind aimed at or inside the data dir or a launch from inside it: each
+//! shows the data dir read-only with its contents, sockets included, the pin too when a broader bind
+//! contains it, and a read-only mount does not refuse `connect()`. What holds there is [`serve`]'s
+//! check of the peer: a connection from outside the supervisor's own PID namespace, as every cage's
+//! is, is closed unanswered before it is read ([`super::peer`]).
 //!
 //! The wire is line-based and minimal, one command per connection: `LOG` returns the retained events
 //! (a `dropped=` line when a `--follow` cursor fell behind the ring, a `head=` cursor, then one
@@ -302,6 +303,7 @@ where
 {
     let dispatch = Arc::new(dispatch);
     let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
+    let mut gate = super::peer::PeerGate::new("lens control");
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -315,6 +317,11 @@ where
                 continue;
             }
         };
+        // A peer outside this process's PID namespace, as every cage is, is closed unanswered
+        // before it can take a slot. See [`super::peer`].
+        if !gate.admits(&stream) {
+            continue;
+        }
         // Past the ceiling the connection is closed unanswered, and nothing is recorded: the ring
         // this socket serves is the lens's record, and a refusal pushed into it would evict the
         // events a reader came for.
