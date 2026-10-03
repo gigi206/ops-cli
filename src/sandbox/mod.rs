@@ -123,6 +123,7 @@ mod catrust;
 mod fonts;
 mod gpu;
 mod guidata;
+mod lima_mac;
 mod notify_relay;
 mod notify_sink;
 mod portal;

@@ -193,10 +193,14 @@ brew install lima
 curl -fsSL https://raw.githubusercontent.com/gigi206/ops-cli/HEAD/install.sh | SBX_VERSION=latest sh
 ```
 
-On macOS the script downloads no binary. It reads the Lima template and the wrapper this
-repository ships at the release's tag, creates a Lima instance named `sbx` from the
-template for that release, starts it, and installs the wrapper at `~/.local/bin/sbx`,
-saying so when that directory is not on your `PATH`. The first start downloads an image
+On macOS the script downloads no binary. It reads the Lima template, the wrapper and the
+Mac-side bridge this repository ships at the release's tag, creates a Lima instance named
+`sbx` from the template for that release, starts it, installs the wrapper at
+`~/.local/bin/sbx`, saying so when that directory is not on your `PATH`, and installs two
+launchd agents, `org.sbx.lima.theme` and `org.sbx.lima.notify`, in
+`~/Library/LaunchAgents`. macOS announces each new agent once with a "Background Items
+Added" banner; each is removed with `launchctl bootout gui/$(id -u)/<label>` and the
+deletion of its plist. The first start downloads an image
 and provisions the guest, including its compositor and sound server, which takes a few
 minutes. An instance named `sbx` that already exists is kept as it is: running the script
 again only reinstalls the wrapper, and an instance keeps the template it was created
@@ -210,7 +214,7 @@ defaults to `Projects`; the script creates it. The same setup by hand, from a ch
 this repository:
 
 ```sh
-mkdir -p ~/Projects
+mkdir -p ~/Projects ~/.local/state/sbx/lima/theme ~/.local/state/sbx/lima/notify
 limactl create --name sbx --param projects=Projects dist/macos/sbx.yaml
 limactl start sbx
 sudo install -d -m 0755 /usr/local/bin
@@ -242,7 +246,8 @@ own default mounts the whole of `~`. That is the opposite of what `sbx` is for: 
 project is writable and nothing above it is in scope at all, so the template mounts one
 subtree and asks you to name yours. The mount is writable, because a cage that cannot
 write the project is not a sandbox to work in, and that is also what makes the narrowing
-worth doing: this mount is the whole of the guest's reach into the Mac's disk.
+worth doing: apart from the two small directories the theme and notification channels
+below use, this mount is the whole of the guest's reach into the Mac's disk.
 
 Four things come from Lima rather than from `sbx`, and only the last takes a line of
 configuration:
@@ -299,6 +304,21 @@ Three differences from a native host are worth knowing before they surprise you:
   its primary group, which every session carries from the start. Lima 2.2.1 attaches the
   output stream alone, so the guest has no capture device and an app's microphone finds
   nothing.
+- **The light/dark appearance follows the Mac's, live.** Under `dbus = true` a cage opens in
+  the Mac's appearance and follows a later switch, Auto mode included. The guest cannot ask
+  the Mac, so the `org.sbx.lima.theme` agent writes `dark` or `light` into a directory the
+  guest mounts read-only, on every change to the global preferences and once a minute; `sbx`
+  reads it at launch and every two seconds after, so a switch reaches a running app within
+  about ten seconds.
+- **Refusals are raised in Notification Center.** The guest runs no notification daemon, so
+  `sbx` drops each announcement into a second directory, writable from the guest, and the
+  `org.sbx.lima.notify` agent raises it and removes it. The note carries Script Editor's
+  icon, the mark of `osascript`, which raises it; registering an application of its own
+  would be a heavier thing to install than the wrong icon is to read. As under WSL the
+  stderr line is kept, since nothing tells the guest whether the note was seen, and at most
+  32 notes wait for an agent that is not running. The agent reads only regular files from
+  that directory, and only their first bytes, because the guest is the one writing there.
+  Neither directory is ever given to a cage.
 - **There is no GPU acceleration.** `vmType: vz` gives the guest a virtio-GPU device without
   3D acceleration. `gpu = true` grants its render node, and mesa renders in software
   (`llvmpipe`) behind it; the launch proceeds. The scope this template commits to is CLI plus GUI, and the two

@@ -1,0 +1,80 @@
+#!/bin/sh
+# sbx on a Mac: the Mac's half of the two channels a Lima guest shares with it.
+#
+# Run by launchd, never by hand. The guest cannot run a program on the Mac, so what it needs from
+# the Mac reaches it through two directories the template mounts into the guest at paths no cage
+# is given:
+#
+#   theme    this script writes `dark` or `light` into `color-scheme`, which the guest reads to
+#            open and keep a caged app in the Mac's appearance. The guest mounts it read-only.
+#   notify   sbx in the guest drops one file per refusal into `queue/`; this script raises each
+#            one in Notification Center and removes it. The guest mounts it writable.
+#
+# `notify/queue` is the guest's to write, so nothing found there is trusted: only a regular file
+# with a name of the shape sbx gives is read, only its first bytes, with control characters taken
+# out, and both lines reach `osascript` as arguments rather than as script text. Every other entry
+# is removed unread, because launchd starts this script again for as long as the directory it
+# watches is not empty.
+
+set -eu
+
+: "${SBX_BRIDGE_DIR:=$HOME/.local/state/sbx/lima}"
+
+# How many notes one run raises. The guest caps its queue, and the rest of a burst is removed
+# rather than raised, so a cage refusing in a loop cannot fill Notification Center.
+MAX_RAISED=5
+
+theme() {
+  dir="$SBX_BRIDGE_DIR/theme"
+  mkdir -p "$dir"
+  # `AppleInterfaceStyle` holds the appearance in effect, in Auto mode as well; it is absent in
+  # Light.
+  if [ "$(defaults read -g AppleInterfaceStyle 2>/dev/null || true)" = Dark ]; then
+    word=dark
+  else
+    word=light
+  fi
+  # Written only on a change, through a temporary name, so the guest never reads half a word.
+  if [ "$(cat "$dir/color-scheme" 2>/dev/null || true)" != "$word" ]; then
+    printf '%s\n' "$word" > "$dir/.color-scheme.new"
+    mv -f "$dir/.color-scheme.new" "$dir/color-scheme"
+  fi
+}
+
+notify() {
+  queue="$SBX_BRIDGE_DIR/notify/queue"
+  [ -d "$queue" ] || exit 0
+  raised=0
+  for entry in "$queue"/* "$queue"/.[!.]* "$queue"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name=${entry##*/}
+    case "$name" in
+      *[!A-Za-z0-9._-]* | .*) ok=no ;;
+      *.note) ok=yes ;;
+      *) ok=no ;;
+    esac
+    if [ "$ok" = yes ] && [ -f "$entry" ] && [ ! -L "$entry" ] && [ "$raised" -lt "$MAX_RAISED" ]; then
+      text=$(head -c 2048 "$entry" | LC_ALL=C tr -d '\000-\011\013-\037\177')
+      title=$(printf '%s\n' "$text" | sed -n 1p)
+      body=$(printf '%s\n' "$text" | sed -n 2p)
+      if [ -n "$title" ]; then
+        /usr/bin/osascript \
+          -e 'on run argv' \
+          -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+          -e 'end run' \
+          "$title" "$body" >/dev/null 2>&1 || true
+        raised=$((raised + 1))
+      fi
+    fi
+    rm -rf -- "$entry"
+  done
+}
+
+case "${1:-}" in
+  theme) theme ;;
+  notify) notify ;;
+  *)
+    printf 'usage: %s theme|notify\n' "${0##*/}" >&2
+    exit 2
+    ;;
+esac

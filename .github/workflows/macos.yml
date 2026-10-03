@@ -164,6 +164,9 @@ jobs:
           #   - outside the mount: neither the guest nor the cage may see it.
           echo "witness" > "$HOME/ci-projects/beside-the-project"
           echo "witness" > "$HOME/outside-the-mount"
+          # The template also mounts the two channels to the Mac, and Lima mounts only a directory
+          # that exists.
+          mkdir -p "$HOME/.local/state/sbx/lima/theme" "$HOME/.local/state/sbx/lima/notify"
           limactl delete --force sbx-ci 2>/dev/null || true
           limactl create --tty=false --name sbx-ci --param projects=ci-projects \
             "$GITHUB_WORKSPACE/dist/macos/sbx.yaml"
@@ -242,7 +245,10 @@ jobs:
           }
           # Both witnesses were written on the host by the creation step, so ABSENT here is a
           # measurement rather than a path that never existed.
-          for path in "$HOME/ci-projects/beside-the-project" "$HOME/outside-the-mount"; do
+          # The two channels to the Mac are mounted in the guest and must be absent from the cage
+          # too: a cage that saw the notification queue could raise notes on the Mac.
+          for path in "$HOME/ci-projects/beside-the-project" "$HOME/outside-the-mount" \
+            /mnt/sbx-mac/theme /mnt/sbx-mac/notify; do
             out=$(probe "$path")
             case "$out" in
               *VISIBLE*) echo "$path is reachable inside the cage"; exit 1 ;;

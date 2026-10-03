@@ -36,7 +36,9 @@ the cage: this is unrelated to [`dbus = true`](dbus), grants the sandbox nothing
 in-cage agent can neither forge an "sbx blocked …" notification nor dismiss one that names it.
 
 With no session bus to reach, over `ssh`, on a headless host, from `cron`, sbx says so once and
-falls back to a line on stderr. A notification is always best-effort: a launch never fails because
+falls back to a line on stderr. Two hosts answer elsewhere instead, keeping the stderr line as
+well: under WSL the announcement is a Windows toast, and in a Lima guest on macOS a note in
+Notification Center; see [Installation](../getting-started/installation). A notification is always best-effort: a launch never fails because
 one could not be delivered.
 
 ## What it looks like

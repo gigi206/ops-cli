@@ -6,8 +6,11 @@
 #
 # On macOS there is no binary to install: sbx runs in a Linux guest that Lima provides. The script
 # creates that guest from the template published with the release, unless one named `sbx` exists
-# already, and installs the wrapper that reaches it from a Mac shell. Lima itself is not installed
-# here; the script stops and names the command when it is missing.
+# already, and installs the wrapper that reaches it from a Mac shell. It also installs two launchd
+# agents in ~/Library/LaunchAgents, `org.sbx.lima.theme` and `org.sbx.lima.notify`, which hand the
+# Mac's light/dark preference to the guest and raise its refusals in Notification Center; each is
+# removed with `launchctl bootout gui/$(id -u)/<label>` and the deletion of its plist. Lima itself
+# is not installed here; the script stops and names the command when it is missing.
 #
 # Environment, each optional:
 #   SBX_REPO           the GitHub repository sbx is released from, `owner/name` (default:
@@ -44,6 +47,10 @@ DEFAULT_BASE="https://github.com/$REPO/releases/download"
 DEFAULT_API="https://api.github.com/repos/$REPO/releases"
 DEFAULT_SOURCE="https://raw.githubusercontent.com/$REPO"
 DOCS="https://${REPO%%/*}.github.io/${REPO#*/}/docs/getting-started/installation/"
+
+# The launchd agents installed on macOS, and the job each runs.
+AGENT_THEME=org.sbx.lima.theme
+AGENT_NOTIFY=org.sbx.lima.notify
 
 # The Lima instance the wrapper reaches by default.
 LIMA_INSTANCE=sbx
@@ -160,6 +167,61 @@ $actual; nothing was installed"
     run_doctor
 }
 
+# The launchd agent `$1` running the bridge `$2` in mode `$3`, woken by the plist keys in `$4`.
+agent_plist() {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$1</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/sh</string><string>$2</string><string>$3</string></array>
+$4
+</dict>
+</plist>
+EOF
+}
+
+# Install the bridge from `$1` and the two agents that run it over the channels under `$2`, replacing
+# any earlier copy. The theme agent runs at load, on every write to the global preferences, and
+# once a minute, which also catches Auto mode changing the appearance at dusk; the notify agent runs
+# whenever the queue holds a note.
+install_agents() {
+    share="${XDG_DATA_HOME:-$HOME/.local/share}/sbx/lima"
+    mkdir -p "$share" "$HOME/Library/LaunchAgents"
+    cp "$1" "$share/.sbx-bridge.$$"
+    chmod 0755 "$share/.sbx-bridge.$$"
+    mv -f "$share/.sbx-bridge.$$" "$share/sbx-bridge"
+    if ! command -v launchctl >/dev/null 2>&1; then
+        say "launchctl is not on PATH, so the theme and notification agents were not started"
+        return 0
+    fi
+    domain="gui/$(id -u)"
+    for agent in "$AGENT_THEME" "$AGENT_NOTIFY"; do
+        case "$agent" in
+            "$AGENT_THEME")
+                mode=theme
+                keys="  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>WatchPaths</key>
+  <array><string>$HOME/Library/Preferences/.GlobalPreferences.plist</string></array>"
+                ;;
+            *)
+                mode=notify
+                keys="  <key>QueueDirectories</key>
+  <array><string>$2/notify/queue</string></array>"
+                ;;
+        esac
+        plist="$HOME/Library/LaunchAgents/$agent.plist"
+        agent_plist "$agent" "$share/sbx-bridge" "$mode" "$keys" > "$plist"
+        launchctl bootout "$domain/$agent" </dev/null >/dev/null 2>&1 || true
+        launchctl bootstrap "$domain" "$plist" </dev/null \
+            || say "launchd did not load $plist; the $mode channel stays off"
+    done
+    say "installed the launchd agents $AGENT_THEME and $AGENT_NOTIFY"
+}
+
 # macOS has no capability-bearing user namespaces, and `sbx doctor` refuses to emulate them, so
 # sbx runs in a Linux guest and what is installed on the Mac is the wrapper that reaches it.
 install_macos() {
@@ -179,6 +241,12 @@ again; see $DOCS"
     fetch "$source/sbx.yaml" "$tmp/sbx.yaml" || die "could not download $source/sbx.yaml; \
 the release $version may predate the macOS support"
     fetch "$source/sbx" "$tmp/sbx" || die "could not download $source/sbx"
+    fetch "$source/sbx-bridge" "$tmp/sbx-bridge" || die "could not download $source/sbx-bridge"
+
+    # The two channels the template mounts into the guest. Lima mounts a directory that exists, and
+    # launchd watches one, so both are made before either is asked to.
+    bridge_dir="$HOME/.local/state/sbx/lima"
+    mkdir -p "$bridge_dir/theme" "$bridge_dir/notify/staging" "$bridge_dir/notify/queue"
 
     if limactl list --quiet </dev/null 2>/dev/null | grep -qx "$LIMA_INSTANCE"; then
         say "the Lima instance '$LIMA_INSTANCE' exists and is kept as it is, with the release \
@@ -199,6 +267,7 @@ a few minutes"
 
     place "$tmp/sbx"
     say "installed the sbx wrapper at $dir/sbx; run sbx from a directory under ~/$projects"
+    install_agents "$tmp/sbx-bridge" "$bridge_dir"
     path_hint
     # The wrapper refuses a directory the guest does not share, so the preflight is run from the
     # subtree. A guest kept from an earlier install may share another one, which only its creator

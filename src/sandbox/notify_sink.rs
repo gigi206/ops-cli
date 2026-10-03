@@ -415,6 +415,32 @@ impl Sink for WslToastSink {
     }
 }
 
+/// The Mac sink: a note in the queue the Mac's agent raises in Notification Center, **and** the
+/// stderr line the fallback would have printed.
+///
+/// Both, for the reason [`WslToastSink`] gives: nothing tells the guest whether the note was raised.
+/// The agent may not be running, the user may have silenced its notifications, or the queue may be
+/// full, in which case no note is written at all. The stderr line is the delivery that always lands.
+struct MacNoteSink {
+    context: String,
+    /// The notification channel's root, [`crate::sandbox::lima_mac::NOTIFY_MOUNT`] outside tests.
+    dir: std::path::PathBuf,
+}
+
+impl Sink for MacNoteSink {
+    fn deliver(
+        &mut self,
+        summary: &str,
+        body: &str,
+        _replaces: Option<u32>,
+    ) -> Result<Option<u32>, ()> {
+        crate::diag::warn(&stderr_line(&self.context, summary, body));
+        // A note that cannot be written is not a transport that is gone: the line above landed.
+        let _ = crate::sandbox::lima_mac::queue_note(&self.dir, summary, body);
+        Ok(None)
+    }
+}
+
 /// The desktop sink: `org.freedesktop.Notifications.Notify` on the host session bus.
 ///
 /// Holds the connection for the session's lifetime — one connection, one thread, and the async work
@@ -806,6 +832,17 @@ impl Notifier {
                         powershell: None,
                         pending: Vec::new(),
                     }),
+                    // The same case on a Lima guest on a Mac: the desktop is the Mac's, reached
+                    // through the notification directory the guest mounts from it.
+                    None if crate::sandbox::lima_mac::mounted(
+                        crate::sandbox::lima_mac::NOTIFY_MOUNT,
+                    ) =>
+                    {
+                        Box::new(MacNoteSink {
+                            context: context.clone(),
+                            dir: std::path::PathBuf::from(crate::sandbox::lima_mac::NOTIFY_MOUNT),
+                        })
+                    }
                     None => {
                         crate::diag::note(
                             "no desktop notification daemon reachable — reporting blocked \

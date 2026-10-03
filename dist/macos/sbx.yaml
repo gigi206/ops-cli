@@ -61,6 +61,19 @@ mounts:
     # narrowing, since this is the hole through which the guest reaches the Mac's disk.
     writable: true
 
+  # The two channels to the Mac, each mounted at a path that exists only in the guest, so no Mac
+  # shell can stand in one and the wrapper never builds a cage around it; no cage is given either.
+  # The Mac's agent (`sbx-bridge`, run by launchd) writes the light/dark preference into the first,
+  # which the guest only reads, and raises in Notification Center each note sbx drops into the
+  # second. Besides the subtree above, these two directories are all of the Mac's disk the guest
+  # reaches.
+  - location: "{{.Home}}/.local/state/sbx/lima/theme"
+    mountPoint: "/mnt/sbx-mac/theme"
+    writable: false
+  - location: "{{.Home}}/.local/state/sbx/lima/notify"
+    mountPoint: "/mnt/sbx-mac/notify"
+    writable: true
+
 video:
   # A native macOS window, keyboard and pointer included. Lima's `default.yaml` documents this
   # field with QEMU's values and omits `vz`, but the VZ driver accepts `vz`, `default` and `none`

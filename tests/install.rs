@@ -24,6 +24,9 @@ const FAKE_SBX: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"sbx 9.9.9
 /// never reads it.
 const FAKE_TEMPLATE: &str = "vmType: \"vz\"\n";
 
+/// The Mac-side bridge a fake release publishes. The script installs it and never runs it.
+const FAKE_BRIDGE: &str = "#!/bin/sh\necho bridge \"$1\"\n";
+
 /// The script as it ships, read from the checkout.
 fn script() -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
@@ -79,6 +82,30 @@ impl Release {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("sbx.yaml"), FAKE_TEMPLATE).unwrap();
         std::fs::write(dir.join("sbx"), FAKE_SBX).unwrap();
+        std::fs::write(dir.join("sbx-bridge"), FAKE_BRIDGE).unwrap();
+    }
+
+    /// A directory holding a `launchctl` that appends each call to `launchctl.log`.
+    fn fake_launchctl(&self) -> PathBuf {
+        let bin = self.root.join("launchbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("launchctl");
+        let body = format!(
+            "#!/bin/sh\necho \"$*\" >> {}\n",
+            self.root.join("launchctl.log").display()
+        );
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// Every `launchctl` call the script made, one per line.
+    fn launchctl_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("launchctl.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// A directory holding a `limactl` that appends each call to [`Release::lima_log`], and lists
@@ -525,4 +552,74 @@ fn on_macos_a_release_without_the_template_is_named() {
     );
     assert!(!fx.installed().exists());
     assert!(fx.lima_calls().is_empty(), "{:?}", fx.lima_calls());
+}
+
+#[test]
+fn on_macos_the_bridge_and_its_two_agents_are_installed_and_replaced() {
+    let fx = Release::new();
+    fx.publish_macos("latest");
+    let path = [
+        &fx.fake_launchctl(),
+        &fx.fake_limactl(),
+        &fx.fake_uname("Darwin", "arm64"),
+    ];
+    let paths: Vec<&Path> = path.iter().map(|p| p.as_path()).collect();
+    let run = fx.run(&script(), &[("SBX_VERSION", "latest")], &paths);
+    assert_eq!(run.code, Some(0), "{}", run.text);
+
+    let state = fx.home().join(".local/state/sbx/lima");
+    for dir in ["theme", "notify/staging", "notify/queue"] {
+        assert!(
+            state.join(dir).is_dir(),
+            "{dir} is made before Lima mounts it"
+        );
+    }
+    let bridge = fx.home().join(".local/share/sbx/lima/sbx-bridge");
+    assert_eq!(std::fs::read_to_string(&bridge).unwrap(), FAKE_BRIDGE);
+    let mode = std::fs::metadata(&bridge).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+
+    let agents = fx.home().join("Library/LaunchAgents");
+    let theme = std::fs::read_to_string(agents.join("org.sbx.lima.theme.plist")).unwrap();
+    assert!(
+        theme.contains("<string>theme</string>")
+            && theme.contains("WatchPaths")
+            && theme.contains(".GlobalPreferences.plist")
+            && theme.contains("StartInterval"),
+        "{theme}"
+    );
+    let notify = std::fs::read_to_string(agents.join("org.sbx.lima.notify.plist")).unwrap();
+    assert!(
+        notify.contains("<string>notify</string>")
+            && notify.contains("QueueDirectories")
+            && notify.contains(&state.join("notify/queue").display().to_string()),
+        "{notify}"
+    );
+
+    let calls = fx.launchctl_calls();
+    for agent in ["org.sbx.lima.theme", "org.sbx.lima.notify"] {
+        let out = calls
+            .iter()
+            .position(|c| c.starts_with("bootout") && c.ends_with(agent));
+        let load = calls
+            .iter()
+            .position(|c| c.starts_with("bootstrap") && c.ends_with(&format!("{agent}.plist")));
+        assert!(
+            matches!((out, load), (Some(o), Some(l)) if o < l),
+            "{agent} is booted out before it is bootstrapped: {calls:?}"
+        );
+    }
+
+    // Again: the same files, replaced in place, and the agents reloaded rather than duplicated.
+    let run = fx.run(
+        &script(),
+        &[("SBX_VERSION", "latest"), ("FAKE_LIMA_EXISTS", "1")],
+        &paths,
+    );
+    assert_eq!(run.code, Some(0), "{}", run.text);
+    assert_eq!(
+        std::fs::read_dir(&agents).unwrap().count(),
+        2,
+        "two agents, whatever the number of runs"
+    );
 }

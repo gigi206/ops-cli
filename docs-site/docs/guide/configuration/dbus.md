@@ -44,7 +44,9 @@ The app probes *that* portal and gets three things:
 - **Theme**, the host light/dark preference is read host-side and seeded into the cage so both the
   app window **and the file chooser** open in the right theme, and a host-side relay mirrors later
   host theme switches into the cage, so both surfaces **follow the theme live** (the file dialog
-  re-themes even while it is open).
+  re-themes even while it is open). Where the host runs no portal the preference is read from
+  the desktop the host belongs to: the Windows registry under WSL, and the Mac's appearance in
+  a Lima guest on macOS (see [Installation](../getting-started/installation)).
 
   One file carries it: the GSettings **keyfile** the in-cage portal serves from. A Chromium/Electron
   app is its own portal client and reads the scheme straight off it. A **GTK app** reaches the same

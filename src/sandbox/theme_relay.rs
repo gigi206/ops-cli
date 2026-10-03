@@ -80,10 +80,60 @@ pub(crate) fn read_host_color_scheme() -> Option<String> {
     }
     // No portal answered. Under WSL that is the normal case rather than a failure — the desktop
     // whose preference this is runs on the Windows side, which answers through a registry value
-    // instead of a bus name — so the same question is asked there. Everywhere else this is where
-    // the read gives up, exactly as before: the branch is gated on the kernel being a WSL one, so a
-    // Linux host with no portal reaches no process spawn it did not reach yesterday.
-    windows_fallback(host_is_wsl(), read_windows_color_scheme)
+    // instead of a bus name — so the same question is asked there. A Lima guest on a Mac is the
+    // same case with another answer: the Mac's agent writes the preference into a directory the
+    // guest mounts. Everywhere else this is where the read gives up, exactly as before: each branch
+    // is gated on the host being that host, so a Linux host with no portal reaches no process spawn
+    // and no file it did not reach yesterday.
+    match theme_source(
+        false,
+        host_is_wsl(),
+        super::lima_mac::mounted(super::lima_mac::THEME_MOUNT),
+    ) {
+        ThemeSource::Windows => windows_fallback(true, read_windows_color_scheme),
+        ThemeSource::Mac => mac_fallback(true, super::lima_mac::read_color_scheme),
+        ThemeSource::Portal | ThemeSource::Nothing => None,
+    }
+}
+
+/// Where a launch reads the host's light/dark preference from, and follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeSource {
+    /// The desktop portal on the host session bus.
+    Portal,
+    /// The Windows registry, under WSL.
+    Windows,
+    /// The theme directory a Lima guest mounts from the Mac.
+    Mac,
+    /// No source: the cage keeps its default theme.
+    Nothing,
+}
+
+/// The source, from the three facts that decide it. Pure, and the one place the order is set: the
+/// seed and the relay both ask it, so a launch never seeds from one source and follows another,
+/// which would correct the cage to a value read a second way.
+///
+/// The portal comes first because a host that answers on the bus is a desktop of its own, whatever
+/// else is true of it. WSL comes before the Mac only because the two cannot both hold.
+fn theme_source(portal_answered: bool, is_wsl: bool, mac_bridge: bool) -> ThemeSource {
+    if portal_answered {
+        ThemeSource::Portal
+    } else if is_wsl {
+        ThemeSource::Windows
+    } else if mac_bridge {
+        ThemeSource::Mac
+    } else {
+        ThemeSource::Nothing
+    }
+}
+
+/// The Mac fallback with its gate and its reader passed in, for the reason [`windows_fallback`]
+/// takes them: what is worth proving is a read that does **not** happen off the Mac's mount.
+fn mac_fallback(mounted: bool, read: impl FnOnce() -> Option<String>) -> Option<String> {
+    if !mounted {
+        return None;
+    }
+    read()
 }
 
 /// The bounded portal read on its own, because the relay must ask the **same** question the seed
@@ -285,7 +335,39 @@ while ($true) {
 /// **not** start off WSL, and an absence is only provable against a decision that can be asked
 /// without a bus or a registry to stand up first.
 fn relay_follows_windows(portal_answered: bool, is_wsl: bool) -> bool {
-    !portal_answered && is_wsl
+    theme_source(portal_answered, is_wsl, false) == ThemeSource::Windows
+}
+
+/// How often the relay reads the Mac's theme file. A write on the Mac is visible in the guest at
+/// once, and the Mac's agent itself runs within launchd's ten-second throttle of a switch, so a
+/// shorter period would only add reads.
+const MAC_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Mirror the Mac's preference into the in-cage keyfile, until the relay is told to stop.
+///
+/// A poll, because a guest is told nothing when a file on a virtiofs mount changes on the Mac side:
+/// inotify sees only writes made in the guest. One read of a one-word file every [`MAC_POLL`] is
+/// the whole cost, and the keyfile is written only when the value changes.
+fn run_mac_watch(home: &Path, shutdown: &async_channel::Receiver<()>) {
+    let mut last = super::lima_mac::read_color_scheme();
+    loop {
+        let ended = async_io::block_on(async {
+            futures_util::select! {
+                _ = shutdown.recv().fuse() => true,
+                _ = FutureExt::fuse(async_io::Timer::after(MAC_POLL)) => false,
+            }
+        });
+        if ended {
+            return;
+        }
+        let now = super::lima_mac::read_color_scheme();
+        if now != last {
+            if let Some(scheme) = now.as_deref() {
+                write_keyfile(home, scheme);
+            }
+            last = now;
+        }
+    }
 }
 
 /// Whether a watcher that has just started may be published into the shared slot, or must be
@@ -363,7 +445,14 @@ fn run_relay(
     shutdown: async_channel::Receiver<()>,
     watcher: &std::sync::Mutex<WatchSlot>,
 ) {
-    if !relay_follows_windows(portal_color_scheme().is_some(), host_is_wsl()) {
+    let portal_answered = portal_color_scheme().is_some();
+    let is_wsl = host_is_wsl();
+    let mac_bridge = super::lima_mac::mounted(super::lima_mac::THEME_MOUNT);
+    if theme_source(portal_answered, is_wsl, mac_bridge) == ThemeSource::Mac {
+        run_mac_watch(&home, &shutdown);
+        return;
+    }
+    if !relay_follows_windows(portal_answered, is_wsl) {
         if let Err(e) = async_io::block_on(run_portal(home, shutdown))
             && !bus_error_is_a_teardown_race(&e.to_string())
         {
@@ -928,5 +1017,40 @@ mod tests {
             guard.child.is_none(),
             "and `Drop` had nothing to kill, which is exactly why the flag has to carry the stop"
         );
+    }
+
+    /// The one order every launch uses: the portal, then Windows, then the Mac, then nothing.
+    #[test]
+    fn the_source_order_is_portal_then_windows_then_the_mac() {
+        use super::{ThemeSource, theme_source};
+        assert_eq!(theme_source(true, true, true), ThemeSource::Portal);
+        assert_eq!(theme_source(true, false, true), ThemeSource::Portal);
+        assert_eq!(theme_source(false, true, false), ThemeSource::Windows);
+        assert_eq!(theme_source(false, true, true), ThemeSource::Windows);
+        assert_eq!(theme_source(false, false, true), ThemeSource::Mac);
+        assert_eq!(theme_source(false, false, false), ThemeSource::Nothing);
+    }
+
+    /// The Mac's theme file is read only on a host where it is the Mac's mount.
+    #[test]
+    fn only_a_mac_guest_reaches_the_macs_theme_file() {
+        let called = std::cell::Cell::new(false);
+        let reader = || {
+            called.set(true);
+            Some("prefer-dark".to_string())
+        };
+        assert_eq!(super::mac_fallback(false, reader), None);
+        assert!(!called.get(), "a host without the mount must read nothing");
+
+        let called = std::cell::Cell::new(false);
+        let reader = || {
+            called.set(true);
+            Some("prefer-dark".to_string())
+        };
+        assert_eq!(
+            super::mac_fallback(true, reader),
+            Some("prefer-dark".to_string())
+        );
+        assert!(called.get(), "a Mac guest reads the file");
     }
 }
