@@ -20,6 +20,10 @@ use std::process::{Command, Stdio};
 const FAKE_SBX: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"sbx 9.9.9\" ;;\n  \
                         doctor) echo \"doctor ran\"; exit \"${FAKE_DOCTOR_RC:-0}\" ;;\nesac\n";
 
+/// The Lima template a fake release publishes for macOS. The script hands it to `limactl` and
+/// never reads it.
+const FAKE_TEMPLATE: &str = "vmType: \"vz\"\n";
+
 /// The script as it ships, read from the checkout.
 fn script() -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
@@ -69,6 +73,43 @@ impl Release {
         std::fs::write(dir.join(format!("{asset}.sha256")), format!("{sum}\n")).unwrap();
     }
 
+    /// Publish the macOS template and wrapper as the repository holds them at `tag`.
+    fn publish_macos(&self, tag: &str) {
+        let dir = self.root.join("source").join(tag).join("dist/macos");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sbx.yaml"), FAKE_TEMPLATE).unwrap();
+        std::fs::write(dir.join("sbx"), FAKE_SBX).unwrap();
+    }
+
+    /// A directory holding a `limactl` that appends each call to [`Release::lima_log`], and lists
+    /// an instance named `sbx` when `FAKE_LIMA_EXISTS` is set.
+    fn fake_limactl(&self) -> PathBuf {
+        let bin = self.root.join("limabin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("limactl");
+        let body = format!(
+            "#!/bin/sh\necho \"$*\" >> {log}\n\
+             case \"$1\" in list) [ -z \"${{FAKE_LIMA_EXISTS:-}}\" ] || echo sbx ;; esac\n",
+            log = self.lima_log().display()
+        );
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn lima_log(&self) -> PathBuf {
+        self.root.join("limactl.log")
+    }
+
+    /// Every `limactl` call the script made, one per line.
+    fn lima_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.lima_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Make the releases API name `tag` as the newest stable release, in the shape GitHub prints.
     fn announce(&self, tag: &str) {
         let api = self.root.join("api");
@@ -108,6 +149,10 @@ impl Release {
             .env(
                 "SBX_RELEASES_API",
                 format!("file://{}", self.root.join("api").display()),
+            )
+            .env(
+                "SBX_SOURCE_BASE",
+                format!("file://{}", self.root.join("source").display()),
             )
             .current_dir(self.root.path())
             .stdin(Stdio::piped())
@@ -325,7 +370,7 @@ fn the_asset_follows_the_machine_and_an_unknown_one_is_refused() {
 
     for (kernel, machine, said) in [
         ("Linux", "riscv64", "no release is published for riscv64"),
-        ("Darwin", "arm64", "sbx runs on Linux, not Darwin"),
+        ("FreeBSD", "amd64", "not on FreeBSD"),
     ] {
         let fx = Release::new();
         fx.announce("v2.0.0");
@@ -375,4 +420,109 @@ fn a_script_cut_short_in_the_pipe_runs_nothing() {
     assert_ne!(run.code, Some(0), "{}", run.text);
     assert!(!run.text.contains("downloading"), "{}", run.text);
     assert!(!fx.installed().exists());
+}
+
+#[test]
+fn on_macos_the_guest_is_created_and_the_wrapper_installed() {
+    let fx = Release::new();
+    fx.publish_macos("latest");
+    let run = fx.run(
+        &script(),
+        &[("SBX_VERSION", "latest")],
+        &[&fx.fake_limactl(), &fx.fake_uname("Darwin", "arm64")],
+    );
+
+    assert_eq!(run.code, Some(0), "{}", run.text);
+    assert_eq!(
+        std::fs::read_to_string(fx.installed()).unwrap(),
+        FAKE_SBX,
+        "the wrapper is what lands on PATH"
+    );
+    assert!(fx.home().join("Projects").is_dir(), "{}", run.text);
+    let calls = fx.lima_calls();
+    assert!(
+        calls.iter().any(|c| c.starts_with(
+            "create --tty=false --name sbx --param projects=Projects --param release=latest "
+        )),
+        "the guest is created for the release asked for, seeing ~/Projects: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c == "start --tty=false sbx"),
+        "{calls:?}"
+    );
+    assert!(run.text.contains("doctor ran"), "{}", run.text);
+}
+
+#[test]
+fn on_macos_an_existing_guest_is_kept() {
+    let fx = Release::new();
+    fx.publish_macos("latest");
+    let run = fx.run(
+        &script(),
+        &[("SBX_VERSION", "latest"), ("FAKE_LIMA_EXISTS", "1")],
+        &[&fx.fake_limactl(), &fx.fake_uname("Darwin", "x86_64")],
+    );
+
+    assert_eq!(run.code, Some(0), "{}", run.text);
+    let calls = fx.lima_calls();
+    assert!(
+        calls
+            .iter()
+            .all(|c| !c.starts_with("create") && !c.starts_with("delete")),
+        "an existing guest is neither recreated nor deleted: {calls:?}"
+    );
+    assert!(run.text.contains("is kept as it is"), "{}", run.text);
+    assert_eq!(std::fs::read_to_string(fx.installed()).unwrap(), FAKE_SBX);
+}
+
+#[test]
+fn on_macos_without_lima_or_with_a_bad_projects_directory_nothing_is_installed() {
+    let fx = Release::new();
+    fx.publish_macos("latest");
+    let run = fx.run(
+        &script(),
+        &[("SBX_VERSION", "latest")],
+        &[&fx.fake_uname("Darwin", "arm64")],
+    );
+    assert_ne!(run.code, Some(0), "{}", run.text);
+    assert!(
+        run.text.contains("limactl is not on PATH") && run.text.contains("brew install lima"),
+        "{}",
+        run.text
+    );
+    assert!(!fx.installed().exists());
+
+    for bad in ["/Users/x", "..", "a/../b", "a//b", "a b", "a\"b"] {
+        let run = fx.run(
+            &script(),
+            &[("SBX_VERSION", "latest"), ("SBX_LIMA_PROJECTS", bad)],
+            &[&fx.fake_limactl(), &fx.fake_uname("Darwin", "arm64")],
+        );
+        assert_ne!(run.code, Some(0), "{bad:?}: {}", run.text);
+        assert!(
+            run.text.contains("SBX_LIMA_PROJECTS must be"),
+            "{bad:?}: {}",
+            run.text
+        );
+        assert!(!fx.installed().exists(), "{bad:?}");
+    }
+    assert!(fx.lima_calls().is_empty(), "{:?}", fx.lima_calls());
+}
+
+#[test]
+fn on_macos_a_release_without_the_template_is_named() {
+    let fx = Release::new();
+    let run = fx.run(
+        &script(),
+        &[("SBX_VERSION", "v1.9.0")],
+        &[&fx.fake_limactl(), &fx.fake_uname("Darwin", "arm64")],
+    );
+    assert_ne!(run.code, Some(0), "{}", run.text);
+    assert!(
+        run.text.contains("may predate the macOS support"),
+        "{}",
+        run.text
+    );
+    assert!(!fx.installed().exists());
+    assert!(fx.lima_calls().is_empty(), "{:?}", fx.lima_calls());
 }

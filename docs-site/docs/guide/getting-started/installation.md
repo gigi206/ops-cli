@@ -19,7 +19,8 @@ curl -fsSL https://raw.githubusercontent.com/gigi206/ops-cli/HEAD/install.sh | s
 The script runs as you, never as root, and does this:
 
 1. Picks the asset for the machine, `sbx-linux-x86_64` or `sbx-linux-aarch64`, and stops on
-   any other system or architecture.
+   any other system or architecture. On macOS it sets up a Linux guest instead, as
+   [Running under Lima](#running-under-lima-macos) describes.
 2. Looks up the newest **stable** release through the GitHub API. A pre-release is never
    chosen on its own.
 3. Downloads the binary and the `.sha256` published beside it, and stops without installing
@@ -43,6 +44,8 @@ it would reach `curl` and not the script.
 | `SBX_REPO` | the GitHub repository to install from, `owner/name` (default: `gigi206/ops-cli`) |
 | `SBX_DOWNLOAD_BASE` | where the assets are fetched from (default: that repository's releases) |
 | `SBX_RELEASES_API` | where the newest stable release is looked up (default: that repository's API) |
+| `SBX_SOURCE_BASE` | macOS only: where the Lima template and the wrapper are read from, as `<base>/<tag>/dist/macos/` (default: that repository's files at the release's tag) |
+| `SBX_LIMA_PROJECTS` | macOS only: the subtree of your home the guest can see, relative to it (default: `Projects`) |
 
 No stable release is published yet, so for now the default stops and names the way out,
 which is the pre-release:
@@ -182,11 +185,29 @@ on, which is the same arrangement as WSL2 above: the binary that runs is an ordi
 Linux `sbx` in an ordinary Linux kernel, and the Mac is what sits at the end of the
 bridges. Nothing in `sbx` is macOS-aware.
 
-The guest comes from [Lima](https://lima-vm.io). This repository ships the template and
-a wrapper for it:
+The guest comes from [Lima](https://lima-vm.io), which the install script does not
+install. With Lima in place, the same command as on Linux sets up the rest:
 
 ```sh
 brew install lima
+curl -fsSL https://raw.githubusercontent.com/gigi206/ops-cli/HEAD/install.sh | SBX_VERSION=latest sh
+```
+
+On macOS the script downloads no binary. It reads the Lima template and the wrapper this
+repository ships at the release's tag, creates a Lima instance named `sbx` from the
+template for that release, starts it, and installs the wrapper at `~/.local/bin/sbx`,
+saying so when that directory is not on your `PATH`. The first start downloads an image
+and provisions the guest, which takes a few minutes. An instance named `sbx` that already
+exists is kept as it is: running the script again only reinstalls the wrapper. The
+template and the wrapper carry no checksum; they come from the same origin as the script
+itself.
+
+`SBX_LIMA_PROJECTS` names the subtree of your home the guest can see, relative to it, and
+defaults to `Projects`; the script creates it. The same setup by hand, from a checkout of
+this repository:
+
+```sh
+mkdir -p ~/Projects
 limactl create --name sbx --param projects=Projects dist/macos/sbx.yaml
 limactl start sbx
 sudo install -d -m 0755 /usr/local/bin
@@ -194,9 +215,8 @@ sudo install -m 0755 dist/macos/sbx /usr/local/bin/sbx
 ```
 
 `/usr/local/bin` is on the default macOS `PATH` but is not created by macOS itself, and
-the `install` macOS ships has no `-D` to create it, hence the first of the two lines.
+the `install` macOS ships has no `-D` to create it, hence the line before the last.
 
-`--param projects` names the subtree of your home the guest can see, relative to it.
 Then `cd` into a project under that subtree and run `sbx` as you would anywhere:
 
 ```sh

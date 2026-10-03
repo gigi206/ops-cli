@@ -20,8 +20,8 @@ set -eu
 
 if ! command -v "$LIMACTL" >/dev/null 2>&1; then
   printf 'sbx: %s is not on PATH\n' "$LIMACTL" >&2
-  printf '     install Lima (`brew install lima`), then create the guest with\n' >&2
-  printf '     `limactl create --name %s dist/macos/sbx.yaml`\n' "$SBX_LIMA_INSTANCE" >&2
+  printf '     install Lima (`brew install lima`), then run the sbx installer again, which\n' >&2
+  printf '     creates the guest and reinstalls this wrapper\n' >&2
   exit 1
 fi
 
@@ -47,7 +47,8 @@ exec "$LIMACTL" shell --start "$SBX_LIMA_INSTANCE" sh -c '
     printf "     the guest mounts one subtree of your home and nothing else, which is what\n" >&2
     printf "     keeps the rest of the Mac out of every cage it builds\n" >&2
     printf "     move the project under that subtree, or recreate the guest naming yours:\n" >&2
-    printf "       limactl delete %s && limactl create --name %s --param projects=<dir> dist/macos/sbx.yaml\n" "$inst" "$inst" >&2
+    printf "       limactl delete %s, then run the sbx installer with SBX_LIMA_PROJECTS=<dir>\n" "$inst" >&2
+    printf "       or: limactl create --name %s --param projects=<dir> <the sbx.yaml template>\n" "$inst" >&2
     exit 1
   fi
 
