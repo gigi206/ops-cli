@@ -279,16 +279,18 @@ effective policy immediately (writes no file, dies with the session); it is the 
 sibling of `sbx net allow|deny --session`. A live mute is not un-loaded by `unmute` (a log
 filter has no counter-verdict): it simply ends with the session.
 
-### Live-only: never written to disk
+### Live, unless a record was asked for
 
-> **The log lives in the running session's memory and is NEVER written to disk.**
-> It shows a session *while it runs*, watch it from another terminal, and once the
-> session exits, nothing remains. There is no post-session forensics, no log file, no
-> rotation.
+> **The log lives in the running session's memory.** It shows a session *while it runs*:
+> watch it from another terminal. Once the session exits, `sbx net logs` has nothing left
+> to read, and nothing was written to disk unless
+> [`[observe] record`](../configuration/observe) asked for it. With it, the session's
+> egress record is on disk, owner-only and outside the cage, and
+> [`sbx logs <id>`](../cli/logs) reads it back. There is no rotation.
 
-This is deliberate: the event data lives at the same trust level as the injected
-secret the proxy already holds in RAM (owner-only, host-side, ephemeral, never in
-the cage). Only a **filtering** posture has a proxy, so only `deny`/`allow`/`ask`
+Memory is the default on purpose: the event data lives at the same trust level as the
+injected secret the proxy already holds in RAM (owner-only, host-side, never in the
+cage), and a record on disk is a choice the configuration makes. Only a **filtering** posture has a proxy, so only `deny`/`allow`/`ask`
 sessions have a log: `shared`/`none` have nothing to log.
 
 ### Verdicts: a superset of `stats`
@@ -595,8 +597,8 @@ This is the **open connections**, distinct from [`sbx net logs`](#sbx-net-logs) 
   wire), WebSockets, and large L7 transfers in progress (a download, a streamed
   completion). An idle session shows an empty list: that is normal.
 
-Like the log, it is **live-only and never written to disk**, read from the same
-per-session control socket, and only a **filtering** posture (`deny`/`allow`/`ask`) runs a
+Unlike the log, which `[observe] record` can keep, it is **live-only and never written to
+disk**, read from the same per-session control socket, and only a **filtering** posture (`deny`/`allow`/`ask`) runs a
 proxy, so only those sessions have flows. The redraw needs a terminal; `--json` works in
 a pipe (one snapshot per tick, since a live view is a *state*, not an event stream).
 

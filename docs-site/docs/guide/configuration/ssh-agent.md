@@ -354,8 +354,8 @@ a client that never binds simply yields a signature line with no destination on 
 Where it lives matters as much as what it says. The feed is read over a socket under the
 data directory that is **never** bound into the cage, so the agent can neither read the
 record of what it asked for nor amend it. The ring lives in the launcher's memory for the
-life of the session and is never written to disk: so it is a live view: read it while the
-session runs, or follow it. A session whose config grants no key has no broker at all, and
+life of the session and is not written to disk unless [`[observe] record`](observe) is on:
+without it, it is a live view, read while the session runs or followed. A session whose config grants no key has no broker at all, and
 says so rather than showing an empty feed.
 
 ## A task cage gets no agent

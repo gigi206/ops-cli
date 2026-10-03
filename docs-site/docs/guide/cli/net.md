@@ -335,8 +335,9 @@ sbx net logs --all                     # …including what a `mute` rule suppres
 sbx net logs --with-headers --with-body   # what actually crossed (needs [network] capture)
 ```
 
-`logs` is live-only and never written to disk: once the session exits, nothing
-remains. `stats` is the durable counterpart:
+`logs` is live: once the session exits it has nothing left to read, and a session that ran
+under [`[observe] record`](../configuration/observe) is read back with [`sbx logs <id>`](logs).
+`stats` is the durable counterpart:
 
 ```sh
 sbx net stats                          # per-host allow / deny / blocked, after the fact

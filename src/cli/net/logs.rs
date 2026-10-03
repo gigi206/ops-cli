@@ -228,7 +228,8 @@ fn snapshot_evicted(snapshot: &sandbox::control::LogSnapshot) -> u64 {
 /// `sbx net logs [-a|--app <name>] [--host <h>] [--verdict …] [-n <N>] [--with-query] [--json]`:
 /// the live egress event log — a chronological, per-session record of every egress decision the
 /// proxy made, read from the same control sockets `sbx net pending` uses. Live-only: it shows a
-/// running session's egress, and nothing remains once the session exits. No launch / nix / network.
+/// running session's egress; a finished session's, when `[observe] record` kept it, is read through
+/// `sbx logs <id>`. No launch / nix / network.
 pub(super) fn net_logs(args: &[OsString]) -> ExitCode {
     let view = match parse_log_args(args) {
         Ok(v) => v,
@@ -612,7 +613,8 @@ fn render_logs(
         let _ = writeln!(
             o,
             "{h}egress log:{r} {dim}(nothing to show{scope} — the log is live while a filtering \
-             posture (allowlist/ask) runs, and is not kept after a session exits){r}"
+             posture (allowlist/ask) runs; a finished session's is read with `sbx logs <id>` when \
+             `[observe] record` kept it){r}"
         );
         return o;
     }
