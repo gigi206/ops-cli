@@ -3,17 +3,41 @@
 //!
 //! Each server ends a read verb's answer with `ok`, or answers a verb it cannot serve with a single
 //! `err …` line. An answer that stops short of both was cut: the server's write deadline passed,
-//! its connection thread failed, or the supervisor exited mid-answer. A peer the server refuses
-//! outright, past its connection ceiling or at its peer check, is closed unanswered, which reads
-//! the same way. Taken at face value, a cut answer is a complete one that happens to be short: a
-//! listing that looks empty, or a log whose `head=` cursor runs past the last event read, so the
-//! next `--follow` poll starts beyond the events that never arrived and nothing says so.
+//! its connection thread failed, or the supervisor exited mid-answer. Taken at face value, a cut
+//! answer is a complete one that happens to be short: a listing that looks empty, or a log whose
+//! `head=` cursor runs past the last event read, so the next `--follow` poll starts beyond the
+//! events that never arrived and nothing says so.
+//!
+//! A peer the server refuses outright, past its connection ceiling or at its peer check, is closed
+//! before its command is read, and that does not read as a short answer: the kernel resets a
+//! connection closed with unread bytes in it, so the reader's next read fails with
+//! `ECONNRESET`, or its write fails with `EPIPE` when the close came first. [`unanswered`] counts
+//! both, a cut and a reader that ran out of time as the one fact a reader needs: the session was
+//! reached and its answer did not arrive in full.
 //!
 //! The verbs that act (an answer to a parked request, a remembered rule, a stop) are not read
 //! through this. By the time their answer is cut the action may already have landed, and each of
 //! those readers says what it makes of a missing reply.
 
 use std::io::{self, BufRead};
+
+/// Whether a read verb's error says the session was reached and its answer did not arrive in full.
+///
+/// An answer cut before its `ok` ([`answer`]'s `UnexpectedEof`), a peer closed before its command was
+/// read (`ConnectionReset` on the read, `BrokenPipe` on the write; see the module documentation),
+/// and a session that did not answer within the reader's timeout. A connect that fails is the other
+/// case: no socket, or one nobody serves any more, which is a plane never stood up or a session
+/// gone, and each reader keeps its own words for that.
+pub(crate) fn unanswered(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+    )
+}
 
 /// The lines of one answer, up to and without its closing `ok`.
 ///
@@ -120,6 +144,21 @@ mod tests {
         );
     }
 
+    /// A connect that fails is not an answer that did not arrive: there is no socket, or a socket
+    /// file nobody serves any more, which is what a session that died leaves behind.
+    #[test]
+    fn a_failed_connect_is_not_an_unanswered_read() {
+        let dir = crate::testutil::TmpDir::new();
+        let missing = std::os::unix::net::UnixStream::connect(dir.join("none.sock"))
+            .expect_err("nothing is there");
+        assert!(!unanswered(&missing), "{missing}");
+        let stale = dir.join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
+        let gone = std::os::unix::net::UnixStream::connect(&stale).expect_err("nobody serves it");
+        assert_eq!(gone.kind(), io::ErrorKind::ConnectionRefused, "{gone}");
+        assert!(!unanswered(&gone));
+    }
+
     #[test]
     fn a_server_error_line_is_a_whole_answer() {
         assert_eq!(
@@ -142,10 +181,19 @@ mod tests {
         })
     }
 
+    /// Bind `socket`, take one connection and close it without reading a byte of it: what the peer
+    /// check and the connection ceiling do with a peer they refuse.
+    fn refuse_once(socket: &std::path::Path) -> std::thread::JoinHandle<()> {
+        let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+        std::thread::spawn(move || drop(listener.accept()))
+    }
+
     /// Every reader of a read verb goes through [`answer`], so each refuses an answer cut after a
-    /// line and one closed unanswered, takes the same bytes followed by `ok`, and keeps whatever it
-    /// made of a server's `err` line. A reader that parses the wire itself again passes the cut
-    /// answers off as whole ones and turns this red.
+    /// line, one closed after its command was read, and one closed before it was, takes the same
+    /// bytes followed by `ok`, and keeps whatever it made of a server's `err` line. A reader that
+    /// parses the wire itself again passes the cut answers off as whole ones and turns this red, and
+    /// so does an [`unanswered`] that knows only the cut: the refused peer meets a reset or a broken
+    /// pipe, never an end of stream.
     #[test]
     fn every_read_verb_reader_refuses_a_cut_answer() {
         use crate::sandbox::{control, fs_control, proc_control, task_control};
@@ -193,14 +241,22 @@ mod tests {
                 let server = answer_once(&socket, wire);
                 let read = reader(&socket);
                 server.join().expect("the server thread");
-                let cut =
-                    read.as_ref().err().map(io::Error::kind) == Some(io::ErrorKind::UnexpectedEof);
+                let cut = read.as_ref().err().is_some_and(unanswered);
                 match whole {
                     Some(true) => assert!(read.is_ok(), "{name}, {shape}: {read:?}"),
                     Some(false) => assert!(cut, "{name}, {shape}: {read:?}"),
                     None => assert!(!cut, "{name}, {shape}: {read:?}"),
                 }
             }
+            let socket = dir.join("answer.sock");
+            let _ = std::fs::remove_file(&socket);
+            let server = refuse_once(&socket);
+            let read = reader(&socket);
+            server.join().expect("the server thread");
+            assert!(
+                read.as_ref().err().is_some_and(unanswered),
+                "{name}, refused before its command was read: {read:?}"
+            );
         }
 
         // The two readers addressed by session rather than by socket: `RULES` fails like the others,

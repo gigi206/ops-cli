@@ -91,6 +91,17 @@ fn serve_reply(data: &Path, lens: &str, pid: u32, reply: String) {
     });
 }
 
+/// Close every connection without reading a byte of it, as the peer check and the connection
+/// ceiling close a peer they refuse.
+fn serve_refusal(data: &Path, lens: &str, pid: u32) {
+    let (_, listener) = bind_lens_socket(data, lens, pid);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+}
+
 /// Answer `replies` one per connection — which is one per read — and then stop.
 ///
 /// When the script runs out the socket is unlinked and the listener dropped, which is exactly how a
@@ -474,7 +485,7 @@ fn a_feed_whose_answer_is_cut_short_is_named_and_shows_nothing() {
         "nothing of the cut answer is shown: {out}"
     );
     assert!(
-        out.contains("proc: its answer was cut short, so none of it is shown"),
+        out.contains("proc: its answer did not arrive in full, so none of it is shown"),
         "the cut feed is named: {out}"
     );
 
@@ -490,12 +501,59 @@ fn a_feed_whose_answer_is_cut_short_is_named_and_shows_nothing() {
         let stderr = String::from_utf8_lossy(&refused.stderr);
         assert_eq!(refused.status.code(), Some(2), "{args:?}: {stderr}");
         assert!(
-            stderr.contains("did not finish its answer"),
+            stderr.contains("did not answer in full"),
             "{args:?} says why, not that the lens is missing: {stderr}"
         );
         assert!(
             !String::from_utf8_lossy(&refused.stdout).contains("cut-short"),
             "{args:?}"
+        );
+    }
+}
+
+/// A feed whose session refuses the reader, closing the connection before reading its command, is
+/// a feed that did not answer in full, not one that was never stood up. The reader meets a reset or
+/// a broken pipe there rather than an end of stream, and the views took that for a missing lens.
+#[test]
+fn a_feed_whose_session_refuses_the_reader_is_named_as_unanswered() {
+    let dir = TmpDir::new("l");
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    serve_lens(
+        data,
+        "fs",
+        pid,
+        &["event seq=1 at=1700000000123 kind=write path=src/whole.rs"],
+    );
+    serve_refusal(data, "proc", pid);
+    let pid = pid.to_string();
+
+    let out = read_feed(data, &["logs", &pid, "--feed", "fs,proc"]);
+    assert!(
+        out.contains("src/whole.rs"),
+        "the whole answer is shown: {out}"
+    );
+    assert!(
+        out.contains("proc: its answer did not arrive in full, so none of it is shown"),
+        "the refused feed is named as unanswered: {out}"
+    );
+
+    for args in [
+        &["logs", &pid, "--feed", "proc"][..],
+        &["proc", "logs", &pid][..],
+    ] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .env("XDG_DATA_HOME", data)
+            .output()
+            .expect("run the view");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("did not answer in full"),
+            "{args:?} says the session did not answer, not that the lens is missing: {stderr}"
         );
     }
 }

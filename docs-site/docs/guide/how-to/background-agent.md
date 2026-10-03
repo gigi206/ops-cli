@@ -33,7 +33,7 @@ sbx session ls          # the live sessions; app sessions show their app name
 The id is the PID that listing shows. The registry is daemonless and validated on read,
 so a crashed session prunes itself rather than lingering as a stale row.
 
-## 3. Watch the four feeds
+## 3. Watch what it prints and what it does
 
 ```sh
 sbx session logs <id> -f     # what it printed

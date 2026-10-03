@@ -327,13 +327,14 @@ fn live_view<E>(
 
     // The first read is a tail of the whole retained window. A connect failure means this lens was
     // never stood up for this session — there is no ring to read, which is a different thing from
-    // an empty one, and the lens says which in its own words. An answer cut before its end is
-    // neither: the session is there and said something, so that is what the error says.
+    // an empty one, and the lens says which in its own words. An answer that did not arrive in full
+    // is neither: the session is there, and cut its answer, refused the reader or did not answer in
+    // time, so that is what the error says.
     let first = match (view.read)(&socket, None) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        Err(e) if crate::sandbox::lens::unanswered(&e) => {
             diag::error(&format!(
-                "sbx: {}: session {pid} did not finish its answer, so none of it is shown: {e}",
+                "sbx: {}: session {pid} did not answer in full, so none of it is shown: {e}",
                 view.verb
             ));
             return ExitCode::from(2);
@@ -371,15 +372,15 @@ fn live_view<E>(
     // Follow: poll past the cursor until the session ends. Whoever stood the lens up unlinks its
     // socket on drop, so a connect failure *after* the first successful read is the clean
     // end-of-session signal (a local UDS connect does not fail transiently); Ctrl+C stops it before
-    // then, and a closed downstream pipe ends it cleanly too. An answer cut before its end moves
-    // nothing: the next poll asks again from the same cursor, and a session that has really gone
-    // fails that poll's connect.
+    // then, and a closed downstream pipe ends it cleanly too. An answer that did not arrive in full
+    // moves nothing: the next poll asks again from the same cursor, and a session that has really
+    // gone fails that poll's connect.
     let mut cursor = first.head;
     loop {
         std::thread::sleep(FOLLOW_INTERVAL);
         let snap = match (view.read)(&socket, Some(cursor)) {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+            Err(e) if crate::sandbox::lens::unanswered(&e) => continue,
             Err(_) => {
                 if !json {
                     let mut out = std::io::stdout().lock();
@@ -1087,7 +1088,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                     unfollowable.push(feed.name);
                 }
             }
-            Err(e) if live && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(e) if live && crate::sandbox::lens::unanswered(&e) => {
                 cut.push(feed.name);
                 feed.cursor = None;
             }
@@ -1120,7 +1121,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     // saying so plainly beats a header over an empty column.
     if absent.len() + cut.len() == feeds.len() {
         diag::error(&format!(
-            "sbx: logs: session {pid} did not finish its answer on {}, so none of it is shown.",
+            "sbx: logs: session {pid} did not answer in full on {}, so none of it is shown.",
             cut.join(", ")
         ));
         for (name, why) in &absent {
@@ -1178,7 +1179,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                 for name in &cut {
                     writeln!(
                         out,
-                        "  {d}{name}: its answer was cut short, so none of it is shown{r}"
+                        "  {d}{name}: its answer did not arrive in full, so none of it is shown{r}"
                     )?;
                 }
                 // Said out loud rather than left to look like a quiet feed: this one answered, and
@@ -1332,8 +1333,8 @@ struct FollowRound {
 /// ending (whoever stood it up unlinks its socket on drop, and a local UDS connect does not fail
 /// transiently), while a successful read that hands back no cursor is a feed that cannot say what
 /// is new and so is read once and not followed. When the last cursor goes, only the first of those
-/// is the session ending. A read whose answer was cut short is neither: the feed keeps its cursor
-/// and is asked again from it next round.
+/// is the session ending. A read whose answer did not arrive in full is neither: the feed keeps its
+/// cursor and is asked again from it next round.
 fn follow_round(feeds: &mut [Feed]) -> FollowRound {
     let mut rows = Vec::new();
     let mut evicted = 0;
@@ -1347,7 +1348,7 @@ fn follow_round(feeds: &mut [Feed]) -> FollowRound {
                 lost_cursor |= head.is_none();
                 feed.cursor = head;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(e) if crate::sandbox::lens::unanswered(&e) => {}
             Err(_) => feed.cursor = None,
         }
     }
@@ -1494,37 +1495,38 @@ mod tests {
         assert_eq!(round.end, None);
     }
 
-    /// An answer cut before its `ok` is neither a feed ending nor one with nothing new: the feed
-    /// keeps its cursor and is asked again from it, so the events past it are not skipped.
+    /// An answer that did not arrive in full is neither a feed ending nor one with nothing new: the
+    /// feed keeps its cursor and is asked again from it, so the events past it are not skipped. A
+    /// session that closed the connection before reading the request is one such answer.
     #[test]
     fn a_cut_follow_read_keeps_the_feeds_cursor() {
-        fn cut_short(
-            _socket: &Path,
-            _after: Option<u64>,
-        ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
-            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        type Read = fn(&Path, Option<u64>) -> std::io::Result<(Vec<Row>, Option<u64>, u64)>;
+        let cut_short: Read = |_, _| Err(std::io::ErrorKind::UnexpectedEof.into());
+        let refused: Read = |_, _| Err(std::io::ErrorKind::ConnectionReset.into());
+        for (shape, read) in [("cut short", cut_short), ("refused", refused)] {
+            let mut feeds = vec![Feed {
+                name: "proc",
+                socket: PathBuf::from("/nonexistent"),
+                absent: "not observed",
+                read,
+                no_record: "no session record",
+                record: None,
+                cursor: Some(5),
+            }];
+            let round = follow_round(&mut feeds);
+            assert!(round.rows.is_empty());
+            assert_eq!(
+                feeds[0].cursor,
+                Some(5),
+                "{shape}: the cursor stays where the last whole answer put it"
+            );
+            assert_eq!(round.end, None, "{shape}: not the session ending");
         }
-        let mut feeds = vec![Feed {
-            name: "proc",
-            socket: PathBuf::from("/nonexistent"),
-            absent: "not observed",
-            read: cut_short,
-            no_record: "no session record",
-            record: None,
-            cursor: Some(5),
-        }];
-        let round = follow_round(&mut feeds);
-        assert!(round.rows.is_empty());
-        assert_eq!(
-            feeds[0].cursor,
-            Some(5),
-            "the cursor stays where the last whole answer put it"
-        );
-        assert_eq!(round.end, None, "a cut answer is not the session ending");
     }
 
-    /// The single-lens view does the same: after a cut answer it asks again from the cursor it
-    /// held, and it is the failed connect that follows which ends the view.
+    /// The single-lens view does the same: after a cut answer, and after a refused one, it asks
+    /// again from the cursor it held, and it is the failed connect that follows which ends the
+    /// view.
     #[test]
     fn a_cut_follow_read_asks_again_from_the_same_cursor() {
         use crate::sandbox::lens::Snapshot;
@@ -1541,6 +1543,7 @@ mod tests {
                     head: 5,
                 }),
                 2 => Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+                3 => Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
                 _ => Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
             }
         }
@@ -1559,8 +1562,8 @@ mod tests {
         let _ = live_view(&view, Path::new("/nonexistent"), 7, "", true, true, &pal);
         assert_eq!(
             *ASKED.lock().expect("the ask record"),
-            [None, Some(5), Some(5)],
-            "the poll after the cut asks from the same cursor"
+            [None, Some(5), Some(5), Some(5)],
+            "the polls after a cut and a refusal ask from the same cursor"
         );
     }
     /// A finished session is gone from `sbx session ls`, and a foreground `sbx run` never printed

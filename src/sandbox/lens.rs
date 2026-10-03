@@ -79,6 +79,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Whether a reader's error says the session was reached and its answer did not arrive in full,
+/// for the views that read these sockets from the command line. The rule is
+/// [`super::reply::unanswered`]'s, reached through here because that module is the sandbox's own.
+pub(crate) use super::reply::unanswered;
+
 /// The largest control command / reply line accepted — bounded so a confused or hostile peer cannot
 /// make the reader buffer unboundedly. A command is short (`LOG after=<seq>`); a reply carries a
 /// lens's verbatim last field, which can be long, so the bound is generous but still finite. The
