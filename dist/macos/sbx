@@ -6,9 +6,7 @@
 # the cage is built around, and the three ways that can go wrong say so instead of failing
 # obscurely.
 #
-# Measured on an Intel Mac (macOS 14, Lima 2.2.1, itself running as a KVM guest): a stopped
-# instance is started, the working directory and the exit status are carried across, and a
-# directory outside the mounted subtree is refused. Not measured on Apple Silicon.
+# Supported on macOS x86_64 with Lima 2.2.1. Apple Silicon is not verified.
 
 set -eu
 

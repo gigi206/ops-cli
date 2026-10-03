@@ -189,8 +189,12 @@ a wrapper for it:
 brew install lima
 limactl create --name sbx --param projects=Projects dist/macos/sbx.yaml
 limactl start sbx
+sudo install -d -m 0755 /usr/local/bin
 sudo install -m 0755 dist/macos/sbx /usr/local/bin/sbx
 ```
+
+`/usr/local/bin` is on the default macOS `PATH` but is not created by macOS itself, and
+the `install` macOS ships has no `-D` to create it, hence the first of the two lines.
 
 `--param projects` names the subtree of your home the guest can see, relative to it.
 Then `cd` into a project under that subtree and run `sbx` as you would anywhere:
@@ -231,9 +235,8 @@ configuration:
 installed by provisioning, from the published release, verified against the checksum
 published beside it. Lima re-runs provisioning on restart, so `limactl stop sbx && limactl
 start sbx` converges the guest on the current build. A guest left running falls behind
-instead, and the wrapper says so on stderr once it has been up long enough to matter. On an
-Intel Mac, `limactl stop` can stop the virtual machine yet keep reporting the instance as
-running, and give up after a few minutes; `limactl stop --force sbx` ends it, and the next
+instead, and the wrapper says so on stderr once it has been up long enough to matter. If
+`limactl stop` does not return, `limactl stop --force sbx` ends the instance, and the next
 `sbx` command starts the guest again.
 
 Three smaller things follow from the command crossing an SSH connection rather than being
@@ -267,18 +270,14 @@ Three differences from a native host are worth knowing before they surprise you:
   Linux guest on Apple Silicon opens no screen. CUDA is out of reach by any route on a Mac,
   because Apple Silicon carries no NVIDIA hardware.
 
-**What of this has been verified, and where.** The template and the wrapper have been run
-on an Intel Mac (macOS 14, Lima 2.2.1, installed from Lima's release archive rather than
-through Homebrew). There, [`doctor`](doctor) passes inside the guest with capability-bearing
-user namespaces, a cage launches in the directory the Mac stood in, the parts of the Mac
-outside the project are absent from it, a directory the guest does not share is refused,
-a stopped guest is started by the wrapper, and a forwarded port reaches the Mac. Apple
-Silicon has not been run: neither the `sbx-linux-aarch64` binary in a guest nor the
-window, sound and GPU behaviour above, which is written against Lima's source and its
-published behaviour. `sbx doctor` inside the guest is what decides whether the boundary is
-there, and it is the first thing to run after `limactl start`. The acceptance workflow in
-the repository replays these checks on a Mac and requires a self-hosted macOS runner,
-which is why it reports rather than hangs when none is registered.
+**Where this is supported.** The template and the wrapper are verified on macOS x86_64
+with Lima 2.2.1. Apple Silicon is not verified: neither the `sbx-linux-aarch64` binary in
+the guest nor the window, sound and GPU behaviour above, which follows Lima's source and
+its published behaviour. [`sbx doctor`](doctor) inside the guest is what decides whether
+the boundary is there, and it is the first thing to run after `limactl start`. The
+acceptance workflow in the repository runs these checks on a Mac and requires a
+self-hosted macOS runner, which is why it reports rather than hangs when none is
+registered.
 
 ## Development build
 

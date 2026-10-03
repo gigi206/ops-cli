@@ -232,8 +232,13 @@ jobs:
           mkdir -p /tmp/sbx-ci-witness
           echo "witness" > /tmp/sbx-ci-witness/on-the-mac
           cd /tmp
-          out=$("$GITHUB_WORKSPACE/dist/macos/sbx" run -- ls /tmp/sbx-ci-witness/on-the-mac 2>&1)
-          status=$?
+          # The refusal is a non-zero exit, and the runner's shell is `bash -e`: the status is
+          # taken inside the `if`, where errexit does not end the step before it is read.
+          if out=$("$GITHUB_WORKSPACE/dist/macos/sbx" run -- ls /tmp/sbx-ci-witness/on-the-mac 2>&1); then
+            status=0
+          else
+            status=$?
+          fi
           rm -rf /tmp/sbx-ci-witness
           [ "$status" -ne 0 ] || { echo "the wrapper ran a cage from /tmp, which the guest does not share: $out"; exit 1; }
           case "$out" in

@@ -5,11 +5,9 @@
 # here is an ordinary Linux sbx inside an ordinary Linux kernel; macOS is the host at the end of
 # the bridges, the same way Windows is for a WSL2 distribution. Nothing in sbx is macOS-aware.
 #
-# WHAT HAS BEEN VERIFIED. This template has been booted on an Intel Mac (macOS 14, Lima 2.2.1),
-# where `sbx doctor` passes inside the guest, the mount semantics hold, and a cage launches in the
-# project. Apple Silicon has not been run, and neither have the window and the sound below, which
-# are written against Lima's source. `sbx doctor` inside the guest is what decides, and
-# `.github/workflows/macos.yml` is what runs it.
+# WHERE THIS IS SUPPORTED. macOS x86_64 with Lima 2.2.1. Apple Silicon is not verified, and
+# neither are the window and the sound below, which follow Lima's source. `sbx doctor` inside the
+# guest is what decides, and `.github/workflows/macos.yml` is what runs it.
 
 # Ubuntu images, and those alone. Lima's `default.yaml` inherits `_images/ubuntu` and
 # `_default/mounts` together, and that second one mounts the whole of `~`: inheriting it would
