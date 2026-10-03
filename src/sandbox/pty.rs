@@ -74,21 +74,17 @@ pub(crate) fn pump(
         // close.
         unsafe { libc::close(pidfd) };
     }
-    if let Some(code) = exited? {
-        return Ok(code);
-    }
-    let mut status: libc::c_int = 0;
-    loop {
-        // SAFETY: `child` is the pid the caller forked and this loop is its only reaper, so the
-        // number cannot yet name a recycled process; `status` is a live local for the kernel to
-        // fill.
-        let r = unsafe { libc::waitpid(child, &mut status, 0) };
-        if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
+    match exited {
+        Ok(Some(code)) => Ok(code),
+        Ok(None) => Ok(reap(child)),
+        // The relay failed under a child that still runs (its standard output gone, a poll the
+        // kernel refused): nothing will relay its terminal any more, so it is stopped and reaped
+        // as a force-quit is, rather than left to a hangup it may never act on and to a zombie.
+        Err(e) => {
+            let _ = terminate_and_reap(child);
+            Err(e)
         }
-        break;
     }
-    Ok(exit_code(status))
 }
 
 /// The relay loop of [`pump`]: `Some(code)` when it reaped the child itself, `None` when the master
@@ -201,7 +197,7 @@ fn pump_until_exit(
                 }
                 // best-effort: if the child is gone, the master read above ends us
                 let _ = write_all(master, chunk);
-            } else if n == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            } else if n == 0 || !retryable(&io::Error::last_os_error()) {
                 stdin_open = false;
                 fds[0].fd = -1; // poll ignores a negative fd
             }
@@ -212,7 +208,10 @@ fn pump_until_exit(
         if (pidfd < 0 || fds[3].revents != 0)
             && let Some(code) = reap_if_exited(child)
         {
-            drain_after_exit(master, &mut buf)?;
+            // The child is reaped, so what follows answers with its code whatever the drain
+            // meets: an error here must not reach the `Err` arm of `pump`, which would signal a
+            // pid that no longer names it.
+            let _ = drain_after_exit(master, &mut buf);
             return Ok(Some(code));
         }
     }
@@ -304,20 +303,41 @@ fn terminate_and_reap(child: libc::pid_t) -> io::Result<i32> {
     // SAFETY: the grace loop above left without reaping `child` (a reaped or vanished one returns
     // from inside it), so the pid still names the forked cage.
     unsafe { libc::kill(child, libc::SIGKILL) };
-    let mut status: libc::c_int = 0;
-    loop {
-        // SAFETY: `child` was signalled but not reaped, so the pid still names it; `status` is a
-        // live local for the kernel to fill.
-        let r = unsafe { libc::waitpid(child, &mut status, 0) };
-        if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        break;
-    }
-    Ok(exit_code(status))
+    Ok(reap(child))
 }
 
-/// Write the whole buffer, retrying short writes and interrupts.
+/// Wait for `child` and return its exit code. A wait that fails outright leaves the child's fate
+/// unknown, and answers `1`, as [`exit_code`] does for a status it cannot read: the status word was
+/// still zero there, and read as a clean exit it reported a success no one had seen.
+fn reap(child: libc::pid_t) -> i32 {
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: `child` is the pid the caller forked and this loop is its only reaper, so the
+        // number cannot yet name a recycled process; `status` is a live local for the kernel to
+        // fill.
+        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+        if r >= 0 {
+            return exit_code(status);
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return 1;
+        }
+    }
+}
+
+/// Whether a failed read or write is worth trying again: an interrupt, or a descriptor some other
+/// program left non-blocking. A terminal's open file is shared with whatever else holds it, and a
+/// program that set `O_NONBLOCK` on it makes this process's reads and writes answer `EAGAIN` when
+/// they would only have waited.
+fn retryable(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
+}
+
+/// Write the whole buffer, retrying short writes and interrupts, and waiting out a descriptor
+/// another program left non-blocking ([`retryable`]) until it takes more.
 pub(crate) fn write_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
         // SAFETY: `fd` is a descriptor the caller keeps open across the call, and the
@@ -326,6 +346,17 @@ pub(crate) fn write_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::WouldBlock {
+                let mut ready = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one live `pollfd` on the stack, and the count passed is one. Its result
+                // is not read: the write is tried again either way and says what went wrong.
+                unsafe { libc::poll(&mut ready, 1, -1) };
+                continue;
+            }
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -821,6 +852,106 @@ mod tests {
         });
     }
 
+    /// A relay that fails under a running child stops and reaps it rather than leave it behind.
+    /// Run alone, so the standard output the relay loses is this test process's own.
+    #[test]
+    fn a_relay_that_loses_its_output_stops_and_reaps_the_child() {
+        let ran = crate::testutil::run_within(
+            crate::testutil::alone(
+                concat!(module_path!(), "::a_relay_whose_output_is_gone"),
+                "",
+            )
+            .stdin(std::process::Stdio::null()),
+            "the relay whose output is gone",
+        );
+        assert!(
+            ran.ended_well(),
+            "the process ended with {}: {}{}",
+            ran.status,
+            ran.stdout,
+            ran.stderr
+        );
+    }
+
+    /// The relay run by [`a_relay_that_loses_its_output_stops_and_reaps_the_child`]; anywhere
+    /// else it does nothing. Its standard output is a pipe nobody reads, so the first line the
+    /// child writes fails to reach it, while the child waits on.
+    #[test]
+    #[ignore = "run alone by the test that reads how it ended, with stdin off any terminal"]
+    fn a_relay_whose_output_is_gone() {
+        crate::testutil::when_run_alone(|_| {
+            let mut pair = [-1 as libc::c_int; 2];
+            let mut ends = [0 as libc::c_int; 2];
+            // SAFETY: `openpty` fills the two out-params, its name, termios and size null; `pipe2`
+            // fills the array it is handed; `dup` takes and returns a descriptor.
+            let saved = unsafe {
+                assert_eq!(
+                    libc::openpty(
+                        &mut pair[0],
+                        &mut pair[1],
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    ),
+                    0
+                );
+                assert_eq!(libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                libc::dup(1)
+            };
+            let (master, slave) = (pair[0], pair[1]);
+            // SAFETY: the child runs only `close`, `write`, `pause` and `_exit`, all
+            // async-signal-safe, on descriptors and a local array prepared before the fork.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork failed");
+            if child == 0 {
+                unsafe {
+                    // Both ends of the pipe go: a read end left open here would take every write
+                    // the relay makes, and nothing would fail.
+                    libc::close(ends[0]);
+                    libc::close(ends[1]);
+                    libc::close(master);
+                    let line = b"a line nobody will read\n";
+                    libc::write(slave, line.as_ptr().cast(), line.len());
+                    loop {
+                        libc::pause();
+                    }
+                }
+            }
+            // SAFETY: this side's copy of the slave, and the pipe: its read end closed so a write
+            // to the other fails, and its write end put on the standard output for the relay.
+            unsafe {
+                libc::close(slave);
+                libc::close(ends[0]);
+                libc::dup2(ends[1], 1);
+                libc::close(ends[1]);
+            }
+            let relayed = pump(master, child, -1, false);
+            // SAFETY: puts the standard output back for the harness's own last line, and closes
+            // the copy and the master this test opened.
+            unsafe {
+                libc::dup2(saved, 1);
+                libc::close(saved);
+                libc::close(master);
+            }
+            // SAFETY: `kill` with signal 0 only asks whether `child` names a process.
+            let alive = unsafe { libc::kill(child, 0) } == 0;
+            if alive {
+                // SAFETY: the child this test forked, still there; stopped and reaped so the test
+                // leaves nothing behind whatever it asserts.
+                unsafe {
+                    libc::kill(child, libc::SIGKILL);
+                    libc::waitpid(child, std::ptr::null_mut(), 0);
+                }
+            }
+            assert!(relayed.is_err(), "a relay that lost its output says so");
+            assert!(
+                !alive,
+                "the child must be stopped and reaped, not left running or a zombie"
+            );
+            Ok(())
+        });
+    }
+
     /// The pty run by [`a_terminal_that_cannot_go_raw_stops_and_reaps_the_started_child`];
     /// anywhere else it does nothing. The child writes its pid and waits; SIGTERM is blocked in it
     /// (inherited from this thread's mask), so the pid is always written before the escalation to
@@ -956,6 +1087,85 @@ mod tests {
             "the handler overwrote the interrupted call's errno with its own"
         );
         assert_eq!(nudged, 1, "the handler stopped writing its nudge byte");
+    }
+
+    /// A child reaped elsewhere has an exit no one can read, and it is not reported as a success.
+    /// The relay's wait failed on it and left the status word at zero, which read as a clean exit.
+    #[test]
+    fn a_child_whose_status_cannot_be_read_is_not_reported_as_a_success() {
+        let mut pair = [-1 as libc::c_int; 2];
+        // SAFETY: `openpty` fills the two out-params; the name, termios and size are null.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut pair[0],
+                    &mut pair[1],
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let (master, slave) = (pair[0], pair[1]);
+        // SAFETY: the child calls `_exit` only.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: this side's copy of the slave, and the child, reaped here so the relay's own
+        // wait finds nothing; the master closed once the relay is done with it.
+        let code = unsafe {
+            libc::close(slave);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+            let code = pump(master, child, -1, false);
+            libc::close(master);
+            code
+        };
+        assert_eq!(code.ok(), Some(1));
+    }
+
+    /// A descriptor another program left non-blocking is waited on, not given up on: a full pipe
+    /// in non-blocking mode answers `EAGAIN`, and the write goes through once the reader drains it.
+    #[test]
+    fn a_write_to_a_non_blocking_descriptor_waits_until_it_takes_more() {
+        let mut ends = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2` fills the two-element array it is handed.
+        assert_eq!(
+            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let (read_fd, write_fd) = (ends[0], ends[1]);
+        let chunk = [b'x'; 4096];
+        // SAFETY: `write_fd` is this test's own pipe end and `chunk` a local array.
+        while unsafe { libc::write(write_fd, chunk.as_ptr().cast(), chunk.len()) } > 0 {}
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut sink = [0u8; 4096];
+            let mut total = 0usize;
+            loop {
+                // SAFETY: `read_fd` is this test's own pipe end, closed only after this loop, and
+                // `sink` a local array of the length passed.
+                let n = unsafe { libc::read(read_fd, sink.as_mut_ptr().cast(), sink.len()) };
+                if n > 0 {
+                    total += n as usize;
+                } else if n == 0 {
+                    break;
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            // SAFETY: this thread's pipe end, used nowhere else.
+            unsafe { libc::close(read_fd) };
+            total
+        });
+        let written = write_all(write_fd, &[b'y'; 65536]);
+        // SAFETY: this side's pipe end; closing it ends the reader's loop.
+        unsafe { libc::close(write_fd) };
+        let total = reader.join().expect("the reader");
+        assert!(written.is_ok(), "the write gave up: {written:?}");
+        assert!(total >= 65536, "the reader got {total} bytes");
     }
 
     #[test]
