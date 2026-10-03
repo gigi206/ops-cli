@@ -1252,10 +1252,57 @@ const PLUGIN_START_EVERY: std::time::Duration = std::time::Duration::from_millis
 /// [`serve_conn`]), ten minutes of holding those too.
 ///
 /// Applied as the *lower* of the two, so a protocol that answers faster than this keeps its own
-/// tighter number and none can exceed this one. Fixed rather than configurable because nothing has
-/// asked: a protocol whose cage side genuinely pauses before its first frame would be the reason to
-/// make it a manifest field, and there is none among those sbx serves.
+/// tighter number and none can exceed this one ([`cage_frame_budget`]). Fixed rather than
+/// configurable because nothing has asked: a protocol whose cage side genuinely pauses before its
+/// first frame would be the reason to make it a manifest field, and there is none among those sbx
+/// serves.
 const CAGE_FIRST_FRAME: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The budget of one frame on the cage's side of a connection: [`CAGE_FIRST_FRAME`], or the
+/// protocol's own deadline where that is shorter.
+///
+/// It bounds the first frame from the moment the cage connects, every later frame from the moment
+/// its first byte arrives, and every frame sbx writes to the cage. Between frames the connection
+/// may sit idle as long as its protocol likes, which is what a broker connection normally does.
+/// What it closes is a cage that begins a frame and stops, or stops reading what it is sent: either
+/// held a thread and one of the broker's slots for good, with a plugin process and a connection to
+/// the host resource behind it.
+fn cage_frame_budget(spec: &crate::plugins::broker::BrokerSpec) -> std::time::Duration {
+    spec.host_deadline.min(CAGE_FIRST_FRAME)
+}
+
+/// The cage's next frame after its first, or `None` once the connection is done: as long as the
+/// cage likes to begin it, then [`cage_frame_budget`] to finish it. A frame cut short by that
+/// budget ends the connection, as a malformed one does.
+fn cage_next_frame(
+    cage_r: &mut io::BufReader<std::os::unix::net::UnixStream>,
+    cage: &std::os::unix::net::UnixStream,
+    spec: &crate::plugins::broker::BrokerSpec,
+    typed: bool,
+) -> Option<Vec<u8>> {
+    use std::io::BufRead as _;
+    loop {
+        match cage_r.fill_buf() {
+            Ok([]) => return None,
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    // The socket timeout bounds each read and the deadline the whole frame: the deadline is asked
+    // before each read, so without the timeout a cage that stops sending would block the read that
+    // follows before the deadline is consulted again.
+    let budget = cage_frame_budget(spec);
+    let _ = cage.set_read_timeout(Some(budget));
+    let frame = read_frame(
+        &mut super::deadline::Deadlined::new(cage_r, std::time::Instant::now() + budget),
+        spec.framing,
+        spec.max_frame,
+        typed,
+    );
+    let _ = cage.set_read_timeout(None);
+    frame.ok().flatten()
+}
 
 /// A running broker's host-side resources. The accept loop is detached and dies with sbx; this
 /// guard owns the socket file and unlinks it when the launch ends.
@@ -1381,7 +1428,7 @@ fn cage_first_frame(
     spec: &crate::plugins::broker::BrokerSpec,
     holding: &str,
 ) -> Result<Option<Vec<u8>>, String> {
-    let silence = spec.host_deadline.min(CAGE_FIRST_FRAME);
+    let silence = cage_frame_budget(spec);
     let deadline = std::time::Instant::now() + silence;
     let _ = cage.set_read_timeout(Some(silence));
     // Under `pgwire` the connection's first message from the client carries no type byte (the
@@ -1564,7 +1611,16 @@ fn write_to_cage(
         ));
         return false;
     }
-    write_frame(cage_w, spec.framing, bytes, true).is_ok()
+    // One budget for the whole frame: a cage that takes it a byte at a time, each inside the
+    // socket's timeout, does not hold the write for as long as the frame is long.
+    let deadline = std::time::Instant::now() + cage_frame_budget(spec);
+    write_frame(
+        &mut super::deadline::Deadlined::new(cage_w, deadline),
+        spec.framing,
+        bytes,
+        true,
+    )
+    .is_ok()
 }
 
 /// Relay one connection's exchanges, from the host's greeting (where the protocol has one) to
@@ -1592,6 +1648,10 @@ fn serve_exchanges(
 ) -> Result<(), String> {
     let mut cage_r = io::BufReader::new(cage.try_clone().map_err(|e| e.to_string())?);
     let mut cage_w = cage;
+    // Each write to the cage is bounded too, the whole frame by `write_to_cage`'s deadline and
+    // each call by this, without which a cage that reads nothing blocks a write before the
+    // deadline is consulted.
+    let _ = cage_w.set_write_timeout(Some(cage_frame_budget(spec)));
     let mut seq = 0u64;
 
     // Some protocols have the host speak first. Its greeting belongs to no cage request, so it is
@@ -1670,10 +1730,11 @@ fn serve_exchanges(
     loop {
         let frame = match pending.take() {
             Some(frame) => frame,
-            None => match read_frame(&mut cage_r, spec.framing, spec.max_frame, cage_typed) {
-                Ok(Some(f)) => f,
-                // A clean end, or a frame that is not one: either way the client is done with us.
-                Ok(None) | Err(_) => return Ok(()),
+            // A clean end, a frame that is not one, or one cut short by its budget: either way
+            // the client is done with us.
+            None => match cage_next_frame(&mut cage_r, &cage_w, spec, cage_typed) {
+                Some(f) => f,
+                None => return Ok(()),
             },
         };
         seq += 1;
@@ -3751,6 +3812,106 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             vec![b"first".to_vec(), b"second".to_vec()],
             "the frame read up front is relayed, and the one queued behind it is not lost with it"
         );
+    }
+
+    /// Run `serve_exchanges` on its own thread over `cage`, with a plugin that forwards everything
+    /// and a host that answers `replies`, and say whether it ended within `within`. A relay that
+    /// never lets go fails the test rather than hanging it.
+    fn served_within(
+        spec: BrokerSpec,
+        cage: std::os::unix::net::UnixStream,
+        replies: Vec<Vec<u8>>,
+        within: std::time::Duration,
+    ) -> Option<Vec<Vec<u8>>> {
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward(); 4]);
+            let mut host = FakeHost::with(replies);
+            let ring = super::super::broker_control::BrokerRing::new(8);
+            let _ = serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x", None);
+            let _ = done.send(host.seen);
+        });
+        ended.recv_timeout(within).ok()
+    }
+
+    /// A cage that begins a frame and stops lets its connection go once the frame's budget is
+    /// spent: idle between frames is free, a frame left half-sent is not, since it holds a thread,
+    /// a slot, a plugin and a connection to the host resource for as long as the cage likes.
+    #[test]
+    fn a_cage_that_stops_mid_frame_lets_its_connection_go() {
+        let mut spec = spec(None);
+        spec.host_deadline = std::time::Duration::from_millis(200);
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut client = theirs;
+        write_frame(&mut client, spec.framing, b"first", false).expect("first frame");
+        client
+            .write_all(&[0, 0])
+            .expect("half of the next frame's length");
+        let seen = served_within(
+            spec,
+            cage,
+            vec![vec![0xa1]],
+            std::time::Duration::from_secs(5),
+        );
+        drop(client);
+        assert_eq!(
+            seen,
+            Some(vec![b"first".to_vec()]),
+            "the first frame was relayed and the half-sent one let the connection go"
+        );
+    }
+
+    /// A cage that stops reading what it is sent lets its connection go once a frame written to it
+    /// has spent its budget, rather than holding the write for good.
+    #[test]
+    fn a_cage_that_reads_nothing_lets_its_connection_go() {
+        let mut spec = spec(None);
+        spec.host_deadline = std::time::Duration::from_millis(200);
+        spec.max_frame = MAX_FRAME_CEILING;
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut client = theirs;
+        write_frame(&mut client, spec.framing, b"first", false).expect("first frame");
+        // Past what the socket buffers, so the write blocks on a reader that never reads.
+        let seen = served_within(
+            spec,
+            cage,
+            vec![vec![b'r'; MAX_FRAME_CEILING]],
+            std::time::Duration::from_secs(5),
+        );
+        drop(client);
+        assert!(
+            seen.is_some(),
+            "the write to a cage that reads nothing held the connection"
+        );
+    }
+
+    /// The budgets bound a frame once it has begun, never the wait for the next one: a cage idle
+    /// between two requests for longer than a frame's budget is still served.
+    #[test]
+    fn a_cage_idle_between_frames_is_still_served() {
+        let mut spec = spec(None);
+        spec.host_deadline = std::time::Duration::from_millis(200);
+        let framing = spec.framing;
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let client = std::thread::spawn(move || {
+            let mut client = theirs;
+            write_frame(&mut client, framing, b"first", false).expect("first frame");
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            write_frame(&mut client, framing, b"second", false).expect("second frame");
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("half-close");
+            let mut answers = Vec::new();
+            let _ = client.read_to_end(&mut answers);
+        });
+        let seen = served_within(
+            spec,
+            cage,
+            vec![vec![0xa1], vec![0xa2]],
+            std::time::Duration::from_secs(5),
+        );
+        let _ = client.join();
+        assert_eq!(seen, Some(vec![b"first".to_vec(), b"second".to_vec()]));
     }
 
     /// A host resource that answers a byte at a time does not hold an exchange past its deadline.

@@ -259,10 +259,12 @@ other end: by then the plugin is running and the host resource is connected, so 
 opens and then says nothing holds all of it. That bound is thirty seconds or the protocol's own
 deadline, whichever is shorter, and it is deliberately not the raised one: ten minutes is what a
 person needs to type a passphrase, not what a client needs to send a request it had already composed
-when it connected. Once the first frame is in the bound is lifted, and the connection may sit idle
-as long as its protocol likes, which is what a broker connection normally does between requests. It
-covers a slow trickle as well as silence: it is a budget for the whole frame rather than a timeout
-on each read, so feeding one byte at a time does not buy more of it.
+when it connected. Once the first frame is in, the connection may sit idle between frames as long
+as its protocol likes, which is what a broker connection normally does between requests. A frame
+that has begun has the same bound to finish, and so does every frame `sbx` writes to the cage: a
+client that stops in the middle of a frame, or stops reading what it is sent, lets its connection
+go. Each bound covers a slow trickle as well as silence: it is a budget for the whole frame rather
+than a timeout on each read or write, so moving one byte at a time does not buy more of it.
 
 How many connections a broker serves is bounded as well, and how fast it takes new ones. A
 connection starts the plugin in a cage of its own once it speaks, at once on a protocol whose host
