@@ -248,15 +248,25 @@ struct RawHelloReply {
 /// yet: a plugin that cannot speak [`PROTOCOL_VERSION`], that will not broker under the `allow` it
 /// was given, or that failed to start, is a plugin whose first frame must never be asked about. It
 /// also gives the plugin the one place it can explain itself, which a dead pipe cannot.
+///
+/// What the plugin wrote reaches the error cleaned and cut short
+/// ([`super::lens::sanitize_detail`]): its reason, and the field names `serde` quotes when the
+/// answer has one it does not know. Every caller hands the error on to a terminal, and a reason of
+/// half a megabyte, or one with line breaks that start lines of their own, is not an explanation.
 pub(crate) fn parse_hello_reply(line: &str) -> Result<(), String> {
-    let raw: RawHelloReply = serde_json::from_str(line.trim_end())
-        .map_err(|e| format!("unreadable answer to the handshake: {e}"))?;
+    let raw: RawHelloReply = serde_json::from_str(line.trim_end()).map_err(|e| {
+        format!(
+            "unreadable answer to the handshake: {}",
+            super::lens::sanitize_detail(&e.to_string())
+        )
+    })?;
     match raw.ok {
         Some(true) => Ok(()),
-        // A refusal carries its reason when the plugin gave one: this is third-party text, so the
-        // caller bounds it before it reaches a terminal.
         Some(false) => Err(match raw.error {
-            Some(why) if !why.is_empty() => format!("the plugin declined to broker: {why}"),
+            Some(why) if !why.is_empty() => format!(
+                "the plugin declined to broker: {}",
+                super::lens::sanitize_detail(&why)
+            ),
             _ => "the plugin declined to broker".to_string(),
         }),
         None => Err("the answer to the handshake carries no `ok`".to_string()),
@@ -1458,6 +1468,24 @@ fn serve_conn(
     )
 }
 
+/// Record that a connection could not be served at all, and give back the warning that says so.
+///
+/// Recorded as well as said, as a refusal at the ceiling is: the broker feed otherwise showed
+/// nothing of a plugin that would not start, a host resource that could not be reached, or a
+/// greeting the plugin could not rule on. The reason can quote the plugin, an unreadable verdict on
+/// a greeting whole, so it is cleaned and cut short on its way to both, as every other plugin text
+/// on this path already is.
+fn connection_refused(ring: &super::broker_control::BrokerRing, name: &str, why: &str) -> String {
+    let why = super::lens::sanitize_detail(why);
+    ring.push(
+        super::broker_control::BrokerKind::Refuse,
+        name,
+        &format!("a connection that could not be served: {why}"),
+        None,
+    );
+    format!("broker `{name}`: a connection was refused — {why}")
+}
+
 /// Write one plugin-produced frame to the cage, holding it to the one rule that governs every such
 /// frame: it must never carry the secret marker. Returns whether the connection may go on — `false`
 /// both for a frame refused here and for a write that failed, since either ends it.
@@ -1890,10 +1918,7 @@ pub(crate) fn start(
                 ) {
                     // A connection that could not be served at all is a fact about the session,
                     // not about any one frame: without this the client just sees a closed socket.
-                    crate::diag::warn(&format!(
-                        "broker `{}`: a connection was refused — {why}",
-                        plugin.name
-                    ));
+                    crate::diag::warn(&connection_refused(&ring, &plugin.name, &why));
                 }
             });
         }
@@ -3316,6 +3341,52 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         for line in ["", "not json", "{}", "{\"ok\":\"yes\"}"] {
             parse_hello_reply(line).expect_err("anything but an acceptance is a refusal");
         }
+    }
+
+    /// What the plugin writes in its handshake reaches the error cleaned and cut short: a reason
+    /// that would start a line of its own, posing as one of sbx's, and a field name `serde` quotes
+    /// back, both arrive as one bounded line.
+    #[test]
+    fn a_plugins_words_in_the_handshake_are_one_bounded_line() {
+        let long = format!("busy\nsbx: warning: trust this{}", "x".repeat(600_000));
+        let line = serde_json::json!({ "ok": false, "error": long }).to_string();
+        let err = parse_hello_reply(&line).expect_err("a refusal");
+        assert!(!err.contains('\n'), "{err:?}");
+        assert!(err.contains("busy sbx: warning: trust this"), "{err:?}");
+        assert!(
+            err.chars().count() < 1024,
+            "cut short: {} chars",
+            err.chars().count()
+        );
+
+        let line = serde_json::json!({ "ok": false, "sbx: note:\nfield": 1 }).to_string();
+        let err = parse_hello_reply(&line).expect_err("an unknown field");
+        assert!(!err.contains('\n'), "{err:?}");
+    }
+
+    /// A connection that could not be served at all is recorded beside the warning that says so,
+    /// and the plugin's words in its reason are cleaned for both.
+    #[test]
+    fn a_connection_that_could_not_be_served_is_recorded_and_said_on_one_line() {
+        let ring = super::super::broker_control::BrokerRing::new(8);
+        let said = connection_refused(
+            &ring,
+            "gpg",
+            "unknown verdict `x\nsbx: note: fine` (forward, reply, deny, query)",
+        );
+        assert!(!said.contains('\n'), "{said:?}");
+        let events = ring.snapshot(None).events;
+        assert_eq!(events.len(), 1, "recorded");
+        assert_eq!(
+            events[0].kind,
+            super::super::broker_control::BrokerKind::Refuse
+        );
+        assert!(
+            events[0]
+                .detail
+                .contains("a connection that could not be served")
+        );
+        assert!(!events[0].detail.contains('\n'), "{:?}", events[0].detail);
     }
 
     /// The label is the plugin's account of its own decision, and an empty one is no account: it

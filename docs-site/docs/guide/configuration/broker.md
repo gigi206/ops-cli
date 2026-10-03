@@ -349,3 +349,7 @@ the **policy's** layer, since the socket is always the global config's.
   refusal by choosing its words. On top of that, the **first** refusal of a connection is
   printed at the terminal, and a plugin that stops answering has its request refused and
   its connection ended, since a broker that stopped deciding is not one to keep asking.
+  A connection refused before any request is recorded as a `refuse` too: one past the
+  concurrency ceiling, and one that could not be served at all because it said nothing in
+  time, the plugin did not start or declined, the host resource could not be reached, or the
+  plugin could not rule on its greeting. The plugin's words in that reason are sanitised and cut short there as well.
