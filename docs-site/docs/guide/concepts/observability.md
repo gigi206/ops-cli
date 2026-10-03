@@ -3,7 +3,7 @@ sidebar_label: "Observability"
 description: "The process and filesystem lenses on a running cage, what they record, and what they cannot see."
 ---
 
-# Observability: the four lenses
+# Observability: the feeds of a session
 
 The **observability stack** lets you inspect and stream the activity of a running
 agent's cage. It is host-side, read-only, unprivileged, and entirely separate from
@@ -11,18 +11,27 @@ the security boundary (the namespaces, capabilities, seccomp denylist, the bind
 layout: those still bound what an agent can do; observability only **sees** what it
 does).
 
-## The four lenses
+## The feeds
 
-A session is watched through four independent lenses, each answering a different
+A session is watched through seven independent feeds, each answering a different
 question and each read with the same `<id>`: the session's pid, as
 [`sbx session ls`](../cli/session) shows it.
 
-| Lens | Question | Reader | Needs |
+| Feed | Question | Reader | Needs |
 |---|---|---|---|
 | **exec** | what did it run? | [`sbx proc logs`](../cli/proc#logs), [`sbx proc ls`](../cli/proc#ls) | [`--observe`](../cli/run#observing-a-run---observe), or `[proc] mode = enforce`/`ask` |
 | **filesystem** | what did it write? | [`sbx fs logs`](../cli/fs#logs) | `--observe` |
 | **egress** | where did it go? | [`sbx net logs`](../cli/net#sbx-net-logs), [`sbx net live`](../cli/net#sbx-net-live) | a filtering network posture |
 | **ssh-agent** | what did it ask your keys to sign? | [`sbx ssh-agent logs`](../cli/ssh-agent#logs) | an [`[ssh_agent] allow`](../configuration/ssh-agent) grant |
+| **broker** | what did a broker plugin rule on? | [`sbx logs --feed broker`](../cli/logs#the-two-plugin-feeds) | a [`[broker.<name>]`](../configuration/broker) binding |
+| **signer** | what did a signer plugin form for a request? | [`sbx logs --feed signer`](../cli/logs#the-two-plugin-feeds) | a credential that declares [`sign`](../configuration/secret#sign-a-credential-computed-from-the-request) |
+| **task** | which declared operations did it invoke? | [`sbx task logs`](../cli/task#logs) | a [`[task.<name>]`](../configuration/task) |
+
+Five of them are **lenses**: each keeps one bounded ring of events and serves it as it is. The
+**egress plane** and the **task plane** are the other two. The egress plane revises what it
+recorded, since a request's upstream status arrives after the decision, and the task plane records
+an invocation once, when it finishes; [`[observe]`](../configuration/observe#the-two-feeds-that-are-not-lenses)
+says what that changes on disk.
 
 They compose into one account of a run, which is the point of the shared id:
 
@@ -32,31 +41,34 @@ sbx proc logs 12345 -f                 # what it executed
 sbx fs logs 12345 -f                   # what it wrote
 sbx net logs -f                        # where it went
 sbx ssh-agent logs 12345 -f            # what it signed
+sbx task logs --session 12345          # the operations it invoked
 ```
 
-Each of those shows the most of its own lens. When the question is what happened in what **order**,
-read them together instead: [`sbx logs`](../cli/logs) interleaves all four by time, plus the feeds
-with no verb of their own (what a broker plugin ruled on, what a signer plugin formed, and the
-declared operations the session invoked), and names any feed that is not recording so an empty
-column is never mistaken for a quiet one.
+Each of those shows the most of its own feed. When the question is what happened in what **order**,
+read them together instead: [`sbx logs`](../cli/logs) interleaves all seven by time, is the only
+reader of the two plugin feeds, and names any feed that is not recording so an empty column is
+never mistaken for a quiet one.
 
 ```sh
 sbx logs 12345 -f                      # all of it, in one column of time
 ```
 
-Three properties hold across all four. Each lives in the **supervisor's memory** and is
+Three properties hold across all seven. Each lives in the **supervisor's memory** and is
 gone when the session exits, unless [`record = true`](../configuration/observe) also
 appends it to a file under the data directory ([`sbx net stats`](../cli/net#sbx-net-stats)
 is apart, a durable per-host counter). Each is
 read over a per-session control socket that is **never bound into the cage**, so the
-agent can neither read the record of what it did nor amend it. And each is a lens,
-not a fence: only the exec lens has an enforcing sibling
-([`[proc] mode`](../configuration/proc)), and only the egress one has a policy behind
-it ([`[network]`](../configuration/network)).
+agent can neither read the record of what it did nor amend it. And none is a fence: where an
+event records a decision, the decision was made elsewhere, by
+[`[proc] mode`](../configuration/proc) for exec, [`[network]`](../configuration/network) for
+egress, the [`[ssh_agent]`](../configuration/ssh-agent) grant, the plugin a broker or signer line
+names, or the declaration of a task.
 
-The rest of this page covers the two lenses `--observe` turns on. The egress lens has
-[its own page](../networking/observability); the ssh-agent one is documented with
-[its grant](../configuration/ssh-agent).
+The rest of this page covers the two lenses `--observe` turns on. The egress plane has
+[its own page](../networking/observability); the ssh-agent lens is documented with
+[its grant](../configuration/ssh-agent), the two plugin feeds with
+[`sbx logs`](../cli/logs#the-two-plugin-feeds), and the task plane with
+[`sbx task`](../cli/task#logs).
 
 ## The two `--observe` lenses
 
@@ -168,7 +180,8 @@ lens uses.
 - The filesystem lens is **inotify-based, not recursive across filesystems**: a
   `bind`-mounted sub-tree with a different device is its own watch.
 - A cage that is no longer alive cannot be observed: the rings are torn down with
-  the supervisor.
+  the supervisor, and what is left to read is the file
+  [`record = true`](../configuration/observe) wrote, when it was on.
 - The observation paths expand **what an operator can see**: they do not change
   what the agent can do. The posture is: same-uid, same-uid's read of `/proc`, which
   needs nothing the agent does not already need on its own host. So they are not a
@@ -179,8 +192,9 @@ lens uses.
 - [`sbx run --observe`](../cli/run): enabling observation on a launch
 - [`sbx proc`](../cli/proc): `ls`, `logs`, `logs --follow --json`
 - [`sbx fs`](../cli/fs): `logs` (the filesystem lens reader)
-- [Egress observability](../networking/observability): the third lens, in full
-- [`sbx ssh-agent`](../cli/ssh-agent): the fourth, and what its record is worth
+- [Egress observability](../networking/observability): the egress plane, in full
+- [`sbx ssh-agent`](../cli/ssh-agent): the ssh-agent lens, and what its record is worth
+- [`sbx logs`](../cli/logs): every feed in one column of time, and the reader of the two plugin feeds
 - [Sessions](../housekeeping/sessions): the registry the shared `<id>` comes from
 - [The trust gate](trust): observation is a host-side lens, not a security field
 - Design rationale is recorded in this page (process tree + filesystem lens, host-side only, no new attack surface).

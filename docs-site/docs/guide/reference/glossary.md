@@ -52,10 +52,11 @@ of a security field. See [The trust gate](../concepts/trust).
 `/usr/bin/env`, `/usr/bin/ldd`, `/nix`, a synthetic `/etc`), with no host `/usr` or ambient
 libraries.
 
-**Lens**, one of the four read-only views on a live session: what it ran, what it wrote,
-where it went, and what it asked your keys to sign. Each is read over a socket the cage
-never sees, and only the exec lens has an enforcing sibling. See
-[Observability](../concepts/observability).
+**Lens**, one of the five bounded rings a live session is watched through: what it ran, what
+it wrote, what it asked your keys to sign, what a broker plugin ruled on, and what a signer
+plugin formed. With the egress and task planes they make up a session's seven feeds. Each is
+read over a socket never bound into the cage, and none is a fence: it records what was decided
+elsewhere. See [Observability](../concepts/observability).
 
 **Mode A / Mode B**: the two actor modes. Mode A is an interactive user shell
 ([`sbx run`](../cli/run)); Mode B is an autonomous agent

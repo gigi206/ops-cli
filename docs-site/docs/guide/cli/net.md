@@ -11,7 +11,7 @@ sbx net <subcommand> [args...]
 The egress-policy surface. Host-side: no launch, no nix. (Distinct from
 [`sbx test net <url>`](test), which tests one URL against the policy.)
 
-See also: [The four lenses](../concepts/observability#the-four-lenses) · [Networking overview](../networking/) · [Rule grammar](../networking/rules) · [Ask mode](../networking/ask) · [Egress observability](../networking/observability) · [Egress groups](../networking/groups).
+See also: [The feeds of a session](../concepts/observability#the-feeds) · [Networking overview](../networking/) · [Rule grammar](../networking/rules) · [Ask mode](../networking/ask) · [Egress observability](../networking/observability) · [Egress groups](../networking/groups).
 
 ## Subcommands
 

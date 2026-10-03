@@ -23,7 +23,7 @@ The other four write the [`[fs]` config table](../configuration/fs), which decid
 can **read**: `deny` closes a project path inside the cage, `readonly` leaves it readable and
 refuses writes, and each has the inverse spelled after it.
 
-See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx proc`](proc) · [`sbx net`](net) · [`sbx session`](session).
+See also: [The feeds of a session](../concepts/observability#the-feeds) · [`sbx proc`](proc) · [`sbx net`](net) · [`sbx session`](session).
 
 ## `deny` / `readonly`
 
@@ -142,8 +142,9 @@ This is the way to watch an observed session **from another terminal**, and, lik
 [`sbx proc logs`](proc#logs), the **only** way to watch a [detached](run) (`--detach`) one.
 The events are held in the supervisor's memory for the session's lifetime (the last 1000),
 read over a per-session
-control socket that is never exposed inside the cage; nothing is written to disk or kept after the
-session exits.
+control socket that is never exposed inside the cage. Nothing is written to disk or kept after the
+session exits, unless [`[observe] record`](../configuration/observe) also appends the events to a
+file.
 
 ### Examples
 
@@ -156,10 +157,10 @@ sbx fs logs 12345                                # what it has written so far
 sbx fs logs 12345 --json | jq -r 'select(.kind=="remove") | .path'   # what it deleted
 sbx fs logs 12345 --json | jq -r .path | sort -u                     # every file touched
 sbx fs logs 12345 --json | jq -r 'select(.path|test("^src/")) | "\(.kind)\t\(.path)"'
-sbx fs logs 12345 --json > run.ndjson &          # keep a record; nothing is written to disk otherwise
+sbx fs logs 12345 --json > run.ndjson &          # a copy of your own; [observe] record = true keeps one too
 ```
 
-The four lenses share one session id, so they compose into a single account of what a
+Every feed shares one session id, so they compose into a single account of what a
 run did:
 
 ```sh

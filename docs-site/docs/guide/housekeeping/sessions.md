@@ -69,19 +69,21 @@ whole path once, feeds included.
 
 ## What survives the session, and what does not
 
-Four feeds report on a live session, and they do not have the same lifetime. The
-distinction decides whether you can answer a question after the fact or only while the
-agent is still running:
+What a session printed and what it did are not kept for the same time. The distinction
+decides whether you can answer a question after the fact or only while the agent is still
+running:
 
-| Feed | Reads | Lives in | After the session exits |
+| View | Reads | Lives in | After the session exits |
 |---|---|---|---|
 | [`sbx session logs`](../cli/session#logs) | what the agent **printed** | on disk, under the session's runtime tree | still there, for a detached session |
-| [`sbx proc logs`](../cli/proc) | what it **executed** | the supervisor's memory (needs `--observe`, or a [`[proc]`](../configuration/proc) mode of `observe`, `enforce` or `ask`) | gone |
-| [`sbx fs logs`](../cli/fs) | what it **wrote** | the supervisor's memory (needs `--observe`) | gone |
-| [`sbx net logs`](../cli/net) | where it **went** | the supervisor's memory | gone |
+| [`sbx proc logs`](../cli/proc) | what it **executed** | the supervisor's memory (needs `--observe`, or a [`[proc]`](../configuration/proc) mode of `observe`, `enforce` or `ask`) | gone, unless [`[observe] record`](../configuration/observe) kept it |
+| [`sbx fs logs`](../cli/fs) | what it **wrote** | the supervisor's memory (needs `--observe`) | gone, unless `[observe] record` kept it |
+| [`sbx net logs`](../cli/net) | where it **went** | the supervisor's memory | gone from this view; what `[observe] record` kept is read with [`sbx logs <id>`](../cli/logs) |
 
-So a record of what an agent *did*, rather than what it said, has to be taken while it
-runs: pipe a `--json` feed to a file. What persists on its own is the printed output,
+The other feeds, ssh-agent, broker, signer and task, live in memory the same way
+([Observability](../concepts/observability#the-feeds)). So a record of what an agent *did*,
+rather than what it said, has to be asked for: `[observe] record = true` before the launch, or
+a `--json` feed piped to a file while it runs. What persists on its own is the printed output,
 plus the aggregate egress counters [`sbx net stats`](../cli/net) keeps per host.
 
 Observation is the other thing that cannot be added later: `--observe` puts the launch on

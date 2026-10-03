@@ -752,7 +752,7 @@ fn launch_foreground_learning(
     interactive: bool,
 ) -> Result<(ExitCode, LearningRun), ExitCode> {
     // The learning path starts no observation lens of its own, so the session record `build`
-    // resolved has no ring to attach to here; the four lenses inside `build` already hold it.
+    // resolved has no ring to attach to here; every feed `build` stood up already holds it.
     let (spec, guard, _, store_lock) = match build(prep, runtime, cmd) {
         Ok((s, g, rec, lock)) if interactive => (s.with_private_tty(), g, rec, lock),
         Ok(v) => v,

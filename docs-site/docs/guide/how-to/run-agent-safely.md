@@ -93,7 +93,7 @@ sbx net logs -f                        # where it went, request by request
 sbx ssh-agent logs <id> -f             # what it asked your keys to sign
 ```
 
-The four lenses and their limits are on [the observability page](../concepts/observability).
+The feeds a session is watched through, and their limits, are on [the observability page](../concepts/observability).
 
 ## 6. Vouch when the evidence says so
 

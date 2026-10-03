@@ -617,7 +617,7 @@ a pipe (one snapshot per tick, since a live view is a *state*, not an event stre
 
 ## See also
 
-- [The four lenses](../concepts/observability#the-four-lenses): this is the egress one; the others watch exec, file writes, and ssh signatures.
+- [The feeds of a session](../concepts/observability#the-feeds): this is the egress one; the others watch exec, file writes, ssh signatures, what broker and signer plugins decided, and declared operations.
 - [Network modes](modes): the postures these surfaces describe.
 - [Rule grammar](rules): how a rule is written, tested, and rendered.
 - [Ask mode](ask): `sbx net rules --source session` and the parked-request flow.

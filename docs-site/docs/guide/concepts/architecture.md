@@ -143,6 +143,7 @@ flowchart TB
         E["<b>the egress socket</b><br/><i>the only path to the network</i>"]
         T["<b>the task socket</b><br/><i>invoke a declared operation</i>"]
         S["<b>the ssh-agent socket</b><br/><i>ask for a signature, never hold a key</i>"]
+        B["<b>the broker sockets</b><br/><i>reach a host resource, under a plugin's verdict</i>"]
         F["<b>the forward sockets</b><br/><i>a host loopback port, inbound</i>"]
         H["<b>the exec handoff socket</b><br/><i>the shim is its client, not the agent</i>"]
     end
@@ -150,14 +151,14 @@ flowchart TB
     subgraph hostonly["<b>host side only · never bound in</b>"]
         direction TB
         A["<b>the ask queue</b><br/><i>answer a parked request</i>"]
-        L["<b>the lens sockets</b><br/><i>exec · filesystem · egress · ssh-agent</i>"]
+        L["<b>the feed sockets</b><br/><i>exec · filesystem · egress · ssh-agent · broker · signer</i>"]
         TL["<b>the task control socket</b><br/><i>the invocation log, and stop</i>"]
         REG["<b>the session registry</b><br/><i>liveness-validated records, no daemon</i>"]
     end
 
     classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
     classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
-    class E,T,S,F,H cs
+    class E,T,S,B,F,H cs
     class A,L,TL,REG hs
 ```
 
@@ -436,16 +437,17 @@ allowlist can name.
 The client the agent gets is a small generated script with a handful of verbs, not sbx
 itself, so the vocabulary reachable from inside is exactly the vocabulary intended.
 
-## The observation lenses
+## The observation feeds
 
-Four lenses answer four questions about a live session: what it ran, what it wrote, where
-it went, and what it asked your keys to sign. Each keeps a bounded record in the
+Seven feeds answer seven questions about a live session: what it ran, what it wrote, where
+it went, what it asked your keys to sign, what a broker plugin ruled on, what a signer plugin
+formed, and which declared operations it invoked. Each keeps a bounded record in the
 supervisor's memory, and on disk as well under [`record = true`](../configuration/observe),
 and each is read over a socket that is never bound into the cage and that closes a
-connection from one should a mount show it there. A lens is not a fence: only the exec lens has an enforcing sibling, and
-only egress has a policy behind it. See [Observability](observability).
+connection from one should a mount show it there. None is a fence: where an event records a
+decision, the decision was made elsewhere. See [Observability](observability).
 
-A lens answers a question you thought to ask. The [`[notify]`](../configuration/notify)
+A feed answers a question you thought to ask. The [`[notify]`](../configuration/notify)
 policy is the other direction: it tells you, unprompted, that a restriction just bit. That
 is why it is a security field rather than a cosmetic one. A refusal notice is the one
 signal that the boundary is working, so a project config able to silence it could hide

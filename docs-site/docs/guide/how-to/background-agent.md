@@ -45,7 +45,8 @@ sbx net logs -f              # where it went
 One distinction is worth internalising before you rely on it: `session logs` reads what
 the agent *printed*, and that survives on disk for a detached session. The other three
 read what it *did*, and they live in the supervisor's memory: when the session exits,
-they are gone. If a run needs a durable record of its actions, pipe a `--json` feed to
+they are gone, unless [`[observe] record`](../configuration/observe) is on and appends each
+to a file. Without it, a durable record of a run's actions means piping a `--json` feed to
 a file while it is still running.
 
 ## 4. Look inside, without widening anything

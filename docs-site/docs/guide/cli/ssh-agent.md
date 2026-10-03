@@ -15,7 +15,7 @@ A cage granted a key with [`[ssh_agent] allow`](../configuration/ssh-agent) neve
 asks a **filtering broker**, which asks your own agent. `sbx ssh-agent logs` is the record of those
 asks.
 
-See also: [The four lenses](../concepts/observability#the-four-lenses) · [`[ssh_agent]`](../configuration/ssh-agent) · [`sbx session`](session) ·
+See also: [The feeds of a session](../concepts/observability#the-feeds) · [`[ssh_agent]`](../configuration/ssh-agent) · [`sbx session`](session) ·
 [`sbx net`](net).
 
 ## `logs`
@@ -104,8 +104,8 @@ yields a signature line with no destination on it. Read it as evidence, not as a
 The feed is held in the launcher's memory for the session's lifetime and read over a per-session
 control socket under the data directory that is **never bound into the cage**: so the agent can
 neither read the record of what it asked for nor amend it. Nothing is written to disk, and nothing
-is kept after the session exits: this answers *what has this session done*, not *what did last
-week's session do*.
+is kept after the session exits, unless [`[observe] record`](../configuration/observe) is on:
+without it, this answers *what has this session done*, not *what did last week's session do*.
 
 A session whose config grants no key has **no broker at all**, and is reported as such: distinct
 from a broker that has been asked for nothing.

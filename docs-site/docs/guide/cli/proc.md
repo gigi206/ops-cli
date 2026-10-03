@@ -32,7 +32,7 @@ To set the posture for a **single launch** without editing a config, use the one
 disables a trusted project's enforcement for one run, and a `--config` blob's `[proc]` table carries
 one-shot allow/deny lists.
 
-See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx fs`](fs) (the file-write sibling) · [`sbx net`](net) · [`sbx session`](session).
+See also: [The feeds of a session](../concepts/observability#the-feeds) · [`sbx fs`](fs) (the file-write sibling) · [`sbx net`](net) · [`sbx session`](session).
 
 ## `ls`
 
@@ -139,8 +139,9 @@ This is the way to watch an observed session **from another terminal**, and the 
 watch a [detached](run) (`--detach`) one, which has no terminal for the inline `[sbx:exec]`
 feed. The events are held in the supervisor's memory for the session's lifetime (the last
 1000; a follower that falls behind is told how many it missed), read over a
-per-session control socket that is never exposed inside the cage; nothing is written to disk or
-kept after the session exits. Commands are sanitized (control characters and the
+per-session control socket that is never exposed inside the cage. Nothing is written to disk or
+kept after the session exits, unless [`[observe] record`](../configuration/observe) also appends
+the events to a file. Commands are sanitized (control characters and the
 characters that reorder a line to spaces, capped at 512 characters) before they travel, and
 the issuing program rides along with
 spaces and `=` flattened to `_`, so a cage path cannot forge the line's own fields.

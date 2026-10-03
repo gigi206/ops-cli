@@ -17,7 +17,7 @@ Most feeds are also readable on their own, and those views show more of their ow
 answers the question none of them can on its own: **what happened in what order**. It is also the
 only reader for the two plugin feeds, `broker` and `signer`.
 
-See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx proc`](proc) ·
+See also: [The feeds of a session](../concepts/observability#the-feeds) · [`sbx proc`](proc) ·
 [`sbx net`](net) · [`sbx fs`](fs) · [`sbx ssh-agent`](ssh-agent) · [`sbx task`](task) ·
 [`[observe]`](../configuration/observe).
 
