@@ -154,10 +154,89 @@ pub(super) fn clear_cloexec(fds: &[libc::c_int]) -> bool {
         .all(|&fd| unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } >= 0)
 }
 
+/// Give the program about to be exec'd the signal state a program starts from: `SIGPIPE` back at
+/// its default, and nothing blocked.
+///
+/// Both cross an `exec`. The Rust runtime ignores `SIGPIPE` in every sbx process, and a raw `fork`
+/// copies the calling thread's mask. `Command` resets both in its child, and the three execs sbx
+/// writes by hand did not: the pty supervisor's child, the netns holder becoming bubblewrap, and
+/// the attached command. bubblewrap and `systemd-run --scope` pass both on as they find them, so a
+/// cage started through any of the three ran with `SIGPIPE` ignored, which a
+/// program cannot take back once it starts (POSIX lets an inherited ignore stand), and `yes | head
+/// -1` answered `EPIPE` in a loop where it would have died. Called on the child side of a fork:
+/// `signal`, `sigemptyset` and `sigprocmask` are async-signal-safe. Best effort, since a failure
+/// leaves the state as it was, which is no worse than before.
+pub(crate) fn default_signals_across_exec() {
+    // SAFETY: `signal` with `SIG_DFL` installs no handler; the set is a local, emptied before
+    // `sigprocmask` reads it.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
     use std::process::Command;
+
+    /// Each exec sbx writes by hand calls [`super::default_signals_across_exec`] first. The three
+    /// sites are pinned against their source: an exec that skipped it fails nothing else, since the
+    /// cage still starts, with `SIGPIPE` ignored.
+    #[test]
+    fn every_hand_written_exec_resets_the_signal_state() {
+        for (file, source) in [
+            ("launch/cage.rs", include_str!("launch/cage.rs")),
+            ("netns.rs", include_str!("netns.rs")),
+            ("attach.rs", include_str!("attach.rs")),
+        ] {
+            assert!(
+                crate::testutil::production_half(source).contains("default_signals_across_exec();"),
+                "`{file}` execs by hand and must reset the signal state first"
+            );
+        }
+    }
+
+    /// A program exec'd by hand starts from the default signal state: `SIGPIPE` no longer ignored,
+    /// nothing blocked. The child starts from what sbx has, which the Rust runtime set and a
+    /// forking thread may add to, and answers by its exit code which part did not reset.
+    #[test]
+    fn a_hand_written_exec_hands_on_the_default_signal_state() {
+        // SAFETY: the child runs `signal`, the `sigset_t` calls, `sigprocmask`, `sigaction` and
+        // `_exit`, all async-signal-safe, on locals.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                let mut term: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut term);
+                libc::sigaddset(&mut term, libc::SIGTERM);
+                libc::sigprocmask(libc::SIG_BLOCK, &term, std::ptr::null_mut());
+
+                super::default_signals_across_exec();
+
+                let mut pipe: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut pipe);
+                let mut blocked: libc::sigset_t = std::mem::zeroed();
+                libc::sigprocmask(libc::SIG_BLOCK, std::ptr::null(), &mut blocked);
+                let code = i32::from(pipe.sa_sigaction != libc::SIG_DFL)
+                    | (i32::from(libc::sigismember(&blocked, libc::SIGTERM) == 1) << 1);
+                libc::_exit(code);
+            }
+        }
+        let mut status = 0;
+        // SAFETY: the child forked above, reaped once.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "the child did not exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "1: SIGPIPE still ignored, 2: SIGTERM still blocked, 3: both"
+        );
+    }
 
     /// Only the composition stages a descriptor for bwrap: every file [`super::write`] makes for
     /// an exec is made by [`crate::sandbox::argv::compose`]'s own steps, the environment's in

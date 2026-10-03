@@ -492,6 +492,7 @@ pub(super) fn supervise(
             // stdin/out/err. This is what gives the sandbox a controlling terminal (and thus job
             // control).
             if libc::login_tty(slave) == 0 {
+                crate::sandbox::memfd::default_signals_across_exec();
                 libc::execv(program_c.as_ptr(), argv.as_ptr());
             }
             // only reached if login_tty or execv failed

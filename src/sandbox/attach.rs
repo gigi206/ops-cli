@@ -556,6 +556,9 @@ unsafe fn confine_and_exec(
                 }
             }
         }
+        // The signal state a program starts from, which this fork of sbx does not have: its
+        // runtime ignores `SIGPIPE`, and the mask is the forking thread's.
+        super::memfd::default_signals_across_exec();
         // Re-apply the cage confinement — NONE of it survived `setns`. `no_new_privs`
         // before seccomp: an unprivileged filter install requires it.
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {

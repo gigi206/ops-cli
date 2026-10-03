@@ -149,6 +149,9 @@ pub(crate) fn run_holder(argv: &[OsString]) -> ! {
     let cargs: Vec<CString> = argv.iter().map(to_cstring).collect();
     let mut ptrs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    // This process is sbx, whose runtime ignores `SIGPIPE`; bubblewrap would hand that on to the
+    // cage.
+    super::memfd::default_signals_across_exec();
     // SAFETY: `prog` and every `CString` in `cargs` are alive for the duration of the call, and
     // `ptrs` holds their pointers terminated by the null `execv` reads as the end of the vector.
     unsafe {
