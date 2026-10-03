@@ -230,7 +230,9 @@ environment and its own descriptors, and the cage's processes cannot read either
 share is the cage's cgroup resource limits (memory/task caps): an inspection shell runs in
 its own scope, so it is not bounded by the agent's OOM ceiling. It needs a live session; if
 the session has exited, `attach` says so (run `sbx session ls` to list live ones). Type
-`exit` to leave a bare shell: the agent keeps running.
+`exit` to leave a bare shell: the agent keeps running. `attach` returns as soon as the shell
+or command has exited, even when a job started from it in the background is still running
+in the cage; that job stays there, and loses its terminal.
 
 The status `attach` returns is the joined command's own, and `128 + N` for one a signal
 ended. Three codes are the join itself failing rather than the command: `125` the

@@ -38,16 +38,68 @@ pub(crate) fn classify_ctrl_c(chunk: &[u8], last: Option<Instant>, now: Instant)
     }
 }
 
-/// Relay bytes between the real terminal and the pty master until the session
-/// ends, then reap the child and return its exit status code. `winch_fd` is the read
-/// end of the resize relay's self-pipe (or `-1` when it could not be installed — `poll`
-/// ignores a negative fd), readable when a `SIGWINCH` has arrived.
+/// How long the master must stay quiet, once the child has exited, before the relay stops.
+const QUIET_AFTER_EXIT_MS: libc::c_int = 100;
+
+/// The longest the relay goes on reading the master once the child has exited.
+const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
+
+/// How often the relay asks whether the child has exited when it has no pidfd to wait on.
+const EXIT_POLL_MS: libc::c_int = 200;
+
+/// Relay bytes between the real terminal and the pty master until the child exits, then reap it
+/// and return its exit status code. `winch_fd` is the read end of the resize relay's self-pipe (or
+/// `-1` when it could not be installed — `poll` ignores a negative fd), readable when a `SIGWINCH`
+/// has arrived.
+///
+/// The child's exit ends the session, not the master's end. The master reads `EIO` only once every
+/// copy of the slave is closed, and a process the child left behind can hold one for as long as it
+/// runs: a job put in the background in an attached shell, which is not the pid namespace's init
+/// and so outlives the shell. Waiting for it kept `sbx session attach` on a raw terminal after the
+/// shell had exited, and sent what the operator typed next into the cage. So the child is watched
+/// through a pidfd (or, where the kernel offers none, asked every [`EXIT_POLL_MS`]), and once it
+/// has exited the relay passes on what it left in the pty and stops.
 pub(crate) fn pump(
     master: libc::c_int,
     child: libc::pid_t,
     winch_fd: libc::c_int,
     gui: bool,
 ) -> io::Result<i32> {
+    // SAFETY: `pidfd_open` takes a pid and flags and returns a fresh descriptor, or -1 where the
+    // kernel or a filter refuses it. `child` is unreaped, so the pid still names it.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) } as libc::c_int;
+    let exited = pump_until_exit(master, child, pidfd, winch_fd, gui);
+    if pidfd >= 0 {
+        // SAFETY: the descriptor `pidfd_open` returned above, used nowhere else; this is its only
+        // close.
+        unsafe { libc::close(pidfd) };
+    }
+    if let Some(code) = exited? {
+        return Ok(code);
+    }
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: `child` is the pid the caller forked and this loop is its only reaper, so the
+        // number cannot yet name a recycled process; `status` is a live local for the kernel to
+        // fill.
+        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+        if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    Ok(exit_code(status))
+}
+
+/// The relay loop of [`pump`]: `Some(code)` when it reaped the child itself, `None` when the master
+/// ended first and the child is still to be reaped.
+fn pump_until_exit(
+    master: libc::c_int,
+    child: libc::pid_t,
+    pidfd: libc::c_int,
+    winch_fd: libc::c_int,
+    gui: bool,
+) -> io::Result<Option<i32>> {
     let mut fds = [
         libc::pollfd {
             fd: 0,
@@ -64,7 +116,13 @@ pub(crate) fn pump(
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
+    let timeout = if pidfd < 0 { EXIT_POLL_MS } else { -1 };
     let mut buf = [0u8; 8192];
     let mut stdin_open = true;
     // For a GUI cage: the instant of the last unescalated Ctrl+C, so a second within the window
@@ -72,10 +130,10 @@ pub(crate) fn pump(
     let mut last_ctrl_c: Option<Instant> = None;
 
     loop {
-        // SAFETY: `fds` is a live stack array of three `pollfd`s and the count passed is its own
-        // length, so `poll` writes `revents` only within it. An entry set to `-1` (stdin after EOF,
-        // or an absent resize relay) is skipped by the kernel rather than dereferenced.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        // SAFETY: `fds` is a live stack array of `pollfd`s and the count passed is its own length,
+        // so `poll` writes `revents` only within it. An entry set to `-1` (stdin after EOF, an
+        // absent resize relay or pidfd) is skipped by the kernel rather than dereferenced.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -129,7 +187,7 @@ pub(crate) fn pump(
                     match classify_ctrl_c(chunk, last_ctrl_c, now) {
                         CtrlC::Escalate => {
                             let _ = write_all(2, b"\r\nsbx: force-quitting the session.\r\n");
-                            return terminate_and_reap(child);
+                            return terminate_and_reap(child).map(Some);
                         }
                         CtrlC::Arm => {
                             last_ctrl_c = Some(now);
@@ -148,20 +206,65 @@ pub(crate) fn pump(
                 fds[0].fd = -1; // poll ignores a negative fd
             }
         }
-    }
 
+        // The child exited: its pidfd turned readable or, with none, a reap that finds it gone.
+        // Handled last, so what the master held in this round has been passed on already.
+        if (pidfd < 0 || fds[3].revents != 0)
+            && let Some(code) = reap_if_exited(child)
+        {
+            drain_after_exit(master, &mut buf)?;
+            return Ok(Some(code));
+        }
+    }
+    Ok(None)
+}
+
+/// Reap `child` if it has exited, without waiting: its exit code, or `None` while it runs. A child
+/// already reaped elsewhere has exited too, and answers `1`, the code a status that cannot be read
+/// gets.
+fn reap_if_exited(child: libc::pid_t) -> Option<i32> {
     let mut status: libc::c_int = 0;
-    loop {
-        // SAFETY: `child` is the pid the caller forked and this loop is its only reaper, so the
-        // number cannot yet name a recycled process; `status` is a live local for the kernel to
-        // fill.
-        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+    // SAFETY: `child` is unreaped until this call returns it, so the pid still names it; `status`
+    // is a live local for the kernel to fill.
+    let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+    if r == child {
+        Some(exit_code(status))
+    } else if r < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Pass on what the child left in the pty before it exited, then stop: read the master until it
+/// has been quiet for [`QUIET_AFTER_EXIT_MS`] or ends, and for no longer than [`DRAIN_AFTER_EXIT`]
+/// in all, so a process the child left behind that keeps writing cannot hold the session open.
+fn drain_after_exit(master: libc::c_int, buf: &mut [u8]) -> io::Result<()> {
+    let deadline = Instant::now() + DRAIN_AFTER_EXIT;
+    while Instant::now() < deadline {
+        let mut fd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live `pollfd` on the stack, and the count passed is one.
+        let r = unsafe { libc::poll(&mut fd, 1, QUIET_AFTER_EXIT_MS) };
         if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
         }
-        break;
+        if r <= 0 {
+            return Ok(());
+        }
+        // SAFETY: `master` stays open until the caller's `pump` returns, and `buf` is the caller's
+        // live buffer, bounded by its own length.
+        let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            write_all(1, &buf[..n as usize])?;
+        } else if n == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Ok(());
+        }
     }
-    Ok(exit_code(status))
+    Ok(())
 }
 
 /// Translate a `waitpid` status into the process exit-code convention (`128 + signal` for a
@@ -599,6 +702,123 @@ mod tests {
             ran.stdout,
             ran.stderr
         );
+    }
+
+    /// The relay ends on the child's exit, not on the last copy of the slave closing, and passes on
+    /// what the child wrote before it exited. Run alone, in a process whose stdin is `/dev/null`,
+    /// so the relay reads no terminal and its standard output is this test's to read.
+    #[test]
+    fn the_relay_ends_when_the_child_exits_though_something_it_left_holds_the_terminal() {
+        let started = Instant::now();
+        let ran = crate::testutil::run_within(
+            crate::testutil::alone(
+                concat!(
+                    module_path!(),
+                    "::a_relay_whose_child_leaves_a_holder_behind"
+                ),
+                "",
+            )
+            .stdin(std::process::Stdio::null()),
+            "the relay whose child leaves a holder behind",
+        );
+        assert!(
+            ran.ended_well(),
+            "the process ended with {}: {}{}",
+            ran.status,
+            ran.stdout,
+            ran.stderr
+        );
+        assert!(
+            ran.stdout.contains("written before the exit"),
+            "what the child wrote before it exited must reach the terminal: {}",
+            ran.stdout
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the relay waited for the holder ({:?})",
+            started.elapsed()
+        );
+    }
+
+    /// The relay run by
+    /// [`the_relay_ends_when_the_child_exits_though_something_it_left_holds_the_terminal`];
+    /// anywhere else it does nothing. The child leaves a grandchild holding the slave for ten
+    /// seconds, writes a line and exits with 3; the relay must answer 3 well before the grandchild
+    /// lets the slave go.
+    #[test]
+    #[ignore = "run alone by the test that reads how it ended, with stdin off any terminal"]
+    fn a_relay_whose_child_leaves_a_holder_behind() {
+        crate::testutil::when_run_alone(|_| {
+            let mut pair = [-1 as libc::c_int; 2];
+            // SAFETY: `openpty` fills the two out-params; the name, termios and size are null.
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut pair[0],
+                        &mut pair[1],
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            let (master, slave) = (pair[0], pair[1]);
+            let mut ends = [0 as libc::c_int; 2];
+            // SAFETY: `pipe2` fills the two-element array it is handed.
+            assert_eq!(
+                unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let (read_fd, write_fd) = (ends[0], ends[1]);
+            // SAFETY: the child runs only `close`, `fork`, `getpid`, `write`, `sleep` and `_exit`,
+            // all async-signal-safe, on descriptors and local arrays prepared before the fork.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork failed");
+            if child == 0 {
+                unsafe {
+                    libc::close(master);
+                    if libc::fork() == 0 {
+                        let pid = libc::getpid().to_ne_bytes();
+                        libc::write(write_fd, pid.as_ptr().cast(), pid.len());
+                        libc::sleep(10);
+                        libc::_exit(0);
+                    }
+                    let line = b"written before the exit\n";
+                    libc::write(slave, line.as_ptr().cast(), line.len());
+                    libc::_exit(3);
+                }
+            }
+            // SAFETY: this side's copies of the slave and of the pipe's write end, used nowhere
+            // else, so the holder's are the only ones left.
+            unsafe {
+                libc::close(slave);
+                libc::close(write_fd);
+            }
+            let started = Instant::now();
+            let code = pump(master, child, -1, false);
+            let took = started.elapsed();
+            let mut pid = [0u8; 4];
+            // SAFETY: `read_fd` is this test's own pipe end and `pid` a local buffer of its length.
+            let got = unsafe { libc::read(read_fd, pid.as_mut_ptr().cast(), pid.len()) };
+            if got == 4 {
+                // SAFETY: the holder this test's child forked; `kill` takes two integers. It is
+                // not this process's child, so its reaping is left to whoever adopted it.
+                unsafe { libc::kill(libc::pid_t::from_ne_bytes(pid), libc::SIGKILL) };
+            }
+            // SAFETY: closes this test's own pipe end and the master it opened.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(master);
+            }
+            assert_eq!(got, 4, "the holder was started");
+            assert_eq!(code.ok(), Some(3), "the child's own exit code");
+            assert!(
+                took < Duration::from_secs(5),
+                "the relay ended only after {took:?}, with the holder gone rather than the child"
+            );
+            Ok(())
+        });
     }
 
     /// The pty run by [`a_terminal_that_cannot_go_raw_stops_and_reaps_the_started_child`];
