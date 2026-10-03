@@ -1156,6 +1156,21 @@ impl<T: Read + Write + Send> ReadWrite for T {}
 /// allowed to take a slot nothing bounds — the rule the ssh-agent broker already applies.
 const MAX_CONCURRENT_CONNS: usize = 32;
 
+/// How many connections the accept loop lets through back to back before it paces them: the
+/// concurrency ceiling, so the pace never holds back what the ceiling would admit at once.
+///
+/// A connection that speaks starts a plugin (a `bwrap` with its namespaces, inside a systemd scope
+/// where systemd runs) and opens the host resource, and under `host_greets` every connection does,
+/// before the cage has said anything ([`serve_conn`]). [`MAX_CONCURRENT_CONNS`] bounds how many of
+/// those run at once, not how fast they turn over: a cage that connects, speaks once and closes, in
+/// a loop, drove those starts host-side, outside its own cgroup, as fast as they completed.
+const PLUGIN_START_BURST: u32 = MAX_CONCURRENT_CONNS as u32;
+
+/// The pace past [`PLUGIN_START_BURST`]: eight connections a second. A client that opens more than
+/// that in a row, a script decrypting file after file, is slowed to it and never refused. Neither
+/// number is measured: what one plugin start costs the host is a launch's to measure.
+const PLUGIN_START_EVERY: std::time::Duration = std::time::Duration::from_millis(125);
+
 /// The longest the cage may stay silent on a connection it opened before saying its first word.
 ///
 /// A ceiling of its own rather than `host_deadline` alone, because the two answer different
@@ -1331,6 +1346,10 @@ fn cage_first_frame(
 /// that way — the host speaks first and the plugin has to rule on the greeting before the cage may
 /// send anything — so there the first frame is read inside [`serve_exchanges`] instead, under the
 /// same budget. The ssh-agent broker beside this one has always had this order.
+///
+/// The order spares only a caller that never speaks. One that sends a frame of a few bytes starts a
+/// plugin all the same, and under a greeting protocol every connection does; what bounds how fast
+/// those starts come is the accept loop's pace ([`PLUGIN_START_EVERY`]).
 fn serve_conn(
     cage: std::os::unix::net::UnixStream,
     bwrap: &std::path::Path,
@@ -1787,6 +1806,11 @@ pub(crate) fn start(
         let plugin = serving;
         let ring = serving_ring;
         let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
+        let mut pacer = super::conncap::Pacer::new(
+            PLUGIN_START_BURST,
+            PLUGIN_START_EVERY,
+            std::time::Instant::now(),
+        );
         for conn in listener.incoming() {
             let conn = match conn {
                 Ok(c) => c,
@@ -1797,6 +1821,9 @@ pub(crate) fn start(
                     continue;
                 }
             };
+            // Before the slot, on this thread: the connections behind this one wait in the
+            // backlog, holding nothing, while the pace is kept.
+            pacer.wait();
             let Some(slot) = cap.take() else {
                 // A connection refused for want of a thread is a fact about the session, not about
                 // the request: without this line the client simply sees the socket close and the
@@ -3715,6 +3742,25 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
                 "/tmp/sbx-broker-gpg-agent".to_string(),
                 "/tmp/sbx-broker-gpg-agent/gpg-agent.sock".to_string()
             )
+        );
+    }
+
+    /// The accept loop keeps the pace of plugin starts: it waits for its token before it takes a
+    /// connection slot, so a cage looping `connect()` is slowed to [`PLUGIN_START_EVERY`] past the
+    /// burst. The pace itself is `conncap::Pacer`'s to test; only a launch would show
+    /// it at this loop, so the loop is read from its source.
+    #[test]
+    fn the_accept_loop_waits_for_its_pace_before_it_takes_a_slot() {
+        let source = crate::testutil::production_half(include_str!("broker.rs"));
+        let at = source
+            .find(r#"accept_backoff("broker""#)
+            .expect("the broker's accept loop");
+        let rest = &source[at..];
+        let slot = rest.find("cap.take()").expect("the loop takes a slot");
+        let paced = rest.find("pacer.wait()").unwrap_or(usize::MAX);
+        assert!(
+            paced < slot,
+            "the broker's accept loop takes a connection slot without keeping its pace"
         );
     }
 }

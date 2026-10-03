@@ -259,6 +259,14 @@ as long as its protocol likes, which is what a broker connection normally does b
 covers a slow trickle as well as silence: it is a budget for the whole frame rather than a timeout
 on each read, so feeding one byte at a time does not buy more of it.
 
+How many connections a broker serves is bounded as well, and how fast it takes new ones. A
+connection starts the plugin in a cage of its own once it speaks, at once on a protocol whose host
+speaks first, and opens the host resource: both happen on the host, outside the cage's limits. So a
+broker serves thirty-two connections at once and closes one past them, and it takes thirty-two back
+to back, then eight a second. A client that opens connections faster than that, a script
+decrypting file after file, is slowed to that pace and never refused: the connections waiting
+their turn hold no thread, plugin or scope on the host.
+
 This is still not a path in a manifest. It says how the protocol locates a socket; the path
 itself comes from the config that named the resource. A `tcp://` target has no such address,
 so the two declarations together are refused rather than one quietly ignoring the other, and

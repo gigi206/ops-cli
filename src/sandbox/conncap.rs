@@ -17,10 +17,13 @@
 //! a burst of accepts all pass the check and land past the cap. [`ConnCap::take`] does both: the
 //! slot is taken by the same operation that tests the ceiling, and it comes back when the guard
 //! goes out of scope, panic or no panic.
+//!
+//! A plane whose connections each start something costly host-side also needs a pace, since the
+//! ceiling bounds how many live at once and not how fast they turn over: [`Pacer`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a loop pauses after a failure it means to survive. Far too short to matter to a real
 /// connection, and long enough that a condition lasting seconds costs no core.
@@ -138,6 +141,63 @@ impl ConnCap {
 impl Drop for ConnSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How fast an accept loop lets connections through, for a plane where each one starts something
+/// costly host-side: `burst` back to back, then one per `every`. A token bucket.
+///
+/// It paces rather than refuses. A connection waits for its token on the accept loop's own thread,
+/// so the ones behind it wait in the kernel's backlog, where they hold no thread, no slot and no
+/// record: a cage that floods the socket slows only the launch that owns it, and a client that
+/// connects again is served late rather than turned away. Where [`ConnCap`] bounds how many
+/// connections live at once, this bounds how fast they turn over.
+///
+/// The instant is passed in, so the arithmetic is tested without sleeping.
+pub(super) struct Pacer {
+    burst: u32,
+    every: Duration,
+    tokens: u32,
+    /// When the bucket last earned a token, or was last seen full: a full bucket earns nothing.
+    credited: Instant,
+}
+
+impl Pacer {
+    pub(super) fn new(burst: u32, every: Duration, now: Instant) -> Self {
+        Self {
+            burst,
+            every,
+            tokens: burst,
+            credited: now,
+        }
+    }
+
+    /// Take a token for a connection at `now`, or say how long until the next one is earned.
+    pub(super) fn take(&mut self, now: Instant) -> Result<(), Duration> {
+        let earned =
+            now.saturating_duration_since(self.credited).as_nanos() / self.every.as_nanos().max(1);
+        let earned = u32::try_from(earned).unwrap_or(u32::MAX);
+        if earned >= self.burst - self.tokens {
+            self.tokens = self.burst;
+            self.credited = now;
+        } else {
+            self.tokens += earned;
+            self.credited += self.every * earned;
+        }
+        if self.tokens == 0 {
+            return Err(self
+                .every
+                .saturating_sub(now.saturating_duration_since(self.credited)));
+        }
+        self.tokens -= 1;
+        Ok(())
+    }
+
+    /// Wait on the caller's thread until a token is earned, and take it.
+    pub(super) fn wait(&mut self) {
+        while let Err(left) = self.take(Instant::now()) {
+            std::thread::sleep(left);
+        }
     }
 }
 
@@ -328,5 +388,54 @@ mod tests {
             "two takers held the one slot"
         );
         assert_eq!(cap.live(), 0, "every slot came back");
+    }
+
+    /// A pacer lets its burst through at once, then one connection per interval, and an idle
+    /// stretch earns back the burst and no more.
+    #[test]
+    fn a_pacer_lets_its_burst_through_then_one_per_interval() {
+        let t0 = Instant::now();
+        let every = Duration::from_millis(100);
+        let mut pacer = Pacer::new(3, every, t0);
+        for n in 1..=3 {
+            assert_eq!(pacer.take(t0), Ok(()), "connection {n} of the burst");
+        }
+        assert_eq!(
+            pacer.take(t0),
+            Err(every),
+            "past the burst, the next waits an interval"
+        );
+        assert_eq!(pacer.take(t0 + every / 2), Err(every / 2));
+        assert_eq!(pacer.take(t0 + every), Ok(()), "an interval earns one");
+        assert_eq!(pacer.take(t0 + every), Err(every));
+
+        let later = t0 + every * 100;
+        for n in 1..=3 {
+            assert_eq!(
+                pacer.take(later),
+                Ok(()),
+                "connection {n} after the idle stretch"
+            );
+        }
+        assert!(
+            pacer.take(later).is_err(),
+            "an idle stretch earns the burst back, and no more"
+        );
+    }
+
+    /// A bucket that sat full earned nothing while it did: its first interval is counted from the
+    /// connection that took it off full, not from when it was last refilled.
+    #[test]
+    fn a_full_pacer_earns_nothing_while_it_stays_full() {
+        let t0 = Instant::now();
+        let every = Duration::from_millis(100);
+        let mut pacer = Pacer::new(1, every, t0);
+        let first = t0 + every * 5 / 2;
+        assert_eq!(pacer.take(first), Ok(()));
+        assert_eq!(
+            pacer.take(first + every / 2),
+            Err(every / 2),
+            "the interval runs from the take that emptied the bucket"
+        );
     }
 }
