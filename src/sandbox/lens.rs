@@ -88,6 +88,12 @@ const LINE_MAX: u64 = 8 * 1024;
 /// belt-and-braces against one that is stuck rather than hostile.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The most control connections a lens serves at once. Each carries one command and is closed once
+/// answered, so a reader holds its slot for the length of one reply; the ceiling is for a peer that
+/// connects and says nothing, which pins a thread for [`IO_TIMEOUT`]. The same shape, and the same
+/// number, as the egress report plane's.
+const MAX_CONCURRENT_CONNS: usize = 8;
+
 /// One event a lens records, and how it crosses the wire. The ring stamps the sequence number, so an
 /// event only has to hand it back: that is what a `--follow` cursor is compared against, and what an
 /// eviction gap is measured in.
@@ -286,14 +292,16 @@ pub(crate) fn dispatch_log<E: Event>(cmd: &str, ring: &Ring<E>) -> String {
 
 // ── The server (the supervisor holding the ring) ──────────────────────────────────────────────
 
-/// Serve a lens's control socket: one short-lived thread per connection, each handling exactly one
-/// command through `dispatch`. A per-connection error is that connection's problem, never the
-/// server's — a reader that hangs up mid-reply must not stop the next one being answered.
+/// Serve a lens's control socket: one short-lived thread per connection, at most
+/// [`MAX_CONCURRENT_CONNS`] at once, each handling exactly one command through `dispatch`. A
+/// per-connection error is that connection's problem, never the server's — a reader that hangs up
+/// mid-reply must not stop the next one being answered.
 pub(crate) fn serve<F>(listener: UnixListener, dispatch: F) -> io::Result<()>
 where
     F: Fn(&str) -> String + Send + Sync + 'static,
 {
     let dispatch = Arc::new(dispatch);
+    let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -307,8 +315,17 @@ where
                 continue;
             }
         };
+        // Past the ceiling the connection is closed unanswered, and nothing is recorded: the ring
+        // this socket serves is the lens's record, and a refusal pushed into it would evict the
+        // events a reader came for.
+        let Some(slot) = cap.take() else {
+            continue;
+        };
         let dispatch = dispatch.clone();
         super::conncap::spawn_conn("lens control", move || {
+            // Held for the connection's life and given back by its `Drop`, so neither a handler
+            // that panics nor a thread the host refuses takes the slot with it.
+            let _slot = slot;
             let _ = handle(stream, dispatch.as_ref());
         });
     }
@@ -1208,6 +1225,50 @@ mod tests {
             read_log(&socket, Some(snap.head)).expect("the follow read");
         assert_eq!(snap.events.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
         assert_eq!(snap.events[0].tail, "second");
+    }
+
+    /// Past [`MAX_CONCURRENT_CONNS`] a connection is closed unanswered rather than given a thread,
+    /// and a slot given back serves the next reader. Without the ceiling, peers that connect and say
+    /// nothing pin one thread each for [`IO_TIMEOUT`], with nothing bounding how many.
+    #[test]
+    fn a_lens_closes_a_connection_past_its_ceiling() {
+        let dir = crate::testutil::TmpDir::new();
+        let socket = dir.join("lens.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        std::thread::spawn(move || {
+            let _ = serve(listener, |_| "ok\n".to_string());
+        });
+        let ask = || {
+            let mut conn = UnixStream::connect(&socket).expect("connect");
+            conn.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            // A connection closed unanswered may refuse the write too; the read says which it was.
+            let _ = conn.write_all(b"LOG\n");
+            let mut reply = String::new();
+            let _ = conn.read_to_string(&mut reply);
+            reply
+        };
+
+        // Silent, so each holds its slot in `read_line` until `IO_TIMEOUT`. The loop accepts in
+        // order, so these take every slot before the next connection is accepted.
+        let mut held: Vec<UnixStream> = (0..MAX_CONCURRENT_CONNS)
+            .map(|_| UnixStream::connect(&socket).expect("connect"))
+            .collect();
+        assert_eq!(ask(), "", "a connection past the ceiling was answered");
+
+        drop(held.pop());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let reply = loop {
+            let reply = ask();
+            if reply == "ok\n" || std::time::Instant::now() > deadline {
+                break reply;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            reply, "ok\n",
+            "the slot a closed connection gave back serves no one"
+        );
     }
 
     /// A ring a panic has poisoned still reads AND still records.
