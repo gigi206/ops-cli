@@ -699,26 +699,50 @@ fn reachability(nix: &Path, layout: &Layout, rev: &str, fresh: bool) -> Reachabi
     let Some(rev) = valid_revision(rev) else {
         return Reachability::Unknown;
     };
-    let compared =
+    let compare = |fresh| {
         crate::sandbox::nixhub::fetch_url_json(nix, layout, &reachability_url(&rev), fresh)
             .ok()
-            .map(|answer| ahead_by(&answer));
-    // Short-circuiting: the control question is asked only when the first one came back with
-    // nothing, which is the only case where its answer changes anything.
-    //
+            .map(|answer| ahead_by(&answer))
+    };
     // Asked uncached whatever `fresh` says, because the two requests have to share the same
     // currency for the control to mean anything. Nothing above is a comparison that failed at the
     // endpoint just now — nix's `tarball-ttl` cache can only ever serve a body that succeeded — so
     // a control answered from a body fetched up to an hour ago would report the endpoint as
     // answering while the live request that matters did not, turning a rate limit into `Absent`.
-    let endpoint_answers = compared.is_some()
-        || crate::sandbox::nixhub::fetch_url_json(
+    let control = || {
+        crate::sandbox::nixhub::fetch_url_json(
             nix,
             layout,
             &reachability_url(NIXPKGS_WITNESS_BRANCH),
             true,
         )
-        .is_ok();
+        .is_ok()
+    };
+    reachability_from(fresh, compare, control)
+}
+
+/// What [`reachability`] concludes, given its two requests: `compare` asks about the revision,
+/// cached or not as its argument says, and `control` asks about a comparison whose answer is
+/// already known. Taken as arguments so that which requests are made, in what order and how often,
+/// is held without the network.
+fn reachability_from(
+    fresh: bool,
+    mut compare: impl FnMut(bool) -> Option<Option<u64>>,
+    control: impl FnOnce() -> bool,
+) -> Reachability {
+    let mut compared = compare(fresh);
+    // Short-circuiting: the control question is asked only when the first one came back with
+    // nothing, which is the only case where its answer changes anything.
+    let endpoint_answers = compared.is_some() || control();
+    // The one reading that accuses is a comparison that failed while the endpoint answered: it is
+    // taken for the `404` of a revision the repository does not have. One failed request is not
+    // that by itself, and nothing here sees why it failed, so the comparison is asked once more,
+    // uncached and after the control, before it counts. A revision the repository does not have
+    // fails both times, while a request that failed for a reason of its own seldom fails again
+    // just after the endpoint answered. The cost is one request, on this path only.
+    if compared.is_none() && endpoint_answers {
+        compared = compare(true);
+    }
     verdict(compared, endpoint_answers)
 }
 
@@ -861,6 +885,58 @@ mod tests {
         // Nothing came back and the endpoint is not answering either: no evidence, and a rate
         // limit must never read as an accusation.
         assert_eq!(verdict(None, false), Reachability::Unknown);
+    }
+
+    /// A comparison that fails while the endpoint answers is read as a revision the repository does
+    /// not have, and the warning that follows tells the user the index may be hostile. One failed
+    /// request was enough for it, so an ancestor of `master` whose single comparison failed was
+    /// reported as outside `master`'s history. The comparison is now asked again, uncached, and
+    /// only a second failure accuses.
+    ///
+    /// The other arms hold what the retry must not change: an endpoint that does not answer is no
+    /// evidence and costs no second comparison, and a comparison that answers costs no control.
+    #[test]
+    fn a_comparison_that_failed_once_is_asked_again_before_it_accuses() {
+        let run = |answers: Vec<Option<Option<u64>>>, endpoint: bool| {
+            let mut answers = answers.into_iter();
+            let mut asked = Vec::new();
+            let mut controls = 0;
+            let verdict = reachability_from(
+                false,
+                |fresh| {
+                    asked.push(fresh);
+                    answers
+                        .next()
+                        .expect("a comparison the case did not script")
+                },
+                || {
+                    controls += 1;
+                    endpoint
+                },
+            );
+            (verdict, asked, controls)
+        };
+
+        assert_eq!(
+            run(vec![None, Some(Some(0))], true),
+            (Reachability::InHistory, vec![false, true], 1),
+            "a failure that does not repeat is read from the comparison that answered"
+        );
+        assert_eq!(
+            run(vec![None, None], true),
+            (Reachability::Absent, vec![false, true], 1),
+            "a revision the repository does not have fails both times"
+        );
+        assert_eq!(
+            run(vec![None], false),
+            (Reachability::Unknown, vec![false], 1),
+            "an endpoint that does not answer is no evidence, and is not asked twice"
+        );
+        assert_eq!(
+            run(vec![Some(Some(0))], true),
+            (Reachability::InHistory, vec![false], 0),
+            "a comparison that answers needs no control"
+        );
     }
 
     #[test]
