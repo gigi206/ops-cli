@@ -9,8 +9,10 @@
 //!
 //! Security: the control socket is **never** bound into the cage — only the proxy socket and the CA
 //! cross in (see [`super::egress`]). In Mode B the in-cage agent is the adversary, so letting it
-//! reach this socket would let it answer its own asks, defeating the whole posture. The socket lives
-//! beside `<data>`, which the cage never sees, and answering is inherently a trusted host-side act.
+//! reach this socket would let it answer its own asks, defeating the whole posture. Where a bind
+//! shows the data dir to the cage anyway, the same holds here as for the lenses ([`super::lens`]):
+//! [`serve`] closes a connection from outside the supervisor's PID namespace before reading it.
+//! Answering is inherently a trusted host-side act.
 //!
 //! Discovery is a glob of the egress directory; the socket filename carries the session pid, which
 //! is also the `<pid>.<seq>` id prefix the park notice prints (the supervisor prints it, from the

@@ -1,7 +1,8 @@
 //! Host-side control-plane client: the `sbx net …` process reads the per-session control
 //! sockets under the data dir — listing parked requests, streaming the log/flow rings, and
-//! injecting live allow/deny/mute decisions. The counterpart of the in-cage server in
-//! [`super`]; it only *reads* the sockets and shares the wire types, never the server state.
+//! injecting live allow/deny/mute decisions. The counterpart of the server in [`super`], which the
+//! launch runs host-side beside the proxy; it only *reads* the sockets and shares the wire types,
+//! never the server state.
 
 use super::*;
 

@@ -1,9 +1,10 @@
 //! The rules every host-side accept loop follows: how many connections it serves at once, what it
 //! does with a failed `accept(2)`, and what it does when the host will not give it a thread.
 //!
-//! Every socket sbx binds host-side is reachable from the cage, and a connection costs a thread for
-//! as long as it lives. So each accept loop carries a ceiling, and beyond it a connection is
-//! refused rather than allowed to pin another thread.
+//! A connection costs a thread for as long as it lives, whoever opened it, and some of these
+//! sockets are the cage's to reach by design, a broker's or the task crossing socket among them. So
+//! each accept loop carries a ceiling, and beyond it a connection is refused rather than allowed to
+//! pin another thread.
 //!
 //! The two failure rules live here for the same reason the ceiling does: each loop is the body of a
 //! detached thread that owns its listener, so a loop that returns — or unwinds — closes its plane

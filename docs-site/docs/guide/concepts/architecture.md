@@ -163,9 +163,11 @@ flowchart TB
 
 The split is not stylistic. Under the [agent posture](./), the process inside the
 cage is the adversary: a reachable ask queue would let it answer its own requests, and a
-reachable lens would let it read or amend the record of what it did. So the sockets on the
-right live beside the data directory, which the cage never sees, and answering one is
-inherently a host-side act.
+reachable lens would let it read or amend the record of what it did. So the planes on the
+right live under the data directory and are never bound into the cage; where a mount shows
+that directory to the cage anyway, their sockets close a connection from it (see the
+[security model](security-model#the-control-plane-is-pinned)). Answering one is inherently
+a host-side act.
 
 One plane is bound in for neither reason, and it is the one that enforces *against* the
 agent. Only the kernel can hand out the descriptor that lets a supervisor decide an
@@ -438,8 +440,9 @@ itself, so the vocabulary reachable from inside is exactly the vocabulary intend
 
 Four lenses answer four questions about a live session: what it ran, what it wrote, where
 it went, and what it asked your keys to sign. Each keeps a bounded record in the
-supervisor's memory rather than on disk, and each is read over a socket the
-cage never sees. A lens is not a fence: only the exec lens has an enforcing sibling, and
+supervisor's memory, and on disk as well under [`record = true`](../configuration/observe),
+and each is read over a socket that is never bound into the cage and that closes a
+connection from one should a mount show it there. A lens is not a fence: only the exec lens has an enforcing sibling, and
 only egress has a policy behind it. See [Observability](observability).
 
 A lens answers a question you thought to ask. The [`[notify]`](../configuration/notify)

@@ -9,10 +9,10 @@
 //!
 //! Security mirrors the egress control socket exactly. The socket is bound under the `0700` data dir
 //! and is **never** bound into the cage: in Mode B the in-cage agent is the adversary, so letting it
-//! reach this socket would let it read — and, once the seccomp user-notification enforcement lands,
-//! answer — its own observation. It lives beside `<data>`, which the cage never sees. The ring is
-//! never written to disk and never crosses into the cage; it is the supervisor's owner-only RAM for
-//! the session's lifetime and dies with it.
+//! reach this socket would let it read its own observation and, under enforcement, answer its own
+//! parked `execve` or load a rule. The ring itself is the supervisor's owner-only RAM for the
+//! session's lifetime and dies with it; the record file a launch may ask for, and what holds where a
+//! bind shows the data dir to the cage anyway, are the same as for every lens ([`super::lens`]).
 //!
 //! The wire protocol is line-based and minimal (one command per connection): `LOG` returns the
 //! retained events (a `dropped=` line when a `--follow` cursor fell behind the ring, a `head=` cursor,

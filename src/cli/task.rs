@@ -8,8 +8,10 @@
 //!
 //! On the host the verbs resolve a live session and talk to its socket, so a human can try an
 //! operation exactly as the agent would see it — the value of that is that a task is testable
-//! without an agent. `logs` is host-only by construction: the invocation log lives on a socket the
-//! cage never sees, because the recorded party does not get to read the record.
+//! without an agent. `logs` is host-only, by construction first: the invocation log lives on a
+//! socket that is never bound into a cage, and that socket also refuses a caller outside sbx's own
+//! PID namespace, should a mount show it to a cage. The recorded party does not get to read the
+//! record.
 //!
 //! No policy lives here. The client sends a name, bounded values, and allowed variable names; every
 //! decision — the program, the bounds, the credential, the ceilings — is the host-side engine's.

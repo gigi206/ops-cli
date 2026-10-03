@@ -44,9 +44,10 @@ column is never mistaken for a quiet one.
 sbx logs 12345 -f                      # all of it, in one column of time
 ```
 
-Three properties hold across all four. Each lives in the **supervisor's memory**,
-never on disk, and is gone when the session exits (the one exception
-is [`sbx net stats`](../cli/net#sbx-net-stats), a durable per-host counter). Each is
+Three properties hold across all four. Each lives in the **supervisor's memory** and is
+gone when the session exits, unless [`record = true`](../configuration/observe) also
+appends it to a file under the data directory ([`sbx net stats`](../cli/net#sbx-net-stats)
+is apart, a durable per-host counter). Each is
 read over a per-session control socket that is **never bound into the cage**, so the
 agent can neither read the record of what it did nor amend it. And each is a lens,
 not a fence: only the exec lens has an enforcing sibling
