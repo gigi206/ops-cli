@@ -283,6 +283,14 @@ to back, then eight a second. A client that opens connections faster than that, 
 decrypting file after file, is slowed to that pace and never refused: the connections waiting
 their turn hold no thread, plugin or scope on the host.
 
+The thirty-two are the broker's, not the cage's: a
+[resolver plugin put behind the broker](#giving-a-resolver-plugin-the-fence) connects through the
+same socket and counts against the same ceiling. A connection may sit idle between frames for as
+long as its protocol likes, so a cage that holds all thirty-two open leaves a resolution made while
+it runs (a credential's refresh, a declared operation's secret) without one, and that resolution
+fails. What it costs stays inside the session: the credentials that do not resolve are the ones
+that session would have used.
+
 This is still not a path in a manifest. It says how the protocol locates a socket; the path
 itself comes from the config that named the resource. A `tcp://` target has no such address,
 so the two declarations together are refused rather than one quietly ignoring the other, and
