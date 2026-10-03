@@ -192,7 +192,9 @@ pub(crate) struct BrokerSpec {
     /// A broker holds no secret — that is what bounds it to the hole it replaces. This grant does
     /// not change that: what the plugin receives is a random per-connection marker, and sbx
     /// substitutes the real value into the plugin's own bytes on their way to the host resource.
-    /// The plugin can place the secret; it can never read it.
+    /// The plugin can place the secret; sbx never hands it the value, and refuses any frame bound
+    /// for the cage that carries it. That refusal matches the plain value only: a resource that
+    /// stores what it is sent can return it encoded, past any scan.
     ///
     /// Declared here, and not only in the config, for the reason every grant is: which plugin may
     /// be handed one is a property of the code that was installed and reviewed, not of the machine

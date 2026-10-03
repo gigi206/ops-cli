@@ -118,7 +118,7 @@ dropped. So is one written in a **project** config, and for a sharper version of
 
 At the start of every connection the plugin receives a **random marker**, places it where
 the protocol wants the value, and `sbx` replaces it on the way to the host resource. The
-plugin can decide *where* the credential goes; it can never read it.
+plugin can decide *where* the credential goes; `sbx` never hands it the value.
 
 Four rules make that true, and each closes a specific hole:
 
@@ -136,8 +136,11 @@ credential is not the same event as one merely rewritten, and an audit should no
 guess which was which.
 
 On the way back, a reply carrying the credential is **refused, not stripped**: a partial
-strip gives false confidence, and an encoded value defeats it anyway. It is a tripwire, not
-a wall, exactly as on the [egress side](../secrets/redaction). A credential shorter than the
+strip gives false confidence, and an encoded value defeats it anyway. That holds for a
+frame the plugin itself sends toward the cage as much as for one the host resource sent. It
+is a tripwire, not a wall, exactly as on the [egress side](../secrets/redaction): a resource
+that stores what it is sent can hand the credential back to the plugin in a form no scan
+recognises, and the plugin could then pass that form on. A credential shorter than the
 [`[redact] min_len`](../secrets/redaction#the-length-floor) floor is placed but **not** watched, and the
 launch says so: a scan that short refuses innocent traffic more often than it catches a leak.
 

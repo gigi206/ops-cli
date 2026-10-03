@@ -1503,9 +1503,16 @@ fn connection_refused(ring: &super::broker_control::BrokerRing, name: &str, why:
     format!("broker `{name}`: a connection was refused — {why}")
 }
 
-/// Write one plugin-produced frame to the cage, holding it to the one rule that governs every such
-/// frame: it must never carry the secret marker. Returns whether the connection may go on — `false`
-/// both for a frame refused here and for a write that failed, since either ends it.
+/// Write one plugin-produced frame to the cage, holding it to the rules that govern every such
+/// frame: it must never carry the secret marker, nor the secret itself. Returns whether the
+/// connection may go on — `false` both for a frame refused here and for a write that failed, since
+/// either ends it.
+///
+/// The second rule is the tripwire `collect_reply` puts on what the host sends, applied at the one
+/// gate every frame toward the cage passes, so it covers what the plugin produced too: a plugin
+/// that placed the marker in a write a resource stores, and read the value back through a query,
+/// would otherwise be free to put it in a reply of its own. Like every tripwire on this path it
+/// matches the plain value only, and blocks rather than strips.
 ///
 /// A function rather than the check spelled out at each write site, because one site did not have
 /// it. The rule lived inline in the request loop under a comment calling that "the last place bytes
@@ -1522,18 +1529,27 @@ fn write_to_cage(
     ring: &super::broker_control::BrokerRing,
     name: &str,
 ) -> bool {
-    if let Some(marker) = marker
-        && marker.present_in(bytes)
-    {
+    let carried = match marker {
+        Some(marker) if marker.present_in(bytes) => Some((
+            "a frame that would have taught the cage the credential's marker",
+            "the secret marker",
+        )),
+        Some(marker) if marker.leaks_in(bytes) => Some((
+            "a frame that would have put the credential in the cage",
+            "the credential itself",
+        )),
+        _ => None,
+    };
+    if let Some((observed, what)) = carried {
         ring.push(
             super::broker_control::BrokerKind::Refuse,
             name,
-            "a frame that would have taught the cage the credential's marker",
+            observed,
             None,
         );
         crate::diag::warn(&format!(
-            "broker `{name}`: a frame bound for the cage carried the secret marker — refused and \
-             the connection ended"
+            "broker `{name}`: a frame bound for the cage carried {what} — refused and the \
+             connection ended"
         ));
         return false;
     }
@@ -2691,6 +2707,56 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let err = relay_with(b"p", &mut plugin, &mut host, &inspecting, &marker)
             .expect_err("must be refused");
         assert!(err.contains("bound for the cage"), "{err}");
+    }
+
+    /// The tripwire holds at the gate to the cage for what the plugin produced, not only for what
+    /// the host sent: a plugin that came to know the credential (a resource that stored what it was
+    /// sent, read back through a query) cannot put it in a reply of its own. The frame is refused,
+    /// recorded, and the connection ended before the cage reads a byte of it.
+    #[test]
+    fn a_plugins_reply_carrying_the_credential_never_reaches_the_cage() {
+        let marker = marker_for("hunter2");
+        let spec = spec(None);
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut client = theirs;
+        write_frame(&mut client, spec.framing, b"p", false).expect("a request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Reply(b"HERE hunter2".to_vec()),
+            expect_reply: true,
+            more: false,
+            label: None,
+        }]);
+        let mut host = FakeHost::with(Vec::new());
+        let ring = super::super::broker_control::BrokerRing::new(8);
+        let _ = serve_exchanges(
+            &spec,
+            &mut plugin,
+            &mut host,
+            cage,
+            &ring,
+            Some(&marker),
+            "x",
+            None,
+        );
+        let mut got = Vec::new();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("a read timeout");
+        let _ = client.read_to_end(&mut got);
+        assert!(
+            !contains(&got, b"hunter2"),
+            "the credential reached the cage: {got:?}"
+        );
+        let events = ring.snapshot(None).events;
+        assert!(
+            events.iter().any(|e| e
+                .detail
+                .contains("would have put the credential in the cage")),
+            "{events:?}"
+        );
     }
 
     /// The tripwire on the way back: a host resource that reflects the credential would put it in
