@@ -119,6 +119,17 @@ provision:
       EOF
       sysctl -q --system
 
+      # Where the Mac's subtree is mounted, for the wrapper: a directory is the Mac's to build a cage
+      # around only when it lies under this path, which no other mount of the guest does. Read from
+      # the mounts themselves, which Lima makes before provisioning runs: `{{.Home}}` here would be
+      # the guest's home rather than the Mac's, and Lima asks provisioning not to read the
+      # variables it keeps for its own boot. Written only when exactly one virtiofs mount is the subtree, so an
+      # ambiguous guest keeps the wrapper's fallback rather than a guess.
+      mounts="$(findmnt -rn -o TARGET -t virtiofs | grep -v '^/mnt/sbx-mac/' || true)"
+      if [ -n "$mounts" ] && [ "$(printf '%s\n' "$mounts" | wc -l)" -eq 1 ]; then
+        printf '%s\n' "$mounts" | put /etc/sbx/projects-mount
+      fi
+
   - mode: system
     script: |
       #!/bin/bash
