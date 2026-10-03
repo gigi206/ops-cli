@@ -85,6 +85,11 @@ provision:
     script: |
       #!/bin/bash
       set -euo pipefail
+      # Files are written through a temporary name and renamed into place. `install /dev/stdin`
+      # is not used: the image's `install` (uutils) refuses to read standard input onto a file
+      # that already exists, which is every file here from the first restart on, since Lima
+      # replays provisioning on every start.
+      put() { mkdir -p "$(dirname "$1")"; cat > "$1.sbx-new"; chmod 0644 "$1.sbx-new"; mv -f "$1.sbx-new" "$1"; }
       # Ubuntu has shipped `kernel.apparmor_restrict_unprivileged_userns=1` since 23.10, which
       # leaves a user namespace creatable but stripped of the capabilities bubblewrap needs.
       # Lima does nothing about it.
@@ -109,7 +114,7 @@ provision:
       # does not have to wait for one. The Ubuntu 26.04 image ships the restriction enabled, in
       # /usr/lib/sysctl.d/10-apparmor.conf, which this file outranks by name, and clearing it is
       # what `sbx doctor` inside the guest needs to pass.
-      install -m 0644 /dev/stdin /etc/sysctl.d/99-sbx-userns.conf <<'EOF'
+      put /etc/sysctl.d/99-sbx-userns.conf <<'EOF'
       kernel.apparmor_restrict_unprivileged_userns = 0
       EOF
       sysctl -q --system
@@ -118,6 +123,8 @@ provision:
     script: |
       #!/bin/bash
       set -euo pipefail
+      # Written through a temporary name; see the first script for why not `install /dev/stdin`.
+      put() { mkdir -p "$(dirname "$1")"; cat > "$1.sbx-new"; chmod 0644 "$1.sbx-new"; mv -f "$1.sbx-new" "$1"; }
       # sbx itself. The image boots a bare Ubuntu, so the binary is fetched from the published
       # release and verified against the `.sha256` published beside it before it is installed.
       # This is the rule build.rs already applies to the embedded bwrap: bytes that have not been
@@ -193,7 +200,7 @@ provision:
       fi
 
       install -D -m 0755 "$tmp/sbx" /usr/local/bin/sbx
-      install -D -m 0644 /dev/stdin "$marker" <<EOF
+      put "$marker" <<EOF
       $got
       EOF
       # Read by the wrapper to say when a long-running guest has fallen behind the release.
@@ -216,6 +223,8 @@ provision:
     script: |
       #!/bin/bash
       set -euo pipefail
+      # Written through a temporary name; see the first script for why not `install /dev/stdin`.
+      put() { mkdir -p "$(dirname "$1")"; cat > "$1.sbx-new"; chmod 0644 "$1.sbx-new"; mv -f "$1.sbx-new" "$1"; }
       # The desktop half of the guest: a Wayland compositor on the window Lima opens, and a sound
       # server behind the virtio-sound device, so `gui = "wayland"` and `audio = true` behave as
       # they do on a Linux desktop without anything being set up by hand.
@@ -231,7 +240,7 @@ provision:
       # because Lima enables lingering, nor the SSH session every `limactl shell`, and so every
       # sbx launch, is made in; the primary group is carried by both from the start. The render
       # node is included so a cage under `gpu = true` can open it, the cage keeping the gid.
-      install -m 0644 /dev/stdin /etc/udev/rules.d/70-sbx-guest-user.rules <<EOF
+      put /etc/udev/rules.d/70-sbx-guest-user.rules <<EOF
       SUBSYSTEM=="sound", GROUP="$group"
       SUBSYSTEM=="drm", KERNEL=="card[0-9]*|renderD[0-9]*", GROUP="$group"
       EOF
@@ -241,7 +250,7 @@ provision:
 
       # seatd hands the compositor the display and the input devices. Ubuntu's unit grants its
       # socket to `video`; the drop-in grants it to the same primary group instead.
-      install -D -m 0644 /dev/stdin /etc/systemd/system/seatd.service.d/sbx.conf <<EOF
+      put /etc/systemd/system/seatd.service.d/sbx.conf <<EOF
       [Service]
       ExecStart=
       ExecStart=/usr/sbin/seatd -g $group
@@ -249,11 +258,11 @@ provision:
 
       # Weston on the guest's display, under a fixed socket name the wrapper looks for. The idle
       # timeout is disabled because the screen it would blank is the Mac's window onto the guest.
-      install -D -m 0644 /dev/stdin /etc/sbx/weston.ini <<'EOF'
+      put /etc/sbx/weston.ini <<'EOF'
       [core]
       idle-time=0
       EOF
-      install -m 0644 /dev/stdin /etc/systemd/system/sbx-weston.service <<EOF
+      put /etc/systemd/system/sbx-weston.service <<EOF
       [Unit]
       Description=Wayland compositor on the Lima display, for sbx
       ConditionPathExists=/dev/dri/card0
