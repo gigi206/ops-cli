@@ -48,11 +48,13 @@
 # since. A run that never fires provides no coverage, whatever it would provide if it did, and the
 # suites it exists for were being exercised on exactly one machine: the author's.
 #
-# So `push` now names the paths that can change what these suites measure, and it names the SAME set
-# `ci.yml` calls a core change (`src/**`, `proc-shim/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`).
-# One definition of "a change that can alter behaviour", not two that drift: a push wide enough to
-# make `ci.yml` run its full selection is wide enough to deserve a cage run. `concurrency` above
-# cancels a superseded run, so a burst of pushes costs one run and not one per commit.
+# So `push` now names the paths that can change what these suites measure: what `ci.yml` calls a
+# core change (`src/**`, `proc-shim/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`, and the shared
+# test helpers under `tests/`), and the suites themselves. A push wide enough to make `ci.yml` run
+# its full selection is wide enough to deserve a cage run, and so is one that changes a suite:
+# `ci.yml` runs that suite, on a runner where its cage cases skip, and the change would otherwise
+# meet a cage only on the nightly `schedule`, which fires on the default branch alone. `concurrency`
+# above cancels a superseded run, so a burst of pushes costs one run and not one per commit.
 #
 # What that costs, measured rather than estimated: a green run took 31 to 37 minutes (2026-08-20,
 # both arms). This is a signal, not a gate -- nothing waits on it, and its value is the skip count
@@ -75,6 +77,7 @@ on:
     paths:
       - .github/workflows/cage.yml
       - src/**
+      - tests/**
       - proc-shim/**
       - Cargo.toml
       - Cargo.lock
