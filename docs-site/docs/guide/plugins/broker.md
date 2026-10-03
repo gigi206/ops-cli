@@ -81,7 +81,10 @@ launch:
   machine speed and is wrong for one that stops to **ask a person**: a gpg-agent opening a
   pinentry answers when the human does. A manifest raises it up to ten minutes; past that,
   whatever is on the other side is wedged rather than thinking. The default is 30 seconds;
-  zero, negative and above-600 values are refused at load.
+  zero, negative and above-600 values are refused at load. It covers what sbx writes to the
+  resource during an exchange as well as what it reads. Connecting to the resource is bounded
+  apart, at 30 seconds or this deadline where it is shorter, so a raised deadline does not let a
+  resource that stopped accepting hold a connection.
 - **`host_greets` and multi-message answers both need `inspect_replies`.** A protocol
   whose reply is a run of messages needs the plugin to say where the run ends, and a
   greeting is a frame from the host that must not reach the cage unseen.

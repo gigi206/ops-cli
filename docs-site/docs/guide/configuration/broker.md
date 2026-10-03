@@ -252,7 +252,16 @@ rather than to any machine: a key with a passphrase makes the agent stop mid-exc
 pinentry, and it answers when the person does. The default `sbx` waits on a host resource is thirty
 seconds (a typing speed, not a fault), so a protocol that asks a person raises it, up to ten
 minutes. Past that, whatever is on the other side is wedged rather than thinking, and letting go is
-what keeps a thread, a plugin process and two connections from being held indefinitely.
+what keeps a thread, a plugin process and two connections from being held indefinitely. The
+deadline covers the whole exchange, what `sbx` writes to the resource as well as what it reads back,
+so a resource that takes a request a few bytes at a time is held to it too.
+
+Reaching the resource in the first place is bounded apart: thirty seconds, or the protocol's own
+deadline where that is shorter. A connection is a handshake between machines and no person waits in
+it, so a deadline raised for a pinentry does not raise this one. Without it, a TCP endpoint that
+drops the handshake held the connection for the kernel's retry schedule, and a Unix socket whose
+listener stopped accepting held it for good. The name a TCP endpoint is written with is looked up by
+the system's resolver, and that lookup is bounded by the resolver's own settings.
 
 The *first* thing the cage says on a connection is bounded too, for the same reason read from the
 other end: by then the plugin is running and the host resource is connected, so a connection that

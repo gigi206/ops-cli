@@ -858,8 +858,9 @@ fn hold_for_cage(out: &mut Vec<Vec<u8>>, held: &mut usize, frame: Vec<u8>) -> Re
 /// afresh, so a resource producing one byte just inside it holds this connection, its plugin process
 /// and one of the broker's slots for as long as it cares to keep dribbling. The budget below closes
 /// that: `host_deadline` is declared as how long *one exchange* may take, so that is what it is spent
-/// on, across every read the exchange makes. See [`super::deadline`]. Either bound landing turns into
-/// an error on the fail-closed path with every other one.
+/// on, across every read and every write the exchange makes: a resource that takes what it is sent
+/// a few bytes at a time stretches a write the same way. See [`super::deadline`]. Either bound
+/// landing turns into an error on the fail-closed path with every other one.
 ///
 /// Every error path is fail-closed: whatever goes wrong with the plugin, the frame is refused and
 /// the caller is told, never forwarded on a guess.
@@ -924,8 +925,13 @@ pub(crate) fn relay_one<H: Read + Write>(
                 // Counted before the write, as `sent` is below: a query whose write fails part way
                 // may still have reached the resource.
                 progress.queries += 1;
-                write_frame(host, spec.framing, &bytes, true)
-                    .map_err(|e| format!("cannot reach the host resource: {e}"))?;
+                write_frame(
+                    &mut super::deadline::Deadlined::new(host, deadline),
+                    spec.framing,
+                    &bytes,
+                    true,
+                )
+                .map_err(|e| format!("cannot reach the host resource: {e}"))?;
                 let reply = read_frame(
                     &mut super::deadline::Deadlined::new(host, deadline),
                     spec.framing,
@@ -970,8 +976,13 @@ pub(crate) fn relay_one<H: Read + Write>(
                 // From here every way this exchange ends leaves the host resource with the request.
                 progress.sent = true;
                 progress.secret_placed = substituted.is_some();
-                write_frame(host, spec.framing, out, typed)
-                    .map_err(|e| format!("cannot reach the host resource: {e}"))?;
+                write_frame(
+                    &mut super::deadline::Deadlined::new(host, deadline),
+                    spec.framing,
+                    out,
+                    typed,
+                )
+                .map_err(|e| format!("cannot reach the host resource: {e}"))?;
                 // A message the protocol answers with nothing: sent, and that is the whole
                 // exchange. Reading here would fail on a close the client asked for, and the
                 // record would call a normal goodbye a refusal.
@@ -1534,32 +1545,7 @@ fn serve_conn(
     let marker = marker.as_ref();
     let mut decider =
         PluginProcess::start(bwrap, plugin, allow, marker).map_err(|e| e.to_string())?;
-    // One connection, whichever kind of endpoint was named. Both carry the read timeout `relay_one`
-    // documents as the caller's to set — the complement to the exchange budget it keeps itself:
-    // without the pair, a wedged or trickling host resource wedges the cage waiting on it.
-    let mut host: Box<dyn ReadWrite> = match host_socket {
-        crate::config::BrokerTarget::Unix(path) => {
-            let stream = std::os::unix::net::UnixStream::connect(path)
-                .map_err(|e| format!("cannot reach {}: {e}", path.display()))?;
-            let _ = stream.set_read_timeout(Some(spec.host_deadline));
-            let _ = stream.set_write_timeout(Some(spec.host_deadline));
-            Box::new(stream)
-        }
-        crate::config::BrokerTarget::Tcp { host, port } => {
-            let stream = std::net::TcpStream::connect((host.as_str(), *port)).map_err(|e| {
-                format!(
-                    "cannot reach tcp://{}:{port}: {e}",
-                    crate::allowlist::display_host(host)
-                )
-            })?;
-            let _ = stream.set_read_timeout(Some(spec.host_deadline));
-            let _ = stream.set_write_timeout(Some(spec.host_deadline));
-            // Nagle would hold a small frame back waiting for more, which on a request/response
-            // protocol is a delay measured in tens of milliseconds per exchange.
-            let _ = stream.set_nodelay(true);
-            Box::new(stream)
-        }
-    };
+    let mut host = connect_host(host_socket, spec)?;
 
     serve_exchanges(
         spec,
@@ -1571,6 +1557,148 @@ fn serve_conn(
         &plugin.name,
         first,
     )
+}
+
+/// The longest sbx waits for the host resource to take a connection: the ceiling of
+/// [`CAGE_FIRST_FRAME`], or the protocol's own deadline where that is shorter.
+///
+/// A connect is a handshake between machines. `host_deadline` is raised for a person typing at a
+/// pinentry, and nothing in a handshake waits on one, so a raised deadline does not raise this.
+/// Without a bound, a TCP endpoint that drops the handshake held the connection for the kernel's
+/// retry schedule, about two minutes, and a Unix socket whose listener stopped accepting held it
+/// for good once its backlog filled. Either held a thread, the plugin process already started for
+/// the connection and one of [`MAX_CONCURRENT_CONNS`] slots.
+fn host_connect_budget(spec: &crate::plugins::broker::BrokerSpec) -> std::time::Duration {
+    spec.host_deadline.min(CAGE_FIRST_FRAME)
+}
+
+/// One connection to the host resource, whichever kind of endpoint was named, taken within
+/// [`host_connect_budget`].
+///
+/// Both kinds carry the read timeout `relay_one` documents as the caller's to set, and a write
+/// timeout beside it: the complement to the exchange budget it keeps itself, without which a wedged
+/// or trickling host resource wedges the cage waiting on it.
+fn connect_host(
+    target: &crate::config::BrokerTarget,
+    spec: &crate::plugins::broker::BrokerSpec,
+) -> Result<Box<dyn ReadWrite>, String> {
+    let budget = host_connect_budget(spec);
+    let refused = |name: String, e: io::Error| match e.kind() {
+        // `EAGAIN` from a Unix socket's backlog, `ETIMEDOUT` from a TCP handshake.
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => format!(
+            "cannot reach {name}: it did not take the connection within {}s",
+            budget.as_secs_f32()
+        ),
+        _ => format!("cannot reach {name}: {e}"),
+    };
+    match target {
+        crate::config::BrokerTarget::Unix(path) => {
+            let stream = connect_unix_within(path, budget)
+                .map_err(|e| refused(path.display().to_string(), e))?;
+            let _ = stream.set_read_timeout(Some(spec.host_deadline));
+            let _ = stream.set_write_timeout(Some(spec.host_deadline));
+            Ok(Box::new(stream))
+        }
+        crate::config::BrokerTarget::Tcp { host, port } => {
+            let stream = connect_tcp_within(host, *port, budget).map_err(|e| {
+                refused(
+                    format!("tcp://{}:{port}", crate::allowlist::display_host(host)),
+                    e,
+                )
+            })?;
+            let _ = stream.set_read_timeout(Some(spec.host_deadline));
+            let _ = stream.set_write_timeout(Some(spec.host_deadline));
+            // Nagle would hold a small frame back waiting for more, which on a request/response
+            // protocol is a delay measured in tens of milliseconds per exchange.
+            let _ = stream.set_nodelay(true);
+            Ok(Box::new(stream))
+        }
+    }
+}
+
+/// Connect to the Unix socket at `path`, waiting at most `budget` for its listener to make room.
+///
+/// `UnixStream::connect` cannot be bounded: it makes the socket and connects it in one call, and a
+/// stream connect to a listener whose backlog is full sleeps until the backlog drains, which a
+/// listener that stopped accepting never lets happen. The kernel bounds that sleep by the
+/// connecting socket's *send* timeout, then fails with `EAGAIN`, so the socket is made here, given
+/// that timeout, and only then connected.
+fn connect_unix_within(
+    path: &std::path::Path,
+    budget: std::time::Duration,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = path.as_os_str().as_bytes();
+    // SAFETY: `sockaddr_un` is a plain C struct, for which all zeroes is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // The name and the NUL after it must fit, the rule `UnixStream::connect` applies.
+    if name.contains(&0) || name.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a socket path must hold no NUL and be shorter than a socket address allows",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in addr.sun_path.iter_mut().zip(name) {
+        *slot = *byte as libc::c_char;
+    }
+    // SAFETY: socket(2) with constant arguments; the result is checked before it is used.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by socket(2), and nothing else holds it.
+    let stream = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    stream.set_write_timeout(Some(budget))?;
+    let len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len() + 1) as libc::socklen_t;
+    loop {
+        // SAFETY: `addr` is a filled `sockaddr_un`, and `len` covers its family, the name and the
+        // NUL after it, within its size.
+        let rc =
+            unsafe { libc::connect(stream.as_raw_fd(), std::ptr::from_ref(&addr).cast(), len) };
+        if rc == 0 {
+            return Ok(stream);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Connect to `host:port` within `budget`, trying each address the name resolves to in turn, as
+/// `TcpStream::connect` does, but out of one budget for all of them.
+///
+/// The name lookup itself is the resolver's, and is bounded by the resolver's own settings rather
+/// than by this budget: the standard library offers no lookup that takes one.
+fn connect_tcp_within(
+    host: &str,
+    port: u16,
+    budget: std::time::Duration,
+) -> io::Result<std::net::TcpStream> {
+    use std::net::ToSocketAddrs;
+
+    let deadline = std::time::Instant::now() + budget;
+    let mut last = None;
+    for addr in (host, port).to_socket_addrs()? {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no address took the connection in time",
+            ));
+        }
+        match std::net::TcpStream::connect_timeout(&addr, left) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "the name resolved to no address")
+    }))
 }
 
 /// Record that a connection could not be served at all, and give back the warning that says so.
@@ -3992,6 +4120,169 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         );
         let _ = client.join();
         assert_eq!(seen, Some(vec![b"first".to_vec(), b"second".to_vec()]));
+    }
+
+    /// A host resource that takes what it is sent a byte at a time: the write-side twin of
+    /// [`TricklingHost`]. Each `write` returns well inside any socket timeout, so only a budget
+    /// for the whole message ends it. It answers nothing.
+    struct SippingHost {
+        per_byte: std::time::Duration,
+    }
+
+    impl Read for SippingHost {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for SippingHost {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(self.per_byte);
+            Ok(buf.len().min(1))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A host resource that takes a request a byte at a time does not hold an exchange past its
+    /// deadline, whether the request is the frame forwarded or a query the plugin asked for.
+    ///
+    /// The socket's write timeout bounds one `write`, and every byte taken starts it afresh, so the
+    /// write ran for as long as the request was long at the resource's pace. Below, the budget is
+    /// two hundred milliseconds and taking the request would take ten seconds. A forward that ends
+    /// this way has still begun to reach the resource, and says so.
+    #[test]
+    fn a_host_resource_taking_a_request_slowly_does_not_hold_the_exchange() {
+        let mut spec = inspecting(None);
+        spec.host_deadline = std::time::Duration::from_millis(200);
+        let request = vec![b'q'; 1000];
+        let query = Answer {
+            verdict: Verdict::Query(request.clone()),
+            expect_reply: true,
+            more: false,
+            label: None,
+        };
+
+        for (what, answer) in [("forward", ScriptedPlugin::forward()), ("query", query)] {
+            let mut host = SippingHost {
+                per_byte: std::time::Duration::from_millis(10),
+            };
+            let mut plugin = ScriptedPlugin::new(vec![answer]);
+            let mut progress = Progress::default();
+            let started = std::time::Instant::now();
+            let why = relay_one(
+                &request,
+                7,
+                &spec,
+                &mut plugin,
+                &mut host,
+                None,
+                false,
+                &mut progress,
+            )
+            .expect_err("a slow reader must not buy the exchange unbounded time");
+            assert!(
+                why.contains(super::super::deadline::WRITE_DEADLINE_PASSED),
+                "{what}: the refusal must name the budget that ended it: {why}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{what}: the exchange must end on its own budget, not on the resource's pace: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(progress.sent, what == "forward", "{what}: {progress:?}");
+        }
+    }
+
+    /// A Unix host resource whose listener stopped accepting does not hold a connection past the
+    /// connect budget.
+    ///
+    /// Once a stream listener's backlog is full, `connect` sleeps until it drains, and a listener
+    /// that never accepts never drains it: `UnixStream::connect` waited there for good. A backlog of
+    /// zero holds one connection, so the second is the one that waits.
+    #[test]
+    fn a_unix_listener_that_stopped_accepting_does_not_hold_the_connect() {
+        use std::os::fd::AsRawFd;
+
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.path().join("full.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // SAFETY: listen(2) on a listening socket this test owns; it only lowers the backlog.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = connect_unix_within(&path, std::time::Duration::from_secs(1))
+            .expect("the first connection fits the backlog");
+
+        let started = std::time::Instant::now();
+        let e = connect_unix_within(&path, std::time::Duration::from_millis(200))
+            .expect_err("the backlog is full and nobody accepts");
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the connect must end on its budget: {:?}",
+            started.elapsed()
+        );
+
+        // The broker's own connect is held to the protocol's deadline where that is shorter, and
+        // says what happened rather than quoting `EAGAIN`.
+        let mut quick = spec(None);
+        quick.host_deadline = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let Err(why) = connect_host(&crate::config::BrokerTarget::Unix(path.clone()), &quick)
+        else {
+            panic!("the backlog is still full");
+        };
+        assert!(
+            why.contains("did not take the connection within 0.2s"),
+            "{why}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // A deadline raised for a person typing does not raise the handshake's.
+        let mut patient = spec(None);
+        patient.host_deadline = std::time::Duration::from_secs(600);
+        assert_eq!(host_connect_budget(&patient), CAGE_FIRST_FRAME);
+
+        // And one that is accepted still connects, as a stream both ends can use.
+        let open = crate::testutil::TmpDir::new();
+        let path = open.path().join("open.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let mut ours = connect_unix_within(&path, std::time::Duration::from_secs(1)).expect("open");
+        let (mut theirs, _) = listener.accept().expect("accept");
+        ours.write_all(b"hi").expect("write");
+        let mut got = [0u8; 2];
+        theirs.read_exact(&mut got).expect("read");
+        assert_eq!(&got, b"hi");
+    }
+
+    /// A TCP host resource that drops the handshake does not hold a connection past the connect
+    /// budget.
+    ///
+    /// `TcpStream::connect` has no bound of its own: an endpoint that never answers the handshake
+    /// held it for the kernel's retry schedule, about two minutes. A loopback listener whose accept
+    /// queue is full drops the next handshake the same way, without leaving the machine.
+    #[test]
+    fn a_tcp_endpoint_that_drops_the_handshake_does_not_hold_the_connect() {
+        use std::os::fd::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        // SAFETY: listen(2) on a listening socket this test owns; it only lowers the backlog.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let port = listener.local_addr().expect("addr").port();
+        // Fill the accept queue, which a backlog of zero lets hold one connection.
+        let _queued = connect_tcp_within("127.0.0.1", port, std::time::Duration::from_secs(1))
+            .expect("first");
+        // Give the first handshake time to land in the queue before the second one is tried.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let e = connect_tcp_within("127.0.0.1", port, std::time::Duration::from_millis(300))
+            .expect_err("the accept queue is full and nobody accepts");
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the connect must end on its budget: {:?}",
+            started.elapsed()
+        );
     }
 
     /// A host resource that answers a byte at a time does not hold an exchange past its deadline.
