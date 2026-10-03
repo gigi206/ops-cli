@@ -82,9 +82,10 @@ pub(crate) fn read_host_color_scheme() -> Option<String> {
     // whose preference this is runs on the Windows side, which answers through a registry value
     // instead of a bus name — so the same question is asked there. A Lima guest on a Mac is the
     // same case with another answer: the Mac's agent writes the preference into a directory the
-    // guest mounts. Everywhere else this is where the read gives up, exactly as before: each branch
-    // is gated on the host being that host, so a Linux host with no portal reaches no process spawn
-    // and no file it did not reach yesterday.
+    // guest mounts. Everywhere else this is where the read gives up, as before: each branch is
+    // gated on the host being that host, so a Linux host with no portal spawns nothing and reads no
+    // theme file. What it does read is its own `/proc/self/mountinfo`, to tell it is not a Mac's
+    // guest.
     match theme_source(
         false,
         host_is_wsl(),

@@ -10,11 +10,13 @@
 #   notify   sbx in the guest drops one file per refusal into `queue/`; this script raises each
 #            one in Notification Center and removes it. The guest mounts it writable.
 #
-# `notify/queue` is the guest's to write, so nothing found there is trusted: only a regular file
-# with a name of the shape sbx gives is read, only its first bytes, with control characters taken
-# out, and both lines reach `osascript` as arguments rather than as script text. Every other entry
-# is removed unread, because launchd starts this script again for as long as the directory it
-# watches is not empty.
+# `notify/queue` is the guest's to write, so nothing found there is trusted. Each entry is first
+# renamed into a directory of the Mac's own, outside every mount, so the guest can no longer swap
+# it for a link or a FIFO between the check and the read; only then is it checked. Only a regular
+# file with a name of the shape sbx gives is read, only its first bytes, with control characters
+# taken out, and both lines reach `osascript` as arguments rather than as script text. Every other
+# entry is removed unread, because launchd starts this script again for as long as the directory
+# it watches is not empty.
 
 set -eu
 
@@ -43,11 +45,19 @@ theme() {
 
 notify() {
   queue="$SBX_BRIDGE_DIR/notify/queue"
+  work="$SBX_BRIDGE_DIR/notify-work"
   [ -d "$queue" ] || exit 0
+  # The same filesystem as the queue, so the rename below is atomic, and mounted nowhere.
+  mkdir -p "$work"
+  chmod 0700 "$work"
   raised=0
   for entry in "$queue"/* "$queue"/.[!.]* "$queue"/..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
     name=${entry##*/}
+    held="$work/$name"
+    rm -rf -- "$held"
+    mv -f -- "$entry" "$held" 2>/dev/null || { rm -rf -- "$entry"; continue; }
+    entry=$held
     case "$name" in
       *[!A-Za-z0-9._-]* | .*) ok=no ;;
       *.note) ok=yes ;;

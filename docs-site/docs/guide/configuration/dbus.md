@@ -48,6 +48,11 @@ The app probes *that* portal and gets three things:
   the desktop the host belongs to: the Windows registry under WSL, and the Mac's appearance in
   a Lima guest on macOS (see [Installation](../getting-started/installation)).
 
+  An app's **own** notifications are relayed to the host's `org.freedesktop.Notifications`
+  daemon, which a Lima guest on macOS does not run: there an app's notification call fails and
+  nothing reaches the Mac. sbx's own refusals take the Notification Center channel the guest
+  shares with the Mac instead.
+
   One file carries it: the GSettings **keyfile** the in-cage portal serves from. A Chromium/Electron
   app is its own portal client and reads the scheme straight off it. A **GTK app** reaches the same
   values, but only because sbx sets `GTK_USE_PORTAL=1` in the cage: GDK consults the settings portal
