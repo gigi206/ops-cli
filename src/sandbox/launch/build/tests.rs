@@ -87,7 +87,7 @@ fn the_project_root_is_one_of_the_binds_the_control_plane_is_pinned_against() {
         path: PathBuf::from("/srv/data"),
         writable: true,
     }];
-    let sources = pin_sources(&declared, &project);
+    let sources = pin_sources(&declared, &project, true);
 
     assert!(
         sources.iter().any(|b| b.path == Path::new("/srv/data")),
@@ -104,6 +104,28 @@ fn the_project_root_is_one_of_the_binds_the_control_plane_is_pinned_against() {
     );
 }
 
+/// It arrives in the mode it is mounted in, last, as it is mounted after the config's binds. A
+/// project inside one of sbx's roots is mounted read-only, and passed as read-write it had the
+/// directories between it and a root nested inside it pinned read-write, inside sbx's own tree.
+#[test]
+fn the_project_is_a_pin_source_in_the_mode_it_is_mounted_in() {
+    let tmp = crate::testutil::TmpDir::new();
+    let declared = vec![crate::config::Bind {
+        path: PathBuf::from("/srv/data"),
+        writable: true,
+    }];
+    for writable in [true, false] {
+        let sources = pin_sources(&declared, tmp.path(), writable);
+        let last = sources.last().expect("the project is always pushed");
+        assert_eq!(
+            last.path,
+            std::fs::canonicalize(tmp.path()).unwrap(),
+            "the project comes last: {sources:?}"
+        );
+        assert_eq!(last.writable, writable, "{sources:?}");
+    }
+}
+
 /// And it arrives canonicalized, because the roots it is tested for containment against are.
 ///
 /// A symlinked component would otherwise mean the project never looks like it contains anything.
@@ -115,7 +137,7 @@ fn the_project_root_is_canonicalized_before_it_is_pinned_against() {
     let link = tmp.path().join("via-link");
     std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-    let sources = pin_sources(&[], &link);
+    let sources = pin_sources(&[], &link, true);
     let only = sources.last().expect("the project is always pushed");
     assert_eq!(
         only.path,

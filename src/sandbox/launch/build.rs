@@ -75,11 +75,12 @@ fn optional_layer<T>(
     }
 }
 
-/// The read-write binds a launch pins its control plane against: the config's own, plus the project
-/// root.
+/// The binds a launch pins its control plane against, in the order they are mounted: the config's
+/// own, then the project root, in the mode it is mounted in (`project_writable`, read-only at or
+/// under one of sbx's roots).
 ///
 /// The project is the one that used to be missing, and it is the one most likely to contain a
-/// control-plane root. `binds::build_spec` binds it read-write at its own path *structurally* — it
+/// control-plane root. `binds::build_spec` binds it at its own path *structurally* — it
 /// is the work surface, not a configured bind — so it never appeared in `cfg.binds` and never
 /// reached [`crate::config::control_plane_pins`]. A session launched from a directory containing a
 /// root therefore handed the cage sbx's data dir, trust store and global config read-write and
@@ -92,11 +93,19 @@ fn optional_layer<T>(
 /// walk straight past the containment test. A path that cannot be canonicalized (it must exist to
 /// be a project, so this is the unusual case) is carried through as written rather than dropped —
 /// pinning on the literal path is worth more than pinning on nothing.
-fn pin_sources(binds: &[crate::config::Bind], project: &Path) -> Vec<crate::config::Bind> {
+///
+/// The mode matters: a project inside one of sbx's roots that contains another (the trust store
+/// under the config home) was passed as read-write, and the directories between the two were
+/// pinned read-write inside sbx's own tree.
+fn pin_sources(
+    binds: &[crate::config::Bind],
+    project: &Path,
+    project_writable: bool,
+) -> Vec<crate::config::Bind> {
     let mut sources = binds.to_vec();
     sources.push(crate::config::Bind {
         path: std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf()),
-        writable: true,
+        writable: project_writable,
     });
     sources
 }
@@ -2217,6 +2226,7 @@ struct FsMasks {
 /// A session that ran anyway would leave open exactly the files the config asked to close.
 fn stage_fs_masks(
     prep: &Prepared,
+    project_writable: bool,
     extra_binds: &mut Vec<binds::ExtraBind>,
 ) -> Result<FsMasks, ExitCode> {
     // Close the project paths `[fs]` names. Emitted among the launcher's extra binds — that is,
@@ -2240,7 +2250,6 @@ fn stage_fs_masks(
     // A built-in directory mask may name a directory that is not there yet (a hooks directory git
     // has not made); it is made now, empty, or the launch refuses, since an unbound mask would
     // leave the cage free to create it and fill it.
-    let root = prep.cwd.canonicalize().unwrap_or_else(|_| prep.cwd.clone());
     if let Err(e) = crate::sandbox::fsmask::create_absent_dirs(&fs_masks) {
         crate::diag::error(&format!(
             "sbx: cannot prepare a directory the cage must not write ({e}) — refusing to launch \
@@ -2255,9 +2264,6 @@ fn stage_fs_masks(
         let dir = crate::sandbox::fsmask::mask_dir(prep.layout.data_dir(), std::process::id());
         match crate::sandbox::fsmask::stage_decoys(&dir) {
             Ok(decoys) => {
-                // The rule the project mount itself follows: read-only at or under one of sbx's own
-                // control-plane roots, read-write everywhere else.
-                let project_writable = crate::config::control_plane_root_of(&root).is_none();
                 fs_binds =
                     crate::sandbox::fsmask::agent_binds(&fs_masks, &decoys, project_writable);
                 extra_binds.extend(fs_binds.iter().cloned());
@@ -2796,8 +2802,16 @@ pub(super) fn build(
     }
     extra_binds.extend(plumbing_pins(&prep.userland, &gui_programs, &prep.layout));
 
+    // The mode the project is mounted in, which the masks and the pins below both follow: read-only
+    // at or under one of sbx's own control-plane roots, read-write everywhere else, as
+    // `binds::build_spec` mounts it.
+    let project_writable = crate::config::control_plane_root_of(
+        &prep.cwd.canonicalize().unwrap_or_else(|_| prep.cwd.clone()),
+    )
+    .is_none();
+
     // The `[fs]` masks, staged and bound over the project paths they close.
-    let fs = stage_fs_masks(prep, &mut extra_binds)?;
+    let fs = stage_fs_masks(prep, project_writable, &mut extra_binds)?;
 
     // Pin sbx's own control plane in place whenever a read-write bind contains it: each root's host
     // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
@@ -2841,7 +2855,7 @@ pub(super) fn build(
     // Canonicalized to match: `sbx_control_plane_roots` resolves symlinks, and a bind is compared
     // against them canonicalized, so a symlinked `$HOME` component would otherwise walk past the
     // containment test.
-    let sources = pin_sources(&prep.cfg.binds, &prep.cwd);
+    let sources = pin_sources(&prep.cfg.binds, &prep.cwd, project_writable);
     let pins = crate::config::control_plane_pins(&sources);
     match pin_decoy(prep.layout.data_dir(), fs.decoys.as_ref(), &pins, &sources)
         .and_then(|decoy| establish_control_plane_pins(&pins, &sources, decoy.as_deref()))
