@@ -24,10 +24,10 @@
 //!   ends as the signal asked), but not a `SIGKILL` (a stop with `--delay 0`, or
 //!   one whose delay runs out), a `SIGHUP`, or a `SIGTERM` that arrives while the
 //!   relay is stuck in the write below, which never returns to read it;
-//! - the relay is single-threaded with a blocking `write_all` to the master, so a
-//!   pathological simultaneous flood (the inner shell not draining its input while
-//!   also flooding output) could stall it. Humans don't trigger it and `script(1)`
-//!   shares the limitation; a split-direction or non-blocking relay is the fix.
+//! - the relay never waits on the cage (its master is non-blocking, and input the
+//!   cage has not taken waits in a bounded buffer), but it does wait on its own
+//!   standard output, shared with whatever else writes the terminal: one that
+//!   stops taking output stalls it.
 //!
 //! What lives where. The pipeline itself stays in this file: the [`Prepared`] prerequisites, the
 //! `prepare*` chain that fills them, the launch-mode decision, and the `run`/`app`/`mise` verbs.

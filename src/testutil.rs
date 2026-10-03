@@ -312,7 +312,7 @@ pub(crate) fn run_within(command: &mut std::process::Command, what: &str) -> Ran
 }
 
 /// What is already queued on `pipe`, read without waiting for more.
-fn queued(mut pipe: impl std::io::Read + std::os::fd::AsRawFd) -> String {
+pub(crate) fn queued(mut pipe: impl std::io::Read + std::os::fd::AsRawFd) -> String {
     let fd = pipe.as_raw_fd();
     // SAFETY: plain integer arguments on a descriptor this process holds.
     unsafe {

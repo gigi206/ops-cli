@@ -47,6 +47,11 @@ const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
 /// How often the relay asks whether the child has exited when it has no pidfd to wait on.
 const EXIT_POLL_MS: libc::c_int = 200;
 
+/// The most input the relay holds for a child that has not taken it yet. Far above what anyone
+/// types; a paste larger than this into a program that reads slowly waits on the terminal instead,
+/// and a graphical cage, which never reads its input, has the rest dropped.
+const PENDING_INPUT_MAX: usize = 64 * 1024;
+
 /// Relay bytes between the real terminal and the pty master until the child exits, then reap it
 /// and return its exit status code, or until this process is asked to stop. `signals_fd` is the
 /// read end of the [`SignalRelay`]'s self-pipe (or `-1` when it could not be installed — `poll`
@@ -59,12 +64,32 @@ const EXIT_POLL_MS: libc::c_int = 200;
 /// shell had exited, and sent what the operator typed next into the cage. So the child is watched
 /// through a pidfd (or, where the kernel offers none, asked every [`EXIT_POLL_MS`]), and once it
 /// has exited the relay passes on what it left in the pty and stops.
+///
+/// The relay never waits on the child. The master is non-blocking, and input the child has not
+/// taken yet waits in a buffer of at most [`PENDING_INPUT_MAX`] bytes; while it is full the terminal
+/// is not read, so nothing is lost, except in a graphical cage, whose input is still read so that a
+/// double Ctrl+C is seen, and what does not fit is dropped, said once. A child that stopped reading
+/// its input therefore stalls none of its output, its resizes or a stop. What the relay does wait
+/// on is its own standard output, shared with whatever else writes the terminal: one that stops
+/// taking output stalls it.
 pub(crate) fn pump(
     master: libc::c_int,
     child: libc::pid_t,
     signals_fd: libc::c_int,
     gui: bool,
 ) -> io::Result<Ended> {
+    // On the master alone: the slave was opened with the same flags, and it is the child's own
+    // standard input, which must keep blocking.
+    // SAFETY: `fcntl` reads the status flags of the master this relay was handed.
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    // SAFETY: and sets them back on the same descriptor with `O_NONBLOCK` added.
+    let set =
+        flags >= 0 && unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0;
+    if !set {
+        let e = io::Error::last_os_error();
+        let _ = terminate_and_reap(child);
+        return Err(e);
+    }
     // SAFETY: `pidfd_open` takes a pid and flags and returns a fresh descriptor, or -1 where the
     // kernel or a filter refuses it. `child` is unreaped, so the pid still names it.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) } as libc::c_int;
@@ -135,11 +160,29 @@ fn pump_until_exit(
     // For a GUI cage: the instant of the last unescalated Ctrl+C, so a second within the window
     // force-quits (a graphical app ignores the forwarded SIGINT). `None` outside a GUI cage.
     let mut last_ctrl_c: Option<Instant> = None;
+    // Input read from the terminal that the master has not taken yet, and whether dropping some of
+    // it in a graphical cage has been said.
+    let mut pending: Vec<u8> = Vec::new();
+    let mut said_dropped = false;
 
     loop {
+        // What this round waits for. The terminal is read while what it gives has room, and always
+        // in a graphical cage; the master is asked for room only while input waits, since a writable
+        // master is otherwise always ready and the poll would spin. A paused stdin is a negative
+        // descriptor rather than no events, because a hangup is reported whatever is asked.
+        fds[0].fd = if stdin_open && (gui || pending.len() < PENDING_INPUT_MAX) {
+            0
+        } else {
+            -1
+        };
+        fds[1].events = match pending.is_empty() {
+            true => libc::POLLIN,
+            false => libc::POLLIN | libc::POLLOUT,
+        };
         // SAFETY: `fds` is a live stack array of `pollfd`s and the count passed is its own length,
-        // so `poll` writes `revents` only within it. An entry set to `-1` (stdin after EOF, an
-        // absent signal relay or pidfd) is skipped by the kernel rather than dereferenced.
+        // so `poll` writes `revents` only within it. An entry set to `-1` (stdin after EOF or while
+        // its input waits, an absent signal relay or pidfd) is skipped by the kernel rather than
+        // dereferenced.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -164,9 +207,10 @@ fn pump_until_exit(
             }
         }
 
-        // master -> stdout. Quit when the master closes (the child exited), which
-        // on Linux surfaces as EIO rather than a clean EOF.
-        if fds[1].revents != 0 {
+        // master -> stdout. Quit when the master closes (the child exited), which on Linux
+        // surfaces as EIO rather than a clean EOF. Read only on what says there is something to
+        // read: a master that is merely writable has nothing, and its `EAGAIN` is not an end.
+        if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             // SAFETY: `master` is the pty master this relay was handed, closed by the caller only
             // after `pump` returns; `buf` is a live stack array and the length passed is its own.
             let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
@@ -179,13 +223,26 @@ fn pump_until_exit(
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                break; // EIO: end of session
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    break; // EIO: end of session
+                }
             }
         }
 
-        // stdin -> master. When the user's stdin ends, stop forwarding it but
-        // keep relaying the master until the child exits.
-        if stdin_open && fds[0].revents != 0 {
+        // pending input -> master, as much as it takes now. A failed write is not an end: a child
+        // that has gone ends the relay through the master's read or its pidfd.
+        if fds[1].revents & libc::POLLOUT != 0 && !pending.is_empty() {
+            // SAFETY: `master` is open as above, and the pointer and length are those of the live
+            // `pending` buffer, which `write` only reads.
+            let n = unsafe { libc::write(master, pending.as_ptr().cast(), pending.len()) };
+            if n > 0 {
+                pending.drain(..n as usize);
+            }
+        }
+
+        // stdin -> pending input. When the user's stdin ends, stop reading it but keep passing on
+        // what waits and relaying the master until the child exits.
+        if fds[0].fd >= 0 && fds[0].revents != 0 {
             // SAFETY: fd 0 is the process's own stdin, which the relay never closes — an EOF
             // neutralizes only the `pollfd` entry — and `buf` is a live stack array bounded by its
             // own length.
@@ -214,8 +271,16 @@ fn pump_until_exit(
                         CtrlC::None => {}
                     }
                 }
-                // best-effort: if the child is gone, the master read above ends us
-                let _ = write_all(master, chunk);
+                // Every byte above was looked at for the double Ctrl+C; what is kept is what fits.
+                let room = PENDING_INPUT_MAX.saturating_sub(pending.len());
+                pending.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                if chunk.len() > room && !said_dropped {
+                    said_dropped = true;
+                    let _ = write_all(
+                        2,
+                        b"\r\nsbx: this graphical session is not reading its input; what does not fit is dropped.\r\n",
+                    );
+                }
             } else if n == 0 || !retryable(&io::Error::last_os_error()) {
                 stdin_open = false;
                 fds[0].fd = -1; // poll ignores a negative fd
@@ -838,86 +903,292 @@ mod tests {
         );
     }
 
-    /// A stop that arrives while the relay runs gives the terminal back before the process ends,
-    /// and the process still ends as the signal asked. Run alone, with a terminal of this test's own
-    /// for its standard input, so raw mode has something to change and to put back.
-    #[test]
-    fn a_stop_while_the_relay_runs_gives_the_terminal_back() {
-        use std::io::Read as _;
-        use std::os::fd::FromRawFd as _;
-        use std::os::unix::process::ExitStatusExt as _;
-        let (master, slave) = open_pty_pair(None).expect("a terminal for the process run alone");
-        // SAFETY: all-zero is a valid `termios`, and `tcgetattr` fills it from the slave this test
-        // opened before anything reads it.
-        let mut before: libc::termios = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::tcgetattr(slave, &mut before) }, 0);
-        // SAFETY: `dup` hands back a fresh descriptor for the slave, owned from here on and given
-        // to the process run alone as its standard input.
-        let stdin = unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave)) };
-        let mut run = crate::testutil::alone(concat!(module_path!(), "::a_relay_told_to_stop"), "")
-            .stdin(std::process::Stdio::from(stdin))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("the process run alone starts");
-        // The child behind the relay says it runs through the pty, so the relay is pumping, its
-        // handler installed, by the time this reads the word.
-        let mut out = run.stdout.take().expect("its output");
-        let (ready, heard) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            let mut chunk = [0u8; 256];
-            while let Ok(n) = out.read(&mut chunk) {
-                if n == 0 {
-                    break;
+    /// A process run alone with a terminal of this test's own for its standard input, so a relay in
+    /// it has something to put in raw mode and to give back, and its standard output read on a
+    /// thread: what the stop and flood tests share.
+    struct OnTerminal {
+        run: std::process::Child,
+        master: libc::c_int,
+        slave: libc::c_int,
+        before: libc::termios,
+        heard: std::sync::mpsc::Receiver<Vec<u8>>,
+        seen: Vec<u8>,
+    }
+
+    /// How a process run [`OnTerminal`] ended.
+    struct Ending {
+        ended: bool,
+        status: std::process::ExitStatus,
+        after: libc::termios,
+        errors: String,
+    }
+
+    impl OnTerminal {
+        fn start(entry: &str) -> Self {
+            use std::io::Read as _;
+            use std::os::fd::FromRawFd as _;
+            let (master, slave) = open_pty_pair(None).expect("a terminal for the process run");
+            // SAFETY: all-zero is a valid `termios`, and `tcgetattr` fills it from the slave this
+            // test opened before anything reads it.
+            let mut before: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(slave, &mut before) }, 0);
+            // SAFETY: `dup` hands back a fresh descriptor for the slave, owned from here on and
+            // given to the process run alone as its standard input.
+            let stdin = unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave)) };
+            let mut run = crate::testutil::alone(entry, "")
+                .stdin(std::process::Stdio::from(stdin))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("the process run alone starts");
+            let mut out = run.stdout.take().expect("its output");
+            let (tell, heard) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = out.read(&mut chunk) {
+                    if n == 0 || tell.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
                 }
-                seen.extend_from_slice(&chunk[..n]);
-                if seen.windows(5).any(|w| w == b"ready") {
-                    let _ = ready.send(());
-                    seen.clear();
+            });
+            OnTerminal {
+                run,
+                master,
+                slave,
+                before,
+                heard,
+                seen: Vec::new(),
+            }
+        }
+
+        /// How many times `word` is in what the process relayed so far.
+        fn count(&mut self, word: &[u8]) -> usize {
+            while let Ok(chunk) = self.heard.try_recv() {
+                self.seen.extend(chunk);
+            }
+            self.seen.windows(word.len()).filter(|w| *w == word).count()
+        }
+
+        /// Whether `word` has been relayed `times` times in all within `within`.
+        fn hear(&mut self, word: &[u8], times: usize, within: Duration) -> bool {
+            let deadline = Instant::now() + within;
+            while self.count(word) < times {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.heard.recv_timeout(left) {
+                    Ok(chunk) => self.seen.extend(chunk),
+                    Err(_) => return false,
                 }
             }
-        });
-        let was_ready = heard.recv_timeout(Duration::from_secs(10)).is_ok();
-        if was_ready {
-            // SAFETY: the process this test started, not yet reaped; `kill` takes two integers.
-            unsafe { libc::kill(run.id() as libc::pid_t, libc::SIGTERM) };
+            true
         }
-        let pidfd = crate::session::open_pidfd(run.id()).expect("a pidfd for the process run");
-        let ended = crate::session::wait_for_exit(pidfd, Duration::from_secs(10));
-        crate::session::close_fd(pidfd);
-        if !ended {
-            let _ = run.kill();
+
+        /// Send `signal` if there is one, give the process `within` to end, killing it past that,
+        /// and say how it ended.
+        fn end(&mut self, signal: Option<libc::c_int>, within: Duration) -> Ending {
+            if let Some(signal) = signal {
+                // SAFETY: the process this test started, not yet reaped; two integers.
+                unsafe { libc::kill(self.run.id() as libc::pid_t, signal) };
+            }
+            let pidfd = crate::session::open_pidfd(self.run.id()).expect("a pidfd for the process");
+            let ended = crate::session::wait_for_exit(pidfd, within);
+            crate::session::close_fd(pidfd);
+            if !ended {
+                let _ = self.run.kill();
+            }
+            let status = self.run.wait().expect("the process run alone is reaped");
+            // SAFETY: as for `before`, on the same slave, which this test still holds.
+            let mut after: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(self.slave, &mut after) }, 0);
+            let errors = self
+                .run
+                .stderr
+                .take()
+                .map(crate::testutil::queued)
+                .unwrap_or_default();
+            Ending {
+                ended,
+                status,
+                after,
+                errors,
+            }
         }
-        let status = run.wait().expect("the process run alone is reaped");
-        // SAFETY: as for `before`, on the same slave, which this test still holds.
-        let mut after: libc::termios = unsafe { std::mem::zeroed() };
-        let read_after = unsafe { libc::tcgetattr(slave, &mut after) };
-        // SAFETY: the pair this test opened, closed once and used nowhere else.
+
+        /// Whether the terminal's settings after are the ones from before the process ran.
+        fn given_back(&self, ending: &Ending) -> bool {
+            let (a, b) = (&ending.after, &self.before);
+            (a.c_iflag, a.c_oflag, a.c_cflag, a.c_lflag)
+                == (b.c_iflag, b.c_oflag, b.c_cflag, b.c_lflag)
+        }
+
+        /// Type `bytes` of `fill` on the terminal from a thread, without ever blocking, until all
+        /// are written or `within` passes; the thread hands back how many went in.
+        fn flood(
+            &self,
+            fill: u8,
+            bytes: usize,
+            within: Duration,
+        ) -> std::thread::JoinHandle<usize> {
+            // SAFETY: `dup` gives the thread a descriptor of its own for the master, closed there.
+            let fd = unsafe { libc::dup(self.master) };
+            // SAFETY: `fcntl` sets non-blocking on the open file both descriptors share, which only
+            // this test writes.
+            unsafe {
+                libc::fcntl(
+                    fd,
+                    libc::F_SETFL,
+                    libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+                )
+            };
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + within;
+                let chunk = vec![fill; 4096];
+                let mut written = 0;
+                while written < bytes && Instant::now() < deadline {
+                    // SAFETY: `fd` is this thread's own descriptor, and the pointer and length are
+                    // those of the live `chunk`.
+                    let n = unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) };
+                    if n > 0 {
+                        written += n as usize;
+                    } else {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                // SAFETY: the descriptor `dup` gave this thread; its only close.
+                unsafe { libc::close(fd) };
+                written
+            })
+        }
+    }
+
+    impl Drop for OnTerminal {
+        fn drop(&mut self) {
+            let _ = self.run.kill();
+            let _ = self.run.wait();
+            // SAFETY: the pair this test opened, closed once and used nowhere else.
+            unsafe {
+                libc::close(self.slave);
+                libc::close(self.master);
+            }
+        }
+    }
+
+    /// The child the flood tests relay: it takes the pty as its terminal, in raw mode so what is
+    /// typed is not dropped at a line's end but waits, never reads it, and says `tick` every tenth
+    /// of a second for at most twenty seconds.
+    fn ticks_and_reads_nothing(slave: libc::c_int) -> std::convert::Infallible {
+        // SAFETY: `login_tty`, `tcgetattr`, `cfmakeraw`, `tcsetattr`, `write`, `usleep` and `_exit`
+        // are async-signal-safe or pure, on a local `termios` and constant bytes; nothing here
+        // allocates.
         unsafe {
-            libc::close(slave);
-            libc::close(master);
+            if libc::login_tty(slave) == 0 {
+                let mut raw: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(0, &mut raw) == 0 {
+                    libc::cfmakeraw(&mut raw);
+                    libc::tcsetattr(0, libc::TCSANOW, &raw);
+                }
+                let tick = b"tick\n";
+                for _ in 0..200 {
+                    libc::write(1, tick.as_ptr().cast(), tick.len());
+                    libc::usleep(100_000);
+                }
+            }
+            libc::_exit(0)
         }
-        let mut errors = String::new();
-        let _ = run.stderr.take().map(|mut e| e.read_to_string(&mut errors));
-        assert!(was_ready, "the relay never ran: {errors}");
-        assert!(ended, "the process did not end on the stop: {errors}");
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGTERM),
-            "it ends as the signal asked, not by returning: {status} {errors}"
+    }
+
+    /// A stop that arrives while the relay runs gives the terminal back before the process ends,
+    /// and the process still ends as the signal asked.
+    #[test]
+    fn a_stop_while_the_relay_runs_gives_the_terminal_back() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut term = OnTerminal::start(concat!(module_path!(), "::a_relay_told_to_stop"));
+        // The child behind the relay says it runs through the pty, so the relay is pumping, its
+        // handler installed, by the time this hears the word.
+        let ran = term.hear(b"ready", 1, Duration::from_secs(10));
+        let ending = term.end(ran.then_some(libc::SIGTERM), Duration::from_secs(10));
+        let errors = &ending.errors;
+        assert!(ran, "the relay never ran: {errors}");
+        assert!(
+            ending.ended,
+            "the process did not end on the stop: {errors}"
         );
-        assert_eq!(read_after, 0);
         assert_eq!(
-            (after.c_iflag, after.c_oflag, after.c_cflag, after.c_lflag),
-            (
-                before.c_iflag,
-                before.c_oflag,
-                before.c_cflag,
-                before.c_lflag
-            ),
+            ending.status.signal(),
+            Some(libc::SIGTERM),
+            "it ends as the signal asked, not by returning: {} {errors}",
+            ending.status
+        );
+        assert!(
+            term.given_back(&ending),
             "the terminal is given back as it was: {errors}"
         );
+    }
+
+    /// A child that stopped reading its input stalls none of its output and no stop, however much
+    /// is typed: the relay holds what the child has not taken, stops reading the terminal once that
+    /// is full, and goes on relaying. The flood goes past what the relay holds, so a relay that
+    /// wrote to the child until it took everything would stall here.
+    #[test]
+    fn a_child_that_reads_nothing_stalls_neither_its_output_nor_a_stop() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut term = OnTerminal::start(concat!(
+            module_path!(),
+            "::a_relay_under_a_child_that_reads_nothing"
+        ));
+        let ran = term.hear(b"tick", 1, Duration::from_secs(10));
+        let flood = term.flood(b'a', 1 << 20, Duration::from_secs(2));
+        let typed = flood.join().expect("the flood");
+        let ticks = term.count(b"tick");
+        let relaying = term.hear(b"tick", ticks + 5, Duration::from_secs(3));
+        let ending = term.end(Some(libc::SIGTERM), Duration::from_secs(10));
+        let errors = &ending.errors;
+        assert!(ran, "the relay never ran: {errors}");
+        assert!(
+            typed >= PENDING_INPUT_MAX,
+            "the flood fills what the relay holds: {typed} bytes typed"
+        );
+        assert!(
+            relaying,
+            "the child's output stops once it is flooded: {errors}"
+        );
+        assert!(
+            ending.ended,
+            "a stop does not end a flooded relay: {errors}"
+        );
+        assert_eq!(ending.status.signal(), Some(libc::SIGTERM), "{errors}");
+        assert!(
+            term.given_back(&ending),
+            "the terminal is given back: {errors}"
+        );
+    }
+
+    /// In a graphical cage, which never reads its input, the terminal is read whatever the flood, so
+    /// a double Ctrl+C typed after it still force-quits; what does not fit is dropped, and said.
+    #[test]
+    fn a_graphical_child_that_reads_nothing_can_still_be_force_quit() {
+        let mut term = OnTerminal::start(concat!(
+            module_path!(),
+            "::a_graphical_relay_under_a_child_that_reads_nothing"
+        ));
+        let ran = term.hear(b"tick", 1, Duration::from_secs(10));
+        let typed = term
+            .flood(b'a', 4 * PENDING_INPUT_MAX, Duration::from_secs(4))
+            .join()
+            .expect("the flood");
+        let ctrl_c = [0x03u8, 0x03];
+        // SAFETY: the master this test holds, and a two-byte local array.
+        let sent = unsafe { libc::write(term.master, ctrl_c.as_ptr().cast(), ctrl_c.len()) };
+        let ending = term.end(None, Duration::from_secs(10));
+        let errors = &ending.errors;
+        assert!(ran, "the relay never ran: {errors}");
+        assert!(
+            typed >= 4 * PENDING_INPUT_MAX,
+            "a graphical relay reads the whole flood: {typed} bytes typed"
+        );
+        assert_eq!(sent, 2);
+        assert!(ending.ended, "the double Ctrl+C was not seen: {errors}");
+        assert!(errors.contains("force-quitting"), "{errors}");
+        assert!(errors.contains("what does not fit is dropped"), "{errors}");
     }
 
     /// The relay ends on the child's exit, not on the last copy of the slave closing, and passes on
@@ -1140,6 +1411,34 @@ mod tests {
                 "the child must be stopped and reaped, not left running or a zombie"
             );
             Ok(())
+        });
+    }
+
+    /// The relay run by [`a_child_that_reads_nothing_stalls_neither_its_output_nor_a_stop`];
+    /// anywhere else it does nothing. Only the stop ends it.
+    #[test]
+    #[ignore = "run alone by the test that floods it, on a terminal of that test's own"]
+    fn a_relay_under_a_child_that_reads_nothing() {
+        crate::testutil::when_run_alone(|_| {
+            // SAFETY: the child honours the async-signal-safe contract and never returns.
+            let result = unsafe { fork_with_pty(false, ticks_and_reads_nothing) };
+            Err(io::Error::other(format!(
+                "the relay returned instead of ending as the stop asked: {result:?}"
+            )))
+        });
+    }
+
+    /// The relay run by [`a_graphical_child_that_reads_nothing_can_still_be_force_quit`]; anywhere
+    /// else it does nothing. The double Ctrl+C ends it with the child's code.
+    #[test]
+    #[ignore = "run alone by the test that floods it, on a terminal of that test's own"]
+    fn a_graphical_relay_under_a_child_that_reads_nothing() {
+        crate::testutil::when_run_alone(|_| {
+            // SAFETY: the child honours the async-signal-safe contract and never returns.
+            match unsafe { fork_with_pty(true, ticks_and_reads_nothing) } {
+                Ok(_) => Ok(()),
+                Err(e) => Err(io::Error::other(format!("the relay failed: {e:?}"))),
+            }
         });
     }
 
