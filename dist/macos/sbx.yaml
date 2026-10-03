@@ -5,9 +5,9 @@
 # here is an ordinary Linux sbx inside an ordinary Linux kernel; macOS is the host at the end of
 # the bridges, the same way Windows is for a WSL2 distribution. Nothing in sbx is macOS-aware.
 #
-# WHERE THIS IS SUPPORTED. macOS x86_64 with Lima 2.2.1. Apple Silicon is not verified, and
-# neither are the window and the sound below, which follow Lima's source. `sbx doctor` inside the
-# guest is what decides, and `.github/workflows/macos.yml` is what runs it.
+# WHERE THIS IS SUPPORTED. macOS x86_64 with Lima 2.2.1, the window and the sound below included.
+# Apple Silicon is not verified. `sbx doctor` inside the guest is what decides, and
+# `.github/workflows/macos.yml` is what runs it.
 
 # Ubuntu images, and those alone. Lima's `default.yaml` inherits `_images/ubuntu` and
 # `_default/mounts` together, and that second one mounts the whole of `~`: inheriting it would
@@ -72,12 +72,14 @@ video:
   display: "vz"
 
 audio:
-  # virtio-sound. Muted by default, and Lima warns that the field is experimental.
+  # virtio-sound, played through the Mac's default output. Lima's own default is no device at all,
+  # and Lima marks the field experimental. What reaches the cage is a PulseAudio socket, so the
+  # guest also needs a sound server, which the last provisioning step installs.
   device: "vz"
 
 provision:
   # Lima's own documentation: provisioning scripts "need to be idempotent because they might be
-  # called multiple times, e.g. when the host VM is being restarted". Both scripts below are
+  # called multiple times, e.g. when the host VM is being restarted". Every script below is
   # written to be re-entrant rather than one-shot.
   - mode: system
     script: |
@@ -209,3 +211,73 @@ provision:
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq
       apt-get install -y -qq bubblewrap ca-certificates
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      # The desktop half of the guest: a Wayland compositor on the window Lima opens, and a sound
+      # server behind the virtio-sound device, so `gui = "wayland"` and `audio = true` behave as
+      # they do on a Linux desktop without anything being set up by hand.
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get install -y -qq weston seatd pipewire pipewire-pulse wireplumber
+
+      user="{{.User}}"
+      uid="$(id -u "$user")"
+      group="$(id -gn "$user")"
+
+      # The guest user reaches the display and the sound card through its primary group. A
+      # supplementary group added here would reach neither the user manager, already running
+      # because Lima enables lingering, nor the SSH session every `limactl shell`, and so every
+      # sbx launch, is made in; the primary group is carried by both from the start. The render
+      # node is included so a cage under `gpu = true` can open it, the cage keeping the gid.
+      install -m 0644 /dev/stdin /etc/udev/rules.d/70-sbx-guest-user.rules <<EOF
+      SUBSYSTEM=="sound", GROUP="$group"
+      SUBSYSTEM=="drm", KERNEL=="card[0-9]*|renderD[0-9]*", GROUP="$group"
+      EOF
+      udevadm control --reload
+      udevadm trigger --action=change --subsystem-match=sound --subsystem-match=drm
+      udevadm settle
+
+      # seatd hands the compositor the display and the input devices. Ubuntu's unit grants its
+      # socket to `video`; the drop-in grants it to the same primary group instead.
+      install -D -m 0644 /dev/stdin /etc/systemd/system/seatd.service.d/sbx.conf <<EOF
+      [Service]
+      ExecStart=
+      ExecStart=/usr/sbin/seatd -g $group
+      EOF
+
+      # Weston on the guest's display, under a fixed socket name the wrapper looks for. The idle
+      # timeout is disabled because the screen it would blank is the Mac's window onto the guest.
+      install -D -m 0644 /dev/stdin /etc/sbx/weston.ini <<'EOF'
+      [core]
+      idle-time=0
+      EOF
+      install -m 0644 /dev/stdin /etc/systemd/system/sbx-weston.service <<EOF
+      [Unit]
+      Description=Wayland compositor on the Lima display, for sbx
+      ConditionPathExists=/dev/dri/card0
+      Requires=seatd.service user-runtime-dir@$uid.service
+      After=seatd.service user-runtime-dir@$uid.service systemd-udev-settle.service
+
+      [Service]
+      User=$user
+      Environment=XDG_RUNTIME_DIR=/run/user/$uid LIBSEAT_BACKEND=seatd
+      ExecStart=/usr/bin/weston --backend=drm --socket=wayland-sbx --config=/etc/sbx/weston.ini
+      Restart=on-failure
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      # The compositor takes the display tty1's console was drawn on.
+      systemctl disable --now getty@tty1.service 2>/dev/null || true
+      systemctl daemon-reload
+      systemctl enable seatd.service sbx-weston.service
+      systemctl restart seatd.service sbx-weston.service
+
+      # PipeWire runs in the user manager and opened the sound card before the rule above gave the
+      # user access to it, so it is restarted to open it again. A failure here leaves sound off
+      # and nothing else, so it never fails the provisioning that the instance's READY waits on.
+      systemctl --machine="$user@.host" --user restart pipewire pipewire-pulse wireplumber \
+        2>/dev/null || true

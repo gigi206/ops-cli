@@ -39,13 +39,12 @@ before the first WSLg client runs and on a distro that never publishes it. sbx t
 runtime-dir path first, and falls back to WSLg's own path when the kernel is a WSL one. A distro
 publishing its own socket still answers for itself, because the runtime-dir candidate comes first.
 
-Under a Lima guest on macOS the shape is different again, and it needs one thing done in the
-guest. `audio.device: vz` gives the guest a virtio-sound device, which is an ALSA device; the
-socket this posture binds is a PulseAudio one. A stock cloud image runs no sound server in the
-user session, so there is no socket to bind and the posture has nothing to work with. Install
-and start one in the guest (PipeWire with `pipewire-pulse`, or PulseAudio) and everything below
-applies unchanged, because what reaches the cage is then an ordinary Linux sound server on an
-ordinary Linux host.
+Under a Lima guest on macOS the guest created from the template this repository ships runs
+PipeWire with `pipewire-pulse` behind a virtio-sound device played through the Mac's default
+output, so everything below applies unchanged: what reaches the cage is an ordinary Linux
+sound server on an ordinary Linux host. Playback only: Lima 2.2.1 attaches no capture stream,
+so the guest has no microphone to offer. See
+[Running under Lima](../getting-started/installation#running-under-lima-macos).
 
 **For a native PulseAudio client** (Chromium/Electron): the **PulseAudio client library**
 (`libpulse.so.0`) is provisioned into sbx's own store and put on the app's loader search path

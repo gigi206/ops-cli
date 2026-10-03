@@ -197,8 +197,11 @@ On macOS the script downloads no binary. It reads the Lima template and the wrap
 repository ships at the release's tag, creates a Lima instance named `sbx` from the
 template for that release, starts it, and installs the wrapper at `~/.local/bin/sbx`,
 saying so when that directory is not on your `PATH`. The first start downloads an image
-and provisions the guest, which takes a few minutes. An instance named `sbx` that already
-exists is kept as it is: running the script again only reinstalls the wrapper. The
+and provisions the guest, including its compositor and sound server, which takes a few
+minutes. An instance named `sbx` that already exists is kept as it is: running the script
+again only reinstalls the wrapper, and an instance keeps the template it was created
+from, so a newer template reaches it only by `limactl delete sbx` and running the script
+again. The
 template and the wrapper carry no checksum; they come from the same origin as the script
 itself.
 
@@ -222,6 +225,16 @@ Then `cd` into a project under that subtree and run `sbx` as you would anywhere:
 ```sh
 cd ~/Projects/my-app
 sbx run -- npm test
+```
+
+The global configuration is the guest's, under the guest's home, and a file of that name on
+the Mac is read by nothing. It is written through the wrapper like any other command, from a
+directory under the shared subtree:
+
+```sh
+cd ~/Projects/my-app
+sbx config set -g gui wayland
+sbx config set -g audio true
 ```
 
 **The guest sees one subtree of your home, and that is a deliberate narrowing.** Lima's
@@ -271,18 +284,21 @@ Three differences from a native host are worth knowing before they surprise you:
 
 - **The window shows the whole guest screen, not one window per application.** With
   `vmType: vz`, Lima opens a native macOS window and draws the guest's framebuffer in it,
-  at a fixed 1920 by 1200. A `gui = "wayland"` posture binds the compositor socket of the
-  *guest*, exactly as on Linux, so what you need in the guest is a Wayland compositor; the
-  window then shows that compositor's screen with the caged application inside it. This is
-  not what WSLg does, which publishes each window onto the Windows desktop with its own
-  taskbar entry. `sbx` writes no display code either way, and there is no VNC involved.
-  X11 is not offered here for the same reason it is not offered anywhere else in `sbx`:
-  an X client can snoop and drive every other window on the same display.
-- **Sound needs a sound server in the guest.** `audio.device: vz` gives the guest a
-  virtio-sound device, which is an ALSA device. The `audio = true` posture binds a
-  PulseAudio socket, so a stock cloud image, which runs no sound server in the user
-  session, has no socket for it to bind. Install and start one in the guest (PipeWire with
-  `pipewire-pulse`, or PulseAudio) and the posture behaves as it does on any Linux host.
+  at a fixed 1920 by 1200. The template runs Weston on that display, under the socket name
+  `wayland-sbx`, and the wrapper points a launch at it, so a `gui = "wayland"` posture binds
+  the compositor socket of the *guest*, exactly as on Linux, and the caged application
+  appears inside that window. This is not what WSLg does, which publishes each window onto
+  the Windows desktop with its own taskbar entry. `sbx` writes no display code either way,
+  and there is no VNC involved. Weston's keyboard layout is US. X11 is not offered here for the same reason it is not
+  offered anywhere else in `sbx`: an X client can snoop and drive every other window on the
+  same display.
+- **Sound plays through the Mac, and there is no microphone yet.** `audio.device: vz` gives
+  the guest a virtio-sound device played through the Mac's default output, and the template
+  runs PipeWire with `pipewire-pulse` behind it, so the `audio = true` posture behaves as
+  it does on any Linux host. The guest user reaches the sound card and the display through
+  its primary group, which every session carries from the start. Lima 2.2.1 attaches the
+  output stream alone, so the guest has no capture device and an app's microphone finds
+  nothing.
 - **There is no GPU acceleration.** `vmType: vz` gives the guest a virtio-GPU device without
   3D acceleration. `gpu = true` grants its render node, and mesa renders in software
   (`llvmpipe`) behind it; the launch proceeds. The scope this template commits to is CLI plus GUI, and the two
@@ -290,10 +306,10 @@ Three differences from a native host are worth knowing before they surprise you:
   Linux guest on Apple Silicon opens no screen. CUDA is out of reach by any route on a Mac,
   because Apple Silicon carries no NVIDIA hardware.
 
-**Where this is supported.** The template and the wrapper are verified on macOS x86_64
-with Lima 2.2.1. Apple Silicon is not verified: neither the `sbx-linux-aarch64` binary in
-the guest nor the window, sound and GPU behaviour above, which follows Lima's source and
-its published behaviour. [`sbx doctor`](doctor) inside the guest is what decides whether
+**Where this is supported.** The template and the wrapper, the window, the sound and the
+GPU behaviour above included, are verified on macOS x86_64 with Lima 2.2.1. Apple Silicon is
+not verified: neither the `sbx-linux-aarch64` binary in the guest nor the window, sound and
+GPU behaviour there. [`sbx doctor`](doctor) inside the guest is what decides whether
 the boundary is there, and it is the first thing to run after `limactl start`. The
 acceptance workflow in the repository runs these checks on a Mac and requires a
 self-hosted macOS runner, which is why it reports rather than hangs when none is

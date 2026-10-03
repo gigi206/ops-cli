@@ -73,5 +73,13 @@ exec "$LIMACTL" shell --start "$SBX_LIMA_INSTANCE" sh -c '
     fi
   fi
 
+  # A `limactl shell` session carries no display variable, so a `gui = "wayland"` launch would run
+  # without one. The template starts the compositor under a fixed socket name; it is named here
+  # only when nothing was set and the socket is there, so a display chosen by hand still wins.
+  runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -S "$runtime/wayland-sbx" ]; then
+    export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-sbx
+  fi
+
   exec sbx "$@"
 ' _ "$PWD" "$SBX_LIMA_STALE_DAYS" "$SBX_LIMA_INSTANCE" "$@"

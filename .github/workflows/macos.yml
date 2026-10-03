@@ -34,7 +34,7 @@
 #
 # WHY IT IS GATED ON A VARIABLE. With no runner registered, that guard turned every weekly run and
 # every push under `dist/macos/` red, and a check that is red whatever the change says nothing about
-# the change. The two jobs above therefore run only when the repository variable `MACOS_RUNNER` is
+# the change. The two jobs below therefore run only when the repository variable `MACOS_RUNNER` is
 # `true`, which is set once a runner with those labels is attached. Otherwise the `not-attached`
 # job runs instead and writes, on the run's summary and as a notice, that the Lima acceptance did
 # not run: the skip is reported, never silent.
@@ -209,6 +209,21 @@ jobs:
             || { echo "the cage did not report the sandbox name on the caller's uid"; exit 1; }
           grep -q "$HOME/ci-projects/project" "$HOME/run.txt" \
             || { echo "the cage was not built around the directory the Mac stood in"; exit 1; }
+
+      - name: The guest must have a compositor on its display and a sound card behind its sink
+        # Neither needs anyone looking at the screen. The compositor's socket under the fixed name
+        # the wrapper looks for is what a `gui = "wayland"` launch binds; a default sink on the ALSA
+        # card, rather than PipeWire's null sink, is what an `audio = true` cage plays into.
+        run: |
+          set -uo pipefail
+          limactl shell --workdir / sbx-ci sh -c 'test -S "/run/user/$(id -u)/wayland-sbx"' \
+            || { echo "no compositor socket wayland-sbx in the guest"; exit 1; }
+          echo "the compositor socket is there"
+          sink=$(limactl shell --workdir / sbx-ci wpctl inspect @DEFAULT_AUDIO_SINK@ 2>&1)
+          case "$sink" in
+            *api.alsa.*) echo "the default sink is the guest's sound card" ;;
+            *) echo "the default sink is not on the sound card: $sink"; exit 1 ;;
+          esac
 
       - name: The Mac's filesystem must be absent from the cage
         # Confidentiality by absence is the model. The guest mounts one subtree of the host home,
