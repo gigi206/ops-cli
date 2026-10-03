@@ -484,6 +484,10 @@ fn root_at_or_above<'a>(canon: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBu
 /// pin again after the pins, each read-only and bound from the path itself or from sbx's own decoy,
 /// so none can substitute what a pin holds.
 ///
+/// `binds` are taken in the order they are mounted, the project's own mount last: a path takes the
+/// mode of the last one at or above it, and an intermediate is pinned only where that mode lets the
+/// cage write.
+///
 /// Iterates the same root set as [`control_plane_mode`], so a root added there is pinned here
 /// automatically.
 pub(crate) fn control_plane_pins(binds: &[Bind]) -> Vec<Bind> {
@@ -511,8 +515,11 @@ fn control_plane_pins_for(binds: &[Bind], roots: &[PathBuf]) -> Vec<Bind> {
         {
             // Each directory strictly between the containing bind and the root, shallow-to-deep: a
             // mountpoint (read-write) so it cannot be renamed to substitute the path below it.
+            // Only where the cage writes: under a read-only bind a rename already fails (`EROFS`,
+            // and `EBUSY` on the bind's own path), and a pin bound from itself read-write there
+            // would reopen what that bind closed.
             for ancestor in ancestors_between(&bind.path, root) {
-                if seen.insert(ancestor.clone()) {
+                if writable_through(binds, &ancestor) && seen.insert(ancestor.clone()) {
                     pins.push(Bind {
                         path: ancestor,
                         writable: true,
@@ -535,6 +542,16 @@ fn control_plane_pins_for(binds: &[Bind], roots: &[PathBuf]) -> Vec<Bind> {
     // directories above it, which then covered the root's pin. A path sorts after its ancestors.
     pins.sort_by(|a, b| a.path.cmp(&b.path));
     pins
+}
+
+/// Whether the cage writes at `path` through `binds`: the mode of the last bind at or above it,
+/// since the binds come in the order they are mounted and a later one covers an earlier.
+fn writable_through(binds: &[Bind], path: &Path) -> bool {
+    binds
+        .iter()
+        .rev()
+        .find(|b| path.starts_with(&b.path))
+        .is_some_and(|b| b.writable)
 }
 
 /// The directories strictly between `bind` (exclusive) and `root` (exclusive), shallow-to-deep.
@@ -3334,6 +3351,50 @@ mod tests {
             "the outer bind pins the directory the inner one is: {pins:?}"
         );
         assert_ancestors_first(&pins);
+    }
+
+    /// No read-write intermediate lands where a read-only bind closed the tree. The pins are laid
+    /// after the binds, each bound from its own path, so a read-write one over `~/.local` declared
+    /// read-only inside a read-write home reopened it for writing. Declared the other way round,
+    /// the home covers `~/.local` and the intermediates are needed again.
+    #[test]
+    fn control_plane_pins_lay_no_read_write_intermediate_over_a_read_only_bind() {
+        let roots = vec![
+            PathBuf::from("/home/u/.local/share/sbx"),
+            PathBuf::from("/home/u/.config/sbx"),
+        ];
+        let home = Bind {
+            path: PathBuf::from("/home/u"),
+            writable: true,
+        };
+        let local = Bind {
+            path: PathBuf::from("/home/u/.local"),
+            writable: false,
+        };
+        let pins = control_plane_pins_for(&[home.clone(), local.clone()], &roots);
+        assert!(
+            pins.iter()
+                .filter(|p| p.path.starts_with("/home/u/.local"))
+                .all(|p| !p.writable),
+            "nothing under the read-only bind is pinned read-write: {pins:?}"
+        );
+        assert!(
+            pins.iter()
+                .any(|p| p.path == Path::new("/home/u/.local/share/sbx") && !p.writable),
+            "its root is still pinned: {pins:?}"
+        );
+        assert!(
+            pins.iter()
+                .any(|p| p.path == Path::new("/home/u/.config") && p.writable),
+            "the rest of the home keeps its chain: {pins:?}"
+        );
+
+        let pins = control_plane_pins_for(&[local, home], &roots);
+        assert!(
+            pins.iter()
+                .any(|p| p.path == Path::new("/home/u/.local") && p.writable),
+            "under the home declared last, `.local` is writable and pinned: {pins:?}"
+        );
     }
 
     #[test]
