@@ -437,11 +437,34 @@ fn a_control_plane_pin_that_lands_on_an_fs_mask_is_dropped() {
     );
 }
 
-/// What the cage finds at `path` once `binds` are laid in order: the last one bound at the path or
-/// at a directory above it. That is the rule measured with bubblewrap, which binds the host's view
-/// of a directory and so covers every mount the cage had below it.
-fn found_at<'b>(binds: &'b [binds::ExtraBind], path: &Path) -> Option<&'b binds::ExtraBind> {
-    binds.iter().rev().find(|b| path.starts_with(&b.dest))
+/// What the cage finds at `path` once `mounts` are laid in order: the last one at the path or at a
+/// directory above it. That is the rule measured with bubblewrap, which binds the host's view of a
+/// directory and so covers every mount the cage had below it.
+fn found_at<'m>(
+    mounts: &'m [crate::sandbox::spec::Mount],
+    path: &Path,
+) -> Option<&'m crate::sandbox::spec::Mount> {
+    mounts.iter().rev().find(|m| path.starts_with(m.dest()))
+}
+
+/// The plan a launch lays for `fs_binds` and `pins` under a project at `home`: the project, the
+/// `[fs]` binds after it, and the pins that clear the masks laid in by [`binds::lay_pins`].
+fn laid_under_home(
+    home: &Path,
+    fs_binds: &[binds::ExtraBind],
+    pins: Vec<binds::ExtraBind>,
+) -> Vec<crate::sandbox::spec::Mount> {
+    let mut mounts = vec![crate::sandbox::spec::Mount::Bind {
+        src: home.to_path_buf(),
+        dest: home.to_path_buf(),
+    }];
+    mounts.extend(fs_binds.iter().map(binds::ExtraBind::mount));
+    let unlaid = binds::lay_pins(
+        &mut mounts,
+        &pins_clear_of_masks(pins, &crate::sandbox::fsmask::Expanded::default(), fs_binds),
+    );
+    assert!(unlaid.is_empty(), "every pin has a cover: {unlaid:?}");
+    mounts
 }
 
 /// A control-plane pin laid above an `[fs]` bind must not cover it, and sbx's roots must stay
@@ -449,8 +472,8 @@ fn found_at<'b>(binds: &'b [binds::ExtraBind], path: &Path) -> Option<&'b binds:
 ///
 /// The chains are the ones `cd ~ && sbx run` produces, and the `[fs]` binds are what a mask under
 /// `.config` and a mask inside the data dir emit: the directories held above them, then the masks.
-/// This is the arrangement itself. A mask inside a root is closed by the root's decoy, laid after
-/// it, and is not laid again: its destination does not exist in the empty decoy.
+/// This is the arrangement itself. A mask inside a root is closed by the root's decoy and dropped
+/// after it: its destination does not exist in the empty decoy.
 #[test]
 fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
     let home = PathBuf::from("/home/agent");
@@ -486,24 +509,16 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
         mask(".config/gh/hosts.yml"),
         mask(".local/share/sbx/sub/secret"),
     ];
-    let laid: Vec<binds::ExtraBind> = fs_binds
-        .iter()
-        .cloned()
-        .chain(pins_clear_of_masks(
-            pins,
-            &crate::sandbox::fsmask::Expanded::default(),
-            &fs_binds,
-        ))
-        .collect();
+    let laid = laid_under_home(&home, &fs_binds, pins);
 
     assert_eq!(
         found_at(&laid, &home.join(".config/gh/hosts.yml")),
-        Some(&mask(".config/gh/hosts.yml")),
+        Some(&mask(".config/gh/hosts.yml").mount()),
         "a mask outside sbx's roots must stay masked: {laid:#?}"
     );
     assert_eq!(
         found_at(&laid, &home.join(".config/gh")),
-        Some(&bind(".config/gh", true)),
+        Some(&bind(".config/gh", true).mount()),
         "the directory held above a mask must stay held: {laid:#?}"
     );
     for (path, at) in [
@@ -514,22 +529,23 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
     ] {
         assert_eq!(
             found_at(&laid, &home.join(path)),
-            Some(&root(at)),
+            Some(&root(at).mount()),
             "`{path}` must stay under the decoy of sbx's root: {laid:#?}"
         );
     }
     assert_eq!(
         found_at(&laid, &home.join(".local/state")),
-        Some(&bind(".local", true)),
+        Some(&bind(".local", true).mount()),
         "a directory outside both keeps its read-write mount point: {laid:#?}"
     );
 }
 
-/// A mask inside a root bound from itself is laid again after it. That root shows the cage its
+/// A mask inside a root bound from itself stays on top of it. That root shows the cage its
 /// contents, the project or a bind lying in it, and laid over the mask it would show the masked
-/// file too.
+/// file too. A directory held read-write inside it does not: the root is sbx's own tree, shown
+/// read-only.
 #[test]
-fn a_mask_inside_a_root_bound_from_itself_is_laid_again() {
+fn a_mask_inside_a_root_bound_from_itself_stays_on_top_of_it() {
     let home = PathBuf::from("/home/agent");
     let bind = |path: &str, writable: bool| binds::ExtraBind {
         src: home.join(path),
@@ -553,23 +569,15 @@ fn a_mask_inside_a_root_bound_from_itself_is_laid_again() {
         bind(".local/share/sbx/sub", true),
         mask.clone(),
     ];
-    let laid: Vec<binds::ExtraBind> = fs_binds
-        .iter()
-        .cloned()
-        .chain(pins_clear_of_masks(
-            pins,
-            &crate::sandbox::fsmask::Expanded::default(),
-            &fs_binds,
-        ))
-        .collect();
+    let laid = laid_under_home(&home, &fs_binds, pins);
     assert_eq!(
         found_at(&laid, &home.join(".local/share/sbx/sub/secret")),
-        Some(&mask),
+        Some(&mask.mount()),
         "the mask must stay over the file: {laid:#?}"
     );
     assert_eq!(
         found_at(&laid, &home.join(".local/share/sbx/sub")),
-        Some(&bind(".local/share/sbx", false)),
+        Some(&bind(".local/share/sbx", false).mount()),
         "and the root stays read-only around it: {laid:#?}"
     );
 }
@@ -648,11 +656,11 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place_inside_the_cage() {
         },
     ];
     mounts.extend(fs_binds.iter().map(binds::ExtraBind::mount));
-    mounts.extend(
-        pins_clear_of_masks(pins, &expanded, &fs_binds)
-            .iter()
-            .map(binds::ExtraBind::mount),
+    let unlaid = binds::lay_pins(
+        &mut mounts,
+        &pins_clear_of_masks(pins, &expanded, &fs_binds),
     );
+    assert!(unlaid.is_empty(), "every pin has a cover: {unlaid:?}");
 
     let script = r#"cd "$1" || exit 9
 for f in .config/gh/hosts.yml .local/share/sbx/sub/secret; do
@@ -695,6 +703,147 @@ echo end"#;
         ".local/share/sbx read-only",
         ".local/share/sbx empty",
         ".config writable",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "expected `{line}`:\n{stdout}\n{stderr}"
+        );
+    }
+}
+
+/// What is mounted beneath a pin keeps its effect in a real cage: a read-only bind under
+/// `~/.config`, declared after a read-write home, still refuses a write, a file bound there from
+/// elsewhere (a broker's socket at its host path) is still the bound one, and a project in
+/// `~/.config` keeps its `.git` and its own root from being renamed. Laid at the end of the plan,
+/// the read-write `~/.config` pin covered the first two, taking the write and showing the host's
+/// file; the renames were refused either way, a covered mountpoint still being one, and are
+/// asserted so that stays true.
+#[test]
+fn a_mount_beneath_a_pin_keeps_its_effect_inside_the_cage() {
+    let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
+        skip_incapable!("skipping the beneath-a-pin smoke: need bwrap");
+        return;
+    };
+    if !matches!(crate::probe_userns(), crate::Userns::Ok) {
+        skip_incapable!("skipping the beneath-a-pin smoke: need a user namespace");
+        return;
+    }
+    let scratch = TmpDir::new();
+    let home = scratch.path().join("home");
+    let project = home.join(".config/dotfiles");
+    for dir in [".config/gh", ".config/sbx", ".config/dotfiles/.git/hooks"] {
+        std::fs::create_dir_all(home.join(dir)).unwrap();
+    }
+    std::fs::write(project.join(".git/config"), b"[core]\n").unwrap();
+    std::fs::write(project.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    // A file bound at a host path from elsewhere, as a broker's socket is: the cage must find the
+    // bound one, not the host's.
+    std::fs::write(home.join(".config/agent.sock"), b"HOST").unwrap();
+    let brokered = scratch.path().join("brokered");
+    std::fs::write(&brokered, b"BROKER").unwrap();
+    let home = home.canonicalize().unwrap();
+    let project = project.canonicalize().unwrap();
+
+    let reach = vec![crate::config::Bind {
+        path: home.clone(),
+        writable: true,
+    }];
+    let expanded = crate::sandbox::fsmask::expand(&project, &Default::default(), &reach, None);
+    assert!(expanded.refused.is_none(), "{:?}", expanded.refused);
+    crate::sandbox::fsmask::create_absent_dirs(&expanded).unwrap();
+    let decoys = crate::sandbox::fsmask::stage_decoys(&scratch.path().join("mask")).unwrap();
+    let fs_binds = crate::sandbox::fsmask::agent_binds(&expanded, &decoys, true);
+    let pins = vec![
+        binds::ExtraBind {
+            src: home.join(".config"),
+            dest: home.join(".config"),
+            writable: true,
+        },
+        binds::ExtraBind {
+            src: decoys.dir.clone(),
+            dest: home.join(".config/sbx"),
+            writable: false,
+        },
+    ];
+    use crate::sandbox::spec::Mount;
+    let mut mounts = vec![
+        Mount::RoBind {
+            src: "/usr".into(),
+            dest: "/usr".into(),
+        },
+        Mount::Symlink {
+            target: "usr/lib".into(),
+            dest: "/lib".into(),
+        },
+        Mount::Symlink {
+            target: "usr/lib64".into(),
+            dest: "/lib64".into(),
+        },
+        Mount::RoBindTry {
+            src: "/etc/ld.so.cache".into(),
+            dest: "/etc/ld.so.cache".into(),
+        },
+        // The config binds, in the order declared, then the project.
+        Mount::Bind {
+            src: home.clone(),
+            dest: home.clone(),
+        },
+        Mount::RoBind {
+            src: home.join(".config/gh"),
+            dest: home.join(".config/gh"),
+        },
+        Mount::Bind {
+            src: project.clone(),
+            dest: project.clone(),
+        },
+        // The launcher's extra binds, the brokered file before the `[fs]` binds.
+        Mount::RoBind {
+            src: brokered,
+            dest: home.join(".config/agent.sock"),
+        },
+    ];
+    mounts.extend(fs_binds.iter().map(binds::ExtraBind::mount));
+    let unlaid = binds::lay_pins(
+        &mut mounts,
+        &pins_clear_of_masks(pins, &expanded, &fs_binds),
+    );
+    assert!(unlaid.is_empty(), "every pin has a cover: {unlaid:?}");
+
+    let script = r#"P="$1"; H="$2"; cd /
+if mv "$P/.git" "$P/.git.moved" 2>&1; then echo ".git moved"; mv "$P/.git.moved" "$P/.git"; else echo ".git held"; fi
+if mv "$P" "$P.moved" 2>&1; then echo "project moved"; mv "$P.moved" "$P"; else echo "project held"; fi
+if touch "$H/.config/gh/written" 2>&1; then echo "gh writable"; rm -f "$H/.config/gh/written"; else echo "gh read-only"; fi
+if [ -z "$(ls -A "$H/.config/sbx")" ]; then echo "sbx empty"; else echo "sbx shows its contents"; fi
+echo "agent $(cat "$H/.config/agent.sock")"
+echo end"#;
+    let spec = crate::sandbox::spec::SandboxSpec::new(
+        "/".into(),
+        mounts,
+        Vec::new(),
+        crate::sandbox::spec::NetPolicy::Shared,
+        vec![
+            std::ffi::OsString::from("/usr/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from(script),
+            std::ffi::OsString::from("sh"),
+            project.clone().into_os_string(),
+            home.clone().into_os_string(),
+        ],
+    )
+    .expect("a spec");
+    let out = crate::sandbox::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.lines().any(|l| l == "end"),
+        "the cage did not run to its end:\n{stdout}\n{stderr}"
+    );
+    for line in [
+        ".git held",
+        "project held",
+        "gh read-only",
+        "sbx empty",
+        "agent BROKER",
     ] {
         assert!(
             stdout.lines().any(|l| l == line),

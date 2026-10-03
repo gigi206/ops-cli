@@ -469,22 +469,19 @@ fn root_at_or_above<'a>(canon: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBu
 /// decoy would cover what was asked for). Under a read-only bind nothing can be renamed, and the
 /// root alone is pinned.
 ///
-/// Returns those mounts as host paths, deduplicated and ordered
-/// shallow-to-deep so a parent mountpoint is always established before its child — a child bound
-/// first would be shadowed when the parent is later mounted over it, silently defeating the
-/// protection. The caller creates each before binding (a root the agent could otherwise create
-/// fresh) and emits them after every structural mount, so the read-write bind that contains a root
-/// is already in place when the pin lands on it — that ordering is the mechanism, not tidiness.
+/// Returns those mounts as host paths, deduplicated and ordered shallow-to-deep so a parent
+/// mountpoint is always established before its child — a child bound first would be shadowed when
+/// the parent is later mounted over it, silently defeating the protection. The caller creates each
+/// before binding (a root the agent could otherwise create fresh) and lays each into the finished
+/// mount plan right after the mount that covers its path (`binds::lay_pins`), so the bind that
+/// contains a root is in place when the pin lands on it, and whatever is mounted beneath a pin
+/// afterwards stays on top of it.
 ///
-/// What it must keep true afterwards is the *destination*: a later mount on a pinned path replaces
-/// what the cage finds there, which is the substitution these pins exist to prevent. The launcher
-/// does append binds after them (the task control socket and its generated client), and those are
-/// safe not because they come first — they do not — but because their destinations are sbx's own
-/// constants: nothing a project configures chooses them. **A bind appended after the pins whose
-/// destination is derived from the configuration would break the protection.** The one exception
-/// is a bind that can only close: the launcher lays the `[fs]` masks that fall inside a read-write
-/// pin again after the pins, each read-only and bound from the path itself or from sbx's own decoy,
-/// so none can substitute what a pin holds.
+/// What it must keep true afterwards is the *destination*: a mount laid after a pin at or above its
+/// path would replace what the cage finds there, which is the substitution these pins exist to
+/// prevent. Laying each pin after the last such mount makes that structural; a mount laid after it
+/// lands beneath it, and only where the pin leaves room: nothing under a root bound from the decoy,
+/// nothing read-write under a root bound from itself.
 ///
 /// `binds` are taken in the order they are mounted, the project's own mount last: a path takes the
 /// mode of the last one at or above it, and an intermediate is pinned only where that mode lets the

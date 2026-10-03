@@ -3035,3 +3035,197 @@ fn a_protected_git_config_gets_push_auto_setup_remote_after_the_users_own_pairs(
         assert_eq!(env, before);
     }
 }
+
+/// A bind of `path` over itself, read-write or not.
+fn host(path: &str, writable: bool) -> ExtraBind {
+    ExtraBind {
+        src: PathBuf::from(path),
+        dest: PathBuf::from(path),
+        writable,
+    }
+}
+
+/// No mount laid after a pin sits at or above its path, so nothing covers it.
+fn assert_nothing_covers_a_pin(mounts: &[Mount], pins: &[ExtraBind]) {
+    for pin in pins {
+        let Some(at) = mounts.iter().position(|m| *m == pin.mount()) else {
+            continue;
+        };
+        for m in &mounts[at + 1..] {
+            assert!(
+                !pin.dest.starts_with(m.dest()),
+                "{} is covered by {m:?}: {mounts:#?}",
+                pin.dest.display()
+            );
+        }
+    }
+}
+
+/// Each pin lands right after the mount that covers its path, so a mount laid beneath it
+/// afterwards stays on top: a read-only bind under `~/.config`, declared after a read-write home,
+/// and a mask in the project. Appended at the end, the read-write `~/.config` pin covered both.
+#[test]
+fn a_pin_lands_after_its_cover_and_under_what_was_mounted_beneath_it() {
+    let gh = host("/h/.config/gh", false);
+    let mask = ExtraBind {
+        src: PathBuf::from("/data/fs/mask-1/file"),
+        dest: PathBuf::from("/h/.config/repo/.env"),
+        writable: false,
+    };
+    let mut mounts = vec![
+        Mount::Tmpfs {
+            dest: PathBuf::from("/"),
+        },
+        host("/h", true).mount(),
+        gh.mount(),
+        host("/h/.config/repo", true).mount(),
+        mask.mount(),
+    ];
+    let pins = vec![
+        host("/h/.config", true),
+        ExtraBind {
+            src: PathBuf::from("/data/fs/mask-1/dir"),
+            dest: PathBuf::from("/h/.config/sbx"),
+            writable: false,
+        },
+    ];
+    assert_eq!(lay_pins(&mut mounts, &pins), Vec::new());
+    assert_eq!(
+        mounts
+            .iter()
+            .filter(|m| pins.iter().any(|p| **m == p.mount()))
+            .count(),
+        2,
+        "both pins are laid: {mounts:#?}"
+    );
+    assert_eq!(
+        mounts[2],
+        pins[0].mount(),
+        "right after the home: {mounts:#?}"
+    );
+    assert_eq!(
+        mounts[3],
+        pins[1].mount(),
+        "and the root after it: {mounts:#?}"
+    );
+    let found = |path: &str| {
+        mounts
+            .iter()
+            .rev()
+            .find(|m| Path::new(path).starts_with(m.dest()))
+            .cloned()
+    };
+    assert_eq!(found("/h/.config/gh/hosts.yml"), Some(gh.mount()));
+    assert_eq!(found("/h/.config/repo/.env"), Some(mask.mount()));
+    assert_nothing_covers_a_pin(&mounts, &pins);
+}
+
+/// A pin lands only on a host bind of its own path, and a read-write pin only on a read-write one:
+/// over a tmpfs, over a decoy, or read-write over a read-only bind it would show the cage host
+/// content or a mode nothing there grants.
+#[test]
+fn a_pin_lands_only_on_a_host_bind_that_grants_its_mode() {
+    let pin = host("/h/.config", true);
+    let root = ExtraBind {
+        src: PathBuf::from("/data/fs/mask-1/dir"),
+        dest: PathBuf::from("/h/.config/sbx"),
+        writable: false,
+    };
+    for cover in [
+        Mount::Tmpfs {
+            dest: PathBuf::from("/"),
+        },
+        Mount::RoBind {
+            src: PathBuf::from("/data/fs/mask-1/dir"),
+            dest: PathBuf::from("/h"),
+        },
+        Mount::Bind {
+            src: PathBuf::from("/elsewhere"),
+            dest: PathBuf::from("/h"),
+        },
+        host("/h", false).mount(),
+    ] {
+        let mut mounts = vec![cover.clone()];
+        assert_eq!(
+            lay_pins(&mut mounts, std::slice::from_ref(&pin)),
+            vec![pin.clone()],
+            "a pin left out is reported, for the launch to refuse"
+        );
+        assert_eq!(
+            mounts,
+            vec![cover.clone()],
+            "the pin must not land on {cover:?}"
+        );
+    }
+    // A read-only pin lands on a read-only host bind of its path.
+    let mut mounts = vec![host("/h", false).mount()];
+    assert_eq!(
+        lay_pins(&mut mounts, std::slice::from_ref(&root)),
+        Vec::new()
+    );
+    assert_eq!(mounts, vec![host("/h", false).mount(), root.mount()]);
+    // With nothing at or above its path, it is reported too.
+    let mut mounts = vec![Mount::Proc {
+        dest: PathBuf::from("/proc"),
+    }];
+    assert_eq!(
+        lay_pins(&mut mounts, std::slice::from_ref(&root)),
+        vec![root.clone()]
+    );
+}
+
+/// Nothing laid after a root bound from the decoy stays beneath it, since the decoy closes the
+/// path and holds no mountpoint; beneath a root bound from itself, nothing read-write stays, since
+/// that is sbx's own tree shown read-only.
+#[test]
+fn nothing_beneath_a_read_only_root_reopens_it() {
+    let held = host("/h/.local/sbx/sub", true);
+    let mask = ExtraBind {
+        src: PathBuf::from("/data/fs/mask-1/file"),
+        dest: PathBuf::from("/h/.local/sbx/sub/secret"),
+        writable: false,
+    };
+    let base = vec![
+        host("/h", true).mount(),
+        host("/h/.local/sbx", true).mount(),
+        held.mount(),
+        mask.mount(),
+    ];
+
+    let decoy = ExtraBind {
+        src: PathBuf::from("/data/fs/mask-1/dir"),
+        dest: PathBuf::from("/h/.local/sbx"),
+        writable: false,
+    };
+    let mut mounts = base.clone();
+    assert_eq!(
+        lay_pins(&mut mounts, std::slice::from_ref(&decoy)),
+        Vec::new()
+    );
+    assert_eq!(
+        mounts,
+        vec![
+            host("/h", true).mount(),
+            host("/h/.local/sbx", true).mount(),
+            decoy.mount(),
+        ],
+        "nothing stays beneath the decoy"
+    );
+
+    let itself = host("/h/.local/sbx", false);
+    let mut mounts = base;
+    assert_eq!(
+        lay_pins(&mut mounts, std::slice::from_ref(&itself)),
+        Vec::new()
+    );
+    assert_eq!(
+        mounts,
+        vec![
+            host("/h", true).mount(),
+            host("/h/.local/sbx", true).mount(),
+            itself.mount(),
+            mask.mount(),
+        ],
+        "the read-only mask stays, the read-write directory does not"
+    );
+}

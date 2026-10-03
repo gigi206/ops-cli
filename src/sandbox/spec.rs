@@ -311,6 +311,22 @@ impl SandboxSpec {
         self
     }
 
+    /// Lay the control-plane pins into the finished mount plan, each after the mount that covers
+    /// it ([`super::binds::lay_pins`]). Applied once the plan is complete, since where a pin goes
+    /// depends on every mount laid before and beneath it. The pins with nothing to land on come
+    /// back as the error: each is a root the cage would find open.
+    pub(crate) fn with_pins(
+        mut self,
+        pins: &[super::binds::ExtraBind],
+    ) -> Result<Self, Vec<super::binds::ExtraBind>> {
+        let unlaid = super::binds::lay_pins(&mut self.mounts, pins);
+        if unlaid.is_empty() {
+            Ok(self)
+        } else {
+            Err(unlaid)
+        }
+    }
+
     /// Set the variables whose values must stay out of the argument list — see
     /// [`SandboxSpec::secret_env`]. Only [`super::argv::compose`] can turn such a spec into a
     /// runnable argv, because only it can create the descriptor they travel on.

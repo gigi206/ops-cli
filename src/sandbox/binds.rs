@@ -519,8 +519,9 @@ pub(super) fn substrate(mounts: &[Mount]) -> Vec<Mount> {
 
 /// One explicit bind injected by the launcher after the structural mounts, so no structural mount
 /// shadows it. Most land on sbx's own destinations (the bound egress socket, the proxy's CA
-/// certificate); the control-plane pins and the `[fs]` masks, with the directories holding those in
-/// place, land on a host path on purpose, as [`cage_mounts`] records where it emits them.
+/// certificate); the `[fs]` masks, with the directories holding those in place, land on a host path
+/// on purpose, as [`cage_mounts`] records where it emits them. The control-plane pins share the
+/// shape and are laid apart, by [`lay_pins`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExtraBind {
     /// Host path bound into the cage.
@@ -546,6 +547,67 @@ impl ExtraBind {
             }
         }
     }
+}
+
+/// Lay the control-plane pins into a cage's finished mount plan, each right after the last mount
+/// at or above its path.
+///
+/// A pin is a host directory bound over itself, or a root bound from the empty decoy, and
+/// bubblewrap binds the host's view of a directory, which carries none of the cage's own mounts
+/// below it. Appended at the end of the plan, a read-write pin covered whatever had been mounted
+/// beneath it: a read-only bind there took writes again, and a file bound there from elsewhere (a
+/// broker's socket at its host path) gave way to the host's own. Laid right after the mount that covers its path, it binds the view that mount
+/// already shows and adds only the mountpoint, and what was mounted beneath it afterwards stays on
+/// top. A covered mountpoint still refuses a rename, so the holds were never what was lost.
+///
+/// Three rules hold whatever the pins' producer decided:
+/// - **A pin lands only on a host bind of its own path**, and a read-write pin only on a read-write
+///   one. Over a tmpfs, a decoy or a read-only bind it would show the cage host content or a mode
+///   nothing there grants, so it is not laid, and is returned: a pin left out is a root left open,
+///   which the caller refuses to launch with.
+/// - **Beneath a root bound from the decoy, nothing laid after it is kept**: the decoy closes the
+///   path already, and bubblewrap could not make a mountpoint inside the empty directory. A pin
+///   bound from the decoy is the one whose source is not its own path.
+/// - **Beneath a root bound from itself, nothing read-write laid after it is kept**: it is sbx's own
+///   tree, shown read-only.
+///
+/// Pure, so the arrangement is asserted without a launch.
+#[must_use = "a pin that was not laid leaves its root open"]
+pub(crate) fn lay_pins(mounts: &mut Vec<Mount>, pins: &[ExtraBind]) -> Vec<ExtraBind> {
+    let mut unlaid = Vec::new();
+    for pin in pins {
+        let Some(at) = mounts.iter().rposition(|m| pin.dest.starts_with(m.dest())) else {
+            unlaid.push(pin.clone());
+            continue;
+        };
+        let lands = match &mounts[at] {
+            Mount::Bind { src, dest } => src == dest,
+            Mount::RoBind { src, dest } | Mount::RoBindTry { src, dest } => {
+                src == dest && !pin.writable
+            }
+            _ => false,
+        };
+        if !lands {
+            unlaid.push(pin.clone());
+            continue;
+        }
+        mounts.insert(at + 1, pin.mount());
+        if pin.writable {
+            continue;
+        }
+        let from_decoy = pin.src != pin.dest;
+        let mut i = at + 2;
+        while i < mounts.len() {
+            let dest = mounts[i].dest();
+            let beneath = dest != pin.dest && dest.starts_with(&pin.dest);
+            if beneath && (from_decoy || matches!(mounts[i], Mount::Bind { .. })) {
+                mounts.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    unlaid
 }
 
 /// The host `nix/` tree to expose at `/nix`, and whether the cage may write to it.
@@ -1107,11 +1169,11 @@ fn cage_mounts(
     // the proxy CA under `/opt/sbx`), whose parents are already mounted above (the tmpfs for the
     // socket, the userland binds' `/opt/sbx`).
     //
-    // Two kinds deliberately land *on* a host path the structural block already mounted, and both
-    // depend on arriving after it: the control-plane pins, which freeze sbx's own roots inside a
-    // read-write bind, and the `[fs]` masks, which close a project path by mounting a decoy over
-    // it, after the directories above them are held in place. For those, "emitted last" is not
-    // tidiness but the mechanism.
+    // One kind deliberately lands *on* a host path the structural block already mounted, and
+    // depends on arriving after it: the `[fs]` masks, which close a project path by mounting a decoy
+    // over it, after the directories above them are held in place. For those, "emitted last" is not
+    // tidiness but the mechanism. The control-plane pins land on host paths too, and are laid into
+    // the finished plan by [`lay_pins`], each right after the mount that covers it.
     mounts.extend(extra_binds.iter().map(ExtraBind::mount));
 
     // Under a declared distribution, drop the synthetic FHS the image supplies itself. Emitting one
