@@ -20,7 +20,10 @@
 //!
 //! Known gaps in the supervisor (named, not silent):
 //! - terminal-state restore is a RAII guard, so it covers normal/error/panic
-//!   exits but not a `SIGTERM`/`SIGHUP` kill;
+//!   exits and a `SIGTERM` the relay carries (it gives the terminal back, then
+//!   ends as the signal asked), but not a `SIGKILL` (a stop with `--delay 0`, or
+//!   one whose delay runs out), a `SIGHUP`, or a `SIGTERM` that arrives while the
+//!   relay is stuck in the write below, which never returns to read it;
 //! - the relay is single-threaded with a blocking `write_all` to the master, so a
 //!   pathological simultaneous flood (the inner shell not draining its input while
 //!   also flooding output) could stall it. Humans don't trigger it and `script(1)`

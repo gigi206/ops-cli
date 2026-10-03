@@ -1,5 +1,5 @@
 //! Interactive-terminal (pty) supervision primitives: the stdin/stdout pump loop,
-//! double-Ctrl+C escalation, the SIGWINCH resize relay, the raw-mode guard, child teardown, and the
+//! double-Ctrl+C escalation, the signal relay (a resize, a stop), the raw-mode guard, child teardown, and the
 //! open-fork-relay sequence that assembles them. Pure file-descriptor and terminal machinery — no
 //! launch or config state.
 
@@ -48,9 +48,9 @@ const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
 const EXIT_POLL_MS: libc::c_int = 200;
 
 /// Relay bytes between the real terminal and the pty master until the child exits, then reap it
-/// and return its exit status code. `winch_fd` is the read end of the resize relay's self-pipe (or
-/// `-1` when it could not be installed — `poll` ignores a negative fd), readable when a `SIGWINCH`
-/// has arrived.
+/// and return its exit status code, or until this process is asked to stop. `signals_fd` is the
+/// read end of the [`SignalRelay`]'s self-pipe (or `-1` when it could not be installed — `poll`
+/// ignores a negative fd), readable when a `SIGWINCH` or a `SIGTERM` has arrived.
 ///
 /// The child's exit ends the session, not the master's end. The master reads `EIO` only once every
 /// copy of the slave is closed, and a process the child left behind can hold one for as long as it
@@ -62,21 +62,21 @@ const EXIT_POLL_MS: libc::c_int = 200;
 pub(crate) fn pump(
     master: libc::c_int,
     child: libc::pid_t,
-    winch_fd: libc::c_int,
+    signals_fd: libc::c_int,
     gui: bool,
-) -> io::Result<i32> {
+) -> io::Result<Ended> {
     // SAFETY: `pidfd_open` takes a pid and flags and returns a fresh descriptor, or -1 where the
     // kernel or a filter refuses it. `child` is unreaped, so the pid still names it.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) } as libc::c_int;
-    let exited = pump_until_exit(master, child, pidfd, winch_fd, gui);
+    let exited = pump_until_exit(master, child, pidfd, signals_fd, gui);
     if pidfd >= 0 {
         // SAFETY: the descriptor `pidfd_open` returned above, used nowhere else; this is its only
         // close.
         unsafe { libc::close(pidfd) };
     }
     match exited {
-        Ok(Some(code)) => Ok(code),
-        Ok(None) => Ok(reap(child)),
+        Ok(Some(ended)) => Ok(ended),
+        Ok(None) => Ok(Ended::Exited(reap(child))),
         // The relay failed under a child that still runs (its standard output gone, a poll the
         // kernel refused): nothing will relay its terminal any more, so it is stopped and reaped
         // as a force-quit is, rather than left to a hangup it may never act on and to a zombie.
@@ -87,15 +87,26 @@ pub(crate) fn pump(
     }
 }
 
-/// The relay loop of [`pump`]: `Some(code)` when it reaped the child itself, `None` when the master
-/// ended first and the child is still to be reaped.
+/// How [`pump`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// The child exited with this code, and is reaped.
+    Exited(i32),
+    /// This process was asked to stop (`SIGTERM`) while the relay ran. The child is left as it is:
+    /// the caller gives the terminal back and then ends as the signal asked, which takes the cage
+    /// down the way that signal always has.
+    Stopped,
+}
+
+/// The relay loop of [`pump`]: `Some` when it reaped the child itself or was asked to stop, `None`
+/// when the master ended first and the child is still to be reaped.
 fn pump_until_exit(
     master: libc::c_int,
     child: libc::pid_t,
     pidfd: libc::c_int,
-    winch_fd: libc::c_int,
+    signals_fd: libc::c_int,
     gui: bool,
-) -> io::Result<Option<i32>> {
+) -> io::Result<Option<Ended>> {
     let mut fds = [
         libc::pollfd {
             fd: 0,
@@ -108,7 +119,7 @@ fn pump_until_exit(
             revents: 0,
         },
         libc::pollfd {
-            fd: winch_fd,
+            fd: signals_fd,
             events: libc::POLLIN,
             revents: 0,
         },
@@ -128,7 +139,7 @@ fn pump_until_exit(
     loop {
         // SAFETY: `fds` is a live stack array of `pollfd`s and the count passed is its own length,
         // so `poll` writes `revents` only within it. An entry set to `-1` (stdin after EOF, an
-        // absent resize relay or pidfd) is skipped by the kernel rather than dereferenced.
+        // absent signal relay or pidfd) is skipped by the kernel rather than dereferenced.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -138,11 +149,19 @@ fn pump_until_exit(
             return Err(e);
         }
 
-        // A resize arrived: drain the self-pipe and copy the real terminal's window size
-        // onto the pty. Handled before stdin so a resize delivered alongside input takes
-        // effect before that input reaches the inner program.
+        // A signal arrived. A resize copies the real terminal's window size onto the pty, handled
+        // before stdin so a resize delivered alongside input takes effect before that input
+        // reaches the inner program. A stop ends the relay at once, the terminal still raw, so the
+        // line saying so carries its own carriage returns.
         if fds[2].revents != 0 {
-            drain_and_resize(winch_fd, master);
+            let caught = drain_signals(signals_fd);
+            if caught.resized {
+                copy_winsize(0, master);
+            }
+            if caught.stop {
+                let _ = write_all(2, b"\r\nsbx: this session was asked to stop.\r\n");
+                return Ok(Some(Ended::Stopped));
+            }
         }
 
         // master -> stdout. Quit when the master closes (the child exited), which
@@ -183,7 +202,7 @@ fn pump_until_exit(
                     match classify_ctrl_c(chunk, last_ctrl_c, now) {
                         CtrlC::Escalate => {
                             let _ = write_all(2, b"\r\nsbx: force-quitting the session.\r\n");
-                            return terminate_and_reap(child).map(Some);
+                            return terminate_and_reap(child).map(|code| Some(Ended::Exited(code)));
                         }
                         CtrlC::Arm => {
                             last_ctrl_c = Some(now);
@@ -212,7 +231,7 @@ fn pump_until_exit(
             // meets: an error here must not reach the `Err` arm of `pump`, which would signal a
             // pid that no longer names it.
             let _ = drain_after_exit(master, &mut buf);
-            return Ok(Some(code));
+            return Ok(Some(Ended::Exited(code)));
         }
     }
     Ok(None)
@@ -367,16 +386,18 @@ pub(crate) fn write_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// The write end of the resize relay's self-pipe, read by the `SIGWINCH` handler. A process-wide
-/// atomic because a signal handler cannot capture state; `-1` when no relay is installed. Only one
-/// pty supervisor runs per process, so there is a single writer.
-static WINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+/// The write end of the signal relay's self-pipe, read by [`relay_handler`]. A process-wide atomic
+/// because a signal handler cannot capture state; `-1` when no relay is installed. Only one pty
+/// supervisor runs per process, so there is a single writer.
+static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// `SIGWINCH` handler: nudge the supervisor by writing one byte to the self-pipe. Async-signal-safe
-/// — it does nothing but a single `write` of a constant byte to a non-blocking fd read from an
-/// atomic (no allocation, no locks). The write's *return value* is ignored, because a full pipe
-/// (`EAGAIN`) or an absent relay costs nothing: the supervisor coalesces, so a dropped nudge only
-/// means an already-pending resize is still pending.
+/// Signal handler: nudge the supervisor by writing the signal's number, one byte, to the self-pipe.
+/// Async-signal-safe — it does nothing but a single `write` of that byte to a non-blocking fd read
+/// from an atomic (no allocation, no locks). The write's *return value* is ignored, because a full
+/// pipe (`EAGAIN`) or an absent relay costs nothing that matters: the supervisor coalesces, so a
+/// dropped resize only means an already-pending one is still pending, and a pipe full enough to
+/// drop a stop is one the relay has stopped reading, where a stop's escalation to `SIGKILL` is what
+/// ends the process.
 ///
 /// `errno` is saved and restored around it, which the return value being ignored does not cover. A
 /// handler runs on whatever thread the signal interrupted, and the code it interrupts here reads
@@ -384,12 +405,12 @@ static WINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 /// call `io::Error::last_os_error()` on the step after a `-1`. A resize landing in that gap
 /// overwrote the real error with the handler's `EAGAIN`, so a genuine `EIO` on the pty was reported
 /// as a would-block, and an `EINTR` the loops retry on was lost.
-extern "C" fn winch_handler(_sig: libc::c_int) {
-    let fd = WINCH_WRITE_FD.load(Ordering::Relaxed);
+extern "C" fn relay_handler(sig: libc::c_int) {
+    let fd = SIGNAL_WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
-        let byte = [1u8];
+        let byte = [u8::try_from(sig).unwrap_or(0)];
         // SAFETY: `__errno_location` returns this thread's own `errno` slot, and the write is a
-        // single constant byte to a non-blocking descriptor.
+        // single byte from a local array to a non-blocking descriptor.
         unsafe {
             let saved = *libc::__errno_location();
             libc::write(fd, byte.as_ptr().cast(), 1);
@@ -398,19 +419,27 @@ extern "C" fn winch_handler(_sig: libc::c_int) {
     }
 }
 
-/// Relays terminal resizes onto the pty master for the life of a supervised session. Installs a
-/// `SIGWINCH` self-pipe handler on construction and restores the previous disposition (and closes
+/// Carries two signals to the pump for the life of a supervised session: `SIGWINCH`, a resize of
+/// the real terminal, and `SIGTERM`, a request to stop (`sbx session stop`). Installs
+/// [`relay_handler`] for both on construction and restores the previous dispositions (and closes
 /// the pipe) on drop, so the handler is live only while the supervisor is pumping.
-pub(crate) struct WinchRelay {
+///
+/// A stop is relayed rather than left to its default action because that action ends the process
+/// on the spot, with the real terminal still raw: [`RawMode`]'s restore runs on a return, never on
+/// a signal. Relayed, the pump returns [`Ended::Stopped`], the terminal is given back, and the
+/// process then ends as the signal asked ([`end_as_asked`]). A `SIGTERM` this process was started
+/// ignoring stays ignored.
+pub(crate) struct SignalRelay {
     read_fd: libc::c_int,
     write_fd: libc::c_int,
-    previous: libc::sigaction,
+    /// The dispositions the handler replaced, each with its signal; restored on drop.
+    previous: Vec<(libc::c_int, libc::sigaction)>,
 }
 
-impl WinchRelay {
-    /// Create the self-pipe and install the `SIGWINCH` handler, saving the previous disposition to
-    /// restore on drop. Both ends are `O_CLOEXEC` (never inherited by bwrap); the read end is
-    /// `O_NONBLOCK` so draining it in the poll loop cannot block.
+impl SignalRelay {
+    /// Create the self-pipe and install the handler, saving each previous disposition to restore on
+    /// drop. Both ends are `O_CLOEXEC` (never inherited by bwrap); the read end is `O_NONBLOCK` so
+    /// draining it in the poll loop cannot block.
     pub(crate) fn install() -> io::Result<Self> {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `pipe2` fills the two-element array.
@@ -418,41 +447,43 @@ impl WinchRelay {
             return Err(io::Error::last_os_error());
         }
         let (read_fd, write_fd) = (fds[0], fds[1]);
-        WINCH_WRITE_FD.store(write_fd, Ordering::Relaxed);
+        SIGNAL_WRITE_FD.store(write_fd, Ordering::Relaxed);
+        let mut relay = SignalRelay {
+            read_fd,
+            write_fd,
+            previous: Vec::new(),
+        };
 
-        // SAFETY: `act` is zeroed then fully initialized before use; `previous` receives the old
-        // disposition. The handler is async-signal-safe (see `winch_handler`).
+        // SAFETY: `act` is zeroed then fully initialized before use. The handler is
+        // async-signal-safe (see `relay_handler`).
         let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
-        act.sa_sigaction = winch_handler as *const () as libc::sighandler_t;
+        act.sa_sigaction = relay_handler as *const () as libc::sighandler_t;
         // SAFETY: `act` is a live local, so `sa_mask` is a valid signal set for `sigemptyset` to
         // clear in place.
         unsafe { libc::sigemptyset(&mut act.sa_mask) };
-        // No `SA_RESTART`: a resize should interrupt the blocking `poll` (the self-pipe is the
+        // No `SA_RESTART`: a signal should interrupt the blocking `poll` (the self-pipe is the
         // primary wakeup; the `EINTR` is a harmless second one the loop already handles).
         act.sa_flags = 0;
-        // SAFETY: `sigaction` is integers, a signal set and a handler pointer, for which all-zero
-        // is a valid value; the call below overwrites it with the old disposition before anything
-        // reads it.
-        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: `act` is fully initialized above — handler, cleared mask, zero flags — and
-        // `previous` is a live local for the kernel to fill; neither is retained past the call.
-        if unsafe { libc::sigaction(libc::SIGWINCH, &act, &mut previous) } != 0 {
-            let e = io::Error::last_os_error();
-            WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
-            // SAFETY: both ends are the ones `pipe2` returned above and nothing has closed them.
-            // The handler was never installed (the `sigaction` failed) and the atomic was reset on
-            // the line before, so no signal can reach these descriptors.
-            unsafe {
-                libc::close(read_fd);
-                libc::close(write_fd);
+        for sig in [libc::SIGWINCH, libc::SIGTERM] {
+            // SAFETY: `sigaction` is integers, a signal set and a handler pointer, for which
+            // all-zero is a valid value; each call below fills it before anything reads it.
+            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+            if sig == libc::SIGTERM {
+                // SAFETY: a null new disposition only reads the current one into `previous`.
+                let read = unsafe { libc::sigaction(sig, std::ptr::null(), &mut previous) };
+                if read != 0 || previous.sa_sigaction == libc::SIG_IGN {
+                    continue;
+                }
             }
-            return Err(e);
+            // SAFETY: `act` is fully initialized above — handler, cleared mask, zero flags — and
+            // `previous` is a live local for the kernel to fill; neither is retained past the call.
+            if unsafe { libc::sigaction(sig, &act, &mut previous) } != 0 {
+                // Dropping `relay` restores what was installed so far and closes the pipe.
+                return Err(io::Error::last_os_error());
+            }
+            relay.previous.push((sig, previous));
         }
-        Ok(WinchRelay {
-            read_fd,
-            write_fd,
-            previous,
-        })
+        Ok(relay)
     }
 
     pub(crate) fn read_fd(&self) -> libc::c_int {
@@ -460,18 +491,20 @@ impl WinchRelay {
     }
 }
 
-impl Drop for WinchRelay {
+impl Drop for SignalRelay {
     fn drop(&mut self) {
-        // Restore the previous handler *first*, so `winch_handler` can no longer run, before
+        // Restore the previous handlers *first*, so `relay_handler` can no longer run, before
         // clearing the fd it reads and closing the pipe — no signal can then touch a closed fd.
-        // SAFETY: `self.previous` was filled by the checked `sigaction` in `install` — `Self`
-        // exists only after that call returned 0 — and a null third argument asks the kernel to
-        // discard the disposition being replaced.
-        unsafe { libc::sigaction(libc::SIGWINCH, &self.previous, std::ptr::null_mut()) };
-        WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
+        for (sig, previous) in &self.previous {
+            // SAFETY: `previous` was filled by the checked `sigaction` in `install` that replaced
+            // it, and a null third argument asks the kernel to discard the disposition being
+            // replaced.
+            unsafe { libc::sigaction(*sig, previous, std::ptr::null_mut()) };
+        }
+        SIGNAL_WRITE_FD.store(-1, Ordering::Relaxed);
         // SAFETY: both fds are the `pipe2` ends this relay owns and has not closed. The previous
-        // handler was restored and the atomic cleared above, so `winch_handler` can no longer write
-        // to them.
+        // handlers were restored and the atomic cleared above, so `relay_handler` can no longer
+        // write to them.
         unsafe {
             libc::close(self.read_fd);
             libc::close(self.write_fd);
@@ -479,17 +512,50 @@ impl Drop for WinchRelay {
     }
 }
 
-/// Drain the resize self-pipe (coalescing however many `SIGWINCH`s queued) and copy the real
-/// terminal's window size onto the pty master. Setting the master's size makes the kernel deliver
-/// `SIGWINCH` to the pty's foreground process group — the cage's interactive program.
-fn drain_and_resize(pipe_fd: libc::c_int, master: libc::c_int) {
+/// What the relay's self-pipe held since the last drain: whether the real terminal was resized,
+/// and whether this process was asked to stop. However many of each queued count once.
+struct Caught {
+    resized: bool,
+    stop: bool,
+}
+
+/// Drain the relay's self-pipe and say what it held ([`Caught`]).
+fn drain_signals(pipe_fd: libc::c_int) -> Caught {
+    let mut caught = Caught {
+        resized: false,
+        stop: false,
+    };
     let mut sink = [0u8; 64];
-    // The read end is non-blocking, so this stops at `EAGAIN`.
-    // SAFETY: this is reached only after `poll` reported `pipe_fd` readable, which the `-1`
-    // placeholder for an absent relay never is, so it is the live relay's read end; `sink` is a
-    // stack array bounded by its own length.
-    while unsafe { libc::read(pipe_fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
-    copy_winsize(0, master);
+    loop {
+        // The read end is non-blocking, so this stops at `EAGAIN`.
+        // SAFETY: this is reached only after `poll` reported `pipe_fd` readable, which the `-1`
+        // placeholder for an absent relay never is, so it is the live relay's read end; `sink` is a
+        // stack array bounded by its own length.
+        let n = unsafe { libc::read(pipe_fd, sink.as_mut_ptr().cast(), sink.len()) };
+        if n <= 0 {
+            return caught;
+        }
+        for byte in &sink[..n as usize] {
+            match libc::c_int::from(*byte) {
+                libc::SIGWINCH => caught.resized = true,
+                libc::SIGTERM => caught.stop = true,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// End this process as the `SIGTERM` the relay caught asked, once the terminal is given back: the
+/// default action is put back and the signal sent to this process again. Should no thread take it,
+/// the process exits with the status a shell gives a death by that signal.
+fn end_as_asked() -> ! {
+    // SAFETY: `signal`, `kill`, `getpid` and `_exit` take integers and a handler constant; nothing
+    // here touches memory.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::kill(libc::getpid(), libc::SIGTERM);
+        libc::_exit(128 + libc::SIGTERM)
+    }
 }
 
 /// Copy `src`'s window size onto `dst` (`TIOCGWINSZ` → `TIOCSWINSZ`). Best effort: if `src` has no
@@ -508,7 +574,8 @@ pub(crate) fn copy_winsize(src: libc::c_int, dst: libc::c_int) {
 }
 
 /// Put a terminal into raw mode, restoring the original settings on drop (covers
-/// normal return, `?`, and panic — but not a `SIGKILL`/`SIGTERM`).
+/// normal return, `?`, and panic — but no signal: [`fork_with_pty`] relays a `SIGTERM` so the
+/// drop runs before it takes effect, and a `SIGKILL` or a `SIGHUP` still leaves the terminal raw).
 pub(crate) struct RawMode {
     fd: libc::c_int,
     original: libc::termios,
@@ -593,7 +660,7 @@ fn open_pty_pair(size: Option<&libc::winsize>) -> io::Result<(libc::c_int, libc:
     }
     if let Some(size) = size {
         // SAFETY: `TIOCSWINSZ` reads the `struct winsize` it is handed. A failure leaves the pty at
-        // its default size, which the resize relay corrects at the first `SIGWINCH`.
+        // its default size, which the signal relay corrects at the first `SIGWINCH`.
         unsafe { libc::ioctl(master, libc::TIOCSWINSZ, size as *const libc::winsize) };
     }
     Ok((master, slave))
@@ -662,15 +729,25 @@ pub(super) unsafe fn fork_with_pty(
         drop(child);
     }
 
-    // Parent: drop the slave, go raw, relay.
+    // Parent: drop the slave, catch the signals the relay carries, go raw, relay.
     // SAFETY: only the parent reaches this line — the child branch above never returns — and its
     // `slave` is its own copy of the descriptor, still open and used nowhere else here.
     unsafe { libc::close(slave) };
-    let _raw = match RawMode::enable(0) {
+    // The relay goes in *after* the fork, so the child never runs with its handler, and *before*
+    // raw mode, so no stop can find the terminal raw with its default action still standing. sbx
+    // keeps the real controlling terminal (only the child `setsid`'d, via `login_tty` or the attach
+    // entry), so it receives `SIGWINCH` from the launching terminal naturally; the handler wakes
+    // `pump` to copy the new size onto the pty master. Best effort: if it cannot be installed the
+    // session still runs, only without dynamic resize (the startup size is already set when the
+    // pair was opened) and with a stop that leaves the terminal raw.
+    let relay = SignalRelay::install().ok();
+    let raw = match RawMode::enable(0) {
         Ok(raw) => raw,
         Err(e) => {
             // The child is running and nothing will relay its terminal: stop it as a force-quit
-            // does, and reap it, rather than leave a cage on a pty no one reads.
+            // does, and reap it, rather than leave a cage on a pty no one reads. The relay goes
+            // first, so a stop that arrives meanwhile takes effect as it always did.
+            drop(relay);
             // SAFETY: the parent has held `master` since `open_pty_pair` and nothing reads it now;
             // this is its only close.
             unsafe { libc::close(master) };
@@ -678,24 +755,25 @@ pub(super) unsafe fn fork_with_pty(
             return Err(PtyFailure::AfterFork(e));
         }
     };
-    // Install the resize relay *after* the fork so the child never inherits the handler. sbx keeps
-    // the real controlling terminal (only the child `setsid`'d, via `login_tty` or the attach
-    // entry), so it receives `SIGWINCH` from the launching terminal naturally; the handler wakes
-    // `pump` to copy the new size onto the pty master. Best effort: if it cannot be installed the
-    // session still runs, only without dynamic resize (the startup size is already set when
-    // the pair was opened).
-    let winch = WinchRelay::install().ok();
-    if winch.is_some() {
+    if relay.is_some() {
         // Close a resize that raced startup (between opening the pair and now).
         copy_winsize(0, master);
     }
-    let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
-    let status = pump(master, pid, winch_fd, gui);
-    drop(winch);
+    let signals_fd = relay.as_ref().map_or(-1, SignalRelay::read_fd);
+    let status = pump(master, pid, signals_fd, gui);
+    drop(relay);
     // SAFETY: the parent has held `master` since `open_pty_pair` and `pump` has returned, so nothing is
     // still reading it; this is its only close.
     unsafe { libc::close(master) };
-    status.map_err(PtyFailure::AfterFork)
+    match status {
+        Ok(Ended::Exited(code)) => Ok(code),
+        // The terminal is given back first: that is what the relay is for.
+        Ok(Ended::Stopped) => {
+            drop(raw);
+            end_as_asked()
+        }
+        Err(e) => Err(PtyFailure::AfterFork(e)),
+    }
 }
 
 /// Why [`fork_with_pty`] has no exit code to give, by the side of the fork the failure came from.
@@ -757,6 +835,88 @@ mod tests {
             ran.status,
             ran.stdout,
             ran.stderr
+        );
+    }
+
+    /// A stop that arrives while the relay runs gives the terminal back before the process ends,
+    /// and the process still ends as the signal asked. Run alone, with a terminal of this test's own
+    /// for its standard input, so raw mode has something to change and to put back.
+    #[test]
+    fn a_stop_while_the_relay_runs_gives_the_terminal_back() {
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        let (master, slave) = open_pty_pair(None).expect("a terminal for the process run alone");
+        // SAFETY: all-zero is a valid `termios`, and `tcgetattr` fills it from the slave this test
+        // opened before anything reads it.
+        let mut before: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut before) }, 0);
+        // SAFETY: `dup` hands back a fresh descriptor for the slave, owned from here on and given
+        // to the process run alone as its standard input.
+        let stdin = unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave)) };
+        let mut run = crate::testutil::alone(concat!(module_path!(), "::a_relay_told_to_stop"), "")
+            .stdin(std::process::Stdio::from(stdin))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the process run alone starts");
+        // The child behind the relay says it runs through the pty, so the relay is pumping, its
+        // handler installed, by the time this reads the word.
+        let mut out = run.stdout.take().expect("its output");
+        let (ready, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 256];
+            while let Ok(n) = out.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&chunk[..n]);
+                if seen.windows(5).any(|w| w == b"ready") {
+                    let _ = ready.send(());
+                    seen.clear();
+                }
+            }
+        });
+        let was_ready = heard.recv_timeout(Duration::from_secs(10)).is_ok();
+        if was_ready {
+            // SAFETY: the process this test started, not yet reaped; `kill` takes two integers.
+            unsafe { libc::kill(run.id() as libc::pid_t, libc::SIGTERM) };
+        }
+        let pidfd = crate::session::open_pidfd(run.id()).expect("a pidfd for the process run");
+        let ended = crate::session::wait_for_exit(pidfd, Duration::from_secs(10));
+        crate::session::close_fd(pidfd);
+        if !ended {
+            let _ = run.kill();
+        }
+        let status = run.wait().expect("the process run alone is reaped");
+        // SAFETY: as for `before`, on the same slave, which this test still holds.
+        let mut after: libc::termios = unsafe { std::mem::zeroed() };
+        let read_after = unsafe { libc::tcgetattr(slave, &mut after) };
+        // SAFETY: the pair this test opened, closed once and used nowhere else.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        let mut errors = String::new();
+        let _ = run.stderr.take().map(|mut e| e.read_to_string(&mut errors));
+        assert!(was_ready, "the relay never ran: {errors}");
+        assert!(ended, "the process did not end on the stop: {errors}");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "it ends as the signal asked, not by returning: {status} {errors}"
+        );
+        assert_eq!(read_after, 0);
+        assert_eq!(
+            (after.c_iflag, after.c_oflag, after.c_cflag, after.c_lflag),
+            (
+                before.c_iflag,
+                before.c_oflag,
+                before.c_cflag,
+                before.c_lflag
+            ),
+            "the terminal is given back as it was: {errors}"
         );
     }
 
@@ -868,7 +1028,11 @@ mod tests {
                 libc::close(master);
             }
             assert_eq!(got, 4, "the holder was started");
-            assert_eq!(code.ok(), Some(3), "the child's own exit code");
+            assert_eq!(
+                code.ok(),
+                Some(Ended::Exited(3)),
+                "the child's own exit code"
+            );
             assert!(
                 took < Duration::from_secs(5),
                 "the relay ended only after {took:?}, with the holder gone rather than the child"
@@ -979,6 +1143,34 @@ mod tests {
         });
     }
 
+    /// The relay run by [`a_stop_while_the_relay_runs_gives_the_terminal_back`]; anywhere else it
+    /// does nothing. The child takes the pty as its terminal, says it runs, and waits; the stop
+    /// arrives while the relay pumps, and a relay that returned instead of ending says so.
+    #[test]
+    #[ignore = "run alone by the test that stops it, on a terminal of that test's own"]
+    fn a_relay_told_to_stop() {
+        crate::testutil::when_run_alone(|_| {
+            let child = move |slave: libc::c_int| -> std::convert::Infallible {
+                // SAFETY: `login_tty`, `write`, `sleep` and `_exit` are async-signal-safe, and the
+                // bytes are a constant; nothing here allocates.
+                unsafe {
+                    if libc::login_tty(slave) == 0 {
+                        let ready = b"ready\n";
+                        libc::write(1, ready.as_ptr().cast(), ready.len());
+                        // Bounded: the hangup when the relay's master closes ends it first.
+                        libc::sleep(20);
+                    }
+                    libc::_exit(0)
+                }
+            };
+            // SAFETY: the child above honours the async-signal-safe contract and never returns.
+            let result = unsafe { fork_with_pty(false, child) };
+            Err(io::Error::other(format!(
+                "the relay returned instead of ending as the stop asked: {result:?}"
+            )))
+        });
+    }
+
     /// The pty run by [`a_terminal_that_cannot_go_raw_stops_and_reaps_the_started_child`];
     /// anywhere else it does nothing. The child writes its pid and waits; SIGTERM is blocked in it
     /// (inherited from this thread's mask), so the pid is always written before the escalation to
@@ -1074,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn winch_handler_leaves_errno_to_the_interrupted_call() {
+    fn relay_handler_leaves_errno_to_the_interrupted_call() {
         // A relay pipe filled to capacity, so the handler's write really fails and really sets
         // `errno` — the case a resize arriving mid-`write_all` produces.
         let mut fds = [0 as libc::c_int; 2];
@@ -1091,21 +1283,21 @@ mod tests {
             "the pipe must be full, or the handler's write would not fail at all"
         );
 
-        let previous = WINCH_WRITE_FD.swap(write_fd, Ordering::Relaxed);
+        let previous = SIGNAL_WRITE_FD.swap(write_fd, Ordering::Relaxed);
         // What a failing pty syscall left behind for the line that is about to read it.
         unsafe { *libc::__errno_location() = libc::EIO };
-        winch_handler(libc::SIGWINCH);
+        relay_handler(libc::SIGWINCH);
         let after_failed_write = unsafe { *libc::__errno_location() };
 
         // And the nudge itself still happens when the pipe has room: the guard must not have
         // become "do nothing".
         let mut sink = [0u8; 64];
         while unsafe { libc::read(read_fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
-        winch_handler(libc::SIGWINCH);
+        relay_handler(libc::SIGWINCH);
         let mut one = [0u8; 8];
         let nudged = unsafe { libc::read(read_fd, one.as_mut_ptr().cast(), one.len()) };
 
-        WINCH_WRITE_FD.store(previous, Ordering::Relaxed);
+        SIGNAL_WRITE_FD.store(previous, Ordering::Relaxed);
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);
@@ -1152,7 +1344,7 @@ mod tests {
             libc::close(master);
             code
         };
-        assert_eq!(code.ok(), Some(1));
+        assert_eq!(code.ok(), Some(Ended::Exited(1)));
     }
 
     /// A descriptor another program left non-blocking is waited on, not given up on: a full pipe

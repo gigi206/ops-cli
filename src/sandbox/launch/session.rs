@@ -382,13 +382,12 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 ///   `<data>/egress/` on disk — the same leak any crash or `SIGKILL` of that process already
 ///   produces; a future sweep of stale egress artefacts (alongside the session housekeeping) is the
 ///   clean fix.
-/// - stopping an interactive `sbx run` session signals its pty supervisor, whose terminal-state restore is
-///   also a RAII guard, so the owner's terminal (where that an interactive `sbx run` runs) is left in raw mode
-///   and needs a `reset`. Stopping a backgrounded agent — the verb's purpose — is unaffected; this
-///   only bites the unusual case of stopping an interactive shell from another terminal. `--all`
-///   targets *every* session, interactive shells included (a deliberate choice — "all" means all,
-///   matching how `sbx session stop <id>` already treats a shell), so it can trip this residual on a shell
-///   open elsewhere; stop a single agent by pid to avoid it.
+/// - stopping an interactive `sbx run` session signals its pty supervisor, which gives the owner's
+///   terminal back before it ends. It cannot when the `SIGKILL` comes first (a `grace` of zero), or
+///   while its relay is stuck writing to a cage that stopped reading its input: that terminal is
+///   left in raw mode and needs a `reset`. Stopping a backgrounded agent — the verb's purpose — is
+///   unaffected. `--all` targets *every* session, interactive shells included (a deliberate choice —
+///   "all" means all, matching how `sbx session stop <id>` already treats a shell).
 pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let layout = match crate::layout_or_fail() {
         Ok(l) => l,
