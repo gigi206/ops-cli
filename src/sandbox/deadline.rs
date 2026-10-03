@@ -19,7 +19,11 @@
 //!
 //! The same gap opens on the other side of a conversation. A message written to a peer that takes
 //! it a few bytes at a time, each inside the socket's send timeout, holds the writer for as long as
-//! the message is long, so the adapter carries the budget over `Write` too.
+//! the message is long, so the adapter carries the budget over `Write` too. There the gap is wider
+//! than one call: a send timeout bounds each wait for room in the socket, not the `write` that
+//! waits, so one `write` of a large buffer to a peer that drains it steadily runs for as long as the
+//! draining takes. The adapter therefore hands the socket at most [`WRITE_CHUNK`] per call, and asks
+//! the budget again between calls.
 
 use std::io::{self, BufRead, Read, Write};
 use std::time::Instant;
@@ -76,10 +80,17 @@ impl<R: BufRead> BufRead for Deadlined<'_, R> {
     }
 }
 
+/// The most one `write` through [`Deadlined`] hands the inner writer at once.
+///
+/// Measured on a Unix socket pair: one `send` of 4 MiB to a peer draining 64 KiB every 150 ms ran
+/// for 9 seconds under a 200 ms send timeout, every wait inside it short. A piece this size needs
+/// room once, so each call waits at most one send timeout before the budget is asked again.
+const WRITE_CHUNK: usize = 16 * 1024;
+
 impl<W: Write> Write for Deadlined<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.budget_left(WRITE_DEADLINE_PASSED)?;
-        self.inner.write(buf)
+        self.inner.write(&buf[..buf.len().min(WRITE_CHUNK)])
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -105,6 +116,40 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A large write to a socket whose peer drains it steadily, each wait for room well inside the
+    /// send timeout, is cut off at the budget. Handed over in one call, the buffer was written for
+    /// as long as the draining took, since the budget is asked only between calls.
+    #[test]
+    fn a_large_write_to_a_steadily_draining_socket_ends_at_the_budget() {
+        let (mut ours, mut theirs) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        ours.set_write_timeout(Some(Duration::from_millis(200)))
+            .expect("a send timeout");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let draining = std::sync::Arc::clone(&stop);
+        let drain = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            while !draining.load(std::sync::atomic::Ordering::SeqCst) {
+                if matches!(theirs.read(&mut buf), Ok(0) | Err(_)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+        let started = Instant::now();
+        let written = Deadlined::new(&mut ours, started + Duration::from_millis(600))
+            .write_all(&vec![b'x'; 4 << 20]);
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(ours);
+        let _ = drain.join();
+        let err = written.expect_err("the budget ends it");
+        assert_eq!(err.to_string(), WRITE_DEADLINE_PASSED);
+        assert!(
+            took < Duration::from_secs(3),
+            "ended near the budget, not when the peer had drained it all: {took:?}"
+        );
     }
 
     /// A write to a peer that sips is cut off at the budget for the whole message, not carried on

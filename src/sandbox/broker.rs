@@ -3807,6 +3807,58 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         );
     }
 
+    /// A plugin that takes its question slowly, each wait well inside the socket's send timeout, is
+    /// given up on at the budget for the whole line: the question is written under the same budget
+    /// the verdict is read under.
+    #[test]
+    fn a_plugin_taking_its_question_slowly_is_cut_off_at_the_budget() {
+        use std::os::unix::net::UnixStream;
+        let (ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        ours.set_write_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("a send timeout");
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("a read timeout");
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("a stand-in plugin process");
+        let mut plugin = PluginProcess {
+            child,
+            max_frame: 1 << 20,
+            reader: io::BufReader::new(ours.try_clone().expect("a second handle")),
+            writer: ours,
+            budget: std::time::Duration::from_millis(300),
+        };
+        let drain = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(n) = theirs.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        });
+        let started = std::time::Instant::now();
+        let err = plugin
+            .ask(&Ask {
+                seq: 1,
+                dir: Direction::Up,
+                data: &vec![b'q'; 1 << 20],
+            })
+            .expect_err("no verdict");
+        let took = started.elapsed();
+        drop(plugin);
+        let _ = drain.join();
+        assert!(
+            err.contains(super::super::deadline::WRITE_DEADLINE_PASSED),
+            "{err}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "cut off near the budget, not when the plugin had read it all: {took:?}"
+        );
+    }
+
     /// What the plugin writes in its handshake reaches the error cleaned and cut short: a reason
     /// that would start a line of its own, posing as one of sbx's, and a field name `serde` quotes
     /// back, both arrive as one bounded line.
