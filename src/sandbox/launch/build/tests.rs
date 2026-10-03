@@ -127,11 +127,13 @@ fn the_project_root_is_canonicalized_before_it_is_pinned_against() {
 #[test]
 fn establish_control_plane_pins_creates_each_pin_and_preserves_its_mode() {
     // A pin's host path is created (so a not-yet-existent control-plane root is present to be
-    // frozen) and turned into a same-path extra bind that carries the pin's mode: a read-write
-    // intermediate, a read-only leaf.
+    // frozen) and turned into an extra bind at that path that carries the pin's mode: a read-write
+    // intermediate bound from itself, a read-only leaf bound from the empty decoy, so the cage
+    // finds the root in place and nothing under it.
     let tmp = TmpDir::new();
     let inter = tmp.path().join("chain/intermediate");
     let leaf = tmp.path().join("chain/intermediate/root");
+    let decoy = tmp.path().join("decoy");
     let pins = vec![
         crate::config::Bind {
             path: inter.clone(),
@@ -142,14 +144,51 @@ fn establish_control_plane_pins_creates_each_pin_and_preserves_its_mode() {
             writable: false,
         },
     ];
-    let binds = establish_control_plane_pins(&pins).expect("pins establish");
+    let binds = establish_control_plane_pins(&pins, Some(&decoy)).expect("pins establish");
     assert!(inter.is_dir() && leaf.is_dir(), "each pin path is created");
     assert_eq!(binds.len(), 2);
     assert_eq!(binds[0].src, inter);
     assert_eq!(binds[0].dest, inter);
     assert!(binds[0].writable, "the intermediate is read-write");
+    assert_eq!(
+        binds[1].src, decoy,
+        "the leaf shows the decoy, not sbx's own tree"
+    );
     assert_eq!(binds[1].dest, leaf);
     assert!(!binds[1].writable, "the leaf is read-only");
+
+    // With nothing to bind the leaf from, the launch fails closed rather than binding the root
+    // itself, which would show the cage what lives under it.
+    let err = establish_control_plane_pins(&pins, None).expect_err("a leaf needs its decoy");
+    assert!(
+        err.to_string().contains(&leaf.display().to_string()),
+        "the failure names the leaf: {err}"
+    );
+}
+
+#[test]
+fn a_launch_stages_a_decoy_only_for_a_read_only_pin() {
+    let tmp = TmpDir::new();
+    let pin = |writable: bool| crate::config::Bind {
+        path: tmp.path().join("root"),
+        writable,
+    };
+    // No read-only pin, no decoy: the launches whose project and binds contain none of sbx's
+    // roots, and the chain's intermediates alone.
+    assert_eq!(pin_decoy(tmp.path(), None, &[]).unwrap(), None);
+    assert_eq!(pin_decoy(tmp.path(), None, &[pin(true)]).unwrap(), None);
+    // The masks' decoy when they staged one, so a launch keeps a single empty directory.
+    let masks = crate::sandbox::fsmask::stage_decoys(&tmp.path().join("masks")).unwrap();
+    assert_eq!(
+        pin_decoy(tmp.path(), Some(&masks), &[pin(false)]).unwrap(),
+        Some(masks.dir.clone())
+    );
+    // Otherwise one staged for the pins, empty.
+    let staged = pin_decoy(tmp.path(), None, &[pin(false)])
+        .unwrap()
+        .expect("a read-only pin gets a decoy");
+    assert!(staged.starts_with(tmp.path()), "{}", staged.display());
+    assert_eq!(std::fs::read_dir(&staged).unwrap().count(), 0);
 }
 
 #[test]
@@ -165,24 +204,32 @@ fn establish_control_plane_pins_fails_closed_when_a_pin_cannot_be_created() {
         path: blocker.join("root"),
         writable: false,
     }];
-    let err = establish_control_plane_pins(&pins).expect_err("a blocked pin must fail closed");
+    let decoy = tmp.path().join("decoy");
+    let err = establish_control_plane_pins(&pins, Some(&decoy))
+        .expect_err("a blocked pin must fail closed");
     assert!(
         err.to_string().contains("blocker"),
         "the failure names the unestablishable path: {err}"
     );
 }
 
-/// A pin that would land on an `[fs]` mask is dropped, so the mask is not silently undone.
+/// A pin that would undo an `[fs]` mask is dropped, so the mask is not silently undone.
 ///
 /// The pins are appended after the masks and the later bind at a destination wins, so a chain
 /// running through a masked directory (`$HOME/.config` with the project root at `$HOME`) would
 /// otherwise put the real, read-write directory back over a `deny`'s decoy — and turn a declared
-/// `readonly` path read-write.
+/// `readonly` path read-write. The read-only leaf is the one pin that may stay, under `readonly`
+/// only: bound from the empty decoy, it closes more than the mask.
 #[test]
 fn a_control_plane_pin_that_lands_on_an_fs_mask_is_dropped() {
     let home = PathBuf::from("/home/agent");
+    let decoy = PathBuf::from("/data/fs/mask-1/dir");
     let pin = |path: PathBuf, writable: bool| binds::ExtraBind {
-        src: path.clone(),
+        src: if writable {
+            path.clone()
+        } else {
+            decoy.clone()
+        },
         dest: path,
         writable,
     };
@@ -210,12 +257,16 @@ fn a_control_plane_pin_that_lands_on_an_fs_mask_is_dropped() {
         "a pin over a denied directory hands the cage back the real one, read-write"
     );
 
-    // `readonly = [".config/"]`: same containment, and the pin would re-bind it read-write.
+    // `readonly = [".config/"]`: same containment, and the intermediate would re-bind it
+    // read-write. The leaf stays, since the mask would otherwise show the cage sbx's own config.
     masks = crate::sandbox::fsmask::Expanded {
         readonly: vec![masked(home.join(".config"))],
         ..Default::default()
     };
-    assert!(pins_clear_of_masks(pins.clone(), &masks, &[]).is_empty());
+    assert_eq!(
+        pins_clear_of_masks(pins.clone(), &masks, &[]),
+        vec![pin(home.join(".config/sbx"), false)]
+    );
 
     // A mask elsewhere in the project does not cost the control plane its pins.
     masks = crate::sandbox::fsmask::Expanded {
@@ -241,13 +292,13 @@ fn found_at<'b>(binds: &'b [binds::ExtraBind], path: &Path) -> Option<&'b binds:
     binds.iter().rev().find(|b| path.starts_with(&b.dest))
 }
 
-/// A control-plane pin laid above an `[fs]` bind must not cover it, and the control plane must stay
-/// read-only around a mask laid inside it, directories held there included.
+/// A control-plane pin laid above an `[fs]` bind must not cover it, and sbx's roots must stay
+/// closed around a mask laid inside one, directories held there included.
 ///
 /// The chains are the ones `cd ~ && sbx run` produces, and the `[fs]` binds are what a mask under
 /// `.config` and a mask inside the data dir emit: the directories held above them, then the masks.
-/// This is the arrangement itself. The cage below cannot tell the second rule apart, since without
-/// it the third lays the masks again and a covered mount point still refuses a rename.
+/// This is the arrangement itself. A mask inside a root is closed by the root's decoy, laid after
+/// it, and is not laid again: its destination does not exist in the empty decoy.
 #[test]
 fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
     let home = PathBuf::from("/home/agent");
@@ -261,12 +312,17 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
         dest: home.join(path),
         writable: false,
     };
+    let root = |path: &str| binds::ExtraBind {
+        src: PathBuf::from("/data/fs/mask-1/dir"),
+        dest: home.join(path),
+        writable: false,
+    };
     let pins = vec![
         bind(".config", true),
-        bind(".config/sbx", false),
+        root(".config/sbx"),
         bind(".local", true),
         bind(".local/share", true),
-        bind(".local/share/sbx", false),
+        root(".local/share/sbx"),
     ];
     let fs_binds = vec![
         bind(".config", true),
@@ -288,27 +344,26 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
         ))
         .collect();
 
-    for path in [".config/gh/hosts.yml", ".local/share/sbx/sub/secret"] {
-        assert_eq!(
-            found_at(&laid, &home.join(path)),
-            Some(&mask(path)),
-            "`{path}` must stay masked: {laid:#?}"
-        );
-    }
+    assert_eq!(
+        found_at(&laid, &home.join(".config/gh/hosts.yml")),
+        Some(&mask(".config/gh/hosts.yml")),
+        "a mask outside sbx's roots must stay masked: {laid:#?}"
+    );
     assert_eq!(
         found_at(&laid, &home.join(".config/gh")),
         Some(&bind(".config/gh", true)),
         "the directory held above a mask must stay held: {laid:#?}"
     );
-    for (path, root) in [
+    for (path, at) in [
         (".config/sbx", ".config/sbx"),
         (".local/share/sbx", ".local/share/sbx"),
         (".local/share/sbx/sub", ".local/share/sbx"),
+        (".local/share/sbx/sub/secret", ".local/share/sbx"),
     ] {
         assert_eq!(
             found_at(&laid, &home.join(path)),
-            Some(&bind(root, false)),
-            "`{path}` must stay under sbx's read-only root: {laid:#?}"
+            Some(&root(at)),
+            "`{path}` must stay under the decoy of sbx's root: {laid:#?}"
         );
     }
     assert_eq!(
@@ -320,7 +375,7 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
 
 /// The same arrangement, laid by bubblewrap: a mask under `.config` and one inside sbx's data dir
 /// stay closed, the directory held above the first cannot be renamed, and sbx's roots stay
-/// read-only, a directory held inside one included. bwrap and a user namespace are enough; no
+/// read-only and show nothing of what they hold. bwrap and a user namespace are enough; no
 /// userland is built.
 #[test]
 fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place_inside_the_cage() {
@@ -339,6 +394,7 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place_inside_the_cage() {
     }
     std::fs::write(home.join(".config/gh/hosts.yml"), b"HOSTS").unwrap();
     std::fs::write(home.join(".local/share/sbx/sub/secret"), b"SECRET").unwrap();
+    std::fs::write(home.join(".config/sbx/sbx.toml"), b"CONFIG").unwrap();
     let home = home.canonicalize().unwrap();
 
     let policy = crate::config::fspolicy::FsPolicy {
@@ -353,7 +409,11 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place_inside_the_cage() {
     let decoys = crate::sandbox::fsmask::stage_decoys(&scratch.path().join("mask")).unwrap();
     let fs_binds = crate::sandbox::fsmask::agent_binds(&expanded, &decoys, true);
     let pin = |path: &str, writable: bool| binds::ExtraBind {
-        src: home.join(path),
+        src: if writable {
+            home.join(path)
+        } else {
+            decoys.dir.clone()
+        },
         dest: home.join(path),
         writable,
     };
@@ -398,8 +458,9 @@ for f in .config/gh/hosts.yml .local/share/sbx/sub/secret; do
   if cat "$f" >&2; then echo "$f open"; else echo "$f closed"; fi
 done
 if mv .config/gh .config/gh.moved 2>&1; then echo ".config/gh moved"; mv .config/gh.moved .config/gh; else echo ".config/gh held"; fi
-for d in .config/sbx .local/share/sbx .local/share/sbx/sub; do
+for d in .config/sbx .local/share/sbx; do
   if touch "$d/written" 2>&1; then echo "$d writable"; rm -f "$d/written"; else echo "$d read-only"; fi
+  if [ -z "$(ls -A "$d")" ]; then echo "$d empty"; else echo "$d shows its contents"; fi
 done
 touch .config/new && echo ".config writable"
 echo end"#;
@@ -429,8 +490,9 @@ echo end"#;
         ".local/share/sbx/sub/secret closed",
         ".config/gh held",
         ".config/sbx read-only",
+        ".config/sbx empty",
         ".local/share/sbx read-only",
-        ".local/share/sbx/sub read-only",
+        ".local/share/sbx empty",
         ".config writable",
     ] {
         assert!(

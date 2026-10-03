@@ -127,8 +127,10 @@ handled fail-closed and warned about; see [`binds`](../configuration/binds).)
   read-only, with a warning.
 - A broad read-write bind that merely **contains** them (e.g. `mode = "rw"` on your
   whole home) stays read-write, but each of `sbx`'s roots is **pinned read-only in
-  place**, so the rest of the tree is writable while the agent still cannot alter
-  what `sbx` runs or trusts.
+  place and shown empty**, so the rest of the tree is writable while the agent still
+  cannot alter what `sbx` runs or trusts, nor reach what those directories hold: the
+  control sockets of every running session, the other projects' homes, the trust
+  markers. Launching from your home (`cd ~ && sbx run`) is this case.
 - The **project itself** follows the same rule. The working directory you launch
   from is bound read-write without being declared anywhere, so running from one of
   `sbx`'s own directories is the same request as a read-write bind over it. It is
@@ -137,12 +139,17 @@ handled fail-closed and warned about; see [`binds`](../configuration/binds).)
 - An [`[fs]`](../configuration/fs) mask keeps its effect where the pins run above it,
   as they do under `.config` and `.local` when you launch from your home. The pins are
   laid around the masks and the directories holding them, never over them, and a mask
-  inside one of `sbx`'s own directories is applied again after the pin that keeps that
-  directory read-only.
+  inside one of `sbx`'s own directories needs nothing more: the empty directory the
+  pin shows there closes it.
 
 This closes an escalation where a writable parent directory would let the agent
 substitute a forged control-plane directory. See [`binds`](../configuration/binds)
 for the details and [The trust gate](trust) for why it matters.
+
+The two read-only cases above keep what they show: a bind aimed at one of `sbx`'s
+directories, or a launch from inside one, shows that directory read-only with its
+contents, sockets included, and a read-only mount does not stop a process from
+connecting to a socket. Neither is something to do with an agent you do not trust.
 
 ## What the trust gate protects
 

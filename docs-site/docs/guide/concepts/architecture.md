@@ -61,7 +61,8 @@ flowchart LR
 The dotted edges carry the same weight as the solid ones. The data directory holds the
 session registry, the installed plugins, the verified stores and the sockets that answer
 for the cage, and none of it is reachable from inside; a read-write
-[`binds`](../configuration/binds) that would expose it is pinned read-only instead.
+[`binds`](../configuration/binds) that would expose it is pinned in place and shown empty
+instead.
 
 ## From a command to a cage
 

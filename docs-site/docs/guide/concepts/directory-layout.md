@@ -94,7 +94,7 @@ All three trees live under your home directory, which means a broad read-write
 [`binds`](../configuration/binds) could in principle expose them to a cage. `sbx`
 prevents that: a read-write bind at or inside one of these directories is forced
 read-only, and a broad bind that merely contains them keeps each pinned read-only in
-place. See [Security model](security-model#the-control-plane-is-pinned).
+place, shown empty. See [Security model](security-model#the-control-plane-is-pinned).
 
 ## Locating the files from the CLI
 

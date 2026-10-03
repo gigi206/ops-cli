@@ -722,8 +722,8 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // writable parent to move a root aside and substitute a forged one (which sbx would then read
     // or `execve` on the host). Proven with teeth on both sides in one real launch:
     //   DENY — a write into a pinned root is `EROFS`; renaming or removing any chain component is
-    //          `EBUSY`; and the pre-placed host trust marker survives untouched (the substitution
-    //          attack fails).
+    //          `EBUSY`; the pre-placed host trust marker survives untouched (the substitution
+    //          attack fails); and a pinned root lists empty, since it is bound from a decoy.
     //   ALLOW — the cage runs at all (its `sh`/coreutils come from `/nix`, whose source lives
     //          *under* the read-only-pinned data dir — so read-through works despite the pin), the
     //          rest of the home is writable, and `/nix` itself is still writable (per-mount, not
@@ -809,8 +809,11 @@ echo "C:$(mv "$H/{s}" "$H/{s}.bak" 2>/dev/null && echo BAD || echo EBUSY)"
 echo "D:$(mv "$H/{s}/sbx/trusted" "$H/stolen" 2>/dev/null && echo BAD || echo EBUSY)"
 echo "E:$(rmdir "$H/{c}/sbx" 2>/dev/null && echo BAD || echo BLOCKED)"
 echo "F:$(touch /nix/.sbx-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
+echo "V:$(ls -A "$H/{d}/sbx" | wc -l)"
+echo "T:$(ls -A "$H/{s}/sbx/trusted" | wc -l)"
 "#,
         h = h.display(),
+        d = DATA_REL,
         s = STATE_REL,
         c = CONFIG_REL
     );
@@ -843,6 +846,12 @@ echo "F:$(touch /nix/.sbx-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
     assert!(
         stdout.contains("E:BLOCKED"),
         "removing a pinned leaf mountpoint must fail: {stdout}"
+    );
+    // A pinned root shows nothing of what it holds: the data dir carries every session's control
+    // sockets and the launch has just filled it, and the trust store carries the marker above.
+    assert!(
+        stdout.lines().any(|l| l == "V:0") && stdout.lines().any(|l| l == "T:0"),
+        "a pinned root must be bound from an empty decoy, not from itself: {stdout}"
     );
     // The decisive teeth: the host trust marker is untouched — the substitution attack failed.
     let after = std::fs::read_to_string(&sentinel).unwrap_or_default();

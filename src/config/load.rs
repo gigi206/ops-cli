@@ -463,9 +463,10 @@ fn root_at_or_above<'a>(canon: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBu
 /// pinned by making every path component below the containing bind a mountpoint (a mountpoint
 /// cannot be renamed or removed — the kernel refuses with `EBUSY`): the intermediates read-write
 /// (the rest of the tree stays writable), the root itself read-only (its host contents cannot be
-/// written through).
+/// written through, and the launcher binds it from an empty decoy so they cannot be read or reached
+/// either: the root holds every session's control sockets).
 ///
-/// Returns those mounts as host binds (source == destination), deduplicated and ordered
+/// Returns those mounts as host paths, deduplicated and ordered
 /// shallow-to-deep so a parent mountpoint is always established before its child — a child bound
 /// first would be shadowed when the parent is later mounted over it, silently defeating the
 /// protection. The caller creates each before binding (a root the agent could otherwise create
@@ -478,9 +479,9 @@ fn root_at_or_above<'a>(canon: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBu
 /// safe not because they come first — they do not — but because their destinations are sbx's own
 /// constants: nothing a project configures chooses them. **A bind appended after the pins whose
 /// destination is derived from the configuration would break the protection.** The one exception
-/// is a bind that can only close: the launcher lays the `[fs]` masks that fall inside a pin again
-/// after the pins, each read-only and bound from the path itself or from sbx's own decoy, so none
-/// can substitute what a pin holds.
+/// is a bind that can only close: the launcher lays the `[fs]` masks that fall inside a read-write
+/// pin again after the pins, each read-only and bound from the path itself or from sbx's own decoy,
+/// so none can substitute what a pin holds.
 ///
 /// Iterates the same root set as [`control_plane_mode`], so a root added there is pinned here
 /// automatically.
@@ -518,7 +519,8 @@ fn control_plane_pins_for(binds: &[Bind], roots: &[PathBuf]) -> Vec<Bind> {
                 }
             }
             // The root itself, read-only: a mountpoint (cannot be renamed/removed) whose host
-            // contents also cannot be written through.
+            // contents cannot be written through, and are not shown either: the launcher binds it
+            // from an empty decoy.
             if seen.insert(root.clone()) {
                 pins.push(Bind {
                     path: root.clone(),
