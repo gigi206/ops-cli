@@ -85,6 +85,9 @@ launch:
 - **`host_greets` and multi-message answers both need `inspect_replies`.** A protocol
   whose reply is a run of messages needs the plugin to say where the run ends, and a
   greeting is a frame from the host that must not reach the cage unseen.
+- **So does a `query`.** The answer a plugin asks the host for is read by the plugin, so a
+  manifest without `inspect_replies` has its plugin refused a query, and the frame it was
+  deciding with it, as it is never shown a reply.
 
 `deny_frame` is optional because it does not generalise: it fits a protocol whose
 refusal is the same whatever was refused, and a protocol whose refusal must echo a

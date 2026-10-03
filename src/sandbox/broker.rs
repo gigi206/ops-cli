@@ -29,7 +29,9 @@
 //!
 //! `Query` grants the plugin no reach it did not already have: a rewritten [`Verdict::Forward`]
 //! could already put arbitrary bytes in front of the host resource. What it adds is *seeing the
-//! answer before deciding*, and sbx still holds the connection throughout.
+//! answer before deciding*, and sbx still holds the connection throughout. Seeing the answer is
+//! seeing what the host says, which is the `inspect_replies` grant: a plugin whose manifest does not
+//! declare it is refused a query, as it is never shown a reply.
 //!
 //! Every parse here is fail-closed and every bound is enforced on sbx's side. A plugin that
 //! answers nonsense, answers late, or asks to query forever is refused, and the caller turns that
@@ -85,8 +87,8 @@ pub(crate) enum Direction {
     /// manifest declares `inspect_replies`.
     Down,
     /// The host's answer to a [`Verdict::Query`] the plugin asked for. Distinct from `Down`
-    /// because it is not on its way anywhere: it is owed to the plugin, which asked for it, and a
-    /// plugin that does not inspect replies still gets these.
+    /// because it is not on its way anywhere: it is owed to the plugin, which asked for it. Only a
+    /// plugin whose manifest declares `inspect_replies` is served a query, and so these.
     QueryReply,
 }
 
@@ -865,6 +867,15 @@ pub(crate) fn relay_one<H: Read + Write>(
         })?;
         match answer.verdict {
             Verdict::Query(bytes) => {
+                // A query's answer is the host's, and without `inspect_replies` the manifest
+                // promised not to show the plugin what the host answers. Serving one anyway let a
+                // plugin query with the cage's own frame, read the answer, and hand it back as its
+                // reply: every answer seen, under a grant that says none is.
+                if !spec.inspect_replies {
+                    return Err("the plugin asked to query the host resource, which needs \
+                         `inspect_replies`: a query's answer is the host's"
+                        .to_string());
+                }
                 // Guard: never in a query. The plugin reads what comes back, so a service that
                 // echoes would hand it the secret — the one path where placing the value would
                 // let the plugin read it.
@@ -2178,6 +2189,14 @@ mod tests {
         }
     }
 
+    /// [`spec`] for a plugin whose manifest declares `inspect_replies`, which a query needs.
+    fn inspecting(deny_frame: Option<Vec<u8>>) -> BrokerSpec {
+        BrokerSpec {
+            inspect_replies: true,
+            ..spec(deny_frame)
+        }
+    }
+
     fn relay(
         frame: &[u8],
         plugin: &mut ScriptedPlugin,
@@ -2298,12 +2317,14 @@ mod tests {
                 label: None,
             },
             ScriptedPlugin::forward(),
+            // The host's reply is put to the plugin too: a query needs `inspect_replies`.
+            ScriptedPlugin::forward(),
         ]);
         let Relayed {
             outcome,
             to_cage: out,
             ..
-        } = relay(&[0x0d], &mut plugin, &mut host, &spec(None)).unwrap();
+        } = relay(&[0x0d], &mut plugin, &mut host, &inspecting(None)).unwrap();
         assert_eq!(
             outcome,
             Outcome::Forwarded {
@@ -2320,6 +2341,7 @@ mod tests {
             vec![
                 (Direction::Up, vec![0x0d]),
                 (Direction::QueryReply, vec![0x0e]),
+                (Direction::Down, vec![0xaa]),
             ]
         );
     }
@@ -2342,13 +2364,41 @@ mod tests {
                 })
                 .collect(),
         );
-        let err = relay(&[0x0d], &mut plugin, &mut host, &spec(None)).expect_err("must be refused");
+        let err =
+            relay(&[0x0d], &mut plugin, &mut host, &inspecting(None)).expect_err("must be refused");
         assert!(err.contains("ceiling"), "{err}");
         assert_eq!(
             host.seen.len(),
             4,
             "the ceiling bounds what actually reached the host"
         );
+    }
+
+    /// A query's answer is the host's, so a plugin whose manifest does not declare
+    /// `inspect_replies` is refused one before anything reaches the host. Otherwise it could query
+    /// with the cage's own frame, read the answer and hand it back as its reply: every answer seen,
+    /// under a grant that says none is.
+    #[test]
+    fn a_query_is_refused_to_a_plugin_that_does_not_inspect_replies() {
+        let mut host = FakeHost::with(vec![b"the host's answer".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![
+            Answer {
+                verdict: Verdict::Query(b"p".to_vec()),
+                expect_reply: true,
+                more: false,
+                label: None,
+            },
+            Answer {
+                verdict: Verdict::Reply(b"the host's answer".to_vec()),
+                expect_reply: true,
+                more: false,
+                label: None,
+            },
+        ]);
+        let err = relay(b"p", &mut plugin, &mut host, &spec(None)).expect_err("refused");
+        assert!(err.contains("needs `inspect_replies`"), "{err}");
+        assert!(host.seen.is_empty(), "the query never reached the host");
+        assert_eq!(plugin.shown, vec![(Direction::Up, b"p".to_vec())]);
     }
 
     /// Whatever goes wrong with the plugin, the frame is refused rather than forwarded on a guess.
@@ -2616,7 +2666,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             more: false,
             label: None,
         }]);
-        let err = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker)
+        let err = relay_with(b"p", &mut plugin, &mut host, &inspecting(None), &marker)
             .expect_err("must be refused");
         assert!(err.contains("query"), "{err}");
         assert!(host.seen.is_empty(), "nothing reaches the host");
@@ -2640,7 +2690,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             more: false,
             label: None,
         }]);
-        let err = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker)
+        let err = relay_with(b"p", &mut plugin, &mut host, &inspecting(None), &marker)
             .expect_err("an echoed credential must be refused before the plugin sees it");
         assert!(err.contains("back toward the cage"), "{err}");
         assert_eq!(

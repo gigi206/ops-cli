@@ -227,7 +227,8 @@ pub(crate) struct BrokerSpec {
     /// Off unless asked for: it is the wider grant of the two, and a broker that only needs to
     /// bound what the cage may *ask* should not be shown what the host answers. On, it is what
     /// lets a reply be rebuilt rather than filtered in place — the property that keeps a withheld
-    /// identity from being spelled toward the cage at all.
+    /// identity from being spelled toward the cage at all. It is also what a `query` verdict needs,
+    /// since the answer the plugin reads is the host's: without it a query is refused.
     pub(crate) inspect_replies: bool,
 }
 
