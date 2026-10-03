@@ -31,8 +31,9 @@
 //! under a project root of `$HOME`, or a read-write bind of it. The launcher pins the data dir there
 //! from an empty decoy (`config::control_plane_pins`), so the cage finds nothing at that path. The
 //! servers check no peer, so what keeps them unreachable is that pin alone, and it does not cover a
-//! bind aimed at the data dir itself or a launch from inside it, both mounted read-only with their
-//! contents, sockets included: a read-only mount does not refuse `connect()`.
+//! bind aimed at or inside the data dir, a launch from inside it, or a read-only bind containing it:
+//! each shows the data dir read-only with its contents, sockets included, the pin too when a bind
+//! or the project lies inside it, and a read-only mount does not refuse `connect()`.
 //!
 //! The wire is line-based and minimal, one command per connection: `LOG` returns the retained events
 //! (a `dropped=` line when a `--follow` cursor fell behind the ring, a `head=` cursor, then one

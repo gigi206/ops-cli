@@ -149,7 +149,9 @@ still lands correctly inside it.
   whole `$HOME`) **stays read-write**, but each `sbx` root is **pinned read-only in
   place and shown empty**, so the rest of the tree is writable while the agent still
   cannot alter what `sbx` runs or trusts, nor reach the control sockets and other
-  projects' state those directories hold.
+  projects' state those directories hold. A root that another bind, or the project,
+  lies inside is shown with its contents instead, read-only, so what you asked for
+  is still there.
 - The **project itself** follows the same rule. The working directory you launch
   from is bound read-write without being declared anywhere, so running from one of
   `sbx`'s own directories is the same request as a read-write bind over it. It is

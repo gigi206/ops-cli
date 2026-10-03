@@ -116,17 +116,21 @@ fn pin_sources(binds: &[crate::config::Bind], project: &Path) -> Vec<crate::conf
 ///   could not be made inside the empty, read-only decoy anyway. Containment is asked of the
 ///   expansion rather than restated here, so "this path is closed" keeps a single definition.
 /// - **A read-write pin under a `readonly` is dropped**, since it would bind the real directory back
-///   read-write over the mask. A read-only pin there stays: its source is the empty decoy, so it
-///   closes more than the mask does, and the mask leaves its path in place to mount on.
+///   read-write over the mask. A read-only pin there stays: its source is the empty decoy or the
+///   path itself, read-only either way, so it never opens more than the mask does, and the mask
+///   leaves its path in place to mount on.
 /// - **A read-write pin `[fs]` already holds is dropped.** A directory held above a mask is bound
 ///   over itself read-write, which is the very bind the pin would lay, already in place and before
 ///   any root below it. Laying it again would cover the masks beneath, for the last rule to lay a
 ///   second time.
-/// - **Every read-only `[fs]` bind strictly under a read-write pin that stays is emitted again after
-///   the pins.** Each of those binds can only close: its source is the path itself or sbx's own
-///   decoy, so landing last never widens what the cage reaches. One under a read-only pin is not:
-///   the decoy covering it closes it already, and its destination does not exist inside the decoy
-///   for bubblewrap to mount on.
+/// - **Every read-only `[fs]` bind strictly under a pin that stays is emitted again after the pins**,
+///   unless that pin is bound from the decoy. Each of those binds can only close: its source is the
+///   path itself or sbx's own decoy, so landing last never widens what the cage reaches. One under
+///   a root bound from the decoy is not: the decoy closes it already, and its destination does not
+///   exist inside the decoy for bubblewrap to mount on.
+///
+/// A pin bound from the decoy is the one whose source is not its own path
+/// ([`establish_control_plane_pins`]).
 ///
 /// Pure, so the arrangement is asserted without a launch.
 fn pins_clear_of_masks(
@@ -135,6 +139,7 @@ fn pins_clear_of_masks(
     fs_binds: &[binds::ExtraBind],
 ) -> Vec<binds::ExtraBind> {
     use crate::sandbox::fsmask::Cover;
+    let from_decoy = |pin: &binds::ExtraBind| pin.src != pin.dest;
     let kept: Vec<binds::ExtraBind> = pins
         .into_iter()
         .filter(|pin| match masks.covering(&pin.dest) {
@@ -150,7 +155,7 @@ fn pins_clear_of_masks(
             !b.writable
                 && !kept
                     .iter()
-                    .any(|pin| !pin.writable && b.dest.starts_with(&pin.dest))
+                    .any(|pin| from_decoy(pin) && b.dest.starts_with(&pin.dest))
                 && kept
                     .iter()
                     .any(|pin| b.dest != pin.dest && b.dest.starts_with(&pin.dest))
@@ -170,46 +175,68 @@ fn pins_clear_of_masks(
 /// the cage's. A read-only root is bound from `decoy`, an empty directory: a read-only bind of the
 /// root itself would freeze its path but show the cage everything under it, and what lives there
 /// (the sockets every session's control plane listens on, other projects' homes) is what the cage
-/// must not reach. A read-only pin with no decoy to bind from is the same failure as one that
-/// cannot be created.
+/// must not reach. The exception is a root that `sources` reach into ([`pin_shows_itself`]). A
+/// read-only pin with no decoy to bind from is the same failure as one that cannot be created.
+///
+/// A pin inside a root bound from the decoy is not laid: the decoy shows the cage nothing there,
+/// and the pin's mountpoint could not be made inside it. Roots nest where the environment puts one
+/// inside another (`XDG_STATE_HOME` at the config home puts the trust store under the global-config
+/// directory), and the pins come shallow-to-deep, so the root above is met first.
 fn establish_control_plane_pins(
     pins: &[crate::config::Bind],
+    sources: &[crate::config::Bind],
     decoy: Option<&Path>,
 ) -> io::Result<Vec<binds::ExtraBind>> {
-    pins.iter()
-        .map(|pin| {
-            std::fs::create_dir_all(&pin.path)
-                .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", pin.path.display())))?;
-            let src = if pin.writable {
-                pin.path.clone()
-            } else {
-                decoy
-                    .ok_or_else(|| {
-                        io::Error::other(format!(
-                            "{}: no empty directory to bind it from",
-                            pin.path.display()
-                        ))
-                    })?
-                    .to_path_buf()
-            };
-            Ok(binds::ExtraBind {
-                src,
-                dest: pin.path.clone(),
-                writable: pin.writable,
-            })
-        })
-        .collect()
+    let mut closed: Vec<&Path> = Vec::new();
+    let mut laid = Vec::new();
+    for pin in pins {
+        if closed.iter().any(|root| pin.path.starts_with(root)) {
+            continue;
+        }
+        std::fs::create_dir_all(&pin.path)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", pin.path.display())))?;
+        let src = if pin_shows_itself(pin, sources) {
+            pin.path.clone()
+        } else {
+            closed.push(&pin.path);
+            decoy
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "{}: no empty directory to bind it from",
+                        pin.path.display()
+                    ))
+                })?
+                .to_path_buf()
+        };
+        laid.push(binds::ExtraBind {
+            src,
+            dest: pin.path.clone(),
+            writable: pin.writable,
+        });
+    }
+    Ok(laid)
+}
+
+/// Whether a control-plane pin is bound from its own path rather than from the empty decoy: a
+/// read-write intermediate always is, and a read-only root is when the project or a configured bind
+/// lies at or under it. Those are mounted before the pins, which cover them, so the decoy would
+/// leave an empty directory where the bind was asked for and a project the cage cannot enter. Such
+/// a root shows the cage its contents, read-only, which is the residual the security model names
+/// for a bind aimed at one of sbx's directories and a launch from inside one.
+fn pin_shows_itself(pin: &crate::config::Bind, sources: &[crate::config::Bind]) -> bool {
+    pin.writable || sources.iter().any(|s| s.path.starts_with(&pin.path))
 }
 
 /// The empty directory a launch's read-only control-plane pins are bound from: the `[fs]` masks'
-/// own decoy when they staged one, a freshly staged one otherwise, and none when no pin is
-/// read-only, which is every launch whose project and binds contain none of sbx's roots.
+/// own decoy when they staged one, a freshly staged one otherwise, and none when every pin is bound
+/// from its own path, which is every launch whose project and binds contain none of sbx's roots.
 fn pin_decoy(
     data_dir: &Path,
     staged: Option<&crate::sandbox::fsmask::Decoys>,
     pins: &[crate::config::Bind],
+    sources: &[crate::config::Bind],
 ) -> io::Result<Option<PathBuf>> {
-    if pins.iter().all(|pin| pin.writable) {
+    if pins.iter().all(|pin| pin_shows_itself(pin, sources)) {
         return Ok(None);
     }
     if let Some(decoys) = staged {
@@ -2778,7 +2805,8 @@ pub(super) fn build(
     // one at the same path — which sbx would otherwise read or `execve` on its next run. The leaf is
     // bound from an empty decoy rather than from itself: frozen in place, it shows the cage nothing
     // of what lives under it, the control sockets of every session included, which a read-only
-    // bind would leave open to `connect()`. The bind stays read-write; only these specific host
+    // bind would leave open to `connect()`. A root the project or a bind lies in is bound from
+    // itself instead (`pin_shows_itself`). The bind stays read-write; only these specific host
     // paths are protected. Emitted after the structural
     // mounts — the containing read-write bind has to be in place before the pin lands on it. Binds
     // are appended after this block (the task control plane below); the rule they have to respect
@@ -2789,7 +2817,8 @@ pub(super) fn build(
     // above one of them (`$HOME/.config` under a project root of `$HOME`). A pin laid there would
     // cover it, so `pins_clear_of_masks` arranges the pins around them: it drops a pin a mask or a
     // held directory already provides, and lays again after the pins a mask that sits inside a
-    // read-write one. A mask inside a read-only leaf needs nothing: the decoy closes it.
+    // pin not bound from the decoy. A mask inside a root bound from the decoy needs nothing: the
+    // decoy closes it.
     //
     // Interdependency: the protection assumes in-cage code cannot `umount` a pin. That holds because
     // bwrap drops all capabilities (no `CAP_SYS_ADMIN` in the cage's user namespace) and the seccomp
@@ -2814,8 +2843,8 @@ pub(super) fn build(
     // containment test.
     let sources = pin_sources(&prep.cfg.binds, &prep.cwd);
     let pins = crate::config::control_plane_pins(&sources);
-    match pin_decoy(prep.layout.data_dir(), fs.decoys.as_ref(), &pins)
-        .and_then(|decoy| establish_control_plane_pins(&pins, decoy.as_deref()))
+    match pin_decoy(prep.layout.data_dir(), fs.decoys.as_ref(), &pins, &sources)
+        .and_then(|decoy| establish_control_plane_pins(&pins, &sources, decoy.as_deref()))
     {
         Ok(pins) => extra_binds.extend(pins_clear_of_masks(pins, &fs.masks, &fs.binds)),
         Err(e) => {

@@ -139,17 +139,22 @@ handled fail-closed and warned about; see [`binds`](../configuration/binds).)
 - An [`[fs]`](../configuration/fs) mask keeps its effect where the pins run above it,
   as they do under `.config` and `.local` when you launch from your home. The pins are
   laid around the masks and the directories holding them, never over them, and a mask
-  inside one of `sbx`'s own directories needs nothing more: the empty directory the
-  pin shows there closes it.
+  inside one of `sbx`'s own directories stays closed too: by the empty directory the
+  pin shows there, or laid again after the pin where that directory is shown with its
+  contents (below).
 
 This closes an escalation where a writable parent directory would let the agent
 substitute a forged control-plane directory. See [`binds`](../configuration/binds)
 for the details and [The trust gate](trust) for why it matters.
 
-The two read-only cases above keep what they show: a bind aimed at one of `sbx`'s
-directories, or a launch from inside one, shows that directory read-only with its
-contents, sockets included, and a read-only mount does not stop a process from
-connecting to a socket. Neither is something to do with an agent you do not trust.
+The two read-only cases above keep what they show: a bind aimed at or inside one of
+`sbx`'s directories, or a launch from inside one, shows what it covers read-only with
+its contents, sockets included, and a read-only mount does not stop a process from
+connecting to a socket. When a broad read-write bind also contains that directory,
+the pin shows the whole directory the same way rather than hide what you asked for.
+A read-only bind that contains one of `sbx`'s directories, such as a read-only bind
+of your whole home, shows it with its contents as well. None of these is something
+to do with an agent you do not trust.
 
 ## What the trust gate protects
 

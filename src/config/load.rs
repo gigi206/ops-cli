@@ -464,7 +464,8 @@ fn root_at_or_above<'a>(canon: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBu
 /// cannot be renamed or removed — the kernel refuses with `EBUSY`): the intermediates read-write
 /// (the rest of the tree stays writable), the root itself read-only (its host contents cannot be
 /// written through, and the launcher binds it from an empty decoy so they cannot be read or reached
-/// either: the root holds every session's control sockets).
+/// either: the root holds every session's control sockets. A root a bind or the project lies inside
+/// is bound from itself instead, read-only, since the decoy would cover what was asked for).
 ///
 /// Returns those mounts as host paths, deduplicated and ordered
 /// shallow-to-deep so a parent mountpoint is always established before its child — a child bound
@@ -520,7 +521,7 @@ fn control_plane_pins_for(binds: &[Bind], roots: &[PathBuf]) -> Vec<Bind> {
             }
             // The root itself, read-only: a mountpoint (cannot be renamed/removed) whose host
             // contents cannot be written through, and are not shown either: the launcher binds it
-            // from an empty decoy.
+            // from an empty decoy, unless a bind or the project lies inside it.
             if seen.insert(root.clone()) {
                 pins.push(Bind {
                     path: root.clone(),

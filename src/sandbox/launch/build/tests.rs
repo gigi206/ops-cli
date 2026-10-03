@@ -144,7 +144,7 @@ fn establish_control_plane_pins_creates_each_pin_and_preserves_its_mode() {
             writable: false,
         },
     ];
-    let binds = establish_control_plane_pins(&pins, Some(&decoy)).expect("pins establish");
+    let binds = establish_control_plane_pins(&pins, &[], Some(&decoy)).expect("pins establish");
     assert!(inter.is_dir() && leaf.is_dir(), "each pin path is created");
     assert_eq!(binds.len(), 2);
     assert_eq!(binds[0].src, inter);
@@ -159,15 +159,122 @@ fn establish_control_plane_pins_creates_each_pin_and_preserves_its_mode() {
 
     // With nothing to bind the leaf from, the launch fails closed rather than binding the root
     // itself, which would show the cage what lives under it.
-    let err = establish_control_plane_pins(&pins, None).expect_err("a leaf needs its decoy");
+    let err = establish_control_plane_pins(&pins, &[], None).expect_err("a leaf needs its decoy");
     assert!(
         err.to_string().contains(&leaf.display().to_string()),
         "the failure names the leaf: {err}"
     );
 }
 
+/// A read-only root the project or a configured bind lies in is bound from itself. Both are mounted
+/// before the pins, which cover them, so the decoy would leave an empty directory where the bind
+/// was asked for, and a project the cage could not enter.
 #[test]
-fn a_launch_stages_a_decoy_only_for_a_read_only_pin() {
+fn a_root_the_project_or_a_bind_lies_in_is_bound_from_itself() {
+    let tmp = TmpDir::new();
+    let inter = tmp.path().join("home/.local");
+    let root = tmp.path().join("home/.local/sbx");
+    let decoy = tmp.path().join("decoy");
+    let pins = vec![
+        crate::config::Bind {
+            path: inter.clone(),
+            writable: true,
+        },
+        crate::config::Bind {
+            path: root.clone(),
+            writable: false,
+        },
+    ];
+    let home = crate::config::Bind {
+        path: tmp.path().join("home"),
+        writable: true,
+    };
+    // The containing bind alone reaches into nothing: the root shows the decoy.
+    let binds = establish_control_plane_pins(&pins, std::slice::from_ref(&home), Some(&decoy))
+        .expect("pins establish");
+    assert_eq!(binds[1].src, decoy, "{binds:?}");
+    for inside in [root.clone(), root.join("projects/one")] {
+        let sources = [
+            home.clone(),
+            crate::config::Bind {
+                path: inside.clone(),
+                writable: false,
+            },
+        ];
+        let binds =
+            establish_control_plane_pins(&pins, &sources, Some(&decoy)).expect("pins establish");
+        assert_eq!(
+            binds[1].src,
+            root,
+            "`{}` lies in the root, which must show it: {binds:?}",
+            inside.display()
+        );
+        assert!(!binds[1].writable, "the root stays read-only");
+        // And a launch whose every root is bound from itself stages no decoy.
+        assert_eq!(pin_decoy(tmp.path(), None, &pins, &sources).unwrap(), None);
+    }
+}
+
+/// A pin inside a root bound from the decoy is not laid: the decoy closes it, and bubblewrap could
+/// not make its mountpoint inside the empty, read-only directory. Roots nest where the environment
+/// puts one inside another, the trust store under the config home when `XDG_STATE_HOME` is set to
+/// it. A root bound from itself shows the path, and the pin inside it is laid.
+#[test]
+fn a_pin_inside_a_root_bound_from_the_decoy_is_not_laid() {
+    let tmp = TmpDir::new();
+    let config = tmp.path().join("home/.config");
+    let outer = config.join("sbx");
+    let inner = outer.join("trusted");
+    let decoy = tmp.path().join("decoy");
+    let pins = vec![
+        crate::config::Bind {
+            path: config.clone(),
+            writable: true,
+        },
+        crate::config::Bind {
+            path: outer.clone(),
+            writable: false,
+        },
+        crate::config::Bind {
+            path: inner.clone(),
+            writable: false,
+        },
+    ];
+    let home = crate::config::Bind {
+        path: tmp.path().join("home"),
+        writable: true,
+    };
+    let binds = establish_control_plane_pins(&pins, std::slice::from_ref(&home), Some(&decoy))
+        .expect("pins establish");
+    let dests: Vec<&Path> = binds.iter().map(|b| b.dest.as_path()).collect();
+    assert_eq!(dests, vec![config.as_path(), outer.as_path()], "{binds:?}");
+
+    let sources = [
+        home,
+        crate::config::Bind {
+            path: outer.join("profiles"),
+            writable: false,
+        },
+    ];
+    let binds =
+        establish_control_plane_pins(&pins, &sources, Some(&decoy)).expect("pins establish");
+    let laid: Vec<(&Path, &Path)> = binds
+        .iter()
+        .map(|b| (b.src.as_path(), b.dest.as_path()))
+        .collect();
+    assert_eq!(
+        laid,
+        vec![
+            (config.as_path(), config.as_path()),
+            (outer.as_path(), outer.as_path()),
+            (decoy.as_path(), inner.as_path()),
+        ],
+        "the outer root shows itself, so the inner one is laid, from the decoy"
+    );
+}
+
+#[test]
+fn a_launch_stages_a_decoy_only_for_a_root_bound_from_it() {
     let tmp = TmpDir::new();
     let pin = |writable: bool| crate::config::Bind {
         path: tmp.path().join("root"),
@@ -175,16 +282,19 @@ fn a_launch_stages_a_decoy_only_for_a_read_only_pin() {
     };
     // No read-only pin, no decoy: the launches whose project and binds contain none of sbx's
     // roots, and the chain's intermediates alone.
-    assert_eq!(pin_decoy(tmp.path(), None, &[]).unwrap(), None);
-    assert_eq!(pin_decoy(tmp.path(), None, &[pin(true)]).unwrap(), None);
+    assert_eq!(pin_decoy(tmp.path(), None, &[], &[]).unwrap(), None);
+    assert_eq!(
+        pin_decoy(tmp.path(), None, &[pin(true)], &[]).unwrap(),
+        None
+    );
     // The masks' decoy when they staged one, so a launch keeps a single empty directory.
     let masks = crate::sandbox::fsmask::stage_decoys(&tmp.path().join("masks")).unwrap();
     assert_eq!(
-        pin_decoy(tmp.path(), Some(&masks), &[pin(false)]).unwrap(),
+        pin_decoy(tmp.path(), Some(&masks), &[pin(false)], &[]).unwrap(),
         Some(masks.dir.clone())
     );
     // Otherwise one staged for the pins, empty.
-    let staged = pin_decoy(tmp.path(), None, &[pin(false)])
+    let staged = pin_decoy(tmp.path(), None, &[pin(false)], &[])
         .unwrap()
         .expect("a read-only pin gets a decoy");
     assert!(staged.starts_with(tmp.path()), "{}", staged.display());
@@ -205,7 +315,7 @@ fn establish_control_plane_pins_fails_closed_when_a_pin_cannot_be_created() {
         writable: false,
     }];
     let decoy = tmp.path().join("decoy");
-    let err = establish_control_plane_pins(&pins, Some(&decoy))
+    let err = establish_control_plane_pins(&pins, &[], Some(&decoy))
         .expect_err("a blocked pin must fail closed");
     assert!(
         err.to_string().contains("blocker"),
@@ -370,6 +480,55 @@ fn a_control_plane_pin_above_an_fs_bind_leaves_it_in_place() {
         found_at(&laid, &home.join(".local/state")),
         Some(&bind(".local", true)),
         "a directory outside both keeps its read-write mount point: {laid:#?}"
+    );
+}
+
+/// A mask inside a root bound from itself is laid again after it. That root shows the cage its
+/// contents, the project or a bind lying in it, and laid over the mask it would show the masked
+/// file too.
+#[test]
+fn a_mask_inside_a_root_bound_from_itself_is_laid_again() {
+    let home = PathBuf::from("/home/agent");
+    let bind = |path: &str, writable: bool| binds::ExtraBind {
+        src: home.join(path),
+        dest: home.join(path),
+        writable,
+    };
+    let mask = binds::ExtraBind {
+        src: PathBuf::from("/data/fs/mask-1/file"),
+        dest: home.join(".local/share/sbx/sub/secret"),
+        writable: false,
+    };
+    let pins = vec![
+        bind(".local", true),
+        bind(".local/share", true),
+        bind(".local/share/sbx", false),
+    ];
+    let fs_binds = vec![
+        bind(".local", true),
+        bind(".local/share", true),
+        bind(".local/share/sbx", true),
+        bind(".local/share/sbx/sub", true),
+        mask.clone(),
+    ];
+    let laid: Vec<binds::ExtraBind> = fs_binds
+        .iter()
+        .cloned()
+        .chain(pins_clear_of_masks(
+            pins,
+            &crate::sandbox::fsmask::Expanded::default(),
+            &fs_binds,
+        ))
+        .collect();
+    assert_eq!(
+        found_at(&laid, &home.join(".local/share/sbx/sub/secret")),
+        Some(&mask),
+        "the mask must stay over the file: {laid:#?}"
+    );
+    assert_eq!(
+        found_at(&laid, &home.join(".local/share/sbx/sub")),
+        Some(&bind(".local/share/sbx", false)),
+        "and the root stays read-only around it: {laid:#?}"
     );
 }
 
