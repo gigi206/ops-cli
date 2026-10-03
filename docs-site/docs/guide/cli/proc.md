@@ -188,6 +188,9 @@ allow <id>` lets it run (the syscall continues), `deny <id>` refuses it (the sys
 | `allow <id>` / `deny <id>` | decide one parked `execve` by its `<session-pid>.<notif-id>` id |
 | `allow <pid>.*` / `deny <pid>.*` | decide **every** parked `execve` in session `<pid>` at once |
 
+A session that is reached and does not answer in full is named on standard error, the listing does
+not say nothing is parked, and it exits 1 ([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)).
+
 ```sh
 sbx proc pending
 # parked exec — awaiting a decision
@@ -316,7 +319,8 @@ sbx proc rules [-a|--app <name>] [--all] [--json]
 List the live `--session` rule overlay of the running enforcing session(s): the rules loaded with
 `sbx proc allow`/`deny --session`, which nothing else surfaces (the config-file `[proc]` rules are
 shown by [`sbx config show`](config)). Scopes to the current project by default; `-a <app>`/`--all`
-widen it.
+widen it. A session in scope that does not answer in full is named, and the listing exits 1
+([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)).
 
 ```sh
 sbx proc rules

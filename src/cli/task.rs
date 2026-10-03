@@ -368,7 +368,17 @@ fn task_list(args: &[OsString]) -> ExitCode {
 
     let sessions: Vec<String> = rows.iter().map(|(s, _)| s.clone()).collect();
     let inventory: Vec<client::TaskRow> = rows.into_iter().map(|(_, r)| r).collect();
-    let mut table = list_table(&inventory, &running_now(&planes), &sessions);
+    let (running, unread) = running_now(&planes);
+    // Said, and the listing still exits 0: what it lists, the declared operations, was read whole,
+    // and only the count beside them is missing.
+    for (plane, e) in &unread {
+        diag::warn(&format!(
+            "task ls: session {} did not answer in full ({e}), so its running invocations are \
+             not counted",
+            plane.describe()
+        ));
+    }
+    let mut table = list_table(&inventory, &running, &sessions);
     with_session_column(
         spans_sessions(&planes),
         &mut table.headers,
@@ -404,19 +414,29 @@ struct ListTable {
     missing: bool,
 }
 
-/// How many invocations of each `(session, operation)` are running right now.
+/// How many invocations of each `(session, operation)` are running right now, and the sessions that
+/// were reached and did not answer in full, with why.
 ///
 /// The inventory is a listing of what is *declared*, but `ls` is the word this product uses for what
 /// is **live** (`sbx session ls`), so a reader typing it is often asking the other question. Answering
 /// both costs one read of the host socket and a column that only appears when something is running.
 /// A cage cannot reach that socket — it has no `host` — so there the listing stays what it always
 /// was.
-fn running_now(planes: &[Plane]) -> BTreeMap<(String, String), usize> {
+///
+/// A session that did not answer is handed back rather than skipped: left out silently, its column
+/// read as nothing running.
+fn running_now(planes: &[Plane]) -> (RunningCounts, Vec<(&Plane, std::io::Error)>) {
     let mut counts = BTreeMap::new();
+    let mut unread = Vec::new();
     for plane in planes {
         let Some(host) = &plane.host else { continue };
-        let Ok(rows) = sandbox::task_control::read_status(host) else {
-            continue;
+        let rows = match sandbox::task_control::read_status(host) {
+            Ok(rows) => rows,
+            Err(e) if sandbox::lens::unanswered(&e) => {
+                unread.push((plane, e));
+                continue;
+            }
+            Err(_) => continue,
         };
         for row in rows {
             if let Some(task) = key_values(&row.fields).get("task") {
@@ -426,8 +446,11 @@ fn running_now(planes: &[Plane]) -> BTreeMap<(String, String), usize> {
             }
         }
     }
-    counts
+    (counts, unread)
 }
+
+/// How many invocations of each `(session, operation)` are running.
+type RunningCounts = BTreeMap<(String, String), usize>;
 
 /// Lay the inventory out, keeping only the columns that carry something.
 fn list_table(
@@ -1774,6 +1797,32 @@ fn unreachable_plane(e: &std::io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session whose host socket is reached and refuses the reader, closing before it reads the
+    /// command as the peer check does, is handed back as unread rather than counted as running
+    /// nothing; one whose socket is gone is neither, as before.
+    #[test]
+    fn a_session_that_refuses_the_status_read_is_not_counted_as_idle() {
+        let dir = crate::testutil::TmpDir::new();
+        let refusing = dir.join("refusing.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&refusing).expect("bind");
+        let server = std::thread::spawn(move || drop(listener.accept()));
+        let plane = |host: PathBuf, pid: u32| Plane {
+            socket: host.clone(),
+            inventory: host.clone(),
+            host: Some(host),
+            session: Some((pid, PathBuf::from("/work/api"))),
+        };
+        let planes = [plane(refusing, 4242), plane(dir.join("gone.sock"), 4343)];
+        let (counts, unread) = running_now(&planes);
+        server.join().expect("the refusing server");
+        assert!(counts.is_empty());
+        let unread: Vec<_> = unread
+            .iter()
+            .map(|(p, _)| p.session.as_ref().map(|(pid, _)| *pid))
+            .collect();
+        assert_eq!(unread, [Some(4242)], "only the refusing session is unread");
+    }
 
     fn row(name: &str, fields: &[&str]) -> client::TaskRow {
         client::TaskRow {

@@ -1,5 +1,6 @@
 //! Integration tests for the `sbx <lens> logs` views — the filesystem, process and ssh-agent
-//! observation lenses, driven through the real binary against a stand-in control socket.
+//! observation lenses, driven through the real binary against a stand-in control socket — and for
+//! the listings across sessions that read the same sockets.
 //!
 //! The three views share one implementation and differ only in a description: which socket to open,
 //! which reader to call, what to head the feed with, and how to render a row. Every one of those is
@@ -555,6 +556,72 @@ fn a_feed_whose_session_refuses_the_reader_is_named_as_unanswered() {
             stderr.contains("did not answer in full"),
             "{args:?} says the session did not answer, not that the lens is missing: {stderr}"
         );
+    }
+}
+
+/// A listing across sessions that reached one and did not get its whole answer says which, prints
+/// none of the lines that say there is nothing, and exits 1: for a session that refused the reader,
+/// closing before it read the command as the peer check does, and for one that cut its answer short.
+/// Each of these listings read such a session as one holding nothing, at exit 0.
+#[test]
+fn a_listing_across_sessions_names_a_session_that_did_not_answer() {
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
+    let standin = Standin::new();
+    let pid = standin.pid();
+    let project = std::fs::canonicalize(project.path()).expect("canonical project");
+    write_session_record(data.path(), pid, &project);
+    // The exec supervisor refuses the reader; the egress plane cuts its answer after one line.
+    serve_refusal(data.path(), "proc", pid);
+    serve_reply(data.path(), "egress", pid, "head=1\n".into());
+
+    let named = format!("session {pid} did not answer in full");
+    for (args, nothing) in [
+        (&["proc", "pending"][..], "no exec is parked"),
+        (&["proc", "pending", "--json"][..], "\"id\""),
+        (&["proc", "rules"][..], "no live session rules"),
+        (&["net", "pending"][..], "pending egress requests"),
+        (&["net", "pending", "--json"][..], "\"id\""),
+        (
+            &["net", "rules", "--source", "session"][..],
+            "no rules declared",
+        ),
+        (&["net", "logs"][..], "nothing to show"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .current_dir(&project)
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run the listing");
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stdout}{stderr}");
+        assert!(
+            stderr.contains(&named),
+            "{args:?} names the session: {stderr}"
+        );
+        assert!(
+            !stdout.contains(nothing),
+            "{args:?} says nothing is there while a session did not answer: {stdout}"
+        );
+    }
+
+    // Outside an `--app` scope, a session that did not answer is not this listing's to name.
+    for args in [
+        &["net", "pending", "-a", "elsewhere"][..],
+        &["net", "logs", "-a", "elsewhere"][..],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .current_dir(&project)
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run the listing");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stderr}");
+        assert!(!stderr.contains(&named), "{args:?}: {stderr}");
     }
 }
 

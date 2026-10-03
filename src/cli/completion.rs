@@ -531,7 +531,7 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
             // in the data directory, a session with no registry record included, each asked on the
             // same glance budget as the execs above.
             let budget = proc_control::GLANCE_TIMEOUT;
-            for s in crate::sandbox::control::list_all_within(layout.data_dir(), budget) {
+            for s in crate::sandbox::control::list_all_within(layout.data_dir(), budget).read {
                 for row in s.rows {
                     out.push((
                         crate::sandbox::control::format_id(s.pid, row.seq, s.incarnation),

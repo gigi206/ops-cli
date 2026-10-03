@@ -111,6 +111,16 @@ pub(crate) fn json_epoch_ms(at: u128) -> u64 {
     u64::try_from(at).unwrap_or(u64::MAX)
 }
 
+/// Say that a listing across sessions reached `pid` and did not get its whole answer, so what that
+/// session holds is missing from it; `missing` says what, as the rest of the sentence ("what it has
+/// parked is not listed"). The listing still shows every answer that came whole, and exits 1 rather
+/// than reading as complete: a session left out silently read exactly like one holding nothing.
+pub(crate) fn warn_unanswered(verb: &str, pid: u32, e: &std::io::Error, missing: &str) {
+    crate::diag::warn(&format!(
+        "{verb}: session {pid} did not answer in full ({e}), so {missing}"
+    ));
+}
+
 /// Refuse an argument a verb does not take, rather than ignoring it. Silently dropping one is worse
 /// than not supporting it: `sbx plugins store ls --installed` would print the whole listing, which
 /// reads as a filtered result and quietly answers a different question than the one asked — and a

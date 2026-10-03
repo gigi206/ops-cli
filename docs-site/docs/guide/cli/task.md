@@ -123,7 +123,9 @@ sbx: note: an operation marked OUTPUT writes into /opt/sbx/task-out/<operation>
 
 A `RUNNING` column joins them while something is running, holding **how many** invocations of that
 operation are live, several at once is ordinary, and [`status`](#status) shows them individually.
-It is host-side only: a cage cannot reach the socket that knows.
+It is host-side only: a cage cannot reach the socket that knows. A session that does not answer in
+full is named, since its column would otherwise read as nothing running, and the listing still exits
+0: the declared operations were read whole ([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)).
 
 A column that reads the same on every line is not information: it is the noise that makes a listing
 unreadable. `MISSING TOOLS` appears when an operation declares

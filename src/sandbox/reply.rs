@@ -260,7 +260,8 @@ mod tests {
         }
 
         // The two readers addressed by session rather than by socket: `RULES` fails like the others,
-        // and the `LIST` sweep leaves a session out rather than listing part of its answer as all.
+        // and the `LIST` sweep names a session that did not answer in full rather than listing part
+        // of its answer as all.
         let data_dir = dir.join("data");
         std::fs::create_dir_all(control::control_dir(&data_dir)).expect("egress dir");
         let socket = control::control_socket(&data_dir, 4242);
@@ -279,7 +280,16 @@ mod tests {
             let server = answer_once(&socket, wire);
             let listed = control::list_all_within(&data_dir, std::time::Duration::from_secs(5));
             server.join().expect("the server thread");
-            assert_eq!(listed.len(), usize::from(whole), "egress LIST");
+            assert_eq!(listed.read.len(), usize::from(whole), "egress LIST");
+            assert_eq!(
+                listed
+                    .unread
+                    .iter()
+                    .map(|(pid, _)| *pid)
+                    .collect::<Vec<_>>(),
+                if whole { vec![] } else { vec![4242] },
+                "egress LIST names the session that did not answer in full"
+            );
         }
     }
 }

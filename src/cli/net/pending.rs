@@ -27,17 +27,19 @@ fn collect_pending(
     data_dir: &Path,
     app: Option<&str>,
 ) -> (
-    Vec<sandbox::control::SessionPending>,
+    sandbox::control::Swept<sandbox::control::SessionPending>,
     Vec<(u32, PathBuf, String)>,
 ) {
-    let mut sessions = sandbox::control::list_all(data_dir);
-    // `--app <name>` scopes the listing to that app's session(s) (the registry maps pid → app).
+    let mut swept = sandbox::control::list_all(data_dir);
+    // `--app <name>` scopes the listing to that app's session(s) (the registry maps pid → app),
+    // the ones that did not answer as well as the ones that did.
     if let Some(name) = app {
         let pids = session_pids_for_app(data_dir, name);
-        sessions.retain(|s| pids.contains(&s.pid));
+        swept.read.retain(|s| pids.contains(&s.pid));
+        swept.unread.retain(|(pid, _)| pids.contains(pid));
     }
     let context = pending_session_context(data_dir);
-    (sessions, context)
+    (swept, context)
 }
 
 /// The rule string that matches the destination just answered, port included. A host-level rule
@@ -66,6 +68,7 @@ fn egress_rule_for(host: &str, port: Option<u16>) -> String {
 /// uses, so it sees exactly what `sbx net pending` would show.
 fn pending_port(data_dir: &Path, pid: u32, seq: u64) -> Option<u16> {
     sandbox::control::list_all(data_dir)
+        .read
         .into_iter()
         .find(|s| s.pid == pid)?
         .rows
@@ -108,7 +111,16 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let (sessions, context) = collect_pending(&data_dir, app.as_deref());
+    let (swept, context) = collect_pending(&data_dir, app.as_deref());
+    let sessions = swept.read;
+    for (pid, e) in &swept.unread {
+        crate::cli::warn_unanswered("net pending", *pid, e, "what it has parked is not listed");
+    }
+    let listed = if swept.unread.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    };
     let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
 
     if json {
@@ -141,15 +153,21 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
             })
             .collect();
         crate::cli::print_document(&format!("{}\n", serde_json::json!({ "pending": rows })));
-        return ExitCode::SUCCESS;
+        return listed;
     }
 
+    // "None parked" is a claim about every session in reach, so it is not made while one of them
+    // did not answer; the warnings above say which.
+    let nothing = sessions.iter().all(|s| s.rows.is_empty());
+    if nothing && !swept.unread.is_empty() {
+        return listed;
+    }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     out!(
         "{}",
         render_pending(&sessions, &context, app.as_deref(), &pal)
     );
-    ExitCode::SUCCESS
+    listed
 }
 
 /// The parsed `sbx net pending watch` flags: how often to refresh, and an optional app scope.
@@ -222,8 +240,10 @@ pub(super) fn net_pending_watch(args: &[OsString]) -> ExitCode {
     let (dim, r) = (pal.dim, pal.reset);
     let secs = parsed.interval.as_secs();
     loop {
-        let (sessions, context) = collect_pending(&data_dir, parsed.app.as_deref());
-        let body = render_pending(&sessions, &context, parsed.app.as_deref(), &pal);
+        // A session that did not answer in full is left out of this redrawn frame, as `net live`
+        // leaves it out; the one-shot listing names it.
+        let (swept, context) = collect_pending(&data_dir, parsed.app.as_deref());
+        let body = render_pending(&swept.read, &context, parsed.app.as_deref(), &pal);
         // `top`-style in-place redraw: home the cursor, paint the frame, then clear from the cursor to
         // the end of the screen. This keeps the terminal scrollback intact (unlike `\x1b[3J`) and
         // erases any trailing lines a shorter frame leaves behind, with no full-screen blank flicker.

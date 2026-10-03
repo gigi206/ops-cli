@@ -345,18 +345,33 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         Err(code) => return code,
     };
     let mut rows: Vec<(u32, &'static str, String)> = Vec::new();
+    // A session with no exec supervisor has no socket to connect to and holds no rule; one that was
+    // reached and did not answer in full may hold some, so it is named rather than left out.
+    let mut unanswered = false;
     for s in sessions {
         let pid = s.pid;
         if !in_scope(pid, &project_pids, &app_pids) {
             continue;
         }
         let socket = sandbox::proc_control::proc_control_socket(&data_dir, pid);
-        if let Ok(overlay) = sandbox::proc_control::read_overlay_rules(&socket) {
-            for r in overlay {
-                rows.push((pid, r.verdict, r.rule));
+        match sandbox::proc_control::read_overlay_rules(&socket) {
+            Ok(overlay) => {
+                for r in overlay {
+                    rows.push((pid, r.verdict, r.rule));
+                }
             }
+            Err(e) if sandbox::lens::unanswered(&e) => {
+                crate::cli::warn_unanswered("proc rules", pid, &e, "its rules are not listed");
+                unanswered = true;
+            }
+            Err(_) => {}
         }
     }
+    let listed = if unanswered {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
     if json {
         let out: Vec<serde_json::Value> = rows
             .iter()
@@ -367,11 +382,13 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         if let Err(code) = crate::print_json("proc rules", &serde_json::json!({ "rules": out })) {
             return code;
         }
-        return ExitCode::SUCCESS;
+        return listed;
     }
     if rows.is_empty() {
-        outln!("no live session rules");
-        return ExitCode::SUCCESS;
+        if !unanswered {
+            outln!("no live session rules");
+        }
+        return listed;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     outln!("{}live session rules{}", pal.head, pal.reset);
@@ -383,7 +400,7 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
             r = pal.reset,
         );
     }
-    ExitCode::SUCCESS
+    listed
 }
 
 /// `sbx proc pending [allow|deny <id>]`: list the `execve`s an `ask`-mode session has parked awaiting a
@@ -413,55 +430,76 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
+    // Read once, for both renderings. A session with no exec supervisor has no socket to connect
+    // to and parks nothing; one that was reached and did not answer in full may hold parked execs,
+    // so it is named rather than read as holding none.
+    let mut parked: Vec<(u32, sandbox::proc_control::ParkedView)> = Vec::new();
+    let mut unanswered = false;
+    for s in &sessions {
+        let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), s.pid);
+        match sandbox::proc_control::read_pending(&socket) {
+            Ok(rows) => parked.extend(rows.into_iter().map(|p| (s.pid, p))),
+            Err(e) if sandbox::lens::unanswered(&e) => {
+                crate::cli::warn_unanswered(
+                    "proc pending",
+                    s.pid,
+                    &e,
+                    "what it has parked is not listed",
+                );
+                unanswered = true;
+            }
+            Err(_) => {}
+        }
+    }
+    let listed = if unanswered {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
     if json {
-        let mut out: Vec<serde_json::Value> = Vec::new();
-        for s in &sessions {
-            let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), s.pid);
-            for p in sandbox::proc_control::read_pending(&socket).unwrap_or_default() {
-                out.push(serde_json::json!({
+        let out: Vec<serde_json::Value> = parked
+            .iter()
+            .map(|(session_pid, p)| {
+                serde_json::json!({
                     // The id a `sbx proc pending allow|deny` takes, pre-assembled: a consumer that
                     // had to join the two numbers itself would be re-deriving a format this
                     // command owns.
-                    "id": format!("{}.{}", s.pid, p.id),
-                    "session_pid": s.pid,
+                    "id": format!("{session_pid}.{}", p.id),
+                    "session_pid": session_pid,
                     "notif_id": p.id,
                     "pid": p.pid,
                     "waiting_seconds": p.waiting_secs,
                     "path": p.path,
-                }));
-            }
-        }
+                })
+            })
+            .collect();
         if let Err(code) = crate::print_json("proc pending", &serde_json::json!({ "parked": out }))
         {
             return code;
         }
-        return ExitCode::SUCCESS;
+        return listed;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, dim, r) = (pal.head, pal.dim, pal.reset);
-    let mut any = false;
-    for s in &sessions {
-        let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), s.pid);
-        let parked = sandbox::proc_control::read_pending(&socket).unwrap_or_default();
-        for p in parked {
-            if !any {
-                outln!("{h}parked exec — awaiting a decision{r}");
-                any = true;
-            }
-            outln!(
-                "  {}.{}  {dim}pid {} · {}s{r}  {}",
-                s.pid,
-                p.id,
-                p.pid,
-                p.waiting_secs,
-                p.path
-            );
+    if parked.is_empty() {
+        // Said only when every session in reach answered: with one unread, "nothing is parked" is
+        // a claim this listing cannot make, and the warning above says why.
+        if !unanswered {
+            outln!("{dim}no exec is parked awaiting a decision.{r}");
         }
+        return listed;
     }
-    if !any {
-        outln!("{dim}no exec is parked awaiting a decision.{r}");
+    outln!("{h}parked exec — awaiting a decision{r}");
+    for (session_pid, p) in &parked {
+        outln!(
+            "  {session_pid}.{}  {dim}pid {} · {}s{r}  {}",
+            p.id,
+            p.pid,
+            p.waiting_secs,
+            p.path
+        );
     }
-    ExitCode::SUCCESS
+    listed
 }
 
 /// Decide one (or, with `*`, all) parked `execve` by id `<session-pid>.<notif-id>`.

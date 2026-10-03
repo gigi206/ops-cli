@@ -58,6 +58,22 @@ sessions of that app hold, so an app with none running, whatever its name, is an
 reads the config instead, as `sbx net rules` and `sbx config show` do, it names a declared app,
 and one that is not declared exits 2.
 
+## A listing that could not read a session exits 1
+
+A listing across live sessions that reached one and did not get its whole answer shows every
+answer that did come whole, names that session on standard error, and exits 1: `sbx proc
+pending`, `sbx proc rules`, `sbx net pending`, `sbx net rules --source session` and `sbx net logs`.
+The answer was cut short, the session closed the connection without reading the request (what it
+does to a reader it refuses, at its connection ceiling or its peer check), or it did not answer in
+time. Such a listing never says there is nothing to show, since that would read as a session
+holding nothing. A session that cannot be connected to at all has gone, or never ran that plane,
+and is not named.
+
+`sbx task ls` names such a session too and still exits 0: what it lists, the declared operations,
+was read in full, and only the running count beside them is missing. The views that redraw, `sbx
+net live` and `sbx net pending watch`, and the polls after the first read of a `--follow`, leave
+such a session out without naming it on every round.
+
 A `--session` rule load is not a name either. `sbx net allow|deny|mute --session` and `sbx proc
 allow|deny --session` load a rule into the live sessions in scope, and exit 1 when that reached
 none or a session refused the rule, since the rule is then not in force where it was meant to

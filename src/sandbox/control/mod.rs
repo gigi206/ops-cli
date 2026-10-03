@@ -4694,7 +4694,7 @@ mod tests {
         assert_eq!(after.dropped, 0);
 
         // Discovery: `log_all` globs the egress dir and finds this session by its socket pid.
-        let sessions = log_all(data.path(), false, false, None);
+        let sessions = log_all(data.path(), false, false, None).read;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, pid);
         assert_eq!(sessions[0].snapshot.events.len(), 2);

@@ -196,9 +196,19 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
 
     // Merge + dedup the manual rules across this project's sessions.
     let mut rules: Vec<NetRuleView> = Vec::new();
+    let mut unanswered = false;
     for pid in pids {
-        let Ok(rows) = sandbox::control::query_manual(&data_dir, pid) else {
-            continue; // the session ended between the registry read and the query
+        let rows = match sandbox::control::query_manual(&data_dir, pid) {
+            Ok(rows) => rows,
+            // Reached, and its answer did not arrive in full: it may hold rules, so it is named
+            // rather than read as holding none.
+            Err(e) if sandbox::lens::unanswered(&e) => {
+                crate::cli::warn_unanswered("net rules", pid, &e, "its rules are not listed");
+                unanswered = true;
+                continue;
+            }
+            // The session ended between the registry read and the query.
+            Err(_) => continue,
         };
         for row in rows {
             // A live rule crosses the control socket as text, so its reach is re-derived here
@@ -228,6 +238,11 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
         }
     }
 
+    let listed = if unanswered {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
     let total = rules.len();
     let shown: Vec<&NetRuleView> = rules
         .iter()
@@ -240,12 +255,17 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
             "rules": shown.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
         });
         crate::cli::print_document(&format!("{value}\n"));
-        return ExitCode::SUCCESS;
+        return listed;
     }
 
+    // An empty listing is a claim about every session in reach, so it is not printed while one of
+    // them did not answer; the warnings above say which.
+    if total == 0 && unanswered {
+        return listed;
+    }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     crate::cli::print_document(&render_net_rules("session", &scope, &shown, total, &pal));
-    ExitCode::SUCCESS
+    listed
 }
 
 /// Render the egress rule listing — a pure presenter (so its colored layout is asserted in a test):

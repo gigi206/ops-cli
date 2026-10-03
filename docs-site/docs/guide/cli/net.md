@@ -38,7 +38,8 @@ Lists the allow/deny rules of the effective filtering posture, each tagged `conf
 rule shows `tcp://`; an egress group shows as one `@<name>` row (`--expand`
 unfolds it). `--app <name>` shows what `sbx app run <name>` would launch with. `--source
 session` queries live `ask`-session rules remembered from `--session` answers (`manual`
-is accepted as an alias). Under
+is accepted as an alias), names a session that does not answer in full and then exits 1
+([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)). Under
 `shared`/`none` there are no rules. See [Egress observability](../networking/observability).
 
 A rule that matches **every** host is tagged as such: `allow re:.* (config, matches
@@ -200,7 +201,8 @@ verb, lists what is parked (id `<pid>.<seq>`; identical retries collapse to `×N
 `allow <id>`/`deny <id>` answer a whole destination; `--all` drains; `--session`
 remembers for the live session; `--save` persists a rule; `watch` redraws live. See
 [Ask mode](../networking/ask). `watch` needs a terminal: in a pipe, use the one-shot
-listing or add `--json`.
+listing or add `--json`. The listing names a session that does not answer in full and exits 1
+([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)); `watch` leaves it out of the frame.
 
 ## `sbx net stats`
 
@@ -223,8 +225,11 @@ sbx net logs [-a|--app <name>] [--host <h>] [--verdict <v>] [-n <N>]
 ```
 
 A chronological, per-request record of every egress decision a **running** session's
-proxy made. **Live-only**: the log lives in the running session's memory and is
-**never written to disk**; once the session exits, nothing remains.
+proxy made. **Live-only**: the log lives in the running session's memory, and once the session
+exits this view has nothing left to read. A session that ran under
+[`[observe] record`](../configuration/observe) kept its egress record on disk, and
+[`sbx logs <id>`](logs) reads it back. A session that does not answer in full is named, and the
+listing exits 1 ([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)).
 
 | Flag | What it does |
 |---|---|
@@ -276,7 +281,8 @@ them; the durable rows are raw `tcp://` tunnels (SSH, a database wire),
 WebSockets, and large L7 transfers in progress. Byte counts are application bytes on an
 inspected `https`/`http` flow, encrypted bytes on a raw `tcp` splice. The redraw needs a
 terminal; `--json` emits one snapshot object per tick (NDJSON) for a pipe. Only a filtering
-posture (`deny`/`allow`/`ask`) runs a proxy, so only those sessions have flows. See
+posture (`deny`/`allow`/`ask`) runs a proxy, so only those sessions have flows. A session that
+does not answer in full is left out of the frame rather than named on every tick. See
 [Egress observability](../networking/observability).
 
 ## Examples

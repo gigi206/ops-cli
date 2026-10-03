@@ -16,6 +16,38 @@ pub(crate) fn control_socket(data_dir: &Path, pid: u32) -> PathBuf {
     control_dir(data_dir).join(format!("control-{pid}.sock"))
 }
 
+/// What a sweep across every session's control socket got: the answers that arrived whole, and the
+/// sessions that were reached and did not answer in full, each with why
+/// ([`crate::sandbox::reply::unanswered`]: cut short, refused before the command was read, or not
+/// given in time). A session whose socket could not be connected to is gone, or never stood this
+/// plane up, and is in neither list.
+///
+/// The second list is what keeps a listing honest. Left out silently, a session that did not answer
+/// read exactly like one holding nothing, and a listing across sessions said "nothing" at exit 0.
+/// Each caller decides what to say about it: the commands a person types name each such session,
+/// and the completion oracle, which runs on a keystroke and promises nothing on standard error,
+/// says nothing.
+pub(crate) struct Swept<T> {
+    pub(crate) read: Vec<T>,
+    pub(crate) unread: Vec<(u32, io::Error)>,
+}
+
+/// Ask every session with a control socket, in pid order, with `read`.
+fn sweep<T>(data_dir: &Path, read: impl Fn(u32, &Path) -> io::Result<T>) -> Swept<T> {
+    let mut swept = Swept {
+        read: Vec::new(),
+        unread: Vec::new(),
+    };
+    for pid in session_pids(data_dir) {
+        match read(pid, &control_socket(data_dir, pid)) {
+            Ok(answer) => swept.read.push(answer),
+            Err(e) if crate::sandbox::reply::unanswered(&e) => swept.unread.push((pid, e)),
+            Err(_) => {}
+        }
+    }
+    swept
+}
+
 /// One reachable session's pending requests, for `sbx net pending`.
 pub(crate) struct SessionPending {
     pub(crate) pid: u32,
@@ -59,27 +91,25 @@ pub(crate) fn parse_id(id: &str) -> Option<(u32, u64, Option<u64>)> {
 
 /// Discover every reachable ask-mode session's pending requests: glob the control sockets, parse
 /// each filename's pid, and query it. A socket whose session is gone (connect refused, or a stale
-/// file from a crashed launch) is skipped — so a dead session never blocks the listing. Sessions
-/// are returned ordered by pid for stable output.
-pub(crate) fn list_all(data_dir: &Path) -> Vec<SessionPending> {
+/// file from a crashed launch) is skipped — so a dead session never blocks the listing — and one
+/// that was reached and did not answer in full is named in [`Swept::unread`]. Sessions are
+/// returned ordered by pid for stable output.
+pub(crate) fn list_all(data_dir: &Path) -> Swept<SessionPending> {
     list_all_within(data_dir, Duration::from_secs(10))
 }
 
 /// [`list_all`] with each session given `timeout` to answer, for a caller that must not wait on a
 /// slow one: the completion oracle, which runs on a keystroke. A session that does not answer in
-/// time is left out, as a dead one is.
-pub(crate) fn list_all_within(data_dir: &Path, timeout: Duration) -> Vec<SessionPending> {
-    let mut sessions = Vec::new();
-    for pid in session_pids(data_dir) {
-        if let Ok((rows, incarnation)) = query(&control_socket(data_dir, pid), timeout) {
-            sessions.push(SessionPending {
-                pid,
-                incarnation,
-                rows,
-            });
-        }
-    }
-    sessions
+/// time is in [`Swept::unread`], which that caller leaves aside.
+pub(crate) fn list_all_within(data_dir: &Path, timeout: Duration) -> Swept<SessionPending> {
+    sweep(data_dir, |pid, socket| {
+        let (rows, incarnation) = query(socket, timeout)?;
+        Ok(SessionPending {
+            pid,
+            incarnation,
+            rows,
+        })
+    })
 }
 
 /// The pids of every session that has a control socket present, sorted for stable output. A superset
@@ -314,8 +344,9 @@ fn parse_capture_line(line: &str) -> Option<(u64, CapturePart, CaptureBytes)> {
 
 /// Discover every reachable session's recent egress events: glob the control sockets, parse each
 /// filename's pid, and query it (with an optional per-nothing tail read — a shared cursor makes no
-/// sense across sessions, whose sequence spaces are independent). A dead/stale socket is skipped.
-/// Sessions are returned ordered by pid for stable output.
+/// sense across sessions, whose sequence spaces are independent). A dead/stale socket is skipped,
+/// and one that was reached and did not answer in full is named in [`Swept::unread`]. Sessions are
+/// returned ordered by pid for stable output.
 ///
 /// `follow` names the `--follow` reader this listing seeds. One that shows amendments asks for them
 /// from this first read on (`amended=0`, which re-sends nothing, since no event is at or behind a
@@ -325,22 +356,19 @@ pub(crate) fn log_all(
     include_muted: bool,
     with_capture: bool,
     follow: Option<Follow>,
-) -> Vec<SessionLog> {
-    let mut sessions = Vec::new();
+) -> Swept<SessionLog> {
     let after_amend = follow.filter(|f| f.amendments).map(|_| 0);
-    for pid in session_pids(data_dir) {
-        if let Ok(snapshot) = read_log(
-            &control_socket(data_dir, pid),
+    sweep(data_dir, |pid, socket| {
+        let snapshot = read_log(
+            socket,
             None,
             after_amend,
             include_muted,
             with_capture,
             follow,
-        ) {
-            sessions.push(SessionLog { pid, snapshot });
-        }
-    }
-    sessions
+        )?;
+        Ok(SessionLog { pid, snapshot })
+    })
 }
 
 /// One reachable session's currently-open flows, for `sbx net live`.
@@ -370,17 +398,17 @@ pub(crate) fn read_flows(socket: &Path) -> io::Result<Vec<FlowSnapshot>> {
 }
 
 /// Discover every reachable session's open flows: glob the control sockets, parse each filename's
-/// pid, and query it. A dead/stale socket is skipped. Sessions are returned ordered by pid for stable
-/// output. An old session that predates the `FLOWS` verb replies `err bad-request`, which parses to no
-/// flow lines — so it simply contributes an empty list rather than failing the whole listing.
-pub(crate) fn flows_all(data_dir: &Path) -> Vec<SessionFlows> {
-    let mut sessions = Vec::new();
-    for pid in session_pids(data_dir) {
-        if let Ok(flows) = read_flows(&control_socket(data_dir, pid)) {
-            sessions.push(SessionFlows { pid, flows });
-        }
-    }
-    sessions
+/// pid, and query it. A dead/stale socket is skipped, and one that was reached and did not answer in
+/// full is named in [`Swept::unread`]. Sessions are returned ordered by pid for stable output. An old
+/// session that predates the `FLOWS` verb replies `err bad-request`, which parses to no flow lines —
+/// so it simply contributes an empty list rather than failing the whole listing.
+pub(crate) fn flows_all(data_dir: &Path) -> Swept<SessionFlows> {
+    sweep(data_dir, |pid, socket| {
+        Ok(SessionFlows {
+            pid,
+            flows: read_flows(socket)?,
+        })
+    })
 }
 
 /// Parse one `flow proto=… port=… start=… up=… down=… host=…` line into a snapshot, or `None` if it

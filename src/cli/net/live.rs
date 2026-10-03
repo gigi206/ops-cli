@@ -58,7 +58,9 @@ fn collect_flows(
     Vec<sandbox::control::SessionFlows>,
     Vec<(u32, PathBuf, String)>,
 ) {
-    let mut sessions = sandbox::control::flows_all(data_dir);
+    // A session that did not answer in full is left out of this redrawn view: it is said by the
+    // one-shot listings, and a warning repeated on every tick would bury the frame.
+    let mut sessions = sandbox::control::flows_all(data_dir).read;
     if let Some(name) = app {
         let pids = session_pids_for_app(data_dir, name);
         sessions.retain(|s| pids.contains(&s.pid));

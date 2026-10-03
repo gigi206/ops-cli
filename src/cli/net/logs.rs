@@ -152,16 +152,17 @@ fn collect_logs(
     with_capture: bool,
     follow: Option<sandbox::control::Follow>,
 ) -> (
-    Vec<sandbox::control::SessionLog>,
+    sandbox::control::Swept<sandbox::control::SessionLog>,
     Vec<(u32, PathBuf, String)>,
 ) {
-    let mut sessions = sandbox::control::log_all(data_dir, true, with_capture, follow);
+    let mut swept = sandbox::control::log_all(data_dir, true, with_capture, follow);
     if let Some(name) = app {
         let pids = session_pids_for_app(data_dir, name);
-        sessions.retain(|s| pids.contains(&s.pid));
+        swept.read.retain(|s| pids.contains(&s.pid));
+        swept.unread.retain(|(pid, _)| pids.contains(pid));
     }
     let context = pending_session_context(data_dir);
-    (sessions, context)
+    (swept, context)
 }
 
 /// Whether one event passes the ongoing `--host`/`--verdict` filters (the `-n` limit is separate —
@@ -245,8 +246,14 @@ pub(super) fn net_logs(args: &[OsString]) -> ExitCode {
         return net_logs_follow(&data_dir, &view, &pal);
     }
 
-    let (sessions, context) =
-        collect_logs(&data_dir, view.app.as_deref(), view.wants_capture(), None);
+    let (swept, context) = collect_logs(&data_dir, view.app.as_deref(), view.wants_capture(), None);
+    let sessions = swept.read;
+    warn_unanswered_logs(&swept.unread);
+    let listed = if swept.unread.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    };
 
     if view.json {
         let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
@@ -279,11 +286,27 @@ pub(super) fn net_logs(args: &[OsString]) -> ExitCode {
             "{}\n",
             serde_json::json!({ "logs": rows, "evicted": evicted })
         ));
-        return ExitCode::SUCCESS;
+        return listed;
     }
 
+    // "Nothing to show" is a claim about every session in reach, so it is not made while one of
+    // them did not answer; the warnings above say which.
+    let nothing = sessions
+        .iter()
+        .all(|s| filtered_log_events(&s.snapshot.events, &view).is_empty());
+    if nothing && listed != ExitCode::SUCCESS {
+        return listed;
+    }
     crate::cli::print_document(&render_logs(&sessions, &context, &view, &pal, true));
-    ExitCode::SUCCESS
+    listed
+}
+
+/// Name each session `sbx net logs` reached and did not get its whole answer from, so its events
+/// are not read as absent.
+fn warn_unanswered_logs(unread: &[(u32, std::io::Error)]) {
+    for (pid, e) in unread {
+        crate::cli::warn_unanswered("net logs", *pid, e, "its events are not shown");
+    }
 }
 
 /// `sbx net logs --follow`: after seeding with the current listing, poll each reachable session on
@@ -322,12 +345,15 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     // Seed: the current listing (human render, or NDJSON of the retained events), respecting `-n`.
     // Only actual events are written — the one-shot's "nothing to show" line is skipped, so a follow
     // that pipes to `head` on an idle session emits no spurious line then spins.
-    let (sessions, context) = collect_logs(
+    let (swept, context) = collect_logs(
         data_dir,
         view.app.as_deref(),
         view.wants_capture(),
         Some(follow),
     );
+    // Said once, for the seed: the polls that follow leave such a session out without repeating it.
+    warn_unanswered_logs(&swept.unread);
+    let sessions = swept.read;
     let has_events = sessions
         .iter()
         .any(|s| !filtered_log_events(&s.snapshot.events, view).is_empty());
