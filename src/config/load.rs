@@ -530,6 +530,10 @@ fn control_plane_pins_for(binds: &[Bind], roots: &[PathBuf]) -> Vec<Bind> {
             }
         }
     }
+    // Parent before child across binds too: the binds come in the order they were declared, so a
+    // bind deeper in the tree declared first pinned its root before a shallower one pinned the
+    // directories above it, which then covered the root's pin. A path sorts after its ancestors.
+    pins.sort_by(|a, b| a.path.cmp(&b.path));
     pins
 }
 
@@ -3285,6 +3289,11 @@ mod tests {
             "the shared intermediate is deduplicated: {pins:?}"
         );
         // Parent-before-child: each pin's index is greater than every strict ancestor pin's index.
+        assert_ancestors_first(&pins);
+    }
+
+    /// Every pin comes after the pins of its ancestors, so none is covered by one laid later.
+    fn assert_ancestors_first(pins: &[Bind]) {
         for (i, p) in pins.iter().enumerate() {
             for (j, q) in pins.iter().enumerate() {
                 if p.path.starts_with(&q.path) && p.path != q.path {
@@ -3297,6 +3306,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The order holds whatever order the binds were declared in. A bind deeper in the tree,
+    /// declared before one that contains it, pinned its root first, and the directories the outer
+    /// bind pinned afterwards covered that root: shown as it is on the host and free to be renamed.
+    #[test]
+    fn control_plane_pins_put_parents_first_whatever_the_binds_order() {
+        let roots = vec![
+            PathBuf::from("/home/u/.local/share/sbx"),
+            PathBuf::from("/home/u/.config/sbx"),
+        ];
+        let binds = vec![
+            Bind {
+                path: PathBuf::from("/home/u/.local/share"),
+                writable: true,
+            },
+            Bind {
+                path: PathBuf::from("/home/u"),
+                writable: true,
+            },
+        ];
+        let pins = control_plane_pins_for(&binds, &roots);
+        assert!(
+            pins.iter()
+                .any(|p| p.path == Path::new("/home/u/.local/share") && p.writable),
+            "the outer bind pins the directory the inner one is: {pins:?}"
+        );
+        assert_ancestors_first(&pins);
     }
 
     #[test]
@@ -3332,18 +3369,7 @@ mod tests {
         );
         // Parent-before-child still holds across the nesting, so the outer root's pin is not
         // shadowed by the inner one.
-        for (i, p) in pins.iter().enumerate() {
-            for (j, q) in pins.iter().enumerate() {
-                if p.path.starts_with(&q.path) && p.path != q.path {
-                    assert!(
-                        j < i,
-                        "ancestor {} must precede {}: {pins:?}",
-                        q.path.display(),
-                        p.path.display()
-                    );
-                }
-            }
-        }
+        assert_ancestors_first(&pins);
     }
 
     #[test]
