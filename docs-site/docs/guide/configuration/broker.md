@@ -349,11 +349,18 @@ the **policy's** layer, since the socket is always the global config's.
 - **The record says what `sbx` observed, not what the plugin claims.** Every decision goes
   to the session's log, readable with [`sbx logs --feed broker`](../cli/logs). One record
   holds every broker of a session, and each line names the one that decided. The verdict
-  (`forward`, `answer`, `refuse`) is `sbx`'s own account and leads each line, after that
+  (`forward`, `answer`, `refuse`, `withhold`) is `sbx`'s own account and leads each line, after that
   name; the plugin's reason is appended after it, sanitised. A plugin cannot make a forward *read* as a
-  refusal by choosing its words. On top of that, the **first** refusal of a connection is
-  printed at the terminal, and a plugin that stops answering has its request refused and
-  its connection ended, since a broker that stopped deciding is not one to keep asking.
+  refusal by choosing its words. What separates `refuse` from `withhold` is whether `sbx`
+  sent the cage's request on to the host resource. A `refuse` was never sent. A `withhold`
+  was, so the resource may have acted on it, and then the cage did not get the answer:
+  the plugin refused it on the way back, or the exchange failed once the request was out.
+  A lookup the plugin had `sbx` make at the resource is counted on whichever line follows
+  it ("after 1 host lookup(s)"), since a plugin can look up with the cage's own bytes and
+  then refuse. On top of that, the **first** refusal or withheld answer of a connection is
+  printed at the terminal, and a plugin that stops answering has its request refused (or
+  the answer withheld, once the request was out) and its connection ended, since a broker
+  that stopped deciding is not one to keep asking.
   A connection refused before any request is recorded as a `refuse` too: one past the
   concurrency ceiling, and one that could not be served at all because it said nothing in
   time, the plugin did not start or declined, the host resource could not be reached, or the

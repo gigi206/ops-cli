@@ -637,14 +637,23 @@ pub(crate) trait Decider {
 
 /// What the relay did with one frame, for the caller's record. Reports what sbx **observed**,
 /// which is not the same thing as what the plugin said it decided.
+///
+/// Whether the cage's frame was sent to the host resource is what separates a refusal from a
+/// withheld answer, because only the second leaves the resource holding a request it may have
+/// acted on. The lookups a plugin made on the way are in [`Progress`], since any outcome can follow
+/// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Sent to the host resource (rewritten or not) and its reply returned to the cage.
-    Forwarded { rewritten: bool, queries: u32 },
-    /// Answered by the plugin without the host resource being contacted.
+    Forwarded { rewritten: bool },
+    /// Answered by the plugin. The cage's frame was not sent to the host resource.
     Answered,
-    /// Refused. The cage got the refusal frame if there was one to give it.
+    /// Refused before the cage's frame was sent to the host resource. The cage got the refusal
+    /// frame if there was one to give it.
     Refused { with_frame: bool },
+    /// Sent to the host resource (rewritten or not), whose answer the plugin then refused. The
+    /// cage got the refusal frame if there was one to give it, and never the answer.
+    Withheld { with_frame: bool, rewritten: bool },
 }
 
 /// What one frame's relay produced: what sbx observed, what the cage is owed, and what the plugin
@@ -659,15 +668,28 @@ pub(crate) struct Relayed {
     pub(crate) to_cage: Vec<Vec<u8>>,
     /// The plugin's own account of the decision, for the record.
     pub(crate) label: Option<String>,
-    /// Whether a credential was placed into what reached the host resource. Recorded because a
-    /// frame carrying a credential is not the same event as one that was merely rewritten, and an
-    /// audit of a session should be able to tell them apart. Never accompanied by the value.
-    pub(crate) secret_placed: bool,
     /// Whether the host resource may still hold the rest of a reply this exchange stopped reading:
     /// a refusal on the way back ends the read mid-run, and nothing here knows how much of the run
     /// is left. The connection then carries no further exchange, since the next one would read
     /// that rest as its own answer and put it before the plugin as such.
     pub(crate) host_unread: bool,
+}
+
+/// How far one exchange got, kept up to date by [`relay_one`] as it goes rather than returned at the
+/// end, so that an exchange which fails is still recorded for what it did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Progress {
+    /// The lookups the plugin had sbx make at the host resource. Each one sent the resource bytes
+    /// the plugin chose, which may be the cage's own.
+    pub(crate) queries: u32,
+    /// Whether sbx began writing the cage's frame, or the plugin's rewrite of it, to the host
+    /// resource. Set before the write rather than after it, since a write that fails part way may
+    /// still have delivered some of it.
+    pub(crate) sent: bool,
+    /// Whether a credential was placed into what was sent. Recorded because a frame carrying a
+    /// credential is not the same event as one that was merely rewritten, and an audit of a session
+    /// should be able to tell them apart. Never accompanied by the value.
+    pub(crate) secret_placed: bool,
 }
 
 /// What one exchange's answer amounted to: the frames owed to the cage, the plugin's account, and
@@ -841,6 +863,11 @@ fn hold_for_cage(out: &mut Vec<Vec<u8>>, held: &mut usize, frame: Vec<u8>) -> Re
 ///
 /// Every error path is fail-closed: whatever goes wrong with the plugin, the frame is refused and
 /// the caller is told, never forwarded on a guess.
+///
+/// `progress` says how far the exchange got, on the error paths as on the others: an exchange that
+/// fails after the frame was sent has left the host resource holding the request, and a record
+/// calling that a refusal would tell an audit the resource never saw it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn relay_one<H: Read + Write>(
     frame: &[u8],
     seq: u64,
@@ -849,12 +876,12 @@ pub(crate) fn relay_one<H: Read + Write>(
     host: &mut H,
     marker: Option<&SecretMarker>,
     typed: bool,
+    progress: &mut Progress,
 ) -> Result<Relayed, String> {
     let mut ask_data = frame.to_vec();
     // Always a frame on its way *up*, from the cage: a frame coming back is `collect_reply`'s, and
     // the only thing that changes direction inside one exchange is a query's answer, below.
     let mut ask_dir = Direction::Up;
-    let mut queries = 0u32;
     // One budget for the whole exchange — the queries a plugin asks for and the reply run that ends
     // it — because that is the unit `host_deadline` is declared in. See the note above.
     let deadline = std::time::Instant::now() + spec.host_deadline;
@@ -887,13 +914,16 @@ pub(crate) fn relay_one<H: Read + Write>(
                             .to_string(),
                     );
                 }
-                queries += 1;
-                if queries > MAX_QUERIES_PER_FRAME {
+                if progress.queries >= MAX_QUERIES_PER_FRAME {
                     return Err(format!(
-                        "the plugin asked the host resource {queries} times for one frame \
-                         (ceiling {MAX_QUERIES_PER_FRAME})"
+                        "the plugin asked the host resource {} times for one frame \
+                         (ceiling {MAX_QUERIES_PER_FRAME})",
+                        progress.queries + 1
                     ));
                 }
+                // Counted before the write, as `sent` is below: a query whose write fails part way
+                // may still have reached the resource.
+                progress.queries += 1;
                 write_frame(host, spec.framing, &bytes, true)
                     .map_err(|e| format!("cannot reach the host resource: {e}"))?;
                 let reply = read_frame(
@@ -937,6 +967,9 @@ pub(crate) fn relay_one<H: Read + Write>(
                     .as_deref()
                     .or(rewritten.as_deref())
                     .unwrap_or(frame);
+                // From here every way this exchange ends leaves the host resource with the request.
+                progress.sent = true;
+                progress.secret_placed = substituted.is_some();
                 write_frame(host, spec.framing, out, typed)
                     .map_err(|e| format!("cannot reach the host resource: {e}"))?;
                 // A message the protocol answers with nothing: sent, and that is the whole
@@ -946,26 +979,25 @@ pub(crate) fn relay_one<H: Read + Write>(
                     return Ok(Relayed {
                         outcome: Outcome::Forwarded {
                             rewritten: rewritten.is_some(),
-                            queries,
                         },
                         to_cage: Vec::new(),
                         label: answer.label,
-                        secret_placed: substituted.is_some(),
                         host_unread: false,
                     });
                 }
                 let reply = collect_reply(spec, decider, host, seq, None, marker, deadline)?;
                 return Ok(Relayed {
-                    secret_placed: substituted.is_some(),
                     host_unread: reply.refused,
+                    // A refusal on the way back is not a refusal of the request, which the host
+                    // resource has already had: what was kept from the cage is its answer.
                     outcome: if reply.refused {
-                        Outcome::Refused {
+                        Outcome::Withheld {
                             with_frame: !reply.frames.is_empty(),
+                            rewritten: rewritten.is_some(),
                         }
                     } else {
                         Outcome::Forwarded {
                             rewritten: rewritten.is_some(),
-                            queries,
                         }
                     },
                     to_cage: reply.frames,
@@ -988,7 +1020,6 @@ pub(crate) fn relay_one<H: Read + Write>(
                     outcome: Outcome::Answered,
                     to_cage: vec![bytes],
                     label: answer.label,
-                    secret_placed: false,
                     host_unread: false,
                 });
             }
@@ -1011,7 +1042,6 @@ pub(crate) fn relay_one<H: Read + Write>(
                     },
                     to_cage: frame.into_iter().collect(),
                     label: answer.label,
-                    secret_placed: false,
                     host_unread: false,
                 });
             }
@@ -1623,6 +1653,58 @@ fn write_to_cage(
     .is_ok()
 }
 
+/// What the record says sbx observed of one exchange: its kind, and the words that come before the
+/// plugin's label. `outcome` is `None` for an exchange that failed, which is a refusal only when
+/// the cage's frame was never sent.
+///
+/// The lookups and the credential are said whatever the kind, because the kind implies neither: a
+/// refusal can follow a lookup that sent the host resource the cage's own bytes.
+fn observed(
+    outcome: Option<&Outcome>,
+    progress: &Progress,
+) -> (super::broker_control::BrokerKind, String) {
+    use super::broker_control::BrokerKind;
+    let (kind, what, rewritten) = match outcome {
+        Some(Outcome::Forwarded { rewritten }) => (BrokerKind::Forward, "a request", *rewritten),
+        Some(Outcome::Answered) if progress.queries == 0 => (
+            BrokerKind::Answer,
+            "a request answered without the host resource",
+            false,
+        ),
+        Some(Outcome::Answered) => (
+            BrokerKind::Answer,
+            "a request answered by the broker",
+            false,
+        ),
+        Some(Outcome::Refused { .. }) => (BrokerKind::Refuse, "a request", false),
+        Some(Outcome::Withheld { rewritten, .. }) => {
+            (BrokerKind::Withhold, "a request", *rewritten)
+        }
+        None if progress.sent => (
+            BrokerKind::Withhold,
+            "an exchange that could not be completed once the request was sent to the host \
+             resource",
+            false,
+        ),
+        None => (
+            BrokerKind::Refuse,
+            "an exchange that could not be completed",
+            false,
+        ),
+    };
+    let mut said = what.to_string();
+    if rewritten {
+        said.push_str(", narrowed by the broker");
+    }
+    if progress.queries > 0 {
+        said.push_str(&format!(", after {} host lookup(s)", progress.queries));
+    }
+    if progress.secret_placed {
+        said.push_str(", carrying the configured credential");
+    }
+    (kind, said)
+}
+
 /// Relay one connection's exchanges, from the host's greeting (where the protocol has one) to
 /// whichever side ends it.
 ///
@@ -1738,48 +1820,38 @@ fn serve_exchanges(
             },
         };
         seq += 1;
+        let mut progress = Progress::default();
         let (answer, ends, closes) = match relay_one(
-            &frame, seq, spec, decider, host, marker, cage_typed,
+            &frame,
+            seq,
+            spec,
+            decider,
+            host,
+            marker,
+            cage_typed,
+            &mut progress,
         ) {
             Ok(relayed) => {
                 // Every decision goes to the record, which is what a reader consults afterwards.
                 // What sbx *observed* decides the kind; the plugin's label is only ever a detail
                 // appended to it.
-                let (kind, observed) = match &relayed.outcome {
-                    Outcome::Forwarded { rewritten, queries } => (
-                        super::broker_control::BrokerKind::Forward,
-                        match (rewritten, queries) {
-                            (false, 0) => "a request".to_string(),
-                            (true, 0) => "a request, narrowed by the broker".to_string(),
-                            (false, n) => format!("a request, after {n} host lookup(s)"),
-                            (true, n) => {
-                                format!(
-                                    "a request, narrowed by the broker, after {n} host lookup(s)"
-                                )
-                            }
-                        },
-                    ),
-                    Outcome::Answered => (
-                        super::broker_control::BrokerKind::Answer,
-                        "a request answered without the host resource".to_string(),
-                    ),
-                    Outcome::Refused { .. } => (
-                        super::broker_control::BrokerKind::Refuse,
-                        "a request".to_string(),
-                    ),
-                };
-                let observed = if relayed.secret_placed {
-                    format!("{observed}, carrying the configured credential")
-                } else {
-                    observed
-                };
+                let (kind, observed) = observed(Some(&relayed.outcome), &progress);
                 ring.push(kind, name, &observed, relayed.label.as_deref());
 
                 // A refusal is also worth saying out loud, and only the first of a connection: it
                 // is rare by nature, and a client that hits one usually reports something
                 // unhelpful ("permission denied") with no hint of who decided. A forward is the
                 // norm and stays silent on the terminal — the record above has it either way.
-                if matches!(relayed.outcome, Outcome::Refused { .. }) && !said_refusal {
+                let said = match relayed.outcome {
+                    Outcome::Refused { .. } => Some("refused a request from the cage"),
+                    Outcome::Withheld { .. } => {
+                        Some("withheld the host resource's answer to a request from the cage")
+                    }
+                    Outcome::Forwarded { .. } | Outcome::Answered => None,
+                };
+                if let Some(said) = said
+                    && !said_refusal
+                {
                     said_refusal = true;
                     let why = relayed
                         .label
@@ -1787,7 +1859,7 @@ fn serve_exchanges(
                         .map(super::lens::sanitize_detail)
                         .unwrap_or_default();
                     crate::diag::note(&format!(
-                        "broker `{name}` refused a request from the cage{}",
+                        "broker `{name}` {said}{}",
                         if why.is_empty() {
                             String::new()
                         } else {
@@ -1799,7 +1871,10 @@ fn serve_exchanges(
                 // frame ends it (closing is the refusal that needs no protocol); a message the
                 // protocol answers with nothing is simply followed by the next one, and treating
                 // that as an ending cuts the connection under a client that was mid-conversation.
-                let ends = matches!(relayed.outcome, Outcome::Refused { .. });
+                let ends = matches!(
+                    relayed.outcome,
+                    Outcome::Refused { .. } | Outcome::Withheld { .. }
+                );
                 // A refusal on the way back left the host mid-reply: the cage is told, and the
                 // connection ends there rather than serve the next request from what is left.
                 (relayed.to_cage, ends, relayed.host_unread)
@@ -1810,18 +1885,20 @@ fn serve_exchanges(
             // Looping here would answer every further frame from a broker that no longer exists,
             // in silence, while holding both connections open.
             Err(why) => {
-                ring.push(
-                    super::broker_control::BrokerKind::Refuse,
-                    name,
-                    "an exchange that could not be completed",
-                    Some(&why),
-                );
+                let (kind, observed) = observed(None, &progress);
+                ring.push(kind, name, &observed, Some(&why));
                 // The reason leads, because it is not always the same one: a plugin that died or
                 // wedged, and a reply the tripwire stopped, both end the exchange here. Saying
                 // "no verdict" for the second would name the wrong cause.
                 crate::diag::warn(&format!(
-                    "broker `{name}`: {} — the request was refused and the connection ended",
-                    super::lens::sanitize_detail(&why)
+                    "broker `{name}`: {} — {}",
+                    super::lens::sanitize_detail(&why),
+                    if progress.sent {
+                        "the request was sent to the host resource, its answer withheld, and the \
+                         connection ended"
+                    } else {
+                        "the request was refused and the connection ended"
+                    }
                 ));
                 if let Some(deny) = &spec.deny_frame {
                     let _ = write_frame(&mut cage_w, spec.framing, deny, true);
@@ -2277,7 +2354,20 @@ mod tests {
         host: &mut FakeHost,
         spec: &BrokerSpec,
     ) -> Result<Relayed, String> {
-        relay_one(frame, 7, spec, plugin, host, None, false)
+        relay_tracked(frame, plugin, host, spec, None).0
+    }
+
+    /// [`relay`], with how far the exchange got, which an exchange that fails reports too.
+    fn relay_tracked(
+        frame: &[u8],
+        plugin: &mut ScriptedPlugin,
+        host: &mut FakeHost,
+        spec: &BrokerSpec,
+        marker: Option<&SecretMarker>,
+    ) -> (Result<Relayed, String>, Progress) {
+        let mut progress = Progress::default();
+        let relayed = relay_one(frame, 7, spec, plugin, host, marker, false, &mut progress);
+        (relayed, progress)
     }
 
     #[test]
@@ -2289,13 +2379,7 @@ mod tests {
             to_cage: out,
             ..
         } = relay(&[0x0b], &mut plugin, &mut host, &spec(None)).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::Forwarded {
-                rewritten: false,
-                queries: 0
-            }
-        );
+        assert_eq!(outcome, Outcome::Forwarded { rewritten: false });
         assert_eq!(out, vec![vec![0xaa]]);
         assert_eq!(host.seen, vec![vec![0x0b]]);
     }
@@ -2312,13 +2396,7 @@ mod tests {
             label: None,
         }]);
         let Relayed { outcome, .. } = relay(&[0x0b], &mut plugin, &mut host, &spec(None)).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::Forwarded {
-                rewritten: true,
-                queries: 0
-            }
-        );
+        assert_eq!(outcome, Outcome::Forwarded { rewritten: true });
         assert_eq!(host.seen, vec![vec![0x0c, 0x0d]]);
     }
 
@@ -2394,18 +2472,15 @@ mod tests {
             // The host's reply is put to the plugin too: a query needs `inspect_replies`.
             ScriptedPlugin::forward(),
         ]);
+        let (relayed, progress) =
+            relay_tracked(&[0x0d], &mut plugin, &mut host, &inspecting(None), None);
         let Relayed {
             outcome,
             to_cage: out,
             ..
-        } = relay(&[0x0d], &mut plugin, &mut host, &inspecting(None)).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::Forwarded {
-                rewritten: false,
-                queries: 1
-            }
-        );
+        } = relayed.unwrap();
+        assert_eq!(outcome, Outcome::Forwarded { rewritten: false });
+        assert_eq!(progress.queries, 1, "the lookup is counted for the record");
         assert_eq!(out, vec![vec![0xaa]]);
         // The host saw the query first, then the frame itself.
         assert_eq!(host.seen, vec![vec![0x0b], vec![0x0d]]);
@@ -2654,7 +2729,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         spec: &BrokerSpec,
         marker: &SecretMarker,
     ) -> Result<Relayed, String> {
-        relay_one(frame, 7, spec, plugin, host, Some(marker), false)
+        relay_tracked(frame, plugin, host, spec, Some(marker)).0
     }
 
     /// What the capability is for: the plugin places a marker, and the bytes that reach the host
@@ -2697,8 +2772,10 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             more: false,
             label: None,
         }]);
-        let out = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker).unwrap();
-        assert!(out.secret_placed, "a placed credential is reported");
+        let (out, progress) =
+            relay_tracked(b"p", &mut plugin, &mut host, &spec(None), Some(&marker));
+        out.unwrap();
+        assert!(progress.secret_placed, "a placed credential is reported");
 
         // A rewrite that places nothing is not reported as carrying one.
         let mut host = FakeHost::with(vec![b"R".to_vec()]);
@@ -2708,8 +2785,10 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             more: false,
             label: None,
         }]);
-        let out = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker).unwrap();
-        assert!(!out.secret_placed);
+        let (out, progress) =
+            relay_tracked(b"p", &mut plugin, &mut host, &spec(None), Some(&marker));
+        out.unwrap();
+        assert!(!progress.secret_placed);
     }
 
     /// Guard: the cage's own bytes are never scanned. A frame passed through untouched carries no
@@ -3091,13 +3170,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             label,
             ..
         } = relay(&[0x0b], &mut plugin, &mut host, &inspecting).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::Forwarded {
-                rewritten: false,
-                queries: 0
-            }
-        );
+        assert_eq!(outcome, Outcome::Forwarded { rewritten: false });
         assert_eq!(out, vec![vec![0xaa]], "the cage gets the rebuilt answer");
         assert_eq!(label.as_deref(), Some("second key withheld"));
         assert_eq!(
@@ -3144,7 +3217,14 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             to_cage: out,
             ..
         } = relay(&[0x0b], &mut plugin, &mut host, &inspecting).unwrap();
-        assert_eq!(outcome, Outcome::Refused { with_frame: true });
+        assert_eq!(
+            outcome,
+            Outcome::Withheld {
+                with_frame: true,
+                rewritten: false
+            },
+            "the host resource had the request, so what was refused is its answer"
+        );
         assert_eq!(out, vec![vec![5]], "the manifest's refusal, not the answer");
     }
 
@@ -3939,8 +4019,17 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward()]);
 
         let started = std::time::Instant::now();
-        let why = relay_one(b"ask", 7, &spec, &mut plugin, &mut host, None, false)
-            .expect_err("a trickle must not buy the exchange unbounded time");
+        let why = relay_one(
+            b"ask",
+            7,
+            &spec,
+            &mut plugin,
+            &mut host,
+            None,
+            false,
+            &mut Progress::default(),
+        )
+        .expect_err("a trickle must not buy the exchange unbounded time");
         assert!(
             why.contains(super::super::deadline::READ_DEADLINE_PASSED),
             "the refusal must name the budget that ended it, not a later symptom: {why}"
@@ -4057,6 +4146,153 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             vec![b"list".to_vec()],
             "the next request must not reach a host still holding the refused run"
         );
+    }
+
+    /// The record's kind says whether the host resource had the request, since that is what an
+    /// audit needs from it: a resource that had it may have acted on it. A refusal on the way back
+    /// and an exchange that failed after the write were both recorded as `refuse`, whose meaning is
+    /// that the frame was never sent, and the failed one also lost that it carried the credential.
+    ///
+    /// The other two arms pin the opposite direction, so that calling everything withheld does
+    /// not pass: a plugin that fails before the write, and one that queries the resource with the
+    /// cage's own bytes and then refuses, are refusals, and the second says what it looked up.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn the_record_says_whether_the_host_resource_had_the_request() {
+        use super::super::broker_control::BrokerKind;
+        let marker = marker_for("hunter2");
+        let deny = |label: &str| Answer {
+            verdict: Verdict::Deny(None),
+            expect_reply: true,
+            more: false,
+            label: Some(label.to_string()),
+        };
+        let cases: Vec<(
+            &str,
+            ScriptedPlugin,
+            FakeHost,
+            BrokerKind,
+            &[&str],
+            Vec<Vec<u8>>,
+        )> = vec![
+            (
+                "an answer refused on the way back",
+                ScriptedPlugin::new(vec![ScriptedPlugin::forward(), deny("not that answer")]),
+                FakeHost::with(vec![b"ANSWER".to_vec()]),
+                BrokerKind::Withhold,
+                &["a request"],
+                vec![b"ask".to_vec()],
+            ),
+            (
+                "a host resource that closed after the credential was sent",
+                ScriptedPlugin::new(vec![Answer {
+                    verdict: Verdict::Forward(Some(
+                        format!("AUTH {}", marker.token()).into_bytes(),
+                    )),
+                    expect_reply: true,
+                    more: false,
+                    label: None,
+                }]),
+                FakeHost::with(Vec::new()),
+                BrokerKind::Withhold,
+                &[
+                    "once the request was sent",
+                    "carrying the configured credential",
+                ],
+                vec![b"AUTH hunter2".to_vec()],
+            ),
+            (
+                "a plugin that failed before anything was sent",
+                ScriptedPlugin::new(Vec::new()),
+                FakeHost::with(Vec::new()),
+                BrokerKind::Refuse,
+                &["an exchange that could not be completed"],
+                Vec::new(),
+            ),
+            (
+                "a refusal after a lookup with the cage's own bytes",
+                ScriptedPlugin::new(vec![
+                    Answer {
+                        verdict: Verdict::Query(b"ask".to_vec()),
+                        expect_reply: true,
+                        more: false,
+                        label: None,
+                    },
+                    deny("looked it up"),
+                ]),
+                FakeHost::with(vec![b"R".to_vec()]),
+                BrokerKind::Refuse,
+                &["a request, after 1 host lookup(s)"],
+                vec![b"ask".to_vec()],
+            ),
+            (
+                "an answer of the plugin's own after a lookup",
+                ScriptedPlugin::new(vec![
+                    Answer {
+                        verdict: Verdict::Query(b"ask".to_vec()),
+                        expect_reply: true,
+                        more: false,
+                        label: None,
+                    },
+                    Answer {
+                        verdict: Verdict::Reply(b"MINE".to_vec()),
+                        expect_reply: true,
+                        more: false,
+                        label: None,
+                    },
+                ]),
+                FakeHost::with(vec![b"R".to_vec()]),
+                BrokerKind::Answer,
+                &["a request answered by the broker, after 1 host lookup(s)"],
+                vec![b"ask".to_vec()],
+            ),
+        ];
+        for (case, mut plugin, mut host, kind, says, seen) in cases {
+            let spec = inspecting(Some(b"NO".to_vec()));
+            let (cage, mut client) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            write_frame(&mut client, spec.framing, b"ask", false).expect("cage frame");
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("half-close");
+            let ring = super::super::broker_control::BrokerRing::new(8);
+            serve_exchanges(
+                &spec,
+                &mut plugin,
+                &mut host,
+                cage,
+                &ring,
+                Some(&marker),
+                "x",
+                None,
+            )
+            .expect("served");
+
+            assert_eq!(host.seen, seen, "{case}: what the host resource had");
+            let events = ring.snapshot(None).events;
+            assert_eq!(events.len(), 1, "{case}: {events:?}");
+            assert_eq!(events[0].kind, kind, "{case}: {:?}", events[0]);
+            for said in says {
+                assert!(
+                    events[0].detail.contains(said),
+                    "{case}: the record says {said:?}: {:?}",
+                    events[0].detail
+                );
+            }
+            if kind == BrokerKind::Refuse {
+                assert!(
+                    !events[0].detail.contains("sent"),
+                    "{case}: a refusal is not said to have been sent: {:?}",
+                    events[0].detail
+                );
+            }
+            if !host.seen.is_empty() {
+                assert!(
+                    !events[0].detail.contains("without the host resource"),
+                    "{case}: the host resource was contacted: {:?}",
+                    events[0].detail
+                );
+            }
+        }
     }
 
     /// Every frame bound for the cage is held to the marker rule — the host's greeting included.

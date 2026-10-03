@@ -28,14 +28,27 @@ use std::sync::Arc;
 pub(crate) const BROKER_RING_CAP: usize = 500;
 
 /// What the broker did with one frame, as **sbx observed it** — never as the plugin described it.
+///
+/// The line between the kinds is whether sbx sent the cage's frame on to the host resource, since
+/// that is what decides whether the resource may have acted on it. None of them says the resource
+/// was never contacted: a plugin that inspects replies may query it first, with bytes of its own
+/// choosing, and the detail counts those lookups on every kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BrokerKind {
-    /// Passed to the host resource, and its answer returned to the cage.
+    /// Sent to the host resource, and its answer returned to the cage. A frame of that answer the
+    /// broker stopped at the cage's door is recorded after it, as a `Refuse` of its own.
     Forward,
-    /// Answered by the plugin, without the host resource being contacted.
+    /// Answered by the plugin. The cage's frame was not sent to the host resource.
     Answer,
-    /// Turned away. The frame never reached the host resource.
+    /// Turned away before the cage's frame was sent to the host resource: a request, a connection,
+    /// or the host's greeting held back from a cage that had said nothing yet. A frame stopped at
+    /// the cage's door is recorded this way too, and comes after the decision it belonged to,
+    /// which says whether the host resource had the request.
     Refuse,
+    /// Sent to the host resource, or begun to be, and its answer kept from the cage: the plugin
+    /// refused the answer, or the exchange failed after the frame was sent. The resource has the
+    /// request and may have acted on it.
+    Withhold,
 }
 
 impl BrokerKind {
@@ -45,6 +58,7 @@ impl BrokerKind {
             BrokerKind::Forward => "forward",
             BrokerKind::Answer => "answer",
             BrokerKind::Refuse => "refuse",
+            BrokerKind::Withhold => "withhold",
         }
     }
 
@@ -53,6 +67,7 @@ impl BrokerKind {
             "forward" => Some(BrokerKind::Forward),
             "answer" => Some(BrokerKind::Answer),
             "refuse" => Some(BrokerKind::Refuse),
+            "withhold" => Some(BrokerKind::Withhold),
             _ => None,
         }
     }
@@ -260,20 +275,34 @@ mod tests {
         assert_eq!(parsed.kind, BrokerKind::Forward);
     }
 
+    /// Every kind, since a token the reader does not know drops the whole line: a session's
+    /// record would then hold fewer decisions than were made, with nothing to say so.
     #[test]
     fn an_event_survives_the_wire_round_trip() {
         let ring = BrokerRing::new(BROKER_RING_CAP);
-        ring.push(
+        let kinds = [
+            BrokerKind::Forward,
             BrokerKind::Answer,
-            "gpg-agent",
-            "the identities it may see",
-            Some("2 of 5"),
-        );
-        let event = ring.snapshot(None).events[0].clone();
-        // Trimmed as the real reader trims: it splits on `lines()`, so a `parse_line` never sees
-        // the terminator `format_line` writes.
-        let parsed = BrokerEvent::parse_line(event.format_line().trim_end()).expect("parses back");
-        assert_eq!(parsed, event);
+            BrokerKind::Refuse,
+            BrokerKind::Withhold,
+        ];
+        for kind in kinds {
+            ring.push(
+                kind,
+                "gpg-agent",
+                "the identities it may see",
+                Some("2 of 5"),
+            );
+        }
+        let events = ring.snapshot(None).events;
+        assert_eq!(events.len(), kinds.len());
+        for event in events {
+            // Trimmed as the real reader trims: it splits on `lines()`, so a `parse_line` never
+            // sees the terminator `format_line` writes.
+            let parsed =
+                BrokerEvent::parse_line(event.format_line().trim_end()).expect("parses back");
+            assert_eq!(parsed, event);
+        }
     }
     /// The record is written through [`super::redact::redact_string`], so a credential that reached
     /// a lens becomes `${NAME}` on the way to disk. That substitution happens on the **whole**

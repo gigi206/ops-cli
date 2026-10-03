@@ -58,7 +58,7 @@ The tokens are each feed's own, not a vocabulary invented here:
 | `net` | `allow`, `deny`, `blocked`, `error`; `resolved` for a name the cage asked the transparent-capture tap for, which is a question rather than a decision |
 | `fs` | `write`, `create`, `remove`, `rename` |
 | `ssh` | `list`, `sign`, `refuse` |
-| `broker` | `forward`, `answer`, `refuse`: what `sbx` observed, with the plugin's own reason appended |
+| `broker` | `forward`, `answer`, `refuse`, `withhold`: what `sbx` observed, with the plugin's own reason appended; a `withhold` was sent to the host resource and its answer kept from the cage, a `refuse` was never sent |
 | `signer` | `sign`, `refuse`: what `sbx` observed of one request's credential, with the plugin's own account appended |
 | `task` | `exit=<n>`, or `refused` |
 
