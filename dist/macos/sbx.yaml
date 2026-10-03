@@ -5,9 +5,10 @@
 # here is an ordinary Linux sbx inside an ordinary Linux kernel; macOS is the host at the end of
 # the bridges, the same way Windows is for a WSL2 distribution. Nothing in sbx is macOS-aware.
 #
-# WHAT IS NOT MEASURED. This template has not been booted. The environment it was written in has
-# no KVM and no Mac, so nothing below was observed: not the user namespaces, not the mount
-# semantics, not the window, not the sound. `sbx doctor` inside the guest is what decides, and
+# WHAT HAS BEEN VERIFIED. This template has been booted on an Intel Mac (macOS 14, Lima 2.2.1),
+# where `sbx doctor` passes inside the guest, the mount semantics hold, and a cage launches in the
+# project. Apple Silicon has not been run, and neither have the window and the sound below, which
+# are written against Lima's source. `sbx doctor` inside the guest is what decides, and
 # `.github/workflows/macos.yml` is what runs it.
 
 # Ubuntu images, and those alone. Lima's `default.yaml` inherits `_images/ubuntu` and
@@ -105,9 +106,9 @@ provision:
       # on the other side of it.
       #
       # Written to /etc/sysctl.d so it survives a reboot, and applied now so the first launch
-      # does not have to wait for one. What is not measured is whether this image ships the
-      # restriction enabled at all, and whether clearing it is sufficient: `sbx doctor` inside
-      # the guest is what answers both.
+      # does not have to wait for one. The Ubuntu 26.04 image ships the restriction enabled, in
+      # /usr/lib/sysctl.d/10-apparmor.conf, which this file outranks by name, and clearing it is
+      # what `sbx doctor` inside the guest needs to pass.
       install -m 0644 /dev/stdin /etc/sysctl.d/99-sbx-userns.conf <<'EOF'
       kernel.apparmor_restrict_unprivileged_userns = 0
       EOF

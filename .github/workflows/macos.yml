@@ -9,8 +9,9 @@
 #
 # WHAT THIS RUN ASSERTS. That `dist/macos/sbx.yaml` still produces a guest whose user namespaces
 # carry capabilities, that `dist/macos/sbx` still reaches it from a Mac shell with the working
-# directory carried over, and that the Mac's own filesystem is absent from the cage the guest
-# builds. The preflight assertion is in two halves and the order matters: `doctor`'s exit status
+# directory carried over, that a directory the guest does not share is refused rather than
+# swapped for one of the same name on the guest's own disk, and that the Mac's own filesystem is
+# absent from the cage the guest builds. The preflight assertion is in two halves and the order matters: `doctor`'s exit status
 # first, then the evidence line. `doctor` prints "capability-bearing" on its success line, on its
 # cannot-prove line, and on the line that blames bubblewrap for a failed launch, and its
 # remediation text contains the phrase too. Grepping for it alone would read a red as a green.
@@ -101,6 +102,12 @@ jobs:
     name: exercise the cage in a Lima guest
     runs-on: [self-hosted, macOS]
     timeout-minutes: 60
+    env:
+      # The wrapper reaches the instance it is told to and defaults to `sbx`, a name this run must
+      # not take from a user who registered the runner on their own Mac. Every wrapper call below
+      # reaches `sbx-ci` through this, and without it each one fails on an instance that does not
+      # exist.
+      SBX_LIMA_INSTANCE: sbx-ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -214,6 +221,24 @@ jobs:
           case "$out" in
             *VISIBLE*) echo "the project is visible, so the probe can tell the two apart" ;;
             *) echo "the project itself did not read as visible, so the probe is broken: $out"; exit 1 ;;
+          esac
+
+      - name: A directory the guest also has must be refused, not swapped for the guest's own
+        # `/tmp` exists on both sides, so a wrapper that only tried to cd into the Mac's directory
+        # would land in the guest's `/tmp` and build the cage there without a word. The witness is
+        # written on the Mac, so a launch that ran anyway is told apart from one that was refused.
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/sbx-ci-witness
+          echo "witness" > /tmp/sbx-ci-witness/on-the-mac
+          cd /tmp
+          out=$("$GITHUB_WORKSPACE/dist/macos/sbx" run -- ls /tmp/sbx-ci-witness/on-the-mac 2>&1)
+          status=$?
+          rm -rf /tmp/sbx-ci-witness
+          [ "$status" -ne 0 ] || { echo "the wrapper ran a cage from /tmp, which the guest does not share: $out"; exit 1; }
+          case "$out" in
+            *"is not visible inside the"*) echo "/tmp refused by name, as the wrapper documents" ;;
+            *) echo "the launch failed, but not with the wrapper's refusal: $out"; exit 1 ;;
           esac
 
       - name: Publish the report

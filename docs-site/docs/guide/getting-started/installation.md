@@ -207,24 +207,34 @@ subtree and asks you to name yours. The mount is writable, because a cage that c
 write the project is not a sandbox to work in, and that is also what makes the narrowing
 worth doing: this mount is the whole of the guest's reach into the Mac's disk.
 
-Four things come from Lima rather than from `sbx`, and none of them needs configuring:
+Four things come from Lima rather than from `sbx`, and only the last takes a line of
+configuration:
 
 - **The path is the same on both sides.** A mount appears in the guest at the path it has
   on the Mac, so `/Users/you/Projects/my-app` is that path in the guest too, and nothing
   has to be translated.
 - **The working directory is carried over.** The wrapper hands the guest the directory
-  you were standing in, and `sbx run` builds the cage around it.
+  you were standing in, and `sbx run` builds the cage around it. A directory outside the
+  mounted subtree is refused by name, including one whose path the guest also has on its
+  own disk, such as `/tmp`: the cage is never built around the guest's directory of the
+  same name.
 - **Resource limits work.** Lima enables lingering for the guest user at boot, so there is
   a user manager for the transient scope to be registered against and the cage is capped
   as it is on a native Linux host.
-- **Loopback listeners reach the Mac.** A server a caged process binds on the guest's
-  loopback is forwarded, so `localhost` in a Mac browser reaches it.
+- **A forwarded port reaches the Mac.** A cage has its own network namespace, so a server
+  started in it listens on the cage's loopback, which nothing outside the cage reaches.
+  Declare the port in [`forward`](../networking/forward), as on a native Linux host, and
+  `sbx` binds it on the guest's loopback. Lima forwards the guest's loopback listeners to
+  the Mac, so `localhost:<port>` in a Mac browser then reaches the server.
 
 **The guest and the release drift apart, and a restart is what closes it.** The binary is
 installed by provisioning, from the published release, verified against the checksum
 published beside it. Lima re-runs provisioning on restart, so `limactl stop sbx && limactl
 start sbx` converges the guest on the current build. A guest left running falls behind
-instead, and the wrapper says so on stderr once it has been up long enough to matter.
+instead, and the wrapper says so on stderr once it has been up long enough to matter. On an
+Intel Mac, `limactl stop` can stop the virtual machine yet keep reporting the instance as
+running, and give up after a few minutes; `limactl stop --force sbx` ends it, and the next
+`sbx` command starts the guest again.
 
 Three smaller things follow from the command crossing an SSH connection rather than being
 run locally. Exit codes come back: the wrapper exits with what the caged program exited
@@ -257,13 +267,18 @@ Three differences from a native host are worth knowing before they surprise you:
   Linux guest on Apple Silicon opens no screen. CUDA is out of reach by any route on a Mac,
   because Apple Silicon carries no NVIDIA hardware.
 
-**What of this has been measured.** The template and the wrapper have not been booted:
-they were written against Lima's source and its published behaviour, not against a
-running guest. [`sbx doctor`](doctor) inside the guest is what decides whether the
-boundary is there, and it is the first thing to run after `limactl start`. The
-acceptance workflow that would measure all of it on a Mac is in the repository and
-requires a self-hosted macOS runner, which is why it reports rather than hangs when none
-is registered.
+**What of this has been verified, and where.** The template and the wrapper have been run
+on an Intel Mac (macOS 14, Lima 2.2.1, installed from Lima's release archive rather than
+through Homebrew). There, [`doctor`](doctor) passes inside the guest with capability-bearing
+user namespaces, a cage launches in the directory the Mac stood in, the parts of the Mac
+outside the project are absent from it, a directory the guest does not share is refused,
+a stopped guest is started by the wrapper, and a forwarded port reaches the Mac. Apple
+Silicon has not been run: neither the `sbx-linux-aarch64` binary in a guest nor the
+window, sound and GPU behaviour above, which is written against Lima's source and its
+published behaviour. `sbx doctor` inside the guest is what decides whether the boundary is
+there, and it is the first thing to run after `limactl start`. The acceptance workflow in
+the repository replays these checks on a Mac and requires a self-hosted macOS runner,
+which is why it reports rather than hangs when none is registered.
 
 ## Development build
 

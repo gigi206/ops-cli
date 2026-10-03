@@ -6,8 +6,9 @@
 # the cage is built around, and the three ways that can go wrong say so instead of failing
 # obscurely.
 #
-# NOT MEASURED. This has not been run against a Mac or a booted instance. What it asserts about
-# limactl comes from reading Lima's source, not from watching it work.
+# Measured on an Intel Mac (macOS 14, Lima 2.2.1, itself running as a KVM guest): a stopped
+# instance is started, the working directory and the exit status are carried across, and a
+# directory outside the mounted subtree is refused. Not measured on Apple Silicon.
 
 set -eu
 
@@ -38,7 +39,12 @@ fi
 exec "$LIMACTL" shell --start "$SBX_LIMA_INSTANCE" sh -c '
   dir=$1; stale_days=$2; inst=$3; shift 3
 
-  if ! cd "$dir" 2>/dev/null; then
+  # A successful cd is not enough. A path the guest also has on its own disk (`/tmp`, `/opt`,
+  # `/usr/local`) is entered without error, and the cage would be built around the directory of
+  # that name in the guest while the one on the Mac stays out of reach. The template mounts the
+  # Mac subtree with `vmType: vz`, whose mounts are virtiofs and the only virtiofs in the guest,
+  # so a directory on any other filesystem did not come from the Mac.
+  if ! cd "$dir" 2>/dev/null || [ "$(findmnt -n -o FSTYPE -T . 2>/dev/null)" != virtiofs ]; then
     printf "sbx: %s is not visible inside the %s guest\n" "$dir" "$inst" >&2
     printf "     the guest mounts one subtree of your home and nothing else, which is what\n" >&2
     printf "     keeps the rest of the Mac out of every cage it builds\n" >&2
