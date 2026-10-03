@@ -34,6 +34,8 @@ mod openuri;
 // Whether a control socket's peer runs in the supervisor's own PID namespace, which no cage does.
 mod peer;
 mod pty;
+// When a host-side reader takes a control socket's answer to a read as whole: once its `ok` came.
+mod reply;
 mod smoke;
 mod spec;
 // What a cage built outside `sandbox` is described with: the storage helper's.

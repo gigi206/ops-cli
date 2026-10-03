@@ -1531,9 +1531,10 @@ fn serve_host(
     if dropped > 0 {
         writeln!(writer, "dropped={dropped}")?;
     }
-    // The head goes out before the events, the way the observation lenses send theirs: a reader that
-    // stops mid-stream still has a cursor it can come back with, and one that sees no `head=` at all
-    // is talking to a plane that predates this and must not try to follow.
+    // The head goes out before the events, the way the observation lenses send theirs. It is the
+    // cursor past the *last* event, so a reader takes it only from an answer that reached its `ok`
+    // ([`super::reply`]); one that sees no `head=` at all is talking to a plane that predates this
+    // and must not try to follow.
     writeln!(writer, "head={head}")?;
     for entry in &entries {
         writeln!(writer, "{}", entry.to_line())?;
@@ -1549,6 +1550,15 @@ fn ask_host(socket: &Path, command: &str) -> io::Result<Vec<String>> {
     let mut text = String::new();
     BufReader::new(stream).read_to_string(&mut text)?;
     Ok(text.lines().map(str::to_string).collect())
+}
+
+/// Ask a session's host-only socket a verb that only reads, and take its answer only once it is
+/// whole ([`super::reply`]): the lines before the closing `ok`, or a cut answer as an error.
+fn read_host(socket: &Path, command: &str) -> io::Result<Vec<String>> {
+    let mut stream = UnixStream::connect(socket)?;
+    writeln!(stream, "{command}")?;
+    stream.flush()?;
+    super::reply::answer(BufReader::new(stream)).collect()
 }
 
 /// The raw `LOG` reply, line by line — for the tests that assert on the **wire format itself**.
@@ -1578,7 +1588,7 @@ pub(crate) fn read_entries(
         Some(cursor) => format!("LOG after={cursor}"),
         None => "LOG".to_string(),
     };
-    let lines = ask_host(socket, &command)?;
+    let lines = read_host(socket, &command)?;
     let mut entries = Vec::new();
     let mut dropped = 0;
     let mut head = 0;
@@ -1603,7 +1613,7 @@ pub(crate) struct StatusRow {
 
 /// What a session is running right now.
 pub(crate) fn read_status(socket: &Path) -> io::Result<Vec<StatusRow>> {
-    Ok(ask_host(socket, "STATUS")?
+    Ok(read_host(socket, "STATUS")?
         .iter()
         .filter_map(|line| {
             let rest = line.strip_prefix("running ")?;
@@ -1624,15 +1634,9 @@ pub(crate) fn read_status(socket: &Path) -> io::Result<Vec<StatusRow>> {
 /// nothing from a session it could not ask: a session that could not be reached, and one whose
 /// answer ended before its `ok`, which said nothing rather than an empty record.
 pub(crate) fn read_info(socket: &Path, target: &str) -> io::Result<Option<Vec<(String, String)>>> {
-    let lines = ask_host(socket, &format!("INFO {target}"))?;
+    let lines = read_host(socket, &format!("INFO {target}"))?;
     if lines.iter().any(|l| l.starts_with("err ")) {
         return Ok(None);
-    }
-    if lines.last().map(String::as_str) != Some("ok") {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the session's answer ended before its `ok`",
-        ));
     }
     Ok(Some(
         lines
@@ -1949,7 +1953,8 @@ pub(crate) mod client {
         }
     }
 
-    /// Send a payload-free command and return its response lines (without the trailing `ok`).
+    /// Send a payload-free command and return its response lines (without the trailing `ok`), an
+    /// answer cut before that `ok` being an error ([`crate::sandbox::reply`]).
     fn exchange(socket: &Path, command: &str, payload: &[String]) -> io::Result<Vec<String>> {
         let mut stream = UnixStream::connect(socket)?;
         writeln!(stream, "{command}")?;
@@ -1957,16 +1962,12 @@ pub(crate) mod client {
             writeln!(stream, "{line}")?;
         }
         stream.flush()?;
-        let mut text = String::new();
-        BufReader::new(stream).read_to_string(&mut text)?;
-        if let Some(err) = text.lines().find_map(|l| l.strip_prefix("err ")) {
+        let lines: Vec<String> =
+            crate::sandbox::reply::answer(BufReader::new(stream)).collect::<io::Result<_>>()?;
+        if let Some(err) = lines.iter().find_map(|l| l.strip_prefix("err ")) {
             return Err(io::Error::other(err.to_string()));
         }
-        Ok(text
-            .lines()
-            .filter(|l| *l != "ok")
-            .map(str::to_string)
-            .collect())
+        Ok(lines)
     }
 }
 

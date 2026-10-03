@@ -103,6 +103,13 @@ Most sessions record two or three. Each feed needs something to have been decide
 If none of them is recording, the command says so and exits non-zero rather than printing an empty
 view that would read as a quiet session.
 
+A feed whose answer stops before the `ok` that closes every whole one is named as cut short, and
+none of its events are shown, since part of a record would pass for all of it. Under `--follow`, a
+later read cut short moves nothing: the feed is asked again from where it was, so no event is
+skipped. `sbx proc logs`, `sbx fs logs` and `sbx ssh-agent logs` hold to the same rule; `sbx net
+logs` leaves out a session whose answer was cut short, as it leaves out one it cannot reach, and its
+`--follow` asks again from the same cursor.
+
 ## Ordering
 
 Rows are ordered by when each event **happened**, not by when it was recorded. That distinction

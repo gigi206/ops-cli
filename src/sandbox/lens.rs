@@ -966,7 +966,9 @@ pub(crate) fn bind_and_serve(
 
 /// Read one session's lens over its control socket (`LOG`, or `LOG after=<seq>` for a follow read
 /// past a cursor). A session whose socket is absent — the lens was never stood up, or the launch is
-/// dead — fails the connect, which the caller distinguishes from an empty feed.
+/// dead — fails the connect, which the caller distinguishes from an empty feed. An answer cut before
+/// its `ok` fails too ([`super::reply`]), so its `head=` never moves a cursor past events that did
+/// not arrive.
 ///
 /// A line the reader does not recognise is skipped rather than failing the read, so a session
 /// serving a field this reader has never heard of is still readable.
@@ -984,11 +986,8 @@ pub(crate) fn read_log<E: Event>(socket: &Path, after: Option<u64>) -> io::Resul
     let mut events = Vec::new();
     let mut dropped = 0;
     let mut head = 0;
-    for line in BufReader::new(&stream).lines() {
+    for line in super::reply::answer(BufReader::new(&stream)) {
         let line = line?;
-        if line == "ok" {
-            break;
-        }
         if let Some(v) = line.strip_prefix("dropped=") {
             dropped = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("head=") {

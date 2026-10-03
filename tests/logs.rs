@@ -71,8 +71,13 @@ fn bind_lens_socket(data: &Path, lens: &str, pid: u32) -> (PathBuf, UnixListener
 /// following still reads more than once across a test (the human pass and the `--json` pass are two
 /// runs of the command), and the protocol is one command per connection.
 fn serve_lens(data: &Path, lens: &str, pid: u32, events: &[&str]) {
+    serve_reply(data, lens, pid, frame(events));
+}
+
+/// [`serve_lens`] with the reply written out by hand, for a test whose point is a reply no session
+/// would frame on purpose.
+fn serve_reply(data: &Path, lens: &str, pid: u32, reply: String) {
     let (_, listener) = bind_lens_socket(data, lens, pid);
-    let reply = frame(events);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
@@ -432,6 +437,67 @@ fn a_feed_that_answers_without_a_cursor_is_still_a_recording_session() {
         out.contains("shown once, not followed"),
         "with the reason it cannot be followed: {out}"
     );
+}
+
+/// An answer that stops before its `ok` is a session that is there and said only part of what it
+/// holds. The merged view names that feed and shows none of its rows beside the ones that came
+/// whole; with no feed answering in full it refuses, and so does the feed's own view, rather than
+/// print part of a record as all of it or say the lens was never stood up.
+#[test]
+fn a_feed_whose_answer_is_cut_short_is_named_and_shows_nothing() {
+    let dir = TmpDir::new("l");
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    serve_lens(
+        data,
+        "fs",
+        pid,
+        &["event seq=1 at=1700000000123 kind=write path=src/whole.rs"],
+    );
+    serve_reply(
+        data,
+        "proc",
+        pid,
+        "head=1\nevent seq=1 at=1700000000456 pid=4242 verdict=observe cmd=rg cut-short\n".into(),
+    );
+    let pid = pid.to_string();
+
+    let out = read_feed(data, &["logs", &pid, "--feed", "fs,proc"]);
+    assert!(
+        out.contains("src/whole.rs"),
+        "the whole answer is shown: {out}"
+    );
+    assert!(
+        !out.contains("cut-short"),
+        "nothing of the cut answer is shown: {out}"
+    );
+    assert!(
+        out.contains("proc: its answer was cut short, so none of it is shown"),
+        "the cut feed is named: {out}"
+    );
+
+    for args in [
+        &["logs", &pid, "--feed", "proc"][..],
+        &["proc", "logs", &pid][..],
+    ] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .env("XDG_DATA_HOME", data)
+            .output()
+            .expect("run the view");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("did not finish its answer"),
+            "{args:?} says why, not that the lens is missing: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&refused.stdout).contains("cut-short"),
+            "{args:?}"
+        );
+    }
 }
 
 /// The merged view is the only one that can be wrong about *order*, and the only one that can lie by

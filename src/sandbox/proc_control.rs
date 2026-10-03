@@ -345,13 +345,9 @@ pub(crate) fn read_pending(socket: &Path) -> io::Result<Vec<ParkedView>> {
 
 /// [`read_pending`] under a caller-chosen deadline — see [`GLANCE_TIMEOUT`].
 pub(crate) fn read_pending_within(socket: &Path, timeout: Duration) -> io::Result<Vec<ParkedView>> {
-    let reply = query_within(socket, "LIST", timeout)?;
     let mut out = Vec::new();
-    for line in reply.lines() {
-        if line == "ok" {
-            break;
-        }
-        if let Some(p) = parse_pending_line(line) {
+    for line in read_within(socket, "LIST", timeout)? {
+        if let Some(p) = parse_pending_line(&line) {
             out.push(p);
         }
     }
@@ -427,12 +423,8 @@ pub(crate) struct OverlayRule {
 /// List a session's live `--session` overlay rules (`RULES`). An absent socket (not enforcing / dead)
 /// fails the connect, distinguished from an empty overlay.
 pub(crate) fn read_overlay_rules(socket: &Path) -> io::Result<Vec<OverlayRule>> {
-    let reply = query(socket, "RULES")?;
     let mut out = Vec::new();
-    for line in reply.lines() {
-        if line == "ok" {
-            break;
-        }
+    for line in read_within(socket, "RULES", QUERY_TIMEOUT)? {
         if let Some(rest) = line.strip_prefix("rule allow ") {
             out.push(OverlayRule {
                 verdict: "allow",
@@ -466,14 +458,27 @@ fn query(socket: &Path, cmd: &str) -> io::Result<String> {
 /// [`query`] under a caller-chosen deadline, for a caller that would rather come back empty
 /// than wait.
 fn query_within(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<String> {
+    let stream = send(socket, cmd, timeout)?;
+    let mut reply = String::new();
+    BufReader::new(&stream).read_to_string(&mut reply)?;
+    Ok(reply)
+}
+
+/// [`query_within`] for a verb that only reads: the lines before the closing `ok`, and an answer
+/// cut before it as an error ([`super::reply`]).
+fn read_within(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<Vec<String>> {
+    let stream = send(socket, cmd, timeout)?;
+    super::reply::answer(BufReader::new(&stream)).collect()
+}
+
+/// Connect to a session's control socket and send it one command line, both under `timeout`.
+fn send(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<UnixStream> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     (&stream).write_all(format!("{cmd}\n").as_bytes())?;
     (&stream).flush()?;
-    let mut reply = String::new();
-    BufReader::new(&stream).read_to_string(&mut reply)?;
-    Ok(reply)
+    Ok(stream)
 }
 
 /// Parse one `pending id=… pid=… waiting=… path=…` line, `path` verbatim last.

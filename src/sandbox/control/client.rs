@@ -122,11 +122,8 @@ fn query(socket: &Path, timeout: Duration) -> io::Result<(Vec<PendingRow>, Optio
     (&stream).flush()?;
     let mut rows = Vec::new();
     let mut incarnation = None;
-    for line in BufReader::new(&stream).lines() {
+    for line in crate::sandbox::reply::answer(BufReader::new(&stream)) {
         let line = line?;
-        if line == "ok" {
-            break;
-        }
         if let Some((row, ticks)) = parse_pending_line(&line) {
             incarnation = incarnation.or(ticks);
             rows.push(row);
@@ -199,7 +196,9 @@ pub(crate) struct Follow {
 
 /// Query one session's control socket for its recent egress events (`LOG`, or `LOG after=<seq>` for a
 /// follow read past a cursor). A session whose socket is gone (a dead/stale launch) fails the connect
-/// and the caller skips it. `follow` names a `--follow` reader to the session.
+/// and the caller skips it; an answer cut before its `ok` fails too ([`crate::sandbox::reply`]), so
+/// its cursors never move past events that did not arrive. `follow` names a `--follow` reader to the
+/// session.
 pub(crate) fn read_log(
     socket: &Path,
     after: Option<u64>,
@@ -242,11 +241,8 @@ pub(crate) fn read_log(
     let mut head = 0;
     let mut amend_head = 0;
     let mut capture_evicted = 0;
-    for line in BufReader::new(&stream).lines() {
+    for line in crate::sandbox::reply::answer(BufReader::new(&stream)) {
         let line = line?;
-        if line == "ok" {
-            break;
-        }
         if let Some(v) = line.strip_prefix("dropped=") {
             dropped = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("head=") {
@@ -259,8 +255,8 @@ pub(crate) fn read_log(
             events.push(ev);
         } else if let Some((seq, sighting)) = parse_sighting_line(&line) {
             // A sighting follows its own event on the wire, so the event it belongs to is already in
-            // hand. One that arrives without it (an evicted event, a truncated reply) is dropped
-            // rather than invented into a bare record with no host or time to show it against.
+            // hand. One that arrives without it (an evicted event) is dropped rather than invented
+            // into a bare record with no host or time to show it against.
             if let Some(ev) = events.iter_mut().find(|e| e.seq == seq) {
                 ev.secrets_seen.push(sighting);
             }
@@ -364,11 +360,8 @@ pub(crate) fn read_flows(socket: &Path) -> io::Result<Vec<FlowSnapshot>> {
     (&stream).write_all(b"FLOWS\n")?;
     (&stream).flush()?;
     let mut flows = Vec::new();
-    for line in BufReader::new(&stream).lines() {
+    for line in crate::sandbox::reply::answer(BufReader::new(&stream)) {
         let line = line?;
-        if line == "ok" {
-            break;
-        }
         if let Some(f) = parse_flow_line(&line) {
             flows.push(f);
         }
@@ -818,11 +811,8 @@ pub(crate) fn query_manual(data_dir: &Path, pid: u32) -> io::Result<Vec<ManualRu
     (&stream).write_all(b"RULES\n")?;
     (&stream).flush()?;
     let mut rules = Vec::new();
-    for line in BufReader::new(&stream).lines() {
+    for line in crate::sandbox::reply::answer(BufReader::new(&stream)) {
         let line = line?;
-        if line == "ok" {
-            break;
-        }
         // The rule text is everything after the kind prefix — taken as the whole remainder, so a
         // rule carrying whitespace (a `re:` regex loaded with `--session`) round-trips intact.
         if let Some(rule) = line.strip_prefix("manual allow ") {
