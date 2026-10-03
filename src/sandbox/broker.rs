@@ -280,7 +280,9 @@ pub(crate) enum Verdict {
     /// Refuse. The bytes are the protocol's refusal when the plugin knows one; without them the
     /// caller falls back to the manifest's `deny_frame`, and failing that, closes the connection.
     Deny(Option<Vec<u8>>),
-    /// Put these bytes to the host resource and hand the answer back, then ask again.
+    /// Put these bytes to the host resource and hand the answer back, then ask again. The answer
+    /// is one frame: a query suits a request the host answers with a single message, since the
+    /// rest of a longer answer would stay in the host's stream for the exchange after it.
     Query(Vec<u8>),
 }
 
@@ -635,6 +637,11 @@ pub(crate) struct Relayed {
     /// frame carrying a credential is not the same event as one that was merely rewritten, and an
     /// audit of a session should be able to tell them apart. Never accompanied by the value.
     pub(crate) secret_placed: bool,
+    /// Whether the host resource may still hold the rest of a reply this exchange stopped reading:
+    /// a refusal on the way back ends the read mid-run, and nothing here knows how much of the run
+    /// is left. The connection then carries no further exchange, since the next one would read
+    /// that rest as its own answer and put it before the plugin as such.
+    pub(crate) host_unread: bool,
 }
 
 /// What one exchange's answer amounted to: the frames owed to the cage, the plugin's account, and
@@ -893,11 +900,13 @@ pub(crate) fn relay_one<H: Read + Write>(
                         to_cage: Vec::new(),
                         label: answer.label,
                         secret_placed: substituted.is_some(),
+                        host_unread: false,
                     });
                 }
                 let reply = collect_reply(spec, decider, host, seq, None, marker, deadline)?;
                 return Ok(Relayed {
                     secret_placed: substituted.is_some(),
+                    host_unread: reply.refused,
                     outcome: if reply.refused {
                         Outcome::Refused {
                             with_frame: !reply.frames.is_empty(),
@@ -929,6 +938,7 @@ pub(crate) fn relay_one<H: Read + Write>(
                     to_cage: vec![bytes],
                     label: answer.label,
                     secret_placed: false,
+                    host_unread: false,
                 });
             }
             Verdict::Deny(bytes) => {
@@ -951,6 +961,7 @@ pub(crate) fn relay_one<H: Read + Write>(
                     to_cage: frame.into_iter().collect(),
                     label: answer.label,
                     secret_placed: false,
+                    host_unread: false,
                 });
             }
         }
@@ -1545,7 +1556,9 @@ fn serve_exchanges(
             },
         };
         seq += 1;
-        let (answer, ends) = match relay_one(&frame, seq, spec, decider, host, marker, cage_typed) {
+        let (answer, ends, closes) = match relay_one(
+            &frame, seq, spec, decider, host, marker, cage_typed,
+        ) {
             Ok(relayed) => {
                 // Every decision goes to the record, which is what a reader consults afterwards.
                 // What sbx *observed* decides the kind; the plugin's label is only ever a detail
@@ -1605,7 +1618,9 @@ fn serve_exchanges(
                 // protocol answers with nothing is simply followed by the next one, and treating
                 // that as an ending cuts the connection under a client that was mid-conversation.
                 let ends = matches!(relayed.outcome, Outcome::Refused { .. });
-                (relayed.to_cage, ends)
+                // A refusal on the way back left the host mid-reply: the cage is told, and the
+                // connection ends there rather than serve the next request from what is left.
+                (relayed.to_cage, ends, relayed.host_unread)
             }
             // No verdict was obtained, so nothing is forwarded. The usual cause is a plugin that
             // died or wedged, and that is not a plugin to keep asking: the refusal goes out (as
@@ -1650,6 +1665,9 @@ fn serve_exchanges(
             if !write_to_cage(&mut cage_w, spec, bytes, marker, ring, name) {
                 return Ok(());
             }
+        }
+        if closes {
+            return Ok(());
         }
     }
 }
@@ -3442,6 +3460,66 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             events[0].detail.contains("greeting") && events[0].detail.contains("do not fence"),
             "and says what was refused, with the plugin's own words: {:?}",
             events[0].detail
+        );
+    }
+
+    /// A reply the plugin refuses partway through its run ends the connection once the cage has
+    /// the refusal. The rest of that run is still in the host's stream, and the loop used to go on
+    /// to the cage's next request: its exchange read that rest as the answer, the plugin judged it
+    /// as one, and the cage was handed a frame of the run the plugin had just withheld.
+    #[test]
+    fn a_reply_refused_mid_run_ends_the_connection_before_the_next_request() {
+        let mut spec = spec(Some(b"NO".to_vec()));
+        spec.inspect_replies = true;
+
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut client = theirs;
+        write_frame(&mut client, spec.framing, b"list", false).expect("first request");
+        write_frame(&mut client, spec.framing, b"ping", false).expect("second request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+
+        let more = |verdict: Verdict, more: bool| Answer {
+            verdict,
+            expect_reply: true,
+            more,
+            label: None,
+        };
+        // The first run is refused at its second frame. The answers past that are what the loop
+        // would need to serve the next request, so a relay that went on serves it rather than
+        // failing on a plugin with nothing left to say.
+        let mut plugin = ScriptedPlugin::new(vec![
+            ScriptedPlugin::forward(),
+            more(Verdict::Forward(None), true),
+            more(Verdict::Deny(None), false),
+            ScriptedPlugin::forward(),
+            more(Verdict::Forward(None), false),
+        ]);
+        let mut host = FakeHost::with_runs(vec![
+            vec![b"KEY-A".to_vec(), b"KEY-B".to_vec(), b"END".to_vec()],
+            vec![b"PONG".to_vec()],
+        ]);
+
+        let ring = super::super::broker_control::BrokerRing::new(8);
+        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x", None)
+            .expect("served");
+
+        let mut delivered = Vec::new();
+        while let Some(frame) = read_frame(&mut client, spec.framing, spec.max_frame, false)
+            .expect("the cage reads what it was sent")
+        {
+            delivered.push(frame);
+        }
+        assert_eq!(
+            delivered,
+            vec![b"NO".to_vec()],
+            "the cage gets the refusal, then the end of the connection"
+        );
+        assert_eq!(
+            host.seen,
+            vec![b"list".to_vec()],
+            "the next request must not reach a host still holding the refused run"
         );
     }
 

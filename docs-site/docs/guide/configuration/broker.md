@@ -160,14 +160,17 @@ gpg-agent replies to `GETINFO version` with two lines (`D 2.4.8`, then `OK`), an
 commands with a run of them ending in `OK`, `ERR` or `INQUIRE`.
 
 Only something that reads the protocol can say where a run ends, so **the plugin says it**:
-it sees each reply frame and answers `more` until it recognises the terminator. That has two
+it sees each reply frame and answers `more` until it recognises the terminator. That has three
 consequences a manifest has to live with:
 
 - such a protocol needs `inspect_replies`, because a broker that never sees the replies
   cannot know when to stop reading;
 - a ceiling bounds what one exchange may take from the host resource, so a resource that
   never stops talking ends the exchange as a refusal rather than holding the cage's
-  connection open.
+  connection open;
+- a run the plugin refuses partway through ends the connection once the cage has the
+  refusal: the rest of the run is still on its way from the host, and no later exchange
+  could tell it from its own answer.
 
 Two other shapes a protocol may have, each declared by the plugin rather than guessed:
 
