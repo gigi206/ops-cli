@@ -82,9 +82,10 @@ impl<R: BufRead> BufRead for Deadlined<'_, R> {
 
 /// The most one `write` through [`Deadlined`] hands the inner writer at once.
 ///
-/// Measured on a Unix socket pair: one `send` of 4 MiB to a peer draining 64 KiB every 150 ms ran
-/// for 9 seconds under a 200 ms send timeout, every wait inside it short. A piece this size needs
-/// room once, so each call waits at most one send timeout before the budget is asked again.
+/// On a Unix socket the send timeout is applied to each wait for room, not to the call: a `send` of
+/// a large buffer to a peer that keeps draining it carries on for as long as the draining does, each
+/// wait inside it short. A piece this size needs room once, so each call waits at most one send
+/// timeout before the budget is asked again.
 const WRITE_CHUNK: usize = 16 * 1024;
 
 impl<W: Write> Write for Deadlined<'_, W> {

@@ -81,7 +81,9 @@ fn pending_port(data_dir: &Path, pid: u32, seq: u64) -> Option<u16> {
 /// requests, grouped by session (with its agent/project context); identical retries of one URL
 /// collapse to a single destination carrying the `<pid>.<seq>` id to answer it (and, in `--json`, a
 /// `count`). `--app <name>` limits the listing to that app's session(s). No launch / nix / network —
-/// it just queries the live control sockets. An empty result is a clean success (nothing is waiting).
+/// it just queries the live control sockets. An empty result is a clean success (nothing is waiting)
+/// only when every session in reach answered in full; one that did not is named, and the listing
+/// exits 1.
 pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
     let mut json = false;
     let mut app: Option<String> = None;
