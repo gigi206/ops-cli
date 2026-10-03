@@ -370,25 +370,33 @@ fn project_inside(pid: u32, project: &Path) -> Option<(u64, u64)> {
         // SAFETY: the descriptor `openat2` returned, owned from here on.
         unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }
     } else if io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
-        let mut dir = root;
-        for name in components {
-            let name = CString::new(name.as_bytes()).ok()?;
-            // SAFETY: `openat` reads the NUL-terminated component beneath the live `dir` and
-            // returns a fresh descriptor or -1; `O_NOFOLLOW` with `O_DIRECTORY` refuses a link.
-            let next =
-                unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), DIR | libc::O_NOFOLLOW) };
-            if next < 0 {
-                return None;
-            }
-            // SAFETY: the descriptor `openat` returned, owned from here on.
-            dir = unsafe { OwnedFd::from_raw_fd(next) };
-        }
-        dir
+        walk_without_links(root, &components)?
     } else {
         return None;
     };
     let meta = std::fs::File::from(dir).metadata().ok()?;
     Some((meta.dev(), meta.ino()))
+}
+
+/// The directory `components` name beneath `root`, opened one component at a time with every link
+/// refused: [`project_inside`]'s resolution on a kernel without `openat2`. A function of its own so
+/// it is exercised on a kernel that has `openat2`, where [`project_inside`] never reaches it.
+fn walk_without_links(root: OwnedFd, components: &[&std::ffi::OsStr]) -> Option<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt as _;
+    const DIR: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let mut dir = root;
+    for name in components {
+        let name = CString::new(name.as_bytes()).ok()?;
+        // SAFETY: `openat` reads the NUL-terminated component beneath the live `dir` and returns a
+        // fresh descriptor or -1; `O_NOFOLLOW` with `O_DIRECTORY` refuses a link.
+        let next = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), DIR | libc::O_NOFOLLOW) };
+        if next < 0 {
+            return None;
+        }
+        // SAFETY: the descriptor `openat` returned, owned from here on.
+        dir = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    Some(dir)
 }
 
 /// Pick the cage process from the candidates: skip any in the host user namespace (`host_userns`)
@@ -716,6 +724,32 @@ unsafe fn drop_all_capabilities() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The walk a kernel without `openat2` takes reaches the directory a real path names, the same
+    /// one by device and inode, and refuses a path any of whose components is a link, wherever the
+    /// link points.
+    #[test]
+    fn the_walk_without_openat2_follows_no_link() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = crate::testutil::TmpDir::new();
+        std::fs::create_dir_all(dir.join("work/api")).expect("a project");
+        std::os::unix::fs::symlink("work", dir.join("linked")).expect("a link to a directory");
+        let walk = |path: &[&str]| {
+            let root = std::fs::File::open(dir.path()).expect("the root");
+            let names: Vec<&std::ffi::OsStr> = path.iter().map(std::ffi::OsStr::new).collect();
+            walk_without_links(OwnedFd::from(root), &names)
+                .map(|fd| std::fs::File::from(fd).metadata().expect("its metadata"))
+        };
+
+        let reached = walk(&["work", "api"]).expect("a real path is walked");
+        let project = std::fs::metadata(dir.join("work/api")).expect("the project");
+        assert_eq!(
+            (reached.dev(), reached.ino()),
+            (project.dev(), project.ino())
+        );
+        assert!(walk(&["linked", "api"]).is_none(), "a link is refused");
+        assert!(walk(&["work", "none"]).is_none(), "a missing component");
+    }
 
     /// Build a candidate; `in_session_cage` says whether it carries the session's project mount.
     fn candidate(pid: u32, userns: Option<&str>, comm: Option<&str>, mine: bool) -> Candidate {
