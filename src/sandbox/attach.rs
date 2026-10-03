@@ -34,6 +34,13 @@
 //!   unprivileged seccomp install requires it. The intermediate process that performed the
 //!   `setns` empties its own sets the same way as soon as it has forked, so no process outlives
 //!   the join still holding what the join granted.
+//! - **the process born in the cage is not dumpable while it is still sbx.** The fork that puts it
+//!   in the cage's pid namespace leaves it running sbx's own image until its `execve`, holding the
+//!   operator's environment, sbx's descriptors and a link to sbx's binary, and every process of the
+//!   cage can name it there. The kernel lets a process of the same uid read a dumpable process's
+//!   `/proc/<pid>` entries, the cage runs as that uid, and a join into a user namespace the operator
+//!   owns leaves the flag as it was. [`enter_and_exec`] clears it before the join, the fork hands
+//!   it on, and the `execve` sets it again for the command, which holds nothing of the host's.
 //!
 //! Three residuals, all named and accepted:
 //! - **cgroup resource limits are not shared.** `setns(CLONE_NEWCGROUP)` joins the cgroup
@@ -424,6 +431,13 @@ pub(super) unsafe fn enter_and_exec(
     // fork (`cage`'s pidfd, `filters`, `argv`, `envp`), and no path leaves the block except `_exit`
     // or the `exec` in the grandchild.
     unsafe {
+        // Not dumpable from here on, which the fork below hands to the process born in the cage
+        // (module header). Before the join, because the join is what puts a process the cage can
+        // name in the cage's pid namespace; the `execve` at the end sets the flag again for the
+        // command alone.
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            libc::_exit(125);
+        }
         // One atomic join of every cage namespace we do not already share — *including* the
         // user namespace — through the pidfd. The kernel orders the user-namespace entry
         // internally so the capability to enter the mnt/net/… namespaces it owns is held at
@@ -895,6 +909,33 @@ mod tests {
         assert!(
             source.contains("libc::login_tty(slave)"),
             "and the pty arm still takes its own controlling terminal"
+        );
+    }
+
+    /// The process the join puts in the cage is not dumpable before the join, so the cage cannot
+    /// read what it still holds of sbx while it runs sbx's image (module header). Nothing on this
+    /// path is observable from a unit test without entering a cage, and the flag's absence fails
+    /// nothing else: the attach works the same with it set. So the shape is pinned against the
+    /// source: the call is made, its return decides, and it comes before the join.
+    #[test]
+    fn the_process_born_in_the_cage_is_not_dumpable_before_the_join() {
+        // The production half only: this test quotes the shapes it looks for.
+        let source = include_str!("attach.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half");
+        let cleared = source
+            .find("if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {")
+            .expect(
+                "`enter_and_exec` must clear the dumpable flag, and refuse the attach if it cannot",
+            );
+        let joined = source
+            .find("if libc::setns(pidfd, mask) != 0 {")
+            .expect("the join this test orders against");
+        assert!(
+            cleared < joined,
+            "the flag must be cleared before the join: once joined, the process is one the cage \
+             can name"
         );
     }
 

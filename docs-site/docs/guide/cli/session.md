@@ -223,7 +223,10 @@ launch `PATH` and resolve, but a tool the agent activated purely at runtime may 
 `attach` provisions nothing and reads no config: it enters namespaces the cage already built.
 The joined shell or command **re-applies the cage's confinement**: the same seccomp denylist,
 `no_new_privs`, and dropped capabilities (none of that is inherited across `setns`): so
-attaching never opens a wider hole than the agent already has. The one thing it does **not**
+attaching never opens a wider hole than the agent already has. The process that enters is also
+made non-dumpable before it joins: until the command starts it is still `sbx`, holding your
+environment and its own descriptors, and the cage's processes cannot read either through
+`/proc`. The one thing it does **not**
 share is the cage's cgroup resource limits (memory/task caps): an inspection shell runs in
 its own scope, so it is not bounded by the agent's OOM ceiling. It needs a live session; if
 the session has exited, `attach` says so (run `sbx session ls` to list live ones). Type
