@@ -1012,6 +1012,53 @@ pub(crate) fn read_log<E: Event>(socket: &Path, after: Option<u64>) -> io::Resul
 mod tests {
     use super::*;
 
+    /// No lens sanitises inside the closure it hands [`Ring::push_with`], which runs under the
+    /// ring's lock: every producer of that lens and its reader wait behind it, and a detail can be as
+    /// long as a plugin's answer line. Three lenses did, and the one that did not said why.
+    ///
+    /// Read from the sources, since a lock held longer is not something a test can see: each
+    /// `push_with(` call's closure, from its first `{` to the brace that closes it, must not name
+    /// `sanitize`. The population is checked too, so a guard that found no call passes nothing.
+    #[test]
+    fn no_lens_sanitises_under_the_ring_lock() {
+        let mut calls = 0;
+        for path in crate::testutil::crate_sources() {
+            let text = std::fs::read_to_string(&path).expect("read a source");
+            let production = crate::testutil::production_half(&text);
+            for (at, _) in production.match_indices("push_with(") {
+                let rest = &production[at..];
+                let Some(open) = rest.find('{') else { continue };
+                let mut depth = 0usize;
+                let mut end = None;
+                for (i, c) in rest[open..].char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(open + i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let body = &rest[open..end.expect("a closed closure body")];
+                // The definition itself is not a call.
+                if rest.starts_with("push_with(&self") {
+                    continue;
+                }
+                calls += 1;
+                assert!(
+                    !body.contains("sanitize"),
+                    "{}: a `push_with` closure sanitises under the ring's lock:\n{body}",
+                    path.display()
+                );
+            }
+        }
+        assert!(calls >= 5, "the guard found {calls} `push_with` calls");
+    }
+
     /// The least an event can be: a sequence number and nothing else. The ring's contract is about
     /// sequencing and eviction, so a lens's own fields would only be noise here — each lens tests
     /// that its `push` maps its arguments onto its own event.

@@ -132,11 +132,14 @@ impl SignerRing {
     /// final order, redacted and capped. It is sanitised and capped again here, on the side that owns
     /// the ring, because it arrives from the proxy, which is to run as a process of its own.
     pub(crate) fn push_detail(&self, kind: SignerKind, detail: &str) -> u64 {
-        self.0.push_with(|seq, at_epoch_ms| SignerEvent {
+        // Sanitised before rather than in here: `push_with` runs its closure under the ring's lock,
+        // which is for building the event and nothing else.
+        let detail = super::lens::sanitize_detail(detail);
+        self.0.push_with(move |seq, at_epoch_ms| SignerEvent {
             seq,
             at_epoch_ms,
             kind,
-            detail: super::lens::sanitize_detail(detail),
+            detail,
         })
     }
 }

@@ -159,11 +159,15 @@ impl BrokerRing {
             Some(l) if !l.is_empty() => format!("{broker}: {observed} — {l}"),
             _ => format!("{broker}: {observed}"),
         };
-        self.0.push_with(|seq, at_epoch_ms| BrokerEvent {
+        // Sanitised before rather than in here: `push_with` runs its closure under the ring's lock,
+        // which every broker thread and the `sbx logs` reader share, and a plugin's label can run to
+        // its answer line's ceiling.
+        let detail = super::lens::sanitize_detail(&detail);
+        self.0.push_with(move |seq, at_epoch_ms| BrokerEvent {
             seq,
             at_epoch_ms,
             kind,
-            detail: super::lens::sanitize_detail(&detail),
+            detail,
         })
     }
 }

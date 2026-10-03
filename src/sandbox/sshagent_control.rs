@@ -178,11 +178,14 @@ impl AgentRing {
                 fix: String::new(),
             });
         }
-        self.ring.push_with(|seq, at_epoch_ms| AgentEvent {
+        // Sanitised before rather than in here: `push_with` runs its closure under the ring's lock,
+        // which is for building the event and nothing else.
+        let detail = super::lens::sanitize_detail(detail);
+        self.ring.push_with(move |seq, at_epoch_ms| AgentEvent {
             seq,
             at_epoch_ms,
             kind,
-            detail: super::lens::sanitize_detail(detail),
+            detail,
         })
     }
 }
