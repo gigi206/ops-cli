@@ -546,6 +546,59 @@ impl Drop for RawMode {
     }
 }
 
+/// Open a pty pair whose two descriptors are close-on-exec from the moment they exist, sized to
+/// `size` when the real terminal has one.
+///
+/// `openpty` opens both ends without the flag, and setting it afterwards leaves a window: the
+/// supervisor runs other threads by then (the egress proxy's, the port forwarder's), and a
+/// process one of them started in that window carried a copy of the slave through its `exec`,
+/// holding the session's terminal for as long as it ran, or of the master, with the terminal's
+/// whole stream. The master comes from `posix_openpt` with the flag, and the slave from the master
+/// itself (`TIOCGPTPEER`, Linux 4.13) with the flag in the same call; a kernel without that
+/// request opens it by name instead, flag included. The child's `login_tty` puts the slave on its
+/// standard descriptors, which carry no flag, so the command keeps its terminal.
+fn open_pty_pair(size: Option<&libc::winsize>) -> io::Result<(libc::c_int, libc::c_int)> {
+    const FLAGS: libc::c_int = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: `posix_openpt` takes flags and returns a fresh descriptor or -1.
+    let master = unsafe { libc::posix_openpt(FLAGS) };
+    if master < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fail = |master: libc::c_int| {
+        let e = io::Error::last_os_error();
+        // SAFETY: the master opened above, used nowhere else; this is its only close.
+        unsafe { libc::close(master) };
+        Err(e)
+    };
+    // SAFETY: both take the master `posix_openpt` returned and nothing else.
+    if unsafe { libc::grantpt(master) } != 0 || unsafe { libc::unlockpt(master) } != 0 {
+        return fail(master);
+    }
+    // SAFETY: `TIOCGPTPEER` takes the open flags as its integer argument and returns a fresh
+    // descriptor for the master's slave, or -1.
+    let mut slave = unsafe { libc::ioctl(master, libc::TIOCGPTPEER, FLAGS) };
+    if slave < 0 {
+        let mut name = [0 as libc::c_char; 64];
+        // SAFETY: `ptsname_r` writes a NUL-terminated name of at most the length passed into the
+        // local buffer, and `open` reads that name.
+        slave = unsafe {
+            if libc::ptsname_r(master, name.as_mut_ptr(), name.len()) != 0 {
+                return fail(master);
+            }
+            libc::open(name.as_ptr(), FLAGS)
+        };
+        if slave < 0 {
+            return fail(master);
+        }
+    }
+    if let Some(size) = size {
+        // SAFETY: `TIOCSWINSZ` reads the `struct winsize` it is handed. A failure leaves the pty at
+        // its default size, which the resize relay corrects at the first `SIGWINCH`.
+        unsafe { libc::ioctl(master, libc::TIOCSWINSZ, size as *const libc::winsize) };
+    }
+    Ok((master, slave))
+}
+
 /// Open a pty, fork, and relay the terminal until the child exits — the machinery `launch::supervise` and
 /// `launch::supervise_attach` share, which is every line of the two but the child itself. Returns the
 /// child's exit code in the shell convention.
@@ -574,42 +627,14 @@ pub(super) unsafe fn fork_with_pty(
 ) -> Result<i32, PtyFailure> {
     // Carry the real terminal's window size onto the pty so the inner shell wraps correctly from
     // the start.
-    // SAFETY: all-zero is a valid `winsize` (four `c_ushort`s), and it is handed to `openpty` only
-    // on the branch where the `ioctl` below filled it.
+    // SAFETY: all-zero is a valid `winsize` (four `c_ushort`s), and it is handed to `open_pty_pair`
+    // only on the branch where the `ioctl` below filled it.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: fd 0 is the process's own stdin and `TIOCGWINSZ` takes the `struct winsize *` out-
     // param `ws` is; a stdin that is not a terminal fails with `ENOTTY` and writes nothing.
-    let winp = if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0 {
-        &ws as *const libc::winsize
-    } else {
-        std::ptr::null()
-    };
+    let size = (unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0).then_some(&ws);
 
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    // SAFETY: out-params are valid; name/termios are null (defaults), winp is null or a valid
-    // winsize.
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            winp,
-        )
-    } != 0
-    {
-        return Err(PtyFailure::BeforeFork(io::Error::last_os_error()));
-    }
-
-    // The master must never reach the sandbox. The parent keeps it (and never execs), so
-    // close-on-exec is exactly right; the slave's controlling-terminal setup is the child's.
-    // SAFETY: `master` is the descriptor `openpty` just returned and nothing has closed it; both
-    // `fcntl` commands take an integer argument rather than a pointer.
-    unsafe {
-        let flags = libc::fcntl(master, libc::F_GETFD);
-        libc::fcntl(master, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-    }
+    let (master, slave) = open_pty_pair(size).map_err(PtyFailure::BeforeFork)?;
 
     // SAFETY: the child branch below runs only `close` and the caller's closure, whose contract is
     // the async-signal-safety this function documents.
@@ -617,7 +642,7 @@ pub(super) unsafe fn fork_with_pty(
     if pid < 0 {
         let e = io::Error::last_os_error();
         // SAFETY: `fork` failed, so no second process shares them: `master` and `slave` are the
-        // pair `openpty` returned and this is their only close.
+        // pair `open_pty_pair` returned and this is their only close.
         unsafe {
             libc::close(master);
             libc::close(slave);
@@ -646,8 +671,8 @@ pub(super) unsafe fn fork_with_pty(
         Err(e) => {
             // The child is running and nothing will relay its terminal: stop it as a force-quit
             // does, and reap it, rather than leave a cage on a pty no one reads.
-            // SAFETY: the parent has held `master` since `openpty` and nothing reads it now; this
-            // is its only close.
+            // SAFETY: the parent has held `master` since `open_pty_pair` and nothing reads it now;
+            // this is its only close.
             unsafe { libc::close(master) };
             let _ = terminate_and_reap(pid);
             return Err(PtyFailure::AfterFork(e));
@@ -657,17 +682,17 @@ pub(super) unsafe fn fork_with_pty(
     // the real controlling terminal (only the child `setsid`'d, via `login_tty` or the attach
     // entry), so it receives `SIGWINCH` from the launching terminal naturally; the handler wakes
     // `pump` to copy the new size onto the pty master. Best effort: if it cannot be installed the
-    // session still runs, only without dynamic resize (the startup size is already set by
-    // `openpty`).
+    // session still runs, only without dynamic resize (the startup size is already set when
+    // the pair was opened).
     let winch = WinchRelay::install().ok();
     if winch.is_some() {
-        // Close a resize that raced startup (between `openpty` and now).
+        // Close a resize that raced startup (between opening the pair and now).
         copy_winsize(0, master);
     }
     let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
     let status = pump(master, pid, winch_fd, gui);
     drop(winch);
-    // SAFETY: the parent has held `master` since `openpty` and `pump` has returned, so nothing is
+    // SAFETY: the parent has held `master` since `open_pty_pair` and `pump` has returned, so nothing is
     // still reading it; this is its only close.
     unsafe { libc::close(master) };
     status.map_err(PtyFailure::AfterFork)
@@ -1166,6 +1191,44 @@ mod tests {
         let total = reader.join().expect("the reader");
         assert!(written.is_ok(), "the write gave up: {written:?}");
         assert!(total >= 65536, "the reader got {total} bytes");
+    }
+
+    /// Both ends of the pty are close-on-exec as they are opened, and they are one terminal: what
+    /// the slave writes, the master reads.
+    #[test]
+    fn the_pty_pair_is_close_on_exec_from_its_opening() {
+        let (master, slave) = open_pty_pair(None).expect("a pty pair");
+        // SAFETY: `F_GETFD` takes no argument and reads the descriptor's flags.
+        let flags = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let line = b"ping\n";
+        let mut read = [0u8; 16];
+        // SAFETY: the pair just opened, and local buffers of the lengths passed.
+        let got = unsafe {
+            libc::write(slave, line.as_ptr().cast(), line.len());
+            libc::read(master, read.as_mut_ptr().cast(), read.len())
+        };
+        let (master_flags, slave_flags) = (flags(master), flags(slave));
+        // SAFETY: the pair this test opened, used nowhere else.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        assert_ne!(
+            master_flags & libc::FD_CLOEXEC,
+            0,
+            "the master is close-on-exec"
+        );
+        assert_ne!(
+            slave_flags & libc::FD_CLOEXEC,
+            0,
+            "the slave is close-on-exec"
+        );
+        assert!(got > 0, "the master reads what the slave wrote");
+        assert!(
+            read.starts_with(b"ping"),
+            "{:?}",
+            &read[..got.max(0) as usize]
+        );
     }
 
     #[test]
