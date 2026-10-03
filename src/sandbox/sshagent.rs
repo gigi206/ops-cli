@@ -731,6 +731,9 @@ pub(crate) fn serve(
     confirm: Option<Arc<Confirmer>>,
 ) {
     let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
+    // What a refusal at the ceiling is recorded as, and when ([`super::conncap::Refusals`]).
+    const CEILING: &str = "broker's concurrency ceiling";
+    let mut refusals = super::conncap::Refusals::new();
     for conn in listener.incoming() {
         let conn = match conn {
             Ok(c) => c,
@@ -743,13 +746,22 @@ pub(crate) fn serve(
         };
         let Some(slot) = cap.take() else {
             // A connection refused for want of a thread is a fact about the session, not about the
-            // request: without this line the client simply sees the socket close.
-            ring.push(
-                AgentKind::Refuse,
-                "a connection beyond the broker's concurrency ceiling",
-            );
+            // request: without this line the client simply sees the socket close. Counted rather
+            // than written once per refusal, since a refusal costs the caller nothing.
+            if let Some(n) = refusals.refused(std::time::Instant::now()) {
+                ring.push(
+                    AgentKind::Refuse,
+                    &super::conncap::Refusals::line(n, CEILING),
+                );
+            }
             continue;
         };
+        if let Some(n) = refusals.served() {
+            ring.push(
+                AgentKind::Refuse,
+                &super::conncap::Refusals::line(n, CEILING),
+            );
+        }
         let host_sock = host_sock.clone();
         let filter = filter.clone();
         let ring = ring.clone();

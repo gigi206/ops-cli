@@ -356,3 +356,7 @@ the **policy's** layer, since the socket is always the global config's.
   concurrency ceiling, and one that could not be served at all because it said nothing in
   time, the plugin did not start or declined, the host resource could not be reached, or the
   plugin could not rule on its greeting. The plugin's words in that reason are sanitised and cut short there as well.
+  Refusals past the ceiling cost the caller nothing, so they are counted rather than written
+  one by one: the first of a run, then one line every ten seconds saying how many it covers,
+  and what is left when a connection is next served. The ssh-agent broker counts its own the
+  same way.

@@ -21,6 +21,9 @@
 //!
 //! A plane whose connections each start something costly host-side also needs a pace, since the
 //! ceiling bounds how many live at once and not how fast they turn over: [`Pacer`].
+//!
+//! A loop that records its refusals at the ceiling needs one more rule, because a refusal costs the
+//! caller nothing: [`Refusals`], which turns a run of them into a line per interval.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -145,6 +148,63 @@ impl Drop for ConnSlot {
     }
 }
 
+/// How often a loop records the connections it refuses at its ceiling while they keep coming.
+pub(super) const REFUSALS_EVERY: Duration = Duration::from_secs(10);
+
+/// When a loop records a connection refused at its ceiling: the first of a run, then at most one
+/// line per [`REFUSALS_EVERY`] carrying how many it covers, and whatever is left unsaid when a
+/// connection is next served.
+///
+/// A refusal at the ceiling costs the caller nothing, no plugin start, no read, so one line per
+/// refusal was an event source a cage could drive as fast as it could connect. The record keeps
+/// what fits, a bounded ring and a file that closes at its cap: a loop of `connect()` evicted every
+/// real decision from the ring in under a second, and then filled the file, after which the
+/// decisions that followed were written nowhere. Counted, the same run costs a line per interval,
+/// and the count still says how hard the ceiling was pushed.
+///
+/// The instant is passed in, so the arithmetic is tested without sleeping.
+pub(super) struct Refusals {
+    /// When a line was last recorded for a refusal; `None` before the first.
+    said_at: Option<Instant>,
+    /// Refusals since that line, not yet recorded.
+    unsaid: u64,
+}
+
+impl Refusals {
+    pub(super) fn new() -> Self {
+        Self {
+            said_at: None,
+            unsaid: 0,
+        }
+    }
+
+    /// One refusal at `now`: `Some(n)` when a line is due, `n` the refusals it covers, itself
+    /// included; `None` when it is counted for a later line.
+    pub(super) fn refused(&mut self, now: Instant) -> Option<u64> {
+        self.unsaid += 1;
+        if let Some(at) = self.said_at
+            && now.saturating_duration_since(at) < REFUSALS_EVERY
+        {
+            return None;
+        }
+        self.said_at = Some(now);
+        Some(std::mem::take(&mut self.unsaid))
+    }
+
+    /// A connection served: the refusals still unsaid, if any, to record now that the run is over.
+    pub(super) fn served(&mut self) -> Option<u64> {
+        (self.unsaid > 0).then(|| std::mem::take(&mut self.unsaid))
+    }
+
+    /// What a line covering `n` refusals says, naming the loop's own ceiling (`what`).
+    pub(super) fn line(n: u64, what: &str) -> String {
+        match n {
+            1 => format!("a connection beyond the {what}"),
+            n => format!("{n} connections beyond the {what}, counted since the last such line"),
+        }
+    }
+}
+
 /// How fast an accept loop lets connections through, for a plane where each one starts something
 /// costly host-side: `burst` back to back, then one per `every`. A token bucket.
 ///
@@ -205,6 +265,76 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run of refusals at the ceiling is recorded as its first, then one line per interval with
+    /// the count it covers, and what is left unsaid comes out when a connection is next served.
+    #[test]
+    fn refusals_at_the_ceiling_are_counted_rather_than_written_one_by_one() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut refusals = Refusals::new();
+        assert_eq!(
+            refusals.refused(t0),
+            Some(1),
+            "the first of a run is recorded"
+        );
+        for i in 1..1000 {
+            assert_eq!(refusals.refused(t0 + ms(i)), None, "refusal {i} is counted");
+        }
+        assert_eq!(
+            refusals.refused(t0 + REFUSALS_EVERY),
+            Some(1000),
+            "one line per interval, covering every refusal since the last"
+        );
+        assert_eq!(
+            refusals.served(),
+            None,
+            "nothing is left unsaid after a line"
+        );
+        assert_eq!(refusals.refused(t0 + REFUSALS_EVERY + ms(1)), None);
+        assert_eq!(refusals.refused(t0 + REFUSALS_EVERY + ms(2)), None);
+        assert_eq!(
+            refusals.served(),
+            Some(2),
+            "the rest of a run is said when it is over"
+        );
+        assert_eq!(refusals.served(), None);
+        assert_eq!(
+            Refusals::line(1, "broker's concurrency ceiling"),
+            "a connection beyond the broker's concurrency ceiling"
+        );
+        assert!(
+            Refusals::line(7, "broker's concurrency ceiling")
+                .starts_with("7 connections beyond the broker's concurrency ceiling")
+        );
+    }
+
+    /// Both loops that record a refusal at their ceiling count it through [`Refusals`], on the
+    /// refusal and on the next connection served: a loop back to one line per refusal is the event
+    /// source the type exists to close.
+    #[test]
+    fn every_loop_that_records_a_ceiling_refusal_counts_it() {
+        for (file, source) in [
+            (
+                "broker.rs",
+                crate::testutil::production_half(include_str!("broker.rs")),
+            ),
+            (
+                "sshagent.rs",
+                crate::testutil::production_half(include_str!("sshagent.rs")),
+            ),
+        ] {
+            let refused = source.matches("refusals.refused(").count();
+            let served = source.matches("refusals.served()").count();
+            let written = source.matches("\"a connection beyond the").count();
+            assert_eq!(
+                (refused, served, written),
+                (1, 1, 0),
+                "{file}: a refusal at the ceiling goes through `Refusals`, and no line is \
+                 written for one directly"
+            );
+        }
+    }
 
     /// The ceiling admits exactly `max`, and a slot given back is a slot another caller can take.
     #[test]

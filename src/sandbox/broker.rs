@@ -1913,6 +1913,9 @@ pub(crate) fn start(
             PLUGIN_START_EVERY,
             std::time::Instant::now(),
         );
+        // What a refusal at the ceiling is recorded as, and when ([`super::conncap::Refusals`]).
+        const CEILING: &str = "broker's concurrency ceiling";
+        let mut refusals = super::conncap::Refusals::new();
         for conn in listener.incoming() {
             let conn = match conn {
                 Ok(c) => c,
@@ -1930,15 +1933,25 @@ pub(crate) fn start(
                 // A connection refused for want of a thread is a fact about the session, not about
                 // the request: without this line the client simply sees the socket close and the
                 // pressure that produced it appears nowhere. The ssh-agent broker beside this one
-                // records the same refusal for the same reason.
+                // records the same refusal for the same reason, counted the same way.
+                if let Some(n) = refusals.refused(std::time::Instant::now()) {
+                    ring.push(
+                        super::broker_control::BrokerKind::Refuse,
+                        &plugin.name,
+                        &super::conncap::Refusals::line(n, CEILING),
+                        None,
+                    );
+                }
+                continue;
+            };
+            if let Some(n) = refusals.served() {
                 ring.push(
                     super::broker_control::BrokerKind::Refuse,
                     &plugin.name,
-                    "a connection beyond the broker's concurrency ceiling",
+                    &super::conncap::Refusals::line(n, CEILING),
                     None,
                 );
-                continue;
-            };
+            }
             let (bwrap, plugin, allow, host_socket, ring, secret) = (
                 bwrap.clone(),
                 plugin.clone(),
