@@ -924,7 +924,7 @@ mod tests {
                 libc::dup(1)
             };
             let (master, slave) = (pair[0], pair[1]);
-            // SAFETY: the child runs only `close`, `write`, `pause` and `_exit`, all
+            // SAFETY: the child runs only `close`, `write`, `sleep` and `_exit`, all
             // async-signal-safe, on descriptors and a local array prepared before the fork.
             let child = unsafe { libc::fork() };
             assert!(child >= 0, "fork failed");
@@ -937,9 +937,11 @@ mod tests {
                     libc::close(master);
                     let line = b"a line nobody will read\n";
                     libc::write(slave, line.as_ptr().cast(), line.len());
-                    loop {
-                        libc::pause();
-                    }
+                    // Bounded, and past the harness's own limit: when a relay never stops it, the
+                    // harness ends this process and not its fork, which would otherwise wait on
+                    // for good.
+                    libc::sleep(60);
+                    libc::_exit(0);
                 }
             }
             // SAFETY: this side's copy of the slave, and the pipe: its read end closed so a write
@@ -1003,14 +1005,16 @@ mod tests {
                 previous
             };
             let child = move |_slave: libc::c_int| -> std::convert::Infallible {
-                // SAFETY: `getpid`, `write` and `pause` are async-signal-safe, and the bytes are a
-                // local array; nothing here allocates.
+                // SAFETY: `getpid`, `write`, `sleep` and `_exit` are async-signal-safe, and the
+                // bytes are a local array; nothing here allocates.
                 unsafe {
                     let pid = libc::getpid().to_ne_bytes();
                     libc::write(write_fd, pid.as_ptr().cast(), pid.len());
-                    loop {
-                        libc::pause();
-                    }
+                    // Bounded, and past the harness's own limit: when nothing stops it, the
+                    // harness ends this process and not its fork, which would otherwise wait on
+                    // for good.
+                    libc::sleep(60);
+                    libc::_exit(0)
                 }
             };
             // SAFETY: the child above honours the async-signal-safe contract and never returns.
