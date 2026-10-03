@@ -2813,18 +2813,19 @@ pub(super) fn build(
     // The `[fs]` masks, staged and bound over the project paths they close.
     let fs = stage_fs_masks(prep, project_writable, &mut extra_binds)?;
 
-    // Pin sbx's own control plane in place whenever a read-write bind contains it: each root's host
-    // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
-    // code cannot rename a writable parent to move a control-plane root aside and recreate a forged
-    // one at the same path — which sbx would otherwise read or `execve` on its next run. The leaf is
-    // bound from an empty decoy rather than from itself: frozen in place, it shows the cage nothing
-    // of what lives under it, the control sockets of every session included, which a read-only
-    // bind would leave open to `connect()`. A root the project or a bind lies in is bound from
-    // itself instead (`pin_shows_itself`). The bind stays read-write; only these specific host
-    // paths are protected. Emitted after the structural
-    // mounts — the containing read-write bind has to be in place before the pin lands on it. Binds
-    // are appended after this block (the task control plane below); the rule they have to respect
-    // is stated on `control_plane_pins`, and it is about their destination, not their position.
+    // Pin sbx's own control plane in place whenever a bind or the project contains it: each root's
+    // host path is frozen as a mountpoint chain (read-write intermediates where the cage writes, a
+    // read-only leaf), so in-cage code cannot rename a writable parent to move a control-plane root
+    // aside and recreate a forged one at the same path — which sbx would otherwise read or `execve`
+    // on its next run. The leaf is bound from an empty decoy rather than from itself: frozen in
+    // place, it shows the cage nothing of what lives under it, the control sockets of every session
+    // included, which a read-only bind would leave open to `connect()`. That is why a read-only bind
+    // that contains a root pins it too. A root the project or a bind lies in is bound from itself
+    // instead (`pin_shows_itself`). A read-write bind stays read-write; only these specific host
+    // paths are protected. Emitted after the structural mounts — the containing bind has to be in
+    // place before the pin lands on it. Binds are appended after this block (the task control plane
+    // below); the rule they have to respect is stated on `control_plane_pins`, and it is about their
+    // destination, not their position.
     //
     // The `[fs]` binds are the one set already emitted *above* this point whose destinations are
     // project paths rather than sbx's own constants, and the pin chain can run straight through or
@@ -2862,11 +2863,11 @@ pub(super) fn build(
     {
         Ok(pins) => extra_binds.extend(pins_clear_of_masks(pins, &fs.masks, &fs.binds)),
         Err(e) => {
-            // Fail closed: if a pin cannot be established the containing read-write bind would be
-            // unprotected, so abort the launch rather than run with a gap. An extreme case — a
-            // mkdir failing in sbx's own data/config tree.
+            // Fail closed: if a pin cannot be established the containing bind would leave the root
+            // open, so abort the launch rather than run with a gap. An extreme case — a mkdir
+            // failing in sbx's own data/config tree.
             crate::diag::error(&format!(
-                "sbx: cannot protect sbx's control plane ({e}) — a read-write bind contains it"
+                "sbx: cannot protect sbx's control plane ({e}) — a bind or the project contains it"
             ));
             return Err(ExitCode::FAILURE);
         }

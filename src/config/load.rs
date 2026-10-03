@@ -456,16 +456,18 @@ fn root_at_or_above<'a>(canon: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBu
     roots.iter().find(|r| canon.starts_with(r))
 }
 
-/// The mountpoint-chain pins that protect sbx's control plane from path substitution when a
-/// read-write bind strictly contains it. Without them a read-write ancestor bind lets in-cage code
-/// rename a writable parent directory to move a control-plane root aside and recreate a forged one
-/// at the same host path — which sbx would then read or `execve` on its next run. Each root is
-/// pinned by making every path component below the containing bind a mountpoint (a mountpoint
-/// cannot be renamed or removed — the kernel refuses with `EBUSY`): the intermediates read-write
-/// (the rest of the tree stays writable), the root itself read-only (its host contents cannot be
-/// written through, and the launcher binds it from an empty decoy so they cannot be read or reached
-/// either: the root holds every session's control sockets. A root a bind or the project lies inside
-/// is bound from itself instead, read-only, since the decoy would cover what was asked for).
+/// The mountpoint-chain pins that protect sbx's control plane when a bind strictly contains it: from
+/// path substitution under a read-write bind, from being read under either. Without them a
+/// read-write ancestor bind lets in-cage code rename a writable parent directory to move a
+/// control-plane root aside and recreate a forged one at the same host path — which sbx would then
+/// read or `execve` on its next run. Each root is pinned by making every path component below the
+/// containing bind a mountpoint (a mountpoint cannot be renamed or removed — the kernel refuses with
+/// `EBUSY`): the intermediates read-write (the rest of the tree stays writable), the root itself
+/// read-only (its host contents cannot be written through, and the launcher binds it from an empty
+/// decoy so they cannot be read or reached either: the root holds every session's control sockets.
+/// A root a bind or the project lies inside is bound from itself instead, read-only, since the
+/// decoy would cover what was asked for). Under a read-only bind nothing can be renamed, and the
+/// root alone is pinned.
 ///
 /// Returns those mounts as host paths, deduplicated and ordered
 /// shallow-to-deep so a parent mountpoint is always established before its child — a child bound
@@ -505,10 +507,18 @@ fn control_plane_pins_for(binds: &[Bind], roots: &[PathBuf]) -> Vec<Bind> {
     // recorded as a read-write intermediate on the way to the inner one and then skipped as
     // already seen, leaving the directory sbx trusts by location writable from the cage. Sorting
     // also keeps the parent-before-child order the mount sequence needs.
-    let mut roots: Vec<&PathBuf> = roots.iter().collect();
-    roots.sort();
-    for bind in binds.iter().filter(|b| b.writable) {
-        for root in roots
+    let mut sorted: Vec<&PathBuf> = roots.iter().collect();
+    sorted.sort();
+    // Every bind that contains a root, whatever its mode. A read-only one shows the cage what the
+    // root holds, the control sockets of every session among it, so its roots are pinned to be
+    // bound from the decoy; it needs no intermediates (`writable_through`), so it gets its roots
+    // alone. A bind at or under a root is left out: it is control plane itself, mounted read-only
+    // with what it covers, which is the residual the security model names.
+    for bind in binds
+        .iter()
+        .filter(|b| root_at_or_above(&b.path, roots).is_none())
+    {
+        for root in sorted
             .iter()
             .copied()
             .filter(|r| r.starts_with(&bind.path) && r.as_path() != bind.path)
@@ -3472,15 +3482,88 @@ mod tests {
             control_plane_pins_for(&under, &roots).is_empty(),
             "a bind under a root pins nothing"
         );
+    }
 
-        // A read-only ancestor bind pins nothing (only a read-write bind needs the protection).
+    /// A read-only bind that contains a root pins the root alone, read-only, for the launcher to
+    /// bind from the decoy: mounted read-only, the root still showed what it holds, the control
+    /// sockets of every session among it. Nothing under a read-only bind can be renamed, so it
+    /// pins no intermediate.
+    #[test]
+    fn a_read_only_bind_pins_its_roots_alone() {
+        let roots = vec![
+            PathBuf::from("/home/u/.local/share/sbx"),
+            PathBuf::from("/home/u/.config/sbx"),
+        ];
         let ro = vec![Bind {
             path: PathBuf::from("/home/u"),
             writable: false,
         }];
+        let pins = control_plane_pins_for(&ro, &roots);
+        let mut expected: Vec<Bind> = roots
+            .iter()
+            .map(|r| Bind {
+                path: r.clone(),
+                writable: false,
+            })
+            .collect();
+        expected.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(pins, expected);
+    }
+
+    /// A read-only bind at a root is control plane itself and pins nothing, a root nested inside it
+    /// included: it shows what it covers, the residual the security model names.
+    #[test]
+    fn a_read_only_bind_at_a_root_pins_nothing() {
+        let roots = vec![
+            PathBuf::from("/home/u/.config/sbx"),
+            PathBuf::from("/home/u/.config/sbx/trusted"),
+        ];
+        let at = vec![Bind {
+            path: PathBuf::from("/home/u/.config/sbx"),
+            writable: false,
+        }];
         assert!(
-            control_plane_pins_for(&ro, &roots).is_empty(),
-            "a read-only bind pins nothing"
+            control_plane_pins_for(&at, &roots).is_empty(),
+            "{:?}",
+            control_plane_pins_for(&at, &roots)
         );
+    }
+
+    /// A root a read-only and a read-write bind both contain is pinned once, after its ancestors,
+    /// and the directories the read-write bind makes writable keep their pins.
+    #[test]
+    fn a_root_under_a_read_only_and_a_read_write_bind_is_pinned_once() {
+        let roots = vec![PathBuf::from("/home/u/.local/share/sbx")];
+        let binds = vec![
+            Bind {
+                path: PathBuf::from("/home/u"),
+                writable: false,
+            },
+            Bind {
+                path: PathBuf::from("/home/u/.local"),
+                writable: true,
+            },
+        ];
+        let pins = control_plane_pins_for(&binds, &roots);
+        assert_eq!(
+            pins.iter()
+                .filter(|p| p.path == roots[0])
+                .collect::<Vec<_>>(),
+            vec![&Bind {
+                path: roots[0].clone(),
+                writable: false,
+            }],
+            "{pins:?}"
+        );
+        assert!(
+            pins.iter()
+                .any(|p| p.path == Path::new("/home/u/.local/share") && p.writable),
+            "{pins:?}"
+        );
+        assert!(
+            pins.iter().all(|p| p.path != Path::new("/home/u")),
+            "{pins:?}"
+        );
+        assert_ancestors_first(&pins);
     }
 }

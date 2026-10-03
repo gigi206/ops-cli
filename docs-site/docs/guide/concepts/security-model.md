@@ -131,6 +131,10 @@ handled fail-closed and warned about; see [`binds`](../configuration/binds).)
   cannot alter what `sbx` runs or trusts, nor reach what those directories hold: the
   control sockets of every running session, the other projects' homes, the trust
   markers. Launching from your home (`cd ~ && sbx run`) is this case.
+- A **read-only** bind that contains them (e.g. a read-only bind of your whole home,
+  for your dotfiles) shows each of `sbx`'s roots empty the same way. Nothing under
+  it can be renamed, so the roots are the only paths pinned. A read-write directory
+  you bind inside it keeps its own pins.
 - The **project itself** follows the same rule. The working directory you launch
   from is bound read-write without being declared anywhere, so running from one of
   `sbx`'s own directories is the same request as a read-write bind over it. It is
@@ -150,11 +154,9 @@ for the details and [The trust gate](trust) for why it matters.
 The two read-only cases above keep what they show: a bind aimed at or inside one of
 `sbx`'s directories, or a launch from inside one, shows what it covers read-only with
 its contents, sockets included, and a read-only mount does not stop a process from
-connecting to a socket. When a broad read-write bind also contains that directory,
-the pin shows the whole directory the same way rather than hide what you asked for.
-A read-only bind that contains one of `sbx`'s directories, such as a read-only bind
-of your whole home, shows it with its contents as well. None of these is something
-to do with an agent you do not trust.
+connecting to a socket. When a broader bind also contains that directory, the pin
+shows the whole directory the same way rather than hide what you asked for. Neither
+is something to do with an agent you do not trust.
 
 ## What the trust gate protects
 

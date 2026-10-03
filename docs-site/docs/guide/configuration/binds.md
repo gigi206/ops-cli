@@ -152,6 +152,9 @@ still lands correctly inside it.
   projects' state those directories hold. A root that another bind, or the project,
   lies inside is shown with its contents instead, read-only, so what you asked for
   is still there.
+- A **read-only** bind that contains them (e.g. your whole `$HOME`, read-only)
+  shows each `sbx` root empty the same way, pinned alone: nothing under a
+  read-only bind can be renamed.
 - The **project itself** follows the same rule. The working directory you launch
   from is bound read-write without being declared anywhere, so running from one of
   `sbx`'s own directories is the same request as a read-write bind over it. It is
