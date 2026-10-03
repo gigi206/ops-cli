@@ -560,7 +560,9 @@ a foreground session, through a terminal or in `sbx session logs`. Your terminal
 bytes, not sbx. What the egress proxy writes to its standard error is not among them: the
 supervisor relays it a line at a time, with control characters and the characters that
 reorder a line replaced, to the terminal of a foreground session or to the log of a detached
-one. sbx's own diagnostics (the `sbx: …` lines on standard error) quote values sbx did not
+one. The capture tap's standard error is a pipe of its own rather than the session's terminal;
+when the tap does not come up, what it wrote there is quoted, cleaned the same way, in the
+warning that says so. sbx's own diagnostics (the `sbx: …` lines on standard error) quote values sbx did not
 write, such as a path the cage chose, a program's error output or a file a project names; each
 is printed with its control characters and its characters that reorder a line written as
 escapes such as `\x1b`. A line break is kept, so a value that carries one can still start a

@@ -110,7 +110,7 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 /// # What now depends on this, and why it must not be narrowed
 ///
 /// It began as the exec lens's own and is now the crate's one answer to a value the cage chooses.
-/// Eight sinks reach it, and on each one it is the only filter between a name the cage picked and a
+/// Nine sinks reach it, and on each one it is the only filter between a name the cage picked and a
 /// line somebody reads:
 ///
 /// - [`command_of`], for the exec feed's inline stderr echo;
@@ -127,6 +127,8 @@ pub(crate) const SANITIZED_CHARS: usize = 512;
 ///   the confirmation prompt;
 /// - `crate::observe`, outside this module through the [`super::sanitize`] re-export, for the
 ///   `sbx proc ls` tree;
+/// - `netns::tap_said`, for what the capture tap's cage wrote to its standard error, quoted in the
+///   warning that the tap did not come up;
 /// - and [`relay_lines`], for the caged egress proxy's standard error (`proxy::child`) and the task
 ///   tool pool's install cage (`taskpool`), which write to the supervisor's terminal or session log
 ///   without a parser in between.

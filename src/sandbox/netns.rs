@@ -317,7 +317,11 @@ fn wire_tap(tap: &TapWiring) {
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            return degraded(&format!("the capture tap did not come up ({e})"));
+            let said = match tap_said(&mut child) {
+                said if said.is_empty() => said,
+                said => format!("; it said: {said}"),
+            };
+            return degraded(&format!("the capture tap did not come up ({e}{said})"));
         }
     }
     if let Err(e) = super::nettap::install_redirect(&tap.nft) {
@@ -340,7 +344,7 @@ fn wire_tap(tap: &TapWiring) {
     }
 }
 
-/// Start the tap in its cage, its stdout piped for the line that says it serves.
+/// Start the tap in its cage, with the standard streams [`tap_stdio`] gives it.
 fn start_tap(tap: &TapWiring) -> io::Result<std::process::Child> {
     use std::os::fd::AsRawFd;
     let (binary, copy) = super::selfcage::running()?;
@@ -349,14 +353,22 @@ fn start_tap(tap: &TapWiring) -> io::Result<std::process::Child> {
     // secrets in it, without the flag, for the exec of the cage's bubblewrap that follows: the tap
     // is handed its own files and none of those.
     let mut cmd = super::selfcage::command(&tap.bwrap, &spec, binary)?.into_command_alone();
-    let child = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .pre_exec_pdeathsig()
-        .spawn();
+    let child = tap_stdio(&mut cmd).pre_exec_pdeathsig().spawn();
     // Read by bwrap by now, or never; closed here, so none reaches the cage this process becomes.
     drop(cmd);
     child
+}
+
+/// The tap's standard streams, none of them this process's: in a launch on a terminal, this
+/// process's are already the cage's terminal, which the tap has no business reading or writing.
+/// Standard input is empty, standard output is the pipe it says it serves on, and standard error is
+/// a pipe whose words reach the person only when the tap does not come up, inside the warning that
+/// says so ([`tap_said`]). Once this process becomes the cage the pipe's reading end is gone, and
+/// anything the tap writes there later is dropped.
+fn tap_stdio(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
 }
 
 /// Where the tap's cage binds the egress socket.
@@ -433,6 +445,62 @@ fn tap_is_ready(child: &mut std::process::Child) -> std::io::Result<()> {
         Err(_) => Err(std::io::Error::other("timed out")),
     }
 }
+
+/// What the tap wrote to its standard error, for the warning that says it did not come up: its own
+/// reason, such as a port already taken or a filter that did not install, or its cage's. Read once
+/// the tap has been stopped, and for [`TAP_SAID_WAIT`] at most, since a process of its cage that
+/// outlived it would hold the pipe open; whatever arrived by then is what is said, one line after
+/// another with the characters that could rewrite the warning taken out.
+fn tap_said(child: &mut std::process::Child) -> String {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    {
+        let heard = Arc::clone(&heard);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let mut heard = match heard.lock() {
+                    Ok(heard) => heard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let room = TAP_SAID_MAX.saturating_sub(heard.len());
+                heard.extend_from_slice(&chunk[..n.min(room)]);
+                if n >= room {
+                    break;
+                }
+            }
+            drop(done);
+        });
+    }
+    let _ = finished.recv_timeout(TAP_SAID_WAIT);
+    let heard = match heard.lock() {
+        Ok(heard) => heard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    String::from_utf8_lossy(&heard)
+        .lines()
+        .map(super::observe_feed::sanitize)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// How much of the tap's standard error [`tap_said`] keeps: a reason, not a transcript.
+const TAP_SAID_MAX: usize = 4096;
+
+/// How long [`tap_said`] waits for the tap's standard error to close.
+const TAP_SAID_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long the holder waits for the tap to report it serves: its cage started, its three loopback
 /// sockets bound and its filter installed. Far above what that costs; it bounds a tap that hangs on
@@ -772,6 +840,54 @@ fn die(code: i32, msg: &str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tap holds none of this process's standard streams, which in a launch on a terminal are
+    /// the cage's terminal: its standard error is a pipe of its own. What it wrote there, its reason
+    /// for not coming up, is quoted in the warning one line after another, with the characters that
+    /// could rewrite that warning taken out.
+    #[test]
+    fn the_tap_writes_to_a_pipe_of_its_own_and_its_reason_is_quoted() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            "printf 'bwrap: \\033[2Jcleared\\n__net-tap: Address already in use\\n' >&2; exit 1",
+        ]);
+        let mut child = tap_stdio(&mut cmd).spawn().expect("spawn a stand-in tap");
+        assert!(
+            child.stdin.is_none(),
+            "standard input is empty, not this process's"
+        );
+        assert!(
+            child.stdout.is_some(),
+            "standard output is the readiness pipe"
+        );
+        assert!(
+            child.stderr.is_some(),
+            "standard error is a pipe, not this process's"
+        );
+        let _ = child.wait();
+        assert_eq!(
+            tap_said(&mut child),
+            "bwrap:  [2Jcleared; __net-tap: Address already in use"
+        );
+    }
+
+    /// A process of the tap's cage that outlives it holds the pipe open, and the launch does not wait
+    /// on it: what arrived before the wait ran out is what is quoted.
+    #[test]
+    fn a_pipe_held_open_by_a_survivor_is_read_for_a_moment_only() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo 'said before it went' >&2; sleep 3 & exit 1"]);
+        let mut child = tap_stdio(&mut cmd).spawn().expect("spawn a stand-in tap");
+        let _ = child.wait();
+        let started = std::time::Instant::now();
+        assert_eq!(tap_said(&mut child), "said before it went");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "bounded by TAP_SAID_WAIT, not by the survivor: {:?}",
+            started.elapsed()
+        );
+    }
 
     /// Whether `needle` appears as a contiguous run in `haystack`.
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
