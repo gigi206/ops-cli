@@ -4224,10 +4224,10 @@ mod tests {
     /// What is asserted is the canary, not the removal's result: a removal raced this way may fail,
     /// and failing is not escaping.
     ///
-    /// Each trial starts the removal only once the swapper has exchanged the two names in it.
-    /// Started first, the removal can unlink one of them before that first exchange, which the order
-    /// a directory lists its entries in decides, and the trial then races nothing. A filesystem that
-    /// refuses `RENAME_EXCHANGE` is named rather than passed for want of a race.
+    /// Each trial starts the removal only once the swapper has exchanged the two names in it:
+    /// started first, the removal can unlink one of them before that first exchange, which the
+    /// order a directory lists its entries in decides, and the trial then races nothing. A
+    /// filesystem that refuses `RENAME_EXCHANGE` is named rather than passed for want of a race.
     #[test]
     fn a_directory_swapped_for_a_link_mid_removal_does_not_carry_it_out_of_the_tree() {
         use std::os::unix::ffi::OsStrExt;
