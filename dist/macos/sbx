@@ -25,6 +25,12 @@ if ! command -v "$LIMACTL" >/dev/null 2>&1; then
   exit 1
 fi
 
+# The directory as the disk spells it, which is how the guest has to be told. A Mac volume ignores
+# case by default, so `cd ~/projects` enters `~/Projects` and leaves the lowercase spelling in
+# `$PWD`, while the guest's view of the mount is case sensitive and has only the other one. The
+# `pwd -P` built into `/bin/sh` (bash) keeps the spelling it was given; `/bin/pwd` asks the kernel.
+here=$(/bin/pwd -P 2>/dev/null) || here=$PWD
+
 # `limactl shell` errors out on a stopped instance unless it is told otherwise, and it only asks
 # interactively when it has a tty. `--start` is what makes a stopped guest a warm one rather
 # than an error, and it is the whole of the friction this wrapper exists to remove.
@@ -90,4 +96,4 @@ exec "$LIMACTL" shell --start "$SBX_LIMA_INSTANCE" sh -c '
   fi
 
   exec sbx "$@"
-' _ "$PWD" "$SBX_LIMA_STALE_DAYS" "$SBX_LIMA_INSTANCE" "$@"
+' _ "$here" "$SBX_LIMA_STALE_DAYS" "$SBX_LIMA_INSTANCE" "$@"
