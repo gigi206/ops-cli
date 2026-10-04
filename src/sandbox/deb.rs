@@ -1574,26 +1574,55 @@ SHA256: 3333333333333333333333333333333333333333333333333333333333333333
         // earlier, and the same fact about the pin.
         assert!(err.contains("is not valid"), "{err}");
         assert!(err.contains("naming the pinned issuer"), "{err}");
-        // And with the pin removed the same call resolves, so the refusal is not the network or the
-        // index failing under another name.
+        // And with the pin removed the same repository attests again, so the refusal is not the
+        // network or the index failing under another name. Removing the pin does not make this
+        // index unattested, it makes the next check a **first pin**: the key is learned again and
+        // the signature checked against it, so `Attested::Yes`. That verdict means "the signature
+        // is by the pinned key", not "the key is one you had reason to trust", which is the
+        // distinction the guide draws about a first pin.
+        //
+        // The first pin is checked through `attest_index` rather than through the resolve, because
+        // the resolve turns `Attested::Unpinned` into a warning and its reason with it. A first pin
+        // fetches the key from a key server by the fingerprint the signature claims, and a key
+        // server that does not answer leaves the resolve unattested by design: only that reason,
+        // a fetch sbx could not make, is the network. Any other is the pin path failing.
         std::fs::remove_file(&pin).expect("the pin is removed");
+        let index = match crate::sandbox::nixhub::fetch_url_text(&nix, &layout, INDEX, true) {
+            Ok(index) => index,
+            Err(e) => {
+                skip_unreachable!("skipping deb:apt pin enforcement (network/nix): {e}");
+                return;
+            }
+        };
+        match attest_index(&nix, &layout, INDEX, &index, true) {
+            Ok(Attested::Yes) => {}
+            Ok(Attested::Unpinned(why)) if why.contains("sbx could fetch") => {
+                skip_unreachable!("skipping deb:apt pin enforcement (network): {why}");
+                return;
+            }
+            Ok(Attested::Unpinned(why)) => {
+                panic!("a repository that signs with a published key must be pinned again: {why}")
+            }
+            Err(e) => {
+                skip_unreachable!("skipping deb:apt pin enforcement (network/nix): {e}");
+                return;
+            }
+        }
+        assert!(
+            pin.exists(),
+            "a first pin that attests the index must record the key it was attested by"
+        );
+        // With the key pinned again the resolve enforces it, and the digest travels. Carrying it
+        // is worth it for a reason the key does not touch: it binds the artifact to the index that
+        // named it, closing the gap between the signed `dists/` and the `pool/` tree it points
+        // into, commonly a different bucket. `Attested::Unpinned` is the case where no digest
+        // travels, and it is reached only when no key could be learned at all.
         match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
             Ok((url, expected)) => {
                 assert!(url.ends_with("_amd64.deb"), "{url}");
-                // The digest travels, and the reason is worth stating: removing the pin does not
-                // make this index unattested, it makes the next resolve a **first pin** — the key
-                // is learned again and the signature checked against it, so `Attested::Yes`. That
-                // verdict means "the signature is by the pinned key", not "the key is one you had
-                // reason to trust", which is the distinction the guide draws about a first pin.
-                //
-                // Carrying the digest there is still worth it, and for a reason the key does not
-                // touch: it binds the artifact to the index that named it, closing the gap between
-                // the signed `dists/` and the `pool/` tree it points into, commonly a different
-                // bucket. `Attested::Unpinned` is the case where no digest travels, and it is
-                // reached only when no key could be learned at all.
                 assert!(
                     expected.is_some(),
-                    "a first pin attests the index, so its digest must reach the fetch"
+                    "an attested index must hand its digest to the fetch"
                 );
             }
             Err(e) => skip_unreachable!("skipping deb:apt pin enforcement (network/nix): {e}"),
