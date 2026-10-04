@@ -2728,7 +2728,7 @@ pub(super) fn build(
 
     // In-cage portal: wrap the command so the private session bus is stood up before the app runs.
     // The **outermost** layer, so its preamble (`dbus-daemon --fork`, which blocks until the socket
-    // is ready) runs first, then execs the rest of the wrapped command. Only present under
+    // is ready) runs before every other wrap's, then execs the rest of the wrapped command. Only present under
     // `gui = "wayland"` + `dbus = true` with a successful provision.
     if let Some(p) = &portal_stack.portal {
         wraps.push((
@@ -3149,6 +3149,17 @@ pub(super) fn build(
             prep.bwrap.display()
         ));
         spec
+    };
+    // The cage checks each held source it sees against the object held here before it runs
+    // anything ([`binds::held_source_check`]). Laid on now rather than with the other wraps, which
+    // were composed before the pins settled which mounts the cage sees, and so it runs ahead of them.
+    let check = binds::held_source_check(&prep.userland.shell_bin, &prep.userland.env_bin, &spec);
+    let spec = match check {
+        Ok(prefix) => spec.with_cmd_prefix(prefix),
+        Err(why) => {
+            crate::diag::error(&format!("sbx: {why}"));
+            return Err(ExitCode::FAILURE);
+        }
     };
     // Stand the task plane up now: the spec is final (so a task cage can be derived from it) and the
     // launch has not happened yet (so bwrap finds the bound socket present). A failure here aborts
@@ -3627,7 +3638,9 @@ enum WrapLayer {
     /// imports.
     CaTrust,
     /// The in-cage portal's private session bus. Outermost, so `dbus-daemon --fork` — which blocks
-    /// until its socket is ready — has finished before anything else in the cage starts.
+    /// until its socket is ready — has finished before anything else these wraps start. Only the
+    /// check of the held bind sources runs ahead of it ([`binds::held_source_check`]), laid on once
+    /// the pins have settled which mounts the cage sees.
     Portal,
 }
 

@@ -3272,3 +3272,119 @@ fn a_bind_source_that_gained_a_link_refuses_the_launch_and_names_the_bind() {
         "a bind source is the user's path, not a tree sbx reclaims: {why}"
     );
 }
+
+/// The check the cage runs first hands the command on, whole, while each held source the cage sees
+/// shows the object held at its path, and exits 125 naming the bind, before the command prints
+/// anything, once one shows another object or nothing. It follows the object, not the name: the
+/// directory moved back to its path passes again. A source covered by a later mount is not checked,
+/// whatever its path shows. Its shell skips the file `BASH_ENV` names, which would otherwise run
+/// ahead of the check. Run on the host, where each path is what the cage reaches through its mount.
+#[test]
+fn the_cage_runs_its_command_only_while_each_held_source_is_the_object_held() {
+    let bash = crate::pathfind::find_on_path("bash").expect("bash on PATH");
+    let stat = crate::pathfind::find_on_path("stat").expect("stat on PATH");
+    let env_bin = stat.with_file_name("env");
+    let spec_of = |mounts: Vec<Mount>, held: Vec<super::super::spec::HeldSource>| {
+        SandboxSpec::new(
+            PathBuf::from("/work"),
+            mounts,
+            Vec::new(),
+            NetPolicy::Shared,
+            vec![OsString::from("/bin/true")],
+        )
+        .expect("valid spec")
+        .with_held_sources(held)
+    };
+    let ro = |p: &PathBuf| Mount::RoBind {
+        src: p.clone(),
+        dest: p.clone(),
+    };
+    let tmp = TmpDir::new();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let [dir, file, covered, rc] = ["a b'c", "notes", "covered", "rc"].map(|n| base.join(n));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::create_dir(&covered).unwrap();
+    std::fs::write(&file, b"declared").unwrap();
+    std::fs::write(&rc, b"echo startup-file-ran\n").unwrap();
+    let binds = [&dir, &file, &covered].map(|p| crate::config::Bind {
+        path: p.clone(),
+        writable: false,
+    });
+    let held = hold_bind_sources(&binds).expect("real paths are held");
+    // Replaced after it was held, and hidden by the tmpfs laid at its path.
+    std::fs::rename(&covered, base.join("covered.old")).unwrap();
+    std::fs::create_dir(&covered).unwrap();
+    let mounts = vec![
+        ro(&dir),
+        ro(&file),
+        ro(&covered),
+        Mount::Tmpfs {
+            dest: covered.clone(),
+        },
+    ];
+    let check = held_source_check(&bash, &env_bin, &spec_of(mounts, held))
+        .expect("the identities are read");
+    assert_eq!(
+        held_source_check(&bash, &env_bin, &spec_of(vec![ro(&dir)], Vec::new())),
+        Ok(Vec::new()),
+        "a cage that holds nothing runs its command as it is"
+    );
+    let run = |check: &[OsString], cmd: &[&str]| {
+        let out = std::process::Command::new(&check[0])
+            .args(&check[1..])
+            .args(cmd)
+            .env("BASH_ENV", &rc)
+            .output()
+            .expect("run the check");
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        (out.status.code(), text(&out.stdout), text(&out.stderr))
+    };
+    let print = ["printf", "%s|", "ran", "with two words"];
+
+    let (code, stdout, stderr) = run(&check, &print);
+    assert_eq!(
+        (code, stdout.as_str()),
+        (Some(0), "ran|with two words|"),
+        "{stderr}"
+    );
+
+    // The directory replaced by another at the same path, as a parent swapped while bwrap set the
+    // cage up leaves it.
+    std::fs::rename(&dir, base.join("moved")).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    let (code, stdout, stderr) = run(&check, &print);
+    assert_eq!((code, stdout.as_str()), (Some(125), ""), "{stderr}");
+    assert!(
+        stderr.contains(&format!("the bind at {} is not the source", dir.display())),
+        "the refusal names the bind: {stderr}"
+    );
+
+    std::fs::remove_dir(&dir).unwrap();
+    std::fs::rename(base.join("moved"), &dir).unwrap();
+    assert_eq!(
+        run(&check, &print).0,
+        Some(0),
+        "the object held, back at its path"
+    );
+    std::fs::remove_file(&file).unwrap();
+    let (code, stdout, stderr) = run(&check, &print);
+    assert_eq!((code, stdout.as_str()), (Some(125), ""), "{stderr}");
+    assert!(
+        stderr.contains(&format!("the bind at {} is not the source", file.display())),
+        "a path that shows nothing is refused too: {stderr}"
+    );
+
+    // The device counts, not the inode alone: the roots of `/proc` and `/sys` share inode 1, so
+    // the procfs root presented as `/sys` is another object.
+    let sys = PathBuf::from("/sys");
+    let procfs = std::fs::File::open("/proc").unwrap();
+    let posing = super::super::spec::HeldSource::new(sys.clone(), procfs.into());
+    let check = held_source_check(&bash, &env_bin, &spec_of(vec![ro(&sys)], vec![posing]))
+        .expect("the identity is read");
+    let (code, _, stderr) = run(&check, &["true"]);
+    assert_eq!(
+        code,
+        Some(125),
+        "another filesystem's object with the same inode passes: {stderr}"
+    );
+}

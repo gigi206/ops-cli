@@ -334,30 +334,14 @@ fn env_fd(spec: &SandboxSpec) -> io::Result<Option<File>> {
 ///
 /// A held bind source ([`HeldSource`](super::spec::HeldSource)) is mounted from its descriptor
 /// (`--bind-fd`, `--ro-bind-fd`), written with the number the spec holds it under, which
-/// [`compose`] replaces with the number of the copy it hands bwrap ([`held_slots`]). The descriptor
-/// goes to the **last** mount of its path onto itself, the one the cage sees there: the config bind
-/// it was opened for is laid before every structural mount, and a control-plane pin of the same
-/// directory is laid after it ([`lay_pins`](super::binds::lay_pins)), so a descriptor given to the
-/// first would leave the visible mount resolved by path. bwrap 0.10.0 and later close such a
-/// descriptor once they have mounted it, so an earlier mount of the same path goes by path,
-/// shadowed by the one that does not. A `RoBindTry` so chosen is written as `--ro-bind-fd`: its
-/// source is open, so it exists.
+/// [`compose`] replaces with the number of the copy it hands bwrap ([`held_slots`]). Which mount
+/// takes it is [`SandboxSpec::handed_sources`]'s answer, the one the cage's own check of its binds
+/// reads too. A `RoBindTry` so chosen is written as `--ro-bind-fd`: its source is open, so it
+/// exists.
 pub(in crate::sandbox) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
-    let mut handed: Vec<Option<RawFd>> = vec![None; spec.mounts.len()];
-    for held in &spec.held_sources {
-        let last = spec.mounts.iter().rposition(|m| match m {
-            Mount::Bind { src, dest }
-            | Mount::RoBind { src, dest }
-            | Mount::RoBindTry { src, dest } => src == dest && *src == held.path,
-            _ => false,
-        });
-        // Two sources of one path meet at one mount, and the second is not handed: it goes
-        // unmounted, which [`compose`] leaves out of the command.
-        if let Some(at) = last {
-            handed[at].get_or_insert(held.fd.as_raw_fd());
-        }
-    }
+    // A source no mount takes is not written here, which [`compose`] leaves out of the command.
+    let handed = spec.handed_sources();
 
     // Namespaces: isolate everything. The pid namespace is mandatory — the
     // same-uid model is only safe behind a pid + user namespace — and the rest
@@ -448,13 +432,13 @@ pub(in crate::sandbox) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     // one at the same path, so the order is load-bearing — it is the Spec's
     // responsibility and is faithfully preserved here.
     for (m, held) in spec.mounts.iter().zip(handed) {
-        if let Some(fd) = held {
+        if let Some(held) = held {
             let flag = match m {
                 Mount::Bind { .. } => "--bind-fd",
                 _ => "--ro-bind-fd",
             };
             a.push(lit(flag));
-            a.push(OsString::from(fd.to_string()));
+            a.push(OsString::from(held.fd.as_raw_fd().to_string()));
             a.push(path(m.dest()));
             continue;
         }
@@ -801,6 +785,105 @@ mod tests {
             at_held,
             ["--ro-bind", "--ro-bind-fd"],
             "the last mount at the held path, the pin, is mounted from the descriptor: {words:?}"
+        );
+    }
+
+    /// The sources the cage checks are the ones it sees: each mounted from its descriptor, on the
+    /// mount the argument list gives it to, and not covered by a later mount at its path or above.
+    /// One inside a directory bound after it, one under a tmpfs laid at its path, the first of two
+    /// mounts of one path, a source no mount takes and a second source of a path already held are
+    /// not checked, since what the cage finds there is not theirs.
+    #[test]
+    fn the_cage_checks_the_held_sources_it_sees_and_no_other() {
+        let tmp = crate::testutil::TmpDir::new();
+        let [seen, inside, proj, masked, twice, spare] =
+            ["seen", "proj/inside", "proj", "masked", "twice", "spare"].map(|p| tmp.join(p));
+        for dir in [&seen, &inside, &masked, &twice, &spare] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let bind = |p: &PathBuf| Mount::RoBind {
+            src: p.clone(),
+            dest: p.clone(),
+        };
+        let mounts = vec![
+            Mount::Bind {
+                src: seen.clone(),
+                dest: seen.clone(),
+            },
+            bind(&inside),
+            bind(&masked),
+            bind(&twice),
+            Mount::Bind {
+                src: proj.clone(),
+                dest: proj.clone(),
+            },
+            Mount::Tmpfs {
+                dest: masked.clone(),
+            },
+            bind(&twice),
+        ];
+        let hold = |p: &PathBuf| {
+            let fd = std::fs::File::open(p).unwrap();
+            super::super::spec::HeldSource::new(p.clone(), fd.into())
+        };
+        let held_spec = spec(mounts, Vec::new(), NetPolicy::Shared).with_held_sources(vec![
+            hold(&seen),
+            hold(&inside),
+            hold(&masked),
+            hold(&twice),
+            hold(&spare),
+            hold(&seen),
+        ]);
+
+        let checked = held_spec.seen_held_sources();
+        let paths: Vec<&Path> = checked.iter().map(|h| h.path()).collect();
+        assert_eq!(paths, [seen.as_path(), twice.as_path()]);
+        assert!(
+            std::sync::Arc::ptr_eq(&checked[0].fd, &held_spec.held_sources[0].fd),
+            "the source checked at a path held twice is the one mounted there"
+        );
+
+        // Each one checked is mounted from its own descriptor, on the mount the cage sees.
+        let words: Vec<String> = to_argv(&held_spec)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for held in &checked {
+            let (fd, shown) = (
+                held.fd.as_raw_fd().to_string(),
+                held.path().display().to_string(),
+            );
+            let mounted_at = words
+                .windows(3)
+                .rposition(|w| w[0].starts_with("--") && w[2] == shown)
+                .expect("the path is mounted");
+            assert!(
+                words[mounted_at].ends_with("-fd") && words[mounted_at + 1] == fd,
+                "{shown} is checked against a descriptor its last mount is not given: {words:?}"
+            );
+        }
+    }
+
+    /// The check rides ahead of the command, which it is handed whole, and an empty one leaves the
+    /// command as it was.
+    #[test]
+    fn a_command_prefix_runs_ahead_of_the_command_it_is_handed() {
+        let tail = |s: &SandboxSpec| {
+            let argv = to_argv(s);
+            let at = argv
+                .iter()
+                .position(|a| a == "--")
+                .expect("the command follows `--`");
+            argv[at + 1..].to_vec()
+        };
+        let plain = spec(Vec::new(), Vec::new(), NetPolicy::Shared);
+        let checked = plain
+            .clone()
+            .with_cmd_prefix(vec![OsString::from("/check"), OsString::from("a b")]);
+        assert_eq!(tail(&checked), ["/check", "a b", "/bin/sh", "-c", "id"]);
+        assert_eq!(
+            tail(&plain.clone().with_cmd_prefix(Vec::new())),
+            tail(&plain)
         );
     }
 

@@ -751,6 +751,24 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
             source.display()
         );
     }
+    // The cage's first act checks each of them against the object held, and the read above shows
+    // that a sound launch passes it.
+    let command = dump
+        .split_once("cmd: [")
+        .and_then(|(_, rest)| rest.split_once("cage_slug:"))
+        .map(|(command, _)| command)
+        .unwrap_or_default();
+    assert!(
+        command.contains("\"sbx-bind-check\""),
+        "the cage's command does not open on the check of its binds:\n{dump}"
+    );
+    for source in [&rw_dir, &ro_dir, &ro_file] {
+        assert!(
+            command.contains(&format!("{:?}", source.display().to_string())),
+            "the cage does not check {}:\n{dump}",
+            source.display()
+        );
+    }
 
     // And none of those descriptors is still open in the cage: one would reach the host object
     // past the mode of the bind that shows it, a read-only bind written through it. The shell

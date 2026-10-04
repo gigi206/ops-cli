@@ -831,13 +831,13 @@ fn launch_foreground_learning(
 /// fail-closed, or a command the `PATH` walk finds nowhere. A relative `./x` that is not there is
 /// the exception the record cannot see: it is recorded as named, unprobed, so it reads as reached.
 ///
-/// A success is taken as a run whatever either says. What neither witness covers is a startup
-/// step bubblewrap did run that failed before the command, a tool being equipped or a bundle's
-/// install: under `--net-learn` alone either still reads as a run. Under `--proc-learn` a tool
-/// being equipped is seen, since its lane runs outside the shim and records nothing, but a
-/// bundle's install runs under the shim with the start-up script, records its programs, and reads
-/// as a run too. A declared service is no such step: it starts in the background and never stops
-/// the command.
+/// A success is taken as a run whatever either says. What neither witness covers is a startup step
+/// bubblewrap did run that failed before the command: the cage's check of its held bind sources
+/// ([`super::binds::held_source_check`]), a tool being equipped or a bundle's install, any of which
+/// under `--net-learn` alone still reads as a run. Under `--proc-learn` the check and a tool being
+/// equipped are seen, since both run outside the shim and record nothing, but a bundle's install
+/// runs under the shim with the start-up script, records its programs, and reads as a run too. A
+/// declared service is no such step: it starts in the background and never stops the command.
 fn reached_its_command(
     code: i32,
     setup: Option<bool>,

@@ -240,9 +240,10 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
 /// mount, in which a parent component could be replaced with a link, and the launch closes it: it
 /// opens each source one component at a time with every link refused
 /// (`sandbox::binds::hold_bind_sources`) and hands bubblewrap the descriptor, which from 0.10.0
-/// checks that what it mounted is that object (Ubuntu 24.04's backport of the option does not). A
-/// component replaced in between refuses the launch. On a bubblewrap with no `--bind-fd` the source
-/// goes by path and the window stays open, which the launch warns about.
+/// checks that what it mounted is that object, and the cage checks it again before it runs anything
+/// (`sandbox::binds::held_source_check`), which covers Ubuntu 24.04's backport of the option, made
+/// without that check. A component replaced in between refuses the launch. On a bubblewrap with no
+/// `--bind-fd` the source goes by path and the window stays open, which the launch warns about.
 ///
 /// The launch writes the same about the project root, which it canonicalises too
 /// (`sandbox::binds`) and still mounts by path. The two used to disagree, one side claiming a pin

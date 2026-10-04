@@ -404,8 +404,8 @@ fn cage_command_with(
 /// Ubuntu 24.04 carries them in its 0.9.0 as a backport, so a version number would refuse the host
 /// sbx most often runs on. The capability is all this answers. That backport looks up the path of
 /// the open source and mounts it without the check bubblewrap makes from 0.10.0, that what it
-/// mounted is that object, so a swap during bubblewrap's own setup goes unnoticed there, a limit
-/// `binds.md` writes.
+/// mounted is that object, so on it a swap during bubblewrap's own setup is caught by the cage's
+/// own check of its binds instead ([`crate::sandbox::binds::held_source_check`]).
 pub(in crate::sandbox) fn bwrap_binds_descriptors(bwrap: &Path) -> bool {
     static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PROBED.get_or_init(|| {

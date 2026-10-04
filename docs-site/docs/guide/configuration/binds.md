@@ -83,14 +83,19 @@ this, since the cage could name a program there that git runs anyway, and the la
   inside your own project is out of its reach, since the project's mount covers that bind.
   bubblewrap looks the descriptor's path up once more as it mounts, and from 0.10.0 it
   then checks that what it mounted is that object, refusing the launch otherwise.
+- The cage checks each bind it sees once more before it runs anything: a path that shows
+  another object than the one the launch opened, or nothing, stops the cage with exit code
+  `125` and names the bind, and your command does not start. A bind covered by a later
+  mount, inside the project for one, is not checked, since what the cage finds there is
+  that mount.
 - A bubblewrap without `--bind-fd` (upstream releases before 0.10.0) is handed the path
   instead, and the launch warns: there a parent swapped between the resolution and the
   mount still races.
-- Ubuntu 24.04's bubblewrap 0.9.0 has `--bind-fd` as a backport, without that check. The
-  descriptor still defeats a swap made before bubblewrap starts, since bubblewrap looks up
-  where the open source is at that moment, but a swap made during bubblewrap's own setup,
-  between that look-up and the mount, goes unnoticed. That window is far narrower than
-  the one the descriptor closes, and the launch does not warn about it.
+- Ubuntu 24.04's bubblewrap 0.9.0 has `--bind-fd` as a backport, without bubblewrap's own
+  check. The descriptor still defeats a swap made before bubblewrap starts, since bubblewrap
+  looks up where the open source is at that moment, and a swap made during its setup,
+  between that look-up and the mount, is caught by the cage's check above. The check
+  detects that swap rather than preventing it: the cage stops instead of running on it.
 - A **missing** path is dropped with a warning rather than failing the launch (a
   best-effort bind), so a portable config referencing an optional path still works.
 - A leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` is expanded from your environment, so

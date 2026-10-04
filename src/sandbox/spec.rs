@@ -222,7 +222,8 @@ pub(crate) struct SandboxSpec {
 /// ([`super::cagedir::hold_entry_beneath`]), and bwrap is handed the descriptor (`--bind-fd`,
 /// `--ro-bind-fd`). It looks up where that object is when it sets the cage up and mounts that path,
 /// checking from 0.10.0 that what it mounted is the object, and closes the descriptor before the
-/// cage's command runs.
+/// cage's command runs. The cage then checks each one it sees again, before anything else runs in
+/// it ([`super::binds::held_source_check`]).
 ///
 /// Compared by path and by the descriptor it shares, so a spec stays comparable: two specs hold the
 /// same sources when they hold the same open objects, not merely equal names.
@@ -241,6 +242,27 @@ impl HeldSource {
             path,
             fd: std::sync::Arc::new(fd),
         }
+    }
+
+    /// The canonical path of the bind, where the cage finds it.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The held object's device and inode, as `stat -c %d:%i` prints them for the path it is
+    /// mounted at.
+    pub(crate) fn identity(&self) -> std::io::Result<String> {
+        use std::os::fd::AsRawFd;
+
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fd` is an open descriptor this source owns, and `st` is written only on success,
+        // which the return value reports.
+        if unsafe { libc::fstat(self.fd.as_raw_fd(), st.as_mut_ptr()) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fstat` returned success, so `st` is initialised.
+        let st = unsafe { st.assume_init() };
+        Ok(format!("{}:{}", st.st_dev, st.st_ino))
     }
 }
 
@@ -407,6 +429,61 @@ impl SandboxSpec {
     /// Mount each of `sources` from its descriptor rather than by its path ([`HeldSource`]).
     pub(crate) fn with_held_sources(mut self, sources: Vec<HeldSource>) -> Self {
         self.held_sources = sources;
+        self
+    }
+
+    /// For each mount, the held source bwrap mounts there from its descriptor, if any.
+    ///
+    /// A source goes to the **last** mount of its path onto itself, the one the cage sees there: the
+    /// config bind it was opened for is laid before every structural mount, and a control-plane pin
+    /// of the same directory is laid after it ([`lay_pins`](super::binds::lay_pins)), so a
+    /// descriptor given to the first would leave the visible mount resolved by path. bwrap 0.10.0
+    /// and later close such a descriptor once they have mounted it, so an earlier mount of the same
+    /// path goes by path, shadowed by the one that does not. Two sources of one path meet at one
+    /// mount, and the second goes to none.
+    pub(super) fn handed_sources(&self) -> Vec<Option<&HeldSource>> {
+        let mut handed = vec![None; self.mounts.len()];
+        for held in &self.held_sources {
+            let last = self.mounts.iter().rposition(|m| match m {
+                Mount::Bind { src, dest }
+                | Mount::RoBind { src, dest }
+                | Mount::RoBindTry { src, dest } => src == dest && *src == held.path,
+                _ => false,
+            });
+            if let Some(at) = last {
+                handed[at].get_or_insert(held);
+            }
+        }
+        handed
+    }
+
+    /// The held sources the cage sees: each one a mount takes ([`SandboxSpec::handed_sources`])
+    /// that no later mount covers, at its path or above it.
+    ///
+    /// A bind inside the project, or under a tmpfs or a decoy pin laid after it, is mounted and
+    /// then hidden: the cage finds the later mount at that path, so what is there says nothing about
+    /// the source.
+    pub(crate) fn seen_held_sources(&self) -> Vec<&HeldSource> {
+        self.handed_sources()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(at, held)| {
+                let dest = self.mounts[at].dest();
+                let covered = self.mounts[at + 1..]
+                    .iter()
+                    .any(|m| dest.starts_with(m.dest()));
+                held.filter(|_| !covered)
+            })
+            .collect()
+    }
+
+    /// Run `prefix` in the cage ahead of the command, which it is handed as its trailing arguments.
+    /// An empty `prefix` leaves the command as it is.
+    pub(crate) fn with_cmd_prefix(mut self, mut prefix: Vec<OsString>) -> Self {
+        if !prefix.is_empty() {
+            prefix.append(&mut self.cmd);
+            self.cmd = prefix;
+        }
         self
     }
 

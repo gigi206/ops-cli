@@ -15,7 +15,7 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 | `0` | success |
 | `1` | a runtime failure, an operation that ran but did not succeed (e.g. `sbx config get` on an unset key, a store/network operation that failed, an answer that could not be written to standard output) |
 | `2` | a **usage or fail-closed** error, a bad argument, a missing operand, a name that names nothing (an app, a plugin, a store, a bundle, an egress group, a project tree, a session, a declared operation, a task invocation), or a rejected [one-shot override](../configuration/overrides) value |
-| `125` | nothing was run, deliberately: [`sbx task run`](../cli/task#run) refused the invocation, or [`sbx session attach`](../cli/session#attach) could not re-apply the cage's confinement |
+| `125` | nothing was run, deliberately: [`sbx task run`](../cli/task#run) refused the invocation, [`sbx session attach`](../cli/session#attach) could not re-apply the cage's confinement, or a launched cage found a [bind](../configuration/binds#path-rules) showing something other than the source the launch opened. A launched command can exit `125` itself |
 | `126` | [`sbx session attach`](../cli/session#attach) could not join the running cage, or could not reap the shell it started |
 | `127` | [`sbx session attach`](../cli/session#attach) reached the cage but could not start the shell in it |
 | `128 + N` | the launched or attached command was terminated by signal `N` |
@@ -118,13 +118,13 @@ a program it could not run, says it never reached its command and exits with the
 code (1). Under `--proc-learn` the exec record tells the rest: a run that recorded no program
 and ended in a failure never reached its command either (the command is nowhere on the cage's
 `PATH`, the exec supervisor stopped it), says so, and exits with that code. What neither
-witness sees is a startup step inside the cage failing before the app, a tool being equipped
-or a bundle's install: under `--net-learn` alone either still reads as a run that learned
-nothing, and exits 0, with the step's own message above it on standard error. Under
-`--proc-learn` a tool being equipped is seen, since it runs ahead of the exec supervisor and
-records nothing, but a bundle's install runs under it: its programs are recorded, and the run
-reads as one that ran. A declared service never stops the app, since it starts in the
-background.
+witness sees is a startup step inside the cage failing before the app: the cage's
+[check of its binds](../configuration/binds#path-rules), a tool being equipped or a bundle's
+install. Under `--net-learn` alone each still reads as a run that learned nothing, and exits 0,
+with the step's own message above it on standard error. Under `--proc-learn` the check of the
+binds and a tool being equipped are seen, since both run ahead of the exec supervisor and record
+nothing, but a bundle's install runs under it: its programs are recorded, and the run reads as
+one that ran. A declared service never stops the app, since it starts in the background.
 
 ## Fail-closed overrides exit 2
 
