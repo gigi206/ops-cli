@@ -431,13 +431,42 @@ impl HostBus for WindowsToasts {
     }
 }
 
-/// The host daemon's `ActionInvoked` signals as the relay reads them: the id and the action key, or
-/// `None` for a signal whose arguments did not decode.
-type ActionSignals = BoxStream<'static, Option<(u32, String)>>;
+/// One of the host daemon's signals the relay carries back to the cage, reduced to its arguments.
+#[derive(Debug, PartialEq, Eq)]
+enum HostSignal {
+    /// `ActionInvoked`: the id and the action key.
+    Action(u32, String),
+    /// `NotificationClosed`: the id and the reason.
+    Closed(u32, u32),
+}
 
-/// The host daemon's `NotificationClosed` signals as the relay reads them: the id and the reason, or
-/// `None` for a signal whose arguments did not decode.
-type ClosedSignals = BoxStream<'static, Option<(u32, u32)>>;
+impl HostSignal {
+    /// The signal `msg` carries, or `None` for a member the relay does not carry or arguments that
+    /// did not decode.
+    fn of(msg: &Message) -> Option<HostSignal> {
+        let header = msg.header();
+        match header.member()?.as_str() {
+            "ActionInvoked" => {
+                let (id, key): (u32, String) = msg.body().deserialize().ok()?;
+                Some(HostSignal::Action(id, key))
+            }
+            "NotificationClosed" => {
+                let (id, reason): (u32, u32) = msg.body().deserialize().ok()?;
+                Some(HostSignal::Closed(id, reason))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The host daemon's signals as the relay reads them, in the order the daemon sent them.
+///
+/// One stream rather than one per member, because the order is part of what the daemon says. A
+/// click on an action is `ActionInvoked` then `NotificationClosed`, and `notify-send --wait`, like
+/// any client that waits on its notification, stops listening at the close: an action relayed after
+/// it reaches nobody. Two streams raced in one `select!` hand over whichever is ready first, which
+/// is either.
+type HostSignals = BoxStream<'static, Option<HostSignal>>;
 
 /// Where the relay sends a cage's notifications.
 #[derive(Debug, PartialEq, Eq)]
@@ -1216,30 +1245,23 @@ async fn run(
     futures_util::pin_mut!(serving);
 
     // The daemon's signals, each reduced to its arguments. Neither the Mac nor Windows sends any
-    // back, so there the two streams never yield and the loop waits on the calls and the shutdown alone.
-    let (mut actions, mut closed): (ActionSignals, ClosedSignals) = match target {
-        RelayTarget::Daemon => (
-            host.receive_action_invoked()
-                .await?
-                .map(|sig| sig.args().ok().map(|a| (a.id, a.action_key.to_string())))
-                .boxed(),
-            host.receive_notification_closed()
-                .await?
-                .map(|sig| sig.args().ok().map(|a| (a.id, a.reason)))
-                .boxed(),
-        ),
-        RelayTarget::Mac | RelayTarget::Windows => (
-            futures_util::stream::pending().boxed(),
-            futures_util::stream::pending().boxed(),
-        ),
+    // back, so there the stream never yields and the loop waits on the calls and the shutdown alone.
+    let mut signals: HostSignals = match target {
+        RelayTarget::Daemon => host
+            .inner()
+            .receive_all_signals()
+            .await?
+            .map(|msg| HostSignal::of(&msg))
+            .boxed(),
+        RelayTarget::Mac | RelayTarget::Windows => futures_util::stream::pending().boxed(),
     };
     loop {
         futures_util::select! {
             _ = shutdown.recv().fuse() => break,
             // The call loop ends once the private bus has gone, or a reply could not be written to it.
             () = serving => break,
-            sig = actions.next().fuse() => match sig {
-                Some(sig) => if let Some((id, key)) = sig {
+            sig = signals.next().fuse() => match sig {
+                Some(Some(HostSignal::Action(id, key))) => {
                     // Verbatim id → the app matches the signal to its own notification.
                     // The host daemon's signals are desktop-wide: they fire for every application on
                     // the user's session, not for this cage. `emit_signal(None, …)` is a broadcast
@@ -1253,11 +1275,8 @@ async fn run(
                     {
                         break;
                     }
-                },
-                None => break,
-            },
-            sig = closed.next().fuse() => match sig {
-                Some(sig) => if let Some((id, reason)) = sig {
+                }
+                Some(Some(HostSignal::Closed(id, reason))) => {
                     // Whoever raised it, this id now names nothing, so it leaves the set either way;
                     // only the cage's own closures cross back. A desktop-wide close signal tells a
                     // watching agent whether a human dismissed a toast (reason 2) or it expired
@@ -1269,7 +1288,8 @@ async fn run(
                     {
                         break;
                     }
-                },
+                }
+                Some(None) => {}
                 None => break,
             },
         }
@@ -2218,11 +2238,12 @@ mod tests {
             _hints: HashMap<String, OwnedValue>,
             _expire_timeout: i32,
         ) -> u32 {
-            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let earlier = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.stalled {
                 std::future::pending::<()>().await;
             }
-            FIRST_ID
+            // A daemon's ids count up, so each notification can be told from the one before it.
+            FIRST_ID + earlier as u32
         }
 
         /// What a real daemon answers first, and what the relay asks at startup to tell a host with
@@ -2410,10 +2431,17 @@ mod tests {
     }
 
     /// The daemon's signals for a notification the cage raised reach the cage with the id, the
-    /// action key and the reason the daemon sent, driven end to end through the relay's own
-    /// startup. Its probe finds the daemon, so this is the path every host with one takes.
+    /// action key and the reason the daemon sent, and in the order it sent them, driven end to end
+    /// through the relay's own startup. Its probe finds the daemon, so this is the path every host
+    /// with one takes.
+    ///
+    /// A click on an action is `ActionInvoked` then `NotificationClosed`, and a client waiting on
+    /// its notification stops listening at the close, so an action delivered after it is lost. The
+    /// pairs are emitted back to back, faster than the relay passes them on, so both signals of a
+    /// pair are waiting at once: a relay that reads them from two streams hands over either first.
     #[test]
     fn a_daemons_signals_for_the_cages_own_notification_reach_the_cage() {
+        const PAIRS: u32 = 20;
         let dir = crate::testutil::TmpDir::new();
         let (host, sock) = (dir.join("host"), dir.join("bus"));
         let (Some(_host_bus), Some(_private_bus)) = (test_bus(&host), test_bus(&sock)) else {
@@ -2435,45 +2463,54 @@ mod tests {
             let mut signals = MessageStream::for_match_rule(rule, &app, None)
                 .await
                 .expect("the cage subscribes");
-            let reply = call_notify(&app, 64).await.expect("the relay answers");
-            let id: u32 = reply.body().deserialize().expect("an id");
-            assert_eq!(id, FIRST_ID);
+            let mut ids = Vec::new();
+            for n in 0..PAIRS {
+                let reply = call_notify(&app, 64).await.expect("the relay answers");
+                let id: u32 = reply.body().deserialize().expect("an id");
+                assert_eq!(id, FIRST_ID + n);
+                ids.push(id);
+            }
 
-            daemon
-                .emit_signal(
-                    None::<&str>,
-                    OBJECT,
-                    IFACE,
-                    "ActionInvoked",
-                    &(id, "default"),
-                )
-                .await
-                .expect("the daemon emits");
-            daemon
-                .emit_signal(
-                    None::<&str>,
-                    OBJECT,
-                    IFACE,
-                    "NotificationClosed",
-                    &(id, 2u32),
-                )
-                .await
-                .expect("the daemon emits");
+            for &id in &ids {
+                daemon
+                    .emit_signal(
+                        None::<&str>,
+                        OBJECT,
+                        IFACE,
+                        "ActionInvoked",
+                        &(id, "default"),
+                    )
+                    .await
+                    .expect("the daemon emits");
+                daemon
+                    .emit_signal(
+                        None::<&str>,
+                        OBJECT,
+                        IFACE,
+                        "NotificationClosed",
+                        &(id, 2u32),
+                    )
+                    .await
+                    .expect("the daemon emits");
+            }
 
-            let action = next_signal(&mut signals).await;
-            assert_eq!(
-                action.header().member().map(|m| m.to_string()).as_deref(),
-                Some("ActionInvoked")
-            );
-            let (aid, key): (u32, String) = action.body().deserialize().unwrap();
-            assert_eq!((aid, key.as_str()), (id, "default"));
-            let close = next_signal(&mut signals).await;
-            assert_eq!(
-                close.header().member().map(|m| m.to_string()).as_deref(),
-                Some("NotificationClosed")
-            );
-            let (cid, reason): (u32, u32) = close.body().deserialize().unwrap();
-            assert_eq!((cid, reason), (id, 2));
+            for &id in &ids {
+                let action = next_signal(&mut signals).await;
+                assert_eq!(
+                    action.header().member().map(|m| m.to_string()).as_deref(),
+                    Some("ActionInvoked"),
+                    "notification {id}: the action comes before the close"
+                );
+                let (aid, key): (u32, String) = action.body().deserialize().unwrap();
+                assert_eq!((aid, key.as_str()), (id, "default"));
+                let close = next_signal(&mut signals).await;
+                assert_eq!(
+                    close.header().member().map(|m| m.to_string()).as_deref(),
+                    Some("NotificationClosed")
+                );
+                let (cid, reason): (u32, u32) = close.body().deserialize().unwrap();
+                assert_eq!((cid, reason), (id, 2));
+            }
         });
     }
 
