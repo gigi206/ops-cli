@@ -258,6 +258,84 @@ jobs:
             esac
           done
 
+      - name: A config bind must reach the cage through the source the launch held
+        # A bind the config declares is mounted from a descriptor the launch opened, and the cage's
+        # first act compares what each bind's path shows with what was held, running nothing on a
+        # difference. The bubblewrap this artifact carries checks the mount itself and refuses a
+        # swapped source before that comparison runs, so what this step shows is the other half:
+        # on the filesystem a WSL2 distribution boots from, the held sources and the check compose,
+        # and a sound launch passes it.
+        # The run cannot print its spec, so the witness is the cage's own bubblewrap, whose
+        # arguments are world-readable while the cage runs. The cage waits for the host to have read
+        # them, then reads both read-only sources, writes through the read-write one and tries the
+        # read-only one.
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          fail() { echo "$1"; exit 1; }
+          base="$HOME/bound"
+          rm -rf "$base"
+          mkdir -p "$base/project" "$base/rw" "$base/ro"
+          echo host-content > "$base/ro/preexisting"
+          echo single-file-content > "$base/file"
+          cd "$base/project" || fail "cannot enter $base/project"
+          printf 'binds = [\n  { path = "%s", mode = "rw" },\n  "%s",\n  "%s",\n]\n' \
+            "$base/rw" "$base/ro" "$base/file" > .sbx.toml
+          # `binds` takes effect only in a trusted config.
+          "$HOME/sbx" trust --yes .sbx.toml || fail "sbx trust failed"
+          # A word only this launch's cage carries, so the probe picks its bubblewrap and no other.
+          tag=sbx-wsl-bind-probe
+          script='i=0
+          while [ ! -e "$3/go" ]; do
+            i=$((i + 1))
+            [ "$i" -le 600 ] || { echo "the host never released the cage"; exit 3; }
+            sleep 0.1
+          done
+          cat "$1/preexisting" "$2"
+          echo written-in-cage > "$3/marker"
+          if (echo nope > "$1/marker") 2>/dev/null; then echo RO-WRITABLE; else echo RO-REFUSED; fi'
+          "$HOME/sbx" run -- sh -c "$script" "$tag" "$base/ro" "$base/file" "$base/rw" \
+            > "$base/run.txt" 2>&1 &
+          launcher=$!
+          # Each process's arguments, one per line: the cage's bubblewrap is the one whose first
+          # argument names a `bwrap` and that carries the tag. Bounded, should the launcher hang
+          # before it starts one. stderr is redirected ahead of the input, so a process gone since
+          # the listing is skipped without a word.
+          argv=
+          deadline=$((SECONDS + 300))
+          while [ -z "$argv" ] && [ "$SECONDS" -lt "$deadline" ] && kill -0 "$launcher" 2>/dev/null; do
+            for p in /proc/[0-9]*; do
+              words=$(tr '\0' '\n' 2>/dev/null < "$p/cmdline") || continue
+              case "${words%%$'\n'*}" in */bwrap) ;; *) continue ;; esac
+              if grep -qxF -- "$tag" <<< "$words"; then argv=$words; break; fi
+            done
+            [ -n "$argv" ] || sleep 0.2
+          done
+          touch "$base/rw/go"
+          wait "$launcher"
+          status=$?
+          {
+            echo "### a launch with config binds (systemd=${{ matrix.systemd }})"
+            echo
+            echo '```'
+            cat "$base/run.txt"
+            echo '```'
+          } >> "$HOME/summary.md"
+          cat "$base/run.txt"
+          # Three outcomes, not two: a probe that never saw the cage has proven nothing either way.
+          [ -n "$argv" ] || fail "the probe never saw the cage's bubblewrap while the launch ran"
+          for word in sbx-bind-check --bind-fd --ro-bind-fd "$base/rw" "$base/ro" "$base/file"; do
+            grep -qxF -- "$word" <<< "$argv" \
+              || fail "the cage was launched without \`$word\`: its binds were not held and checked"
+          done
+          [ "$status" -eq 0 ] || fail "the launch exited $status"
+          grep -qx host-content "$base/run.txt" || fail "the read-only directory did not reach the cage"
+          grep -qx single-file-content "$base/run.txt" || fail "the read-only file did not reach the cage"
+          grep -qx RO-REFUSED "$base/run.txt" || fail "a write into the read-only bind was not refused"
+          [ ! -e "$base/ro/marker" ] || fail "the read-only bind let the cage create a host file"
+          [ "$(cat "$base/rw/marker" 2>/dev/null)" = written-in-cage ] \
+            || fail "the cage's write did not reach the host through the read-write bind"
+
       - name: Publish the report collected inside the distribution
         # Written from Windows, where `$GITHUB_STEP_SUMMARY` is certainly defined. `if: always()`
         # so a failing assertion still lands its evidence beside itself.
