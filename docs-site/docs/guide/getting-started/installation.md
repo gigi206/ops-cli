@@ -132,8 +132,8 @@ Three further differences are worth knowing before they surprise you:
   Windows home directory, which is the opposite of what the security model is for.
   Keep projects in the distribution's own filesystem, where the bind is the project
   and nothing above it.
-- **Refusals are raised as Windows toasts.** A distribution owns no
-  `org.freedesktop.Notifications`, and the desktop these announcements are for is the
+- **Refusals and an app's own notifications are raised as Windows toasts.** A
+  distribution owns no `org.freedesktop.Notifications`, and the desktop these announcements are for is the
   Windows one, so under a WSL kernel `sbx` raises them there instead. It also keeps the
   stderr line: nothing in the toast call reports whether it was seen, because a session
   mismatch, Focus Assist, or a per-application notification setting each swallow one and
@@ -151,6 +151,12 @@ Three further differences are worth knowing before they surprise you:
   the toasts are drawn where nobody looks; `sbx` compares that session against the
   desktop's and says so once, after the first announcement, rather than leaving it to be
   discovered. `wsl --shutdown` and a launch from the desktop puts them back.
+
+  A caged app's own notifications take the same route under `dbus = true`, as toasts
+  titled `sandboxed · <app>` so they cannot pass for a refusal (see
+  [`dbus`](../configuration/dbus)), and land in the same session. The session check runs
+  only once a refusal has been announced, so a launch that refuses nothing raises the
+  app's toasts into that session without the note.
 - **GPU acceleration needs the bridge libraries, and `sbx` binds them.** Where the
   Windows host has a GPU that WSL can share, the distribution gets an ordinary
   `renderD*` node and `gpu = true` grants it as it would on any Linux host. The driver
