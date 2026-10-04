@@ -3942,6 +3942,29 @@ fn a_client_that_ignores_the_proxy_variables_is_judged_by_the_proxy_through_the_
         stdout.contains("denied=403\n"),
         "a denied host must be refused by the proxy through the tap: {stdout}{stderr}"
     );
+
+    // The names the tap answered reach the session's counters through its report socket, which
+    // takes a report only behind the token the launch drew and handed the tap. A link that dropped
+    // the token would leave the tap reporting nothing, by design, and every assertion above green;
+    // one counted name is the token's whole trip, from the proxy that drew it to the tap and back.
+    let stats = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["net", "stats", "--json"],
+    );
+    assert!(
+        stats.status.success(),
+        "net stats failed: {}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&stats.stdout).expect("net stats --json is valid JSON");
+    assert!(
+        v["resolutions"].as_u64().unwrap_or(0) >= 1,
+        "the names the tap answered must be counted through its report socket: {}",
+        String::from_utf8_lossy(&stats.stdout)
+    );
 }
 
 #[test]
