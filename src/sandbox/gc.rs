@@ -4223,10 +4223,15 @@ mod tests {
     ///
     /// What is asserted is the canary, not the removal's result: a removal raced this way may fail,
     /// and failing is not escaping.
+    ///
+    /// Each trial starts the removal only once the swapper has exchanged the two names in it.
+    /// Started first, the removal can unlink one of them before that first exchange, which the order
+    /// a directory lists its entries in decides, and the trial then races nothing. A filesystem that
+    /// refuses `RENAME_EXCHANGE` is named rather than passed for want of a race.
     #[test]
     fn a_directory_swapped_for_a_link_mid_removal_does_not_carry_it_out_of_the_tree() {
         use std::os::unix::ffi::OsStrExt;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
         const FILES: usize = 256;
         const TRIALS: usize = 20;
@@ -4241,6 +4246,7 @@ mod tests {
         let alt = std::ffi::CString::new(root.join("alt").as_os_str().as_bytes()).unwrap();
 
         let exchanged = AtomicUsize::new(0);
+        let refused = AtomicI32::new(0);
         for trial in 0..TRIALS {
             std::fs::create_dir_all(root.join("sub")).unwrap();
             for i in 0..FILES {
@@ -4249,6 +4255,7 @@ mod tests {
             std::os::unix::fs::symlink(&canary, root.join("alt")).unwrap();
 
             let stop = AtomicBool::new(false);
+            let before = exchanged.load(Ordering::Relaxed);
             std::thread::scope(|s| {
                 s.spawn(|| {
                     while !stop.load(Ordering::Relaxed) {
@@ -4268,9 +4275,28 @@ mod tests {
                         };
                         if rc == 0 {
                             exchanged.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            let errno = std::io::Error::last_os_error().raw_os_error();
+                            refused.store(errno.unwrap_or(0), Ordering::Relaxed);
                         }
                     }
                 });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while exchanged.load(Ordering::Relaxed) == before {
+                    if std::time::Instant::now() > deadline {
+                        stop.store(true, Ordering::Relaxed);
+                        let errno = refused.load(Ordering::Relaxed);
+                        assert_ne!(
+                            errno,
+                            libc::EINVAL,
+                            "the fixture's filesystem does not support RENAME_EXCHANGE"
+                        );
+                        panic!(
+                            "trial {trial}: the swapper never exchanged the names (errno {errno})"
+                        );
+                    }
+                    std::thread::yield_now();
+                }
                 let _ = force_remove_dir_all(&root);
                 stop.store(true, Ordering::Relaxed);
             });
@@ -4285,12 +4311,6 @@ mod tests {
             // The swapper has stopped, so what is left of the tree has no other writer.
             let _ = std::fs::remove_dir_all(&root);
         }
-        // A filesystem that refuses `RENAME_EXCHANGE` (`EINVAL`) would leave the tree unswapped,
-        // and the canary intact for want of a race rather than because the removal held.
-        assert!(
-            exchanged.load(Ordering::Relaxed) > 0,
-            "no exchange succeeded: the fixture's filesystem may not support RENAME_EXCHANGE"
-        );
     }
 
     /// A directory whose mode refuses even its owner's reads is emptied all the same. The cage can
