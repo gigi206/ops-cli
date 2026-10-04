@@ -258,11 +258,14 @@ impl Sink for StderrSink {
     }
 }
 
-/// The PowerShell fragment that raises one Windows toast, with `title` and `body` carried as base64
-/// and decoded by the script itself. Pure, so the encoding is pinned by a test rather than by a
-/// terminal.
+/// The PowerShell fragment that raises one Windows toast showing `texts`, each carried as base64 and
+/// decoded by the script itself. Pure, so the encoding is pinned by a test rather than by a terminal.
 ///
-/// Both strings are the cage's writing: a refused host, an exec target, a task name. They are
+/// Two texts are a title and a body (`ToastText02`), three a title and two lines under it
+/// (`ToastText04`); the texts past the third are not shown.
+///
+/// Every text is the cage's writing: a refused host, an exec target, a task name, or the whole of a
+/// caged app's notification. They are
 /// sanitised first, which takes the control characters and newlines out, and then never appear in
 /// the script as text at all: what the script holds is their UTF-8 in base64, whose alphabet has no
 /// quote of any kind, inside a literal sbx wrote. Escaping them into a single-quoted literal is not
@@ -274,28 +277,36 @@ impl Sink for StderrSink {
 /// knows, and registering one for `sbx` would mean writing to the Windows registry from Linux as a
 /// side effect of a notification. The visible cost is the name on the toast, which reads
 /// "Windows PowerShell"; the alternative costs a write to another operating system's configuration.
-fn toast_script(title: &str, body: &str) -> String {
-    let decoded = |s: &str| {
-        format!(
-            "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))",
-            crate::config::base64_encode(crate::sandbox::sanitize(s).as_bytes())
-        )
+fn toast_script(texts: &[&str]) -> String {
+    let texts = &texts[..texts.len().min(3)];
+    let template = if texts.len() == 3 {
+        "ToastText04"
+    } else {
+        "ToastText02"
     };
+    let lines: String = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            format!(
+                "$t.Item({i}).AppendChild($x.CreateTextNode(\
+                 [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')))) > $null\n",
+                crate::config::base64_encode(crate::sandbox::sanitize(text).as_bytes())
+            )
+        })
+        .collect();
     format!(
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, \
          ContentType=WindowsRuntime] > $null\n\
          [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, \
          ContentType=WindowsRuntime] > $null\n\
          $x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(\
-         [Windows.UI.Notifications.ToastTemplateType]::ToastText02)\n\
+         [Windows.UI.Notifications.ToastTemplateType]::{template})\n\
          $t = $x.GetElementsByTagName('text')\n\
-         $t.Item(0).AppendChild($x.CreateTextNode({title})) > $null\n\
-         $t.Item(1).AppendChild($x.CreateTextNode({body})) > $null\n\
+         {lines}\
          [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(\
          '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe'\
          ).Show([Windows.UI.Notifications.ToastNotification]::new($x))\n",
-        title = decoded(title),
-        body = decoded(body),
     )
 }
 
@@ -328,6 +339,84 @@ fn toast_is_visible() -> Option<bool> {
     Some(interop == desktop)
 }
 
+/// The interop launcher toasts are raised through, and the toasts it has raised that are still
+/// running. Shared by sbx's own refusals ([`WslToastSink`]) and a caged app's notifications under
+/// WSL ([`super::notify_relay`]).
+#[derive(Default)]
+pub(crate) struct Toaster {
+    /// The interop launcher, searched for once and kept — including the answer "there is none",
+    /// which is `Some(None)`, so a host without one does not pay for a search per toast either.
+    ///
+    /// Filled on the first toast rather than at construction, for the reason
+    /// [`WslToastSink::diagnosed`] gives: work placed in front of the first announcement is work a
+    /// short launch never gets past. Worth keeping at all because the search weighs each match's
+    /// owner and mode, which costs a `stat` per candidate, and under WSL several `PATH` entries
+    /// are on the Windows drive — once per launcher, not once per toast.
+    powershell: Option<Option<std::path::PathBuf>>,
+    /// The toasts already handed to Windows, kept so they can be reaped.
+    ///
+    /// A toast is spawned and never waited on, deliberately: an announcement must not cost a
+    /// launch an interop round-trip of its own time. A child nobody waits on stays a zombie in the
+    /// supervisor's table until the supervisor itself exits, and the supervisor outlives the
+    /// session — one entry per toast raised, on a process whose whole job is to keep running. They
+    /// are reaped on the way into the next toast, which is the next moment the owner is alive and
+    /// not in a hurry.
+    pending: Vec<std::process::Child>,
+}
+
+impl Toaster {
+    /// How many of the toasts handed to Windows are still running, once those that have finished
+    /// are reaped.
+    pub(crate) fn in_flight(&mut self) -> usize {
+        reap_finished(&mut self.pending);
+        self.pending.len()
+    }
+
+    /// Hand one toast showing `texts` (see [`toast_script`]) to Windows, without waiting for it.
+    /// Whether one was spawned: `false` when there is no trusted `powershell.exe` on the `PATH`, or
+    /// it could not be started.
+    pub(crate) fn raise(&mut self, texts: &[&str]) -> bool {
+        reap_finished(&mut self.pending);
+        // The lookup the visibility probe takes, so a binary that probe refused is never the one
+        // a toast is spawned from.
+        if self.powershell.is_none() {
+            self.powershell = Some(crate::store::find_trusted_on_path("powershell.exe"));
+        }
+        let Some(powershell) = self.powershell.as_ref().and_then(Option::as_ref) else {
+            return false;
+        };
+        match std::process::Command::new(powershell)
+            .args(["-NoProfile", "-Command", &toast_script(texts)])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                self.pending.push(child);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// A toaster that raises through `launcher` rather than the `powershell.exe` a `PATH` search
+    /// would find.
+    #[cfg(test)]
+    pub(crate) fn with_launcher(launcher: std::path::PathBuf) -> Toaster {
+        Toaster {
+            powershell: Some(Some(launcher)),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Count `child` as a toast still on its way to Windows.
+    #[cfg(test)]
+    pub(crate) fn hold(&mut self, child: std::process::Child) {
+        self.pending.push(child);
+    }
+}
+
 /// The WSL sink: a Windows toast, **and** the stderr line the fallback would have printed.
 ///
 /// Both, deliberately. Nothing in the toast call reports whether it was seen: a session mismatch,
@@ -343,25 +432,7 @@ struct WslToastSink {
     /// inside it lost its refusal entirely. Measured — a cage that refused a request and exited
     /// announced nothing at all.
     diagnosed: bool,
-    /// The interop launcher, searched for once and kept — including the answer "there is none",
-    /// which is `Some(None)`, so a host without one does not pay for a search per announcement
-    /// either.
-    ///
-    /// Filled on the first delivery rather than at construction, for the reason `diagnosed` gives
-    /// above: work placed in front of the first announcement is work a short launch never gets
-    /// past. Worth keeping at all because the search weighs each match's owner and mode, which
-    /// costs a `stat` per candidate, and under WSL several `PATH` entries are on the Windows
-    /// drive — once per sink, not once per toast.
-    powershell: Option<Option<std::path::PathBuf>>,
-    /// The toasts already handed to Windows, kept so they can be reaped.
-    ///
-    /// A toast is spawned and never waited on, deliberately: an announcement must not cost a
-    /// launch an interop round-trip of its own time. A child nobody waits on stays a zombie in the
-    /// supervisor's table until the supervisor itself exits, and the supervisor outlives the
-    /// session — one entry per announcement delivered, on a process whose whole job is to keep
-    /// running. Reaped on the way into the next delivery, which is the next moment this sink is
-    /// alive and not in a hurry.
-    pending: Vec<std::process::Child>,
+    toaster: Toaster,
 }
 
 /// Drop the toasts that have finished, keeping those still running.
@@ -385,22 +456,7 @@ impl Sink for WslToastSink {
         // interop round-trip of its own time on one. A failure to spawn is not a transport that is
         // gone either — the stderr half above is the delivery that always lands — so this sink
         // never asks to be replaced.
-        reap_finished(&mut self.pending);
-        // The lookup the visibility probe takes, so a binary that probe refused is never the one
-        // a toast is spawned from.
-        if self.powershell.is_none() {
-            self.powershell = Some(crate::store::find_trusted_on_path("powershell.exe"));
-        }
-        if let Some(powershell) = self.powershell.as_ref().and_then(Option::as_ref)
-            && let Ok(child) = std::process::Command::new(powershell)
-                .args(["-NoProfile", "-Command", &toast_script(summary, body)])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-        {
-            self.pending.push(child);
-        }
+        self.toaster.raise(&[summary, body]);
         if !self.diagnosed {
             self.diagnosed = true;
             // Last, so neither the line above nor the toast waits on it. What it explains is a
@@ -869,8 +925,7 @@ impl Notifier {
                         DaemonlessDesktop::Windows => Box::new(WslToastSink {
                             context: context.clone(),
                             diagnosed: false,
-                            powershell: None,
-                            pending: Vec::new(),
+                            toaster: Toaster::default(),
                         }),
                         DaemonlessDesktop::Mac => Box::new(MacNoteSink {
                             context: context.clone(),
@@ -1155,7 +1210,7 @@ mod tests {
     fn a_toast_script_contains_what_the_cage_wrote() {
         let title = "Blocked: evil'‘’‚‛\"; Start-Process calc.exe; #.test:443";
         let body = "line one\nline two";
-        let script = super::toast_script(title, body);
+        let script = super::toast_script(&[title, body]);
         assert!(
             !script.contains("Start-Process"),
             "the cage's text is not in the script as text: {script}"
@@ -1170,12 +1225,12 @@ mod tests {
         let quotes = |s: &str| s.matches('\'').count();
         assert_eq!(
             quotes(&script),
-            quotes(&super::toast_script("a", "b")),
+            quotes(&super::toast_script(&["a", "b"])),
             "{script}"
         );
         assert_eq!(
             script.lines().count(),
-            super::toast_script("a", "b").lines().count(),
+            super::toast_script(&["a", "b"]).lines().count(),
             "a newline in the cage's text adds no statement: {script}"
         );
         for text in [title, body] {
@@ -1185,6 +1240,24 @@ mod tests {
                 "{text:?} is carried as the base64 of what the sanitiser left: {script}"
             );
         }
+    }
+
+    /// Two texts are a title and a body, three a title and two lines; each lands in its own slot of
+    /// the template that has that many, and a text past the third is not carried at all.
+    #[test]
+    fn a_toast_script_fills_the_template_with_as_many_slots_as_texts() {
+        let two = super::toast_script(&["a", "b"]);
+        assert!(
+            two.contains("ToastText02") && !two.contains("$t.Item(2)"),
+            "{two}"
+        );
+        let three = super::toast_script(&["a", "b", "c"]);
+        assert!(
+            three.contains("ToastText04") && three.contains("$t.Item(2)"),
+            "{three}"
+        );
+        let four = super::toast_script(&["a", "b", "c", "dropped"]);
+        assert_eq!(four, three);
     }
 
     impl Sink for Recorder {
@@ -2186,8 +2259,7 @@ mod tests {
             // Already made, so the delivery does not also run the two interop round-trips of the
             // visibility probe, which this test is not about.
             diagnosed: true,
-            powershell: None,
-            pending: Vec::new(),
+            toaster: Toaster::default(),
         };
 
         // The invariant is that the slot is filled, not what it was filled with: `Some(None)` —
@@ -2195,7 +2267,7 @@ mod tests {
         // would be asserting whether this host is WSL.
         assert!(sink.deliver("first", "body", None).is_ok());
         assert!(
-            sink.powershell.is_some(),
+            sink.toaster.powershell.is_some(),
             "the first delivery must record that it searched, whatever it found"
         );
 
@@ -2205,20 +2277,20 @@ mod tests {
         let fake = tmp.join("launcher");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        sink.powershell = Some(Some(fake.clone()));
+        sink.toaster.powershell = Some(Some(fake.clone()));
 
         assert!(sink.deliver("second", "body", None).is_ok());
         assert_eq!(
-            sink.powershell.as_ref().and_then(Option::as_ref),
+            sink.toaster.powershell.as_ref().and_then(Option::as_ref),
             Some(&fake),
             "a delivery must not overwrite the launcher it was given"
         );
         assert_eq!(
-            sink.pending.len(),
+            sink.toaster.pending.len(),
             1,
             "the kept launcher is the one a toast is spawned from"
         );
-        for child in &mut sink.pending {
+        for child in &mut sink.toaster.pending {
             let _ = child.wait();
         }
     }

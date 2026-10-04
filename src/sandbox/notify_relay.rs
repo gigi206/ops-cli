@@ -100,6 +100,14 @@
 //! Mac, so a relayed note offers no actions and is never reported closed, and the app's icon and
 //! pixel hints are not shown.
 //!
+//! A WSL distribution is the same case with Windows as the desktop. There each call is raised as a
+//! Windows toast ([`WindowsToasts`]) through the launcher sbx's own refusal toasts take, again after
+//! every guard. A toast is shown under PowerShell's name whoever raised it, so the title is the
+//! supervisor's application name here too, and the app's summary and body are the two lines under
+//! it. Nothing comes back from Windows either: no actions, no close, no icon. Each toast is a
+//! `powershell.exe` started on the Windows side, so at most [`TOASTS_IN_FLIGHT`] of a cage's
+//! toasts are on their way at once, and a call past that is refused rather than queued.
+//!
 //! Lifecycle:[`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
 //! `async_io::block_on` (the pure-Rust async-io backend — no tokio, and the runtime never leaves this
 //! module). The thread waits for the in-cage `dbus-daemon` to create the private-bus socket (the
@@ -113,6 +121,7 @@
 
 use crate::diag;
 use crate::sandbox::locks::locked;
+use crate::sandbox::notify_sink::Toaster;
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt};
@@ -348,6 +357,80 @@ impl HostBus for MacQueue {
     }
 }
 
+/// The relay's destination in a WSL distribution: a Windows toast per `Notify`, raised through the
+/// [`Toaster`] sbx's own refusals use, in place of a daemon the distribution does not run.
+///
+/// What reaches it has been through [`Served::notify`] already. The toast's title is the
+/// supervisor's application name, which opens with [`RELAYED_BY`], and the app's summary and body
+/// are the two lines under it: Windows shows every one of these toasts under PowerShell's name, so
+/// the title is what tells a caged app's toast from sbx's refusal, whose title is what was refused.
+/// The ids are its own count, never `0`, as [`MacQueue`]'s are, and for the same reasons nothing
+/// comes back: no action is offered and no close is reported.
+struct WindowsToasts {
+    toaster: Mutex<Toaster>,
+    next: AtomicU32,
+}
+
+/// How many of a cage's toasts may be on their way to Windows at once.
+///
+/// Each one is a `powershell.exe` the relay starts on the Windows side and does not wait for, and
+/// one takes about a second to start .NET and raise its toast. A cage that calls `Notify` in a loop
+/// would otherwise start them as fast as it can call, on the host's processors; past this count a
+/// call is refused, as a full queue refuses one on the Mac, and the app hears an error it can retry.
+const TOASTS_IN_FLIGHT: usize = 4;
+
+impl WindowsToasts {
+    fn new(toaster: Toaster) -> WindowsToasts {
+        WindowsToasts {
+            toaster: Mutex::new(toaster),
+            next: AtomicU32::new(1),
+        }
+    }
+}
+
+/// The three texts a relayed call's toast shows: the title the supervisor set, then the cage's
+/// summary and body. Pure, so which of the cage's fields can reach the title is pinned by a test.
+fn toast_texts(call: &NotifyCall) -> [&str; 3] {
+    [&call.app_name, &call.summary, &call.body]
+}
+
+impl HostBus for WindowsToasts {
+    fn notify(&self, call: NotifyCall) -> BoxFuture<'_, zbus::Result<u32>> {
+        let mut toaster = locked(&self.toaster);
+        let raised = if toaster.in_flight() >= TOASTS_IN_FLIGHT {
+            Err(zbus::Error::Failure(
+                "Windows is still raising this cage's earlier toasts".to_string(),
+            ))
+        } else if toaster.raise(&toast_texts(&call)) {
+            Ok(self.next.fetch_add(1, Ordering::Relaxed))
+        } else {
+            Err(zbus::Error::Failure(
+                "no powershell.exe to raise a Windows toast with".to_string(),
+            ))
+        };
+        Box::pin(std::future::ready(raised))
+    }
+
+    fn close_notification(&self, _id: u32) -> BoxFuture<'_, zbus::Result<()>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn get_capabilities(&self) -> BoxFuture<'_, zbus::Result<Vec<String>>> {
+        Box::pin(std::future::ready(Ok(vec!["body".to_string()])))
+    }
+
+    fn get_server_information(
+        &self,
+    ) -> BoxFuture<'_, zbus::Result<(String, String, String, String)>> {
+        Box::pin(std::future::ready(Ok((
+            "sbx".to_string(),
+            "sbx".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+            "1.2".to_string(),
+        ))))
+    }
+}
+
 /// The host daemon's `ActionInvoked` signals as the relay reads them: the id and the action key, or
 /// `None` for a signal whose arguments did not decode.
 type ActionSignals = BoxStream<'static, Option<(u32, String)>>;
@@ -363,18 +446,26 @@ enum RelayTarget {
     Daemon,
     /// The Mac's notification directory ([`MacQueue`]).
     Mac,
+    /// Windows toasts ([`WindowsToasts`]).
+    Windows,
 }
 
-/// Where the relay sends: the host daemon whenever one answered, the Mac's directory only when none
-/// did and `fallback`, asked only then, names the Mac. Pure apart from `fallback`.
+/// Where the relay sends: the host daemon whenever one answered, and only when none did, the
+/// desktop `fallback` names — the Mac's directory or Windows toasts. A host with neither keeps the
+/// daemon, whose calls then fail as they would have. Pure apart from `fallback`, which is asked
+/// only when no daemon answered.
 fn relay_target(
     daemon_answered: bool,
     fallback: impl FnOnce() -> super::notify_sink::DaemonlessDesktop,
 ) -> RelayTarget {
-    if !daemon_answered && fallback() == super::notify_sink::DaemonlessDesktop::Mac {
-        RelayTarget::Mac
-    } else {
-        RelayTarget::Daemon
+    use super::notify_sink::DaemonlessDesktop;
+    if daemon_answered {
+        return RelayTarget::Daemon;
+    }
+    match fallback() {
+        DaemonlessDesktop::Mac => RelayTarget::Mac,
+        DaemonlessDesktop::Windows => RelayTarget::Windows,
+        DaemonlessDesktop::None => RelayTarget::Daemon,
     }
 }
 
@@ -1111,6 +1202,7 @@ async fn run(
     let destination: Box<dyn HostBus> = match target {
         RelayTarget::Daemon => Box::new(host.clone()),
         RelayTarget::Mac => Box::new(MacQueue::new(PathBuf::from(super::lima_mac::NOTIFY_MOUNT))),
+        RelayTarget::Windows => Box::new(WindowsToasts::new(Toaster::default())),
     };
     let served = Served {
         host: destination,
@@ -1123,8 +1215,8 @@ async fn run(
     let serving = serve_calls(&private_conn, &served, calls).fuse();
     futures_util::pin_mut!(serving);
 
-    // The daemon's signals, each reduced to its arguments. The Mac sends none back, so there the
-    // two streams never yield and the loop waits on the calls and the shutdown alone.
+    // The daemon's signals, each reduced to its arguments. Neither the Mac nor Windows sends any
+    // back, so there the two streams never yield and the loop waits on the calls and the shutdown alone.
     let (mut actions, mut closed): (ActionSignals, ClosedSignals) = match target {
         RelayTarget::Daemon => (
             host.receive_action_invoked()
@@ -1136,7 +1228,7 @@ async fn run(
                 .map(|sig| sig.args().ok().map(|a| (a.id, a.reason)))
                 .boxed(),
         ),
-        RelayTarget::Mac => (
+        RelayTarget::Mac | RelayTarget::Windows => (
             futures_util::stream::pending().boxed(),
             futures_util::stream::pending().boxed(),
         ),
@@ -1328,10 +1420,10 @@ mod tests {
         notes
     }
 
-    /// A host whose daemon answers keeps it, whatever else it mounts; the Mac's directory is taken
-    /// only when no daemon answered on a Mac guest, and the fallback is not even asked otherwise.
+    /// A host whose daemon answers keeps it, whatever else it is; the Mac's directory and Windows
+    /// toasts are taken only when no daemon answered, and the fallback is not even asked otherwise.
     #[test]
-    fn the_mac_directory_is_taken_only_where_no_daemon_answered() {
+    fn a_daemonless_desktop_is_taken_only_where_no_daemon_answered() {
         use crate::sandbox::notify_sink::DaemonlessDesktop;
         let unasked = || -> DaemonlessDesktop { panic!("asked although a daemon answered") };
         assert_eq!(relay_target(true, unasked), RelayTarget::Daemon);
@@ -1341,7 +1433,7 @@ mod tests {
         );
         assert_eq!(
             relay_target(false, || DaemonlessDesktop::Windows),
-            RelayTarget::Daemon
+            RelayTarget::Windows
         );
         assert_eq!(
             relay_target(false, || DaemonlessDesktop::None),
@@ -1402,6 +1494,109 @@ mod tests {
         let caps = async_io::block_on(served.get_capabilities()).unwrap();
         assert!(!caps.iter().any(|c| c == "actions"), "{caps:?}");
         async_io::block_on(served.close_notification(first)).unwrap();
+    }
+
+    /// The relay in front of Windows toasts raised through `toaster`.
+    fn served_by_windows(toaster: Toaster) -> (Served, Arc<OwnedIds>) {
+        let ours = Arc::new(OwnedIds::default());
+        let served = Served {
+            host: Box::new(WindowsToasts::new(toaster)),
+            ours: Arc::clone(&ours),
+            needles: Arc::new(std::sync::RwLock::new(Vec::new())),
+        };
+        (served, ours)
+    }
+
+    /// Windows shows every toast under PowerShell's name, so the title is the one place a caged
+    /// app's toast can be told from sbx's refusal. A cage that writes a refusal's words, and names
+    /// itself sbx, still gets a title that opens with the relay's mark, with its own summary and
+    /// body on the lines under it.
+    #[test]
+    fn a_caged_app_cannot_title_its_windows_toast_as_sbxs_refusal() {
+        let refusal = "Blocked: evil.com:443";
+        let host = FakeHost::default();
+        let served = served(&host);
+        async_io::block_on(served.notify(
+            "sbx".to_string(),
+            0,
+            String::new(),
+            refusal.to_string(),
+            "allow it: sbx net allow evil.com".to_string(),
+            Vec::new(),
+            HashMap::new(),
+            -1,
+        ))
+        .expect("the fake host takes the call");
+        let calls = locked(&host.calls);
+        let [title, summary, body] = toast_texts(&calls[0]);
+        assert!(title.starts_with(RELAYED_BY), "{title:?}");
+        assert_ne!(title, refusal);
+        assert_eq!(
+            summary, refusal,
+            "the cage's summary is the first line under the title"
+        );
+        assert_eq!(body, "allow it: sbx net allow evil.com");
+    }
+
+    /// Windows toasts answer like a daemon the relay can hold to its rules, as the Mac queue does:
+    /// ids that are never `0` and never repeat, and no action offered.
+    #[test]
+    fn windows_toasts_hand_out_ids_the_relay_can_rule_on() {
+        // `true` takes the launcher's arguments and exits at once, which is a toast raised.
+        let (served, ours) = served_by_windows(Toaster::with_launcher("/bin/true".into()));
+        let first = notify(&served, 0);
+        let second = notify(&served, first);
+        assert!(first != 0 && second != 0 && first != second);
+        assert!(ours.owns(first) && ours.owns(second));
+        let caps = async_io::block_on(served.get_capabilities()).unwrap();
+        assert!(!caps.iter().any(|c| c == "actions"), "{caps:?}");
+        async_io::block_on(served.close_notification(first)).unwrap();
+    }
+
+    /// Each toast is a process on the Windows side, so a cage that calls `Notify` in a loop is held
+    /// to [`TOASTS_IN_FLIGHT`] of them at once: the next call is refused while they run, and taken
+    /// again once they have finished.
+    #[test]
+    fn a_cage_has_at_most_a_few_toasts_on_their_way_at_once() {
+        // Toasts still on their way: each runs long enough for the refused call below to be made
+        // while all of them are alive, and ends on its own after that.
+        let mut toaster = Toaster::with_launcher("/bin/true".into());
+        for _ in 0..TOASTS_IN_FLIGHT {
+            toaster.hold(
+                std::process::Command::new("sleep")
+                    .arg("2")
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let (served, _) = served_by_windows(toaster);
+        let call = || {
+            async_io::block_on(served.notify(
+                "app".to_string(),
+                0,
+                String::new(),
+                "summary".to_string(),
+                String::new(),
+                Vec::new(),
+                HashMap::new(),
+                -1,
+            ))
+        };
+        let refused = call();
+        assert!(refused.is_err(), "{refused:?}");
+
+        let deadline = Instant::now() + SOCKET_WAIT;
+        let taken = loop {
+            let answer = call();
+            if answer.is_ok() || Instant::now() > deadline {
+                break answer;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        };
+        assert!(
+            taken.is_ok(),
+            "a call is taken again once the toasts ahead of it finished: {taken:?}"
+        );
     }
 
     /// The interface the private bus serves, in front of a recording host.

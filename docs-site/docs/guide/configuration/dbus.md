@@ -55,6 +55,10 @@ The app probes *that* portal and gets three things:
   sbx's icon whoever wrote it, so that title is what tells it from a refusal sbx raised, which
   opens with what was refused. Nothing comes back from the Mac: a relayed note offers no buttons,
   is never reported closed to the app, and shows neither the app's icon nor an image it attached.
+  A WSL distribution runs none either, and there they become Windows toasts, raised the way sbx's
+  own refusals are: titled `sandboxed · <app>`, with the app's summary and body on the two lines
+  under it, and with the same one-way limits. A toast is a `powershell.exe` started on the Windows
+  side, so a cage has at most four on their way at once, and a call past that fails.
 
   One file carries it: the GSettings **keyfile** the in-cage portal serves from. A Chromium/Electron
   app is its own portal client and reads the scheme straight off it. A **GTK app** reaches the same
