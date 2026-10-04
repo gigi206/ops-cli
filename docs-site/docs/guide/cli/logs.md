@@ -108,9 +108,12 @@ since part of a record would pass for all of it. That covers an answer that stop
 that closes every whole one, a session that closes the connection without reading the request (what
 it does to a reader it refuses, at its connection ceiling or its peer check), and one that does not
 answer in time. Under `--follow`, a later read that does not arrive in full moves nothing: the feed
-is asked again from where it was, so no event is skipped. `sbx proc logs`, `sbx fs logs` and `sbx
-ssh-agent logs` hold to the same rule; `sbx net logs` leaves out a session whose answer did not
-arrive in full, as it leaves out one it cannot reach, and its `--follow` asks again from the same
+is asked again from where it was, so no event is skipped, and it is named on standard error when it
+stops answering, once for each run of such reads rather than on every poll. A feed that did not
+answer in full at the first read is asked again too, from the start of its ring, and the header says
+its events are shown once a poll gets them whole. `sbx proc logs`, `sbx fs logs` and `sbx ssh-agent
+logs` hold to the same rule; `sbx net logs` names a session whose answer did not arrive in full and
+exits 1, and its `--follow` names it each time it stops answering and asks again from the same
 cursor.
 
 ## Ordering

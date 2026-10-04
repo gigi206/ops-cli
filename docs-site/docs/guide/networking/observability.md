@@ -528,7 +528,9 @@ would with the capture off, streaming included.
 `--follow` prints the current listing, then appends new events as they happen (a
 `tail -f`) until Ctrl-C, polling every `--interval` seconds (default 1). If the
 in-memory ring overflowed between polls, the dropped count is announced, never
-silently skipped; a session that ends is noted, and a new one is picked up. The
+silently skipped; a session that ends is noted, and a new one is picked up. A session
+that stops answering in full is named on standard error, once each time it stops, and
+asked again from where it was when it answers. The
 append shape is pipe-friendly, and `--json` streams one event object per line. An
 exchange whose traffic is being captured appears first as a bare line, then **once**
 more: complete, with its status and its traffic, when it finishes. A followed
@@ -595,7 +597,10 @@ This is the **open connections**, distinct from [`sbx net logs`](#sbx-net-logs) 
   it, so short API calls flash by in under a second even when the tunnel that served them
   stays open for the next one. The durable rows are raw `tcp://` tunnels (SSH, a database
   wire), WebSockets, and large L7 transfers in progress (a download, a streamed
-  completion). An idle session shows an empty list: that is normal.
+  completion). An idle session shows an empty list: that is normal. A session that was
+  reached and did not answer in full is named under its own header instead, for as long as
+  it does not answer, so it is not read as idle; each `--json` snapshot lists such sessions
+  under `unanswered`.
 
 Unlike the log, which `[observe] record` can keep, it is **live-only and never written to
 disk**, read from the same per-session control socket, and only a **filtering** posture (`deny`/`allow`/`ask`) runs a

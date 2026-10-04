@@ -202,7 +202,7 @@ verb, lists what is parked (id `<pid>.<seq>`; identical retries collapse to `×N
 remembers for the live session; `--save` persists a rule; `watch` redraws live. See
 [Ask mode](../networking/ask). `watch` needs a terminal: in a pipe, use the one-shot
 listing or add `--json`. The listing names a session that does not answer in full and exits 1
-([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)); `watch` leaves it out of the frame.
+([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)); `watch` names it in its frame, for as long as it does not answer.
 
 ## `sbx net stats`
 
@@ -242,7 +242,7 @@ listing exits 1 ([exit codes](../reference/exit-codes#a-listing-that-could-not-r
 | `--with-status` | add the upstream HTTP status the server answered, for a completed inspected-`https` request only: an L4 (`tcp://`) splice, a refusal or an `error` shows `-`, having no HTTP response to read. Distinct from the verdict: an allowed request can still get a 404. Under `--follow`, an event whose response has not returned yet prints once without a status and again carrying it, tagged `update`, since a live tail cannot un-print a line |
 | `--with-headers` | the request and response heads that actually crossed (needs `capture`) |
 | `--with-body` | the leading bytes of each body as well (needs `capture = "bodies"`) |
-| `-f`, `--follow` | tail the log instead of printing a snapshot. A session that ends waits for the follow's next read, at most two seconds, so what arrived since the last read still reaches it |
+| `-f`, `--follow` | tail the log instead of printing a snapshot. A session that ends waits for the follow's next read, at most two seconds, so what arrived since the last read still reaches it. A session that stops answering in full is named on standard error, once each time it stops, and asked again from where it was |
 | `-i <secs>` | the poll interval under `--follow` |
 | `--json` | one JSON object per event (NDJSON), for a pipe. Each carries `seq`, the event's number in its session; under `--follow`, each also carries `update`, `true` when it shows an event again |
 
@@ -282,8 +282,10 @@ WebSockets, and large L7 transfers in progress. Byte counts are application byte
 inspected `https`/`http` flow, encrypted bytes on a raw `tcp` splice. The redraw needs a
 terminal; `--json` emits one snapshot object per tick (NDJSON) for a pipe. Only a filtering
 posture (`deny`/`allow`/`ask`) runs a proxy, so only those sessions have flows. A session that
-does not answer in full is left out of the frame rather than named on every tick. See
-[Egress observability](../networking/observability).
+does not answer in full is named in the frame, under its own header, for as long as it does not
+answer, so it is not read as one with nothing open. Each `--json` snapshot carries `flows` and
+`unanswered`, the sessions that did not answer, each as a `pid` and an `error`, empty when every
+session answered. See [Egress observability](../networking/observability).
 
 ## Examples
 

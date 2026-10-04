@@ -2,9 +2,10 @@
 //! network control plane.
 //!
 //! This file is the verb tree itself: the three dispatchers behind `net`, `net pending` and
-//! `net groups`, and the session header line every listing that spans sessions shares. Each verb
-//! family is a child module, and none of them calls another — the dispatch below and that one
-//! shared writer are the only edges between them:
+//! `net groups`, the session header line every listing that spans sessions shares, and the line a
+//! redrawn frame names an unanswered session with. Each verb family is a child module, and none of
+//! them calls another — the dispatch below and those shared writers are the only edges between
+//! them:
 //!
 //! * [`mod@pending`] — the `ask`-posture control plane: what is parked, watching it, answering
 //!   one request or draining a session, and saving the rule an answer implies.
@@ -156,4 +157,24 @@ fn write_session_header(
         },
         pal,
     );
+}
+
+/// Name, inside a frame that redraws in place, each session that was reached and did not answer in
+/// full, under its own session header, so what it holds is not read as absent. The line belongs to
+/// this round: it goes when the session answers again, and repeating it costs no scrollback.
+///
+/// `missing` finishes the sentence ("its open flows are not in this frame").
+fn write_unanswered(
+    o: &mut String,
+    unread: &[(u32, std::io::Error)],
+    context: &[(u32, PathBuf, String)],
+    missing: &str,
+    pal: &style::Palette,
+) {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    for (pid, e) in unread {
+        write_session_header(o, *pid, context, pal);
+        let _ = writeln!(o, "    {dim}did not answer in full ({e}), so {missing}{r}");
+    }
 }

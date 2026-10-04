@@ -121,6 +121,40 @@ pub(crate) fn warn_unanswered(verb: &str, pid: u32, e: &std::io::Error, missing:
     ));
 }
 
+/// What a `--follow` has already said about the reads that did not answer in full, so it names one
+/// each time it stops answering and stays quiet while it goes on not answering.
+///
+/// A follow polls the same session every round. Warning on every unanswered poll would bury the
+/// stream under one line per round; warning on none read exactly like a session with nothing new,
+/// which is what every follow did. The key is whatever the follow polls: a session's pid, or a feed's
+/// name when one session is read through several feeds.
+pub(crate) struct Unanswering<K>(std::collections::HashSet<K>);
+
+impl<K: Eq + std::hash::Hash> Unanswering<K> {
+    /// A follow that has named nothing yet.
+    pub(crate) fn new() -> Self {
+        Unanswering(std::collections::HashSet::new())
+    }
+
+    /// Record a read of `key` that did not answer in full, and say whether it starts a run of them,
+    /// which is when the caller names it.
+    pub(crate) fn stalled(&mut self, key: K) -> bool {
+        self.0.insert(key)
+    }
+
+    /// Record a read of `key` that answered whole, so the next read that does not answer is named
+    /// again.
+    pub(crate) fn answered(&mut self, key: &K) {
+        self.0.remove(key);
+    }
+
+    /// Forget every key `keep` refuses: what a follow no longer polls, such as a session that has
+    /// gone.
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&K) -> bool) {
+        self.0.retain(keep);
+    }
+}
+
 /// Refuse an argument a verb does not take, rather than ignoring it. Silently dropping one is worse
 /// than not supporting it: `sbx plugins store ls --installed` would print the whole listing, which
 /// reads as a filtered result and quietly answers a different question than the one asked — and a

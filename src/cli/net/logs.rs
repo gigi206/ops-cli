@@ -352,8 +352,13 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         view.wants_capture(),
         Some(follow),
     );
-    // Said once, for the seed: the polls that follow leave such a session out without repeating it.
+    // Named for the seed, and again by a poll only when a session stops answering after it had
+    // answered: a session that goes on not answering is named once, not on every round.
     warn_unanswered_logs(&swept.unread);
+    let mut unanswering = crate::cli::Unanswering::new();
+    for (pid, _) in &swept.unread {
+        unanswering.stalled(*pid);
+    }
     let sessions = swept.read;
     let has_events = sessions
         .iter()
@@ -414,6 +419,9 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
             .copied()
             .filter(|p| !live.contains(p))
             .collect();
+        // A session that has gone is forgotten here too, so a later one under its pid that does
+        // not answer is named.
+        unanswering.retain(|pid| live.contains(pid));
         for pid in ended {
             cursor.remove(&pid);
             printed_from.remove(&pid);
@@ -437,16 +445,31 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
             let after_amend = view
                 .shows_amendments()
                 .then(|| entry.map_or(0, |(_, amend)| amend));
-            let Ok(snap) = sandbox::control::read_log(
+            let snap = match sandbox::control::read_log(
                 &sandbox::control::control_socket(data_dir, pid),
                 after,
                 after_amend,
                 view.all,
                 view.wants_capture(),
                 Some(follow),
-            ) else {
-                continue; // a session that vanished mid-read is handled next tick
+            ) {
+                Ok(snap) => snap,
+                // Reached, and the answer did not arrive in full. Its cursor stays where it was, so
+                // what it holds past it is shown when it answers again.
+                Err(e) if sandbox::lens::unanswered(&e) => {
+                    if unanswering.stalled(pid) {
+                        crate::cli::warn_unanswered(
+                            "net logs",
+                            pid,
+                            &e,
+                            "its events are shown when it answers again",
+                        );
+                    }
+                    continue;
+                }
+                Err(_) => continue, // a session that vanished mid-read is handled next tick
             };
+            unanswering.answered(&pid);
             // A gap between polls (the ring overflowed) — surfaced, never silent.
             if snap.dropped > 0 {
                 if view.json {

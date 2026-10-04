@@ -374,13 +374,28 @@ fn live_view<E>(
     // end-of-session signal (a local UDS connect does not fail transiently); Ctrl+C stops it before
     // then, and a closed downstream pipe ends it cleanly too. An answer that did not arrive in full
     // moves nothing: the next poll asks again from the same cursor, and a session that has really
-    // gone fails that poll's connect.
+    // gone fails that poll's connect. It is named on standard error when the session stops
+    // answering, once for each run of such polls rather than on every one.
     let mut cursor = first.head;
+    let mut unanswering = crate::cli::Unanswering::new();
     loop {
         std::thread::sleep(FOLLOW_INTERVAL);
         let snap = match (view.read)(&socket, Some(cursor)) {
-            Ok(s) => s,
-            Err(e) if crate::sandbox::lens::unanswered(&e) => continue,
+            Ok(s) => {
+                unanswering.answered(&pid);
+                s
+            }
+            Err(e) if crate::sandbox::lens::unanswered(&e) => {
+                if unanswering.stalled(pid) {
+                    crate::cli::warn_unanswered(
+                        view.verb,
+                        pid,
+                        &e,
+                        "its events are shown when it answers again",
+                    );
+                }
+                continue;
+            }
             Err(_) => {
                 if !json {
                     let mut out = std::io::stdout().lock();
@@ -1050,9 +1065,10 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     let mut unfollowable: Vec<&str> = Vec::new();
     // Records that were cut short: named once, beside the feeds that are missing entirely.
     let mut truncated: Vec<&str> = Vec::new();
-    // Feeds whose answer ended before its `ok`: there, but nothing of theirs is shown, since part of
-    // an answer would pass for all of it.
-    let mut cut: Vec<&str> = Vec::new();
+    // Feeds that were reached and did not answer in full: there, but nothing of theirs is shown,
+    // since part of an answer would pass for all of it. A follow keeps their cursor at the start and
+    // asks them again on every poll.
+    let mut cut: Vec<&'static str> = Vec::new();
     for feed in &mut feeds {
         // A running session is read from its ring, which holds what its record does and what has
         // not reached the disk yet; a finished one only exists as a file.
@@ -1090,7 +1106,6 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
             }
             Err(e) if live && crate::sandbox::lens::unanswered(&e) => {
                 cut.push(feed.name);
-                feed.cursor = None;
             }
             Err(_) => {
                 absent.push((feed.name, if live { feed.absent } else { feed.no_record }));
@@ -1179,7 +1194,12 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                 for name in &cut {
                     writeln!(
                         out,
-                        "  {d}{name}: its answer did not arrive in full, so none of it is shown{r}"
+                        "  {d}{name}: its answer did not arrive in full, so none of it is shown{}{r}",
+                        if follow {
+                            " until a poll gets it whole"
+                        } else {
+                            ""
+                        }
                     )?;
                 }
                 // Said out loud rather than left to look like a quiet feed: this one answered, and
@@ -1222,9 +1242,10 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Nothing left to poll before the first sleep: every feed either did not answer or answered
+    // Nothing left to poll before the first sleep: every feed either was not there or answered
     // without a cursor, and what was printed above is the whole of their record. Saying the session
-    // ended here would report a live session as finished, so the follow declines instead.
+    // ended here would report a live session as finished, so the follow declines instead. A feed
+    // that did not answer in full still carries its cursor, so it is polled.
     if let Some(end) = follow_end(&feeds, !unfollowable.is_empty()) {
         if !json {
             let mut out = std::io::stdout().lock();
@@ -1242,9 +1263,24 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     // The round's rows are written **before** its end is acted on. A feed can lose its cursor on a
     // *successful* read that handed back rows, so returning first discarded the batch just
     // collected and closed the view with a verdict about a session whose record it was holding.
+    //
+    // A feed that stops answering in full is named on standard error, once for each run of such
+    // polls. One cut at the first read was named in the header already.
+    let mut unanswering = crate::cli::Unanswering::new();
+    for name in &cut {
+        unanswering.stalled(*name);
+    }
     loop {
         std::thread::sleep(FOLLOW_INTERVAL);
-        let round = follow_round(&mut feeds);
+        let round = follow_round(&mut feeds, &mut unanswering);
+        for (name, e) in &round.stalled {
+            crate::cli::warn_unanswered(
+                "logs",
+                pid,
+                e,
+                &format!("its {name} rows are shown when that feed answers again"),
+            );
+        }
         let mut out = std::io::stdout().lock();
         let wrote = (|| -> std::io::Result<()> {
             if round.evicted > 0 && !json {
@@ -1325,6 +1361,9 @@ struct FollowRound {
     evicted: u64,
     /// Set when no feed is left to poll, with the reason.
     end: Option<FollowEnd>,
+    /// The feeds that stopped answering in full this round after answering whole, each with why:
+    /// the ones to name. A feed that goes on not answering is not here again.
+    stalled: Vec<(&'static str, std::io::Error)>,
 }
 
 /// Poll every feed that still carries a cursor, past that cursor.
@@ -1334,27 +1373,42 @@ struct FollowRound {
 /// transiently), while a successful read that hands back no cursor is a feed that cannot say what
 /// is new and so is read once and not followed. When the last cursor goes, only the first of those
 /// is the session ending. A read whose answer did not arrive in full is neither: the feed keeps its
-/// cursor and is asked again from it next round.
-fn follow_round(feeds: &mut [Feed]) -> FollowRound {
+/// cursor and is asked again from it next round, and `unanswering` decides whether this round is
+/// the one that names it.
+fn follow_round(
+    feeds: &mut [Feed],
+    unanswering: &mut crate::cli::Unanswering<&'static str>,
+) -> FollowRound {
     let mut rows = Vec::new();
     let mut evicted = 0;
     let mut lost_cursor = false;
+    let mut stalled = Vec::new();
     for feed in feeds.iter_mut() {
         let Some(cursor) = feed.cursor else { continue };
         match (feed.read)(&feed.socket, Some(cursor)) {
             Ok((batch, head, dropped)) => {
+                unanswering.answered(&feed.name);
                 rows.extend(batch);
                 evicted += dropped;
                 lost_cursor |= head.is_none();
                 feed.cursor = head;
             }
-            Err(e) if crate::sandbox::lens::unanswered(&e) => {}
+            Err(e) if crate::sandbox::lens::unanswered(&e) => {
+                if unanswering.stalled(feed.name) {
+                    stalled.push((feed.name, e));
+                }
+            }
             Err(_) => feed.cursor = None,
         }
     }
     rows.sort_by_key(|r| r.at_epoch_ms);
     let end = follow_end(feeds, lost_cursor);
-    FollowRound { rows, evicted, end }
+    FollowRound {
+        rows,
+        evicted,
+        end,
+        stalled,
+    }
 }
 
 #[cfg(test)]
@@ -1429,7 +1483,7 @@ mod tests {
             record: None,
             cursor: Some(0),
         }];
-        let round = follow_round(&mut feeds);
+        let round = follow_round(&mut feeds, &mut crate::cli::Unanswering::new());
         assert_eq!(round.rows.len(), 1, "the rows this round read are carried");
         assert_eq!(round.rows[0].subject, "sync");
         assert_eq!(
@@ -1458,7 +1512,7 @@ mod tests {
             record: None,
             cursor: Some(0),
         }];
-        let round = follow_round(&mut feeds);
+        let round = follow_round(&mut feeds, &mut crate::cli::Unanswering::new());
         assert!(round.rows.is_empty());
         assert_eq!(round.end, Some(FollowEnd::SessionEnded));
         assert_eq!(round.end.unwrap().note(4242), "session 4242 ended");
@@ -1490,7 +1544,7 @@ mod tests {
                 cursor: Some(0),
             },
         ];
-        let round = follow_round(&mut feeds);
+        let round = follow_round(&mut feeds, &mut crate::cli::Unanswering::new());
         assert_eq!(round.rows.len(), 1);
         assert_eq!(round.end, None);
     }
@@ -1513,7 +1567,8 @@ mod tests {
                 record: None,
                 cursor: Some(5),
             }];
-            let round = follow_round(&mut feeds);
+            let mut unanswering = crate::cli::Unanswering::new();
+            let round = follow_round(&mut feeds, &mut unanswering);
             assert!(round.rows.is_empty());
             assert_eq!(
                 feeds[0].cursor,
@@ -1521,7 +1576,51 @@ mod tests {
                 "{shape}: the cursor stays where the last whole answer put it"
             );
             assert_eq!(round.end, None, "{shape}: not the session ending");
+            let named: Vec<&str> = round.stalled.iter().map(|(name, _)| *name).collect();
+            assert_eq!(
+                named,
+                ["proc"],
+                "{shape}: the feed is named when it stops answering"
+            );
+            let again = follow_round(&mut feeds, &mut unanswering);
+            assert!(
+                again.stalled.is_empty(),
+                "{shape}: a feed that goes on not answering is not named on every round"
+            );
         }
+    }
+
+    /// A feed is named each time it stops answering, not once for the whole follow: after a round it
+    /// answered whole, the next one that does not answer is named again. Every follow shares this
+    /// tracker, so the order of reads below stands for theirs too.
+    #[test]
+    fn a_feed_that_answers_and_then_stops_again_is_named_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn read(_: &Path, after: Option<u64>) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+            match READS.fetch_add(1, Ordering::SeqCst) {
+                1 => Ok((Vec::new(), after, 0)),
+                _ => Err(std::io::ErrorKind::ConnectionReset.into()),
+            }
+        }
+        let mut feeds = vec![Feed {
+            name: "proc",
+            socket: PathBuf::from("/nonexistent"),
+            absent: "not observed",
+            read,
+            no_record: "no session record",
+            record: None,
+            cursor: Some(5),
+        }];
+        let mut unanswering = crate::cli::Unanswering::new();
+        let named: Vec<usize> = (0..4)
+            .map(|_| follow_round(&mut feeds, &mut unanswering).stalled.len())
+            .collect();
+        assert_eq!(
+            named,
+            [1, 0, 1, 0],
+            "refused, answered, refused, refused: named on the first refusal of each run"
+        );
     }
 
     /// The single-lens view does the same: after a cut answer, and after a refused one, it asks

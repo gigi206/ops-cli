@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::{diag, help, sandbox, style};
 use crate::{egress_dir_or_fail, interval_seconds, pending_session_context, session_pids_for_app};
 
-use super::write_session_header;
+use super::{write_session_header, write_unanswered};
 
 /// Parsed `sbx net live` options: the redraw interval, an optional app filter, and JSON output.
 #[derive(Debug)]
@@ -51,22 +51,26 @@ fn parse_live_args(args: &[OsString]) -> Result<LiveArgs, String> {
 /// Query the live control sockets for the tunnels open right now, scoped to one app's session(s) when
 /// `app` is set, and pair them with their registry context (`(pid, project, label)`). The shared
 /// gather behind each `net live` tick. No launch / nix / network.
+///
+/// A session that was reached and did not answer in full comes back in [`Swept::unread`], scoped
+/// the same way, and each tick names it in its frame.
+///
+/// [`Swept::unread`]: sandbox::control::Swept::unread
 fn collect_flows(
     data_dir: &Path,
     app: Option<&str>,
 ) -> (
-    Vec<sandbox::control::SessionFlows>,
+    sandbox::control::Swept<sandbox::control::SessionFlows>,
     Vec<(u32, PathBuf, String)>,
 ) {
-    // A session that did not answer in full is left out of this redrawn view: it is said by the
-    // one-shot listings, and a warning repeated on every tick would bury the frame.
-    let mut sessions = sandbox::control::flows_all(data_dir).read;
+    let mut swept = sandbox::control::flows_all(data_dir);
     if let Some(name) = app {
         let pids = session_pids_for_app(data_dir, name);
-        sessions.retain(|s| pids.contains(&s.pid));
+        swept.read.retain(|s| pids.contains(&s.pid));
+        swept.unread.retain(|(pid, _)| pids.contains(pid));
     }
     let context = pending_session_context(data_dir);
-    (sessions, context)
+    (swept, context)
 }
 
 /// Render a flow's age compactly: `12s`, `3m04s`, `2h05m`.
@@ -84,8 +88,13 @@ fn format_flow_age(secs: u64) -> String {
 /// open right now grouped under a per-session header (registry label + project), each a
 /// `host:port  proto  age  ↑up ↓down` line. An empty listing says so and names what populates it.
 /// `now_ms` is passed in (not read from the clock) so the age column is deterministic under test.
+///
+/// A session in `unread` was reached and did not answer in full. It is named at the foot of the
+/// frame, and while one is, the frame never says no tunnel is open: that would read as a session
+/// with nothing open.
 fn render_live(
     sessions: &[sandbox::control::SessionFlows],
+    unread: &[(u32, std::io::Error)],
     context: &[(u32, PathBuf, String)],
     app: Option<&str>,
     now_ms: u128,
@@ -95,7 +104,7 @@ fn render_live(
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let mut o = String::new();
     let total: usize = sessions.iter().map(|s| s.flows.len()).sum();
-    if total == 0 {
+    if total == 0 && unread.is_empty() {
         match app {
             Some(name) => {
                 let _ = writeln!(
@@ -142,15 +151,26 @@ fn render_live(
             );
         }
     }
+    write_unanswered(
+        &mut o,
+        unread,
+        context,
+        "its open flows are not in this frame",
+        pal,
+    );
     o
 }
 
 /// Emit one `sbx net live --json` snapshot object (the whole state this tick, NDJSON — one object per
 /// line, not one per flow: a live view is a state, not an event stream). Each flow carries its session
 /// context, destination, transport, age, and byte totals.
+///
+/// `unanswered` is always present, and lists each session that was reached this tick and did not
+/// answer in full, with why, so an empty `flows` beside it is not read as nothing open there.
 fn flush_live_json(
     out: &mut impl std::io::Write,
     sessions: &[sandbox::control::SessionFlows],
+    unread: &[(u32, std::io::Error)],
     context: &[(u32, PathBuf, String)],
     now_ms: u128,
 ) -> std::io::Result<()> {
@@ -175,7 +195,11 @@ fn flush_live_json(
             })
         })
         .collect();
-    let obj = serde_json::json!({ "flows": flows });
+    let unanswered: Vec<_> = unread
+        .iter()
+        .map(|(pid, e)| serde_json::json!({ "pid": pid, "error": e.to_string() }))
+        .collect();
+    let obj = serde_json::json!({ "flows": flows, "unanswered": unanswered });
     writeln!(out, "{obj}")?;
     out.flush()
 }
@@ -216,17 +240,24 @@ pub(super) fn net_live(args: &[OsString]) -> ExitCode {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let (sessions, context) = collect_flows(&data_dir, parsed.app.as_deref());
+        let (swept, context) = collect_flows(&data_dir, parsed.app.as_deref());
         // Build this tick's frame, then write it once — a broken downstream pipe (`… | head`) is
         // detected on the single write and ends the view cleanly (Rust ignores SIGPIPE).
         let mut out = std::io::stdout().lock();
         let wrote = if parsed.json {
             // One snapshot object per tick (NDJSON) — a live state, not a per-flow event stream.
-            flush_live_json(&mut out, &sessions, &context, now_ms)
+            flush_live_json(&mut out, &swept.read, &swept.unread, &context, now_ms)
         } else {
             // `top`-style in-place redraw: home the cursor, paint the frame, then clear to end of
             // screen (keeps scrollback intact and erases a shorter frame's trailing lines).
-            let body = render_live(&sessions, &context, parsed.app.as_deref(), now_ms, &pal);
+            let body = render_live(
+                &swept.read,
+                &swept.unread,
+                &context,
+                parsed.app.as_deref(),
+                now_ms,
+                &pal,
+            );
             write!(
                 out,
                 "\x1b[H{dim}live egress · refresh {secs}s · Ctrl-C to quit{r}\n{body}\x1b[J"
@@ -323,7 +354,7 @@ mod tests {
             PathBuf::from("/home/u/proj"),
             "app:demo-app".to_string(),
         )];
-        let out = render_live(&sessions, &ctx, None, now_ms, &pal);
+        let out = render_live(&sessions, &[], &ctx, None, now_ms, &pal);
         assert!(out.contains("open egress flows:"), "header: {out}");
         assert!(
             out.contains("session 4242 [app:demo-app] /home/u/proj"),
@@ -341,12 +372,88 @@ mod tests {
         );
 
         // An empty listing names what populates it, and an app filter names the app.
-        let empty = render_live(&[], &[], None, now_ms, &pal);
+        let empty = render_live(&[], &[], &[], None, now_ms, &pal);
         assert!(empty.contains("no egress tunnel is open"), "empty: {empty}");
-        let empty_app = render_live(&[], &[], Some("demo-app"), now_ms, &pal);
+        let empty_app = render_live(&[], &[], &[], Some("demo-app"), now_ms, &pal);
         assert!(
             empty_app.contains("app `demo-app`"),
             "app-scoped empty: {empty_app}"
         );
+    }
+
+    /// A session reached that did not answer in full is named in the frame, under its own header,
+    /// beside the sessions that did answer, and while one is, the frame does not say no tunnel is
+    /// open. Left out, it read exactly like a session with nothing open.
+    #[test]
+    fn a_session_that_did_not_answer_is_named_in_the_frame() {
+        let pal = style::Palette::plain();
+        let unread = || {
+            vec![(
+                5151u32,
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            )]
+        };
+        let ctx = vec![(
+            5151u32,
+            PathBuf::from("/home/u/other"),
+            "app:demo-tool".to_string(),
+        )];
+
+        for app in [None, Some("demo-tool")] {
+            let alone = render_live(&[], &unread(), &ctx, app, 10_000, &pal);
+            assert!(
+                alone.contains("session 5151 [app:demo-tool] /home/u/other"),
+                "{app:?}: under its own header: {alone}"
+            );
+            assert!(
+                alone.contains("did not answer in full")
+                    && alone.contains("its open flows are not in this frame"),
+                "{app:?}: named, with what is missing: {alone}"
+            );
+            assert!(!alone.contains("none"), "{app:?}: no empty claim: {alone}");
+        }
+
+        let answered = vec![sandbox::control::SessionFlows {
+            pid: 4242,
+            flows: vec![sandbox::control::FlowSnapshot {
+                host: "api.test".into(),
+                port: 443,
+                proto: sandbox::control::Proto::Https,
+                start_epoch_ms: 7_000,
+                up: 1,
+                down: 1,
+            }],
+        }];
+        let both = render_live(&answered, &unread(), &ctx, None, 10_000, &pal);
+        assert!(both.contains("api.test:443"), "the answer is shown: {both}");
+        assert!(
+            both.contains("session 5151") && both.contains("did not answer in full"),
+            "and the silent session is named beside it: {both}"
+        );
+    }
+
+    /// Every `--json` snapshot carries `unanswered`, empty when every session answered, so a
+    /// consumer reads an empty `flows` beside a session that did not answer for what it is.
+    #[test]
+    fn a_json_snapshot_names_the_sessions_that_did_not_answer() {
+        let snapshot = |unread: &[(u32, std::io::Error)]| {
+            let mut out = Vec::new();
+            flush_live_json(&mut out, &[], unread, &[], 0).expect("write the snapshot");
+            serde_json::from_slice::<serde_json::Value>(&out).expect("one JSON object")
+        };
+        let quiet = snapshot(&[]);
+        assert_eq!(quiet["unanswered"], serde_json::json!([]), "{quiet}");
+        let named = snapshot(&[(
+            5151,
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        )]);
+        assert_eq!(named["unanswered"][0]["pid"], 5151, "{named}");
+        assert!(
+            named["unanswered"][0]["error"]
+                .as_str()
+                .is_some_and(|e| !e.is_empty()),
+            "why it did not answer: {named}"
+        );
+        assert_eq!(named["flows"], serde_json::json!([]), "{named}");
     }
 }

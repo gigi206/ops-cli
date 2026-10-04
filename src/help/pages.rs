@@ -3019,7 +3019,9 @@ pub(super) const PAGES: &[Page] = &[
             request appears as soon as an agent triggers it. Answer it from another shell with\n\
             `sbx net pending allow|deny <id>`; the watch picks up the change on the next refresh.\n\
             Ctrl-C quits. Needs a terminal — for a pipe or a script use the one-shot listing (`--json`).\n\
-            No launch, no nix, no network.",
+            A session that was reached and did not answer in full is named in the frame, for as long\n\
+            as it does not answer, so it is not read as one with nothing parked. No launch, no nix,\n\
+            no network.",
     },
     Page {
         path: &["net", "pending", "allow"],
@@ -3328,7 +3330,12 @@ pub(super) const PAGES: &[Page] = &[
             The redraw needs a terminal; use `--json` to script it (one snapshot object per tick,\n\
             each flow carrying its session, destination, transport, age, and byte totals). Read live\n\
             from the same control sockets `sbx net logs` uses — host-side, no launch, no nix, no\n\
-            network.",
+            network.\n\
+            \n\
+            A session that was reached and did not answer in full is named in the frame, under its\n\
+            own header, for as long as it does not answer, so it is not read as one with nothing\n\
+            open; each `--json` snapshot lists such sessions under `unanswered`, each as a `pid` and\n\
+            an `error`.",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {

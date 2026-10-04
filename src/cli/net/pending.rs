@@ -18,7 +18,7 @@ use crate::{
     session_pids_for_app, session_pids_for_project, split_scope,
 };
 
-use super::write_session_header;
+use super::{write_session_header, write_unanswered};
 
 /// Query the live control sockets for the parked requests, scoped to one app's session(s) when
 /// `app` is set, and pair them with their registry context (`(pid, project, label)`). The shared
@@ -167,7 +167,7 @@ pub(super) fn net_pending_list(args: &[OsString]) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     out!(
         "{}",
-        render_pending(&sessions, &context, app.as_deref(), &pal)
+        render_pending(&sessions, &[], &context, app.as_deref(), &pal)
     );
     listed
 }
@@ -242,10 +242,14 @@ pub(super) fn net_pending_watch(args: &[OsString]) -> ExitCode {
     let (dim, r) = (pal.dim, pal.reset);
     let secs = parsed.interval.as_secs();
     loop {
-        // A session that did not answer in full is left out of this redrawn frame, as `net live`
-        // leaves it out; the one-shot listing names it.
         let (swept, context) = collect_pending(&data_dir, parsed.app.as_deref());
-        let body = render_pending(&swept.read, &context, parsed.app.as_deref(), &pal);
+        let body = render_pending(
+            &swept.read,
+            &swept.unread,
+            &context,
+            parsed.app.as_deref(),
+            &pal,
+        );
         // `top`-style in-place redraw: home the cursor, paint the frame, then clear from the cursor to
         // the end of the screen. This keeps the terminal scrollback intact (unlike `\x1b[3J`) and
         // erases any trailing lines a shorter frame leaves behind, with no full-screen blank flicker.
@@ -307,8 +311,13 @@ fn group_pending(rows: &[sandbox::control::PendingRow]) -> Vec<PendingGroup<'_>>
 /// a single `×N` line. An empty listing says so and points at how requests arrive (an `ask`-posture
 /// launch); under an `--app` filter it names the app, so an empty result is not mistaken for
 /// "nothing parked anywhere" when other apps do have requests.
+///
+/// A session in `unread` was reached and did not answer in full. The `watch` frame names it below
+/// the parked requests, and while one is, the frame never says nothing is parked. The one-shot
+/// listing passes none: it names such a session on standard error and exits 1.
 fn render_pending(
     sessions: &[sandbox::control::SessionPending],
+    unread: &[(u32, std::io::Error)],
     context: &[(u32, PathBuf, String)],
     app: Option<&str>,
     pal: &style::Palette,
@@ -317,7 +326,7 @@ fn render_pending(
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let mut o = String::new();
     let total: usize = sessions.iter().map(|s| s.rows.len()).sum();
-    if total == 0 {
+    if total == 0 && unread.is_empty() {
         match app {
             Some(name) => {
                 let _ = writeln!(
@@ -372,14 +381,23 @@ fn render_pending(
             );
         }
     }
-    let _ = writeln!(
-        o,
-        "  {dim}answer: sbx net pending allow <id> [--save --local|--global|--app <name>]{r}"
+    write_unanswered(
+        &mut o,
+        unread,
+        context,
+        "what it has parked is not in this frame",
+        pal,
     );
-    let _ = writeln!(
-        o,
-        "  {dim}        sbx net pending allow|deny --all  (drain every parked request at once){r}"
-    );
+    if total > 0 {
+        let _ = writeln!(
+            o,
+            "  {dim}answer: sbx net pending allow <id> [--save --local|--global|--app <name>]{r}"
+        );
+        let _ = writeln!(
+            o,
+            "  {dim}        sbx net pending allow|deny --all  (drain every parked request at once){r}"
+        );
+    }
     o
 }
 
@@ -1076,15 +1094,73 @@ fn net_pending_drain_and_save(
 mod tests {
     use super::*;
 
+    /// The `watch` frame names a session reached that did not answer in full, under its own header,
+    /// and does not say nothing is parked while one is: left out, it read like a session with
+    /// nothing parked. With nothing listed, the answer hints, which name ids to answer, are not
+    /// shown either.
+    #[test]
+    fn the_watch_frame_names_a_session_that_did_not_answer() {
+        use sandbox::control::{PendingRow, SessionPending};
+        let p = style::Palette::plain();
+        let unread = || {
+            vec![(
+                5151u32,
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            )]
+        };
+        let context = vec![(
+            5151u32,
+            PathBuf::from("/home/u/other"),
+            "app:demo-tool".to_string(),
+        )];
+
+        for app in [None, Some("demo-tool")] {
+            let alone = render_pending(&[], &unread(), &context, app, &p);
+            assert!(
+                alone.contains("session 5151 [app:demo-tool] /home/u/other"),
+                "{app:?}: under its own header:\n{alone}"
+            );
+            assert!(
+                alone.contains("did not answer in full")
+                    && alone.contains("what it has parked is not in this frame"),
+                "{app:?}: named, with what is missing:\n{alone}"
+            );
+            assert!(!alone.contains("none"), "{app:?}: no empty claim:\n{alone}");
+            assert!(
+                !alone.contains("answer:"),
+                "{app:?}: nothing to answer:\n{alone}"
+            );
+        }
+
+        let parked = [SessionPending {
+            pid: 4242,
+            incarnation: None,
+            rows: vec![PendingRow {
+                seq: 1,
+                host: "api.example.com".into(),
+                port: 443,
+                path: "/v1".into(),
+                waiting_secs: 3,
+            }],
+        }];
+        let both = render_pending(&parked, &unread(), &context, None, &p);
+        assert!(both.contains("api.example.com:443/v1"), "{both}");
+        assert!(both.contains("did not answer in full"), "{both}");
+        assert!(
+            both.contains("answer:"),
+            "the hints follow a listed request:\n{both}"
+        );
+    }
+
     #[test]
     fn render_pending_groups_requests_under_a_session_header() {
         use sandbox::control::{PendingRow, SessionPending};
         let p = style::Palette::plain();
 
         // Empty → the "none" line with the how-it-arrives hint.
-        assert!(render_pending(&[], &[], None, &p).contains("none"));
+        assert!(render_pending(&[], &[], &[], None, &p).contains("none"));
         // An empty listing under an `--app` filter names the app (not "nothing anywhere").
-        let scoped = render_pending(&[], &[], Some("demo-app"), &p);
+        let scoped = render_pending(&[], &[], &[], Some("demo-app"), &p);
         assert!(
             scoped.contains("none for app `demo-app`"),
             "the empty filtered listing must name the app:\n{scoped}"
@@ -1121,7 +1197,7 @@ mod tests {
             "app:demo".to_string(),
         )];
 
-        let out = render_pending(&sessions, &context, None, &p);
+        let out = render_pending(&sessions, &[], &context, None, &p);
         // The collapsed destination: the lowest-seq id, the target, `×2`, and the largest wait.
         // The id carries its session's incarnation, because that is the form an operator copies
         // and the form the answer path refuses to apply to a later session holding that pid.
@@ -1200,7 +1276,7 @@ mod tests {
             ),
         ];
 
-        let out = render_pending(&sessions, &context, None, &p);
+        let out = render_pending(&sessions, &[], &context, None, &p);
         assert!(
             !out.contains("session 4242"),
             "a session with nothing parked must not get a header:\n{out}"

@@ -111,13 +111,37 @@ fn serve_refusal(data: &Path, lens: &str, pid: u32) {
 ///
 /// Returns the commands the view sent, so a test can assert the cursor it carried forward.
 fn serve_script(data: &Path, lens: &str, pid: u32, replies: Vec<String>) -> Asked {
+    serve_turns(
+        data,
+        lens,
+        pid,
+        replies.into_iter().map(Turn::Answer).collect(),
+    )
+}
+
+/// What a scripted session does with one connection.
+enum Turn {
+    /// Read the command and write this reply, whole or not.
+    Answer(String),
+    /// Close the connection without reading a byte of it, as the peer check and the connection
+    /// ceiling close a peer they refuse. The reader meets a reset, not an end of stream, and the
+    /// command is not recorded, since it was never read.
+    Refuse,
+}
+
+/// [`serve_script`] with refusals among the answers.
+fn serve_turns(data: &Path, lens: &str, pid: u32, turns: Vec<Turn>) -> Asked {
     let (socket, listener) = bind_lens_socket(data, lens, pid);
     let asked: Asked = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&asked);
     std::thread::spawn(move || {
-        for reply in replies {
+        for turn in turns {
             let Ok((stream, _)) = listener.accept() else {
                 break;
+            };
+            let Turn::Answer(reply) = turn else {
+                drop(stream);
+                continue;
             };
             let mut line = String::new();
             if BufReader::new(&stream).read_line(&mut line).is_err() {
@@ -131,6 +155,25 @@ fn serve_script(data: &Path, lens: &str, pid: u32, replies: Vec<String>) -> Aske
         drop(listener);
     });
     asked
+}
+
+/// A follow's script in which the session stops answering twice: refused, then cut short in the same
+/// run, then whole again, then refused once more before it ends. A follow names a session each time
+/// it stops answering, so this is named twice: once per run, neither on every unanswered poll (three)
+/// nor once for the whole follow (one). The cursor stays at 1 across the first run.
+fn stalls_twice(first: &str, second: &str) -> Vec<Turn> {
+    vec![
+        Turn::Answer(frame(&[first])),
+        Turn::Refuse,
+        Turn::Answer("head=1\n".to_string()),
+        Turn::Answer(format!("head=2\n{second}\nok\n")),
+        Turn::Refuse,
+    ]
+}
+
+/// How many times a follow's standard error named a session as not answering in full.
+fn times_named(stderr: &str) -> usize {
+    stderr.matches("did not answer in full").count()
 }
 
 /// A live pid to hang a session record on, and the guard that reaps it.
@@ -328,6 +371,132 @@ fn a_follow_walks_its_cursor_reports_the_gap_and_stops_when_the_session_ends() {
         *asked.lock().unwrap(),
         ["LOG", "LOG after=1", "LOG after=5"],
         "each poll resumes from the head the last one reported"
+    );
+}
+
+/// A follow whose session stops answering in full names it on standard error, once each time it
+/// stops, and asks again from the cursor it held: for the single-lens view and for the merged view.
+/// Every follow went quiet there, which read exactly like a session with nothing new.
+#[test]
+fn a_follow_names_a_session_each_time_it_stops_answering() {
+    for args in [
+        &["fs", "logs", "--follow"][..],
+        &["logs", "--feed", "fs", "--follow"][..],
+    ] {
+        let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
+        let child = Standin::new();
+        write_session_record(data.path(), child.pid(), project.path());
+        let asked = serve_turns(
+            data.path(),
+            "fs",
+            child.pid(),
+            stalls_twice(
+                "event seq=1 at=1700000000123 kind=write path=first.rs",
+                "event seq=2 at=1700000000456 kind=create path=later.rs",
+            ),
+        );
+        let pid = child.pid().to_string();
+        let mut argv: Vec<&str> = args[..args.len() - 1].to_vec();
+        argv.push(&pid);
+        argv.push("--follow");
+
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(&argv)
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run the follow");
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(out.status.code(), Some(0), "{argv:?}: {stdout}{stderr}");
+        assert_eq!(
+            times_named(&stderr),
+            2,
+            "{argv:?}: named once each time the session stopped answering: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("session {pid} did not answer in full")),
+            "{argv:?}: {stderr}"
+        );
+        assert!(
+            stdout.contains("first.rs") && stdout.contains("later.rs"),
+            "{argv:?}: what came whole is shown: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("session {pid} ended")),
+            "{argv:?}: {stdout}"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["LOG", "LOG after=1", "LOG after=1"],
+            "{argv:?}: the polls across the run ask from the cursor the last whole answer left"
+        );
+    }
+}
+
+/// A feed of the merged view that did not answer in full at the first read is asked again by the
+/// follow, from the start of its ring, rather than dropped for the rest of it; the header says so,
+/// and the polls that go on not answering do not name it again. Its rows are shown once it answers.
+#[test]
+fn a_merged_follow_asks_again_a_feed_that_did_not_answer_at_first() {
+    let dir = TmpDir::new("l");
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    serve_script(
+        data,
+        "fs",
+        pid,
+        vec![
+            frame(&["event seq=1 at=1700000000100 kind=write path=whole.rs"]),
+            "head=1\nok\n".to_string(),
+            "head=1\nok\n".to_string(),
+        ],
+    );
+    let asked = serve_turns(
+        data,
+        "proc",
+        pid,
+        vec![
+            Turn::Answer("head=1\n".to_string()),
+            Turn::Refuse,
+            Turn::Answer(frame(&[
+                "event seq=1 at=1700000000200 pid=4242 verdict=observe cmd=late-arrival",
+            ])),
+        ],
+    );
+    let pid = pid.to_string();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["logs", &pid, "--feed", "fs,proc", "--follow"])
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("run the follow");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(
+            "proc: its answer did not arrive in full, so none of it is shown until a poll gets it \
+             whole"
+        ),
+        "the header says the feed is asked again: {stdout}"
+    );
+    assert_eq!(
+        times_named(&stderr),
+        0,
+        "the header named it already, and the refused poll continues that run: {stderr}"
+    );
+    assert!(stdout.contains("late-arrival"), "{stdout}");
+    assert!(stdout.contains(&format!("session {pid} ended")), "{stdout}");
+    assert_eq!(
+        *asked.lock().unwrap(),
+        ["LOG", "LOG after=0"],
+        "asked again from the start of its ring"
     );
 }
 
@@ -623,6 +792,135 @@ fn a_listing_across_sessions_names_a_session_that_did_not_answer() {
         assert_eq!(out.status.code(), Some(0), "{args:?}: {stderr}");
         assert!(!stderr.contains(&named), "{args:?}: {stderr}");
     }
+}
+
+/// The redrawn view's `--json` snapshot names a session that did not answer in full, within its
+/// `--app` scope, beside its empty `flows`. Every tick of `sbx net live` read such a session as one
+/// with no tunnel open.
+#[test]
+fn a_live_snapshot_names_a_session_that_did_not_answer() {
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data.path(), pid, project.path());
+    serve_refusal(data.path(), "egress", pid);
+
+    let first_snapshot = |args: &[&str]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .env("XDG_DATA_HOME", data.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run the live view");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("the piped stdout"))
+            .read_line(&mut line)
+            .expect("read the first snapshot");
+        let _ = child.kill();
+        let _ = child.wait();
+        serde_json::from_str::<serde_json::Value>(&line)
+            .unwrap_or_else(|e| panic!("{args:?}: one JSON object per tick ({e}): {line:?}"))
+    };
+
+    let named = first_snapshot(&["net", "live", "--json"]);
+    assert_eq!(named["unanswered"][0]["pid"], pid, "{named}");
+    assert_eq!(named["flows"], serde_json::json!([]), "{named}");
+
+    let elsewhere = first_snapshot(&["net", "live", "--json", "-a", "elsewhere"]);
+    assert_eq!(
+        elsewhere["unanswered"],
+        serde_json::json!([]),
+        "outside the `--app` scope it is not this view's to name: {elsewhere}"
+    );
+}
+
+/// `sbx net logs --follow` names a session that stops answering in full the same way: once each
+/// time it stops, keeping its cursor, where the polls skipped it without a word.
+#[test]
+fn an_egress_follow_names_a_session_each_time_it_stops_answering() {
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data.path(), pid, project.path());
+    let asked = serve_turns(
+        data.path(),
+        "egress",
+        pid,
+        stalls_twice(
+            "event seq=1 at=1700000000100 port=443 verdict=deny proto=https reason=no-rule \
+             host=first.example",
+            "event seq=2 at=1700000000200 port=443 verdict=deny proto=https reason=no-rule \
+             host=later.example",
+        ),
+    );
+
+    // The follow outlives its sessions, so it is read until it says this one ended, then stopped.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["net", "logs", "--follow", "-i", "1"])
+        .env("XDG_DATA_HOME", data.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the follow");
+    let stderr = child.stderr.take().expect("the piped stderr");
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut text);
+        text
+    });
+    // Lines arrive over a channel, so the deadline bounds a follow that never says it ended rather
+    // than a read blocking past it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take().expect("the piped stdout");
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let ended = format!("session {pid} ended");
+    let mut stdout = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !stdout.contains(&ended) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                stdout.push_str(&line);
+                stdout.push('\n');
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = stderr.join().expect("the stderr reader");
+
+    assert!(stdout.contains(&ended), "{stdout}{stderr}");
+    assert_eq!(
+        times_named(&stderr),
+        2,
+        "named once each time the session stopped answering: {stderr}"
+    );
+    assert!(
+        stdout.contains("first.example") && stdout.contains("later.example"),
+        "what came whole is shown: {stdout}"
+    );
+    let asked = asked.lock().unwrap().clone();
+    let cursors: Vec<&str> = asked
+        .iter()
+        .map(|cmd| {
+            cmd.split_whitespace()
+                .find(|t| t.starts_with("after="))
+                .unwrap_or("-")
+        })
+        .collect();
+    assert_eq!(
+        cursors,
+        ["-", "after=1", "after=1"],
+        "the polls across the run ask from the cursor the last whole answer left: {asked:?}"
+    );
 }
 
 /// The merged view is the only one that can be wrong about *order*, and the only one that can lie by

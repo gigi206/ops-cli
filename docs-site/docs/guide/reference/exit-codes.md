@@ -70,9 +70,11 @@ holding nothing. A session that cannot be connected to at all has gone, or never
 and is not named.
 
 `sbx task ls` names such a session too and still exits 0: what it lists, the declared operations,
-was read in full, and only the running count beside them is missing. The views that redraw, `sbx
-net live` and `sbx net pending watch`, and the polls after the first read of a `--follow`, leave
-such a session out without naming it on every round.
+was read in full, and only the running count beside them is missing. The views that run until
+stopped name such a session without an exit code. `sbx net live` and `sbx net pending watch` name it
+in their frame for as long as it does not answer, and every `sbx net live --json` snapshot lists it
+under `unanswered`. A `--follow` names it on standard error each time it stops answering, once for
+each run of unanswered reads rather than on every poll, and asks it again from where it was.
 
 A `--session` rule load is not a name either. `sbx net allow|deny|mute --session` and `sbx proc
 allow|deny --session` load a rule into the live sessions in scope, and exit 1 when that reached
