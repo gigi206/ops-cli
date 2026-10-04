@@ -549,6 +549,33 @@ impl ExtraBind {
     }
 }
 
+/// Hold each config-declared bind's source open by `O_PATH`, every link on its path refused, for
+/// bubblewrap to mount from the descriptor ([`super::spec::HeldSource`]).
+///
+/// The paths were canonicalised when the config was read, so a link found on one now is a component
+/// replaced since, and the launch is refused rather than the bind dropped: a read-only bind left out
+/// can leave the read-write bind it sits in writable beneath it, and a bind the user declared that
+/// silently goes missing is a launch that runs on something other than what was asked.
+pub(crate) fn hold_bind_sources(
+    binds: &[crate::config::Bind],
+) -> Result<Vec<super::spec::HeldSource>, String> {
+    binds
+        .iter()
+        .map(|b| {
+            let rel = b.path.strip_prefix("/").unwrap_or(&b.path);
+            super::cagedir::hold_entry_beneath(Path::new("/"), rel)
+                .map(|fd| super::spec::HeldSource::new(b.path.clone(), fd))
+                .map_err(|e| {
+                    format!(
+                        "cannot hold the bind source {}: {e}. It was resolved when the config was \
+                         read, so a component of its path has been replaced or removed since",
+                        b.path.display()
+                    )
+                })
+        })
+        .collect()
+}
+
 /// Lay the control-plane pins into a cage's finished mount plan, each right after the last mount
 /// at or above its path.
 ///

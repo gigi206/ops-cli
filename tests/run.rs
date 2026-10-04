@@ -607,21 +607,26 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     let state = TmpDir::prefixed("r", "rwbind-state");
     let rw = TmpDir::prefixed("r", "rwbind-rw");
     let ro = TmpDir::prefixed("r", "rwbind-ro");
+    let lone = TmpDir::prefixed("r", "rwbind-file");
     // Canonical paths: `load` canonicalizes each bind source, so the cage dest is the canonical
     // path — write to and read from exactly that, or the in-cage path would not match the mount.
     let rw_dir = std::fs::canonicalize(rw.path()).unwrap();
     let ro_dir = std::fs::canonicalize(ro.path()).unwrap();
+    let ro_file = std::fs::canonicalize(lone.path()).unwrap().join("single");
 
     // Pre-place a file in the read-only bind so the test can prove the bind is actually mounted
     // (the cage reads it) — otherwise a "write refused" could be confused with "bind absent".
     std::fs::write(ro_dir.join("preexisting"), b"host-content\n").unwrap();
+    // And a bind of one file, which reaches bwrap the way a directory does: by its descriptor.
+    std::fs::write(&ro_file, b"single-file-content\n").unwrap();
 
     std::fs::write(
         project.path().join(".sbx.toml"),
         format!(
-            "binds = [\n  {{ path = \"{}\", mode = \"rw\" }},\n  \"{}\",\n]\n",
+            "binds = [\n  {{ path = \"{}\", mode = \"rw\" }},\n  \"{}\",\n  \"{}\",\n]\n",
             rw_dir.display(),
             ro_dir.display(),
+            ro_file.display(),
         ),
     )
     .unwrap();
@@ -712,6 +717,76 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     assert!(
         !ro_target.exists(),
         "a read-only bind must not let the cage create a host file"
+    );
+
+    // Each source is mounted from the descriptor the launch held it by, a file as well as a
+    // directory: the spec this launch built holds all three, and the cage reads the file through
+    // its bind. A bubblewrap with no `--bind-fd` mounts by path and says so, which is this host
+    // lacking the capability rather than the launch getting it wrong.
+    let dump = state.path().join("spec.dump");
+    let read_file = sbx_session_in(project.path(), data.path(), state.path())
+        .args(["run", "--", "cat", &ro_file.display().to_string()])
+        .env("SBX_DEBUG_SPEC_DUMP", &dump)
+        .output()
+        .expect("spawn sbx");
+    let stderr = String::from_utf8_lossy(&read_file.stderr);
+    if stderr.contains("has no `--bind-fd`") {
+        skip_incapable!("skipping the held bind sources: {}", stderr.trim());
+        return;
+    }
+    assert!(
+        read_file.status.success()
+            && String::from_utf8_lossy(&read_file.stdout).contains("single-file-content"),
+        "a bind of one file is not exposing it: {stderr}"
+    );
+    let dump = std::fs::read_to_string(&dump).expect("the launch wrote its spec");
+    let held = dump
+        .split_once("held_sources: [")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    for source in [&rw_dir, &ro_dir, &ro_file] {
+        assert!(
+            held.contains(&format!("path: {:?}", source.display().to_string())),
+            "{} is not among the sources the launch held:\n{dump}",
+            source.display()
+        );
+    }
+
+    // And none of those descriptors is still open in the cage: one would reach the host object
+    // past the mode of the bind that shows it, a read-only bind written through it. The shell
+    // compares each of its own descriptors with each bind (`-ef`, same device and inode, which a
+    // bind mount keeps), after opening one on the read-only bind itself, so the one line expected
+    // is the comparison seeing a descriptor where there is one. The command's descriptors are the
+    // ones to read: bubblewrap's own init in the cage closes all but its standard ones.
+    let script = "exec 9<\"$2\"; for f in /proc/self/fd/*; do for s in \"$@\"; do \
+                  if [ \"$f\" -ef \"$s\" ]; then echo \"${f##*/} $s\"; fi; done; done";
+    let open_fds = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            &rw_dir.display().to_string(),
+            &ro_dir.display().to_string(),
+            &ro_file.display().to_string(),
+        ],
+    );
+    assert!(
+        open_fds.status.success(),
+        "listing the cage's descriptors failed: {}",
+        String::from_utf8_lossy(&open_fds.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&open_fds.stdout);
+    let found: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        found,
+        [format!("9 {}", ro_dir.display())],
+        "a bind source's descriptor is open in the cage, or the comparison cannot see one"
     );
 }
 

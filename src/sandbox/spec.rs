@@ -205,7 +205,52 @@ pub(crate) struct SandboxSpec {
     /// mapped without a setuid helper, so it is 0 and nothing else: a package that insists on
     /// giving a file to some *other* uid still fails, and fails saying so.
     pub(super) as_root: bool,
+    /// The sources of the config-declared binds, each already open, so bwrap mounts what was opened
+    /// rather than what the path names when it gets there ([`HeldSource`]). Empty for every cage
+    /// but the launch's own, and on a bubblewrap with no `--bind-fd`, where the bind goes by path.
+    pub(super) held_sources: Vec<HeldSource>,
 }
+
+/// One config-declared bind's source, held open by `O_PATH` from the moment the launch resolved it.
+///
+/// A path is looked up again by whoever opens it, and the bind sources sbx exposes to a swap are the
+/// ones whose parents a concurrent cage can write: in that cage's project, one of its read-write
+/// binds or its mise pool. A source inside the launching cage's own project is not among them, the
+/// project's mount covering its bind. Between the config load that canonicalised the path and
+/// bubblewrap's own mount, a cage could replace a parent with a link to somewhere else, and the bind
+/// would mount that. Held here, the source is the object the launch opened with every link refused
+/// ([`super::cagedir::hold_entry_beneath`]), and bwrap is handed the descriptor (`--bind-fd`,
+/// `--ro-bind-fd`). It looks up where that object is when it sets the cage up and mounts that path,
+/// checking from 0.10.0 that what it mounted is the object, and closes the descriptor before the
+/// cage's command runs.
+///
+/// Compared by path and by the descriptor it shares, so a spec stays comparable: two specs hold the
+/// same sources when they hold the same open objects, not merely equal names.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldSource {
+    /// The canonical path of the bind, the `src` and `dest` of its [`Mount`].
+    pub(super) path: PathBuf,
+    /// The source, open by `O_PATH`.
+    pub(super) fd: std::sync::Arc<std::os::fd::OwnedFd>,
+}
+
+impl HeldSource {
+    /// Hold `fd` as the source of the bind at `path`.
+    pub(crate) fn new(path: PathBuf, fd: std::os::fd::OwnedFd) -> Self {
+        Self {
+            path,
+            fd: std::sync::Arc::new(fd),
+        }
+    }
+}
+
+impl PartialEq for HeldSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && std::sync::Arc::ptr_eq(&self.fd, &other.fd)
+    }
+}
+
+impl Eq for HeldSource {}
 
 /// The netns-holder wiring for a cage that needs a `dummy0` interface (see
 /// [`SandboxSpec::netns_dummy`]). Carries the host credentials the cage is mapped back to and the
@@ -285,6 +330,7 @@ impl SandboxSpec {
             netns_dummy: None,
             limit_scope: None,
             dies_with_launcher: true,
+            held_sources: Vec::new(),
         })
     }
 
@@ -355,6 +401,12 @@ impl SandboxSpec {
     /// it from the resolved `[seccomp] allow`; a default (empty) policy is the mandatory denylist.
     pub(crate) fn with_seccomp(mut self, seccomp: super::seccomp::SeccompPolicy) -> Self {
         self.seccomp = seccomp;
+        self
+    }
+
+    /// Mount each of `sources` from its descriptor rather than by its path ([`HeldSource`]).
+    pub(crate) fn with_held_sources(mut self, sources: Vec<HeldSource>) -> Self {
+        self.held_sources = sources;
         self
     }
 

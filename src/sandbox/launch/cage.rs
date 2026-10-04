@@ -397,6 +397,28 @@ fn cage_command_with(
     })
 }
 
+/// Whether `bwrap` mounts a bind from a descriptor (`--bind-fd`, `--ro-bind-fd`), probed once per
+/// process.
+///
+/// Asked of the binary rather than read off a version: the options arrived upstream in 0.10.0, and
+/// Ubuntu 24.04 carries them in its 0.9.0 as a backport, so a version number would refuse the host
+/// sbx most often runs on. The capability is all this answers. That backport looks up the path of
+/// the open source and mounts it without the check bubblewrap makes from 0.10.0, that what it
+/// mounted is that object, so a swap during bubblewrap's own setup goes unnoticed there, a limit
+/// `binds.md` writes.
+pub(in crate::sandbox) fn bwrap_binds_descriptors(bwrap: &Path) -> bool {
+    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBED.get_or_init(|| {
+        std::process::Command::new(bwrap)
+            .arg("--help")
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout).contains("--ro-bind-fd")
+                    || String::from_utf8_lossy(&o.stderr).contains("--ro-bind-fd")
+            })
+    })
+}
+
 /// What the pty child exits with when the cage could not be entered at all — the descriptors could
 /// not be made inheritable, the terminal could not be taken, or the `execv` failed.
 ///

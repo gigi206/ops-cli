@@ -15,7 +15,9 @@
 //! and [`hold_under`] create what is missing and hand back the leaf's path or its descriptor;
 //! [`open_beneath`] creates nothing and hands back a descriptor for a listing or a removal
 //! ([`super::gc`](mod@super::gc)), and [`hold_beneath`] holds one by `O_PATH`, for a mode to be set
-//! through it (the project store's state directories). The live-theme keyfile write ([`super::theme_relay`]), the
+//! through it (the project store's state directories). [`hold_entry_beneath`] holds a config bind's
+//! source, a file or a directory, for bubblewrap to mount from the descriptor
+//! ([`super::binds::hold_bind_sources`]). The live-theme keyfile write ([`super::theme_relay`]), the
 //! project store's seed and the mise plugin registration take the descriptor and write through
 //! [`entry`]; the seed opens each directory it makes through [`open_entry_dir`]. The image unpack
 //! asks another question of a tree no cage holds (`distro::layers`): which component of a layer
@@ -100,6 +102,59 @@ pub(crate) fn open_beneath(root: &Path, rel: &Path) -> io::Result<OwnedFd> {
 /// its mode to be set through `/proc/self/fd/<n>`.
 pub(crate) fn hold_beneath(root: &Path, rel: &Path) -> io::Result<OwnedFd> {
     walk(root, rel, None, libc::O_PATH).map(|(_, dir)| dir)
+}
+
+/// [`hold_beneath`] for a leaf that may be a file as well as a directory: the directories above it
+/// are walked the same way, and the leaf is held by `O_PATH` with `O_NOFOLLOW`, a link refused.
+///
+/// `O_PATH | O_NOFOLLOW` does not fail on a link the way `O_DIRECTORY` does: it hands back the
+/// link itself. So the leaf's kind is read through the descriptor it was opened with, which is the
+/// object the caller goes on to use, and a link is refused there.
+///
+/// A component refused on the way is named alone. The remedy the other walks give with it is for
+/// sbx's own trees, which a cage writes and `sbx gc` reclaims; the paths held here are anywhere.
+pub(crate) fn hold_entry_beneath(root: &Path, rel: &Path) -> io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let found_alone = |e: io::Error| match e.get_ref().and_then(|e| e.downcast_ref()) {
+        Some(refused @ NotADirectory { .. }) => {
+            io::Error::new(io::ErrorKind::InvalidData, refused.found())
+        }
+        None => e,
+    };
+    let (Some(name), parent) = (rel.file_name(), rel.parent().unwrap_or(Path::new(""))) else {
+        return hold_beneath(root, rel).map_err(found_alone);
+    };
+    let (at, dir) = walk(root, parent, None, libc::O_PATH).map_err(found_alone)?;
+    let leaf = at.join(name);
+    let name = cstr(name.as_encoded_bytes())?;
+    // SAFETY: `name` is a live NUL-terminated component for the duration of the call (`cstr`
+    // refuses an interior NUL), and `dir` is an open directory descriptor this function owns.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh owned descriptor; `OwnedFd` takes sole ownership and closes it.
+    let held = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `held` is an open descriptor, and `st` is written only on success, which the return
+    // value reports.
+    if unsafe { libc::fstat(held.as_raw_fd(), st.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstat` returned success, so `st` is initialised.
+    if unsafe { st.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("`{}` is a symlink", leaf.display()),
+        ));
+    }
+    Ok(held)
 }
 
 /// The path naming `name` inside the directory `dir` holds: `/proc/self/fd/<n>/<name>`.
@@ -306,21 +361,47 @@ fn describe(at: &Path, dir: libc::c_int, name: &std::ffi::CString, e: io::Error)
 /// The refusal [`ensure_under`] returns for a component that exists and is not a directory, naming
 /// what was found and what to do about it.
 fn not_a_directory(at: &Path, is_symlink: bool) -> io::Error {
-    let kind = if is_symlink {
-        "a symlink"
-    } else {
-        "not a directory"
-    };
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "`{}` is {kind} — this tree is writable by the cage, so this is what in-cage code \
-             leaves behind to redirect the next launch. Reclaim it (`sbx gc`) or remove that entry \
-             by hand",
-            at.display()
-        ),
+        NotADirectory {
+            at: at.to_path_buf(),
+            is_symlink,
+        },
     )
 }
+
+/// A component [`walk`] found and refused for not being a directory, carried by the refusal
+/// [`not_a_directory`] builds so a caller can name it without the remedy that refusal gives.
+#[derive(Debug)]
+struct NotADirectory {
+    at: PathBuf,
+    is_symlink: bool,
+}
+
+impl NotADirectory {
+    /// What was found, and where.
+    fn found(&self) -> String {
+        let kind = if self.is_symlink {
+            "a symlink"
+        } else {
+            "not a directory"
+        };
+        format!("`{}` is {kind}", self.at.display())
+    }
+}
+
+impl std::fmt::Display for NotADirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} — this tree is writable by the cage, so this is what in-cage code leaves behind to \
+             redirect the next launch. Reclaim it (`sbx gc`) or remove that entry by hand",
+            self.found()
+        )
+    }
+}
+
+impl std::error::Error for NotADirectory {}
 
 #[cfg(test)]
 mod tests {
@@ -504,6 +585,61 @@ mod tests {
         assert!(
             open_entry_dir(&held, OsStr::new("dir/..")).is_err(),
             "a name that is not one component is opened"
+        );
+    }
+
+    /// A bind's source is held whether it is a file or a directory, and the descriptor is the
+    /// object at the path. A link anywhere on the path is refused, at the leaf as well as above it,
+    /// where a lookup by path follows it: a parent replaced with a link to a sibling after the path
+    /// was canonicalised reaches the sibling's content by name, and nothing by this walk.
+    #[test]
+    fn a_held_entry_is_the_object_at_the_path_and_never_through_a_link() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TmpDir::new();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let (proj, sibling) = (base.join("proj"), base.join("sibling"));
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(proj.join("sub/file"), b"declared").unwrap();
+        std::fs::write(sibling.join("file"), b"swapped in").unwrap();
+        let rel = |p: &Path| p.strip_prefix("/").unwrap().to_path_buf();
+        let identity = |fd: &OwnedFd| {
+            let path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let on_disk = |p: &Path| {
+            let meta = std::fs::metadata(p).unwrap();
+            (meta.dev(), meta.ino())
+        };
+
+        for leaf in [proj.join("sub/file"), proj.join("sub")] {
+            let held =
+                hold_entry_beneath(Path::new("/"), &rel(&leaf)).expect("a real path is held");
+            assert_eq!(identity(&held), on_disk(&leaf), "{}", leaf.display());
+        }
+
+        std::os::unix::fs::symlink(proj.join("sub/file"), base.join("link")).unwrap();
+        let err = hold_entry_beneath(Path::new("/"), &rel(&base.join("link")))
+            .expect_err("a link at the leaf is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+
+        // The swap the held source is for: the path was canonicalised, then a parent was replaced.
+        let declared = proj.join("sub/file");
+        std::fs::rename(proj.join("sub"), base.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&sibling, proj.join("sub")).unwrap();
+        assert_eq!(
+            std::fs::read(&declared).unwrap(),
+            b"swapped in",
+            "by name, the declared path now reaches the sibling"
+        );
+        let err = hold_entry_beneath(Path::new("/"), &rel(&declared))
+            .expect_err("a parent replaced with a link is refused");
+        assert_eq!(
+            err.to_string(),
+            format!("`{}` is a symlink", proj.join("sub").display()),
+            "the refused component is named alone, without the remedy for sbx's own trees"
         );
     }
 

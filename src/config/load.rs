@@ -235,18 +235,19 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
 /// Canonicalize one bind source, dropping it with a warning if it cannot be resolved (a
 /// missing path or a broken symlink) — bwrap could not bind it anyway.
 ///
-/// Following symlinks here **narrows** the source's swap window rather than closing it, and the
-/// distinction is worth the words: the source is pinned to its real location, so a later
-/// project-controlled symlink no longer trivially redirects the bind, but a parent component
-/// swapped between this call and the mount still races. The same sentence is written where the
-/// launch canonicalises (`sandbox::binds`), and the two used to disagree — this side claimed a pin,
-/// that side named the race. One rule, one description of it, or a reader believes whichever they
-/// happen to open.
+/// Following symlinks here pins the source to its real location, so a later project-controlled
+/// symlink no longer redirects the bind. What it leaves is the window between this call and the
+/// mount, in which a parent component could be replaced with a link, and the launch closes it: it
+/// opens each source one component at a time with every link refused
+/// (`sandbox::binds::hold_bind_sources`) and hands bubblewrap the descriptor, which from 0.10.0
+/// checks that what it mounted is that object (Ubuntu 24.04's backport of the option does not). A
+/// component replaced in between refuses the launch. On a bubblewrap with no `--bind-fd` the source
+/// goes by path and the window stays open, which the launch warns about.
 ///
-/// Closing it rather than narrowing it means resolving at the moment of the mount, under
-/// `openat2(RESOLVE_BENEATH)` or through an `O_PATH` descriptor opened here and mounted from
-/// `/proc/self/fd`. That is a change to how every bind reaches bwrap, not a check added beside
-/// this one.
+/// The launch writes the same about the project root, which it canonicalises too
+/// (`sandbox::binds`) and still mounts by path. The two used to disagree, one side claiming a pin
+/// and the other naming the race: one rule, one description of it, or a reader believes whichever
+/// they happen to open.
 fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
     match p.canonicalize() {
         Ok(canon) => Some(canon),

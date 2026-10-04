@@ -129,12 +129,14 @@ pub(crate) fn project_identity(cwd: &Path) -> io::Result<(String, PathBuf)> {
 }
 
 /// Resolve `path` to a real, existing directory, following symlinks in the host
-/// namespace. Canonicalising up front *narrows* the bind-source TOCTOU window:
+/// namespace. Canonicalising up front *narrows* the project mount's TOCTOU window:
 /// the source is pinned to its real location, so a later project-controlled
 /// symlink swap no longer trivially redirects the bind. It is not an absolute
 /// guarantee — a parent component swapped between this call and the actual bind
-/// still races — but the broader confinement of arbitrary, config-declared bind
-/// paths is enforced where those binds are introduced.
+/// still races, and the project root is mounted by path. The config-declared binds,
+/// whose parents another session's cage can write when they lie in its project, its
+/// read-write binds or its mise pool, are held open instead and mounted from their
+/// descriptors ([`super::hold_bind_sources`]).
 pub(super) fn canonicalize_project(path: &Path) -> io::Result<PathBuf> {
     let canon = path.canonicalize()?;
     if !canon.is_dir() {

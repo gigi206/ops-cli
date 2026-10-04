@@ -3129,6 +3129,27 @@ pub(super) fn build(
         ));
         ExitCode::FAILURE
     })?;
+    // The config binds' sources, held open now that the plan is final, so bwrap mounts the objects
+    // opened here rather than whatever their paths name by the time it reaches them. A bubblewrap
+    // with no `--bind-fd` is handed the paths, and the race a held source closes stays open there.
+    let spec = if config_binds.is_empty() {
+        spec
+    } else if super::cage::bwrap_binds_descriptors(&prep.bwrap) {
+        match binds::hold_bind_sources(&config_binds) {
+            Ok(held) => spec.with_held_sources(held),
+            Err(why) => {
+                crate::diag::error(&format!("sbx: {why}"));
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        crate::diag::warn(&format!(
+            "{} has no `--bind-fd`, so the `[bind]` sources are mounted by path: a cage that can \
+             write a parent of one could replace that parent with a link before the mount",
+            prep.bwrap.display()
+        ));
+        spec
+    };
     // Stand the task plane up now: the spec is final (so a task cage can be derived from it) and the
     // launch has not happened yet (so bwrap finds the bound socket present). A failure here aborts
     // the launch rather than running a cage whose declared operations silently do not exist — the

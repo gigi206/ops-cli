@@ -73,12 +73,24 @@ this, since the cage could name a program there that git runs anyway, and the la
 ## Path rules
 
 - A bind path must be **absolute**. It is canonicalized (resolving symlinks) at
-  resolution time, which **narrows** the time-of-check/time-of-use gap rather than
-  closing it: the source is pinned to its real location, so a symlink swapped in later
-  no longer redirects the bind, but a **parent directory** swapped between that
-  resolution and the mount still races. Under the
-  [same-uid model](../concepts/security-model) winning that race takes a host process
-  already running as you, which has your rights anyway.
+  resolution time, which pins the source to its real location, so a symlink swapped in
+  later no longer redirects the bind. The launch then opens the source with every link on
+  its path refused and hands bubblewrap that open descriptor (`--bind-fd`,
+  `--ro-bind-fd`). A parent directory swapped for a link between the resolution and the
+  launch, or a source removed in between, refuses the launch and names the bind. That gap
+  is not only yours: another session's cage can write the parents of a source that lies in
+  its own project, in one of its read-write binds or in its mise install pool. A bind
+  inside your own project is out of its reach, since the project's mount covers that bind.
+  bubblewrap looks the descriptor's path up once more as it mounts, and from 0.10.0 it
+  then checks that what it mounted is that object, refusing the launch otherwise.
+- A bubblewrap without `--bind-fd` (upstream releases before 0.10.0) is handed the path
+  instead, and the launch warns: there a parent swapped between the resolution and the
+  mount still races.
+- Ubuntu 24.04's bubblewrap 0.9.0 has `--bind-fd` as a backport, without that check. The
+  descriptor still defeats a swap made before bubblewrap starts, since bubblewrap looks up
+  where the open source is at that moment, but a swap made during bubblewrap's own setup,
+  between that look-up and the mount, goes unnoticed. That window is far narrower than
+  the one the descriptor closes, and the launch does not warn about it.
 - A **missing** path is dropped with a warning rather than failing the launch (a
   best-effort bind), so a portable config referencing an optional path still works.
 - A leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` is expanded from your environment, so

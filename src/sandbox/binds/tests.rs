@@ -3229,3 +3229,46 @@ fn nothing_beneath_a_read_only_root_reopens_it() {
         "the read-only mask stays, the read-write directory does not"
     );
 }
+
+/// Each config bind's source is held as the object at its canonical path, and a bind whose path
+/// gained a link since it was canonicalised refuses the launch, naming that bind, rather than being
+/// left out: a read-only bind dropped from inside a read-write one leaves its subtree writable.
+#[test]
+fn a_bind_source_that_gained_a_link_refuses_the_launch_and_names_the_bind() {
+    let tmp = TmpDir::new();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let (tree, sibling) = (base.join("tree"), base.join("sibling"));
+    std::fs::create_dir_all(tree.join("inner")).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(tree.join("inner/notes"), b"declared").unwrap();
+    let binds = vec![
+        crate::config::Bind {
+            path: tree.clone(),
+            writable: true,
+        },
+        crate::config::Bind {
+            path: tree.join("inner/notes"),
+            writable: false,
+        },
+    ];
+
+    let held = hold_bind_sources(&binds).expect("real paths are held");
+    let paths: Vec<&Path> = held.iter().map(|h| h.path.as_path()).collect();
+    assert_eq!(paths, [tree.as_path(), tree.join("inner/notes").as_path()]);
+
+    std::fs::rename(tree.join("inner"), base.join("moved")).unwrap();
+    std::os::unix::fs::symlink(&sibling, tree.join("inner")).unwrap();
+    let why = hold_bind_sources(&binds).expect_err("a parent replaced with a link is refused");
+    assert!(
+        why.contains(&tree.join("inner/notes").display().to_string()),
+        "the refusal names the bind: {why}"
+    );
+    assert!(
+        why.contains(&format!("`{}` is a symlink", tree.join("inner").display())),
+        "the refusal names the component replaced: {why}"
+    );
+    assert!(
+        !why.contains("sbx gc"),
+        "a bind source is the user's path, not a tree sbx reclaims: {why}"
+    );
+}
