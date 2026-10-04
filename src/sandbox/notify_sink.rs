@@ -258,21 +258,29 @@ impl Sink for StderrSink {
     }
 }
 
-/// The PowerShell fragment that raises one Windows toast, with `title` and `body` embedded as
-/// single-quoted literals. Pure, so the quoting is pinned by a test rather than by a terminal.
+/// The PowerShell fragment that raises one Windows toast, with `title` and `body` carried as base64
+/// and decoded by the script itself. Pure, so the encoding is pinned by a test rather than by a
+/// terminal.
 ///
 /// Both strings are the cage's writing: a refused host, an exec target, a task name. They are
-/// sanitised first, which takes the control characters and newlines out, and then embedded with
-/// PowerShell's own escape for a single-quoted string — a quote doubled. Interpolating them into a
-/// command line instead would hand the cage a shell on the Windows side, which is a boundary this
-/// sandbox exists to keep.
+/// sanitised first, which takes the control characters and newlines out, and then never appear in
+/// the script as text at all: what the script holds is their UTF-8 in base64, whose alphabet has no
+/// quote of any kind, inside a literal sbx wrote. Escaping them into a single-quoted literal is not
+/// enough. PowerShell closes such a literal on the typographic quotes U+2018 to U+201B as well as on
+/// `'`, so a doubled ASCII quote leaves four other ways out, and a way out of the literal is a shell
+/// on the Windows side, which is a boundary this sandbox exists to keep.
 ///
 /// The application id is PowerShell's own. A toast has to be raised under an id Windows already
 /// knows, and registering one for `sbx` would mean writing to the Windows registry from Linux as a
 /// side effect of a notification. The visible cost is the name on the toast, which reads
 /// "Windows PowerShell"; the alternative costs a write to another operating system's configuration.
 fn toast_script(title: &str, body: &str) -> String {
-    let quote = |s: &str| crate::sandbox::sanitize(s).replace('\'', "''");
+    let decoded = |s: &str| {
+        format!(
+            "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))",
+            crate::config::base64_encode(crate::sandbox::sanitize(s).as_bytes())
+        )
+    };
     format!(
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, \
          ContentType=WindowsRuntime] > $null\n\
@@ -281,13 +289,13 @@ fn toast_script(title: &str, body: &str) -> String {
          $x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(\
          [Windows.UI.Notifications.ToastTemplateType]::ToastText02)\n\
          $t = $x.GetElementsByTagName('text')\n\
-         $t.Item(0).AppendChild($x.CreateTextNode('{title}')) > $null\n\
-         $t.Item(1).AppendChild($x.CreateTextNode('{body}')) > $null\n\
+         $t.Item(0).AppendChild($x.CreateTextNode({title})) > $null\n\
+         $t.Item(1).AppendChild($x.CreateTextNode({body})) > $null\n\
          [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(\
          '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe'\
          ).Show([Windows.UI.Notifications.ToastNotification]::new($x))\n",
-        title = quote(title),
-        body = quote(body),
+        title = decoded(title),
+        body = decoded(body),
     )
 }
 
@@ -1139,33 +1147,44 @@ mod tests {
         );
     }
 
-    /// The two strings a toast carries are the cage's writing, so the escape that contains them is
-    /// the boundary. A quote in a host name must close no literal, and a newline must add no
-    /// statement.
+    /// The two strings a toast carries are the cage's writing, so the encoding that carries them is
+    /// the boundary. No quote PowerShell closes a literal on, ASCII or typographic, and no newline
+    /// reaches the script: the cage's text is in it only as base64, and decodes back to what the
+    /// sanitiser left of it.
     #[test]
     fn a_toast_script_contains_what_the_cage_wrote() {
-        let script = super::toast_script(
-            "Blocked: evil'; Start-Process calc.exe; #.test:443",
-            "line one\nline two",
+        let title = "Blocked: evil'‘’‚‛\"; Start-Process calc.exe; #.test:443";
+        let body = "line one\nline two";
+        let script = super::toast_script(title, body);
+        assert!(
+            !script.contains("Start-Process"),
+            "the cage's text is not in the script as text: {script}"
         );
         assert!(
-            script.contains("evil''; Start-Process calc.exe; #.test:443"),
-            "a quote is doubled, which is PowerShell's own escape: {script}"
+            !script
+                .chars()
+                .any(|c| matches!(c, '\u{2018}'..='\u{201B}' | '"')),
+            "no quote but sbx's own: {script}"
         );
-        assert!(
-            !script.contains("line one\nline two"),
-            "a newline is taken out before quoting, not carried into the script"
-        );
-        // The statements the script is made of are sbx's, and there are exactly as many lines as it
-        // wrote: a cage string that opened a line of its own would show up here.
+        // sbx's own literals are the only ones: as many ASCII quotes as a toast of plain words has.
+        let quotes = |s: &str| s.matches('\'').count();
         assert_eq!(
-            script
-                .lines()
-                .filter(|l| l.contains("Start-Process"))
-                .count(),
-            1,
-            "the injected text sits inside one literal, not on a line of its own: {script}"
+            quotes(&script),
+            quotes(&super::toast_script("a", "b")),
+            "{script}"
         );
+        assert_eq!(
+            script.lines().count(),
+            super::toast_script("a", "b").lines().count(),
+            "a newline in the cage's text adds no statement: {script}"
+        );
+        for text in [title, body] {
+            let carried = crate::config::base64_encode(crate::sandbox::sanitize(text).as_bytes());
+            assert!(
+                script.contains(&format!("FromBase64String('{carried}')")),
+                "{text:?} is carried as the base64 of what the sanitiser left: {script}"
+            );
+        }
     }
 
     impl Sink for Recorder {
