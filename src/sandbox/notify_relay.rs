@@ -103,11 +103,13 @@
 //! Lifecycle:[`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
 //! `async_io::block_on` (the pure-Rust async-io backend — no tokio, and the runtime never leaves this
 //! module). The thread waits for the in-cage `dbus-daemon` to create the private-bus socket (the
-//! portal's command wrap starts it before the app runs), then attaches. The guard's `Drop` closes a
-//! shutdown channel and joins the thread, so the relay is torn down before the portal's host
-//! directory (and its socket) is removed. Everything is **best-effort**: no host bus, a socket that
-//! never appears, or a failed connection warns and the app simply runs without notifications (the
-//! picker and at-launch theme, served entirely in-cage, are unaffected).
+//! portal's command wrap starts it before the app runs), then attaches; the wait has no bound of its
+//! own, because the relay is started before the rest of the launch is provisioned. The guard's
+//! `Drop` closes a shutdown channel and joins the thread, so the relay is torn down before the
+//! portal's host directory (and its socket) is removed. Everything is **best-effort**: a socket
+//! that never appears leaves the relay waiting until that teardown, and no host bus or a failed
+//! connection warns; either way the app simply runs without notifications (the picker and
+//! at-launch theme, served entirely in-cage, are unaffected).
 
 use crate::diag;
 use crate::sandbox::locks::locked;
@@ -119,7 +121,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use zbus::message::{Flags, Header, Type};
 use zbus::zvariant::{DynamicDeserialize, DynamicType, OwnedValue};
 use zbus::{MatchRule, Message, MessageStream, connection, fdo, proxy};
@@ -160,10 +162,7 @@ const CALLS_QUEUED: usize = 2;
 /// [`OwnedIds`], so the cage can neither replace nor close that notification, and its signals do
 /// not cross back.
 const HOST_CALL_DEADLINE: Duration = Duration::from_secs(5);
-/// How long to wait for the in-cage `dbus-daemon` to create the private-bus socket before giving up
-/// (best-effort: the portal's wrap starts the daemon before the app, so the socket appears within
-/// milliseconds; this bound only guards against a portal that failed to come up).
-const SOCKET_WAIT: Duration = Duration::from_secs(10);
+/// How often the relay looks for the private-bus socket while the cage is not yet up.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The longest a relayed signal may take to reach the private bus before the relay gives up on it.
@@ -1060,10 +1059,12 @@ async fn run(
     needles: crate::sandbox::notify_sink::Needles,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Wait for the in-cage dbus-daemon to create its socket (the portal wrap starts it before the
-    // app). Give up quietly after the bound — a portal that never came up already warned elsewhere.
-    let start = Instant::now();
+    // app). The relay is started before the rest of the launch is provisioned, and on a first launch
+    // that can mean minutes of downloads before the cage exists, so the wait has no bound of its
+    // own: it ends when the socket appears or when the launch tears the relay down. A portal that
+    // never came up already warned elsewhere.
     while !private_socket.exists() {
-        if shutdown.is_closed() || start.elapsed() > SOCKET_WAIT {
+        if shutdown.is_closed() {
             return Ok(());
         }
         async_io::Timer::after(POLL_INTERVAL).await;
@@ -1187,6 +1188,10 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// How long a test waits for a bus, a name or a signal before it fails rather than hangs.
+    const SOCKET_WAIT: Duration = Duration::from_secs(10);
 
     /// The private bus's socket is in a directory the cage writes, so a link left at its name must
     /// not carry the relay to the socket the link names. The refusal comes before the host's own
@@ -1233,7 +1238,7 @@ mod tests {
         async_io::block_on(async {
             let bound = Duration::from_millis(50);
 
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             assert!(
                 !completes_within(std::future::pending::<bool>(), bound).await,
                 "a write that never finishes must be given up on"
@@ -2275,5 +2280,38 @@ mod tests {
             let (cid, reason): (u32, u32) = close.body().deserialize().unwrap();
             assert_eq!((cid, reason), (id, 2));
         });
+    }
+
+    /// A private bus that comes up long after the relay started is still attached to. The relay is
+    /// started before the rest of a launch is provisioned, and a first launch may still be fetching
+    /// packages when a fixed wait would have run out, which would leave the whole session without
+    /// notifications.
+    #[test]
+    fn a_private_bus_that_comes_up_late_is_still_attached_to() {
+        /// Longer than the test's own bound, so a relay that gave up on any wait of that order
+        /// fails here.
+        const LATE: Duration = Duration::from_secs(11);
+
+        let dir = crate::testutil::TmpDir::new();
+        let (host, sock) = (dir.join("host"), dir.join("bus"));
+        let Some(_host_bus) = test_bus(&host) else {
+            skip_incapable!("skipping: no dbus-daemon on PATH");
+            return;
+        };
+        let host_address = address_of(&host);
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _daemon = fake_daemon(&host_address, &seen, false);
+        let _relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
+
+        std::thread::sleep(LATE);
+        let _private_bus = test_bus(&sock).expect("the dbus-daemon that served the host side");
+
+        async_io::block_on(async {
+            let app = cage_app(&sock).await;
+            let reply = call_notify(&app, 64).await.expect("the relay answers");
+            let id: u32 = reply.body().deserialize().expect("an id");
+            assert_eq!(id, FIRST_ID);
+        });
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
