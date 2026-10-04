@@ -1,0 +1,69 @@
+# `opencode-v2` — the OpenCode v2 agent CLI: what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/opencode-v2.toml
+#   # then in an app profile:   use = ["opencode-v2"]
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
+# Derived from `examples/app/opencode-v2.toml`, whose namesake profile now names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# DISTINCT FROM THE `opencode` BUNDLE, deliberately. That one carries the v1 CLI (`mise:opencode`),
+# which mise resolves through its registry to a GitHub release asset — and upstream publishes v2
+# outside GitHub Releases (v2 tags carry no Release object; the binaries live on
+# `opencode.ai/files/bin`), so no `mise:` token can ever offer it. This bundle therefore rides
+# `tarball:resolve` against the vendor's own update channel instead. Both CLIs install a binary
+# named `opencode` and read the same config locations, but each app equips in its own home, so
+# the two lines coexist: keep `opencode` for v1, add `opencode-v2` for v2.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+allow = [
+    "@models-catalog",
+    "@npm-registry",
+    "{*} https://opencode.ai",
+]
+mute = [
+    "@npm-audit",  # npm's audit endpoint: POSTed by the install, irrelevant to whether it succeeded
+    "@npm-jsr",  # the JSR mirror the resolver probes: nothing here is installed from it
+]
+
+[packages]
+# The v2 agent itself. The key is `opencode` — the name the generated wrapper is installed as,
+# which is also the command the consuming profile writes — even though the bundle is `opencode-v2`:
+# the archive root holds one executable named `opencode`, and the install phase wraps the
+# `[packages]` key. (Precedent for a bundle name that is not its package key: `kiro-desktop`
+# carries `kiro`.)
+opencode = "tarball:resolve"
+
+# The `tarball:resolve` command for the `opencode` package above. sbx runs it in a hermetic sandbox
+# (its own base tools; the HOST network, because provisioning is host-side and an allowlist governs
+# runtime egress), captures the URL it prints, validates it is an https `.tar.gz`, and pins it with
+# its content hash, so `sbx upgrade` rolls the app forward. A warm launch reuses the pin offline
+# and never re-runs this.
+#
+# The vendor's update channel (`/update/api/latest/cli`) names the current version and every
+# distribution artifact (URL + sha256 each), so the resolver reads the linux build for this machine
+# out of it rather than reconstructing a path — a constant alias would break the next launch with
+# a hash mismatch the moment upstream ships a new build.
+#
+# ARCHITECTURE: x64 takes the `baseline` build (no AVX2 requirement, the same choice the vendor's
+# Homebrew formula makes); arm64 has no baseline variant. Anything else is refused by name.
+# GNU rather than musl: the hermetic cage's toolchain is glibc-based and the `tarball:` backend
+# autoPatchelfHooks the binary host-side, the same path a bun-compiled CLI (`warp`) already rides.
+[tarball.opencode]
+resolve = [
+    "sh",
+    "-c",
+    'case "$(uname -m)" in x86_64) f=opencode-linux-x64-baseline.tar.gz ;; aarch64) f=opencode-linux-arm64.tar.gz ;; *) echo "opencode-v2: the vendor publishes no $(uname -m) build" >&2; exit 1 ;; esac; u=$(curl -fsSL https://opencode.ai/update/api/latest/cli | grep -oE "https://opencode\.ai/files/bin/[^\"]*$f" | head -1); [ -n "$u" ] || { echo "opencode-v2: the update channel named no $f build" >&2; exit 1; }; echo "$u"',
+]

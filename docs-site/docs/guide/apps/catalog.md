@@ -4,7 +4,7 @@ description: "The importable starter profiles in the repository, what each one l
 
 # Profile catalog
 
-The repository's `examples/app/` directory ships **74 importable
+The repository's `examples/app/` directory ships **75 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -13,7 +13,7 @@ sbx app import examples/app/claude-code.toml
 sbx app run claude-code
 ```
 
-**Every profile below takes two imports.** All 74 name a bundle in `use`: the bundle holds
+**Every profile below takes two imports.** All 75 name a bundle in `use`: the bundle holds
 the agent's package, environment and egress and follows upstream, the profile holds what
 you configure, and each ships as `examples/bundle/<name>.toml` beside
 `examples/app/<name>.toml`. Either order works, and nothing runs until you launch. Some
@@ -29,12 +29,12 @@ See also: [Portable profiles](profiles) · [The app framework](../apps/) · [Bun
 
 The tables below list every shipped profile, grouped by **how you interact with it**: a
 terminal agent, a desktop window, or a UI served in your host browser. The grouping is
-editorial (51 terminal agents, 17 desktop applications, 6 browser-served UIs); the
-exhaustive fact is the total, 74 profiles, each with its row below. Each profile's own
+editorial (52 terminal agents, 17 desktop applications, 6 browser-served UIs); the
+exhaustive fact is the total, 75 profiles, each with its row below. Each profile's own
 header carries its packaging specifics; how the artifacts are built and fit together, and
 the "not here yet, and why" triage, live in `examples/README.md`.
 
-## Terminal agents (51)
+## Terminal agents (52)
 
 The common case: a CLI or TUI that runs in the terminal you launched it from.
 
@@ -76,6 +76,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `openclaude` | `nix:nodejs` (+ `mise:npm:@gitlawb/openclaude`) | provider-dependent (BYOK: OpenAI-compatible / Anthropic / Gemini) |
 | `openclaw` | `nix:nodejs` (+ `mise:npm:openclaw`) | `api.openai.com` (BYOK) |
 | `opencode` | `mise:opencode` | provider-dependent (BYOK) |
+| `opencode-v2` | `tarball:resolve` (the vendor's update channel) | provider-dependent (BYOK) |
 | `openfox` | `nix:nodejs` (+ `mise:npm:openfox`) | **none**: a local LLM you point it at |
 | `pi` | `mise:aqua:earendil-works/pi` | provider-dependent (BYOK) |
 | `pool` | `tarball:resolve` (the vendor's version file) | `*.poolside.ai` (Poolside account) |
@@ -149,7 +150,7 @@ default (`home_scope = "global"`).
 ## Bundles: the shared pieces
 
 Beyond the app profiles, `examples/bundle/`
-ships **67 reusable tool bundles**: a named set of packages and egress rules that
+ships **68 reusable tool bundles**: a named set of packages and egress rules that
 profiles pull in with `use = [...]` instead of restating it: the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as
