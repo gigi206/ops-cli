@@ -289,6 +289,10 @@ impl HostBus for HostNotificationsProxy<'static> {
 /// answers with are its own count, never `0`, so [`OwnedIds`] still rules on `replaces_id` and
 /// `CloseNotification`; a replacement is a new note, since a raised note cannot be revised. The
 /// capabilities name the body alone: no action is offered, because no click comes back.
+///
+/// Nor does a close: the Mac never reports a note dismissed, so [`OwnedIds`] keeps every id this
+/// hands out for the rest of the launch rather than only the notes still on screen, one `u32` per
+/// note the app raised.
 struct MacQueue {
     /// The notification channel's root, [`super::lima_mac::NOTIFY_MOUNT`] outside tests.
     dir: PathBuf,
@@ -2020,6 +2024,17 @@ mod tests {
             }
             FIRST_ID
         }
+
+        /// What a real daemon answers first, and what the relay asks at startup to tell a host with
+        /// a daemon from one without.
+        async fn get_server_information(&self) -> (String, String, String, String) {
+            (
+                "fake".to_string(),
+                "sbx-tests".to_string(),
+                "0".to_string(),
+                "1.2".to_string(),
+            )
+        }
     }
 
     fn fake_daemon(
@@ -2181,6 +2196,84 @@ mod tests {
                 "{dropped:?}"
             );
             assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    /// The next signal the cage receives, failing the test when none arrives in time.
+    async fn next_signal(signals: &mut MessageStream) -> Message {
+        futures_util::select! {
+            m = signals.next().fuse() => m.expect("a signal").expect("a message"),
+            _ = FutureExt::fuse(async_io::Timer::after(SOCKET_WAIT)) => {
+                panic!("no signal reached the cage")
+            }
+        }
+    }
+
+    /// The daemon's signals for a notification the cage raised reach the cage with the id, the
+    /// action key and the reason the daemon sent, driven end to end through the relay's own
+    /// startup. Its probe finds the daemon, so this is the path every host with one takes.
+    #[test]
+    fn a_daemons_signals_for_the_cages_own_notification_reach_the_cage() {
+        let dir = crate::testutil::TmpDir::new();
+        let (host, sock) = (dir.join("host"), dir.join("bus"));
+        let (Some(_host_bus), Some(_private_bus)) = (test_bus(&host), test_bus(&sock)) else {
+            skip_incapable!("skipping: no dbus-daemon on PATH");
+            return;
+        };
+        let host_address = address_of(&host);
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let daemon = fake_daemon(&host_address, &seen, false);
+        let _relay = NotifyRelay::start_on(sock.clone(), Some(host_address), Default::default());
+
+        async_io::block_on(async {
+            let app = cage_app(&sock).await;
+            let rule = MatchRule::builder()
+                .msg_type(Type::Signal)
+                .interface(IFACE)
+                .expect("a well-formed interface")
+                .build();
+            let mut signals = MessageStream::for_match_rule(rule, &app, None)
+                .await
+                .expect("the cage subscribes");
+            let reply = call_notify(&app, 64).await.expect("the relay answers");
+            let id: u32 = reply.body().deserialize().expect("an id");
+            assert_eq!(id, FIRST_ID);
+
+            daemon
+                .emit_signal(
+                    None::<&str>,
+                    OBJECT,
+                    IFACE,
+                    "ActionInvoked",
+                    &(id, "default"),
+                )
+                .await
+                .expect("the daemon emits");
+            daemon
+                .emit_signal(
+                    None::<&str>,
+                    OBJECT,
+                    IFACE,
+                    "NotificationClosed",
+                    &(id, 2u32),
+                )
+                .await
+                .expect("the daemon emits");
+
+            let action = next_signal(&mut signals).await;
+            assert_eq!(
+                action.header().member().map(|m| m.to_string()).as_deref(),
+                Some("ActionInvoked")
+            );
+            let (aid, key): (u32, String) = action.body().deserialize().unwrap();
+            assert_eq!((aid, key.as_str()), (id, "default"));
+            let close = next_signal(&mut signals).await;
+            assert_eq!(
+                close.header().member().map(|m| m.to_string()).as_deref(),
+                Some("NotificationClosed")
+            );
+            let (cid, reason): (u32, u32) = close.body().deserialize().unwrap();
+            assert_eq!((cid, reason), (id, 2));
         });
     }
 }

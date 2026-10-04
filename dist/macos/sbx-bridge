@@ -15,7 +15,8 @@
 # renamed into a directory of the Mac's own, outside every mount, so the guest can no longer swap
 # it for a link or a FIFO between the check and the read; only then is it checked. Only a regular
 # file with a name of the shape sbx gives is read, only its first bytes, with control characters
-# taken out, and its three lines reach Notification Center as data rather than as script text.
+# taken out and the other line separators made spaces, and its three lines reach Notification
+# Center as data rather than as script text.
 # Every other entry is removed unread, because launchd starts this script again for as long as the
 # directory it watches is not empty.
 #
@@ -33,6 +34,12 @@ set -eu
 # never crowds out a refusal. The rest of a burst is removed rather than raised, so a cage refusing
 # or notifying in a loop cannot fill Notification Center.
 MAX_RAISED=5
+
+# The line and paragraph separators past the control range, NEL, LS and PS, which a renderer may
+# break a line on. Built from their UTF-8 bytes, so the substitution below is byte for byte.
+NEL=$(printf '\302\205')
+LS=$(printf '\342\200\250')
+PS=$(printf '\342\200\251')
 
 # The application notes are raised under, built by the installer next to this script.
 NOTIFIER="${0%/*}/sbx.app"
@@ -101,7 +108,8 @@ notify() {
       *) raised=$raised_sbx ;;
     esac
     if [ "$ok" = yes ] && [ -f "$entry" ] && [ ! -L "$entry" ] && [ "$raised" -lt "$MAX_RAISED" ]; then
-      text=$(head -c 2048 "$entry" | LC_ALL=C tr -d '\000-\011\013-\037\177')
+      text=$(head -c 2048 "$entry" | LC_ALL=C tr -d '\000-\011\013-\037\177' |
+        LC_ALL=C sed -e "s/$NEL/ /g" -e "s/$LS/ /g" -e "s/$PS/ /g")
       title=$(printf '%s\n' "$text" | sed -n 1p)
       subtitle=$(printf '%s\n' "$text" | sed -n 2p)
       body=$(printf '%s\n' "$text" | sed -n 3p)
