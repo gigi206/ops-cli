@@ -28,7 +28,7 @@ use super::spec::{Mount, NetPolicy, SandboxSpec, TerminalPolicy};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 fn lit(s: &str) -> OsString {
@@ -108,7 +108,7 @@ pub(crate) fn compose_with(
 
 /// A cage's launch command before it is a process: the program, its argument list, and the
 /// descriptors that list names by number (the compiled seccomp filters, the cage's environment,
-/// and whatever a caller [hands](CageCommand::hand) it).
+/// and whatever a caller [hands](CageCommand::hand) or [stages](CageCommand::stage) on it).
 ///
 /// The three travel together because none of them works alone. bwrap reads each descriptor by the
 /// number its argument list carries, and the descriptors are close-on-exec in this process
@@ -128,7 +128,8 @@ pub(crate) fn compose_with(
 /// What this does **not** check: that the list carries the filters and the resource scope its
 /// launch owes, which the guard in this module's tests does, and that a number a caller wrote into
 /// the cage's own command is among the descriptors held here. Two such numbers exist: the proxy's
-/// `__proxy <fd>` and `selfcage`'s `/proc/self/fd/<binary>`.
+/// `__proxy <fd>` and `selfcage`'s `/proc/self/fd/<binary>`. A number [`CageCommand::stage`]
+/// returns is held by construction.
 #[derive(Debug)]
 pub(crate) struct CageCommand {
     program: PathBuf,
@@ -157,6 +158,16 @@ impl CageCommand {
     /// [`super::selfcage`] binds, the proxy's end of its link.
     pub(crate) fn hand(&mut self, file: File) {
         self.files.push(file);
+    }
+
+    /// Stage `bytes` on a descriptor this command carries to its exec, and return the number that
+    /// names it there: for a wrapper handed something its argument list must not show, as the netns
+    /// holder is handed the report socket's token ([`super::netns::behind_holder`]).
+    pub(crate) fn stage(&mut self, name: &std::ffi::CStr, bytes: &[u8]) -> io::Result<RawFd> {
+        let file = super::memfd::write(name, bytes)?;
+        let fd = file.as_raw_fd();
+        self.files.push(file);
+        Ok(fd)
     }
 
     /// The command, prepared: it owns the descriptors, so they stay open exactly as long as it does,

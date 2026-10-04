@@ -29,6 +29,7 @@
 use super::spec::{NetnsDummy, TapWiring};
 use std::ffi::{CString, OsString};
 use std::io;
+use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -39,14 +40,38 @@ use std::path::{Path, PathBuf};
 const DUMMY_OCTETS: [u8; 4] = [10, 11, 12, 13];
 const DUMMY_PREFIX: u8 = 24;
 
+/// `cage` behind the netns holder `dummy` describes ([`holder_wrap`]), and unchanged without one.
+///
+/// The report socket's token rides along on a descriptor of its own, which the holder's argument
+/// list names by number: an argument list is world-readable, and the token is what tells the tap's
+/// reports apart from a cage's ([`super::nettap::ReportToken`]).
+pub(crate) fn behind_holder(
+    mut cage: super::argv::CageCommand,
+    dummy: Option<&NetnsDummy>,
+) -> io::Result<super::argv::CageCommand> {
+    let report = dummy
+        .and_then(|nd| nd.tap.as_ref())
+        .and_then(|tap| tap.report.as_ref());
+    let token_fd = match report {
+        Some(report) => Some(cage.stage(c"sbx-report-token", report.token.as_str().as_bytes())?),
+        None => None,
+    };
+    Ok(cage.wrapped(|bwrap, argv| holder_wrap(bwrap, argv, dummy, token_fd)))
+}
+
 /// Wrap a bwrap invocation so it runs behind the netns holder, when `dummy` is set. Returns the
 /// program to spawn and its argument list; with `None` it is the unchanged `(bwrap, argv)`, so the
 /// ordinary launch path is byte-for-byte identical. The result is what the cgroup scope wrapper
 /// then splices, giving `systemd-run --scope -- <sbx> __netns-holder <bwrap> <argv…>`.
+///
+/// The report socket is named only with `token_fd`, the descriptor its token was staged on
+/// ([`behind_holder`]): a holder handed the socket without the token could make no report the
+/// socket would take.
 pub(crate) fn holder_wrap(
     bwrap: &Path,
     bwrap_argv: Vec<OsString>,
     dummy: Option<&NetnsDummy>,
+    token_fd: Option<RawFd>,
 ) -> (PathBuf, Vec<OsString>) {
     match dummy {
         None => (bwrap.to_path_buf(), bwrap_argv),
@@ -60,9 +85,11 @@ pub(crate) fn holder_wrap(
                 argv.push(tap.bwrap.as_os_str().to_owned());
                 argv.push(OsString::from("--nft"));
                 argv.push(tap.nft.as_os_str().to_owned());
-                if let Some(report) = &tap.report {
+                if let (Some(report), Some(fd)) = (&tap.report, token_fd) {
                     argv.push(OsString::from("--report"));
-                    argv.push(report.as_os_str().to_owned());
+                    argv.push(report.uds.as_os_str().to_owned());
+                    argv.push(OsString::from("--report-token-fd"));
+                    argv.push(OsString::from(fd.to_string()));
                 }
             }
             // Always emitted, tap or no tap: it is what makes the command unambiguous to parse, so
@@ -78,7 +105,9 @@ pub(crate) fn holder_wrap(
 /// The holder's own options, split from the command it will exec.
 ///
 /// Returns `None` when the argument list has no `--`, which is a caller that did not come through
-/// [`holder_wrap`]; the holder refuses rather than guessing where its options end.
+/// [`holder_wrap`]; the holder refuses rather than guessing where its options end. A
+/// `--report-token-fd` descriptor is read and closed as soon as its option is parsed
+/// ([`read_report_token`]); a refusal ends the holder, which closes the rest.
 fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString])> {
     let sep = argv.iter().position(|a| a == "--")?;
     let (opts, rest) = argv.split_at(sep);
@@ -87,6 +116,7 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
     let mut bwrap = None;
     let mut nft = None;
     let mut report = None;
+    let mut token = None;
     let mut i = 0;
     while i < opts.len() {
         match opts[i].to_str() {
@@ -94,10 +124,21 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
             Some("--bwrap") => bwrap = opts.get(i + 1).map(PathBuf::from),
             Some("--nft") => nft = opts.get(i + 1).map(PathBuf::from),
             Some("--report") => report = opts.get(i + 1).map(PathBuf::from),
+            // Never one of the standard three: closing it after the read would close this
+            // process's own stream.
+            Some("--report-token-fd") => {
+                let fd = opts.get(i + 1)?.to_str()?.parse::<RawFd>().ok();
+                token = read_report_token(fd.filter(|&fd| fd > 2)?);
+            }
             _ => return None,
         }
         i += 2;
     }
+    let report = match (report, token) {
+        (Some(uds), Some(token)) => Some(super::nettap::ReportEndpoint { uds, token }),
+        // A socket without its token takes no report, so the tap is wired to report nothing.
+        _ => None,
+    };
     let tap = match (uds, bwrap, nft) {
         (Some(uds), Some(bwrap), Some(nft)) => Some(TapWiring {
             uds,
@@ -110,6 +151,24 @@ fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString
         _ => None,
     };
     Some((tap, rest))
+}
+
+/// The report socket's token, read from the descriptor the launcher staged it on, which is closed
+/// on the way out whatever the read found.
+///
+/// Closed because of what this process becomes: the cage's bwrap, which hands the cage every
+/// descriptor it holds without the close-on-exec flag, and this one was cleared of the flag for the
+/// holder's own exec. Left open, the token would be one `read` away for the cage it exists to keep
+/// it from.
+fn read_report_token(fd: RawFd) -> Option<super::nettap::ReportToken> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    // SAFETY: `fd` is the descriptor the launcher staged and named in this process's argument
+    // list, above the standard three; it is wrapped once, here, and closed when `file` drops.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut text = String::new();
+    file.take(64).read_to_string(&mut text).ok()?;
+    super::nettap::ReportToken::parse(&text)
 }
 
 /// The `__netns-holder` subcommand body. `argv` is `[bwrap, bwrap-args…]`. Sets up the user and
@@ -379,7 +438,8 @@ const TAP_REPORT: &str = "/report.sock";
 
 /// The cage the tap runs in ([`super::selfcage::spec`]): nothing of the host but the read-only
 /// userland, the binary, and the two sockets the tap dials, read-only at fixed paths. The egress
-/// socket is one the cage already reaches; the report socket answers the tap's reports alone.
+/// socket is one the cage already reaches; the report socket answers the tap's reports alone, which
+/// carry the token this cage's environment holds.
 ///
 /// Its network is shared, and shared with the process that starts its `bwrap`: that is what puts
 /// the tap in the cage's namespace, where the redirect sends it the cage's traffic. It is sound here
@@ -397,18 +457,24 @@ fn tap_cage(
     };
     let mut mounts = vec![ro(&tap.uds, TAP_EGRESS)];
     let mut args = vec![OsString::from("__net-tap"), OsString::from(TAP_EGRESS)];
+    let mut env = Vec::new();
     if let Some(report) = &tap.report {
-        mounts.push(ro(report, TAP_REPORT));
+        mounts.push(ro(&report.uds, TAP_REPORT));
         args.extend([OsString::from("--report"), OsString::from(TAP_REPORT)]);
+        env.push((
+            super::nettap::REPORT_TOKEN_ENV.to_string(),
+            report.token.as_str().to_string(),
+        ));
     }
-    super::selfcage::spec(
+    Ok(super::selfcage::spec(
         "the capture tap",
         binary,
         copy,
         mounts,
         super::spec::NetPolicy::Shared,
         args,
-    )
+    )?
+    .with_secret_env(env))
 }
 
 /// Run one netlink operation against `dummy0`, opening and closing the socket around it.
@@ -949,7 +1015,7 @@ mod tests {
     #[test]
     fn holder_wrap_is_a_byte_for_byte_passthrough_without_a_dummy() {
         let argv = vec![OsString::from("--unshare-net"), OsString::from("--")];
-        let (prog, out) = holder_wrap(Path::new("/usr/bin/bwrap"), argv.clone(), None);
+        let (prog, out) = holder_wrap(Path::new("/usr/bin/bwrap"), argv.clone(), None, None);
         assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
         assert_eq!(out, argv);
     }
@@ -966,6 +1032,7 @@ mod tests {
             Path::new("/usr/bin/bwrap"),
             vec![OsString::from("--cap-drop"), OsString::from("ALL")],
             Some(&nd),
+            None,
         );
         // The program becomes sbx itself, invoked as `__netns-holder -- <bwrap> <args…>`.
         assert_eq!(prog, PathBuf::from("/opt/sbx"));
@@ -1013,6 +1080,8 @@ mod tests {
         );
     }
 
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
     fn holder_with_tap() -> NetnsDummy {
         NetnsDummy {
             uid: 1000,
@@ -1022,17 +1091,52 @@ mod tests {
                 uds: PathBuf::from("/run/sbx/proxy.sock"),
                 bwrap: PathBuf::from("/usr/bin/bwrap"),
                 nft: PathBuf::from("/usr/sbin/nft"),
-                report: Some(PathBuf::from("/run/sbx/report.sock")),
+                report: Some(crate::sandbox::nettap::ReportEndpoint {
+                    uds: PathBuf::from("/run/sbx/report.sock"),
+                    token: crate::sandbox::nettap::ReportToken::parse(TOKEN).expect("a token"),
+                }),
             }),
         }
     }
 
+    /// A pipe whose reading end holds `bytes`, its number, and the inode that end opens, which is
+    /// how [`still_open`] tells it apart from whatever takes its number once it is closed.
+    fn staged(bytes: &[u8]) -> (RawFd, u64) {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a live two-slot array, which is what `pipe2` fills.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the writing end `pipe2` just returned, written once from a live slice, then
+        // closed; the pipe's buffer holds far more than a token.
+        unsafe {
+            assert_eq!(
+                libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()),
+                bytes.len() as isize
+            );
+            libc::close(fds[1]);
+        }
+        (fds[0], inode(fds[0]).expect("open"))
+    }
+
+    fn inode(fd: RawFd) -> Option<u64> {
+        // SAFETY: `fstat` fills the zeroed `stat` on the stack, or fails on a closed number.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino)
+    }
+
+    /// Whether `fd` still opens the pipe [`staged`] made. Another test may have been handed the
+    /// number since, which is a closed pipe too.
+    fn still_open(fd: RawFd, ino: u64) -> bool {
+        inode(fd) == Some(ino)
+    }
+
     #[test]
     fn a_wired_tap_rides_the_holder_argv_and_comes_back_out_of_it() {
+        let (fd, ino) = staged(TOKEN.as_bytes());
         let (_, argv) = holder_wrap(
             Path::new("/usr/bin/bwrap"),
             vec![OsString::from("--cap-drop"), OsString::from("ALL")],
             Some(&holder_with_tap()),
+            Some(fd),
         );
         assert_eq!(
             argv,
@@ -1046,6 +1150,8 @@ mod tests {
                 OsString::from("/usr/sbin/nft"),
                 OsString::from("--report"),
                 OsString::from("/run/sbx/report.sock"),
+                OsString::from("--report-token-fd"),
+                OsString::from(fd.to_string()),
                 OsString::from("--"),
                 OsString::from("/usr/bin/bwrap"),
                 OsString::from("--cap-drop"),
@@ -1058,6 +1164,128 @@ mod tests {
         assert_eq!(tap, holder_with_tap().tap);
         assert_eq!(rest[0], OsString::from("/usr/bin/bwrap"));
         assert_eq!(rest.len(), 3);
+        assert!(
+            !still_open(fd, ino),
+            "the holder becomes bwrap, which hands the cage every descriptor left open"
+        );
+    }
+
+    /// The token reaches the holder on a descriptor the command carries, named by number, and
+    /// never in an argument list another uid can read.
+    #[test]
+    fn the_report_token_rides_a_descriptor_and_never_an_argument() {
+        let spec = crate::sandbox::spec::SandboxSpec::new(
+            PathBuf::from("/work"),
+            vec![],
+            vec![],
+            crate::sandbox::spec::NetPolicy::Isolated,
+            vec![OsString::from("true")],
+        )
+        .expect("a valid spec");
+        let cage =
+            crate::sandbox::argv::compose(Path::new("/usr/bin/bwrap"), &spec).expect("compose");
+        let cage = behind_holder(cage, Some(&holder_with_tap())).expect("behind the holder");
+        let args = cage.args();
+        assert!(
+            !args.iter().any(|a| a.to_string_lossy().contains(TOKEN)),
+            "the token is in the argument list: {args:?}"
+        );
+        let at = args
+            .iter()
+            .position(|a| a == "--report-token-fd")
+            .expect("the holder is told where the token is");
+        let fd: RawFd = args[at + 1]
+            .to_str()
+            .and_then(|n| n.parse().ok())
+            .expect("a number");
+        let held = cage
+            .files()
+            .iter()
+            .find(|f| std::os::fd::AsRawFd::as_raw_fd(*f) == fd)
+            .expect("the command carries the descriptor it names");
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut std::fs::File::open(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(held)
+            ))
+            .expect("reopen"),
+            &mut text,
+        )
+        .expect("read");
+        assert_eq!(text, TOKEN);
+    }
+
+    /// A report socket the holder cannot pair with a token is one the tap does not report to; a
+    /// descriptor that is one of the standard three is refused before it is read, since reading it
+    /// would close it.
+    #[test]
+    fn a_report_socket_without_its_token_wires_no_report() {
+        let tail = [OsString::from("--"), OsString::from("/usr/bin/bwrap")];
+        let wiring = |extra: &[OsString]| {
+            let mut argv = vec![
+                OsString::from("--tap"),
+                OsString::from("/run/s.sock"),
+                OsString::from("--bwrap"),
+                OsString::from("/usr/bin/bwrap"),
+                OsString::from("--nft"),
+                OsString::from("/usr/sbin/nft"),
+                OsString::from("--report"),
+                OsString::from("/run/r.sock"),
+            ];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&tail);
+            argv
+        };
+        let (tap, _) = split_holder_args(&wiring(&[])).expect("parsed");
+        assert_eq!(tap.expect("still a tap").report, None, "no token at all");
+
+        let (fd, ino) = staged(b"not a token");
+        let (tap, _) = split_holder_args(&wiring(&[
+            OsString::from("--report-token-fd"),
+            OsString::from(fd.to_string()),
+        ]))
+        .expect("parsed");
+        assert_eq!(
+            tap.expect("still a tap").report,
+            None,
+            "a token that does not parse"
+        );
+        assert!(!still_open(fd, ino), "closed whatever it held");
+
+        for standard in ["0", "1", "2"] {
+            assert!(
+                split_holder_args(&wiring(&[
+                    OsString::from("--report-token-fd"),
+                    OsString::from(standard),
+                ]))
+                .is_none(),
+                "descriptor {standard} is refused"
+            );
+        }
+    }
+
+    /// The tap's own cage carries the token in its environment, which travels on a descriptor too,
+    /// and its argument list names the report socket's path alone.
+    #[test]
+    fn the_taps_cage_carries_the_token_in_its_environment() {
+        let tap = holder_with_tap().tap.expect("a tap");
+        let spec = tap_cage(3, false, &tap).expect("the tap's cage");
+        assert!(
+            spec.secret_env
+                .iter()
+                .any(|(k, v)| k == crate::sandbox::nettap::REPORT_TOKEN_ENV && v == TOKEN),
+            "the token is not in the tap's environment"
+        );
+        let argv = crate::sandbox::argv::to_argv(&spec);
+        assert!(
+            !argv.iter().any(|a| a.to_string_lossy().contains(TOKEN)),
+            "the token is in the tap's argument list: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == TAP_REPORT),
+            "the socket is still bound"
+        );
     }
 
     #[test]

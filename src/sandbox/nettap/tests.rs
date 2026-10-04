@@ -657,9 +657,20 @@ fn the_cage_resolver_file_names_an_address_the_redirect_catches() {
     );
 }
 
-/// A stand-in report socket: collects the lines the tap reports, and answers `ok` like the real one.
-fn stand_in_report_socket(uds: &Path) -> std::sync::mpsc::Receiver<String> {
-    let listener = UnixListener::bind(uds).expect("bind the stand-in report socket");
+/// The report socket at `uds`, with a token of its own.
+fn endpoint(uds: PathBuf) -> ReportEndpoint {
+    ReportEndpoint {
+        uds,
+        token: ReportToken::draw().expect("a token"),
+    }
+}
+
+/// A stand-in report socket: collects the lines the tap reports, each with the endpoint's token
+/// taken off the front as the real socket takes it, and answers `ok` like the real one. A line
+/// without the token arrives marked, so no assertion on a report's text can pass on one.
+fn stand_in_report_socket(report: &ReportEndpoint) -> std::sync::mpsc::Receiver<String> {
+    let listener = UnixListener::bind(&report.uds).expect("bind the stand-in report socket");
+    let token = report.token.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -670,7 +681,12 @@ fn stand_in_report_socket(uds: &Path) -> std::sync::mpsc::Receiver<String> {
                 .is_ok()
             {
                 let _ = stream.write_all(b"ok\n");
-                if tx.send(line.trim().to_string()).is_err() {
+                let line = line.trim();
+                let line = match token.admits(line) {
+                    Some(report) => report.to_string(),
+                    None => format!("<without the token> {line}"),
+                };
+                if tx.send(line).is_err() {
                     break;
                 }
             }
@@ -679,13 +695,72 @@ fn stand_in_report_socket(uds: &Path) -> std::sync::mpsc::Receiver<String> {
     rx
 }
 
+/// Each report opens with the launch's token: the one thing that tells the tap's reports apart from
+/// a cage's on a socket both can reach.
+#[test]
+fn each_report_opens_with_the_launchs_token() {
+    let dir = TmpDir::new();
+    let report = endpoint(dir.join("report.sock"));
+    let listener = UnixListener::bind(&report.uds).expect("bind");
+    let reporter = Reporter::new(Some(report.clone()));
+    reporter.resolved("github.com");
+    let (stream, _) = listener.accept().expect("the report arrives");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).expect("read");
+    assert_eq!(
+        line,
+        format!("{} RESOLVED github.com\n", report.token.as_str())
+    );
+}
+
+/// The token is read back only in its own shape, compared whole, and never printed.
+#[test]
+fn a_report_token_is_admitted_whole_and_never_shown() {
+    let token = ReportToken::draw().expect("a token");
+    let text = token.as_str();
+    assert_eq!(text.len(), 32);
+    assert_eq!(ReportToken::parse(text), Some(token.clone()));
+    assert_ne!(
+        ReportToken::draw().expect("another"),
+        token,
+        "each launch draws its own"
+    );
+    for malformed in [&text[..31], &format!("{text}0"), &text.to_uppercase(), ""] {
+        assert_eq!(ReportToken::parse(malformed), None, "{malformed:?}");
+    }
+
+    assert_eq!(
+        token.admits(&format!("{text} RESOLVED a.test")),
+        Some("RESOLVED a.test")
+    );
+    let mut flipped = text.to_string().into_bytes();
+    flipped[31] = if flipped[31] == b'0' { b'1' } else { b'0' };
+    let flipped = String::from_utf8(flipped).expect("hex");
+    for refused in [
+        "RESOLVED a.test".to_string(),
+        format!("{flipped} RESOLVED a.test"),
+        format!("{} RESOLVED a.test", &text[..31]),
+        format!("{text}0 RESOLVED a.test"),
+        text.to_string(),
+    ] {
+        assert_eq!(token.admits(&refused), None, "{refused:?}");
+    }
+    assert!(
+        !format!("{token:?}").contains(text),
+        "Debug shows the token"
+    );
+}
+
 /// A name is reported when it is first given an address, and **not** on the queries that follow.
 /// A build resolving one host thousands of times must leave one entry: the record answers "which
 /// names did this cage ask for", and repeating it would drown that answer in its own noise.
 #[test]
 fn a_name_is_reported_once_however_often_it_is_asked_for() {
     let dir = TmpDir::new();
-    let report = dir.join("report.sock");
+    let report = endpoint(dir.join("report.sock"));
     let lines = stand_in_report_socket(&report);
     let reporter = Reporter::new(Some(report));
     let table = Mutex::new(FakeIps::new());
@@ -714,7 +789,7 @@ fn a_name_is_reported_once_however_often_it_is_asked_for() {
 #[test]
 fn a_question_that_gets_no_address_is_not_reported() {
     let dir = TmpDir::new();
-    let report = dir.join("report.sock");
+    let report = endpoint(dir.join("report.sock"));
     let lines = stand_in_report_socket(&report);
     let reporter = Reporter::new(Some(report));
     let table = Mutex::new(FakeIps::new());
@@ -733,7 +808,7 @@ fn a_question_that_gets_no_address_is_not_reported() {
 #[test]
 fn only_the_address_with_no_name_is_reported_to_the_record() {
     let dir = TmpDir::new();
-    let report = dir.join("report.sock");
+    let report = endpoint(dir.join("report.sock"));
     let lines = stand_in_report_socket(&report);
     let reporter = Reporter::new(Some(report));
 
@@ -782,7 +857,7 @@ fn a_reporter_with_nowhere_to_report_still_answers() {
     let table = Mutex::new(FakeIps::new());
     for reporter in [
         Reporter::default(),
-        Reporter::new(Some(dir.join("nothing-listens-here.sock"))),
+        Reporter::new(Some(endpoint(dir.join("nothing-listens-here.sock")))),
     ] {
         let reply = answer_query(&query("github.com", QTYPE_A), &table, &reporter)
             .expect("the answer does not depend on the report");
@@ -867,7 +942,7 @@ fn the_taps_process() {
 fn the_taps_work_under_its_filter(dir: &Path) {
     let uds = dir.join("egress.sock");
     let heads = stand_in_proxy(&uds, "HTTP/1.1 200 Connection established\r\n\r\n");
-    let report = dir.join("report.sock");
+    let report = endpoint(dir.join("report.sock"));
     let lines = stand_in_report_socket(&report);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the client side");
     let addr = listener.local_addr().expect("addr");

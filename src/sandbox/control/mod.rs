@@ -1653,14 +1653,14 @@ pub(crate) fn serve(
 ) -> io::Result<()> {
     let gate = Some(super::peer::PeerGate::new("egress control"));
     accept_each(listener, &stop, "egress control", None, gate, move |cmd| {
-        dispatch(
+        Some(dispatch(
             cmd,
             &planes.state,
             &planes.manual,
             &planes.log,
             &planes.flows,
             planes.capture.as_deref(),
-        )
+        ))
     });
     Ok(())
 }
@@ -1680,11 +1680,16 @@ const REPORT_CONNS: usize = 8;
 /// refused here, they are out of its reach.
 ///
 /// For the same reason this socket passes no [`super::peer::PeerGate`]: its peer runs in a cage of
-/// its own, in a PID namespace beside the agent's, and nothing here could tell the two apart. What
-/// a cage that can see this socket could do through it is add `RESOLVED` and `BYPASSED` events to
-/// the record and the counters.
+/// its own, in a PID namespace beside the agent's, and nothing the kernel says about a peer tells
+/// the two apart. What does is `token`, drawn for this launch and handed to the tap alone
+/// ([`super::nettap::ReportToken`]): a complete line that does not open with it is closed
+/// unanswered before [`report`] reads it, and one cut at the read bound is refused before it is
+/// dispatched at all, so a cage that can see this socket adds nothing to the record or the
+/// counters. It can still hold the socket's connections open until each one's read times out,
+/// and the tap's reports are dropped while it does.
 pub(crate) fn serve_reports(
     listener: UnixListener,
+    token: super::nettap::ReportToken,
     log: Arc<LogRing>,
     stats: Option<Arc<super::egress_stats::EgressStats>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -1696,7 +1701,7 @@ pub(crate) fn serve_reports(
         "egress reports",
         Some(cap),
         None,
-        move |cmd| report(cmd, &log, stats.as_deref()),
+        move |line| Some(report(token.admits(line)?, &log, stats.as_deref())),
     );
     Ok(())
 }
@@ -1704,7 +1709,8 @@ pub(crate) fn serve_reports(
 /// The accept loop of both of this module's sockets: each connection on a thread of its own,
 /// answered by `dispatch`, until `stop` is set. With a `cap`, a connection past the ceiling is
 /// closed unanswered; with a `gate`, so is one whose peer runs outside this process's PID
-/// namespace, before it takes a slot.
+/// namespace, before it takes a slot. A command `dispatch` answers with `None` is closed
+/// unanswered as well.
 fn accept_each<F>(
     listener: UnixListener,
     stop: &std::sync::atomic::AtomicBool,
@@ -1713,7 +1719,7 @@ fn accept_each<F>(
     mut gate: Option<super::peer::PeerGate>,
     dispatch: F,
 ) where
-    F: Fn(&str) -> String + Send + Sync + 'static,
+    F: Fn(&str) -> Option<String> + Send + Sync + 'static,
 {
     let dispatch = Arc::new(dispatch);
     for stream in listener.incoming() {
@@ -1785,8 +1791,9 @@ pub(crate) const UNCONFIRMED: &str = "err unconfirmed";
 const REPLY_MAX: u64 = 8 * 1024;
 
 /// Handle one control connection: read a single command line, dispatch it, write the response, and
-/// close. The bound read and the timeout hold against a stuck or malformed caller on either socket.
-fn handle(stream: UnixStream, dispatch: &dyn Fn(&str) -> String) -> io::Result<()> {
+/// close; a command `dispatch` gives no response is closed with nothing written. The bound read and
+/// the timeout hold against a stuck or malformed caller on either socket.
+fn handle(stream: UnixStream, dispatch: &dyn Fn(&str) -> Option<String>) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(CMD_MAX));
@@ -1799,7 +1806,10 @@ fn handle(stream: UnixStream, dispatch: &dyn Fn(&str) -> String) -> io::Result<(
     // ([`client`]), where a partial host would be persisted by `--save`.
     let response = match n as u64 >= CMD_MAX && !line.ends_with('\n') {
         true => "err bad-request\n".to_string(),
-        false => dispatch(line.trim()),
+        false => match dispatch(line.trim()) {
+            Some(response) => response,
+            None => return Ok(()),
+        },
     };
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
@@ -2063,7 +2073,8 @@ fn dispatch(
 }
 
 /// Map one of the transparent-capture tap's reports to its response, on the socket
-/// [`serve_reports`] serves. `RESOLVED <host>` records a name the cage asked for, and
+/// [`serve_reports`] serves, which has already taken the launch's token off the front of the line.
+/// `RESOLVED <host>` records a name the cage asked for, and
 /// `BYPASSED <addr> <port>` a connection it made to an address no name was handed out for; both
 /// answer `ok`. Any other verb, the owner's included, is `err bad-request`.
 ///
@@ -2945,6 +2956,58 @@ mod tests {
             log.snapshot(None, None, true).events.is_empty(),
             "a refusal leaves no row"
         );
+    }
+
+    /// The report socket closes a line that does not open with the launch's token before
+    /// [`report`] reads it: no answer, so nothing reached the verb that writes the record and the
+    /// counters, and no row. The line that opens with it is answered and recorded.
+    #[test]
+    fn the_report_socket_takes_a_report_only_with_the_launchs_token() {
+        use std::io::{Read, Write};
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.join("report.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let token = crate::sandbox::nettap::ReportToken::draw().expect("a token");
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (token, log, stop) = (token.clone(), log.clone(), stop.clone());
+            thread::spawn(move || serve_reports(listener, token, log, None, stop));
+        }
+        let ask = |line: &str| {
+            let mut sock = UnixStream::connect(&path).expect("connect");
+            sock.write_all(format!("{line}\n").as_bytes())
+                .expect("write");
+            let mut reply = String::new();
+            sock.read_to_string(&mut reply).expect("read");
+            reply
+        };
+        let other = crate::sandbox::nettap::ReportToken::draw().expect("another token");
+        for forged in [
+            "RESOLVED forged.test".to_string(),
+            "BYPASSED 198.18.0.7 443".to_string(),
+            format!("{} RESOLVED forged.test", other.as_str()),
+            token.as_str().to_string(),
+        ] {
+            assert_eq!(ask(&forged), "", "`{forged}` was answered");
+        }
+        assert!(
+            log.snapshot(None, None, true).events.is_empty(),
+            "a report without the token left a row"
+        );
+        assert_eq!(
+            ask(&format!("{} RESOLVED real.test", token.as_str())),
+            "ok\n"
+        );
+        assert!(
+            log.snapshot(None, None, true)
+                .events
+                .iter()
+                .any(|e| e.host == "real.test"),
+            "the tap's report reaches the record"
+        );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = UnixStream::connect(&path);
     }
 
     /// And the owner's socket takes no report: each socket has one peer and that peer's verbs.

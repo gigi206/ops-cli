@@ -2591,7 +2591,7 @@ pub(super) fn build(
     // The same, for the socket the tap reports on: the names the cage resolves land in the record
     // `sbx net logs` reads rather than in a second place. Not the control socket, whose verbs
     // decide egress.
-    let mut proxy_report_uds: Option<std::path::PathBuf> = None;
+    let mut proxy_report: Option<crate::sandbox::nettap::ReportEndpoint> = None;
 
     // The declared loopback forwarders, bridged into the cage.
     let forward_up = forward_ports(prep, &mut wraps)?;
@@ -2705,7 +2705,7 @@ pub(super) fn build(
         authenticated = wiring.authenticated;
         withdrawn = wiring.withdrawn;
         proxy_host_uds = Some(wiring.host_uds);
-        proxy_report_uds = Some(wiring.report_uds);
+        proxy_report = Some(wiring.report);
         egress_guard = Some(guard);
     }
 
@@ -3069,7 +3069,7 @@ pub(super) fn build(
         prep.cfg.gui.renders(),
         &prep.bwrap,
         proxy_host_uds.as_deref(),
-        proxy_report_uds.as_deref(),
+        proxy_report.as_ref(),
         crate::sandbox::netns::probe_namespace,
     );
     let capture_resolver = holder.as_ref().is_some_and(|h| h.tap.is_some());
@@ -3293,7 +3293,7 @@ pub(super) fn holder_plan(
     gui_renders: bool,
     bwrap: &std::path::Path,
     proxy_host_uds: Option<&std::path::Path>,
-    proxy_report_uds: Option<&std::path::Path>,
+    proxy_report: Option<&crate::sandbox::nettap::ReportEndpoint>,
     netns: impl FnOnce(&std::path::Path) -> Result<(), String>,
 ) -> Option<crate::sandbox::spec::NetnsDummy> {
     if net != NetPolicy::Isolated || as_root {
@@ -3307,7 +3307,7 @@ pub(super) fn holder_plan(
             uds: uds.to_path_buf(),
             bwrap: bwrap.to_path_buf(),
             nft,
-            report: proxy_report_uds.map(std::path::Path::to_path_buf),
+            report: proxy_report.cloned(),
         })
     });
     if !gui_renders && tap.is_none() {

@@ -239,8 +239,8 @@ pub(crate) struct Wiring {
     /// The socket the tap reports on ([`super::control::serve_reports`]): each name the cage
     /// resolves, so the resolutions land in the same record `sbx net logs` reads, and each address
     /// it reached without one. Not the control socket, whose verbs decide egress: the tap parses
-    /// what the cage writes and is handed this one alone.
-    pub(crate) report_uds: PathBuf,
+    /// what the cage writes and is handed this one alone, with the token the socket asks for.
+    pub(crate) report: super::nettap::ReportEndpoint,
     /// The destinations this proxy will attach a credential to, rendered, for the in-cage
     /// contract to name.
     ///
@@ -1121,7 +1121,13 @@ pub(crate) fn start(
     let control_listener = UnixListener::bind(&control_uds).map_err(&unlink_socket)?;
     // The tap's own socket, bound beside it and before either thread starts, so a failure here has
     // only the two paths to take back. The tap reports on it, never on the owner's socket above.
+    // Its token is drawn with it: the server keeps one copy, and the wiring carries the other to the
+    // launcher, which hands it to the tap alone ([`super::nettap::ReportToken`]).
     let report_uds = dir.join(format!("report-{pid}{instance}.sock"));
+    let report_token = super::nettap::ReportToken::draw().map_err(|e| {
+        let _ = std::fs::remove_file(&control_uds);
+        unlink_socket(e)
+    })?;
     let _ = std::fs::remove_file(&report_uds);
     let report_listener = UnixListener::bind(&report_uds).map_err(|e| {
         let _ = std::fs::remove_file(&control_uds);
@@ -1147,9 +1153,11 @@ pub(crate) fn start(
     }
     {
         let (report_log, report_stats, report_stop) = (log.clone(), stats.clone(), stop.clone());
+        let token = report_token.clone();
         std::thread::spawn(move || {
             let _ = super::control::serve_reports(
                 report_listener,
+                token,
                 report_log,
                 report_stats,
                 report_stop,
@@ -1288,7 +1296,10 @@ pub(crate) fn start(
             binds,
             env,
             host_uds,
-            report_uds,
+            report: super::nettap::ReportEndpoint {
+                uds: report_uds,
+                token: report_token,
+            },
             authenticated,
             withdrawn,
         },
@@ -2303,7 +2314,7 @@ mod tests {
             "the control socket must not be a cage bind"
         );
         // The tap's report socket is a second one, host-side as well, and no more a cage bind.
-        let report = wiring.report_uds.clone();
+        let report = wiring.report.uds.clone();
         assert_ne!(
             report, control,
             "the tap must not report on the control socket"
@@ -2531,7 +2542,8 @@ mod tests {
 
     /// The tap's socket, as a launch binds it, takes the tap's reports into the session's record
     /// and nothing that decides egress: a rule sent there is refused and never reaches the rules
-    /// the owner's socket lists.
+    /// the owner's socket lists. And it takes them from the holder of the launch's token alone: a
+    /// report without it, or with another, is closed unanswered and leaves no row.
     #[test]
     fn the_report_socket_records_the_taps_reports_and_remembers_no_rule() {
         let data = TmpDir::new();
@@ -2559,18 +2571,37 @@ mod tests {
         )
         .expect("start the ask egress proxy");
         let control = guard.control_uds.clone().expect("a control socket");
-        let report = wiring.report_uds.clone();
+        let report = wiring.report.uds.clone();
+        let token = wiring.report.token.as_str();
 
         for verb in ["REMEMBER ALLOW https://api.test", "ALLOW *", "RULES", "LOG"] {
             assert_eq!(
-                ask(&report, verb),
+                ask(&report, &format!("{token} {verb}")),
                 "err bad-request\n",
                 "`{verb}` must be refused on the tap's socket"
             );
         }
         assert_eq!(ask(&control, "RULES"), "ok\n", "no rule was remembered");
 
-        assert_eq!(ask(&report, "RESOLVED api.test"), "ok\n");
+        let other = crate::sandbox::nettap::ReportToken::draw().expect("a second token");
+        for forged in [
+            "RESOLVED forged.test".to_string(),
+            format!("{} RESOLVED forged.test", other.as_str()),
+            format!("{} RESOLVED forged.test", &token[..31]),
+            token.to_string(),
+        ] {
+            assert_eq!(
+                ask(&report, &forged),
+                "",
+                "`{forged}` must be closed unanswered"
+            );
+        }
+        assert!(
+            !ask(&control, "LOG").contains("forged.test"),
+            "a report without the launch's token leaves no row"
+        );
+
+        assert_eq!(ask(&report, &format!("{token} RESOLVED api.test")), "ok\n");
         let log = ask(&control, "LOG");
         assert!(
             log.lines()

@@ -424,13 +424,93 @@ impl FakeIps {
     }
 }
 
+/// The environment variable the tap's cage carries its [`ReportToken`] in. A cage's environment
+/// travels on a descriptor ([`super::spec::SandboxSpec::secret_env`]), never in an argument list
+/// another uid can read.
+pub(crate) const REPORT_TOKEN_ENV: &str = "SBX_REPORT_TOKEN";
+
+/// The secret a launch's report socket asks of every connection, drawn where the socket is bound
+/// and handed to the tap alone.
+///
+/// The socket passes no [`super::peer::PeerGate`]: its peer, the tap, runs in a PID namespace beside
+/// the agent's, and nothing the kernel says about a peer tells the two apart. What tells them apart
+/// is what each was handed. The tap is handed this token, through the holder on a descriptor and
+/// then in its own cage's environment; the agent is handed nothing. A cage that can see the socket
+/// (a bind of the data directory shows it) is closed before its line reaches the record or the
+/// counters ([`super::control::serve_reports`]).
+///
+/// 128 bits from the system's random source, carried as 32 lowercase hexadecimal characters so it
+/// is one word on a report's line. Its `Debug` shows none of it.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ReportToken(String);
+
+impl ReportToken {
+    /// A fresh token.
+    pub(crate) fn draw() -> io::Result<Self> {
+        use ring::rand::SecureRandom;
+        let mut bytes = [0u8; 16];
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| {
+                io::Error::other("no randomness to draw the report socket's token from")
+            })?;
+        Ok(Self(bytes.iter().map(|b| format!("{b:02x}")).collect()))
+    }
+
+    /// A token read back where the holder or the tap was handed it: exactly 32 lowercase
+    /// hexadecimal characters, or `None`.
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let well_formed =
+            text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        well_formed.then(|| Self(text.to_string()))
+    }
+
+    /// The token as it travels.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// What follows this token on a report's line, or `None` when the line does not open with it.
+    ///
+    /// Every byte is compared whichever one differs, so a peer timing its refusals learns nothing
+    /// of how much of a guess was right.
+    pub(crate) fn admits<'a>(&self, line: &'a str) -> Option<&'a str> {
+        let (word, rest) = line.split_once(' ')?;
+        if word.len() != self.0.len() {
+            return None;
+        }
+        let diff = word
+            .bytes()
+            .zip(self.0.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        (std::hint::black_box(diff) == 0).then_some(rest)
+    }
+}
+
+impl std::fmt::Debug for ReportToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReportToken(..)")
+    }
+}
+
+/// Where the tap reports, and the token it reports with: one value, because neither is of any use
+/// to the tap without the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReportEndpoint {
+    /// The report socket: its host path, or the path the tap's cage binds it at.
+    pub(crate) uds: PathBuf,
+    /// The launch's token.
+    pub(crate) token: ReportToken,
+}
+
 /// Where the tap reports what it saw: the names the cage asked for, and the connections it refused
 /// for want of one.
 ///
 /// The report goes to the proxy's report socket, so it lands in the same record `sbx net logs`
 /// reads rather than in a second place with its own reader. That socket answers the two reports
 /// and nothing else ([`super::control::serve_reports`]): the tap never holds the control socket,
-/// whose verbs decide egress. A report is never a prerequisite:
+/// whose verbs decide egress. Each line opens with the launch's [`ReportToken`], without which the
+/// socket closes the connection unanswered. A report is never a prerequisite:
 /// every failure is swallowed, because a cage whose egress works must not lose it because a log
 /// line could not be delivered.
 ///
@@ -477,7 +557,7 @@ pub(crate) struct Reporter {
 const REPORT_BACKLOG: usize = 256;
 
 impl Reporter {
-    pub(crate) fn new(report: Option<PathBuf>) -> Self {
+    pub(crate) fn new(report: Option<ReportEndpoint>) -> Self {
         let Some(report) = report else {
             return Self { outbox: None };
         };
@@ -487,8 +567,9 @@ impl Reporter {
         // last sender goes, which is this `Reporter` being dropped.
         std::thread::spawn(move || {
             for line in queue {
-                if let Ok(mut sock) = UnixStream::connect(&report) {
+                if let Ok(mut sock) = UnixStream::connect(&report.uds) {
                     let _ = sock.set_write_timeout(Some(REPORT_TIMEOUT));
+                    let line = format!("{} {line}", report.token.as_str());
                     let _ = sock.write_all(line.as_bytes());
                     let _ = sock.flush();
                 }
@@ -889,6 +970,15 @@ pub(crate) fn run_tap(argv: &[OsString]) -> ! {
         errln!("__net-tap: usage: __net-tap <egress socket> [--report <socket>]");
         std::process::exit(2);
     };
+    // A report socket without the token is one whose every report would be refused, so the tap
+    // makes none rather than send them to be dropped.
+    let report = report.and_then(|uds| {
+        let token = std::env::var(REPORT_TOKEN_ENV).ok()?;
+        Some(ReportEndpoint {
+            uds,
+            token: ReportToken::parse(&token)?,
+        })
+    });
     let listeners = Listeners::bind().unwrap_or_else(|e| stop(&e));
     if let Err(e) = crate::sandbox::seccomp::tap::confine() {
         stop(&e);
@@ -917,7 +1007,8 @@ fn stop(e: &io::Error) -> ! {
 /// Strict, like the holder's own parse and for the same reason: an argument list this process does
 /// not fully understand is one it was not given by the launcher, and guessing at it would leave a
 /// tap serving with a wiring nobody chose. `--report` is the one option, and its absence costs the
-/// cage nothing but the record — the tap still answers DNS and still captures.
+/// cage nothing but the record — the tap still answers DNS and still captures. The token the
+/// reports carry is not an argument: it arrives in [`REPORT_TOKEN_ENV`].
 fn parse_tap_args(argv: &[OsString]) -> Option<(PathBuf, Option<PathBuf>)> {
     let uds = PathBuf::from(argv.first()?);
     let mut report = None;

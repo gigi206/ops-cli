@@ -104,7 +104,10 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 /// answer never met the refusal.
 ///
 /// The report is sent from a thread of the tap's own after the answer, and the tap ends with the
-/// command, so the command waits for the report to land before it exits.
+/// command, so the command waits for the report to land before it exits. It opens with the token
+/// the holder was handed on a descriptor, as a launch hands it, and that descriptor is closed by
+/// the time the holder becomes the command: the command, which stands where the cage's bwrap
+/// stands in a launch, holds no descriptor onto it.
 ///
 /// The tap parses what the cage writes, so it runs caged: the command reads, from outside, what the
 /// tap and each of its threads hold. Every one of them is under its filter with no new privileges
@@ -133,6 +136,24 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     let dir = TmpDir::new("tapdns");
     let egress = dir.join("egress.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&egress).expect("bind egress socket");
+    // The token, on the reading end of a pipe the holder inherits, as a launch stages it.
+    const TOKEN: &str = "00112233445566778899aabbccddeeff";
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a live two-slot array, which is what `pipe` fills. Neither end is
+    // close-on-exec, so the holder inherits the reading one.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: the writing end just returned, written once from a live slice and closed.
+    unsafe {
+        assert_eq!(
+            libc::write(fds[1], TOKEN.as_ptr().cast(), TOKEN.len()),
+            TOKEN.len() as isize
+        );
+        libc::close(fds[1]);
+    }
+    // SAFETY: `fstat` fills the zeroed `stat` on the stack for the open reading end.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(fds[0], &mut st) }, 0);
+    let token_pipe = format!("pipe:[{}]", st.st_ino);
     // The report socket: its first line is written to `reported`, which the command waits for.
     let report = dir.join("report.sock");
     let reported = dir.join("reported");
@@ -188,6 +209,13 @@ else:
         print("thread", fields["NoNewPrivs"], fields["Seccomp_filters"], fields["CapEff"])
     own = os.readlink(f"/proc/{tap}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
     print("tap mount", "own" if own else "shared")
+held = False
+for fd in os.listdir("/proc/self/fd"):
+    try:
+        held = held or os.readlink(f"/proc/self/fd/{fd}") == sys.argv[2]
+    except OSError:
+        pass
+print("token fd", "held" if held else "closed")
 "#;
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["__netns-holder", "--tap"])
@@ -198,12 +226,17 @@ else:
         .arg(&nft)
         .arg("--report")
         .arg(&report)
+        .arg("--report-token-fd")
+        .arg(fds[0].to_string())
         .arg("--")
         .arg(python)
         .args(["-c", query])
         .arg(&reported)
+        .arg(&token_pipe)
         .output()
         .expect("spawn sbx __netns-holder");
+    // SAFETY: this process's own reading end, closed once.
+    unsafe { libc::close(fds[0]) };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     for own in [
@@ -245,8 +278,14 @@ else:
         "the tap's answer did not come back: {stdout}{stderr}"
     );
     assert!(
-        stdout.lines().any(|l| l == "reported RESOLVED example.com"),
-        "the name must reach the report socket: {stdout}{stderr}"
+        stdout
+            .lines()
+            .any(|l| l == format!("reported {TOKEN} RESOLVED example.com")),
+        "the name must reach the report socket, behind the token: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == "token fd closed"),
+        "the holder must close the token's descriptor before it becomes the command: {stdout}"
     );
     let threads: Vec<&str> = stdout
         .lines()

@@ -240,8 +240,9 @@ mod tests {
 
     /// Only the composition stages a descriptor for bwrap: every file [`super::write`] makes for
     /// an exec is made by [`crate::sandbox::argv::compose`]'s own steps, the environment's in
-    /// `argv.rs` and the filters' in `seccomp.rs`, and leaves inside a
-    /// [`crate::sandbox::argv::CageCommand`], whose only ways out hand it to the exec.
+    /// `argv.rs` and the filters' in `seccomp.rs`, or by
+    /// [`crate::sandbox::argv::CageCommand::stage`] for what a wrapper is handed, and leaves inside
+    /// a [`crate::sandbox::argv::CageCommand`], whose only ways out hand it to the exec.
     ///
     /// This asked the other question before: whether every file that stages one also prepares the
     /// exec that inherits it. That needed a list of the ways to stage one, and the list was short

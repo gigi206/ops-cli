@@ -363,7 +363,9 @@ fn cage_output_line(line: &str) -> String {
 ///
 /// The memfds behind the seccomp filters and the cage's environment travel inside the returned
 /// command, through both wrappers, so whatever starts it hands them to bwrap
-/// ([`crate::sandbox::argv::CageCommand`]).
+/// ([`crate::sandbox::argv::CageCommand`]). So does the one the holder is handed the report
+/// socket's token on, which the holder closes before it becomes bwrap
+/// ([`crate::sandbox::netns::behind_holder`]).
 pub(in crate::sandbox) fn cage_command(
     bwrap: &Path,
     spec: &SandboxSpec,
@@ -381,9 +383,10 @@ fn cage_command_with(
     limits: &crate::sandbox::cgroup::Limits,
     status: Option<&std::fs::File>,
 ) -> io::Result<crate::sandbox::argv::CageCommand> {
-    let cage = crate::sandbox::argv::compose_with(bwrap, spec, status)?.wrapped(|bwrap, argv| {
-        crate::sandbox::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref())
-    });
+    let cage = crate::sandbox::netns::behind_holder(
+        crate::sandbox::argv::compose_with(bwrap, spec, status)?,
+        spec.netns_dummy.as_ref(),
+    )?;
     // The launch's own decision when it took one, so the cage carries the limits its contract
     // names; otherwise the one `wrap` takes here.
     Ok(match &spec.limit_scope {
