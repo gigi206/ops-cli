@@ -199,7 +199,8 @@ Mac-side bridge this repository ships at the release's tag, creates a Lima insta
 `~/.local/bin/sbx`, saying so when that directory is not on your `PATH`, and installs two
 launchd agents, `org.sbx.lima.theme` and `org.sbx.lima.notify`, in
 `~/Library/LaunchAgents`. macOS announces each new agent once with a "Background Items
-Added" banner; each is removed with `launchctl bootout gui/$(id -u)/<label>` and the
+Added" banner naming `sbx-bridge`, the program both agents run, and lists it under that name
+in Login Items settings; each is removed with `launchctl bootout gui/$(id -u)/<label>` and the
 deletion of its plist. The first start downloads an image
 and provisions the guest, including its compositor and sound server, which takes a few
 minutes. An instance named `sbx` that already exists is kept as it is: running the script

@@ -581,6 +581,15 @@ fn on_macos_the_bridge_and_its_two_agents_are_installed_and_replaced() {
 
     let agents = fx.home().join("Library/LaunchAgents");
     let theme = std::fs::read_to_string(agents.join("org.sbx.lima.theme.plist")).unwrap();
+    let notify = std::fs::read_to_string(agents.join("org.sbx.lima.notify.plist")).unwrap();
+    // macOS names a background item after its program, so the program is the bridge itself.
+    let program = format!("<array><string>{}</string>", bridge.display());
+    for plist in [&theme, &notify] {
+        assert!(
+            plist.contains(&program) && !plist.contains("/bin/sh"),
+            "{plist}"
+        );
+    }
     assert!(
         theme.contains("<string>theme</string>")
             && theme.contains("WatchPaths")
@@ -588,7 +597,6 @@ fn on_macos_the_bridge_and_its_two_agents_are_installed_and_replaced() {
             && theme.contains("StartInterval"),
         "{theme}"
     );
-    let notify = std::fs::read_to_string(agents.join("org.sbx.lima.notify.plist")).unwrap();
     assert!(
         notify.contains("<string>notify</string>")
             && notify.contains("QueueDirectories")

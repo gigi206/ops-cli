@@ -168,6 +168,10 @@ $actual; nothing was installed"
 }
 
 # The launchd agent `$1` running the bridge `$2` in mode `$3`, woken by the plist keys in `$4`.
+#
+# The bridge is the program itself, run through its own shebang, never an argument to `/bin/sh`:
+# macOS lists a background item, and announces it when it is added, under the name of its
+# executable, and `sh` would name nothing the user installed.
 agent_plist() {
     cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -176,7 +180,7 @@ agent_plist() {
 <dict>
   <key>Label</key><string>$1</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/sh</string><string>$2</string><string>$3</string></array>
+  <array><string>$2</string><string>$3</string></array>
 $4
 </dict>
 </plist>
