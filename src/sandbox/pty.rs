@@ -194,8 +194,9 @@ fn pump_until_exit(
 
         // A signal arrived. A resize copies the real terminal's window size onto the pty, handled
         // before stdin so a resize delivered alongside input takes effect before that input
-        // reaches the inner program. A stop ends the relay at once, the terminal still raw, so the
-        // line saying so carries its own carriage returns.
+        // reaches the inner program. A stop ends the relay at once. The handler has given the
+        // terminal back already, and the line saying so carries its own carriage returns, which
+        // read the same whether the terminal is raw or not.
         if fds[2].revents != 0 {
             let caught = drain_signals(signals_fd);
             if caught.resized {
@@ -456,9 +457,79 @@ pub(crate) fn write_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
 /// supervisor runs per process, so there is a single writer.
 static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// Signal handler: nudge the supervisor by writing the signal's number, one byte, to the self-pipe.
-/// Async-signal-safe — it does nothing but a single `write` of that byte to a non-blocking fd read
-/// from an atomic (no allocation, no locks). The write's *return value* is ignored, because a full
+/// The settings [`RawMode`] replaced, and the terminal they belong to, for [`relay_handler`] to put
+/// back the moment a stop arrives ([`GIVE_BACK`]).
+///
+/// The handler cannot wait for the pump to return. The pump may be parked in a write to a standard
+/// output that stopped taking it, where a stop waits for that output to be read and the stop's
+/// escalation to `SIGKILL` comes first, ending the process with the terminal still raw. Put back
+/// from the handler, without waiting for the output (`TCSANOW`), the terminal is the user's again
+/// whichever comes next.
+///
+/// `fd` publishes `settings`: written before `fd` is stored (`Release`), read only once `fd` is
+/// loaded (`Acquire`). One terminal at a time, as one pty supervisor runs per process: a second
+/// [`RawMode`] finds the slot taken and leaves it alone.
+struct GiveBack {
+    /// The terminal the settings belong to; `-1` when none is saved, [`GiveBack::ARMING`] while
+    /// they are being written.
+    fd: AtomicI32,
+    settings: std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>,
+}
+
+// SAFETY: `settings` is written only by the owner that took the slot from `-1`, before it publishes
+// `fd`, and read only once `fd` names a terminal; see the type's documentation.
+unsafe impl Sync for GiveBack {}
+
+/// The one [`GiveBack`] slot of this process.
+static GIVE_BACK: GiveBack = GiveBack {
+    fd: AtomicI32::new(-1),
+    settings: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+};
+
+impl GiveBack {
+    /// What `fd` holds while the settings are being written.
+    const ARMING: libc::c_int = -2;
+
+    /// Save `settings` as what `fd` is to be given back to, when no terminal is saved already, and
+    /// say whether they were.
+    fn arm(&self, fd: libc::c_int, settings: &libc::termios) -> bool {
+        if self
+            .fd
+            .compare_exchange(-1, Self::ARMING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        // SAFETY: the exchange above made this call the slot's only writer, and no reader looks at
+        // `settings` until `fd` names a terminal, which the store below does after the write.
+        unsafe { (*self.settings.get()).write(*settings) };
+        self.fd.store(fd, Ordering::Release);
+        true
+    }
+
+    /// Forget what `fd` was to be given back to.
+    fn disarm(&self, fd: libc::c_int) {
+        let _ = self
+            .fd
+            .compare_exchange(fd, -1, Ordering::Release, Ordering::Relaxed);
+    }
+
+    /// Give the saved terminal its settings back, at once and without waiting for its output: what
+    /// [`relay_handler`] does on a stop. Async-signal-safe: an atomic load and `tcsetattr`.
+    fn give_back(&self) {
+        let fd = self.fd.load(Ordering::Acquire);
+        if fd >= 0 {
+            // SAFETY: `fd` names a terminal only once `arm` has written `settings`, so they are
+            // initialised; `tcsetattr` reads them without retaining.
+            unsafe { libc::tcsetattr(fd, libc::TCSANOW, (*self.settings.get()).as_ptr()) };
+        }
+    }
+}
+
+/// Signal handler: nudge the supervisor by writing the signal's number, one byte, to the self-pipe,
+/// and on a stop give the terminal back first ([`GiveBack`]). Async-signal-safe — it does nothing
+/// but `tcsetattr` on a stop and a single `write` of that byte to a non-blocking fd read from an
+/// atomic (no allocation, no locks). The write's *return value* is ignored, because a full
 /// pipe (`EAGAIN`) or an absent relay costs nothing that matters: the supervisor coalesces, so a
 /// dropped resize only means an already-pending one is still pending, and a pipe full enough to
 /// drop a stop is one the relay has stopped reading, where a stop's escalation to `SIGKILL` is what
@@ -471,17 +542,21 @@ static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 /// overwrote the real error with the handler's `EAGAIN`, so a genuine `EIO` on the pty was reported
 /// as a would-block, and an `EINTR` the loops retry on was lost.
 extern "C" fn relay_handler(sig: libc::c_int) {
+    // SAFETY: `__errno_location` returns this thread's own `errno` slot, read here and written back
+    // below around every call this handler makes.
+    let saved = unsafe { *libc::__errno_location() };
+    // A resize leaves the terminal raw: the session goes on.
+    if sig == libc::SIGTERM {
+        GIVE_BACK.give_back();
+    }
     let fd = SIGNAL_WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let byte = [u8::try_from(sig).unwrap_or(0)];
-        // SAFETY: `__errno_location` returns this thread's own `errno` slot, and the write is a
-        // single byte from a local array to a non-blocking descriptor.
-        unsafe {
-            let saved = *libc::__errno_location();
-            libc::write(fd, byte.as_ptr().cast(), 1);
-            *libc::__errno_location() = saved;
-        }
+        // SAFETY: the write is a single byte from a local array to a non-blocking descriptor.
+        unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
     }
+    // SAFETY: as above, this thread's own `errno` slot.
+    unsafe { *libc::__errno_location() = saved };
 }
 
 /// Carries two signals to the pump for the life of a supervised session: `SIGWINCH`, a resize of
@@ -491,8 +566,13 @@ extern "C" fn relay_handler(sig: libc::c_int) {
 ///
 /// A stop is relayed rather than left to its default action because that action ends the process
 /// on the spot, with the real terminal still raw: [`RawMode`]'s restore runs on a return, never on
-/// a signal. Relayed, the pump returns [`Ended::Stopped`], the terminal is given back, and the
-/// process then ends as the signal asked ([`end_as_asked`]). A `SIGTERM` this process was started
+/// a signal. Relayed, the handler gives the terminal back at once ([`GiveBack`]), the pump returns
+/// [`Ended::Stopped`], and the process then ends as the signal asked ([`end_as_asked`]). A pump
+/// parked in a write to a standard output that stopped taking it returns only once that output is
+/// read, and the stop's escalation to `SIGKILL` may come first: the terminal is the user's already.
+/// Once given back it is in its own mode again for the rest of that wait, so a Ctrl+C typed there
+/// reaches this process as a `SIGINT`, which nothing here handles: its default action ends the
+/// process at once, as the escalation would have later. A `SIGTERM` this process was started
 /// ignoring stays ignored.
 pub(crate) struct SignalRelay {
     read_fd: libc::c_int,
@@ -638,12 +718,15 @@ pub(crate) fn copy_winsize(src: libc::c_int, dst: libc::c_int) {
     }
 }
 
-/// Put a terminal into raw mode, restoring the original settings on drop (covers
-/// normal return, `?`, and panic — but no signal: [`fork_with_pty`] relays a `SIGTERM` so the
-/// drop runs before it takes effect, and a `SIGKILL` or a `SIGHUP` still leaves the terminal raw).
+/// Put a terminal into raw mode, restoring the original settings on drop (covers normal return,
+/// `?`, and panic — but no signal). [`fork_with_pty`] relays a `SIGTERM`, whose handler gives the
+/// original settings back at once ([`GiveBack`]) and whose return path runs the drop. A `SIGKILL`
+/// that comes with no `SIGTERM` before it, or a `SIGHUP`, still leaves the terminal raw.
 pub(crate) struct RawMode {
     fd: libc::c_int,
     original: libc::termios,
+    /// Whether the original settings are the ones a stop gives back ([`GiveBack::arm`]).
+    armed: bool,
 }
 
 impl RawMode {
@@ -665,12 +748,22 @@ impl RawMode {
         if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(RawMode { fd, original })
+        let armed = GIVE_BACK.arm(fd, &original);
+        Ok(RawMode {
+            fd,
+            original,
+            armed,
+        })
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // Forgotten first, so a stop that comes after this restore does not undo whatever the
+        // terminal is put in next.
+        if self.armed {
+            GIVE_BACK.disarm(self.fd);
+        }
         // SAFETY: `self.original` was filled by the checked `tcgetattr` in `enable` — `Self` exists
         // only after it returned 0 — and `self.fd` is the terminal that call succeeded on, which
         // this guard never closes.
@@ -925,6 +1018,17 @@ mod tests {
 
     impl OnTerminal {
         fn start(entry: &str) -> Self {
+            Self::spawn(entry, false)
+        }
+
+        /// [`Self::start`] with the process's standard output on the terminal as well, as a launch
+        /// from a terminal has it, and read by no thread: what the process writes waits on the
+        /// master for [`Self::read_until`].
+        fn start_writing_to_it(entry: &str) -> Self {
+            Self::spawn(entry, true)
+        }
+
+        fn spawn(entry: &str, writing_to_it: bool) -> Self {
             use std::io::Read as _;
             use std::os::fd::FromRawFd as _;
             let (master, slave) = open_pty_pair(None).expect("a terminal for the process run");
@@ -935,22 +1039,30 @@ mod tests {
             // SAFETY: `dup` hands back a fresh descriptor for the slave, owned from here on and
             // given to the process run alone as its standard input.
             let stdin = unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave)) };
+            let stdout = match writing_to_it {
+                // SAFETY: as for `stdin`, a fresh descriptor for the slave, owned from here on.
+                true => std::process::Stdio::from(unsafe {
+                    std::os::fd::OwnedFd::from_raw_fd(libc::dup(slave))
+                }),
+                false => std::process::Stdio::piped(),
+            };
             let mut run = crate::testutil::alone(entry, "")
                 .stdin(std::process::Stdio::from(stdin))
-                .stdout(std::process::Stdio::piped())
+                .stdout(stdout)
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .expect("the process run alone starts");
-            let mut out = run.stdout.take().expect("its output");
             let (tell, heard) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let mut chunk = [0u8; 4096];
-                while let Ok(n) = out.read(&mut chunk) {
-                    if n == 0 || tell.send(chunk[..n].to_vec()).is_err() {
-                        break;
+            if let Some(mut out) = run.stdout.take() {
+                std::thread::spawn(move || {
+                    let mut chunk = [0u8; 4096];
+                    while let Ok(n) = out.read(&mut chunk) {
+                        if n == 0 || tell.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            }
             OnTerminal {
                 run,
                 master,
@@ -1015,9 +1127,67 @@ mod tests {
 
         /// Whether the terminal's settings after are the ones from before the process ran.
         fn given_back(&self, ending: &Ending) -> bool {
-            let (a, b) = (&ending.after, &self.before);
+            self.as_before(&ending.after)
+        }
+
+        /// Whether `settings` are the terminal's from before the process ran.
+        fn as_before(&self, settings: &libc::termios) -> bool {
+            let (a, b) = (settings, &self.before);
             (a.c_iflag, a.c_oflag, a.c_cflag, a.c_lflag)
                 == (b.c_iflag, b.c_oflag, b.c_cflag, b.c_lflag)
+        }
+
+        /// Whether the terminal has its settings from before the process ran, now, while the
+        /// process may still run.
+        fn given_back_now(&self) -> bool {
+            // SAFETY: as for `before`, on the same slave, which this test still holds.
+            let mut now: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(self.slave, &mut now) }, 0);
+            self.as_before(&now)
+        }
+
+        /// Read what the process wrote to the terminal ([`Self::start_writing_to_it`]) until `word`
+        /// is in it or `within` passes, and say whether it was.
+        fn read_until(&mut self, word: &[u8], within: Duration) -> bool {
+            let deadline = Instant::now() + within;
+            let mut chunk = [0u8; 4096];
+            while !self.seen.windows(word.len()).any(|w| w == word) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                let mut ready = libc::pollfd {
+                    fd: self.master,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+                // SAFETY: one live `pollfd` on the master this test holds, with its count.
+                if unsafe { libc::poll(&mut ready, 1, millis) } <= 0 {
+                    continue;
+                }
+                // SAFETY: the master this test holds, read into a live stack array bounded by its
+                // own length.
+                let n = unsafe { libc::read(self.master, chunk.as_mut_ptr().cast(), chunk.len()) };
+                if n > 0 {
+                    self.seen.extend_from_slice(&chunk[..n as usize]);
+                }
+            }
+            true
+        }
+
+        /// How many bytes the process wrote to the terminal that wait on the master unread.
+        fn unread(&self) -> libc::c_int {
+            let mut queued: libc::c_int = 0;
+            // SAFETY: `FIONREAD` writes one `c_int` into what is passed, on the master this test
+            // holds.
+            unsafe { libc::ioctl(self.master, libc::FIONREAD, &mut queued) };
+            queued
+        }
+
+        /// Whether the process still runs.
+        fn running(&mut self) -> bool {
+            matches!(self.run.try_wait(), Ok(None))
         }
 
         /// Type `bytes` of `fill` on the terminal from a thread, without ever blocking, until all
@@ -1122,6 +1292,106 @@ mod tests {
             term.given_back(&ending),
             "the terminal is given back as it was: {errors}"
         );
+    }
+
+    /// A stop gives the terminal back while the relay is parked writing to it, behind output nobody
+    /// reads: the stop's escalation to `SIGKILL` then finds the terminal as it was. A resize in the
+    /// same wait leaves it raw, since the session goes on.
+    ///
+    /// The relay writes to the terminal itself, as from a launch on one, and this test stops
+    /// reading it once the child's output has started. The relay is parked in that write when the
+    /// output waiting unread has stopped growing under a child that never stops writing, and it is
+    /// still parked when the process outlives the stop: a relay at its poll ends on a stop at once.
+    /// The stop lands on whichever thread of that process takes it.
+    #[test]
+    fn a_stop_gives_the_terminal_back_while_the_relay_is_parked_writing_to_it() {
+        let mut term = OnTerminal::start_writing_to_it(concat!(
+            module_path!(),
+            "::a_relay_under_a_child_that_floods"
+        ));
+        let pid = term.run.id() as libc::pid_t;
+        let ran = term.read_until(b"tick", Duration::from_secs(10));
+        let mut stalled = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ran && !stalled && Instant::now() < deadline {
+            let before = term.unread();
+            std::thread::sleep(Duration::from_millis(300));
+            stalled = before > 0 && term.unread() == before;
+        }
+        let raw = !term.given_back_now();
+        // SAFETY: the process this test started, not yet reaped; two integers.
+        unsafe { libc::kill(pid, libc::SIGWINCH) };
+        std::thread::sleep(Duration::from_millis(300));
+        let raw_after_resize = !term.given_back_now();
+        // SAFETY: as above.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !term.given_back_now() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let given_back = term.given_back_now();
+        std::thread::sleep(Duration::from_millis(500));
+        let still_parked = term.running();
+        let ending = term.end(Some(libc::SIGKILL), Duration::from_secs(5));
+        let errors = &ending.errors;
+        assert!(ran, "the relay never ran: {errors}");
+        assert!(stalled, "the relay's output never stalled: {errors}");
+        assert!(
+            raw,
+            "the relay never put the terminal in raw mode: {errors}"
+        );
+        assert!(
+            raw_after_resize,
+            "a resize gave the terminal back: {errors}"
+        );
+        assert!(
+            given_back,
+            "the stop left the terminal raw while the relay was parked: {errors}"
+        );
+        assert!(
+            still_parked,
+            "the process ended on the stop, so the relay was not parked: {errors}"
+        );
+        assert!(
+            term.given_back(&ending),
+            "the terminal is not as it was once the escalation ended the process: {errors}"
+        );
+    }
+
+    /// The relay run by [`a_stop_gives_the_terminal_back_while_the_relay_is_parked_writing_to_it`];
+    /// anywhere else it does nothing. Only the escalation ends it.
+    #[test]
+    #[ignore = "run alone by the test that stops it, writing to a terminal of that test's own"]
+    fn a_relay_under_a_child_that_floods() {
+        crate::testutil::when_run_alone(|_| {
+            // SAFETY: the child honours the async-signal-safe contract and never returns.
+            let result = unsafe { fork_with_pty(false, floods_and_reads_nothing) };
+            Err(io::Error::other(format!(
+                "the relay returned instead of being ended: {result:?}"
+            )))
+        });
+    }
+
+    /// The child the parked-relay test relays: it takes the pty as its terminal, says `tick`, then
+    /// writes without pause for at most thirty seconds, and never reads. A write that fails ends
+    /// it.
+    fn floods_and_reads_nothing(slave: libc::c_int) -> std::convert::Infallible {
+        // SAFETY: `login_tty`, `write`, `time` and `_exit` are async-signal-safe, on constant bytes
+        // and a stack array; nothing here allocates.
+        unsafe {
+            if libc::login_tty(slave) == 0 {
+                let tick = b"tick\n";
+                libc::write(1, tick.as_ptr().cast(), tick.len());
+                let fill = [b'x'; 4096];
+                let until = libc::time(std::ptr::null_mut()) + 30;
+                while libc::time(std::ptr::null_mut()) < until {
+                    if libc::write(1, fill.as_ptr().cast(), fill.len()) < 0 {
+                        break;
+                    }
+                }
+            }
+            libc::_exit(0)
+        }
     }
 
     /// A child that stopped reading its input stalls none of its output and no stop, however much

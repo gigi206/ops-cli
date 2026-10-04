@@ -276,9 +276,10 @@ stopping everything).
 
 `--all` targets every session, interactive shells included. An interactive session stopped this
 way gives its terminal back before it ends: that terminal reads `sbx: this session was asked to
-stop.` and returns to its usual mode. With `--delay 0`, or while `sbx` is stuck writing the
-session's output to a terminal or pipe that stopped taking it, the `SIGKILL` can come first, and
-that terminal then needs a `reset`.
+stop.` and returns to its usual mode. While `sbx` is stuck writing the session's output to a
+terminal or pipe that stopped taking it, the terminal returns to its usual mode as soon as the stop
+arrives, and the session ends at the `SIGKILL` after the delay. With `--delay 0` the `SIGKILL`
+comes first, and that terminal then needs a `reset`.
 
 ```sh
 sbx session stop 12345
