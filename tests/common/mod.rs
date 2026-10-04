@@ -9,7 +9,8 @@
 //!   call site, and a site that leaves it out does not fail, it runs the body anyway and reports a
 //!   defect that is really an absent prerequisite. A probe that failed on a download is the
 //!   network's skip, not the host's: [`probe`] tells the two apart, with the reading of nix's
-//!   download faults the heavier e2es share, [`transient_fetch_failure`].
+//!   download faults the heavier e2es share, [`transient_fetch_failure`], and [`probe_with`] does
+//!   the same for a verb that reports nix's failure in a sentence of its own.
 //! * The **fixture directory**, in [`fixture`].
 //! * The **command tree**. `tests/help.rs` and `tests/completion.rs` each assert a property over
 //!   every command and subcommand, so both need the same answer to "what is the command tree?".
@@ -127,15 +128,22 @@ pub enum Probe {
 /// The limit this draws: a regression that breaks substitution itself, a wrong substituter for one,
 /// fails on a download every time and so reads as unreachable, which `SBX_REQUIRE_CAPABLE` does not
 /// turn into a failure. It still lands in the skip report, once per probing test.
-pub fn probe(mut launch: impl FnMut() -> Output) -> Probe {
+pub fn probe(launch: impl FnMut() -> Output) -> Probe {
+    probe_with(launch, download_fault)
+}
+
+/// [`probe`], with what reads a download fault out of a failure's stderr given: [`download_fault`]
+/// for a launch, whose stderr is nix's own, and [`metadata_fetch_fault`] for `sbx upgrade`, which
+/// folds nix's stderr into a sentence of its own.
+pub fn probe_with(mut launch: impl FnMut() -> Output, fault: fn(&[u8]) -> Option<String>) -> Probe {
     let mut out = launch();
-    if !out.status.success() && download_fault(&out.stderr).is_some() {
+    if !out.status.success() && fault(&out.stderr).is_some() {
         out = launch();
     }
     if out.status.success() {
         return Probe::Ran(out);
     }
-    match download_fault(&out.stderr) {
+    match fault(&out.stderr) {
         Some(lines) => Probe::Unreachable(lines),
         None => Probe::Incapable(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
     }
@@ -148,7 +156,8 @@ const NO_SUBSTITUTER: &str = "there is no substituter that can build it";
 /// failed for another reason.
 ///
 /// nix's stderr reaches the launch's unchanged, because provisioning inherits it, and two shapes
-/// mean a download:
+/// mean a download. `sbx upgrade` is the exception: it folds nix's stderr onto one line, so its
+/// failures are read by [`metadata_fetch_fault`] instead.
 ///
 /// * an `error:` line [`transient_fetch_failure`] reads as a fault of the moment, such as a resumed
 ///   download the cache answers with a 416;
@@ -182,6 +191,73 @@ fn download_fault(stderr: &[u8]) -> Option<String> {
         .filter(|line| line.contains(NO_SUBSTITUTER) || transient_fetch_failure(line))
         .collect();
     Some(named.join("\n"))
+}
+
+/// What `sbx upgrade` writes before nix's own words when a `nix flake metadata` it ran failed:
+/// `` `nix flake metadata <ref>` failed: ``.
+const METADATA_RUN: &str = "`nix flake metadata ";
+const METADATA_FAILED: &str = "` failed: ";
+
+/// nix's error in a failed `sbx upgrade`, when every `nix flake metadata` it ran that failed did so
+/// on a download, or `None` when one failed for another reason, or none ran.
+///
+/// `sbx upgrade` resolves the nixpkgs channel and each `flake:` package with `nix flake metadata`,
+/// and reports a failure as a sentence of its own: `` `nix flake metadata <ref>` failed: ``, then
+/// nix's stderr folded onto the same line, its retry warnings and its error together
+/// (`metadata_failed`, in `src/sandbox/flake.rs`). [`download_fault`] reads whole `error:` lines and
+/// finds none there. This reads only what follows that sentence, so it cannot misread a launch,
+/// whose stderr keeps nix's lines apart.
+///
+/// What counts is nix's error: the text from the first `error:` that opens one of its messages to
+/// the end of the line, read by [`transient_fetch_failure`], veto included. The retry warnings
+/// before it do not count, for the reason they do not in [`download_fault`]. In nix 2.34 a warning
+/// opens on `warning:` alone, in older releases on `warning: error:`, and one may carry a `(curl
+/// error: …)` inside, so an `error:` after `warning:` or `curl` opens nothing.
+///
+/// Every failed resolution has to read as a download. `sbx upgrade` rolls several at once, and a
+/// `flake:` reference answered with a 404 is a regression even when the channel's fetch failed
+/// beside it.
+///
+/// Measured with nix 2.34.5 behind a proxy that refuses every connection: four `warning: unable to
+/// download '…': Could not connect to server (7) …; retrying`, then `error: … while fetching the
+/// input '…' error: unable to download '…': Could not connect to server`. Neither a host that cannot
+/// resolve a name nor a GitHub API quota that ran out has been measured. If the second answers 403,
+/// the veto reads it as the host's, as every failure here was read before.
+pub fn metadata_fetch_fault(log: &[u8]) -> Option<String> {
+    let log = String::from_utf8_lossy(log);
+    let mut faults = Vec::new();
+    for line in log.lines() {
+        let Some(run) = line.find(METADATA_RUN) else {
+            continue;
+        };
+        let Some(failed) = line[run..].find(METADATA_FAILED) else {
+            continue;
+        };
+        match nix_error(&line[run + failed + METADATA_FAILED.len()..]) {
+            Some(error) if transient_fetch_failure(error) => faults.push(error),
+            _ => return None,
+        }
+    }
+    (!faults.is_empty()).then(|| faults.join("\n"))
+}
+
+/// The error in nix's stderr once folded onto one line: from the first `error:` that opens one of
+/// its messages, to the end. A message opens the text or follows a space, and an `error:` after
+/// `warning:` or `curl` is inside a warning ([`metadata_fetch_fault`] says which).
+fn nix_error(folded: &str) -> Option<&str> {
+    let mut from = 0;
+    while let Some(i) = folded[from..].find("error:") {
+        let at = from + i;
+        let before = &folded[..at];
+        let word = before.trim_end();
+        if word.is_empty()
+            || (before.ends_with(' ') && !word.ends_with("warning:") && !word.ends_with("curl"))
+        {
+            return Some(&folded[at..]);
+        }
+        from = at + "error:".len();
+    }
+    None
 }
 
 /// Whether a failed build log shows a *transient* upstream-download fault — a truncated tarball,

@@ -10395,3 +10395,122 @@ error: path '/nix/store/aaaa-perl-5.42.3' is required, but there is no substitut
         }
     }
 }
+
+/// `sbx upgrade` folds nix's stderr into a sentence of its own, so its failures are read after that
+/// sentence, from nix's error on: a download that failed there is the network's, tried once more as
+/// a launch is. A retry warning, whatever it carries, is not nix's error, and a resolution that
+/// failed for good is the host's even beside one that failed on a download.
+#[test]
+fn an_upgrade_that_failed_on_a_download_is_read_from_nixs_error_and_not_its_warnings() {
+    use common::{Probe, metadata_fetch_fault, probe_with};
+    use std::os::unix::process::ExitStatusExt;
+
+    fn output(code: i32, stderr: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+    fn drive(launches: &[Output]) -> (Probe, usize) {
+        let mut calls = 0;
+        let verdict = probe_with(
+            || {
+                let out = launches[calls.min(launches.len() - 1)].clone();
+                calls += 1;
+                out
+            },
+            metadata_fetch_fault,
+        );
+        (verdict, calls)
+    }
+
+    // Measured with nix 2.34.5 behind a proxy that refuses every connection, two of its four
+    // retries kept.
+    const REFUSED_CONNECTION: &str = "sbx: cannot upgrade the nixpkgs channel: `nix flake metadata \
+github:NixOS/nixpkgs/nixos-unstable` failed: warning: unable to download \
+'https://api.github.com/repos/NixOS/nixpkgs/commits/nixos-unstable': Could not connect to server (7) \
+Failed to connect to api.github.com port 443 via 127.0.0.1 after 0 ms: Could not connect to server; \
+retrying in 297 ms (attempt 1/5) warning: unable to download \
+'https://api.github.com/repos/NixOS/nixpkgs/commits/nixos-unstable': Could not connect to server (7) \
+Failed to connect to api.github.com port 443 via 127.0.0.1 after 0 ms: Could not connect to server; \
+retrying in 2316 ms (attempt 4/5) error: … while fetching the input \
+'github:NixOS/nixpkgs/nixos-unstable' error: unable to download \
+'https://api.github.com/repos/NixOS/nixpkgs/commits/nixos-unstable': Could not connect to server (7) \
+Failed to connect to api.github.com port 443 via 127.0.0.1 after 0 ms: Could not connect to server
+";
+    // The flake roll's line on standard output, read beside it.
+    const FLAKE_REFUSED: &str =
+        "  flake:github:numtide/flake-utils: re-resolve failed — `nix flake \
+metadata github:numtide/flake-utils` failed: warning: unable to download \
+'https://api.github.com/repos/numtide/flake-utils/commits/HEAD': Could not connect to server (7); \
+retrying in 320 ms (attempt 1/5) error: … while fetching the input 'github:numtide/flake-utils' \
+error: unable to download 'https://api.github.com/repos/numtide/flake-utils/commits/HEAD': Could \
+not connect to server (7)
+";
+    // A download nix retried and then fetched, and a failure of the host's after it.
+    const WARNED_THEN_REFUSED: &str =
+        "sbx: cannot upgrade the nixpkgs channel: `nix flake metadata \
+github:NixOS/nixpkgs/nixos-unstable` failed: warning: unable to download \
+'https://api.github.com/repos/NixOS/nixpkgs/commits/nixos-unstable': Could not connect to server \
+(7); retrying in 297 ms (attempt 1/5) error: opening lock file \
+'/nix/var/nix/db/big-lock': Permission denied
+";
+    // The older warning shapes: `warning: error:`, and a curl error inside the warning.
+    const OLDER_WARNINGS: &str = "sbx: cannot upgrade the nixpkgs channel: `nix flake metadata \
+github:NixOS/nixpkgs/nixos-unstable` failed: warning: error: unable to download \
+'https://api.github.com/repos/NixOS/nixpkgs/commits/nixos-unstable': (curl error: Couldn't resolve \
+host name); retrying in 63 ms (attempt 1/5) error: opening lock file '/nix/var/nix/db/big-lock': \
+Permission denied
+";
+    // A reference GitHub answered for good.
+    const MISSING: &str = "  flake:github:numtide/flake-utils: re-resolve failed — `nix flake \
+metadata github:numtide/flake-utils` failed: error: … while fetching the input \
+'github:numtide/flake-utils' error: unable to download \
+'https://api.github.com/repos/numtide/flake-utils/commits/HEAD': HTTP error 404
+";
+    // No resolution ran: the engine itself is missing.
+    const NO_NIX: &str = "sbx: nix is not installed — cannot upgrade. See `sbx doctor`.\n";
+    // nix's own line from a launch, which carries no sentence of sbx's: not this reader's to read.
+    const RAW_LAUNCH: &str =
+        "error: unable to download 'https://cache.nixos.org/nar/a.nar.zst': HTTP error 416\n";
+    let ok = output(0, "");
+
+    for shape in [
+        REFUSED_CONNECTION.to_string(),
+        format!("{REFUSED_CONNECTION}{FLAKE_REFUSED}"),
+    ] {
+        match drive(&[output(1, &shape)]) {
+            (Probe::Unreachable(why), 2) => assert!(
+                why.lines().all(|line| line.starts_with("error:")) && !why.contains("warning:"),
+                "only nix's error is quoted, from its first `error:` on: {why}"
+            ),
+            (other, calls) => panic!(
+                "a resolution that failed on a download twice is the network's, after two \
+                 tries: {other:?} after {calls}\n{shape}"
+            ),
+        }
+        let (verdict, calls) = drive(&[output(1, &shape), ok.clone()]);
+        assert!(
+            matches!(verdict, Probe::Ran(_)) && calls == 2,
+            "one that failed on a download once is tried again: {verdict:?} after {calls}"
+        );
+    }
+
+    for shape in [
+        WARNED_THEN_REFUSED.to_string(),
+        OLDER_WARNINGS.to_string(),
+        MISSING.to_string(),
+        format!("{REFUSED_CONNECTION}{MISSING}"),
+        NO_NIX.to_string(),
+        RAW_LAUNCH.to_string(),
+    ] {
+        match drive(&[output(1, &shape), ok.clone()]) {
+            (Probe::Incapable(why), 1) => assert_eq!(why, shape.trim()),
+            (other, calls) => panic!(
+                "a failure of the host's, or an answer given for good, is the host's, at once, \
+                 whatever nix warned before it: {other:?} after {calls}\n{shape}"
+            ),
+        }
+    }
+}

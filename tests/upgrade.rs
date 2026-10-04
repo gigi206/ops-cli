@@ -98,13 +98,30 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
             .expect("spawn sbx upgrade")
     };
 
-    let first = run();
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&first.stderr),
-        String::from_utf8_lossy(&first.stdout)
-    );
-    if !first.status.success() || log.contains("re-resolve failed") {
+    // The flake roll reports a reference that failed to resolve on standard output, and the
+    // channel's failure goes to standard error, so both are read, the way the skip always quoted
+    // them.
+    let logged = || {
+        let mut out = run();
+        out.stderr.extend_from_slice(&out.stdout);
+        out
+    };
+    let first = match common::probe_with(logged, common::metadata_fetch_fault) {
+        common::Probe::Ran(first) => first,
+        common::Probe::Unreachable(why) => {
+            skip_unreachable!(
+                "skipping flake upgrade resolution: a resolution failed on a download, twice ({})",
+                why
+            );
+            return;
+        }
+        common::Probe::Incapable(log) => {
+            skip_incapable!("skipping flake upgrade resolution: {log}");
+            return;
+        }
+    };
+    let log = String::from_utf8_lossy(&first.stderr).into_owned();
+    if log.contains("re-resolve failed") {
         skip_incapable!("skipping flake upgrade resolution: {log}");
         return;
     }
@@ -175,14 +192,21 @@ fn upgrade_resolves_and_locks_the_default_channel() {
             .expect("spawn sbx upgrade")
     };
 
-    let first = run();
-    if !first.status.success() {
-        skip_incapable!(
-            "skipping upgrade resolution: {}",
-            String::from_utf8_lossy(&first.stderr)
-        );
-        return;
-    }
+    let first = match common::probe_with(&run, common::metadata_fetch_fault) {
+        common::Probe::Ran(first) => first,
+        common::Probe::Unreachable(why) => {
+            skip_unreachable!(
+                "skipping upgrade resolution: the channel's resolution failed on a download, \
+                 twice ({})",
+                why
+            );
+            return;
+        }
+        common::Probe::Incapable(stderr) => {
+            skip_incapable!("skipping upgrade resolution: {stderr}");
+            return;
+        }
+    };
     let stdout = String::from_utf8_lossy(&first.stdout);
     assert!(stdout.contains("channel"), "stdout:\n{stdout}");
     assert!(
