@@ -6,6 +6,7 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::transient_fetch_failure;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -2606,42 +2607,6 @@ fn command_settles(pid: u32) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     below(pid)
-}
-
-/// Whether a failed build log shows a *transient* upstream-download fault — a truncated tarball,
-/// a reset connection, an upstream stall — rather than a real failure of the code under test. The
-/// heavy `flake:` e2es fetch tens of megabytes of nixpkgs per fresh run, so an occasional
-/// truncated download from a busy mirror is a property of the network, not a regression. A build
-/// that fails *only* with one of these signatures should skip (never turn the suite red); a build
-/// that fails for any other reason — or succeeds with the wrong output — must still assert.
-fn transient_fetch_failure(log: &str) -> bool {
-    const SIGNATURES: [&str; 8] = [
-        "Truncated tar archive",
-        "unexpected end-of-file",
-        "unexpected EOF",
-        "Connection reset by peer",
-        "Couldn't resolve host",
-        "Connection timed out",
-        "transferred only",
-        "unable to download",
-    ];
-    // `unable to download` is nix's wrapper around every fetch failure, and it carries the reason
-    // after it: `Couldn't resolve host` on one run and `HTTP error 404` on another. A definite
-    // client answer is not a property of the network. A 404 or a 403 is a URL this code fabricated
-    // or a release that moved, which is precisely the regression these e2es exist to catch, and
-    // reading it as transient turned that regression into a green skip. A 408 and a 429 are the
-    // two 4xx that *are* about the moment, so they are left to the signatures above.
-    const DEFINITE: [&str; 5] = [
-        "HTTP error 400",
-        "HTTP error 401",
-        "HTTP error 403",
-        "HTTP error 404",
-        "HTTP error 410",
-    ];
-    if DEFINITE.iter().any(|s| log.contains(s)) {
-        return false;
-    }
-    SIGNATURES.iter().any(|s| log.contains(s))
 }
 
 /// The host's Wayland compositor socket, if one is reachable — so the GUI e2e skips (does not
@@ -6697,15 +6662,14 @@ fn a_global_app_splits_mise_pools_across_two_projects() {
 
     // capability probe per project (also seeds each project's base store once); skip if the host
     // cannot sandbox or the network (tools are fetched fresh from upstream) is unreachable.
-    let probe_a = run_in(project_a.path(), data.path(), &["true"]);
-    let probe_b = run_in(project_b.path(), data.path(), &["true"]);
-    if !probe_a.status.success() || !probe_b.status.success() {
-        skip_incapable!(
-            "skipping mise-split two-project e2e: host cannot sandbox ({})",
-            String::from_utf8_lossy(&probe_a.stderr).trim()
-        );
-        return;
-    }
+    probe_or_skip!(
+        "mise-split two-project e2e",
+        run_in(project_a.path(), data.path(), &["true"])
+    );
+    probe_or_skip!(
+        "mise-split two-project e2e",
+        run_in(project_b.path(), data.path(), &["true"])
+    );
     need_reachable!(
         cache_reachable(),
         "skipping mise-split two-project e2e: the network is unreachable"
@@ -9807,21 +9771,10 @@ fn gc_prune_drops_a_superseded_seed_root_and_keeps_the_current_base() {
     // Seed the project store (capability probe): a successful `true` provisions and roots the base
     // userland — creating both the store's direct seed roots and the `<data>/gcroots/base/<rev>`
     // out-links the keep-set reads.
-    let probe = run_in(project.path(), data.path(), &["true"]);
-    if !probe.status.success() {
-        need_reachable!(
-            cache_reachable(),
-            "skipping gc-superseded e2e: the binary cache is unreachable"
-        );
-        skip_incapable!(
-            "skipping gc-superseded e2e: host cannot sandbox ({})",
-            String::from_utf8_lossy(&probe.stderr)
-                .lines()
-                .last()
-                .unwrap_or("")
-        );
-        return;
-    }
+    probe_or_skip!(
+        "gc-superseded e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
 
     // Locate the project's store gcroots (exactly one project in this fresh data dir; sbx's data
     // lives under the `sbx/` subdirectory of `$XDG_DATA_HOME`).
@@ -9892,21 +9845,10 @@ fn upgrade_hints_at_reclaimable_superseded_builds() {
     let project = TmpDir::prefixed("r", "uphint-proj");
     let data = TmpDir::prefixed("r", "uphint-data");
 
-    let probe = run_in(project.path(), data.path(), &["true"]);
-    if !probe.status.success() {
-        need_reachable!(
-            cache_reachable(),
-            "skipping upgrade-hint e2e: the binary cache is unreachable"
-        );
-        skip_incapable!(
-            "skipping upgrade-hint e2e: host cannot sandbox ({})",
-            String::from_utf8_lossy(&probe.stderr)
-                .lines()
-                .last()
-                .unwrap_or("")
-        );
-        return;
-    }
+    probe_or_skip!(
+        "upgrade-hint e2e",
+        run_in(project.path(), data.path(), &["true"])
+    );
 
     // Inject a superseded seed root the keep-set will not cover.
     let id_dir = std::fs::read_dir(data.path().join("sbx").join("projects"))
@@ -10360,4 +10302,96 @@ fn a_definite_http_answer_is_not_a_transient_fetch_failure() {
     assert!(!transient_fetch_failure(
         "error: builder for '/nix/store/x' failed with exit code 1"
     ));
+}
+
+/// A capability probe that fails on a download is the network's skip, not the host's. It is tried
+/// once more, because a fresh launch begins the fetch again, and a second failure on a download is
+/// counted as unreachable rather than enforced as incapable. A launch refused for a reason of the
+/// host's stays the host's, at once, even when nix warned about a download on its way there.
+#[test]
+fn a_probe_that_fails_on_a_download_is_retried_and_never_blamed_on_the_host() {
+    use common::{Probe, probe};
+    use std::os::unix::process::ExitStatusExt;
+
+    fn output(code: i32, stderr: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+    // Run `probe` over a scripted series of launches, the last one repeating, and count how many
+    // it asked for.
+    fn drive(launches: &[Output]) -> (Probe, usize) {
+        let mut calls = 0;
+        let verdict = probe(|| {
+            let out = launches[calls.min(launches.len() - 1)].clone();
+            calls += 1;
+            out
+        });
+        (verdict, calls)
+    }
+
+    // A cache that drops a connection halfway: a retry warned about, then a resumed download the
+    // cache refuses, and the closure nix could not realise without it.
+    const DROPPED: &str = "\
+warning: unable to download 'https://cache.nixos.org/nar/a.nar.zst': HTTP error 200 (curl error: Failed sending data to the peer); retrying from offset 2615104 in 63 ms (attempt 1/5)
+error: unable to download 'https://cache.nixos.org/nar/a.nar.zst': HTTP error 416
+error: path '/nix/store/aaaa-perl-5.42.3' is required, but there is no substituter that can build it
+error: some references of path '/nix/store/bbbb-mise-2026.8.6' could not be realised
+sbx: cannot resolve the sandbox userland: nix build github:NixOS/nixpkgs/c59305b#mise failed
+";
+    // A path no reachable cache offers: nix names the download in its warnings only, then says it
+    // cannot realise the path.
+    const SILENT: &str = "\
+warning: unable to download 'https://cache.nixos.org/nix-cache-info': Could not connect to server (7) Failed to connect to cache.nixos.org port 443 after 0 ms: Could not connect to server
+error: path '/nix/store/aaaa-glibc-2.44' is required, but there is no substituter that can build it
+sbx: cannot resolve the sandbox userland: nix build github:NixOS/nixpkgs/c59305b#mise failed
+";
+    // A host refusal, after a userland that needed one retry to arrive.
+    const REFUSED: &str = "\
+warning: unable to download 'https://cache.nixos.org/nar/a.nar.zst': HTTP error 200 (curl error: Failed sending data to the peer); retrying from offset 2615104 in 63 ms (attempt 1/5)
+bwrap: setting up uid map: Permission denied
+";
+    // A definite answer from the cache: a path this code asked for is not there.
+    const MISSING: &str = "\
+error: unable to download 'https://cache.nixos.org/nar/a.nar.zst': HTTP error 404
+error: path '/nix/store/aaaa-perl-5.42.3' is required, but there is no substituter that can build it
+";
+    let ok = output(0, "");
+
+    let (verdict, calls) = drive(std::slice::from_ref(&ok));
+    assert!(
+        matches!(verdict, Probe::Ran(_)) && calls == 1,
+        "a launch that ran is not repeated: {verdict:?} after {calls}"
+    );
+
+    for shape in [DROPPED, SILENT] {
+        match drive(&[output(1, shape)]) {
+            (Probe::Unreachable(why), 2) => assert!(
+                why.lines().all(|line| line.starts_with("error:"))
+                    && why.contains("there is no substituter that can build it"),
+                "only nix's error lines that name the download are quoted: {why}"
+            ),
+            (other, calls) => panic!(
+                "a launch that failed on a download twice is the network's, after two tries: \
+                 {other:?} after {calls}\n{shape}"
+            ),
+        }
+        let (verdict, calls) = drive(&[output(1, shape), ok.clone()]);
+        assert!(
+            matches!(verdict, Probe::Ran(_)) && calls == 2,
+            "a launch that failed on a download once is tried again: {verdict:?} after {calls}"
+        );
+    }
+
+    for shape in [REFUSED, MISSING] {
+        match drive(&[output(1, shape), ok.clone()]) {
+            (Probe::Incapable(why), 1) => assert_eq!(why, shape.trim()),
+            (other, calls) => panic!(
+                "a launch the host refused, or the cache answered for good, is the host's, at \
+                 once: {other:?} after {calls}\n{shape}"
+            ),
+        }
+    }
 }

@@ -1610,17 +1610,7 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
     // PATH inside the sandbox — but only once the project is trusted. Uses `hello`
     // (tiny, in the signed cache). Skipped where the host cannot sandbox.
     let fx = Project::new("cfg");
-    let can_sandbox = fx
-        .cmd(&["run", "--", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !can_sandbox {
-        skip_incapable!(
-            "skipping package PATH test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!("package PATH test", fx.run(&["run", "--", "true"]));
     fx.write_project("[packages]\nhello = \"nix:hello\"\n");
 
     // Untrusted: the tool is withheld, so it is not on PATH.
@@ -1657,17 +1647,7 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
     // `bin/`) is a hard failure that names the tool, never a silent drop. Skipped
     // where the host cannot sandbox.
     let fx = Project::new("cfg");
-    let can_sandbox = fx
-        .cmd(&["run", "--", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !can_sandbox {
-        skip_incapable!(
-            "skipping unrealisable-package test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!("unrealisable-package test", fx.run(&["run", "--", "true"]));
     // a well-formed attribute (so it passes validation and reaches nix) that no real
     // package provides
     fx.write_project("[packages]\nbogus = \"nix:sbx-no-such-attribute-xyz\"\n");
@@ -1853,17 +1833,7 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
     fx.write_project("nixpkgs = \"nixos-23.11\"\n[packages]\nhello = \"nix:hello\"\n");
     assert!(fx.run(&["trust", "--yes", ".sbx.toml"]).status.success());
 
-    let can_sandbox = fx
-        .cmd(&["run", "--", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !can_sandbox {
-        skip_incapable!(
-            "skipping cross-channel pin test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!("cross-channel pin test", fx.run(&["run", "--", "true"]));
 
     let out = fx
         .cmd(&["run", "--", "hello"])

@@ -33,9 +33,10 @@ fn root() -> &'static Path {
 /// The host kind is written two ways and both are read here. `skip_incapable!` is the macro itself;
 /// `probe_or_skip!` is the gate the integration suites write around it, which runs a launch that
 /// does nothing and reports that launch's own refusal through `skip_incapable!` when it fails. A
-/// suite that adopted the gate did not stop needing a cage, and a scan reading only the inner
-/// spelling would drop four suites and then report the omission against the runs rather than
-/// against itself.
+/// launch that failed on a download goes to `skip_unreachable!` instead, but every other refusal
+/// is still the host's. A suite that adopted the gate did not stop needing a cage, and a scan
+/// reading only the inner spelling would drop four suites and then report the omission against the
+/// runs rather than against itself.
 ///
 /// **The distinction has no subject in today's tree, and that is written here rather than left to be
 /// rediscovered.** Measured on 2026-08-31: only `run` carries an off-host skip (7

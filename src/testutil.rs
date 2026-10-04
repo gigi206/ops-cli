@@ -900,22 +900,21 @@ pub(crate) fn assert_nix_parses(instantiate: &Path, emitter: &str, expr: &str) {
 /// network hiccup then reads as "this host cannot sandbox", which is the single distinction the
 /// task exists to make.
 ///
-/// The exception is real and stays mechanical: a reason may name an off-host condition when it also
-/// names the host capability, because several sites fail for either and say so ("host cannot
-/// sandbox (no userns/bwrap, or the base cache is unreachable)"). Those are enforceable on their
-/// host half, so they keep the enforceable macro.
+/// There is no exception for a reason that names both. The sites that once said "host cannot
+/// sandbox (no userns/bwrap, or the base cache is unreachable)" could not tell which half had
+/// failed, so they now go through `probe_or_skip!`, which can.
 ///
 /// The integration suites' two gate macros are not exceptions but the property made structural: a
 /// site written with `probe_or_skip!` cannot name an off-host reason, because the macro writes the
-/// reason itself around the caller's label, and a site written with `need_reachable!` reaches only
-/// the counted macro. What this sweep still reads is every skip written out by hand.
+/// reason itself around the caller's label and sends a launch that failed on a download to the
+/// counted macro, and a site written with `need_reachable!` reaches only the counted macro. What
+/// this sweep still reads is every skip written out by hand.
 #[test]
 fn an_off_host_skip_is_never_written_with_the_enforceable_macro() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     // Built at runtime, so this file does not match its own needle.
     let needle = format!("skip_{}!(", "incapable");
     const OFF_HOST: [&str; 3] = ["is unreachable", "download fault", "flake upstream"];
-    const HOST: &str = "cannot sandbox";
     let mut offenders = Vec::new();
     let mut scanned = 0;
     let mut stack = vec![root.join("src"), root.join("tests")];
@@ -951,7 +950,7 @@ fn an_off_host_skip_is_never_written_with_the_enforceable_macro() {
                 }
                 let reason = &text[start..end.min(text.len())];
                 scanned += 1;
-                if OFF_HOST.iter().any(|o| reason.contains(o)) && !reason.contains(HOST) {
+                if OFF_HOST.iter().any(|o| reason.contains(o)) {
                     let rel = path.strip_prefix(root).unwrap_or(&path).display();
                     let line = text[..start].lines().count();
                     offenders.push(format!("{rel}:{line}: {reason}"));

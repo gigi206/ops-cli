@@ -7,7 +7,9 @@
 //!   cannot build a cage, `need_reachable!` for a remote that is not answering. A gate has to
 //!   return from the test, so both are macros: a helper returning `bool` leaves the `return` at the
 //!   call site, and a site that leaves it out does not fail, it runs the body anyway and reports a
-//!   defect that is really an absent prerequisite.
+//!   defect that is really an absent prerequisite. A probe that failed on a download is the
+//!   network's skip, not the host's: [`probe`] tells the two apart, with the reading of nix's
+//!   download faults the heavier e2es share, [`transient_fetch_failure`].
 //! * The **fixture directory**, in [`fixture`].
 //! * The **command tree**. `tests/help.rs` and `tests/completion.rs` each assert a property over
 //!   every command and subcommand, so both need the same answer to "what is the command tree?".
@@ -51,19 +53,37 @@ pub fn fixtures_root() -> std::path::PathBuf {
 /// `return` does not fail: it runs the body against a host that cannot support it and reports a
 /// real defect. `$what` names the test in the skip line, which is the only record a skipped run
 /// leaves behind.
+///
+/// A probe that failed on a download is not a host that cannot sandbox. The first launch fetches
+/// the userland, and a cache that drops a connection halfway fails it as surely as a refused user
+/// namespace does. Read as incapable, that turned an e2e into a skip on a capable runner, and made
+/// `SBX_REQUIRE_CAPABLE` fail a run over the network. [`probe`] decides, and may evaluate `$probe`
+/// a second time, so the expression must be a launch that can be repeated.
 #[allow(unused_macros)]
 macro_rules! probe_or_skip {
-    ($what:literal, $probe:expr $(,)?) => {{
-        let probe = $probe;
-        if !probe.status.success() {
-            skip_incapable!(
-                concat!("skipping ", $what, ": host cannot sandbox ({})"),
-                String::from_utf8_lossy(&probe.stderr).trim()
-            );
-            return;
+    ($what:literal, $probe:expr $(,)?) => {
+        match $crate::common::probe(|| $probe) {
+            $crate::common::Probe::Ran(probe) => probe,
+            $crate::common::Probe::Unreachable(why) => {
+                skip_unreachable!(
+                    concat!(
+                        "skipping ",
+                        $what,
+                        ": the launch failed on a download, twice ({})"
+                    ),
+                    why
+                );
+                return;
+            }
+            $crate::common::Probe::Incapable(why) => {
+                skip_incapable!(
+                    concat!("skipping ", $what, ": host cannot sandbox ({})"),
+                    why
+                );
+                return;
+            }
         }
-        probe
-    }};
+    };
 }
 
 /// Gate a test on a remote it needs being available, skipping it when the remote is not.
@@ -83,6 +103,121 @@ macro_rules! need_reachable {
             return;
         }
     };
+}
+
+/// What a capability probe found, as [`probe`] reads it.
+#[derive(Debug)]
+pub enum Probe {
+    /// The launch succeeded. Its output is kept for the callers that read what it printed.
+    Ran(Output),
+    /// The launch failed on a download, again on the second try. Carries the lines that say so.
+    Unreachable(String),
+    /// The launch failed for a reason of the host's. Carries its whole stderr.
+    Incapable(String),
+}
+
+/// Run a capability probe and say whether a failure is the host's or the network's.
+///
+/// A launch that failed on a download is run once more. nix has retried each download by then, so
+/// one more launch is a fresh start rather than a sixth attempt: it begins the fetch again and
+/// keeps every path the first one finished. A second failure on a download is the network's
+/// answer, and goes to [`skip_unreachable!`], which counts it and never enforces it. Anything else
+/// is the host's, exactly as before.
+///
+/// The limit this draws: a regression that breaks substitution itself, a wrong substituter for one,
+/// fails on a download every time and so reads as unreachable, which `SBX_REQUIRE_CAPABLE` does not
+/// turn into a failure. It still lands in the skip report, once per probing test.
+pub fn probe(mut launch: impl FnMut() -> Output) -> Probe {
+    let mut out = launch();
+    if !out.status.success() && download_fault(&out.stderr).is_some() {
+        out = launch();
+    }
+    if out.status.success() {
+        return Probe::Ran(out);
+    }
+    match download_fault(&out.stderr) {
+        Some(lines) => Probe::Unreachable(lines),
+        None => Probe::Incapable(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+    }
+}
+
+/// nix's word for a closure it could not fetch: one of the paths it needed came from no cache.
+const NO_SUBSTITUTER: &str = "there is no substituter that can build it";
+
+/// The lines of a failed launch's stderr that show it failed on a download, or `None` when it
+/// failed for another reason.
+///
+/// nix's stderr reaches the launch's unchanged, because provisioning inherits it, and two shapes
+/// mean a download:
+///
+/// * an `error:` line [`transient_fetch_failure`] reads as a fault of the moment, such as a resumed
+///   download the cache answers with a 416;
+/// * nix's [`NO_SUBSTITUTER`] error, when the stderr also shows a download that failed and no
+///   definite HTTP answer. It follows a dropped download, and it is also the one `error:` line nix
+///   prints when it realises a path that no reachable cache offers: the download is then named only
+///   in `warning:` lines.
+///
+/// What a launch prints when the cache answers nothing at all is not settled here. The launch's
+/// `nix build` passes neither `--fallback` nor `--max-jobs`, so nix may go on to build locally and
+/// fail on another line, and that failure then reads as the host's.
+///
+/// A download named in a `warning:` line is not enough on its own. nix warns for every retry,
+/// including the ones that then succeed, so a launch that fetched its userland with one retry and
+/// was then refused a user namespace carries that warning too. Reading it as the network's would
+/// take that failure away from `SBX_REQUIRE_CAPABLE`.
+fn download_fault(stderr: &[u8]) -> Option<String> {
+    let stderr = String::from_utf8_lossy(stderr);
+    let errors: Vec<&str> = stderr
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("error:"))
+        .collect();
+    let unreachable =
+        errors.iter().any(|line| line.contains(NO_SUBSTITUTER)) && transient_fetch_failure(&stderr);
+    if !unreachable && !transient_fetch_failure(&errors.join("\n")) {
+        return None;
+    }
+    let named: Vec<&str> = errors
+        .into_iter()
+        .filter(|line| line.contains(NO_SUBSTITUTER) || transient_fetch_failure(line))
+        .collect();
+    Some(named.join("\n"))
+}
+
+/// Whether a failed build log shows a *transient* upstream-download fault — a truncated tarball,
+/// a reset connection, an upstream stall — rather than a real failure of the code under test. The
+/// heavy `flake:` e2es fetch tens of megabytes of nixpkgs per fresh run, so an occasional
+/// truncated download from a busy mirror is a property of the network, not a regression. A build
+/// that fails *only* with one of these signatures should skip (never turn the suite red); a build
+/// that fails for any other reason — or succeeds with the wrong output — must still assert.
+pub fn transient_fetch_failure(log: &str) -> bool {
+    const SIGNATURES: [&str; 8] = [
+        "Truncated tar archive",
+        "unexpected end-of-file",
+        "unexpected EOF",
+        "Connection reset by peer",
+        "Couldn't resolve host",
+        "Connection timed out",
+        "transferred only",
+        "unable to download",
+    ];
+    // `unable to download` is nix's wrapper around every fetch failure, and it carries the reason
+    // after it: `Couldn't resolve host` on one run and `HTTP error 404` on another. A definite
+    // client answer is not a property of the network. A 404 or a 403 is a URL this code fabricated
+    // or a release that moved, which is precisely the regression these e2es exist to catch, and
+    // reading it as transient turned that regression into a green skip. A 408 and a 429 are the
+    // two 4xx that *are* about the moment, so they are left to the signatures above.
+    const DEFINITE: [&str; 5] = [
+        "HTTP error 400",
+        "HTTP error 401",
+        "HTTP error 403",
+        "HTTP error 404",
+        "HTTP error 410",
+    ];
+    if DEFINITE.iter().any(|s| log.contains(s)) {
+        return false;
+    }
+    SIGNATURES.iter().any(|s| log.contains(s))
 }
 
 /// The fixture directory every suite creates its trees under, in one definition.

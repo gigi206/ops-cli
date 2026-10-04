@@ -70,18 +70,14 @@ fn doctor_proves_the_boundary_by_a_real_launch_where_supported() {
     // are all present, so doctor must be fully green. Skipped, not failed,
     // elsewhere.
     let data = TmpDir::new("dr");
-    let can_sandbox = sbx()
-        .args(["run", "--", "true"])
-        .env("XDG_DATA_HOME", data.path())
-        .status()
-        .expect("spawn sbx run")
-        .success();
-    if !can_sandbox {
-        skip_incapable!(
-            "skipping doctor launch-proof: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "doctor launch-proof",
+        sbx()
+            .args(["run", "--", "true"])
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("spawn sbx run")
+    );
 
     let out = sbx()
         .arg("doctor")
@@ -155,18 +151,14 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
     // unambiguously the engine. Skipped, not failed, where the host cannot
     // sandbox.
     let data = TmpDir::new("dr");
-    let can_sandbox = sbx()
-        .args(["run", "--", "true"])
-        .env("XDG_DATA_HOME", data.path())
-        .status()
-        .expect("spawn sbx run")
-        .success();
-    if !can_sandbox {
-        skip_incapable!(
-            "skipping bubblewrap-fault attribution: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "bubblewrap-fault attribution",
+        sbx()
+            .args(["run", "--", "true"])
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("spawn sbx run")
+    );
 
     // A stub bwrap, first on PATH, that always fails with a recognizable message.
     let stub_dir = TmpDir::new("dr");

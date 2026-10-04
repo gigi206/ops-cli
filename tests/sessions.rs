@@ -71,12 +71,15 @@ fn a_second_sandbox_shares_the_projects_persistent_home() {
     let data = TmpDir::prefixed("sn", "data");
 
     // Skip where the host cannot sandbox (this first run also warms the userland).
-    if !run(&["run", "--", "true"], project.path(), data.path()).0 {
-        skip_incapable!(
-            "skipping shared-home smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "shared-home smoke",
+        sbx()
+            .args(["run", "--", "true"])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("spawn sbx")
+    );
 
     // First sandbox: create a file in its $HOME.
     let marker = format!("{SANDBOX_HOME}/marker");
