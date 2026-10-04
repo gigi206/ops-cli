@@ -3968,7 +3968,11 @@ fn a_client_that_ignores_the_proxy_variables_is_judged_by_the_proxy_through_the_
             r#"unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
                code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$1"; }
                printf 'allowed=%s\n' "$(code https://cache.nixos.org/nix-cache-info)"
-               printf 'denied=%s\n' "$(code https://example.com/)""#,
+               printf 'denied=%s\n' "$(code https://example.com/)"
+               for f in /proc/$$/fd/*; do
+                 l=$(readlink "$f")
+                 printf 'fd=%s %s\n' "${f##*/}" "$l"
+               done"#,
         ],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -4000,11 +4004,29 @@ fn a_client_that_ignores_the_proxy_variables_is_judged_by_the_proxy_through_the_
         stdout.contains("denied=403\n"),
         "a denied host must be refused by the proxy through the tap: {stdout}{stderr}"
     );
+    // The agent's command holds no socket: the tap's end of the report channel went to the holder
+    // and the tap alone, and the holder keeps it from the cage it becomes. Each descriptor it holds
+    // is listed with what it opens, and one that reads as something else proves the listing read.
+    let held: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("fd="))
+        .collect();
+    assert!(
+        held.iter()
+            .any(|l| l.split_once(' ').is_some_and(|(_, link)| !link.is_empty())),
+        "the agent's command listed no descriptor it could read: {stdout}"
+    );
+    assert!(
+        !held.iter().any(|l| l
+            .split_once(' ')
+            .is_some_and(|(_, link)| link.starts_with("socket:"))),
+        "the agent's command holds a socket: {stdout}"
+    );
 
-    // The names the tap answered reach the session's counters through its report socket, which
-    // takes a report only behind the token the launch drew and handed the tap. A link that dropped
-    // the token would leave the tap reporting nothing, by design, and every assertion above green;
-    // one counted name is the token's whole trip, from the proxy that drew it to the tap and back.
+    // The names the tap answered reach the session's counters down the report channel the launch
+    // made and handed the tap. A link that dropped the channel would leave the tap reporting
+    // nothing, by design, and every assertion above green; one counted name is the channel's whole
+    // trip, from the proxy that made it to the tap and back.
     let stats = sbx_in(
         project.path(),
         data.path(),
@@ -4020,7 +4042,7 @@ fn a_client_that_ignores_the_proxy_variables_is_judged_by_the_proxy_through_the_
         serde_json::from_slice(&stats.stdout).expect("net stats --json is valid JSON");
     assert!(
         v["resolutions"].as_u64().unwrap_or(0) >= 1,
-        "the names the tap answered must be counted through its report socket: {}",
+        "the names the tap answered must be counted down its report channel: {}",
         String::from_utf8_lossy(&stats.stdout)
     );
 }

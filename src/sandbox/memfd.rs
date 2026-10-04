@@ -110,6 +110,48 @@ pub(crate) fn inherit_only(command: &mut Command, files: Vec<File>) {
     inherit_across_exec(command, files);
 }
 
+/// The socket this process was started holding as descriptor `fd`, the other side of
+/// [`inherit_across_exec`], which it now owns: refused unless `fd` is a socket of type `kind`, so a
+/// number that names anything else (closed, a file, another kind of socket) is never adopted, and
+/// `what` names the socket in the refusal. Made close-on-exec, so no program this process runs
+/// inherits it.
+pub(crate) fn adopt_socket(
+    fd: std::os::fd::RawFd,
+    kind: libc::c_int,
+    what: &str,
+) -> io::Result<std::os::fd::OwnedFd> {
+    let mut found: libc::c_int = 0;
+    let mut len = size_of_val(&found) as libc::socklen_t;
+    // SAFETY: `SO_TYPE` writes one `c_int` into what is passed, with its size; a number that is no
+    // open descriptor fails with `EBADF` and writes nothing.
+    let read = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::from_mut(&mut found).cast(),
+            &mut len,
+        )
+    };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if found != kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a descriptor that is not {what}"),
+        ));
+    }
+    // SAFETY: `fd` is an open socket this process was started with and nothing else owns;
+    // `F_SETFD` changes only its close-on-exec flag.
+    unsafe {
+        if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(std::os::fd::OwnedFd::from_raw_fd(fd))
+    }
+}
+
 /// Mark every descriptor past the standard three close-on-exec, in one call where the kernel has
 /// it (5.11), and one at a time below the descriptor limit where it does not. Called between a fork
 /// and an exec, so it reads no directory and allocates nothing: a number that is not open answers
@@ -240,9 +282,8 @@ mod tests {
 
     /// Only the composition stages a descriptor for bwrap: every file [`super::write`] makes for
     /// an exec is made by [`crate::sandbox::argv::compose`]'s own steps, the environment's in
-    /// `argv.rs` and the filters' in `seccomp.rs`, or by
-    /// [`crate::sandbox::argv::CageCommand::stage`] for what a wrapper is handed, and leaves inside
-    /// a [`crate::sandbox::argv::CageCommand`], whose only ways out hand it to the exec.
+    /// `argv.rs` and the filters' in `seccomp.rs`, and leaves inside a
+    /// [`crate::sandbox::argv::CageCommand`], whose only ways out hand it to the exec.
     ///
     /// This asked the other question before: whether every file that stages one also prepares the
     /// exec that inherits it. That needed a list of the ways to stage one, and the list was short

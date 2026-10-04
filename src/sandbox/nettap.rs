@@ -37,9 +37,9 @@
 //!
 //! The tap is started by the netns holder ([`super::netns`]) **before** it execs `bwrap`, so it
 //! lives in the cage's network namespace, and in a cage of its own for everything else: mount and
-//! pid namespaces of its own, with no host file but the read-only userland, its binary and the two
-//! sockets it dials (the egress socket, which the cage reaches as well, and the report socket,
-//! which answers its reports and nothing else); no capability; and a syscall filter it installs
+//! pid namespaces of its own, with no host file but the read-only userland, its binary and the
+//! egress socket it dials, which the cage reaches as well; the one end of a socket pair it reports
+//! down, which nothing else holds; no capability; and a syscall filter it installs
 //! once its listeners are bound ([`crate::sandbox::seccomp::tap`]). The cage cannot see it or
 //! signal it. It has no route of its own either — the namespace is the same empty one — so the
 //! only way out remains the bound Unix socket, exactly as before.
@@ -84,7 +84,7 @@ use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -424,95 +424,67 @@ impl FakeIps {
     }
 }
 
-/// The environment variable the tap's cage carries its [`ReportToken`] in. A cage's environment
-/// travels on a descriptor ([`super::spec::SandboxSpec::secret_env`]), never in an argument list
-/// another uid can read.
-pub(crate) const REPORT_TOKEN_ENV: &str = "SBX_REPORT_TOKEN";
-
-/// The secret a launch's report socket asks of every connection, drawn where the socket is bound
-/// and handed to the tap alone.
+/// The tap's end of the channel it reports on: one end of a datagram socket pair, whose other end
+/// the egress plane that drew it reads ([`super::control::serve_reports`]).
 ///
-/// The socket passes no [`super::peer::PeerGate`]: its peer, the tap, runs in a PID namespace beside
-/// the agent's, and nothing the kernel says about a peer tells the two apart. What tells them apart
-/// is what each was handed. The tap is handed this token, through the holder on a descriptor and
-/// then in its own cage's environment; the agent is handed nothing. A cage that can see the socket
-/// (a bind of the data directory shows it) is closed before its line reaches the record or the
-/// counters ([`super::control::serve_reports`]).
+/// A pair rather than a socket at a path. A path is a door anyone who sees it may knock on: a bind
+/// of the data directory shows it to the agent, and a read-only bind holds nothing back, since
+/// `connect(2)` asks for write permission on the socket and a read-only mount withholds that from
+/// files, directories and links but not from a socket. Nor can the far end tell its callers apart:
+/// the tap runs in a PID namespace beside the agent's, and nothing the kernel says about a peer
+/// separates the two. A pair has no name to find. Its end reaches the tap by inheritance alone,
+/// from the launcher to the netns holder and from the holder to the tap's cage, each step handing
+/// it to one exec and no other, so a process that was not handed it has nothing to report through.
 ///
-/// 128 bits from the system's random source, carried as 32 lowercase hexadecimal characters so it
-/// is one word on a report's line. Its `Debug` shows none of it.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ReportToken(String);
+/// Compared by the descriptor it shares, as [`super::spec::HeldSource`] is, so a spec that carries
+/// it stays comparable.
+#[derive(Clone, Debug)]
+pub(crate) struct ReportChannel(Arc<std::os::fd::OwnedFd>);
 
-impl ReportToken {
-    /// A fresh token.
-    pub(crate) fn draw() -> io::Result<Self> {
-        use ring::rand::SecureRandom;
-        let mut bytes = [0u8; 16];
-        ring::rand::SystemRandom::new()
-            .fill(&mut bytes)
-            .map_err(|_| {
-                io::Error::other("no randomness to draw the report socket's token from")
-            })?;
-        Ok(Self(bytes.iter().map(|b| format!("{b:02x}")).collect()))
+impl ReportChannel {
+    /// Hold `end` as the tap's end of the channel.
+    pub(crate) fn new(end: std::os::fd::OwnedFd) -> Self {
+        Self(Arc::new(end))
     }
 
-    /// A token read back where the holder or the tap was handed it: exactly 32 lowercase
-    /// hexadecimal characters, or `None`.
-    pub(crate) fn parse(text: &str) -> Option<Self> {
-        let well_formed =
-            text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        well_formed.then(|| Self(text.to_string()))
+    /// A descriptor of its own onto the same end, close-on-exec, for a command to hand on.
+    pub(crate) fn dup(&self) -> io::Result<std::os::fd::OwnedFd> {
+        self.0.try_clone()
     }
 
-    /// The token as it travels.
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// What follows this token on a report's line, or `None` when the line does not open with it.
-    ///
-    /// Every byte is compared whichever one differs, so a peer timing its refusals learns nothing
-    /// of how much of a guess was right.
-    pub(crate) fn admits<'a>(&self, line: &'a str) -> Option<&'a str> {
-        let (word, rest) = line.split_once(' ')?;
-        if word.len() != self.0.len() {
-            return None;
-        }
-        let diff = word
-            .bytes()
-            .zip(self.0.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        (std::hint::black_box(diff) == 0).then_some(rest)
+    /// The descriptor, for a test that asserts on what the end is.
+    #[cfg(test)]
+    pub(crate) fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
     }
 }
 
-impl std::fmt::Debug for ReportToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ReportToken(..)")
+impl PartialEq for ReportChannel {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-/// Where the tap reports, and the token it reports with: one value, because neither is of any use
-/// to the tap without the other.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ReportEndpoint {
-    /// The report socket: its host path, or the path the tap's cage binds it at.
-    pub(crate) uds: PathBuf,
-    /// The launch's token.
-    pub(crate) token: ReportToken,
+impl Eq for ReportChannel {}
+
+/// The tap's end of its report channel, which this process was started holding as `fd`: adopted
+/// only when it is a datagram socket ([`super::memfd::adopt_socket`]), and made close-on-exec.
+///
+/// The holder adopts it as it parses its arguments and the tap before its filter goes on, which
+/// would refuse the question this asks of the descriptor.
+pub(crate) fn adopt_report_end(fd: std::os::fd::RawFd) -> io::Result<std::os::fd::OwnedFd> {
+    super::memfd::adopt_socket(fd, libc::SOCK_DGRAM, "the end of a report channel")
 }
 
 /// Where the tap reports what it saw: the names the cage asked for, and the connections it refused
 /// for want of one.
 ///
-/// The report goes to the proxy's report socket, so it lands in the same record `sbx net logs`
-/// reads rather than in a second place with its own reader. That socket answers the two reports
-/// and nothing else ([`super::control::serve_reports`]): the tap never holds the control socket,
-/// whose verbs decide egress. Each line opens with the launch's [`ReportToken`], without which the
-/// socket closes the connection unanswered. A report is never a prerequisite:
-/// every failure is swallowed, because a cage whose egress works must not lose it because a log
-/// line could not be delivered.
+/// The report goes down the tap's [`ReportChannel`], one datagram per report, to the egress plane
+/// that drew it, so it lands in the same record `sbx net logs` reads rather than in a second place
+/// with its own reader. The far end takes the two reports and nothing else
+/// ([`super::control::serve_reports`]): the tap never holds the control socket, whose verbs decide
+/// egress. A report is never a prerequisite: every failure is swallowed, because a cage whose
+/// egress works must not lose it because a log line could not be delivered.
 ///
 /// A resolution is sent **once per name**, when it is first given an address, not once per query: a
 /// build resolving one host a thousand times leaves one entry, and the question the record answers
@@ -521,11 +493,11 @@ pub(crate) struct ReportEndpoint {
 /// currently held.
 ///
 /// **The report is handed to a thread of its own, never delivered on the caller's.** Delivering it
-/// in line put a `connect` and a `write` — bounded by [`REPORT_TIMEOUT`], not by anything faster —
-/// on the single-threaded UDP resolver, between a query arriving and its answer going out. Every
-/// *fresh* name paid it, one at a time, so a cage asking for names nobody has asked for before
-/// slowed its own resolution by however long the control plane took to accept, and the queries
-/// behind it waited their turn. The tap's job is to answer; the record is what it says about
+/// in line put a send — bounded by [`REPORT_TIMEOUT`], not by anything faster — on the
+/// single-threaded UDP resolver, between a query arriving and its answer going out. Every *fresh*
+/// name paid it, one at a time, so a cage asking for names nobody has asked for before slowed its
+/// own resolution by however long the control plane took to read, and the queries behind it waited
+/// their turn. The tap's job is to answer; the record is what it says about
 /// having answered, and the two must not be the same wait.
 ///
 /// The queue is bounded and a full one **drops** rather than blocks, which is the only choice that
@@ -535,8 +507,8 @@ pub(crate) struct ReportEndpoint {
 /// prerequisite — and the thing that is bounded is the one the cage controls.
 #[derive(Debug, Default)]
 pub(crate) struct Reporter {
-    /// The queue the sender thread drains; `None` when there is no report socket to report to,
-    /// which is every test and any launch without one.
+    /// The queue the sender thread drains; `None` when there is no channel to report down, which
+    /// is every test and any launch without one.
     outbox: Option<std::sync::mpsc::SyncSender<String>>,
 }
 
@@ -551,14 +523,14 @@ pub(crate) struct Reporter {
 /// plane **counts** it, and that count is the part which survives the live ring evicting its own
 /// entries. A dropped report therefore loses a resolution from that count. It is still the right
 /// direction — the alternative is holding the resolver the cage is waiting on, which loses the
-/// resolution itself — and reaching it takes a control plane that has stopped accepting for long
-/// enough to fill this, while each write the sender thread makes is already bounded by
+/// resolution itself — and reaching it takes a control plane that has stopped reading for long
+/// enough to fill this, while each send the sender thread makes is already bounded by
 /// [`REPORT_TIMEOUT`].
 const REPORT_BACKLOG: usize = 256;
 
 impl Reporter {
-    pub(crate) fn new(report: Option<ReportEndpoint>) -> Self {
-        let Some(report) = report else {
+    pub(crate) fn new(channel: Option<UnixDatagram>) -> Self {
+        let Some(channel) = channel else {
             return Self { outbox: None };
         };
         let (outbox, queue) = std::sync::mpsc::sync_channel::<String>(REPORT_BACKLOG);
@@ -566,13 +538,11 @@ impl Reporter {
         // `BYPASSED` that follows it read as a sequence in the record. It ends when the queue's
         // last sender goes, which is this `Reporter` being dropped.
         std::thread::spawn(move || {
+            // Once, before the first send: a far end whose queue is full holds each send this long
+            // at most, rather than until it reads.
+            let _ = channel.set_write_timeout(Some(REPORT_TIMEOUT));
             for line in queue {
-                if let Ok(mut sock) = UnixStream::connect(&report.uds) {
-                    let _ = sock.set_write_timeout(Some(REPORT_TIMEOUT));
-                    let line = format!("{} {line}", report.token.as_str());
-                    let _ = sock.write_all(line.as_bytes());
-                    let _ = sock.flush();
-                }
+                let _ = channel.send(line.as_bytes());
             }
         });
         Self {
@@ -601,9 +571,10 @@ impl Reporter {
     }
 }
 
-/// How long one report's write may take before it is abandoned. Short because a control plane that
-/// is not accepting must not hold the sender thread while the queue behind it fills: the cage is no
-/// longer waiting on this — the answer went out without it — but the reports behind it are.
+/// How long one report's send may wait for room before it is abandoned. Short because a control
+/// plane that is not reading must not hold the sender thread while the queue behind it fills: the
+/// cage is no longer waiting on this — the answer went out without it — but the reports behind it
+/// are.
 const REPORT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A parsed DNS question: the name asked for, its type, and how many bytes the question section
@@ -953,13 +924,14 @@ pub(crate) fn serve_capture(
     Capture::Proxied { host, port }
 }
 
-/// The `__net-tap` subcommand body. `argv` is `[<egress socket path>]`, then `--report <socket>`;
+/// The `__net-tap` subcommand body. `argv` is `[<egress socket path>]`, then `--report-fd <fd>`;
 /// the ports are the fixed constants above, because the redirect rule that feeds them is built from
 /// the same ones.
 ///
-/// In this order, and the order is the confinement: the three listeners are bound, which the tap's
-/// filter would refuse; the filter goes on ([`crate::sandbox::seccomp::tap`]); only then does the
-/// tap say it serves, start a thread, or read a byte of the cage's. A tap whose filter does not
+/// In this order, and the order is the confinement: the report channel is adopted and the three
+/// listeners are bound, both of which the tap's filter would refuse; the filter goes on
+/// ([`crate::sandbox::seccomp::tap`]); only then does the tap say it serves, start a thread, or
+/// read a byte of the cage's. A tap whose filter does not
 /// install exits before it says so, and the holder carries on without capture: a tap serving
 /// without its filter is not one of the outcomes.
 ///
@@ -967,18 +939,15 @@ pub(crate) fn serve_capture(
 /// holder takes it down with its cage.
 pub(crate) fn run_tap(argv: &[OsString]) -> ! {
     let Some((uds, report)) = parse_tap_args(argv) else {
-        errln!("__net-tap: usage: __net-tap <egress socket> [--report <socket>]");
+        errln!("__net-tap: usage: __net-tap <egress socket> [--report-fd <fd>]");
         std::process::exit(2);
     };
-    // A report socket without the token is one whose every report would be refused, so the tap
-    // makes none rather than send them to be dropped.
-    let report = report.and_then(|uds| {
-        let token = std::env::var(REPORT_TOKEN_ENV).ok()?;
-        Some(ReportEndpoint {
-            uds,
-            token: ReportToken::parse(&token)?,
-        })
-    });
+    // A descriptor that is not the end of a report channel is one the launcher did not hand over,
+    // and the tap stops rather than serve with a wiring nobody chose.
+    let report = match report.map(adopt_report_end).transpose() {
+        Ok(report) => report.map(UnixDatagram::from),
+        Err(e) => stop(&e),
+    };
     let listeners = Listeners::bind().unwrap_or_else(|e| stop(&e));
     if let Err(e) = crate::sandbox::seccomp::tap::confine() {
         stop(&e);
@@ -1006,16 +975,27 @@ fn stop(e: &io::Error) -> ! {
 ///
 /// Strict, like the holder's own parse and for the same reason: an argument list this process does
 /// not fully understand is one it was not given by the launcher, and guessing at it would leave a
-/// tap serving with a wiring nobody chose. `--report` is the one option, and its absence costs the
-/// cage nothing but the record — the tap still answers DNS and still captures. The token the
-/// reports carry is not an argument: it arrives in [`REPORT_TOKEN_ENV`].
-fn parse_tap_args(argv: &[OsString]) -> Option<(PathBuf, Option<PathBuf>)> {
+/// tap serving with a wiring nobody chose. `--report-fd` is the one option, the number of the
+/// report channel's end the tap was started holding, and its absence costs the cage nothing but
+/// the record — the tap still answers DNS and still captures. One of the standard three is refused:
+/// it is a stream the tap already uses for something else.
+fn parse_tap_args(argv: &[OsString]) -> Option<(PathBuf, Option<std::os::fd::RawFd>)> {
     let uds = PathBuf::from(argv.first()?);
     let mut report = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].to_str() {
-            Some("--report") => report = Some(PathBuf::from(argv.get(i + 1)?)),
+            Some("--report-fd") => {
+                let fd = argv
+                    .get(i + 1)?
+                    .to_str()?
+                    .parse::<std::os::fd::RawFd>()
+                    .ok()?;
+                if fd <= 2 {
+                    return None;
+                }
+                report = Some(fd);
+            }
             _ => return None,
         }
         i += 2;

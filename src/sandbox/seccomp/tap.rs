@@ -4,12 +4,12 @@
 //! The tap ([`crate::sandbox::nettap`]) parses the DNS the cage writes and reads the connections the
 //! cage makes, so it is a process an attacker in the cage talks to. What it asks of the kernel once
 //! its listeners are bound is narrow: it accepts on them, reads the address a redirected connection
-//! was meant for, dials the two Unix sockets it was handed (the egress socket for each captured
-//! connection, the report socket for each report), pumps bytes, and starts threads. So this filter
-//! names those calls and answers every other one with `EPERM`: no file opened, no socket but a Unix
-//! one, no listener bound, no program run, no process started. The cage the tap runs in holds no
-//! host file but the read-only userland and those two sockets; the filter takes away the calls that
-//! would reach past it, should a flaw in the tap hand someone its execution.
+//! was meant for, dials the egress socket for each captured connection, sends each report down the
+//! channel it was handed, pumps bytes, and starts threads. So this filter names those calls and
+//! answers every other one with `EPERM`: no file opened, no socket but a Unix one, no listener
+//! bound, no program run, no process started. The cage the tap runs in holds no host file but the
+//! read-only userland and the egress socket; the filter takes away the calls that would reach past
+//! it, should a flaw in the tap hand someone its execution.
 //!
 //! The tap installs it itself ([`confine`]) once its listeners are bound and before it answers
 //! anything or starts a thread ([`allowlist`] says why that order, and what every such list starts

@@ -2082,7 +2082,7 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 const RUNTIME_DIRS: &[(&str, &[&str])] = &[
     (
         "egress",
-        &["ca-", "proxy-", "control-", "report-", "hosts-", "sshcfg-"],
+        &["ca-", "proxy-", "control-", "hosts-", "sshcfg-"],
     ),
     ("ssh-agent", &["agent-", "control-"]),
     // The broker plugins' record socket, and the per-launch directory their own sockets live in
@@ -3400,16 +3400,6 @@ mod tests {
         let proc = &["control-", "notif-"];
         assert_eq!(runtime_entry_pid("notif-1234.t3.sock", proc), Some(1234));
         assert_eq!(runtime_entry_pid("notif-1234.sock", proc), Some(1234));
-
-        // The capture tap's report socket sits beside the control socket, and is read through the
-        // table itself: a prefix missing from it keeps one socket per killed session for good.
-        let (_, table) = RUNTIME_DIRS
-            .iter()
-            .find(|(dir, _)| *dir == "egress")
-            .expect("the egress directory is swept");
-        for name in ["report-1234.sock", "report-1234.t17.sock"] {
-            assert_eq!(runtime_entry_pid(name, table), Some(1234), "{name}");
-        }
     }
 
     #[test]

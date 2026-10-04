@@ -94,7 +94,7 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 }
 
 /// A query to the cage's resolver is answered through the capture tap, over UDP, and the name
-/// reaches the report socket the holder handed the tap.
+/// reaches the report channel the holder handed the tap.
 ///
 /// The cage's resolver is off loopback (`nettap::CAGE_RESOLVER`), so a query leaves with `dummy0`'s
 /// address as its source, the `nat` chain bends it to the tap, and the tap answers at that address.
@@ -104,10 +104,10 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 /// answer never met the refusal.
 ///
 /// The report is sent from a thread of the tap's own after the answer, and the tap ends with the
-/// command, so the command waits for the report to land before it exits. It opens with the token
-/// the holder was handed on a descriptor, as a launch hands it, and that descriptor is closed by
-/// the time the holder becomes the command: the command, which stands where the cage's bwrap
-/// stands in a launch, holds no descriptor onto it.
+/// command, so the command waits for the report to land before it exits. It travels down the end
+/// of the report channel the holder was handed on a descriptor, as a launch hands it, and the
+/// holder adopts that end close-on-exec: the command, which stands where the cage's bwrap stands
+/// in a launch, holds no descriptor onto it.
 ///
 /// The tap parses what the cage writes, so it runs caged: the command reads, from outside, what the
 /// tap and each of its threads hold. Every one of them is under its filter with no new privileges
@@ -136,35 +136,24 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     let dir = TmpDir::new("tapdns");
     let egress = dir.join("egress.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&egress).expect("bind egress socket");
-    // The token, on the reading end of a pipe the holder inherits, as a launch stages it.
-    const TOKEN: &str = "00112233445566778899aabbccddeeff";
-    let mut fds = [0; 2];
-    // SAFETY: `fds` is a live two-slot array, which is what `pipe` fills. Neither end is
-    // close-on-exec, so the holder inherits the reading one.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: the writing end just returned, written once from a live slice and closed.
-    unsafe {
-        assert_eq!(
-            libc::write(fds[1], TOKEN.as_ptr().cast(), TOKEN.len()),
-            TOKEN.len() as isize
-        );
-        libc::close(fds[1]);
-    }
-    // SAFETY: `fstat` fills the zeroed `stat` on the stack for the open reading end.
+    // The report channel, as a launch makes it: the holder inherits the tap's end, and the first
+    // report the far end reads is written to `reported`, which the command waits for.
+    let (tap_end, far) = std::os::unix::net::UnixDatagram::pair().expect("a report channel");
+    let tap_fd = std::os::fd::AsRawFd::as_raw_fd(&tap_end);
+    // SAFETY: `F_SETFD` on this process's own open descriptor clears its close-on-exec flag, so
+    // the holder inherits it; the far end keeps the flag and stays here.
+    assert_eq!(unsafe { libc::fcntl(tap_fd, libc::F_SETFD, 0) }, 0);
+    // SAFETY: `fstat` fills the zeroed `stat` on the stack for the open end.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::fstat(fds[0], &mut st) }, 0);
-    let token_pipe = format!("pipe:[{}]", st.st_ino);
-    // The report socket: its first line is written to `reported`, which the command waits for.
-    let report = dir.join("report.sock");
+    assert_eq!(unsafe { libc::fstat(tap_fd, &mut st) }, 0);
+    let tap_socket = format!("socket:[{}]", st.st_ino);
     let reported = dir.join("reported");
-    let listener = std::os::unix::net::UnixListener::bind(&report).expect("bind report socket");
     {
         let reported = reported.clone();
         std::thread::spawn(move || {
-            use std::io::BufRead;
-            if let Ok((stream, _)) = listener.accept() {
-                let mut line = String::new();
-                let _ = std::io::BufReader::new(stream).read_line(&mut line);
+            let mut datagram = [0u8; 512];
+            if let Ok(n) = far.recv(&mut datagram) {
+                let line = String::from_utf8_lossy(&datagram[..n]);
                 let _ = std::fs::write(&reported, line.trim());
             }
         });
@@ -215,7 +204,7 @@ for fd in os.listdir("/proc/self/fd"):
         held = held or os.readlink(f"/proc/self/fd/{fd}") == sys.argv[2]
     except OSError:
         pass
-print("token fd", "held" if held else "closed")
+print("report fd", "held" if held else "closed")
 "#;
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["__netns-holder", "--tap"])
@@ -224,19 +213,16 @@ print("token fd", "held" if held else "closed")
         .arg(&bwrap)
         .arg("--nft")
         .arg(&nft)
-        .arg("--report")
-        .arg(&report)
-        .arg("--report-token-fd")
-        .arg(fds[0].to_string())
+        .arg("--report-fd")
+        .arg(tap_fd.to_string())
         .arg("--")
         .arg(python)
         .args(["-c", query])
         .arg(&reported)
-        .arg(&token_pipe)
+        .arg(&tap_socket)
         .output()
         .expect("spawn sbx __netns-holder");
-    // SAFETY: this process's own reading end, closed once.
-    unsafe { libc::close(fds[0]) };
+    drop(tap_end);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     for own in [
@@ -278,14 +264,12 @@ print("token fd", "held" if held else "closed")
         "the tap's answer did not come back: {stdout}{stderr}"
     );
     assert!(
-        stdout
-            .lines()
-            .any(|l| l == format!("reported {TOKEN} RESOLVED example.com")),
-        "the name must reach the report socket, behind the token: {stdout}{stderr}"
+        stdout.lines().any(|l| l == "reported RESOLVED example.com"),
+        "the name must reach the report channel: {stdout}{stderr}"
     );
     assert!(
-        stdout.lines().any(|l| l == "token fd closed"),
-        "the holder must close the token's descriptor before it becomes the command: {stdout}"
+        stdout.lines().any(|l| l == "report fd closed"),
+        "the holder must keep the report channel's end from the command it becomes: {stdout}"
     );
     let threads: Vec<&str> = stdout
         .lines()

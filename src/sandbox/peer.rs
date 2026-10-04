@@ -289,9 +289,10 @@ mod tests {
         assert!(PeerGate::new("test").admits(&ours));
     }
 
-    /// Each accept loop that serves a control socket asks the gate before it takes a slot, so a
-    /// refused connection never holds one. The report socket, whose peer is the caged capture tap,
-    /// is the one egress plane that passes no gate.
+    /// Each accept loop that serves a control socket asks the gate before it takes a slot, or,
+    /// where it takes none, before it serves the connection, so a refused connection never holds
+    /// one. The capture tap's report channel is the one egress plane that passes no gate: a socket
+    /// pair has no peer but the one handed its other end.
     #[test]
     fn every_control_accept_loop_asks_the_gate_before_it_takes_a_slot() {
         let loops = [
@@ -305,7 +306,7 @@ mod tests {
                 "control/mod.rs",
                 crate::testutil::production_half(include_str!("control/mod.rs")),
                 "&& !gate.admits(&stream)",
-                "cap.take()",
+                "super::conncap::spawn_conn(who",
             ),
             (
                 "task_control.rs",
@@ -333,7 +334,7 @@ mod tests {
             } else {
                 assert!(
                     check_at < anchor_at,
-                    "{file}: the gate must be asked before a slot is taken"
+                    "{file}: the gate must be asked before a slot is taken or the connection served"
                 );
             }
         }

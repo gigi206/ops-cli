@@ -10,7 +10,7 @@ use super::*;
 use crate::testutil::{TmpDir, run_alone, when_run_alone};
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixDatagram, UnixListener};
 
 /// A DNS query on the wire: header, one question, no additional records.
 fn query(name: &str, qtype: u16) -> Vec<u8> {
@@ -657,101 +657,40 @@ fn the_cage_resolver_file_names_an_address_the_redirect_catches() {
     );
 }
 
-/// The report socket at `uds`, with a token of its own.
-fn endpoint(uds: PathBuf) -> ReportEndpoint {
-    ReportEndpoint {
-        uds,
-        token: ReportToken::draw().expect("a token"),
-    }
+/// A report channel: the tap's end, and the far end a launch reads.
+fn channel() -> (UnixDatagram, UnixDatagram) {
+    let (tap, far) = UnixDatagram::pair().expect("a pair");
+    (tap, far)
 }
 
-/// A stand-in report socket: collects the lines the tap reports, each with the endpoint's token
-/// taken off the front as the real socket takes it, and answers `ok` like the real one. A line
-/// without the token arrives marked, so no assertion on a report's text can pass on one.
-fn stand_in_report_socket(report: &ReportEndpoint) -> std::sync::mpsc::Receiver<String> {
-    let listener = UnixListener::bind(&report.uds).expect("bind the stand-in report socket");
-    let token = report.token.clone();
+/// A stand-in for the far end of a report channel: collects each datagram the tap reports, as the
+/// launch's end reads it.
+fn stand_in_report_channel(far: UnixDatagram) -> std::sync::mpsc::Receiver<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let mut line = String::new();
-            if BufReader::new(stream.try_clone().expect("clone"))
-                .read_line(&mut line)
-                .is_ok()
-            {
-                let _ = stream.write_all(b"ok\n");
-                let line = line.trim();
-                let line = match token.admits(line) {
-                    Some(report) => report.to_string(),
-                    None => format!("<without the token> {line}"),
-                };
-                if tx.send(line).is_err() {
-                    break;
-                }
+        let mut datagram = [0u8; 512];
+        while let Ok(n) = far.recv(&mut datagram) {
+            let line = String::from_utf8_lossy(&datagram[..n]).trim().to_string();
+            if tx.send(line).is_err() {
+                break;
             }
         }
     });
     rx
 }
 
-/// Each report opens with the launch's token: the one thing that tells the tap's reports apart from
-/// a cage's on a socket both can reach.
+/// Each report is one datagram down the channel, whole: the far end reads one report per read
+/// and nothing frames it.
 #[test]
-fn each_report_opens_with_the_launchs_token() {
-    let dir = TmpDir::new();
-    let report = endpoint(dir.join("report.sock"));
-    let listener = UnixListener::bind(&report.uds).expect("bind");
-    let reporter = Reporter::new(Some(report.clone()));
-    reporter.resolved("github.com");
-    let (stream, _) = listener.accept().expect("the report arrives");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+fn each_report_is_one_datagram_down_the_channel() {
+    let (tap, far) = channel();
+    far.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).expect("read");
-    assert_eq!(
-        line,
-        format!("{} RESOLVED github.com\n", report.token.as_str())
-    );
-}
-
-/// The token is read back only in its own shape, compared whole, and never printed.
-#[test]
-fn a_report_token_is_admitted_whole_and_never_shown() {
-    let token = ReportToken::draw().expect("a token");
-    let text = token.as_str();
-    assert_eq!(text.len(), 32);
-    assert_eq!(ReportToken::parse(text), Some(token.clone()));
-    assert_ne!(
-        ReportToken::draw().expect("another"),
-        token,
-        "each launch draws its own"
-    );
-    for malformed in [&text[..31], &format!("{text}0"), &text.to_uppercase(), ""] {
-        assert_eq!(ReportToken::parse(malformed), None, "{malformed:?}");
-    }
-
-    assert_eq!(
-        token.admits(&format!("{text} RESOLVED a.test")),
-        Some("RESOLVED a.test")
-    );
-    let mut flipped = text.to_string().into_bytes();
-    flipped[31] = if flipped[31] == b'0' { b'1' } else { b'0' };
-    let flipped = String::from_utf8(flipped).expect("hex");
-    for refused in [
-        "RESOLVED a.test".to_string(),
-        format!("{flipped} RESOLVED a.test"),
-        format!("{} RESOLVED a.test", &text[..31]),
-        format!("{text}0 RESOLVED a.test"),
-        text.to_string(),
-    ] {
-        assert_eq!(token.admits(&refused), None, "{refused:?}");
-    }
-    assert!(
-        !format!("{token:?}").contains(text),
-        "Debug shows the token"
-    );
+    let reporter = Reporter::new(Some(tap));
+    reporter.resolved("github.com");
+    let mut datagram = [0u8; 512];
+    let n = far.recv(&mut datagram).expect("the report arrives");
+    assert_eq!(&datagram[..n], b"RESOLVED github.com\n");
 }
 
 /// A name is reported when it is first given an address, and **not** on the queries that follow.
@@ -759,10 +698,9 @@ fn a_report_token_is_admitted_whole_and_never_shown() {
 /// names did this cage ask for", and repeating it would drown that answer in its own noise.
 #[test]
 fn a_name_is_reported_once_however_often_it_is_asked_for() {
-    let dir = TmpDir::new();
-    let report = endpoint(dir.join("report.sock"));
-    let lines = stand_in_report_socket(&report);
-    let reporter = Reporter::new(Some(report));
+    let (tap, far) = channel();
+    let lines = stand_in_report_channel(far);
+    let reporter = Reporter::new(Some(tap));
     let table = Mutex::new(FakeIps::new());
 
     for _ in 0..3 {
@@ -788,10 +726,9 @@ fn a_name_is_reported_once_however_often_it_is_asked_for() {
 /// record would otherwise name hosts the cage never got an answer for.
 #[test]
 fn a_question_that_gets_no_address_is_not_reported() {
-    let dir = TmpDir::new();
-    let report = endpoint(dir.join("report.sock"));
-    let lines = stand_in_report_socket(&report);
-    let reporter = Reporter::new(Some(report));
+    let (tap, far) = channel();
+    let lines = stand_in_report_channel(far);
+    let reporter = Reporter::new(Some(tap));
     let table = Mutex::new(FakeIps::new());
 
     answer_query(&query("github.com", 28 /* AAAA */), &table, &reporter).expect("answered");
@@ -807,10 +744,9 @@ fn a_question_that_gets_no_address_is_not_reported() {
 /// is the one that could not be reached.
 #[test]
 fn only_the_address_with_no_name_is_reported_to_the_record() {
-    let dir = TmpDir::new();
-    let report = endpoint(dir.join("report.sock"));
-    let lines = stand_in_report_socket(&report);
-    let reporter = Reporter::new(Some(report));
+    let (tap, far) = channel();
+    let lines = stand_in_report_channel(far);
+    let reporter = Reporter::new(Some(tap));
 
     for quiet in [
         Capture::Proxied {
@@ -848,17 +784,15 @@ fn only_the_address_with_no_name_is_reported_to_the_record() {
     );
 }
 
-/// Reporting is never a prerequisite: a tap wired without a report socket, or pointed at a socket
-/// nothing serves, must answer DNS exactly the same. A cage whose egress works must not lose it
+/// Reporting is never a prerequisite: a tap wired without a report channel, or holding one whose
+/// far end is gone, must answer DNS exactly the same. A cage whose egress works must not lose it
 /// because a log line could not be delivered.
 #[test]
 fn a_reporter_with_nowhere_to_report_still_answers() {
-    let dir = TmpDir::new();
     let table = Mutex::new(FakeIps::new());
-    for reporter in [
-        Reporter::default(),
-        Reporter::new(Some(endpoint(dir.join("nothing-listens-here.sock")))),
-    ] {
+    let (tap, far) = channel();
+    drop(far);
+    for reporter in [Reporter::default(), Reporter::new(Some(tap))] {
         let reply = answer_query(&query("github.com", QTYPE_A), &table, &reporter)
             .expect("the answer does not depend on the report");
         assert_eq!(ancount(&reply), 1);
@@ -871,35 +805,52 @@ fn a_reporter_with_nowhere_to_report_still_answers() {
 #[test]
 fn the_taps_arguments_are_parsed_strictly() {
     let sock = OsString::from("/run/sbx/egress.sock");
-    let report = OsString::from("/run/sbx/report.sock");
+    let fd = OsString::from("7");
 
     let (uds, reported) =
         parse_tap_args(std::slice::from_ref(&sock)).expect("the socket alone is enough");
     assert_eq!(uds, PathBuf::from("/run/sbx/egress.sock"));
     assert_eq!(
         reported, None,
-        "no report socket is a tap that reports nothing"
+        "no report channel is a tap that reports nothing"
     );
 
-    let (_, reported) = parse_tap_args(&[sock.clone(), OsString::from("--report"), report.clone()])
-        .expect("with a report socket");
-    assert_eq!(reported, Some(PathBuf::from("/run/sbx/report.sock")));
+    let (_, reported) = parse_tap_args(&[sock.clone(), OsString::from("--report-fd"), fd.clone()])
+        .expect("with a report channel");
+    assert_eq!(reported, Some(7));
 
     assert_eq!(parse_tap_args(&[]), None, "no socket at all");
     assert_eq!(
-        parse_tap_args(&[sock.clone(), OsString::from("--report")]),
+        parse_tap_args(&[sock.clone(), OsString::from("--report-fd")]),
         None,
         "a flag with no value"
     );
-    // The flag the tap reported through before it had a socket of its own: a launcher still
-    // passing it is handing over the control socket, which this process must not accept.
+    for refused in ["0", "1", "2", "-1", "seven"] {
+        assert_eq!(
+            parse_tap_args(&[
+                sock.clone(),
+                OsString::from("--report-fd"),
+                OsString::from(refused),
+            ]),
+            None,
+            "descriptor {refused} is not a report channel's end"
+        );
+    }
+    // The paths the tap reported on before it was handed a channel: a launcher still passing one
+    // is handing over a socket anyone who sees it can reach, which this process must not accept.
+    for flag in ["--report", "--control"] {
+        assert_eq!(
+            parse_tap_args(&[
+                sock.clone(),
+                OsString::from(flag),
+                OsString::from("/run/sbx/report.sock"),
+            ]),
+            None,
+            "`{flag}` is not the tap's to report on"
+        );
+    }
     assert_eq!(
-        parse_tap_args(&[sock.clone(), OsString::from("--control"), report.clone()]),
-        None,
-        "the control socket is not the tap's to report on"
-    );
-    assert_eq!(
-        parse_tap_args(&[sock, OsString::from("--unknown"), report]),
+        parse_tap_args(&[sock, OsString::from("--unknown"), fd]),
         None,
         "an option this process does not understand"
     );
@@ -913,8 +864,8 @@ fn the_taps_arguments_are_parsed_strictly() {
 /// ([`crate::sandbox::seccomp::tap`]); this pins what it must not.
 ///
 /// In a process of its own, as the tap is, for the reason [`run_alone`] gives: the stand-in proxy,
-/// the report socket and the client run there too, on threads started before the filter and out
-/// of it.
+/// the far end of the report channel and the client run there too, on threads started before the
+/// filter and out of it.
 #[test]
 fn the_taps_work_runs_under_its_filter() {
     let ran = run_alone(concat!(module_path!(), "::the_taps_process"));
@@ -942,8 +893,8 @@ fn the_taps_process() {
 fn the_taps_work_under_its_filter(dir: &Path) {
     let uds = dir.join("egress.sock");
     let heads = stand_in_proxy(&uds, "HTTP/1.1 200 Connection established\r\n\r\n");
-    let report = endpoint(dir.join("report.sock"));
-    let lines = stand_in_report_socket(&report);
+    let (report, far) = channel();
+    let lines = stand_in_report_channel(far);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the client side");
     let addr = listener.local_addr().expect("addr");
     let client = std::thread::spawn(move || {

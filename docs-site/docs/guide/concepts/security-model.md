@@ -167,11 +167,11 @@ own PID namespace, and every cage has a PID namespace of its own. The `sbx` comm
 run from another PID namespace, such as from outside a container a session runs in,
 is refused the same way. The check needs Linux 5.5 or later; on an older kernel those
 sockets refuse every connection. The sockets a cage is meant to reach, its brokers
-and its task socket, take no such check. Neither does the capture tap's report socket,
-whose own peer runs in a cage. That socket asks instead for a token drawn for each
-launch and handed to the tap alone, never as a command-line argument. A cage that can see the socket but does not hold the
-token is closed before anything reaches the session's egress record. It can still
-hold the socket's connections open, and the tap's reports are lost while it does.
+and its task socket, take no such check. The capture tap, whose own peer runs in a
+cage, reports on no socket at all: it is handed one end of a socket pair, which has
+no name to find, and the session reads the other end. A cage that can see the
+session's sockets can neither add to its egress record nor hold the tap's reports
+back.
 
 ## What the trust gate protects
 

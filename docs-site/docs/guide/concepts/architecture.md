@@ -489,7 +489,7 @@ It comes in two tiers, and the difference between them is what a flaw would reac
 | `src/sandbox/proxy/link.rs`, `link/judge.rs`, `link/wire.rs` | the proxy's questions: may this host and port be reached, open the connection, refresh a credential | the proxy | every proxy |
 | `src/sandbox/proxy/child.rs` | the proxy's answer when it starts, carrying the session CA's certificate | the proxy | every proxy |
 | `src/sandbox/proxy/events.rs`, `events/wire.rs` | the proxy's account of what it decided, captured bodies included | the proxy | every proxy |
-| `src/sandbox/control/mod.rs`, the report socket | a name the tap answered, an address it could not map back to one | the tap | the capture tap is wired |
+| `src/sandbox/control/mod.rs`, the report channel | a name the tap answered, an address it could not map back to one | the tap | the capture tap is wired |
 | `src/sandbox/broker.rs` | the cage's frames, and the plugin's verdicts on them | the agent, and the plugin that read its frames | a `[broker.<name>]` binding |
 | `src/sandbox/sshagent.rs` | ssh-agent requests | the agent | `[ssh_agent] allow` |
 | `src/sandbox/task_control.rs` | an invocation: the task's name, its parameters, the variables passed | the agent | a `[task.<name>]` is declared |

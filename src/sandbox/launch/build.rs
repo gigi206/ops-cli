@@ -2588,10 +2588,10 @@ pub(super) fn build(
     // transparent-capture tap dials it from *outside* the cage, so it needs the real path, not the
     // bind's in-cage name. `None` under any posture that stands no proxy up.
     let mut proxy_host_uds: Option<std::path::PathBuf> = None;
-    // The same, for the socket the tap reports on: the names the cage resolves land in the record
-    // `sbx net logs` reads rather than in a second place. Not the control socket, whose verbs
-    // decide egress.
-    let mut proxy_report: Option<crate::sandbox::nettap::ReportEndpoint> = None;
+    // The same, for the channel the tap reports down: the names the cage resolves land in the
+    // record `sbx net logs` reads rather than in a second place. Not the control socket, whose
+    // verbs decide egress.
+    let mut proxy_report: Option<crate::sandbox::nettap::ReportChannel> = None;
 
     // The declared loopback forwarders, bridged into the cage.
     let forward_up = forward_ports(prep, &mut wraps)?;
@@ -3325,7 +3325,7 @@ pub(super) fn holder_plan(
     gui_renders: bool,
     bwrap: &std::path::Path,
     proxy_host_uds: Option<&std::path::Path>,
-    proxy_report: Option<&crate::sandbox::nettap::ReportEndpoint>,
+    proxy_report: Option<&crate::sandbox::nettap::ReportChannel>,
     netns: impl FnOnce(&std::path::Path) -> Result<(), String>,
 ) -> Option<crate::sandbox::spec::NetnsDummy> {
     if net != NetPolicy::Isolated || as_root {

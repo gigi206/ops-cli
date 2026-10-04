@@ -88,33 +88,8 @@ impl Socket {
     /// anything else (closed, a file, another socket) is never read as a link. Made close-on-exec,
     /// as every end is.
     pub(in crate::sandbox::proxy) fn adopt(fd: RawFd) -> io::Result<Socket> {
-        let mut kind: libc::c_int = 0;
-        let mut len = size_of_val(&kind) as libc::socklen_t;
-        // SAFETY: `SO_TYPE` writes one `c_int` into what is passed, with its size; a number that is
-        // no open descriptor fails with `EBADF` and writes nothing.
-        let read = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_TYPE,
-                std::ptr::from_mut(&mut kind).cast(),
-                &mut len,
-            )
-        };
-        if read < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if kind != libc::SOCK_SEQPACKET {
-            return Err(invalid("a descriptor that is not the end of a link"));
-        }
-        // SAFETY: `fd` is an open socket this process was started with and nothing else owns;
-        // `F_SETFD` changes only its close-on-exec flag.
-        unsafe {
-            if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Socket(OwnedFd::from_raw_fd(fd)))
-        }
+        crate::sandbox::memfd::adopt_socket(fd, libc::SOCK_SEQPACKET, "the end of a link")
+            .map(Socket)
     }
 
     /// Wait at most `wait` for a message, or the end of the link, to be there to read. `false` when
