@@ -27,6 +27,12 @@ const FAKE_TEMPLATE: &str = "vmType: \"vz\"\n";
 /// The Mac-side bridge a fake release publishes. The script installs it and never runs it.
 const FAKE_BRIDGE: &str = "#!/bin/sh\necho bridge \"$1\"\n";
 
+/// The notifier's AppleScript a fake release publishes. The script hands it to `osacompile`.
+const FAKE_NOTIFY_SCRIPT: &str = "on open theFiles\nend open\n";
+
+/// The notifier's icon a fake release publishes. The script hands it to `sips`.
+const FAKE_ICON: &str = "png";
+
 /// The script as it ships, read from the checkout.
 fn script() -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
@@ -83,6 +89,53 @@ impl Release {
         std::fs::write(dir.join("sbx.yaml"), FAKE_TEMPLATE).unwrap();
         std::fs::write(dir.join("sbx"), FAKE_SBX).unwrap();
         std::fs::write(dir.join("sbx-bridge"), FAKE_BRIDGE).unwrap();
+        std::fs::write(dir.join("sbx-notify.applescript"), FAKE_NOTIFY_SCRIPT).unwrap();
+        let assets = self.root.join("source").join(tag).join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("sbx.png"), FAKE_ICON).unwrap();
+    }
+
+    /// A directory holding the five macOS tools the notifier is built with, each appending its
+    /// name and arguments to [`Release::tool_calls`]. `osacompile` lays out the application,
+    /// `sips` and `iconutil` write the files they are asked for, and `plutil` and `codesign`
+    /// only record. A tool named in `missing` is left out.
+    fn fake_mac_tools(&self, missing: &[&str]) -> PathBuf {
+        let bin = self.root.join("macbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = self.root.join("tools.log");
+        let tools = [
+            (
+                "osacompile",
+                "mkdir -p \"$2/Contents/Resources\"; cp \"$3\" \"$2/Contents/Resources/main\"; \
+                 echo plist > \"$2/Contents/Info.plist\"",
+            ),
+            ("sips", "cp \"$4\" \"$6\""),
+            ("iconutil", "echo icns > \"$4\""),
+            ("plutil", ":"),
+            ("codesign", ":"),
+        ];
+        for (name, action) in tools {
+            if missing.contains(&name) {
+                continue;
+            }
+            let path = bin.join(name);
+            let body = format!(
+                "#!/bin/sh\necho \"{name} $*\" >> {log}\n{action}\n",
+                log = log.display()
+            );
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    /// Every call the fake macOS tools received, one per line.
+    fn tool_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("tools.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// A directory holding a `launchctl` that appends each call to `launchctl.log`.
@@ -629,5 +682,116 @@ fn on_macos_the_bridge_and_its_two_agents_are_installed_and_replaced() {
         std::fs::read_dir(&agents).unwrap().count(),
         2,
         "two agents, whatever the number of runs"
+    );
+}
+
+/// Where the notifier lands, beside the bridge.
+fn notifier(fx: &Release) -> PathBuf {
+    fx.home().join(".local/share/sbx/lima/sbx.app")
+}
+
+/// With the system's tools, the notifier is compiled from the published script, given sbx's
+/// identifier, name and icon, kept out of the Dock, offered for its own notes only, and signed;
+/// a second run replaces it rather than nesting a copy inside it.
+#[test]
+fn on_macos_the_notifier_is_built_with_sbxs_identity_and_replaced() {
+    let fx = Release::new();
+    fx.publish_macos("latest");
+    let path = [
+        &fx.fake_mac_tools(&[]),
+        &fx.fake_launchctl(),
+        &fx.fake_limactl(),
+        &fx.fake_uname("Darwin", "arm64"),
+    ];
+    let paths: Vec<&Path> = path.iter().map(|p| p.as_path()).collect();
+    let run = fx.run(&script(), &[("SBX_VERSION", "latest")], &paths);
+    assert_eq!(run.code, Some(0), "{}", run.text);
+
+    let app = notifier(&fx);
+    assert_eq!(
+        std::fs::read_to_string(app.join("Contents/Resources/main")).unwrap(),
+        FAKE_NOTIFY_SCRIPT,
+        "compiled from the published script"
+    );
+    assert!(app.join("Contents/Resources/droplet.icns").is_file());
+    let calls = fx.tool_calls();
+    for wanted in [
+        "plutil -replace CFBundleIdentifier -string org.sbx.lima.notifier ",
+        "plutil -replace CFBundleName -string sbx ",
+        "plutil -replace LSUIElement -bool true ",
+    ] {
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with(wanted) && c.ends_with("/Contents/Info.plist")),
+            "{wanted:?} not in {calls:?}"
+        );
+    }
+    assert!(
+        calls.iter().any(
+            |c| c.starts_with("plutil -replace CFBundleDocumentTypes") && c.contains("sbxnote")
+        ),
+        "{calls:?}"
+    );
+    let sign = calls
+        .iter()
+        .position(|c| c.starts_with("codesign --force --sign -"));
+    let last_edit = calls
+        .iter()
+        .rposition(|c| c.starts_with("plutil") || c.starts_with("iconutil"));
+    assert!(
+        matches!((last_edit, sign), (Some(e), Some(s)) if e < s),
+        "signed after its last edit: {calls:?}"
+    );
+    assert!(
+        run.text.contains("installed the sbx notifier"),
+        "{}",
+        run.text
+    );
+
+    let run = fx.run(
+        &script(),
+        &[("SBX_VERSION", "latest"), ("FAKE_LIMA_EXISTS", "1")],
+        &paths,
+    );
+    assert_eq!(run.code, Some(0), "{}", run.text);
+    assert!(
+        !app.join("sbx.app").exists(),
+        "a reinstall replaces, never nests"
+    );
+    let share: Vec<_> = std::fs::read_dir(app.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !share.iter().any(|n| n.starts_with(".sbx.app")),
+        "no partial copy left: {share:?}"
+    );
+}
+
+/// A Mac without one of the tools still gets sbx: the notifier is skipped, said so, and the bridge
+/// keeps raising notes under Script Editor's icon.
+#[test]
+fn on_macos_a_missing_tool_skips_the_notifier_and_says_so() {
+    let fx = Release::new();
+    fx.publish_macos("latest");
+    let path = [
+        &fx.fake_mac_tools(&["iconutil"]),
+        &fx.fake_launchctl(),
+        &fx.fake_limactl(),
+        &fx.fake_uname("Darwin", "arm64"),
+    ];
+    let paths: Vec<&Path> = path.iter().map(|p| p.as_path()).collect();
+    let run = fx.run(&script(), &[("SBX_VERSION", "latest")], &paths);
+    assert_eq!(run.code, Some(0), "{}", run.text);
+    assert!(
+        fx.installed().is_file(),
+        "the wrapper is installed regardless"
+    );
+    assert!(!notifier(&fx).exists());
+    assert!(
+        run.text.contains("iconutil is not on PATH") && run.text.contains("Script Editor"),
+        "{}",
+        run.text
     );
 }

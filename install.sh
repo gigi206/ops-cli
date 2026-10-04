@@ -8,9 +8,12 @@
 # creates that guest from the template published with the release, unless one named `sbx` exists
 # already, and installs the wrapper that reaches it from a Mac shell. It also installs two launchd
 # agents in ~/Library/LaunchAgents, `org.sbx.lima.theme` and `org.sbx.lima.notify`, which hand the
-# Mac's light/dark preference to the guest and raise its refusals in Notification Center; each is
-# removed with `launchctl bootout gui/$(id -u)/<label>` and the deletion of its plist. Lima itself
-# is not installed here; the script stops and names the command when it is missing.
+# Mac's light/dark preference to the guest and raise its notes in Notification Center; each is
+# removed with `launchctl bootout gui/$(id -u)/<label>` and the deletion of its plist. The notes
+# are raised under a small application, sbx.app, which the script compiles from the system's own
+# tools next to the agents' bridge so they carry sbx's name and icon; deleting it brings back
+# Script Editor's. Lima itself is not installed here; the script stops and names the command when
+# it is missing.
 #
 # Environment, each optional:
 #   SBX_REPO           the GitHub repository sbx is released from, `owner/name` (default:
@@ -23,8 +26,9 @@
 #                      releases)
 #   SBX_RELEASES_API   where the newest stable release is looked up (default: the repository's
 #                      GitHub API); both accept https, or file:// for a local copy
-#   SBX_SOURCE_BASE    macOS only: where the Lima template and the wrapper are read from, as
-#                      <base>/<tag>/dist/macos/ (default: the repository's raw files at the tag)
+#   SBX_SOURCE_BASE    macOS only: where the Lima template, the wrapper and the notifier's script
+#                      and icon are read from, as <base>/<tag>/dist/macos/ and <base>/<tag>/assets/
+#                      (default: the repository's raw files at the tag)
 #   SBX_LIMA_PROJECTS  macOS only: the subtree of your home the guest can see, relative to it
 #                      (default: Projects); every other part of the Mac stays out of the guest
 #
@@ -51,6 +55,9 @@ DOCS="https://${REPO%%/*}.github.io/${REPO#*/}/docs/getting-started/installation
 # The launchd agents installed on macOS, and the job each runs.
 AGENT_THEME=org.sbx.lima.theme
 AGENT_NOTIFY=org.sbx.lima.notify
+
+# The bundle identifier of the application the bridge raises notes under.
+NOTIFIER_ID=org.sbx.lima.notifier
 
 # The Lima instance the wrapper reaches by default.
 LIMA_INSTANCE=sbx
@@ -226,6 +233,61 @@ install_agents() {
     say "installed the launchd agents $AGENT_THEME and $AGENT_NOTIFY"
 }
 
+# Compile the notifier from the AppleScript `$1` and the icon `$2` into `$3`, an application with
+# sbx's identifier, name and icon, signed ad hoc as a modified bundle must be. Fails on the first
+# step that does.
+build_notifier() {
+    app="$3"
+    iconset="${3%/*}/sbx.iconset"
+    mkdir -p "$iconset" &&
+        osacompile -o "$app" "$1" &&
+        sips -z 16 16 "$2" --out "$iconset/icon_16x16.png" >/dev/null &&
+        sips -z 32 32 "$2" --out "$iconset/icon_16x16@2x.png" >/dev/null &&
+        sips -z 32 32 "$2" --out "$iconset/icon_32x32.png" >/dev/null &&
+        sips -z 64 64 "$2" --out "$iconset/icon_32x32@2x.png" >/dev/null &&
+        sips -z 128 128 "$2" --out "$iconset/icon_128x128.png" >/dev/null &&
+        iconutil -c icns -o "$app/Contents/Resources/droplet.icns" "$iconset" &&
+        plutil -replace CFBundleIdentifier -string "$NOTIFIER_ID" "$app/Contents/Info.plist" &&
+        plutil -replace CFBundleName -string sbx "$app/Contents/Info.plist" &&
+        plutil -replace LSUIElement -bool true "$app/Contents/Info.plist" &&
+        plutil -replace CFBundleDocumentTypes -json \
+            '[{"CFBundleTypeExtensions":["sbxnote"],"CFBundleTypeRole":"Viewer"}]' \
+            "$app/Contents/Info.plist" &&
+        codesign --force --sign - "$app" >/dev/null 2>&1
+}
+
+# Install the notifier next to the bridge, replacing any earlier copy. Best-effort: without it the
+# bridge raises its notes through `osascript`, under Script Editor's icon, so a tool or a download
+# that is missing is said and the install goes on. macOS asks once, at the first note, whether sbx
+# may notify.
+install_notifier() {
+    share="${XDG_DATA_HOME:-$HOME/.local/share}/sbx/lima"
+    without="notes are raised under Script Editor's icon"
+    for tool in osacompile sips iconutil plutil codesign; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            say "$tool is not on PATH, so the sbx notifier was not built; $without"
+            return 0
+        fi
+    done
+    if ! fetch "$source/sbx-notify.applescript" "$tmp/sbx-notify.applescript" ||
+        ! fetch "$assets/sbx.png" "$tmp/sbx.png"; then
+        say "could not download the sbx notifier's script or icon; $without"
+        return 0
+    fi
+    mkdir -p "$tmp/notifier" "$share"
+    if ! build_notifier "$tmp/sbx-notify.applescript" "$tmp/sbx.png" "$tmp/notifier/sbx.app"; then
+        say "could not build the sbx notifier; $without"
+        return 0
+    fi
+    # Beside its destination and renamed over it, so the bridge never finds half an application.
+    rm -rf "$share/.sbx.app.$$"
+    cp -R "$tmp/notifier/sbx.app" "$share/.sbx.app.$$"
+    rm -rf "$share/sbx.app"
+    mv "$share/.sbx.app.$$" "$share/sbx.app"
+    say "installed the sbx notifier at $share/sbx.app; macOS asks at its first note whether sbx \
+may notify"
+}
+
 # macOS has no capability-bearing user namespaces, and `sbx doctor` refuses to emulate them, so
 # sbx runs in a Linux guest and what is installed on the Mac is the wrapper that reaches it.
 install_macos() {
@@ -240,6 +302,7 @@ Lima provides, and limactl is not on PATH. Install Lima (brew install lima), the
 again; see $DOCS"
     resolve_version
     source="${SBX_SOURCE_BASE:-$DEFAULT_SOURCE}/$version/dist/macos"
+    assets="${SBX_SOURCE_BASE:-$DEFAULT_SOURCE}/$version/assets"
 
     say "downloading the Lima template and the wrapper ($version)"
     fetch "$source/sbx.yaml" "$tmp/sbx.yaml" || die "could not download $source/sbx.yaml; \
@@ -272,6 +335,7 @@ a few minutes"
     place "$tmp/sbx"
     say "installed the sbx wrapper at $dir/sbx; run sbx from a directory under ~/$projects"
     install_agents "$tmp/sbx-bridge" "$bridge_dir"
+    install_notifier
     path_hint
     # The wrapper refuses a directory the guest does not share, so the preflight is run from the
     # subtree. A guest kept from an earlier install may share another one, which only its creator

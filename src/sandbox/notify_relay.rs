@@ -89,6 +89,17 @@
 //! held only by zbus's ceiling of 128 MiB per message, and the bound becomes [`CALLS_QUEUED`] plus
 //! two such messages.
 //!
+//! **A host whose desktop is not on its session bus.** A Lima guest on a Mac runs no
+//! notifications daemon: the desktop is the Mac's. When none answers there and the guest mounts the
+//! Mac's notification directory ([`super::notify_sink::desktop_without_daemon`], the decision sbx's
+//! own refusals take too), each call is written into that directory as a note instead
+//! ([`MacQueue`]), every guard above applied first. The Mac shows a note as a title, a subtitle and
+//! a body under sbx's own icon, with no separate line for the sending application, so the
+//! supervisor's application name becomes the title: a relayed note always opens with
+//! [`RELAYED_BY`], where sbx's own notes open with what was refused. Nothing comes back from the
+//! Mac, so a relayed note offers no actions and is never reported closed, and the app's icon and
+//! pixel hints are not shown.
+//!
 //! Lifecycle:[`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
 //! `async_io::block_on` (the pure-Rust async-io backend — no tokio, and the runtime never leaves this
 //! module). The thread waits for the in-cage `dbus-daemon` to create the private-bus socket (the
@@ -101,9 +112,11 @@
 use crate::diag;
 use crate::sandbox::locks::locked;
 use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -265,6 +278,100 @@ impl HostBus for HostNotificationsProxy<'static> {
         &self,
     ) -> BoxFuture<'_, zbus::Result<(String, String, String, String)>> {
         Box::pin(HostNotificationsProxy::get_server_information(self))
+    }
+}
+
+/// The relay's destination on a Lima guest on a Mac: the Mac's notification directory, written one
+/// note per `Notify`, in place of a daemon the guest does not run.
+///
+/// What reaches it has been through [`Served::notify`] already, so its fields hold what the guards
+/// left of the cage's call; the note's own sanitising and length ceiling apply on top. The ids it
+/// answers with are its own count, never `0`, so [`OwnedIds`] still rules on `replaces_id` and
+/// `CloseNotification`; a replacement is a new note, since a raised note cannot be revised. The
+/// capabilities name the body alone: no action is offered, because no click comes back.
+struct MacQueue {
+    /// The notification channel's root, [`super::lima_mac::NOTIFY_MOUNT`] outside tests.
+    dir: PathBuf,
+    next: AtomicU32,
+}
+
+impl MacQueue {
+    fn new(dir: PathBuf) -> MacQueue {
+        MacQueue {
+            dir,
+            next: AtomicU32::new(1),
+        }
+    }
+}
+
+impl HostBus for MacQueue {
+    fn notify(&self, call: NotifyCall) -> BoxFuture<'_, zbus::Result<u32>> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let written = super::lima_mac::queue_note(
+            &self.dir,
+            super::lima_mac::NoteSource::App,
+            &call.app_name,
+            &call.summary,
+            &call.body,
+        );
+        Box::pin(std::future::ready(match written {
+            Ok(true) => Ok(id),
+            Ok(false) => Err(zbus::Error::Failure(
+                "the Mac's notification queue is full".to_string(),
+            )),
+            Err(e) => Err(zbus::Error::Failure(format!(
+                "the Mac's notification queue: {e}"
+            ))),
+        }))
+    }
+
+    fn close_notification(&self, _id: u32) -> BoxFuture<'_, zbus::Result<()>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn get_capabilities(&self) -> BoxFuture<'_, zbus::Result<Vec<String>>> {
+        Box::pin(std::future::ready(Ok(vec!["body".to_string()])))
+    }
+
+    fn get_server_information(
+        &self,
+    ) -> BoxFuture<'_, zbus::Result<(String, String, String, String)>> {
+        Box::pin(std::future::ready(Ok((
+            "sbx".to_string(),
+            "sbx".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+            "1.2".to_string(),
+        ))))
+    }
+}
+
+/// The host daemon's `ActionInvoked` signals as the relay reads them: the id and the action key, or
+/// `None` for a signal whose arguments did not decode.
+type ActionSignals = BoxStream<'static, Option<(u32, String)>>;
+
+/// The host daemon's `NotificationClosed` signals as the relay reads them: the id and the reason, or
+/// `None` for a signal whose arguments did not decode.
+type ClosedSignals = BoxStream<'static, Option<(u32, u32)>>;
+
+/// Where the relay sends a cage's notifications.
+#[derive(Debug, PartialEq, Eq)]
+enum RelayTarget {
+    /// The daemon on the host's session bus.
+    Daemon,
+    /// The Mac's notification directory ([`MacQueue`]).
+    Mac,
+}
+
+/// Where the relay sends: the host daemon whenever one answered, the Mac's directory only when none
+/// did and `fallback`, asked only then, names the Mac. Pure apart from `fallback`.
+fn relay_target(
+    daemon_answered: bool,
+    fallback: impl FnOnce() -> super::notify_sink::DaemonlessDesktop,
+) -> RelayTarget {
+    if !daemon_answered && fallback() == super::notify_sink::DaemonlessDesktop::Mac {
+        RelayTarget::Mac
+    } else {
+        RelayTarget::Daemon
     }
 }
 
@@ -974,6 +1081,10 @@ async fn run(
     .build()
     .await?;
     let host = HostNotificationsProxy::new(&host_conn).await?;
+    let target = relay_target(
+        host.get_server_information().await.is_ok(),
+        super::notify_sink::desktop_without_daemon,
+    );
 
     // Private bus. Its calls are read off a stream of the relay's own, `CALLS_QUEUED` deep, rather
     // than served by zbus's object server, whose queue is 64 calls deep and which decodes a call
@@ -992,8 +1103,12 @@ async fn run(
     let calls = MessageStream::for_match_rule(to_relay, &private_conn, Some(CALLS_QUEUED)).await?;
     private_conn.request_name(IFACE).await?;
     let ours = Arc::new(OwnedIds::default());
+    let destination: Box<dyn HostBus> = match target {
+        RelayTarget::Daemon => Box::new(host.clone()),
+        RelayTarget::Mac => Box::new(MacQueue::new(PathBuf::from(super::lima_mac::NOTIFY_MOUNT))),
+    };
     let served = Served {
-        host: Box::new(host.clone()),
+        host: destination,
         ours: Arc::clone(&ours),
         needles,
     };
@@ -1003,17 +1118,32 @@ async fn run(
     let serving = serve_calls(&private_conn, &served, calls).fuse();
     futures_util::pin_mut!(serving);
 
-    let mut actions = host.receive_action_invoked().await?;
-    let mut closed = host.receive_notification_closed().await?;
+    // The daemon's signals, each reduced to its arguments. The Mac sends none back, so there the
+    // two streams never yield and the loop waits on the calls and the shutdown alone.
+    let (mut actions, mut closed): (ActionSignals, ClosedSignals) = match target {
+        RelayTarget::Daemon => (
+            host.receive_action_invoked()
+                .await?
+                .map(|sig| sig.args().ok().map(|a| (a.id, a.action_key.to_string())))
+                .boxed(),
+            host.receive_notification_closed()
+                .await?
+                .map(|sig| sig.args().ok().map(|a| (a.id, a.reason)))
+                .boxed(),
+        ),
+        RelayTarget::Mac => (
+            futures_util::stream::pending().boxed(),
+            futures_util::stream::pending().boxed(),
+        ),
+    };
     loop {
         futures_util::select! {
             _ = shutdown.recv().fuse() => break,
             // The call loop ends once the private bus has gone, or a reply could not be written to it.
             () = serving => break,
             sig = actions.next().fuse() => match sig {
-                Some(sig) => if let Ok(a) = sig.args() {
+                Some(sig) => if let Some((id, key)) = sig {
                     // Verbatim id → the app matches the signal to its own notification.
-                    let (id, key) = (a.id, a.action_key.to_string());
                     // The host daemon's signals are desktop-wide: they fire for every application on
                     // the user's session, not for this cage. `emit_signal(None, …)` is a broadcast
                     // and the private bus lets any process receive it, so a foreign signal relayed
@@ -1030,8 +1160,7 @@ async fn run(
                 None => break,
             },
             sig = closed.next().fuse() => match sig {
-                Some(sig) => if let Ok(a) = sig.args() {
-                    let (id, reason) = (a.id, a.reason);
+                Some(sig) => if let Some((id, reason)) = sig {
                     // Whoever raised it, this id now names nothing, so it leaves the set either way;
                     // only the cage's own closures cross back. A desktop-wide close signal tells a
                     // watching agent whether a human dismissed a toast (reason 2) or it expired
@@ -1166,6 +1295,104 @@ mod tests {
         ) -> BoxFuture<'_, zbus::Result<(String, String, String, String)>> {
             Box::pin(std::future::ready(Ok(Default::default())))
         }
+    }
+
+    /// The relay in front of the Mac's notification directory at `dir`.
+    fn served_by_mac(dir: &std::path::Path) -> Served {
+        Served {
+            host: Box::new(MacQueue::new(dir.to_path_buf())),
+            ours: Arc::new(OwnedIds::default()),
+            needles: Arc::new(std::sync::RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Every note the relay queued under `dir`, as text.
+    fn queued_notes(dir: &std::path::Path) -> Vec<String> {
+        let mut notes: Vec<String> = std::fs::read_dir(dir.join("queue"))
+            .map(|entries| {
+                entries
+                    .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        notes.sort();
+        notes
+    }
+
+    /// A host whose daemon answers keeps it, whatever else it mounts; the Mac's directory is taken
+    /// only when no daemon answered on a Mac guest, and the fallback is not even asked otherwise.
+    #[test]
+    fn the_mac_directory_is_taken_only_where_no_daemon_answered() {
+        use crate::sandbox::notify_sink::DaemonlessDesktop;
+        let unasked = || -> DaemonlessDesktop { panic!("asked although a daemon answered") };
+        assert_eq!(relay_target(true, unasked), RelayTarget::Daemon);
+        assert_eq!(
+            relay_target(false, || DaemonlessDesktop::Mac),
+            RelayTarget::Mac
+        );
+        assert_eq!(
+            relay_target(false, || DaemonlessDesktop::Windows),
+            RelayTarget::Daemon
+        );
+        assert_eq!(
+            relay_target(false, || DaemonlessDesktop::None),
+            RelayTarget::Daemon
+        );
+    }
+
+    /// On the Mac every note shows under sbx's icon with no line of its own for the sender, so the
+    /// title is the one place a caged app's note can be told from sbx's refusal. A cage that writes
+    /// a refusal's words, and names itself sbx, still gets a title that opens with the relay's mark
+    /// and never the refusal's own title.
+    #[test]
+    fn a_caged_app_cannot_title_its_mac_note_as_sbxs_refusal() {
+        let dir = crate::testutil::TmpDir::new();
+        let served = served_by_mac(dir.path());
+        let refusal = "Blocked: evil.com:443";
+        async_io::block_on(served.notify(
+            "sbx".to_string(),
+            0,
+            String::new(),
+            refusal.to_string(),
+            "allow it: sbx net allow evil.com".to_string(),
+            Vec::new(),
+            HashMap::new(),
+            -1,
+        ))
+        .expect("the queue takes the note");
+
+        let notes = queued_notes(dir.path());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let title = notes[0].lines().next().unwrap();
+        assert!(title.starts_with(RELAYED_BY), "{title:?}");
+        assert_ne!(title, refusal);
+        assert_eq!(
+            notes[0].lines().nth(1),
+            Some(refusal),
+            "the cage's summary is the subtitle"
+        );
+    }
+
+    /// The Mac queue answers like a daemon the relay can hold to its rules: ids that are never `0`
+    /// and never repeat, so a cage's replacement and close are still ruled on, and no action
+    /// offered, since no click comes back from the Mac.
+    #[test]
+    fn the_mac_queue_hands_out_ids_the_relay_can_rule_on() {
+        let dir = crate::testutil::TmpDir::new();
+        let served = served_by_mac(dir.path());
+        let first = notify(&served, 0);
+        let second = notify(&served, first);
+        assert!(first != 0 && second != 0 && first != second);
+        assert!(served.ours.owns(first) && served.ours.owns(second));
+        assert_eq!(
+            queued_notes(dir.path()).len(),
+            2,
+            "a replacement is a new note"
+        );
+
+        let caps = async_io::block_on(served.get_capabilities()).unwrap();
+        assert!(!caps.iter().any(|c| c == "actions"), "{caps:?}");
+        async_io::block_on(served.close_notification(first)).unwrap();
     }
 
     /// The interface the private bus serves, in front of a recording host.

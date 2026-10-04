@@ -415,6 +415,33 @@ impl Sink for WslToastSink {
     }
 }
 
+/// The desktop a host with no notification daemon on its session bus still has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DaemonlessDesktop {
+    /// A WSL distribution: the desktop is Windows, which takes a toast through its own API.
+    Windows,
+    /// A Lima guest on a Mac: the desktop is the Mac's, reached through the notification directory
+    /// the guest mounts from it.
+    Mac,
+    /// Neither: nothing on this host shows a notification.
+    None,
+}
+
+/// Where a notification goes on a host whose session bus has no daemon to take it.
+///
+/// One decision for both writers: sbx's own refusals ([`Notifier`]) and a caged app's
+/// notifications ([`super::notify_relay`]) ask it, so the two cannot disagree about which desktop
+/// a host has. Asked only once a daemon has failed to answer, so a host with one keeps it.
+pub(crate) fn desktop_without_daemon() -> DaemonlessDesktop {
+    if crate::sandbox::wsl::host_is_wsl() {
+        DaemonlessDesktop::Windows
+    } else if crate::sandbox::lima_mac::mounted(crate::sandbox::lima_mac::NOTIFY_MOUNT) {
+        DaemonlessDesktop::Mac
+    } else {
+        DaemonlessDesktop::None
+    }
+}
+
 /// The Mac sink: a note in the queue the Mac's agent raises in Notification Center, **and** the
 /// stderr line the fallback would have printed.
 ///
@@ -436,7 +463,15 @@ impl Sink for MacNoteSink {
     ) -> Result<Option<u32>, ()> {
         crate::diag::warn(&stderr_line(&self.context, summary, body));
         // A note that cannot be written is not a transport that is gone: the line above landed.
-        let _ = crate::sandbox::lima_mac::queue_note(&self.dir, summary, body);
+        // The summary is the title, and the line a Linux desktop gives the sending application
+        // rides as the subtitle, so the note says which session refused.
+        let _ = crate::sandbox::lima_mac::queue_note(
+            &self.dir,
+            crate::sandbox::lima_mac::NoteSource::Sbx,
+            summary,
+            &app_name(&self.context),
+            body,
+        );
         Ok(None)
     }
 }
@@ -822,36 +857,27 @@ impl Notifier {
                 Some(s) => s,
                 None => match DesktopSink::connect(&context) {
                     Some(d) => Box::new(d),
-                    // No daemon answered. Under WSL that is the normal state rather than a
-                    // failure — the desktop these announcements are for is the Windows one, which
-                    // takes them through its own toast API — so the announcement goes there as
-                    // well as to stderr. Everywhere else this is the stderr fallback it always was.
-                    None if crate::sandbox::wsl::host_is_wsl() => Box::new(WslToastSink {
-                        context: context.clone(),
-                        diagnosed: false,
-                        powershell: None,
-                        pending: Vec::new(),
-                    }),
-                    // The same case on a Lima guest on a Mac: the desktop is the Mac's, reached
-                    // through the notification directory the guest mounts from it.
-                    None if crate::sandbox::lima_mac::mounted(
-                        crate::sandbox::lima_mac::NOTIFY_MOUNT,
-                    ) =>
-                    {
-                        Box::new(MacNoteSink {
+                    None => match desktop_without_daemon() {
+                        DaemonlessDesktop::Windows => Box::new(WslToastSink {
+                            context: context.clone(),
+                            diagnosed: false,
+                            powershell: None,
+                            pending: Vec::new(),
+                        }),
+                        DaemonlessDesktop::Mac => Box::new(MacNoteSink {
                             context: context.clone(),
                             dir: std::path::PathBuf::from(crate::sandbox::lima_mac::NOTIFY_MOUNT),
-                        })
-                    }
-                    None => {
-                        crate::diag::note(
-                            "no desktop notification daemon reachable — reporting blocked \
-                             requests on stderr instead",
-                        );
-                        Box::new(StderrSink {
-                            context: context.clone(),
-                        })
-                    }
+                        }),
+                        DaemonlessDesktop::None => {
+                            crate::diag::note(
+                                "no desktop notification daemon reachable — reporting blocked \
+                                 requests on stderr instead",
+                            );
+                            Box::new(StderrSink {
+                                context: context.clone(),
+                            })
+                        }
+                    },
                 },
             };
             let mut coalescer = Coalescer::default();
@@ -1087,6 +1113,30 @@ mod tests {
         seen: Arc<Mutex<Vec<Delivery>>>,
         /// Whether this sink hands out ids (a desktop daemon does, stderr does not).
         ids: bool,
+    }
+
+    /// sbx's own note on a Mac opens with what was refused and names the session under it: the
+    /// title a caged app's relayed note can never take, and the session a Linux desktop shows on
+    /// the sender's line.
+    #[test]
+    fn a_mac_note_is_titled_with_the_refusal_and_names_its_session() {
+        let dir = crate::testutil::TmpDir::new();
+        let mut sink = MacNoteSink {
+            context: "demo".to_string(),
+            dir: dir.path().to_path_buf(),
+        };
+        assert_eq!(
+            sink.deliver("Blocked: evil.com:443", "allow it", None),
+            Ok(None)
+        );
+        let notes: Vec<String> = std::fs::read_dir(dir.join("queue"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(
+            notes,
+            vec!["Blocked: evil.com:443\nsbx · demo\nallow it\n".to_string()]
+        );
     }
 
     /// The two strings a toast carries are the cage's writing, so the escape that contains them is

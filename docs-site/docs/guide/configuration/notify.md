@@ -48,6 +48,11 @@ notification daemon opens the icon file itself, in its own process, so the mark 
 sbx's data directory (`sbx.png` and `sbx-dark.png`, beside the store) and named to the daemon by
 path. It is written once and left alone unless the mark itself changes.
 
+In a Lima guest on macOS the mark is the icon of a small application the installer builds on the
+Mac, `sbx.app`, which Notification Center shows every note under. An application has one icon, so
+there the mark does not follow the dark appearance. macOS asks, at the first note, whether sbx may
+notify; until it is allowed, nothing is shown, and the stderr line is still printed.
+
 The two files are the same drawing in the two fills it comes in, one for a light desktop and one
 for a dark one. Which is sent is decided per notification, from the desktop portal's appearance
 setting, so switching your desktop between light and dark is followed rather than fixed at launch.

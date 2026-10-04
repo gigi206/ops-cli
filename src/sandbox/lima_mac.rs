@@ -1,11 +1,12 @@
 //! What a Lima guest on a Mac shares with the Mac: its light/dark preference, and a queue of
-//! announcements for its Notification Center.
+//! notes for its Notification Center.
 //!
 //! A guest cannot run a program on the Mac the way a WSL distribution runs one on Windows, so the
 //! two channels are directories the template mounts from the Mac, each at a path that exists only
 //! in the guest and that no cage is given. The theme directory is read-only here: an agent on the
 //! Mac writes the current preference into it. The notification directory is writable: sbx drops
-//! one file per announcement into it, and an agent on the Mac raises each one and removes it.
+//! one file per note into it, its own refusals and the notifications a caged app raises through the
+//! relay alike, and an agent on the Mac raises each one and removes it.
 //!
 //! Each channel answers only when its directory is a virtiofs mount at that exact path, read from
 //! `/proc/self/mountinfo`. A host where the path is an ordinary directory, or absent, reads and
@@ -34,9 +35,29 @@ const THEME_READ_CAP: u64 = 64;
 const STAGING: &str = "staging";
 const QUEUE: &str = "queue";
 
-/// How many notes may wait in the queue. Nothing empties it when the Mac's agent is not running,
-/// so past this a note is not written: the stderr line the sink prints regardless still carries it.
+/// How many notes of one [`NoteSource`] may wait in the queue. Nothing empties it when the Mac's
+/// agent is not running, so past this a note is not written. Counted per source, so a caged app
+/// that raises notifications in a loop fills its own share and never the one sbx's refusals use.
 pub(crate) const QUEUE_CAP: usize = 32;
+
+/// Who wrote a note, which is also the head of its file name: the Mac's agent raises each source
+/// under a ceiling of its own, as the queue holds each to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoteSource {
+    /// sbx's own announcement of a refusal.
+    Sbx,
+    /// A notification a caged app raised, relayed by [`super::notify_relay`].
+    App,
+}
+
+impl NoteSource {
+    fn prefix(self) -> &'static str {
+        match self {
+            NoteSource::Sbx => "sbx-",
+            NoteSource::App => "app-",
+        }
+    }
+}
 
 /// How many characters of the title and of the body a note carries.
 const NOTE_FIELD_CAP: usize = 512;
@@ -101,45 +122,58 @@ fn read_scheme_file(path: &Path) -> Option<String> {
     scheme_name(&word).map(str::to_string)
 }
 
-/// The text of one note: the title on the first line, the body on the second. Pure.
+/// The text of one note: the title, the subtitle and the body, one to a line. Pure.
 ///
-/// Both are the cage's writing, a refused host or an exec target, so each is sanitised, which takes
-/// out the newlines that would otherwise let a subject add lines of its own, and is cut to
-/// [`NOTE_FIELD_CAP`] characters. The Mac's agent sanitises again before raising the note, because
-/// the directory is the guest's to write and the agent trusts nothing it finds there.
-pub(crate) fn note_text(title: &str, body: &str) -> String {
+/// Every field may carry the cage's writing, a refused host, an exec target or a caged app's own
+/// words, so each is sanitised, which takes out the newlines that would otherwise let a field add
+/// lines of its own, and is cut to [`NOTE_FIELD_CAP`] characters. The Mac's agent sanitises again
+/// before raising the note, because the directory is the guest's to write and the agent trusts
+/// nothing it finds there.
+pub(crate) fn note_text(title: &str, subtitle: &str, body: &str) -> String {
     let field = |s: &str| {
         crate::sandbox::sanitize(s)
             .chars()
             .take(NOTE_FIELD_CAP)
             .collect::<String>()
     };
-    format!("{}\n{}\n", field(title), field(body))
+    format!("{}\n{}\n{}\n", field(title), field(subtitle), field(body))
 }
 
-/// A name no other note from this process, or from another sbx process, will take.
-fn note_name() -> String {
+/// A name no other note from this process, or from another sbx process, will take, headed by its
+/// source.
+fn note_name(source: NoteSource) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
-        "{}-{}.note",
+        "{}{}-{}.note",
+        source.prefix(),
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }
 
-/// Queue one note under `dir`, the notification channel's root. `Ok(false)` when the queue already
-/// holds [`QUEUE_CAP`] notes and nothing was written.
-pub(crate) fn queue_note(dir: &Path, title: &str, body: &str) -> std::io::Result<bool> {
+/// Queue one note from `source` under `dir`, the notification channel's root. `Ok(false)` when the
+/// queue already holds [`QUEUE_CAP`] notes from that source and nothing was written.
+pub(crate) fn queue_note(
+    dir: &Path,
+    source: NoteSource,
+    title: &str,
+    subtitle: &str,
+    body: &str,
+) -> std::io::Result<bool> {
     let staging = dir.join(STAGING);
     let queue = dir.join(QUEUE);
     std::fs::create_dir_all(&staging)?;
     std::fs::create_dir_all(&queue)?;
-    if std::fs::read_dir(&queue)?.count() >= QUEUE_CAP {
+    let waiting = std::fs::read_dir(&queue)?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(source.prefix()))
+        .count();
+    if waiting >= QUEUE_CAP {
         return Ok(false);
     }
-    let name = note_name();
+    let name = note_name(source);
     let staged = staging.join(&name);
-    std::fs::write(&staged, note_text(title, body))?;
+    std::fs::write(&staged, note_text(title, subtitle, body))?;
     std::fs::rename(&staged, queue.join(&name)).inspect_err(|_| {
         let _ = std::fs::remove_file(&staged);
     })?;
@@ -220,21 +254,27 @@ mod tests {
         );
     }
 
-    /// A subject's newline does not become a line of the note, and the note has two lines.
+    /// A field's newline does not become a line of the note, and the note has three lines.
     #[test]
-    fn a_note_is_two_lines_whatever_its_subject_carries() {
-        let text = note_text("Blocked: evil.com\nforged line", "body\r\nmore");
-        assert_eq!(text.lines().count(), 2, "{text:?}");
+    fn a_note_is_three_lines_whatever_its_fields_carry() {
+        let text = note_text(
+            "Blocked: evil.com\nforged line",
+            "sub\rline",
+            "body\r\nmore",
+        );
+        assert_eq!(text.lines().count(), 3, "{text:?}");
         assert!(text.starts_with("Blocked: evil.com"), "{text:?}");
-        let long = note_text(&"x".repeat(5000), "");
+        let long = note_text(&"x".repeat(5000), "", "");
         assert!(long.lines().next().unwrap().chars().count() <= NOTE_FIELD_CAP);
+        assert_eq!(note_text("t", "", "").lines().count(), 3);
     }
 
-    /// A note reaches the queue through staging, and the cap stops the queue growing.
+    /// A note reaches the queue through staging, named after its source, and the cap stops the
+    /// queue growing.
     #[test]
     fn notes_are_queued_through_staging_and_capped() {
         let dir = TmpDir::new();
-        assert!(queue_note(dir.path(), "title", "body").unwrap());
+        assert!(queue_note(dir.path(), NoteSource::Sbx, "title", "sub", "body").unwrap());
         let queued: Vec<_> = std::fs::read_dir(dir.join(QUEUE))
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -242,17 +282,51 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(
             std::fs::read_to_string(&queued[0]).unwrap(),
-            "title\nbody\n"
+            "title\nsub\nbody\n"
+        );
+        let name = queued[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.starts_with("sbx-") && name.ends_with(".note"),
+            "{name}"
         );
         assert_eq!(std::fs::read_dir(dir.join(STAGING)).unwrap().count(), 0);
 
         for _ in 1..QUEUE_CAP {
-            assert!(queue_note(dir.path(), "t", "b").unwrap());
+            assert!(queue_note(dir.path(), NoteSource::Sbx, "t", "", "b").unwrap());
         }
-        assert!(!queue_note(dir.path(), "t", "b").unwrap(), "the cap holds");
+        assert!(
+            !queue_note(dir.path(), NoteSource::Sbx, "t", "", "b").unwrap(),
+            "the cap holds"
+        );
         assert_eq!(
             std::fs::read_dir(dir.join(QUEUE)).unwrap().count(),
             QUEUE_CAP
         );
+    }
+
+    /// A caged app that fills its share of the queue leaves sbx's share untouched, and the other
+    /// way round.
+    #[test]
+    fn each_source_is_capped_on_its_own() {
+        let dir = TmpDir::new();
+        for _ in 0..QUEUE_CAP {
+            assert!(queue_note(dir.path(), NoteSource::App, "a", "", "b").unwrap());
+        }
+        assert!(!queue_note(dir.path(), NoteSource::App, "a", "", "b").unwrap());
+        assert!(
+            queue_note(dir.path(), NoteSource::Sbx, "Blocked: x", "", "b").unwrap(),
+            "a busy app does not crowd out a refusal"
+        );
+        let app = std::fs::read_dir(dir.join(QUEUE))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("app-")
+            })
+            .count();
+        assert_eq!(app, QUEUE_CAP);
     }
 }

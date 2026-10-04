@@ -201,7 +201,9 @@ launchd agents, `org.sbx.lima.theme` and `org.sbx.lima.notify`, in
 `~/Library/LaunchAgents`. macOS announces each new agent once with a "Background Items
 Added" banner naming `sbx-bridge`, the program both agents run, and lists it under that name
 in Login Items settings; each is removed with `launchctl bootout gui/$(id -u)/<label>` and the
-deletion of its plist. The first start downloads an image
+deletion of its plist. Beside the bridge it compiles `sbx.app`, the application Notification
+Center shows sbx's notes under, removed by deleting
+`~/.local/share/sbx/lima/sbx.app`. The first start downloads an image
 and provisions the guest, including its compositor and sound server, which takes a few
 minutes. An instance named `sbx` that already exists is kept as it is: running the script
 again only reinstalls the wrapper, and an instance keeps the template it was created
@@ -311,15 +313,20 @@ Three differences from a native host are worth knowing before they surprise you:
   guest mounts read-only, on every change to the global preferences and once a minute; `sbx`
   reads it at launch and every two seconds after, so a switch reaches a running app within
   about ten seconds.
-- **Refusals are raised in Notification Center.** The guest runs no notification daemon, so
-  `sbx` drops each announcement into a second directory, writable from the guest, and the
-  `org.sbx.lima.notify` agent raises it and removes it. The note carries Script Editor's
-  icon, the mark of `osascript`, which raises it; registering an application of its own
-  would be a heavier thing to install than the wrong icon is to read. As under WSL the
-  stderr line is kept, since nothing tells the guest whether the note was seen, and at most
-  32 notes wait for an agent that is not running. The agent reads only regular files from
-  that directory, and only their first bytes, because the guest is the one writing there.
-  Neither directory is ever given to a cage.
+- **Refusals and an app's own notifications are raised in Notification Center.** The guest
+  runs no notification daemon, so `sbx` drops each note into a second directory, writable from
+  the guest: its own refusals, and under `dbus = true` what a caged app raises, titled
+  `sandboxed · <app>` so it cannot pass for a refusal (see [`dbus`](../configuration/dbus)). The
+  `org.sbx.lima.notify` agent raises each note and removes it, under `sbx.app`, a small
+  application the installer compiles on the Mac with the system's own tools so the note carries
+  sbx's name and icon. macOS asks at the first note whether sbx may notify, and shows nothing
+  until it is allowed. Without that application, because a tool it is built with was missing or
+  it was deleted, the note is raised through `osascript` under Script Editor's icon. As under WSL
+  the stderr line of a refusal is kept, since nothing tells the guest whether the note was seen.
+  Refusals and app notifications are each held to 32 notes waiting for an agent that is not
+  running and to 5 raised per run of the agent, so a busy app never crowds out a refusal. The
+  agent reads only regular files from that directory, and only their first bytes, because the
+  guest is the one writing there. Neither directory is ever given to a cage.
 - **There is no GPU acceleration.** `vmType: vz` gives the guest a virtio-GPU device without
   3D acceleration. `gpu = true` grants its render node, and mesa renders in software
   (`llvmpipe`) behind it; the launch proceeds. The scope this template commits to is CLI plus GUI, and the two

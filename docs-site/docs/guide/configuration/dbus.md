@@ -49,9 +49,12 @@ The app probes *that* portal and gets three things:
   a Lima guest on macOS (see [Installation](../getting-started/installation)).
 
   An app's **own** notifications are relayed to the host's `org.freedesktop.Notifications`
-  daemon, which a Lima guest on macOS does not run: there an app's notification call fails and
-  nothing reaches the Mac. sbx's own refusals take the Notification Center channel the guest
-  shares with the Mac instead.
+  daemon. A Lima guest on macOS runs none, so there they cross to Notification Center through the
+  channel sbx's own refusals take, as a note titled `sandboxed · <app>` with the app's summary
+  under it, after the same guards. A Mac note has no line of its own for the sender and shows
+  sbx's icon whoever wrote it, so that title is what tells it from a refusal sbx raised, which
+  opens with what was refused. Nothing comes back from the Mac: a relayed note offers no buttons,
+  is never reported closed to the app, and shows neither the app's icon nor an image it attached.
 
   One file carries it: the GSettings **keyfile** the in-cage portal serves from. A Chromium/Electron
   app is its own portal client and reads the scheme straight off it. A **GTK app** reaches the same
