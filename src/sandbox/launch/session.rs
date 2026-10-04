@@ -379,9 +379,9 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 /// Residuals (named, not fixed here), both because a signal terminates a supervisor without running
 /// its RAII drops:
 /// - the `network = "deny"` supervisor leaves its per-session egress socket and CA under
-///   `<data>/egress/` on disk — the same leak any crash or `SIGKILL` of that process already
-///   produces; a future sweep of stale egress artefacts (alongside the session housekeeping) is the
-///   clean fix.
+///   `<data>/egress/` on disk, as any crash or `SIGKILL` of that process does. They stay until the
+///   next cage launches, which sweeps the runtime files of every launch whose pid is gone
+///   ([`crate::sandbox::gc::sweep_runtime_dirs`]), or until `sbx gc`.
 /// - stopping an interactive `sbx run` session signals its pty supervisor, which gives the owner's
 ///   terminal back the moment the `SIGTERM` arrives, then ends. A supervisor stuck writing the
 ///   session's output to a standard output that stopped taking it ends only at the `SIGKILL` after
