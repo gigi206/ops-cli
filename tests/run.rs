@@ -10421,8 +10421,10 @@ fn a_definite_http_answer_is_not_a_transient_fetch_failure() {
 
 /// A capability probe that fails on a download is the network's skip, not the host's. It is tried
 /// once more, because a fresh launch begins the fetch again, and a second failure on a download is
-/// counted as unreachable rather than enforced as incapable. A launch refused for a reason of the
-/// host's stays the host's, at once, even when nix warned about a download on its way there.
+/// counted as unreachable rather than enforced as incapable. So is one whose cache nix gave up on
+/// before it set out to build the closure itself, though that build then fails on a line that names
+/// no download. A launch refused for a reason of the host's stays the host's, at once, even when nix
+/// warned about a download on its way there.
 #[test]
 fn a_probe_that_fails_on_a_download_is_retried_and_never_blamed_on_the_host() {
     use common::{Probe, probe};
@@ -10473,6 +10475,52 @@ bwrap: setting up uid map: Permission denied
 error: unable to download 'https://cache.nixos.org/nar/a.nar.zst': HTTP error 404
 error: path '/nix/store/aaaa-perl-5.42.3' is required, but there is no substituter that can build it
 ";
+    // A cache that answers nothing at all, measured with nix 2.34.5 against one that refuses every
+    // connection, most retries and list entries left out. nix gives the cache up on its last
+    // attempt, the one that names no retry, builds the closure from source, and fails on the first
+    // bootstrap step that breaks: none of its errors names a download.
+    const GAVE_UP: &str = "\
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7) Failed to connect to 127.0.0.1 port 9 after 0 ms: Could not connect to server; retrying in 346 ms (attempt 1/5)
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7) Failed to connect to 127.0.0.1 port 9 after 0 ms: Could not connect to server
+these 396 derivations will be built:
+  /nix/store/013mqc5ymx4cih72blz21l6ync49i3jg-expr-strcmp.patch.drv
+building '/nix/store/d1simrxi41d15h88m043y00yd400fpd4-cb41cbfe717e4c00d7bb70035cda5ee5f0ff9341.tar.gz.drv'...
+error: hash mismatch in fixed-output derivation '/nix/store/d1simrxi41d15h88m043y00yd400fpd4-cb41cbfe717e4c00d7bb70035cda5ee5f0ff9341.tar.gz.drv':
+         specified: sha256-MRuqq3TKcfIahtUWdhAcYhqDiGPkAjS8UTMsDE+/jGU=
+            got:    sha256-h8oii8cebdwILBrlYrL1Oct77rXDdfkkt2ai0CYBJ0A=
+error: Cannot build '/nix/store/jmgi0aram7my7q2fzdbk4jjf24wygl3b-tinycc-musl-unstable-2025-12-03.drv'.
+       Reason: 1 dependency failed.
+       Output paths:
+         /nix/store/dc4vnj9nypgrbn6v0wkp22ns8wcyssgx-tinycc-musl-unstable-2025-12-03
+error: Build failed due to failed dependency
+sbx: cannot resolve the sandbox userland: nix build github:NixOS/nixpkgs/a7868a7#glibc.out failed
+";
+    // The cache answered on a later attempt, and a build of the host's then failed: every warning
+    // names a retry, so nix never gave the cache up.
+    const RETRIED_THEN_BUILT: &str = "\
+warning: unable to download 'https://cache.nixos.org/nix-cache-info': Could not connect to server (7); retrying in 346 ms (attempt 1/5)
+these 2 derivations will be built:
+  /nix/store/aaaa-sbx-gui-data.drv
+error: builder for '/nix/store/aaaa-sbx-gui-data.drv' failed with exit code 1
+";
+    // A cache given up on a definite answer: a substituter URL that does not exist is the host's.
+    const GAVE_UP_ON_404: &str = "\
+warning: unable to download 'https://cache.example.test/nix-cache-info': HTTP error 404
+these 396 derivations will be built:
+error: Build failed due to failed dependency
+";
+    // A cache given up, a build nix then finished, and a refusal of the host's after it.
+    const GAVE_UP_THEN_REFUSED: &str = "\
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7)
+these 2 derivations will be built:
+building '/nix/store/aaaa-sbx-gui-data.drv'...
+bwrap: setting up uid map: Permission denied
+";
+    // A cache given up, then a failure of nix's own before it set out to build anything.
+    const GAVE_UP_THEN_LOCKED: &str = "\
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7)
+error: opening lock file '/nix/var/nix/db/big-lock': Permission denied
+";
     let ok = output(0, "");
 
     let (verdict, calls) = drive(std::slice::from_ref(&ok));
@@ -10500,7 +10548,29 @@ error: path '/nix/store/aaaa-perl-5.42.3' is required, but there is no substitut
         );
     }
 
-    for shape in [REFUSED, MISSING] {
+    // What is quoted of a cache nix gave up on is its last warning, the one that names no retry.
+    let given_up = GAVE_UP.lines().nth(1).expect("the fixture's last attempt");
+    match drive(&[output(1, GAVE_UP)]) {
+        (Probe::Unreachable(why), 2) => assert_eq!(why, given_up),
+        (other, calls) => panic!(
+            "a launch whose cache nix gave up on, and whose closure it then failed to build, is \
+             the network's, after two tries: {other:?} after {calls}"
+        ),
+    }
+    let (verdict, calls) = drive(&[output(1, GAVE_UP), ok.clone()]);
+    assert!(
+        matches!(verdict, Probe::Ran(_)) && calls == 2,
+        "a launch whose cache nix gave up on once is tried again: {verdict:?} after {calls}"
+    );
+
+    for shape in [
+        REFUSED,
+        MISSING,
+        RETRIED_THEN_BUILT,
+        GAVE_UP_ON_404,
+        GAVE_UP_THEN_REFUSED,
+        GAVE_UP_THEN_LOCKED,
+    ] {
         match drive(&[output(1, shape), ok.clone()]) {
             (Probe::Incapable(why), 1) => assert_eq!(why, shape.trim()),
             (other, calls) => panic!(
