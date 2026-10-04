@@ -440,64 +440,80 @@ fn a_follow_names_a_session_each_time_it_stops_answering() {
 /// and the polls that go on not answering do not name it again. Its rows are shown once it answers.
 #[test]
 fn a_merged_follow_asks_again_a_feed_that_did_not_answer_at_first() {
-    let dir = TmpDir::new("l");
-    let data = dir.path();
-    let standin = Standin::new();
-    let pid = standin.pid();
-    write_session_record(data, pid, Path::new("/tmp/demo-app"));
-    serve_script(
-        data,
-        "fs",
-        pid,
-        vec![
-            frame(&["event seq=1 at=1700000000100 kind=write path=whole.rs"]),
-            "head=1\nok\n".to_string(),
-            "head=1\nok\n".to_string(),
-        ],
-    );
-    let asked = serve_turns(
-        data,
-        "proc",
-        pid,
-        vec![
-            Turn::Answer("head=1\n".to_string()),
-            Turn::Refuse,
-            Turn::Answer(frame(&[
-                "event seq=1 at=1700000000200 pid=4242 verdict=observe cmd=late-arrival",
-            ])),
-        ],
-    );
-    let pid = pid.to_string();
+    for json in [false, true] {
+        let dir = TmpDir::new("l");
+        let data = dir.path();
+        let standin = Standin::new();
+        let pid = standin.pid();
+        write_session_record(data, pid, Path::new("/tmp/demo-app"));
+        serve_script(
+            data,
+            "fs",
+            pid,
+            vec![
+                frame(&["event seq=1 at=1700000000100 kind=write path=whole.rs"]),
+                "head=1\nok\n".to_string(),
+                "head=1\nok\n".to_string(),
+            ],
+        );
+        let asked = serve_turns(
+            data,
+            "proc",
+            pid,
+            vec![
+                Turn::Answer("head=1\n".to_string()),
+                Turn::Refuse,
+                Turn::Answer(frame(&[
+                    "event seq=1 at=1700000000200 pid=4242 verdict=observe cmd=late-arrival",
+                ])),
+            ],
+        );
+        let pid = pid.to_string();
+        let mut args = vec!["logs", &pid, "--feed", "fs,proc", "--follow"];
+        if json {
+            args.push("--json");
+        }
 
-    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(["logs", &pid, "--feed", "fs,proc", "--follow"])
-        .env("XDG_DATA_HOME", data)
-        .output()
-        .expect("run the follow");
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
-    assert!(
-        stdout.contains(
-            "proc: its answer did not arrive in full, so none of it is shown until a poll gets it \
-             whole"
-        ),
-        "the header says the feed is asked again: {stdout}"
-    );
-    assert_eq!(
-        times_named(&stderr),
-        0,
-        "the header named it already, and the refused poll continues that run: {stderr}"
-    );
-    assert!(stdout.contains("late-arrival"), "{stdout}");
-    assert!(stdout.contains(&format!("session {pid} ended")), "{stdout}");
-    assert_eq!(
-        *asked.lock().unwrap(),
-        ["LOG", "LOG after=0"],
-        "asked again from the start of its ring"
-    );
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(&args)
+            .env("XDG_DATA_HOME", data)
+            .output()
+            .expect("run the follow");
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stdout}{stderr}");
+        assert!(stdout.contains("late-arrival"), "{args:?}: {stdout}");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["LOG", "LOG after=0"],
+            "{args:?}: asked again from the start of its ring"
+        );
+        if json {
+            // No header under `--json`: the feed is named on standard error, once, and the refused
+            // poll continues that run.
+            assert_eq!(times_named(&stderr), 1, "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("its proc rows are not shown until a poll gets them whole"),
+                "{args:?}: {stderr}"
+            );
+        } else {
+            assert!(
+                stdout.contains(
+                    "proc: its answer did not arrive in full, so none of it is shown until a \
+                     poll gets it whole"
+                ),
+                "the header says the feed is asked again: {stdout}"
+            );
+            assert_eq!(
+                times_named(&stderr),
+                0,
+                "the header named it already, and the refused poll continues that run: {stderr}"
+            );
+            assert!(stdout.contains(&format!("session {pid} ended")), "{stdout}");
+        }
+    }
 }
 
 /// The three views take the same flags and refuse the same things in their own name. A view that
@@ -813,10 +829,18 @@ fn a_live_snapshot_names_a_session_that_did_not_answer() {
             .stderr(Stdio::null())
             .spawn()
             .expect("run the live view");
-        let mut line = String::new();
-        BufReader::new(child.stdout.take().expect("the piped stdout"))
-            .read_line(&mut line)
-            .expect("read the first snapshot");
+        // Read over a channel, so a view that never writes its first snapshot fails the test
+        // rather than holding it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stdout = child.stdout.take().expect("the piped stdout");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        let line = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_default();
         let _ = child.kill();
         let _ = child.wait();
         serde_json::from_str::<serde_json::Value>(&line)

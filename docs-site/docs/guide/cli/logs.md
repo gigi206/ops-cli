@@ -109,12 +109,16 @@ that closes every whole one, a session that closes the connection without readin
 it does to a reader it refuses, at its connection ceiling or its peer check), and one that does not
 answer in time. Under `--follow`, a later read that does not arrive in full moves nothing: the feed
 is asked again from where it was, so no event is skipped, and it is named on standard error when it
-stops answering, once for each run of such reads rather than on every poll. A feed that did not
-answer in full at the first read is asked again too, from the start of its ring, and the header says
-its events are shown once a poll gets them whole. `sbx proc logs`, `sbx fs logs` and `sbx ssh-agent
-logs` hold to the same rule; `sbx net logs` names a session whose answer did not arrive in full and
-exits 1, and its `--follow` names it each time it stops answering and asks again from the same
-cursor.
+stops answering, once for each run of such reads rather than on every poll. `sbx proc logs`, `sbx
+fs logs` and `sbx ssh-agent logs` hold to the same rule; `sbx net logs` names a session whose answer
+did not arrive in full and exits 1, and its `--follow` names it each time it stops answering and
+asks again from the same cursor.
+
+At the first read, a feed that did not answer in full while another feed answered is shown as such,
+in the header or, under `--json`, on standard error, and `--follow` asks it again from the start of
+its ring, showing its events once a poll gets them whole. A view where no feed answered in full at
+the first read refuses with exit 2, with or without `--follow`, and so do `sbx proc logs`, `sbx fs
+logs` and `sbx ssh-agent logs` when their one feed did not.
 
 ## Ordering
 

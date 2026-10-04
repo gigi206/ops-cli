@@ -1068,7 +1068,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     // Feeds that were reached and did not answer in full: there, but nothing of theirs is shown,
     // since part of an answer would pass for all of it. A follow keeps their cursor at the start and
     // asks them again on every poll.
-    let mut cut: Vec<&'static str> = Vec::new();
+    let mut cut: Vec<(&'static str, std::io::Error)> = Vec::new();
     for feed in &mut feeds {
         // A running session is read from its ring, which holds what its record does and what has
         // not reached the disk yet; a finished one only exists as a file.
@@ -1105,7 +1105,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                 }
             }
             Err(e) if live && crate::sandbox::lens::unanswered(&e) => {
-                cut.push(feed.name);
+                cut.push((feed.name, e));
             }
             Err(_) => {
                 absent.push((feed.name, if live { feed.absent } else { feed.no_record }));
@@ -1137,7 +1137,10 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     if absent.len() + cut.len() == feeds.len() {
         diag::error(&format!(
             "sbx: logs: session {pid} did not answer in full on {}, so none of it is shown.",
-            cut.join(", ")
+            cut.iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         for (name, why) in &absent {
             diag::hint(&format!("       {name}: {why}"));
@@ -1162,7 +1165,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                 let answered: Vec<&str> = feeds
                     .iter()
                     .filter(|f| !absent.iter().any(|(name, _)| *name == f.name))
-                    .filter(|f| !cut.contains(&f.name))
+                    .filter(|f| !cut.iter().any(|(name, _)| *name == f.name))
                     .map(|f| f.name)
                     .collect();
                 writeln!(out, "{h}feeds — {header}{r}")?;
@@ -1191,7 +1194,7 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
                          are missing{r}"
                     )?;
                 }
-                for name in &cut {
+                for (name, _) in &cut {
                     writeln!(
                         out,
                         "  {d}{name}: its answer did not arrive in full, so none of it is shown{}{r}",
@@ -1219,6 +1222,25 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         })();
         if wrote.is_err() {
             return ExitCode::SUCCESS;
+        }
+    }
+    // `--json` writes no header, so a feed that did not answer in full is named on standard error
+    // instead: an object stream with none of its rows reads as a quiet feed.
+    if json {
+        for (name, e) in &cut {
+            crate::cli::warn_unanswered(
+                "logs",
+                pid,
+                e,
+                &format!(
+                    "its {name} rows are not shown{}",
+                    if follow {
+                        " until a poll gets them whole"
+                    } else {
+                        ""
+                    }
+                ),
+            );
         }
     }
 
@@ -1265,9 +1287,10 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     // collected and closed the view with a verdict about a session whose record it was holding.
     //
     // A feed that stops answering in full is named on standard error, once for each run of such
-    // polls. One cut at the first read was named in the header already.
+    // polls. One cut at the first read was named already, in the header or under `--json` on
+    // standard error, so its run started there.
     let mut unanswering = crate::cli::Unanswering::new();
-    for name in &cut {
+    for (name, _) in &cut {
         unanswering.stalled(*name);
     }
     loop {
