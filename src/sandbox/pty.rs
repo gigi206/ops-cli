@@ -1215,8 +1215,9 @@ mod tests {
                 let mut written = 0;
                 while written < bytes && Instant::now() < deadline {
                     // SAFETY: `fd` is this thread's own descriptor, and the pointer and length are
-                    // those of the live `chunk`.
-                    let n = unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) };
+                    // those of the live `chunk`, cut to what is left to type.
+                    let left = chunk.len().min(bytes - written);
+                    let n = unsafe { libc::write(fd, chunk.as_ptr().cast(), left) };
                     if n > 0 {
                         written += n as usize;
                     } else {
@@ -1445,9 +1446,12 @@ mod tests {
             .flood(b'a', 4 * PENDING_INPUT_MAX, Duration::from_secs(4))
             .join()
             .expect("the flood");
-        let ctrl_c = [0x03u8, 0x03];
-        // SAFETY: the master this test holds, and a two-byte local array.
-        let sent = unsafe { libc::write(term.master, ctrl_c.as_ptr().cast(), ctrl_c.len()) };
+        // The flood leaves the master non-blocking, and a relay still draining it leaves no room
+        // for a moment: the two keys go in as the flood's did, well inside the force-quit window.
+        let sent = term
+            .flood(0x03, 2, Duration::from_secs(1))
+            .join()
+            .expect("the double Ctrl+C");
         let ending = term.end(None, Duration::from_secs(10));
         let errors = &ending.errors;
         assert!(ran, "the relay never ran: {errors}");
@@ -1455,7 +1459,7 @@ mod tests {
             typed >= 4 * PENDING_INPUT_MAX,
             "a graphical relay reads the whole flood: {typed} bytes typed"
         );
-        assert_eq!(sent, 2);
+        assert_eq!(sent, 2, "the double Ctrl+C was not typed: {errors}");
         assert!(ending.ended, "the double Ctrl+C was not seen: {errors}");
         assert!(errors.contains("force-quitting"), "{errors}");
         assert!(errors.contains("what does not fit is dropped"), "{errors}");
