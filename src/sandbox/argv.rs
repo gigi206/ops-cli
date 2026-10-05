@@ -346,34 +346,19 @@ pub(in crate::sandbox) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     ] {
         a.push(lit(ns));
     }
-    match &spec.netns_dummy {
-        // Ordinary path: bwrap creates the cage's network namespace itself. An isolated posture
-        // gets an empty namespace (loopback only); a shared one inherits the host's.
-        None => {
-            if spec.net == NetPolicy::Isolated {
-                a.push(lit("--unshare-net"));
-            }
-            // A build maps itself to uid 0 *inside* this namespace, which is what a distribution's
-            // package tools check for. Only on this branch: the holder path already sets the pair
-            // below, and for the opposite reason.
-            if spec.as_root {
-                a.push(lit("--uid"));
-                a.push(lit("0"));
-                a.push(lit("--gid"));
-                a.push(lit("0"));
-            }
-        }
-        // Holder path: the network namespace is pre-created by the netns holder (with a `dummy0`
-        // interface up) and inherited across the holder's exec, so bwrap must *not* unshare its
-        // own — that would replace the holder's namespace with an empty one and lose the dummy.
-        // The holder runs as root in its user namespace, so map the cage back to the host uid/gid
-        // to keep the same-uid model (bwrap's default would otherwise leave the cage as uid 0).
-        Some(nd) => {
-            a.push(lit("--uid"));
-            a.push(OsString::from(nd.uid.to_string()));
-            a.push(lit("--gid"));
-            a.push(OsString::from(nd.gid.to_string()));
-        }
+    // bwrap creates the cage's network namespace itself, holder or not: an isolated posture gets an
+    // empty namespace (loopback only), which the netns holder, when the launch is wrapped in it,
+    // configures before the cage's command runs; a shared one inherits the host's.
+    if spec.net == NetPolicy::Isolated {
+        a.push(lit("--unshare-net"));
+    }
+    // A build maps itself to uid 0 *inside* this namespace, which is what a distribution's package
+    // tools check for.
+    if spec.as_root {
+        a.push(lit("--uid"));
+        a.push(lit("0"));
+        a.push(lit("--gid"));
+        a.push(lit("0"));
     }
     // A fresh UTS namespace inherits the host's hostname at creation, so set the cage's own —
     // `sbx-<slug>`, naming the cage after its app/project. It still never reveals the *host's*
@@ -970,27 +955,26 @@ mod tests {
     }
 
     #[test]
-    fn the_holder_netns_replaces_unshare_net_with_a_uid_gid_map() {
-        // With the netns holder providing the (dummy-carrying) namespace, bwrap must NOT unshare its
-        // own network namespace — that would discard the holder's namespace — and must map the cage
-        // back to the host credentials (the holder runs root-in-userns).
+    fn the_holder_leaves_bwrap_its_own_network_namespace_and_the_host_uid() {
+        // The netns holder configures the namespace bwrap creates, so a holder-wrapped cage is
+        // given the argv of any other isolated one: its own network namespace, and the same-uid
+        // model with no `--uid`/`--gid` pair. A cage that lost `--unshare-net` here would run on
+        // the host's network whenever the holder could not configure it.
+        let plain = to_argv(&spec(vec![], vec![], NetPolicy::Isolated));
         let s = spec(vec![], vec![], NetPolicy::Isolated).with_netns_dummy(
             super::super::spec::NetnsDummy {
-                uid: 4242,
-                gid: 4343,
                 holder_exe: PathBuf::from("/opt/sbx"),
                 tap: None,
             },
         );
         let argv = to_argv(&s);
         assert!(
-            index_of(&argv, "--unshare-net").is_none(),
-            "holder mode must not unshare-net: {argv:?}"
+            index_of(&argv, "--unshare-net").is_some(),
+            "holder mode must still unshare-net: {argv:?}"
         );
-        let uid = index_of(&argv, "--uid").expect("--uid present");
-        assert_eq!(argv[uid + 1], OsString::from("4242"));
-        let gid = index_of(&argv, "--gid").expect("--gid present");
-        assert_eq!(argv[gid + 1], OsString::from("4343"));
+        assert!(index_of(&argv, "--uid").is_none(), "{argv:?}");
+        assert!(index_of(&argv, "--gid").is_none(), "{argv:?}");
+        assert_eq!(argv, plain);
     }
 
     /// The environment is set from nothing, and set **off the argument list**: a value there is
@@ -1497,14 +1481,16 @@ mod tests {
         ];
         // Holds a `bwrap` path to hand on and starts no cage with it. The process each does spawn
         // is a host-side one of its own: `sops` decrypting a secret, sbx's `__net-probe` asking
-        // for a throwaway namespace, and the host's `git` asked a setting by `doctor`, which hands
-        // its path to the smoke probe. The netns holder passes its path to `selfcage` for the tap
-        // and becomes the command the launch composed, so what each owes is that the path travels
-        // and nothing here starts a cage beside the ones above.
+        // for a throwaway namespace, `nft` installing the redirect, and the host's `git` asked a
+        // setting by `doctor`, which hands its path to the smoke probe. The netns holder passes its
+        // path to `selfcage` for the tap and becomes the command the launch composed; its probe
+        // starts a bwrap for its namespaces alone and kills it before it runs any command. So what
+        // each owes is that the path travels and nothing here starts a cage beside the ones above.
         const HANDS_THE_PATH_ON: &[&str] = &[
             "src/cli/doctor.rs",
             "src/sandbox/egress.rs",
             "src/sandbox/netns.rs",
+            "src/sandbox/nettap.rs",
         ];
         // These read the pure list to assert something about what it contains, and run nothing.
         const READS_THE_LIST: &[&str] = &[];

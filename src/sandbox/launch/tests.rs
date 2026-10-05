@@ -621,7 +621,7 @@ fn collect_roots_unions_base_then_packages_then_tools_then_fonts() {
 
 /// The namespace probe handed to [`super::build::holder_plan`] where the launch needs no holder:
 /// the probe spawns a process, so a launch that returns before it must not reach it.
-fn unasked(_: &std::path::Path) -> Result<(), String> {
+fn unasked(_: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
     panic!("the namespace probe ran for a launch that needs no holder")
 }
 
@@ -631,8 +631,8 @@ fn unasked(_: &std::path::Path) -> Result<(), String> {
 /// pointed at a resolver no tap answers has no DNS at all, which is a break, not a degradation.
 #[test]
 fn an_as_root_cage_never_runs_behind_the_holder() {
-    // The holder maps the cage back to the host uid, which is the opposite of what `as_root`
-    // asks for, so the two are mutually exclusive by construction rather than by luck.
+    // A distro build is mapped to root in its namespace and needs neither the online signal nor
+    // capture, so the two are mutually exclusive by construction rather than by luck.
     assert!(
         super::build::holder_plan(
             NetPolicy::Isolated,
@@ -699,17 +699,22 @@ fn isolated_cage_argv(holder: Option<crate::sandbox::spec::NetnsDummy>) -> Vec<s
     crate::sandbox::argv::to_argv(&spec)
 }
 
-/// The holder cannot fall back by itself: behind it bwrap is not told to unshare a network
-/// namespace, so a holder that carried on past a refusal would leave the cage on the host network.
-/// The refusal is therefore decided before the holder is chosen, and pinned where it lands: no
-/// holder, and bwrap's own `--unshare-net`.
+/// A refused namespace is decided before the holder is chosen, and pinned where it lands: no
+/// holder, and bwrap's own `--unshare-net`. A granted one keeps that `--unshare-net` too: the
+/// holder configures the namespace bwrap creates, so a holder that fails leaves the cage in an
+/// empty namespace, never on the host network.
 #[test]
 fn a_refused_namespace_leaves_a_graphical_cage_in_bwraps_own_empty_namespace() {
     let bwrap = std::path::Path::new("/usr/bin/bwrap");
-    let refused =
-        super::build::holder_plan(NetPolicy::Isolated, false, true, bwrap, None, None, |_| {
-            Err("a private network namespace could not be created (refused)".to_string())
-        });
+    let refused = super::build::holder_plan(
+        NetPolicy::Isolated,
+        false,
+        true,
+        bwrap,
+        None,
+        None,
+        |_, _| Err("the cage's network namespace could not be joined (refused)".to_string()),
+    );
     assert!(
         refused.is_none(),
         "a refused namespace must not be given the holder"
@@ -720,18 +725,23 @@ fn a_refused_namespace_leaves_a_graphical_cage_in_bwraps_own_empty_namespace() {
         "without the holder, bwrap must create the cage's empty namespace: {argv:?}"
     );
 
-    // teeth: granted, the same cage goes behind the holder and bwrap is told nothing about the
-    // network, which is why a refusal must never reach it.
-    let granted =
-        super::build::holder_plan(NetPolicy::Isolated, false, true, bwrap, None, None, |_| {
-            Ok(())
-        });
+    // teeth: granted, the same cage goes behind the holder, and bwrap still creates the namespace
+    // the holder configures.
+    let granted = super::build::holder_plan(
+        NetPolicy::Isolated,
+        false,
+        true,
+        bwrap,
+        None,
+        None,
+        |_, _| Ok(()),
+    );
     assert!(
         granted.is_some(),
         "a graphical cage whose namespace is granted gets the holder"
     );
     let argv = isolated_cage_argv(granted);
-    assert!(!argv.iter().any(|a| a == "--unshare-net"), "{argv:?}");
+    assert!(argv.iter().any(|a| a == "--unshare-net"), "{argv:?}");
 }
 
 /// The second reason a launch takes the holder, the capture tap, meets the same refusal the same
@@ -749,11 +759,18 @@ fn a_refused_namespace_gives_a_capturing_cage_no_holder() {
     let bwrap = std::path::Path::new("/usr/bin/bwrap");
     let uds = Some(std::path::Path::new("/x.sock"));
     let asked = std::cell::Cell::new(0);
-    let refused =
-        super::build::holder_plan(NetPolicy::Isolated, false, false, bwrap, uds, None, |_| {
+    let refused = super::build::holder_plan(
+        NetPolicy::Isolated,
+        false,
+        false,
+        bwrap,
+        uds,
+        None,
+        |_, _| {
             asked.set(asked.get() + 1);
-            Err("a private network namespace could not be created (refused)".to_string())
-        });
+            Err("the cage's network namespace could not be joined (refused)".to_string())
+        },
+    );
     assert_eq!(
         asked.get(),
         1,
@@ -770,10 +787,15 @@ fn a_refused_namespace_gives_a_capturing_cage_no_holder() {
     );
 
     // teeth: granted, the tap rides behind the holder.
-    let granted =
-        super::build::holder_plan(NetPolicy::Isolated, false, false, bwrap, uds, None, |_| {
-            Ok(())
-        });
+    let granted = super::build::holder_plan(
+        NetPolicy::Isolated,
+        false,
+        false,
+        bwrap,
+        uds,
+        None,
+        |_, _| Ok(()),
+    );
     assert!(
         granted.is_some_and(|h| h.tap.is_some()),
         "a granted namespace carries the tap"

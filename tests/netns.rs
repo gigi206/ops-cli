@@ -10,29 +10,60 @@
 mod common;
 
 use common::fixture::TmpDir;
+use std::ffi::OsString;
 use std::process::Command;
+
+/// The holder's argument list for `cmd`, run in a bwrap that creates the namespaces a launch's cage
+/// gets — a user and a network namespace, and a fresh `/dev`, which is what has bwrap map root in
+/// the user namespace the holder joins — over the host's read-only root, so `cmd` and the test's
+/// files are found where they are.
+fn holder_argv(bwrap: &std::path::Path, cmd: &[OsString]) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![bwrap.into()];
+    argv.extend(
+        [
+            "--unshare-user",
+            "--unshare-net",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--",
+        ]
+        .map(OsString::from),
+    );
+    argv.extend_from_slice(cmd);
+    argv
+}
 
 /// Run the holder with a shell checker that dumps the two per-netns proc files, returning
 /// `(dev, route)` — the contents of `/proc/net/dev` and `/proc/net/route` as seen *inside* the
-/// configured namespace. `None` means skip: the holder did not run (this host cannot create a
-/// capability-bearing user namespace, or has no `/bin/sh`), which is an environment gap, not a
-/// failure.
+/// configured namespace. `None` means skip: no bwrap on PATH, or the holder did not run (this host
+/// cannot create a capability-bearing user namespace, or has no `/bin/sh`), which is an
+/// environment gap, not a failure.
 fn holder_dump() -> Option<(String, String)> {
+    let Some(bwrap) = common::bwrap_on_path() else {
+        skip_incapable!("skipping netns holder e2e: no bwrap on PATH to create the namespace");
+        return None;
+    };
+    let cmd = [
+        "/bin/sh",
+        "-c",
+        "echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route",
+    ]
+    .map(OsString::from);
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args([
-            "__netns-holder",
-            // The separator the production wrapper always emits (`holder_wrap`), tap or no tap: it
-            // is what makes the command unambiguous to parse. Without it the holder exits on a
-            // usage error, which this helper would read as an environment gap and skip.
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route",
-        ])
+        // The separator the production wrapper always emits (`holder_wrap`), tap or no tap: it is
+        // what makes the command unambiguous to parse. Without it the holder exits on a usage
+        // error, which this helper would read as an environment gap and skip.
+        .args(["__netns-holder", "--"])
+        .args(holder_argv(&bwrap, &cmd))
         .output()
         .expect("spawn sbx __netns-holder");
 
-    if !out.status.success() {
+    if !out.status.success() || String::from_utf8_lossy(&out.stderr).contains("could not be joined")
+    {
         skip_incapable!(
             "skipping netns holder e2e: the holder did not run ({})",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -176,13 +207,14 @@ else:
         time.sleep(0.05)
     if os.path.exists(sys.argv[1]):
         print("reported", open(sys.argv[1]).read())
-# The tap, found among this process's descendants (this process is the holder, become the command).
+# The tap, found among the descendants of this process's parent: the holder, become bwrap, whose
+# configurer started it.
 def children(pid):
     out = []
     for task in os.listdir(f"/proc/{pid}/task"):
         out += open(f"/proc/{pid}/task/{task}/children").read().split()
     return out
-todo, tap = children(os.getpid()), None
+todo, tap = children(os.getppid()), None
 while todo and tap is None:
     pid = todo.pop()
     # The tap itself, not the bwrap that cages it, whose own arguments name it too.
@@ -216,10 +248,16 @@ print("report fd", "held" if held else "closed")
         .arg("--report-fd")
         .arg(tap_fd.to_string())
         .arg("--")
-        .arg(python)
-        .args(["-c", query])
-        .arg(&reported)
-        .arg(&tap_socket)
+        .args(holder_argv(
+            &bwrap,
+            &[
+                python.into(),
+                "-c".into(),
+                query.into(),
+                reported.clone().into(),
+                tap_socket.clone().into(),
+            ],
+        ))
         .output()
         .expect("spawn sbx __netns-holder");
     drop(tap_end);

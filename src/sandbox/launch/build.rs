@@ -3289,36 +3289,37 @@ pub(super) fn build(
 
 /// Whether this launch runs behind the netns holder, and with what.
 ///
-/// The holder pre-creates the cage's network namespace instead of letting bwrap unshare one. Two
-/// things need that, and either one is enough:
+/// The holder configures the network namespace bwrap creates for the cage, before the cage's
+/// command runs. Two things need that, and either one is enough:
 ///
 ///   - a **graphical** cage reads as *offline* to an in-cage browser under an isolated namespace:
 ///     Chromium decides `navigator.onLine` from the presence of a non-loopback interface, not from
 ///     real reachability, so a panel freezes on "No internet" even though proxy egress works. The
 ///     holder adds a black-hole `dummy0` that flips the signal and opens no egress.
 ///   - the **transparent-capture tap** ([`crate::sandbox::nettap`]) needs redirect rules installed
-///     in that namespace before the cage starts, which only the holder can do: it owns the user
+///     in that namespace before the cage starts, which only the holder can do: it joins the user
 ///     namespace the network namespace belongs to, and the cage is nested inside a different one.
 ///
 /// `None` under any of: a posture that is not isolated (there is nothing to capture and no browser
-/// to reassure), an `as_root` cage (the holder path maps the cage back to the host uid, which is
-/// the opposite of what a distro build asks for), sbx being unable to resolve its own path, or
-/// `netns` refusing the namespace the holder would create. Each leaves the cage to bwrap's own
-/// `--unshare-net`, so a cage without the holder is never a cage on the host network.
+/// to reassure), an `as_root` cage (a distro build, which needs neither), sbx being unable to
+/// resolve its own path, or `netns` refusing to let sbx configure the namespace `bwrap` creates.
+/// Each leaves the cage to bwrap's own `--unshare-net` alone — as does a holder that fails — so a
+/// cage is never on the host network either way.
 ///
-/// `netns` is asked last, so a launch that needs no holder never pays for the probe; the launch
-/// passes [`crate::sandbox::netns::probe_namespace`]. It exists because the holder cannot fall
-/// back by itself: behind it, bwrap is not told to unshare a network namespace, so the answer has
-/// to be known before the holder is chosen. A host that restricts unprivileged user namespaces
-/// (Ubuntu's AppArmor restriction) refuses sbx the namespace while its path-profiled `bwrap` still
-/// creates one.
+/// `netns` is asked last, with sbx's own path and `bwrap`, so a launch that needs no holder never
+/// pays for the probe; the launch passes [`crate::sandbox::netns::probe_namespace`]. It is asked
+/// rather than left to the holder's own degradation because the cage's `/etc/resolv.conf` names
+/// the tap's resolver once the holder is chosen, and a tap that could never stand up would leave
+/// the cage with no DNS. A setuid `bwrap` on a host that restricts unprivileged user namespaces is
+/// the one it refuses: the holder cannot have it run unprivileged there, and the namespace it
+/// creates belongs to the host's user namespace, where sbx holds no capability.
 ///
 /// The tap rides along only when a proxy was stood up (so there is a socket to hand captured
 /// connections to) **and** `nft` is on the host's PATH. Neither absence is announced here: capture
 /// is an addition, not a requirement, and a line on every launch would be noise. `sbx doctor` is
 /// where it is reported, once, with the reason. A refused namespace is announced, as a warning
-/// pointing at `sbx doctor`: the holder was wanted, the host has what it needs but the permission,
-/// and a graphical app that reads as offline would otherwise be left unexplained.
+/// pointing at `sbx doctor`: the holder was wanted, and a graphical app that reads as offline would
+/// otherwise be left unexplained.
 pub(super) fn holder_plan(
     net: NetPolicy,
     as_root: bool,
@@ -3326,7 +3327,7 @@ pub(super) fn holder_plan(
     bwrap: &std::path::Path,
     proxy_host_uds: Option<&std::path::Path>,
     proxy_report: Option<&crate::sandbox::nettap::ReportChannel>,
-    netns: impl FnOnce(&std::path::Path) -> Result<(), String>,
+    netns: impl FnOnce(&std::path::Path, &std::path::Path) -> Result<(), String>,
 ) -> Option<crate::sandbox::spec::NetnsDummy> {
     if net != NetPolicy::Isolated || as_root {
         return None;
@@ -3355,7 +3356,7 @@ pub(super) fn holder_plan(
             return None;
         }
     };
-    if let Err(why) = netns(&exe) {
+    if let Err(why) = netns(&exe, bwrap) {
         let lost = match (tap.is_some(), gui_renders) {
             (true, true) => {
                 "a client that ignores the proxy variables will fail to connect rather than be \
@@ -3369,17 +3370,11 @@ pub(super) fn holder_plan(
         };
         crate::diag::warn(&format!(
             "{why}, so the cage runs in an empty network namespace of bwrap's own: {lost}; \
-             `sbx doctor` says what blocks it and how to lift it"
+             `sbx doctor` says what blocks it"
         ));
         return None;
     }
     Some(crate::sandbox::spec::NetnsDummy {
-        // SAFETY: `getuid` takes no pointer and reads this process's own real uid — the
-        // identity the holder maps to root inside the user namespace it creates.
-        uid: unsafe { libc::getuid() },
-        // SAFETY: `getgid` likewise reads this process's own real gid, mapped to root
-        // alongside the uid above.
-        gid: unsafe { libc::getgid() },
         holder_exe: exe,
         tap,
     })

@@ -13,8 +13,8 @@
 //! (`examples/app/t3code.toml` — a packaged Electron main process constructing its own `Agent`)
 //! cannot be reached by any environment variable at all.
 //!
-//! The tap closes that class. A `nat OUTPUT REDIRECT` rule — installed in the holder's network
-//! namespace, which the cage cannot touch — bends every non-loopback TCP connection to a listener
+//! The tap closes that class. A `nat OUTPUT REDIRECT` rule — installed by the holder in the cage's
+//! network namespace, through a user namespace the cage cannot reach — bends every non-loopback TCP connection to a listener
 //! on the cage's loopback, and `SO_ORIGINAL_DST` recovers the address the client meant to reach.
 //!
 //! ## The name is the point
@@ -35,11 +35,12 @@
 //!
 //! ## Where it runs, and what that costs
 //!
-//! The tap is started by the netns holder ([`super::netns`]) **before** it execs `bwrap`, so it
-//! lives in the cage's network namespace, and in a cage of its own for everything else: mount and
-//! pid namespaces of its own, with no host file but the read-only userland, its binary and the
-//! egress socket it dials, which the cage reaches as well; the one end of a socket pair it reports
-//! down, which nothing else holds; no capability; and a syscall filter it installs
+//! The tap is started by the netns holder's configurer ([`super::netns`]) once it has joined the
+//! cage's network namespace and **before** the cage's command runs, so it lives in that namespace,
+//! and in a cage of its own for everything else: mount and pid namespaces of its own, with no host
+//! file but the read-only userland, its binary and the egress socket it dials, which the cage
+//! reaches as well; the one end of a socket pair it reports down, which nothing else holds; no
+//! capability; and a syscall filter it installs
 //! once its listeners are bound ([`crate::sandbox::seccomp::tap`]). The cage cannot see it or
 //! signal it. It has no route of its own either — the namespace is the same empty one — so the
 //! only way out remains the bound Unix socket, exactly as before.
@@ -229,9 +230,10 @@ pub(crate) fn redirect_ruleset() -> String {
 /// The nftables table the redirect lives in — sbx's own, never a shared chain.
 const NFT_TABLE: &str = "sbx";
 
-/// Install [`redirect_ruleset`] with `nft`. Called by the holder, inside the network namespace it
-/// owns and holds `CAP_NET_ADMIN` over; the cage that inherits that namespace is in a *nested* user
-/// namespace and cannot read or remove what this writes.
+/// Install [`redirect_ruleset`] with `nft`. Called by the holder's configurer, inside the cage's
+/// network namespace, which it joined through the user namespace that owns it and holds
+/// `CAP_NET_ADMIN` in; the cage is in a *nested* user namespace and cannot read or remove what this
+/// writes.
 ///
 /// The rules need `nf_nat`, the nat chain type and `reject`. A kernel that has them as modules loads
 /// them on demand even for this unprivileged namespace, so the ordinary host needs nothing prepared;
@@ -270,9 +272,9 @@ pub(crate) fn install_redirect(nft: &Path) -> io::Result<()> {
 pub(crate) enum CaptureSupport {
     /// The rules installed. A launch under a filtering posture will capture.
     Ready,
-    /// sbx could not create the namespace the rules go in, with the probe's words. Asked whether
-    /// or not `nft` is present, because the holder needs that namespace for a graphical cage too;
-    /// a launch that meets it runs in bwrap's own empty namespace instead, without the holder.
+    /// sbx could not configure the namespace the rules go in, with the probe's words. Asked
+    /// whether or not `nft` is present, because the holder needs that namespace for a graphical
+    /// cage too; a launch that meets it runs in bwrap's own empty namespace, without the holder.
     NoNamespace(String),
     /// No `nft` on the host's PATH, so nothing can install them.
     NoNft,
@@ -283,8 +285,8 @@ pub(crate) enum CaptureSupport {
 impl CaptureSupport {
     /// What the user is told, and what to do about it. `None` when there is nothing to fix.
     ///
-    /// For [`CaptureSupport::NoNamespace`] this is what a launch loses; what lifts the refusal
-    /// depends on its cause and on where this binary lives, so `doctor` says that beside it.
+    /// For [`CaptureSupport::NoNamespace`] this is what a launch loses; the probe's own words,
+    /// which `doctor` prints beside it, say what refused it.
     pub(crate) fn remediation(&self) -> Option<&'static str> {
         match self {
             CaptureSupport::Ready => None,
@@ -306,19 +308,19 @@ impl CaptureSupport {
     }
 }
 
-/// Ask the running kernel whether sbx can create the namespace the holder runs in and, when a
-/// trusted `nft` is found, whether it takes the redirect rules there: both are done in a throwaway
-/// user+network namespace that dies with the probe.
+/// Ask the running kernel whether sbx can configure the network namespace `bwrap` creates for a
+/// cage and, when a trusted `nft` is found, whether it takes the redirect rules there: both are
+/// done in the namespace of a throwaway `bwrap`, killed before it runs anything.
 ///
-/// `exe` is sbx's own path — the probe runs as `<exe> __net-probe [<nft>]`, because the question
-/// cannot be answered in-process (`unshare` is not something `doctor` may do to itself).
-pub(crate) fn probe_capture(exe: &Path) -> CaptureSupport {
+/// `exe` is sbx's own path — the probe runs as `<exe> __net-probe <bwrap> [<nft>]`, because the
+/// question cannot be answered in-process (`setns` is not something `doctor` may do to itself).
+pub(crate) fn probe_capture(exe: &Path, bwrap: &Path) -> CaptureSupport {
     // Trusted form: `nft` writes the redirect that puts every outbound connection in front of the
     // proxy, so a binary anyone may replace would decide where a cage's traffic goes. An untrusted
     // match is named and skipped, and finding nothing usable reads as "no nft" — the posture a host
     // without it already has.
     let nft = crate::store::find_trusted_on_path("nft");
-    match (super::netns::probe(exe, nft.as_deref()), nft) {
+    match (super::netns::probe(exe, bwrap, nft.as_deref()), nft) {
         (super::netns::Probe::NamespaceRefused(why), _) => CaptureSupport::NoNamespace(why),
         (super::netns::Probe::RulesRefused(why), _) => CaptureSupport::Refused(why),
         (super::netns::Probe::Passed, Some(_)) => CaptureSupport::Ready,
@@ -452,8 +454,8 @@ impl ReportChannel {
         self.0.try_clone()
     }
 
-    /// The descriptor, for a test that asserts on what the end is.
-    #[cfg(test)]
+    /// The descriptor: the one the holder's configurer keeps open when it closes the rest, and
+    /// what a test asserts on.
     pub(crate) fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.0.as_raw_fd()
     }

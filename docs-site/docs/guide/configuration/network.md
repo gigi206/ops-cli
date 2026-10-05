@@ -287,12 +287,14 @@ Two consequences worth knowing:
   lifted by a rule naming the address, and this one cannot be. Allow such a destination the ordinary
   way (by name) or, for a protocol that cannot be inspected, with a `tcp://` rule.
 - The rules need a kernel that will take them (NAT support, and module loading not locked down),
-  the `nft` command on the host, and a network namespace sbx may create itself, which a host that
-  restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) refuses it. Where any of
-  them is missing, launches still run and keep the behaviour above: a proxy-blind client fails to
-  connect. Nothing is silently loosened: without its own namespace sbx leaves the cage in the empty
-  one bwrap creates, and each launch says so. [`sbx doctor`](../cli/doctor) reports which of them
-  you have, once, with the reason and, for the restriction, how to lift it:
+  the `nft` command on the host, and a cage network namespace sbx may join. Joining creates nothing,
+  so a host that restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) is not one
+  of them, unless its `bwrap` is also setuid: sbx then cannot have it run unprivileged, and the
+  namespace it creates belongs to the host.
+  Where any of them is missing, launches still run and keep the behaviour above: a proxy-blind
+  client fails to connect. Nothing is silently loosened: the cage stays in the empty namespace
+  bwrap creates, and a launch that cannot join it says so. [`sbx doctor`](../cli/doctor) reports
+  which of them you have, once, with the reason:
 
 ```
   [ ok ] capture           a client that ignores the proxy variables is still routed

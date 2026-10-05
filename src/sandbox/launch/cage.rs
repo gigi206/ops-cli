@@ -357,9 +357,11 @@ fn cage_output_line(line: &str) -> String {
 /// for this function is the pair of steps that need what a spec alone does not carry — the host's
 /// netns holder and the launch's resource limits.
 ///
-/// The middle step is the one a new launch path would forget it needs: for a graphical isolated cage
-/// it routes the launch through the netns holder so the namespace carries a `dummy0` interface (see
-/// [`crate::sandbox::netns`]), and for every other spec `holder_wrap` is a byte-for-byte passthrough.
+/// The middle step is the one a new launch path would forget it needs: for an isolated cage that
+/// renders a GUI or is wired for capture it routes the launch through the netns holder, which
+/// configures the namespace bwrap creates — a `dummy0` interface, the capture tap (see
+/// [`crate::sandbox::netns`]) — and for every other spec
+/// [`crate::sandbox::netns::behind_holder`] leaves the command unchanged.
 ///
 /// The memfds behind the seccomp filters and the cage's environment travel inside the returned
 /// command, through both wrappers, so whatever starts it hands them to bwrap

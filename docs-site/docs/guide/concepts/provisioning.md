@@ -196,9 +196,9 @@ The two engines differ in how complete the independence is:
   create the namespace); on an unrestricted host the bundled engine leads. This
   choice is non-regressive by construction. The `sbx` binary itself carries no
   such profile, so on a restricted host a launch proves the boundary through that
-  `bwrap` rather than through a namespace of its own, and runs without the network
-  namespace `sbx` would prepare itself; `sbx doctor` says what that costs and how
-  to lift it (see
+  `bwrap` rather than through a namespace of its own. It needs none for the network
+  namespace it configures for the capture tap and graphical apps either: that one is
+  `bwrap`'s, which `sbx` joins rather than creates (see
   [Troubleshooting](../getting-started/troubleshooting#a-launch-warns-about-its-network-namespace)).
 
 `sbx doctor` reports which engine it would use and why. See

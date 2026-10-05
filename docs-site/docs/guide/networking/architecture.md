@@ -81,8 +81,10 @@ curl https://1.2.3.4/        → Could not connect
 The one **nuance**: some launches need a host-side `__netns-holder` binary
 (`src/sandbox/netns.rs`), namely `gui = "offscreen"` or `gui = "wayland"`, as
 [`gui`](../configuration/gui#offscreen) describes, and any launch that wires the
-[capture tap](../configuration/network#clients-that-ignore-the-proxy-variables). That holder adds a
-`dummy0` interface (a kernel black hole, no peer, drops everything) before exec'ing bwrap.
+[capture tap](../configuration/network#clients-that-ignore-the-proxy-variables). That holder execs
+bwrap, which still creates the cage's empty network namespace itself and waits, and meanwhile joins
+that namespace from the host to add a `dummy0` interface (a kernel black hole, no peer, drops
+everything) before the cage's command runs.
 Chromium/Electron decide `navigator.onLine` from the **presence of a non-loopback
 interface**, not from actual reachability, so a loopback-only cage reads as "no
 network" and a graphical app freezes on *"No internet"* even
@@ -105,13 +107,18 @@ fails closed, and all real traffic still goes through the proxy on loopback. So:
   cage raised. A DNS resolver *is* present here, and it is the tap itself (see
   [`network`](../configuration/network#clients-that-ignore-the-proxy-variables)).
 
-The holder is sbx's own binary creating a user namespace with capabilities, which a host that
-restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) refuses it while still
-letting a path-profiled `bwrap` create its own. So a launch asks first, in a throwaway process, and
-a refusal leaves the cage to bwrap's `--unshare-net`: `lo` only, as in the first case above, with a
-warning that the capture tap and the `dummy0` are missing. The holder itself never carries on past
-a refusal, because bwrap behind it is not told to unshare a network namespace: going on would put
-the cage on the host network.
+The holder creates no namespace. bwrap's outer user namespace belongs to the invoking user, which
+gives a host process of that user every capability in it, so the holder joins it and the network
+namespace it owns. That is why a host that restricts unprivileged user namespaces (Ubuntu's
+AppArmor restriction), which lets a path-profiled `bwrap` create them and refuses sbx the same,
+does not stop it. A setuid `bwrap` would create the namespace with real privilege, so that it
+belongs to the host, where sbx holds nothing; the holder therefore first enters a user namespace
+of its own that does not map root, where the kernel ignores the setuid bit and `bwrap` runs
+unprivileged. Only a host that both ships a setuid `bwrap` and restricts unprivileged user
+namespaces refuses that step, and with it the join. So a launch asks first, against a throwaway `bwrap`, and a refusal leaves the cage
+without the holder: `lo` only, as in the first case above, with a warning that the capture tap and
+the `dummy0` are missing. Either way the namespace is bwrap's own, so a holder that fails to
+configure it leaves the cage in an empty namespace, never on the host network.
 
 Why the inverse fallback `lo` only → `lo + dummy0` does **not** re-introduce Model P's
 holes: under Model P a NAT uplink leaks the host's loopback and `169.254.169.254` by

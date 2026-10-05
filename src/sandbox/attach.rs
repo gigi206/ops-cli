@@ -404,10 +404,10 @@ fn walk_without_links(root: OwnedFd, components: &[&std::ffi::OsStr]) -> Option<
 /// left that is neither `bwrap` nor on the host's mounts as the payload, and report one of those as
 /// a monitor — never as a payload — if that is all there is. Pure.
 ///
-/// A process in a child user namespace that still shares the host's mount namespace is the launch
-/// on its way into the cage, not the cage. The network-namespace holder ([`super::netns`]) unshares
-/// a user and a network namespace, stands the capture tap up and waits for it, and only then
-/// becomes the cage's `bwrap`. Until it does, it is root of its own user namespace looking at the
+/// A process in a child user namespace that still shares the host's mount namespace is part of the
+/// launch, not the cage. The network-namespace holder's configurer ([`super::netns`]) joins the
+/// user namespace that owns the cage's network namespace to configure it, and stays there as the
+/// capture tap's parent for the whole session. It is root of that user namespace looking at the
 /// host's files, so it carries the project the way the cage does, and its `environ` is the
 /// launching one: entered, it would give a shell on the host's filesystem under the host's `HOME`.
 fn choose_cage_pid(candidates: &[Candidate], host_userns: &str) -> Option<CageTarget> {
@@ -959,12 +959,12 @@ mod tests {
         assert_eq!(choose_cage_pid(&candidates, host), None);
     }
 
-    /// The launch's network-namespace holder is never entered as the agent.
+    /// The launch's network-namespace configurer is never entered as the agent.
     ///
-    /// It has left the host's user namespace and not yet the host's mount namespace: it waits for
-    /// the capture tap before it becomes the cage's `bwrap`, and in that window it carries the
-    /// project and is not a `bwrap`. Entering it gave a shell as root of its user namespace, on the
-    /// host's files and under the host's `HOME`.
+    /// It has left the host's user namespace and not the host's mount namespace: it joins the user
+    /// namespace that owns the cage's network namespace and stays there, beside the cage, as the
+    /// capture tap's parent; it carries the project and is not a `bwrap`. Entering it would give a
+    /// shell as root of that user namespace, on the host's files and under the host's `HOME`.
     #[test]
     fn a_process_on_the_hosts_mounts_is_never_the_agent() {
         let host = "user:[4026531837]";
@@ -976,7 +976,7 @@ mod tests {
         assert_eq!(
             choose_cage_pid(&[holding()], host),
             Some(CageTarget::MonitorOnly(100)),
-            "the holder is the launch still starting, never a payload"
+            "the configurer is part of the launch, never a payload"
         );
 
         // Once the cage's payload is up beside it, that is what is entered.

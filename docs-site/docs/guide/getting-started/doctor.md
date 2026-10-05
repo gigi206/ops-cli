@@ -93,15 +93,15 @@ differently, and the store moves into it:
 
 - **Transparent egress capture.** Whether a filtering launch can route a client that
   ignores the proxy environment variables, rather than letting it fail to connect. The
-  answer is not read from kernel configuration: `doctor` installs the redirect rules in a
-  throwaway namespace and reports what the kernel did. Like resource limiting this is not
-  the boundary, so a host that cannot take the rules gets a warning naming what is
-  missing, never a failure: egress still works, and a proxy-blind client fails to connect
-  instead of being routed. The probe first creates the namespace itself. A host that
-  restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) refuses sbx that.
-  Where the host's `bwrap` carries a profile of its own, the sandbox still launches; the
-  warning then names the restriction and the two ways to lift it: an AppArmor profile that
-  grants `userns` to the `sbx` binary alone, or the sysctl, for every program. See
+  answer is not read from kernel configuration: `doctor` starts a throwaway `bwrap`, joins
+  its network namespace the way a launch joins its cage's, installs the redirect rules
+  there and reports what the kernel did. Like resource limiting this is not the boundary,
+  so a host that cannot take the rules gets a warning naming what is missing, never a
+  failure: egress still works, and a proxy-blind client fails to connect instead of being
+  routed. Joining creates no namespace, so a host that restricts unprivileged user
+  namespaces (Ubuntu's AppArmor restriction) does not refuse it. Only a setuid `bwrap` on
+  such a host does, because the namespace it creates then belongs to the host, and the
+  warning says so. See
   [Clients that ignore the proxy variables](../configuration/network#clients-that-ignore-the-proxy-variables).
 
 - **git** (optional). Needed only to fetch a remote plugin store, never to run a sandbox.
@@ -160,9 +160,10 @@ If `doctor` reports that user namespaces are missing or non-capability-bearing:
   path-profiled `/usr/bin/bwrap` works there; a bwrap materialized elsewhere would
   match no profile. See [Provisioning](../concepts/provisioning) for how `sbx`
   chooses its bwrap engine on such a host. The `sbx` binary matches none either,
-  so where that `bwrap` exists a launch proves the boundary through it, and the network
-  namespace `sbx` prepares for the capture tap and for graphical apps is refused:
-  the `capture` line says so and prints what lifts it (see
+  so where that `bwrap` exists a launch proves the boundary through it. The network
+  namespace `sbx` configures for the capture tap and for graphical apps is that
+  `bwrap`'s own, which `sbx` joins rather than creates, so the restriction does not
+  reach it (see
   [Troubleshooting](troubleshooting#a-launch-warns-about-its-network-namespace)).
   Where the host's `bwrap` carries no profile of its own, no engine gets the capability
   and the boundary fails. The profile the `capture` line prints lifts that failure too,

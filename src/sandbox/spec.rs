@@ -163,14 +163,13 @@ pub(crate) struct SandboxSpec {
     /// and prepends them as `--add-seccomp-fd` descriptors, and not by [`super::argv::to_argv`],
     /// which stays a pure function of the rest of this type.
     pub(super) seccomp: super::seccomp::SeccompPolicy,
-    /// When set, the cage's network namespace is provided by the netns holder (which pre-creates
-    /// it with a dummy interface up) instead of by bwrap's own `--unshare-net`. A graphical app
-    /// under an isolated netns (empty except loopback) sees itself as *offline* — Chromium's
-    /// connectivity detection reports "no network interface" for a loopback-only namespace — so a
-    /// black-hole `dummy0` is added purely to make it report online; egress stays forced through
-    /// the proxy on loopback (the dummy has no route). Some means the launch is holder-wrapped and
-    /// `to_argv` maps the cage back to these host credentials (the holder runs root-in-userns);
-    /// None is the ordinary path (bwrap emits `--unshare-net`). See [`NetnsDummy`].
+    /// When set, the cage's network namespace — still bwrap's own, from `--unshare-net` — is
+    /// configured by the netns holder before the cage's command runs. A graphical app under an
+    /// isolated netns (empty except loopback) sees itself as *offline* — Chromium's connectivity
+    /// detection reports "no network interface" for a loopback-only namespace — so a black-hole
+    /// `dummy0` is added purely to make it report online; egress stays forced through the proxy on
+    /// loopback (the dummy has no route). Some means the launch is holder-wrapped; None is the
+    /// ordinary path. The argv bwrap is given is the same either way. See [`NetnsDummy`].
     pub(super) netns_dummy: Option<NetnsDummy>,
     /// The resource-limit decision the launch already took, when it took one
     /// ([`super::cgroup::Scope`]). The launch path decides once, names the properties in the
@@ -275,16 +274,10 @@ impl PartialEq for HeldSource {
 impl Eq for HeldSource {}
 
 /// The netns-holder wiring for a cage that needs a `dummy0` interface (see
-/// [`SandboxSpec::netns_dummy`]). Carries the host credentials the cage is mapped back to and the
-/// path to sbx's own binary (the `__netns-holder` subcommand), resolved once at build time so the
-/// launch never falls back to a namespace without `--unshare-net` (which would share the host
-/// network — a fail-open the holder path must never reach).
+/// [`SandboxSpec::netns_dummy`]): the path to sbx's own binary (the `__netns-holder` subcommand),
+/// resolved once at build time, and the tap's wiring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetnsDummy {
-    /// The host uid the cage is mapped to (`--uid`), preserving the same-uid model.
-    pub(super) uid: u32,
-    /// The host gid the cage is mapped to (`--gid`).
-    pub(super) gid: u32,
     /// Absolute path to sbx's own binary, invoked as `<exe> __netns-holder … -- <bwrap> <args…>`.
     pub(super) holder_exe: PathBuf,
     /// What the holder needs to stand the transparent-capture tap up inside the namespace it
@@ -294,10 +287,11 @@ pub(crate) struct NetnsDummy {
 
 /// The transparent-capture tap's wiring, resolved by the launcher and carried to the holder.
 ///
-/// Every path is host-side and is used *before* the cage's `bwrap` runs, by the holder — the cage
-/// never sees any. The tap itself runs in a cage of its own, which binds the two sockets at fixed
-/// paths. `None` on [`NetnsDummy::tap`] is the degraded mode: the namespace is still pre-created
-/// (for the dummy interface), simply with no redirect and no tap.
+/// Every path is host-side and is used *before* the cage's command runs, by the holder's
+/// configurer — the cage never sees any. The tap itself runs in a cage of its own, which binds the
+/// egress socket at a fixed path and holds its end of the report channel by descriptor. `None` on
+/// [`NetnsDummy::tap`] is the degraded mode: the namespace is still configured (for the dummy
+/// interface), simply with no redirect and no tap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TapWiring {
     /// The host-side egress socket the proxy serves — what the tap dials for each captured
@@ -374,9 +368,8 @@ impl SandboxSpec {
 
     /// Route this launch through the netns holder so the cage's network namespace carries a
     /// black-hole `dummy0` interface (see [`SandboxSpec::netns_dummy`]). The launch path sets it
-    /// only for a graphical (`gui = "wayland"`) cage under an isolated netns, and only once sbx's
-    /// own binary path is known — so `to_argv` can safely drop `--unshare-net` in favour of the
-    /// holder-provided namespace without ever risking a namespace-less (host-network) fallback.
+    /// only for a cage under an isolated netns that renders a GUI or is wired for capture, and
+    /// only once sbx's own binary path is known.
     pub(crate) fn with_netns_dummy(mut self, holder: NetnsDummy) -> Self {
         self.netns_dummy = Some(holder);
         self

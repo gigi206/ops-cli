@@ -28,46 +28,40 @@ user namespace there is no security boundary. Fix the listed item (usually bubbl
 `kernel.apparmor_restrict_unprivileged_userns` sysctl) and re-run. See
 [Prerequisites](doctor).
 
-On a host that restricts unprivileged user namespaces, the `capture` line of the same report prints
-an AppArmor profile that lifts the restriction for `sbx` alone, the narrow alternative to the sysctl
-(see [below](#a-launch-warns-about-its-network-namespace)). It lifts the failure even where the
-host's `bwrap` carries no profile of its own.
+On a host that restricts unprivileged user namespaces, the `user namespaces` line of the same report
+prints an AppArmor profile that lifts the restriction for `sbx` alone, the narrow alternative to the
+sysctl. Save it as `/etc/apparmor.d/sbx` and load it with `sudo apparmor_parser -r
+/etc/apparmor.d/sbx`. It lifts the failure even where the host's `bwrap` carries no profile of its
+own. It is attached to the path `doctor` printed, so a binary that moves needs its path updated.
 
 ## A launch warns about its network namespace
 
-On a host that restricts unprivileged user namespaces (Ubuntu 24.04 and later do by default), a
-launch that would route proxy-blind clients, or that runs a graphical app, prints:
+A launch that would route proxy-blind clients, or that runs a graphical app, configures the network
+namespace `bwrap` creates for the cage before the cage's command runs: it joins that namespace from
+the host and adds the
+[capture tap](../configuration/network#clients-that-ignore-the-proxy-variables) and the interface
+that tells a graphical app it is online. Joining creates no namespace, so a host that restricts
+unprivileged user namespaces (Ubuntu 24.04 and later do by default) does not prevent it: only `bwrap`
+creates one. Where the join is refused, the launch prints:
 
 ```text
-sbx: warning: a private network namespace could not be created (Operation not permitted (os error 1)), so the cage runs in an empty network namespace of bwrap's own: a client that ignores the proxy variables will fail to connect rather than be routed; `sbx doctor` says what blocks it and how to lift it
+sbx: warning: the cage's network namespace could not be joined (bwrap runs privileged (setuid), so its sandbox is not this user's to join), so the cage runs in an empty network namespace of bwrap's own: a client that ignores the proxy variables will fail to connect rather than be routed; `sbx doctor` says what blocks it
 ```
 
 The cage still runs, and it is still filtered: its network namespace is the empty one `bwrap`
-creates, and its egress goes through the proxy as usual. What is missing is the namespace `sbx`
-prepares itself, which carries the
-[capture tap](../configuration/network#clients-that-ignore-the-proxy-variables) and the interface
-that tells a graphical app it is online. This is a host whose `bwrap` carries an AppArmor profile
-that lets it create user namespaces while the `sbx` binary carries none. `sbx doctor` names the
-cause and prints what lifts it:
+creates, and its egress goes through the proxy as usual. What is missing is the tap and the
+interface. The case above is a setuid `bwrap` on a host that also restricts unprivileged user
+namespaces. Elsewhere `sbx` has a setuid `bwrap` run unprivileged, from a user namespace of its own
+where the kernel ignores the setuid bit; here that namespace is refused, so `bwrap` runs
+privileged and the namespace it creates belongs to the host, not to the invoking user. A `bwrap`
+that is not setuid avoids it.
+`sbx doctor` reports the same refusal under `capture`:
 
 ```text
-  [warn] capture           sbx cannot create the cage's network namespace, so a launch runs without capture
-         · the kernel refused: a private network namespace could not be created (Operation not permitted (os error 1))
+  [warn] capture           sbx cannot configure the cage's network namespace, so a launch runs without capture
+         · the cage's network namespace could not be joined (bwrap runs privileged (setuid), so its sandbox is not this user's to join)
          · a launch still filters its egress through the proxy, but a client that ignores the proxy environment variables fails to connect rather than being routed, and a graphical app may report itself offline
-         · cause: AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns is set), and no AppArmor profile grants one to sbx
-         · to lift it for sbx alone, save this profile as /etc/apparmor.d/sbx, then run `sudo apparmor_parser -r /etc/apparmor.d/sbx`:
-             abi <abi/4.0>,
-             include <tunables/global>
-             profile sbx "/home/you/.local/bin/sbx" flags=(unconfined) {
-               userns,
-             }
-         · or for every program at once: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, which undoes that hardening host-wide until the next boot (a file under /etc/sysctl.d/ makes it last)
 ```
-
-The profile is the narrow fix: it lets that one binary create user namespaces and confines it no
-further, while the cage's own processes stay under the profile the host gives `bwrap`. It is
-attached to the path `doctor` printed, which is the file a link leads to, so a binary that moves
-needs its path updated. The sysctl lifts the restriction for every program on the host.
 
 ## The launch works, but the project's config is silently ignored
 

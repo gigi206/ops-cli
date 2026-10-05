@@ -29,9 +29,9 @@
 //! next launch resolves `[fs]` again.
 //!
 //! **Why the mid-session gap is not closed by re-masking a live cage.** Applying a mask after
-//! launch is reachable — a launcher that creates its own user namespace before `execve`ing
-//! bubblewrap leaves the cage's namespaces joinable, and that shape is already built for another
-//! purpose. It is not done because of what it would be racing. The mask would have to be in place
+//! launch is reachable — the user namespace bubblewrap creates is owned by the invoking user, which
+//! leaves the cage's namespaces joinable from the host, and the netns holder already joins them for
+//! another purpose. It is not done because of what it would be racing. The mask would have to be in place
 //! before the first open, and anything waiting for the file wins that moment reliably: the guard
 //! would hold against a path created by accident, never against one created by something that
 //! wanted it. A boundary that only holds when nobody is trying is not the class of boundary this

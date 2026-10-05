@@ -827,13 +827,14 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
     // already using a volume, one already offered, or an ineligible host.
     storage::maybe_propose_on_launch(name, &rest);
     match name {
-        // Internal: the network-namespace holder. Runs host-side (never in the cage), pre-creates
-        // the cage's network namespace with a black-hole `dummy0` interface so an in-cage browser
-        // reports itself online, then execs the real `bwrap …` command. Never invoked by a user
-        // directly. `rest` is `[bwrap, bwrap-args…]`; it never returns.
+        // Internal: the network-namespace holder. Runs host-side (never in the cage): forks a
+        // configurer, then execs the real `bwrap …` command, which waits while the configurer
+        // joins the network namespace bwrap created and adds a black-hole `dummy0` interface so an
+        // in-cage browser reports itself online, and the capture tap when one is wired. Never
+        // invoked by a user directly. `rest` is `[bwrap, bwrap-args…]`; it never returns.
         "__netns-holder" => crate::sandbox::run_holder(&rest),
-        // Internal: the transparent-capture tap. Forked by the holder into the cage's network
-        // namespace (host mount/pid namespaces kept), it answers the cage's DNS with synthetic
+        // Internal: the transparent-capture tap. Started by the holder's configurer in the cage's
+        // network namespace (host mount/pid namespaces kept), it answers the cage's DNS with synthetic
         // addresses and hands every redirected connection to the same host proxy, named. Never
         // invoked by a user directly, so it carries no page of its own. `rest` is
         // `[<egress socket path>]`; it never returns.
@@ -850,11 +851,12 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // `[<media type>, <bytes spent>, <entries spent>]`.
         "__unpack" => crate::sandbox::run_unpack(&rest),
         // Internal: the namespace and transparent-capture probe, run by `doctor` and by a launch
-        // before it chooses the netns holder. Creates a throwaway user+network namespace and,
-        // given an `nft`, tries to install the redirect rules in it, so the answer is a measurement
-        // rather than an inference about the kernel. A subcommand because neither caller can
-        // unshare itself. Never invoked by a user directly, so it carries no page of its own.
-        // `rest` is `[]` or `[<nft path>]`; it never returns.
+        // before it chooses the netns holder. Starts a throwaway bwrap, joins its network
+        // namespace the way the holder does and, given an `nft`, tries to install the redirect
+        // rules in it, so the answer is a measurement rather than an inference about the kernel. A
+        // subcommand because neither caller can `setns` itself. Never invoked by a user directly,
+        // so it carries no page of its own. `rest` is `[<bwrap path>]` or
+        // `[<bwrap path>, <nft path>]`; it never returns.
         "__net-probe" => crate::sandbox::run_probe(&rest),
         // Internal: the oracle the emitted completion scripts call on every completion
         // request. Answers with the candidates for the words typed so far and nothing

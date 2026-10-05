@@ -237,7 +237,11 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
     // Read before anything later adds to it: what is recorded so far is the engine and the
     // boundary, and either one missing means no launch runs at all.
     let launches_run = remediation.is_empty();
-    report_transparent_capture(&mut rep, launches_run);
+    report_transparent_capture(
+        &mut rep,
+        launches_run,
+        bwrap.as_ref().ok().map(|c| c.path.as_path()),
+    );
 
     // The nix that drives the store. Its absence is load-bearing too — without
     // nix, sbx cannot provision a project's tools. Resolution follows override,
@@ -372,7 +376,8 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
 /// otherwise invisible: a launch says nothing about it, precisely so a host without the machinery
 /// is not nagged on every run.
 ///
-/// The answer comes from actually installing the rules in a throwaway namespace. Reading kernel
+/// The answer comes from actually installing the rules in the namespace of a throwaway `bwrap`,
+/// joined the way a launch joins its cage's. Reading kernel
 /// configuration instead would be inference: whether an unprivileged namespace may autoload the nat
 /// modules is not stated in any single file, and it is the question that decides this.
 ///
@@ -380,7 +385,10 @@ pub(crate) fn doctor(json: bool) -> ExitCode {
 /// costs a launch is then left unsaid, in the verdict as in the notes: no launch runs, so a line
 /// saying one runs without capture, or still filters through the proxy, would contradict the
 /// failure printed above it.
-fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool) {
+///
+/// `bwrap` is the engine the report resolved above; without one there is no namespace to probe,
+/// and the answer is unknown.
+fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool, bwrap: Option<&Path>) {
     // Recorded as the `capture` check rather than as a note: a note lands under whichever check
     // was recorded last, which would file this verdict under a neighbouring probe and leave a
     // consumer keyed on check names with no capture answer at all.
@@ -392,17 +400,19 @@ fn report_transparent_capture(rep: &mut Report<'_>, launches_run: bool) {
         );
         return;
     };
-    report_capture(rep, &sandbox::probe_capture(&exe), launches_run, &exe);
+    let Some(bwrap) = bwrap else {
+        rep.check(
+            "warn",
+            "capture",
+            "unknown — no bubblewrap to probe the namespace with",
+        );
+        return;
+    };
+    report_capture(rep, &sandbox::probe_capture(&exe, bwrap), launches_run);
 }
 
-/// Record the `capture` check for what the probe of the binary at `exe` answered, with the context
-/// and remedies that answer calls for.
-fn report_capture(
-    rep: &mut Report<'_>,
-    support: &sandbox::CaptureSupport,
-    launches_run: bool,
-    exe: &Path,
-) {
+/// Record the `capture` check for what the probe answered, with the context that answer calls for.
+fn report_capture(rep: &mut Report<'_>, support: &sandbox::CaptureSupport, launches_run: bool) {
     match support {
         sandbox::CaptureSupport::Ready => {
             rep.check(
@@ -417,9 +427,9 @@ fn report_capture(
             "warn",
             "capture",
             if launches_run {
-                "sbx cannot create the cage's network namespace, so a launch runs without capture"
+                "sbx cannot configure the cage's network namespace, so a launch runs without capture"
             } else {
-                "sbx cannot create the cage's network namespace"
+                "sbx cannot configure the cage's network namespace"
             },
         ),
         sandbox::CaptureSupport::NoNft | sandbox::CaptureSupport::Refused(_) => rep.check(
@@ -428,10 +438,10 @@ fn report_capture(
             "proxy-blind clients will fail to connect, not be routed",
         ),
     }
-    if let sandbox::CaptureSupport::NoNamespace(why) | sandbox::CaptureSupport::Refused(why) =
-        support
-    {
-        rep.note(&format!("the kernel refused: {why}"));
+    match support {
+        sandbox::CaptureSupport::NoNamespace(why) => rep.note(why),
+        sandbox::CaptureSupport::Refused(why) => rep.note(&format!("the kernel refused: {why}")),
+        sandbox::CaptureSupport::Ready | sandbox::CaptureSupport::NoNft => {}
     }
     let refused_namespace = matches!(support, sandbox::CaptureSupport::NoNamespace(_));
     if let Some(hint) = support.remediation()
@@ -439,63 +449,6 @@ fn report_capture(
     {
         rep.note(hint);
     }
-    if refused_namespace {
-        report_namespace_remedies(rep, exe);
-    }
-}
-
-/// Say what refused sbx its namespace and what lifts the refusal, when the host says what it was.
-///
-/// Only the AppArmor restriction is named, and only when its sysctl is set: that is a cause this
-/// host states, where any other would be a guess, and a guessed cause is how a remedy comes to
-/// point at the wrong layer. Two remedies, the narrow one first: a profile that grants `userns` to
-/// this binary alone, attached to the path it runs from (resolved, since AppArmor attaches to the
-/// file a link leads to), and the sysctl, which lifts the restriction for every program.
-fn report_namespace_remedies(rep: &mut Report<'_>, exe: &Path) {
-    if !store::apparmor_userns_restricted() {
-        return;
-    }
-    rep.note(
-        "cause: AppArmor restricts unprivileged user namespaces \
-         (kernel.apparmor_restrict_unprivileged_userns is set), and no AppArmor profile grants one \
-         to sbx",
-    );
-    match apparmor_profile(exe) {
-        Some(lines) => rep.note_with_lines(
-            "to lift it for sbx alone, save this profile as /etc/apparmor.d/sbx, then run \
-             `sudo apparmor_parser -r /etc/apparmor.d/sbx`:",
-            &lines,
-        ),
-        None => rep.note(&format!(
-            "to lift it for sbx alone, give {} an AppArmor profile that grants `userns`",
-            exe.display()
-        )),
-    }
-    rep.note(
-        "or for every program at once: `sudo sysctl -w \
-         kernel.apparmor_restrict_unprivileged_userns=0`, which undoes that hardening host-wide \
-         until the next boot (a file under /etc/sysctl.d/ makes it last)",
-    );
-}
-
-/// The AppArmor profile that lets the binary at `exe` create user namespaces with capabilities,
-/// and confines it no further: `unconfined` keeps every other permission it has today.
-///
-/// `None` when the path cannot be written between the profile's double quotes as it stands: a
-/// quote, a backslash or a line break would change what the profile says, so the caller names the
-/// remedy without writing it out.
-fn apparmor_profile(exe: &Path) -> Option<Vec<String>> {
-    let path = exe.to_str()?;
-    if path.contains(['"', '\\', '\n', '\r']) {
-        return None;
-    }
-    Some(vec![
-        "abi <abi/4.0>,".to_string(),
-        "include <tunables/global>".to_string(),
-        format!("profile sbx \"{path}\" flags=(unconfined) {{"),
-        "  userns,".to_string(),
-        "}".to_string(),
-    ])
 }
 
 /// Report best-effort cgroup v2 resource limiting (anti-DoS). Unlike the security
@@ -755,7 +708,55 @@ fn classify_namespace_failure(
         Userns::Ok => "transient namespace probe failure",
     };
     rep.check("fail", "user namespaces", detail);
+    report_apparmor_profile(rep);
     remediation.push(USERNS_REMEDIATION);
+}
+
+/// Print the AppArmor profile that grants `userns` to this binary, when the host's AppArmor
+/// restriction is what is in force.
+///
+/// Only then, and only under the failed boundary: the restriction is a cause this host states
+/// (its sysctl is set), where any other would be a guess. The profile is the narrow form of the
+/// remedy [`USERNS_REMEDIATION`] names beside the sysctl: the sysctl lifts the restriction for
+/// every program on the host, the profile for this binary alone.
+fn report_apparmor_profile(rep: &mut Report<'_>) {
+    if !store::apparmor_userns_restricted() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    match apparmor_profile(&exe) {
+        Some(lines) => rep.note_with_lines(
+            "to lift it for sbx alone, save this profile as /etc/apparmor.d/sbx, then run \
+             `sudo apparmor_parser -r /etc/apparmor.d/sbx`:",
+            &lines,
+        ),
+        None => rep.note(&format!(
+            "to lift it for sbx alone, give {} an AppArmor profile that grants `userns`",
+            exe.display()
+        )),
+    }
+}
+
+/// The AppArmor profile that lets the binary at `exe` create user namespaces with capabilities,
+/// and confines it no further: `unconfined` keeps every other permission it has today.
+///
+/// `None` when the path cannot be written between the profile's double quotes as it stands: a
+/// quote, a backslash or a line break would change what the profile says, so the caller names the
+/// remedy without writing it out.
+fn apparmor_profile(exe: &Path) -> Option<Vec<String>> {
+    let path = exe.to_str()?;
+    if path.contains(['"', '\\', '\n', '\r']) {
+        return None;
+    }
+    Some(vec![
+        "abi <abi/4.0>,".to_string(),
+        "include <tunables/global>".to_string(),
+        format!("profile sbx \"{path}\" flags=(unconfined) {{"),
+        "  userns,".to_string(),
+        "}".to_string(),
+    ])
 }
 
 /// The command that has the host's git read a bare repository only when it is named with
@@ -806,18 +807,33 @@ mod tests {
 
     use super::*;
 
+    /// The profile names the binary's own path, and a path that would change what the profile
+    /// says between its quotes gets none.
+    #[test]
+    fn the_apparmor_profile_names_the_binary_or_is_not_written() {
+        let lines = apparmor_profile(Path::new("/home/you/.local/bin/sbx")).expect("a profile");
+        assert!(
+            lines.contains(
+                &"profile sbx \"/home/you/.local/bin/sbx\" flags=(unconfined) {".to_string()
+            ),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"  userns,".to_string()), "{lines:?}");
+        for path in ["/a\"b/sbx", "/a\\b/sbx", "/a\nb/sbx"] {
+            assert_eq!(apparmor_profile(Path::new(path)), None, "{path:?}");
+        }
+    }
+
     /// The `capture` check `doctor` records for a namespace the kernel refused, beside a boundary
     /// that held (`launches_run`) or one that failed.
     fn refused_namespace_capture(launches_run: bool) -> Check {
         let pal = style::Palette::plain();
         let mut rep = Report::new(true, &pal);
-        let refused = sandbox::CaptureSupport::NoNamespace("Operation not permitted".to_string());
-        report_capture(
-            &mut rep,
-            &refused,
-            launches_run,
-            Path::new("/usr/local/bin/sbx"),
+        let refused = sandbox::CaptureSupport::NoNamespace(
+            "the cage's network namespace could not be joined (Operation not permitted)"
+                .to_string(),
         );
+        report_capture(&mut rep, &refused, launches_run);
         assert_eq!(rep.checks.len(), 1, "one check, the capture one");
         rep.checks.remove(0)
     }

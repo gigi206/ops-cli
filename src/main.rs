@@ -177,8 +177,8 @@ fn restore_child_reaping() {
 /// The internal verbs keep theirs. sbx starts each of them itself and hands it the descriptors its
 /// arguments name: `__netns-holder` passes them on to the cage's bubblewrap, `__proxy` serves the
 /// link it is given. Each is started from a process that has already done this, save the capture
-/// tap, which the holder starts while it holds the cage's descriptors, and which is handed its own
-/// alone ([`sandbox::memfd::inherit_only`]).
+/// tap, which the holder's configurer starts once it has closed the cage's descriptors, and which
+/// is handed its own alone ([`sandbox::memfd::inherit_only`]).
 fn close_inherited_descriptors() {
     // SAFETY: `close_range` takes no pointer, and nothing this process owns is open past the
     // standard three yet.

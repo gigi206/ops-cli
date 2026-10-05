@@ -47,11 +47,11 @@ reports itself online (Chromium decides `navigator.onLine` from a non-loopback i
 being present, not from real reachability). No egress is opened: the dummy has no route, or,
 when the [capture tap](network#clients-that-ignore-the-proxy-variables) is wired, a default route
 through it whose uncaptured packets are rejected with `net-unreachable`. All traffic still goes
-through the proxy on loopback. A host that refuses `sbx` the namespace this takes (Ubuntu's
-AppArmor restriction on unprivileged user namespaces) gets the cage without the `dummy0`, so the
-engine may report itself offline, and the launch says so;
+through the proxy on loopback. A host where `sbx` cannot join the namespace `bwrap` creates (a
+setuid `bwrap` on a host that restricts unprivileged user namespaces) gets the cage without the `dummy0`, so the engine may report itself offline, and
+the launch says so;
 [Troubleshooting](../getting-started/troubleshooting#a-launch-warns-about-its-network-namespace)
-shows what lifts it.
+explains it.
 
 Use it for a terminal agent whose tools browse the web. It is strictly less exposure than
 `wayland` for the same capability, so prefer it whenever nothing needs a real window.
