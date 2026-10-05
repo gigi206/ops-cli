@@ -88,6 +88,19 @@ fn holder_dump() -> Option<(String, String)> {
     Some((dev, route.to_string()))
 }
 
+/// Whether this kernel has the `dummy` driver once the holder has asked it for a `dummy` link:
+/// loaded (`/sys/module/dummy`), or built in (`modules.builtin` lists it). The holder reports no
+/// failure of its own there, so a cage without `dummy0` is a host gap only when this is false: a
+/// kernel without the driver, or one that did not load it. With the driver, it is the holder's.
+fn kernel_has_dummy() -> bool {
+    if std::path::Path::new("/sys/module/dummy").exists() {
+        return true;
+    }
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    std::fs::read_to_string(format!("/lib/modules/{}/modules.builtin", release.trim()))
+        .is_ok_and(|list| list.lines().any(|l| l == "kernel/drivers/net/dummy.ko"))
+}
+
 /// The holder reads bwrap's `--info-fd` report to its end before it closes the pipe.
 ///
 /// bwrap writes the report in several writes: the child's pid, each namespace id, the closing
@@ -167,16 +180,21 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
     };
 
     // `/proc/net/dev` is per-netns, so seeing `dummy0` proves the `RTM_NEWLINK` create landed in the
-    // fresh namespace. If it is absent even though the namespace came up, the `dummy` kernel module
-    // is unavailable — production treats that as acceptable loopback-only degradation, so skip rather
-    // than fail (a regression in the netlink path would surface here on the common host that *does*
-    // carry the module).
+    // fresh namespace. Production treats a kernel without the `dummy` driver as acceptable
+    // loopback-only degradation, so that one skips. A kernel that has it fails here instead: the
+    // holder says nothing when a create fails, and a regression in the netlink path would otherwise
+    // read as the missing driver.
     let dummy0_present = dev
         .lines()
         .any(|l| l.split(':').next().is_some_and(|n| n.trim() == "dummy0"));
     if !dummy0_present {
+        assert!(
+            !kernel_has_dummy(),
+            "this kernel has the dummy driver, yet the holder left no dummy0 in the namespace:\n{dev}"
+        );
         skip_incapable!(
-            "skipping netns holder e2e: dummy0 absent (dummy kernel module unavailable?)"
+            "skipping netns holder e2e: dummy0 absent, with no dummy driver loaded, even after the \
+             holder asked, and none built in"
         );
         return;
     }
@@ -232,9 +250,9 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 ///
 /// A tap that did not start or did not come up fails this test rather than skipping it. The
 /// environment gaps the capture has say so in their own words, and still skip: a kernel that
-/// refuses the redirect rules, and one without the `dummy` module, which leaves no route. So does a
+/// refuses the redirect rules, and one without the `dummy` driver, which leaves no route. So does a
 /// holder or a cage that never ran the command. A command that ran and then failed is this test's
-/// failure: its first line says it ran.
+/// failure: its first line says it ran. So is no route on a kernel that has the driver.
 #[test]
 fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     let python = std::path::Path::new("/usr/bin/python3");
@@ -382,8 +400,14 @@ print("report fd", "held" if held else "closed")
     );
     let reply = stdout.lines().nth(1).unwrap_or_default();
     if reply.starts_with(&format!("error {} ", libc::ENETUNREACH)) {
+        assert!(
+            !kernel_has_dummy(),
+            "this kernel has the dummy driver, yet the cage has no route to the resolver: \
+             {stdout}{stderr}"
+        );
         skip_incapable!(
-            "skipping tap DNS e2e: no route to the resolver (dummy module unavailable?)"
+            "skipping tap DNS e2e: no route to the resolver, with no dummy driver loaded, even \
+             after the holder asked, and none built in"
         );
         return;
     }
