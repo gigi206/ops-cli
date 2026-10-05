@@ -1097,13 +1097,19 @@ mod tests {
         /// Send `signal` if there is one, give the process `within` to end, killing it past that,
         /// and say how it ended.
         fn end(&mut self, signal: Option<libc::c_int>, within: Duration) -> Ending {
-            if let Some(signal) = signal {
-                // SAFETY: the process this test started, not yet reaped; two integers.
-                unsafe { libc::kill(self.run.id() as libc::pid_t, signal) };
-            }
-            let pidfd = crate::session::open_pidfd(self.run.id()).expect("a pidfd for the process");
-            let ended = crate::session::wait_for_exit(pidfd, within);
-            crate::session::close_fd(pidfd);
+            // A process [`Self::running`] already reaped has ended, and its pid names nothing left
+            // to signal or to open a pidfd on.
+            let ended = matches!(self.run.try_wait(), Ok(Some(_))) || {
+                if let Some(signal) = signal {
+                    // SAFETY: the process this test started, not yet reaped; two integers.
+                    unsafe { libc::kill(self.run.id() as libc::pid_t, signal) };
+                }
+                let pidfd =
+                    crate::session::open_pidfd(self.run.id()).expect("a pidfd for the process");
+                let ended = crate::session::wait_for_exit(pidfd, within);
+                crate::session::close_fd(pidfd);
+                ended
+            };
             if !ended {
                 let _ = self.run.kill();
             }
@@ -1300,10 +1306,14 @@ mod tests {
     /// same wait leaves it raw, since the session goes on.
     ///
     /// The relay writes to the terminal itself, as from a launch on one, and this test stops
-    /// reading it once the child's output has started. The relay is parked in that write when the
-    /// output waiting unread has stopped growing under a child that never stops writing, and it is
-    /// still parked when the process outlives the stop: a relay at its poll ends on a stop at once.
-    /// The stop lands on whichever thread of that process takes it.
+    /// reading it once the child's output has started. The output waiting unread stops growing once
+    /// the terminal's read buffer is full, and the relay's write then sleeps, but not always at the
+    /// terminal's limit: room can open behind a sleeping write without waking it, and any change to
+    /// the terminal's settings wakes it, which the stop's own give-back is. A write so woken
+    /// finishes, and the relay then ends on the stop at its poll. So the test wakes the write once
+    /// before the stop, with settings that change nothing, and lets it fill what room it slept
+    /// beside. The relay is still parked when the process outlives the stop: a relay at its poll
+    /// ends on a stop at once. The stop lands on whichever thread of that process takes it.
     #[test]
     fn a_stop_gives_the_terminal_back_while_the_relay_is_parked_writing_to_it() {
         let mut term = OnTerminal::start_writing_to_it(concat!(
@@ -1319,6 +1329,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             stalled = before > 0 && term.unread() == before;
         }
+        // SAFETY: all-zero is a valid `termios`, filled from the slave this test holds and set back
+        // on it unchanged: a change of nothing, which still wakes a write asleep on it.
+        let mut now: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(term.slave, &mut now) }, 0);
+        assert_eq!(
+            unsafe { libc::tcsetattr(term.slave, libc::TCSANOW, &now) },
+            0
+        );
+        std::thread::sleep(Duration::from_millis(300));
         let raw = !term.given_back_now();
         // SAFETY: the process this test started, not yet reaped; two integers.
         unsafe { libc::kill(pid, libc::SIGWINCH) };
@@ -1351,7 +1370,8 @@ mod tests {
         );
         assert!(
             still_parked,
-            "the process ended on the stop, so the relay was not parked: {errors}"
+            "the process ended on the stop ({}), so the relay was not parked: {errors}",
+            ending.status
         );
         assert!(
             term.given_back(&ending),
