@@ -10423,7 +10423,8 @@ fn a_definite_http_answer_is_not_a_transient_fetch_failure() {
 /// once more, because a fresh launch begins the fetch again, and a second failure on a download is
 /// counted as unreachable rather than enforced as incapable. So is one whose cache nix gave up on
 /// before it set out to build the closure itself, though that build then fails on a line that names
-/// no download. A launch refused for a reason of the host's stays the host's, at once, even when nix
+/// no download, unless another cache served it something: the build was then not for want of a
+/// cache. A launch refused for a reason of the host's stays the host's, at once, even when nix
 /// warned about a download on its way there.
 #[test]
 fn a_probe_that_fails_on_a_download_is_retried_and_never_blamed_on_the_host() {
@@ -10521,6 +10522,33 @@ bwrap: setting up uid map: Permission denied
 warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7)
 error: opening lock file '/nix/var/nix/db/big-lock': Permission denied
 ";
+    // A dead cache beside a live one, given up, and a build of the host's that then failed. The
+    // warning and the fetch are measured with nix 2.34.5 and `substituters` naming a refused
+    // address before cache.nixos.org; nix lists what it will build before what it will fetch.
+    const GAVE_UP_BESIDE_A_CACHE: &str = "\
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7) Failed to connect to 127.0.0.1 port 9 after 0 ms: Could not connect to server
+these 2 derivations will be built:
+  /nix/store/aaaa-sbx-gui-data.drv
+this path will be fetched (72.6 KiB download, 133.5 KiB unpacked):
+  /nix/store/wgw25d181h0qks7qsfp1bh7c5nd3f0s7-zlib-1.3.2
+copying path '/nix/store/wgw25d181h0qks7qsfp1bh7c5nd3f0s7-zlib-1.3.2' from 'https://cache.nixos.org'...
+building '/nix/store/aaaa-sbx-gui-data.drv'...
+error: builder for '/nix/store/aaaa-sbx-gui-data.drv' failed with exit code 1
+";
+    // The same two caches across two `nix build`s, as sbx runs one per attribute: nix gives the dead
+    // cache up again in each, the first fetches from the live one, and the second only builds.
+    const GAVE_UP_BESIDE_A_CACHE_EARLIER: &str = "\
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7) Failed to connect to 127.0.0.1 port 9 after 0 ms: Could not connect to server; retrying in 339 ms (attempt 1/5)
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7) Failed to connect to 127.0.0.1 port 9 after 0 ms: Could not connect to server
+these 4 paths will be fetched (10.9 MiB download, 36.5 MiB unpacked):
+  /nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25
+copying path '/nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25' from 'https://cache.nixos.org'...
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7) Failed to connect to 127.0.0.1 port 9 after 0 ms: Could not connect to server; retrying in 351 ms (attempt 1/5)
+warning: unable to download 'http://127.0.0.1:9/nix-cache-info': Could not connect to server (7) Failed to connect to 127.0.0.1 port 9 after 0 ms: Could not connect to server
+these 2 derivations will be built:
+  /nix/store/aaaa-sbx-gui-data.drv
+error: builder for '/nix/store/aaaa-sbx-gui-data.drv' failed with exit code 1
+";
     let ok = output(0, "");
 
     let (verdict, calls) = drive(std::slice::from_ref(&ok));
@@ -10570,6 +10598,8 @@ error: opening lock file '/nix/var/nix/db/big-lock': Permission denied
         GAVE_UP_ON_404,
         GAVE_UP_THEN_REFUSED,
         GAVE_UP_THEN_LOCKED,
+        GAVE_UP_BESIDE_A_CACHE,
+        GAVE_UP_BESIDE_A_CACHE_EARLIER,
     ] {
         match drive(&[output(1, shape), ok.clone()]) {
             (Probe::Incapable(why), 1) => assert_eq!(why, shape.trim()),

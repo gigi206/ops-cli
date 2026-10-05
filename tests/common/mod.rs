@@ -128,9 +128,10 @@ pub enum Probe {
 /// The limit this draws: a regression that breaks substitution itself, a wrong substituter for one,
 /// fails on a download every time and so reads as unreachable, which `SBX_REQUIRE_CAPABLE` does not
 /// turn into a failure. It still lands in the skip report, once per probing test. So does a host
-/// with a dead extra substituter beside a working cache, when a build nix then runs locally fails
-/// for a reason of the host's: nix gave the dead cache up and built, the shape [`cache_given_up`]
-/// reads as the network's.
+/// with a dead extra substituter beside a working cache, when the working one had nothing to serve
+/// and a build nix then ran failed for a reason of the host's. Where the working cache served
+/// anything, [`cache_given_up`] leaves the failure to the host, which is wrong when the dead cache
+/// was the only one holding what nix then built.
 pub fn probe(launch: impl FnMut() -> Output) -> Probe {
     probe_with(launch, download_fault)
 }
@@ -168,9 +169,9 @@ const NO_SUBSTITUTER: &str = "there is no substituter that can build it";
 ///   definite HTTP answer. It follows a dropped download, and it is also the one `error:` line nix
 ///   prints when it realises a path that no reachable cache offers: the download is then named only
 ///   in `warning:` lines;
-/// * a binary cache nix gave up on before it set out to build the closure itself
-///   ([`cache_given_up`]). The build that follows fails on a line that names no download, so what
-///   is quoted is the warning in which nix gave the cache up.
+/// * a binary cache nix gave up on before it set out to build the closure itself, with no other
+///   cache serving it anything ([`cache_given_up`]). The build that follows fails on a line that
+///   names no download, so what is quoted is the warning in which nix gave the cache up.
 ///
 /// The third is what a cache that answers nothing at all produces. Measured with nix 2.34.5 against
 /// one that refused every connection, GitHub reachable: five warnings on the cache's
@@ -213,13 +214,25 @@ const RETRYING: &str = "; retrying";
 /// nix's word for a closure it set out to build itself.
 const WILL_BE_BUILT: &str = "will be built";
 
+/// nix's word for the paths a cache that answered will serve, after `these N paths` or `this path`.
+const WILL_BE_FETCHED: &str = "will be fetched";
+
 /// The warnings in which nix gave a binary cache up, when it then set out to build the closure
-/// itself and failed, or `None`.
+/// itself with no other cache serving it anything, and failed, or `None`.
 ///
 /// nix asks each cache for its [`CACHE_INFO`] before anything else, and warns at every attempt that
 /// fails. Each attempt it will follow with another says so ([`RETRYING`]); the last does not, and
 /// nix drops the cache for the rest of the run. With no cache left it builds the whole closure from
 /// source, says so ([`WILL_BE_BUILT`]), and fails on whichever bootstrap step breaks first.
+///
+/// A cache that still answers changes what that build means: nix builds what no cache it reached
+/// offered, and the one it gave up may have held none of it. Such a cache shows in the paths nix
+/// says it will fetch ([`WILL_BE_FETCHED`]), printed after the paths it will build, and one such
+/// line anywhere in the stderr is enough. nix records the [`CACHE_INFO`] of a cache that answered
+/// on disk and, while that record is current, does not ask for it again, so the warning that gives
+/// a cache up names one that has not answered, and whatever nix fetched came from another. sbx
+/// realises the userland one attribute at a time, each in a `nix build` of its own, so the fetch
+/// can sit in an earlier invocation than the build.
 ///
 /// Each warning that gives a cache up passes through [`transient_fetch_failure`], so a cache that
 /// answered with a definite HTTP status, a substituter URL that does not exist, stays the host's.
@@ -230,17 +243,20 @@ fn cache_given_up(stderr: &str, errors: &[&str]) -> Option<String> {
         return None;
     }
     let mut given_up = Vec::new();
+    let mut built = false;
     for line in stderr.lines().map(str::trim_start) {
         if line.starts_with("warning:") && line.contains(CACHE_INFO) && !line.contains(RETRYING) {
             if !transient_fetch_failure(line) {
                 return None;
             }
             given_up.push(line);
+        } else if line.contains(WILL_BE_FETCHED) {
+            return None;
         } else if !given_up.is_empty() && line.contains(WILL_BE_BUILT) {
-            return Some(given_up.join("\n"));
+            built = true;
         }
     }
-    None
+    built.then(|| given_up.join("\n"))
 }
 
 /// What `sbx upgrade` writes before nix's own words when a `nix flake metadata` it ran failed:
