@@ -141,15 +141,47 @@ fn doctor_reports_a_refused_engine_override_as_refused_not_missing() {
     );
 }
 
+/// Whether an unprivileged process gets a capability-bearing user namespace here, asked the way
+/// `doctor`'s own stand-in asks before it classifies a failed launch: a forked child creates a user
+/// namespace, then a mount namespace inside it, which needs `CAP_SYS_ADMIN` there.
+///
+/// A host that restricts unprivileged user namespaces (Ubuntu's AppArmor restriction) answers no
+/// even where a launch works: the launch goes through a `bwrap` its profile names, and the question
+/// is asked of a binary none does.
+fn unprivileged_namespace_bears_capabilities() -> bool {
+    // SAFETY: the child calls only `unshare` and `_exit`, both async-signal-safe, so forking from
+    // the multithreaded test harness is sound; the parent only reaps it.
+    unsafe {
+        match libc::fork() {
+            0 => {
+                let ok = libc::unshare(libc::CLONE_NEWUSER) == 0
+                    && libc::unshare(libc::CLONE_NEWNS) == 0;
+                libc::_exit(if ok { 0 } else { 1 })
+            }
+            -1 => false,
+            pid => {
+                let mut status = 0;
+                libc::waitpid(pid, &mut status, 0) == pid
+                    && libc::WIFEXITED(status)
+                    && libc::WEXITSTATUS(status) == 0
+            }
+        }
+    }
+}
+
 #[test]
 fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
     // The crux: a capability-bearing namespace plus a failed launch means
     // the *engine* is at fault, so doctor must blame bubblewrap and surface its
     // stderr — never the namespace. Force it with a stub bwrap that always fails.
     // Gate on a real sandbox working first (with the unmodified PATH), so the
-    // namespace probe is known to say Ok; only then is the stub's failure
-    // unambiguously the engine. Skipped, not failed, where the host cannot
-    // sandbox.
+    // host can sandbox at all. Skipped, not failed, where it cannot.
+    //
+    // Whether the namespace counts as working for the stub is the host's answer, not the gate's:
+    // on a host that restricts unprivileged user namespaces, the gate's launch goes through a
+    // `bwrap` the host's AppArmor profile names, while the stub runs from a path none does, so the
+    // namespace is refused to it as it is to sbx's own probe. There the verdict to pin is the
+    // other one: the namespace, and what lifts the restriction.
     let data = TmpDir::new("dr");
     probe_or_skip!(
         "bubblewrap-fault attribution",
@@ -188,6 +220,27 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
         Some(1),
         "a failed launch is a hard failure; stdout was:\n{stdout}"
     );
+    if !unprivileged_namespace_bears_capabilities() {
+        assert!(
+            stdout.contains("[FAIL] user namespaces"),
+            "a namespace the host refuses the stub is the fault; stdout was:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("the failure is in bubblewrap"),
+            "the engine must not be blamed for a namespace the host refuses; stdout was:\n{stdout}"
+        );
+        let restricted =
+            std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                .is_ok_and(|v| v.trim() != "0");
+        if restricted {
+            assert!(
+                stdout.contains("apparmor_parser") && stdout.contains("  userns,"),
+                "the AppArmor restriction is the stated cause, so its remedy is printed; stdout \
+                 was:\n{stdout}"
+            );
+        }
+        return;
+    }
     assert!(
         stdout.contains("the failure is in bubblewrap"),
         "the fault must be attributed to the engine, not the namespace; stdout was:\n{stdout}"
