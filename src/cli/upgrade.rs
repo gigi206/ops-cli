@@ -1,5 +1,5 @@
-//! `sbx upgrade [all|nix|mise|distro|provision] [-a <name>] [--project <path>]`: roll the managed
-//! channels and `[packages]` backends forward by re-resolving and rewriting their locks, so
+//! `sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>]`: roll the
+//! managed channels and `[packages]` backends forward by re-resolving and rewriting their locks, so
 //! versions advance only on an explicit upgrade, never on an sbx binary update. `-a` narrows the
 //! whole roll to one app, across every backend that app rides; `--project` retargets it at another
 //! project, exactly as running the command from that directory would. The lock-rewriting parts need
@@ -16,6 +16,11 @@
 //! when nothing did. What installs REGARDLESS is naming what to install: the `provision` verb, or a
 //! single app through `-a`. That is what an agent whose guard cannot detect a new release needs,
 //! and what a wrong guard needs.
+//!
+//! `self` is the one target that rolls no channel: it replaces the sbx binary with what its release
+//! serves now ([`super::upgrade_self`]). It is never part of `all`, because a roll of the project's
+//! channels is not a request to replace the program running it, and it takes neither `--app` nor
+//! `--project`, since the binary belongs to no app and no project.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -35,8 +40,9 @@ use crate::{config, diag, help, layout_or_fail, sandbox, short_rev, store, style
 /// user actually has; narrowing by backend was a way of spelling it that required reading the
 /// app's profile first. What remains is what names work no app carries: the nixpkgs revision, the
 /// mise engine with the project's `nix:` tools and task pool, and the distribution image — plus
-/// `provision`, which is not a backend at all but the forcing of an install step.
-pub(crate) const TARGETS: &[&str] = &["all", "nix", "mise", "distro", "provision"];
+/// `provision`, which is not a backend at all but the forcing of an install step. `self` closes the
+/// list: the sbx binary, which `all` leaves alone.
+pub(crate) const TARGETS: &[&str] = &["all", "nix", "mise", "distro", "provision", "self"];
 
 /// Map a target word to its `'static` spelling, so a parsed target outlives the borrowed argv.
 fn known_target(s: &str) -> Option<&'static str> {
@@ -158,15 +164,23 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
             }
         }
     }
-    // Every remaining target takes `--app`, so the grammar has nothing left to refuse here. Which
-    // targets select no work for a GIVEN app is a different question, answered against the resolved
+    // `self` replaces the binary, which no app and no project owns, so a selector beside it would
+    // narrow nothing; it is refused rather than ignored. Every other target takes `--app`. Which of
+    // them select no work for a GIVEN app is a different question, answered against the resolved
     // config by `app_selector_refusal` — this parser reads no config and must not pretend to.
+    if what == Some("self") && (app.is_some() || project.is_some()) {
+        return ParsedArgs::Error(
+            "sbx: upgrade: `self` replaces the sbx binary, which belongs to no app and no \
+             project, so it takes neither --app nor --project."
+                .into(),
+        );
+    }
     let what = what.unwrap_or("all");
     ParsedArgs::Run { what, project, app }
 }
 
-/// `sbx upgrade [all|nix|mise|distro|provision] [-a <name>] [--project <path>]`: parse, then hand
-/// the roll to [`run_upgrade`].
+/// `sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>]`: parse, then
+/// hand the roll to [`run_upgrade`], or the binary to [`super::upgrade_self`].
 ///
 /// `nix` rolls the nixpkgs channel the target directory tracks (a trusted project pin, else the
 /// global channel) — base and native `nix:` `[packages]`. `mise` rolls the mise engine (its own
@@ -174,12 +188,13 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
 /// (the last in-cage). `distro` re-resolves the declared image. `all` rolls every one of them,
 /// every package backend, and the bundles' install steps under their own guards. `-a <name>`
 /// narrows all of that to one app; `--project <path>` runs it against another project instead of
-/// the current directory.
+/// the current directory. `self` replaces the sbx binary and rolls nothing else.
 pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
     // Parse an optional target word and an optional `--project <path>`, in any order, before
     // touching anything so a typo fails cleanly.
     let (what, project_arg, app_arg) = match parse_upgrade_args(args) {
         ParsedArgs::Help => return help::show(&["upgrade"]),
+        ParsedArgs::Run { what: "self", .. } => return super::upgrade_self::upgrade_self_cmd(),
         ParsedArgs::Run { what, project, app } => (what, project, app),
         ParsedArgs::Error(message) => {
             diag::error(&message);
@@ -2001,9 +2016,9 @@ mod tests {
         );
     }
 
-    /// `--app` is read in every spelling and accepted on every target — including the one nobody
-    /// types, since `all` is what a bare `sbx upgrade --app x` resolves to, and that is the case
-    /// the flag exists for.
+    /// `--app` is read in every spelling and accepted on every target that rolls a channel,
+    /// including the one nobody types: `all` is what a bare `sbx upgrade --app x` resolves to, and
+    /// that is the case the flag exists for. `self` rolls none, and refuses it.
     #[test]
     fn parse_reads_app_in_both_forms_and_offers_it_on_every_target() {
         for args in [
@@ -2032,12 +2047,12 @@ mod tests {
             }
         );
 
-        // EVERY target takes the selector — the invariant the surface now rests on, walked over
-        // `TARGETS` itself so a target added later is covered without touching this test. The
-        // grammar refuses nothing here: which targets select no work for a GIVEN app is a question
-        // about the resolved config, answered by `app_selector_refusal`, and a parser that reads no
-        // config must not pre-empt it.
-        for t in TARGETS {
+        // EVERY target that rolls a channel takes the selector. That is the invariant the surface
+        // now rests on, walked over `TARGETS` itself so a target added later is covered without
+        // touching this test. The grammar refuses nothing here: which targets select no work for a
+        // GIVEN app is a question about the resolved config, answered by `app_selector_refusal`,
+        // and a parser that reads no config must not pre-empt it.
+        for t in TARGETS.iter().filter(|&&t| t != "self") {
             assert_eq!(
                 parse_upgrade_args(&os(&[t, "--app", "demo-app"])),
                 ParsedArgs::Run {
@@ -2047,6 +2062,23 @@ mod tests {
                 },
                 "`{t}` must accept --app"
             );
+        }
+
+        // `self` replaces the binary, which no app and no project owns: a selector beside it is
+        // refused in either order and either spelling, never silently dropped.
+        for args in [
+            os(&["self", "--app", "demo-app"]),
+            os(&["--app=demo-app", "self"]),
+            os(&["self", "--project", "/some/dir"]),
+            os(&["--project=/some/dir", "self"]),
+        ] {
+            match parse_upgrade_args(&args) {
+                ParsedArgs::Error(message) => assert!(
+                    message.contains("takes neither --app nor --project"),
+                    "{args:?}: {message}"
+                ),
+                other => panic!("{args:?} was accepted: {other:?}"),
+            }
         }
 
         // The defaulted target carries the selector too: `sbx upgrade --app x` is `all` narrowed to

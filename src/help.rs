@@ -62,7 +62,7 @@ struct Page {
 /// path.
 ///
 /// It exists for a page whose option list is mostly one repeated shape. `sbx upgrade` is the case:
-/// three of its seven rows are a channel name, each a way to narrow the roll to one piece of
+/// three of its eight rows are a channel name, each a way to narrow the roll to one piece of
 /// project-wide work, and listing them at the same level as the default made the command read as a
 /// choice to make when the answer is almost always `sbx upgrade` with no argument at all. Folding
 /// them says which rows are the decision and which are the narrowing, without taking a capability

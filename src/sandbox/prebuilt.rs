@@ -466,6 +466,26 @@ pub(crate) fn prefetch_hash(
     quiet: bool,
     expected_sha256: Option<&str>,
 ) -> io::Result<String> {
+    prefetch_file(nix, layout, url, quiet, expected_sha256).map(|fetched| fetched.hash)
+}
+
+/// A file [`prefetch_file`] added to sbx's store: its SRI content hash, and where it landed.
+pub(crate) struct Prefetched {
+    pub(crate) hash: String,
+    /// The *logical* store path holding the file, as nix reports it; read on the host through
+    /// [`store::physical_path`]. Read-only, as every store path is.
+    pub(crate) store_path: PathBuf,
+}
+
+/// [`prefetch_hash`], keeping the store path the file landed at beside its hash, for a caller that
+/// uses the file itself rather than pinning it for a later build.
+pub(crate) fn prefetch_file(
+    nix: &Path,
+    layout: &Layout,
+    url: &str,
+    quiet: bool,
+    expected_sha256: Option<&str>,
+) -> io::Result<Prefetched> {
     let mut cmd = store::nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .args(["store", "prefetch-file", "--json"])
@@ -513,7 +533,14 @@ pub(crate) fn prefetch_hash(
             "prefetch-file returned a non-SRI hash: {hash}"
         )));
     }
-    Ok(hash.to_string())
+    let store_path = v
+        .get("storePath")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| io::Error::other("prefetch-file JSON has no `storePath`"))?;
+    Ok(Prefetched {
+        hash: hash.to_string(),
+        store_path: PathBuf::from(store_path),
+    })
 }
 
 /// Reduce nix's captured prefetch stderr to a single actionable cause for the summary line. nix

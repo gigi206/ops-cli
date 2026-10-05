@@ -86,6 +86,7 @@ mod paths;
 mod pin_coverage;
 mod plugins;
 mod proc_policy;
+mod release;
 mod sandbox;
 mod session;
 mod storage;

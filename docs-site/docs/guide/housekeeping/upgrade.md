@@ -28,12 +28,12 @@ A project's base userland and tools are pinned by **locks** in the data director
 
 A launch reads these locks; it does not re-resolve. So updating the `sbx` binary leaves
 your versions exactly where they were. `sbx upgrade` is the one place that rewrites a
-lock.
+lock. Its `self` target is the binary update itself, and rewrites none.
 
 ## The upgrade targets
 
 ```sh
-sbx upgrade [all|nix|mise|distro|provision] [-a <name>]
+sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>]
 ```
 
 | Target | Rolls forward |
@@ -43,6 +43,7 @@ sbx upgrade [all|nix|mise|distro|provision] [-a <name>]
 | `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the declared operations' tool pool |
 | `distro` | the declared [`distro`](../configuration/distro) image, re-resolved to the digest the registry serves now |
 | `provision` | re-runs the apps' bundle install steps in-cage, one cage per app, regardless of their guards |
+| `self` | no lock: the `sbx` binary, replaced with what its release serves now, and never part of `all` (see [Upgrading sbx itself](../cli/upgrade#upgrading-sbx-itself)) |
 
 The package backends (`flake:`, `deb:`, `appimage:`, `tarball:`, `binary:`) have **no
 target of their own**. `all` rolls every one of them, and to advance a single app you

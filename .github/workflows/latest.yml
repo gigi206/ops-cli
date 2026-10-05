@@ -62,6 +62,7 @@ jobs:
       - name: Build the self-contained static musl binary
         uses: ./.github/actions/build-static-sbx
         with:
+          release-tag: latest
           nixpkgs-rev: ${{ env.NIXPKGS_REV }}
           target: ${{ matrix.target }}
           asset: ${{ matrix.asset }}

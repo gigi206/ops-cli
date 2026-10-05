@@ -54,6 +54,21 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// window by construction, because the rename is the only thing that appears at the final path and
 /// it appears finished.
 pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    write_atomic_checked(path, bytes, mode, |_| Ok(()))
+}
+
+/// [`write_atomic_mode`], with `check` run on the finished temp **before** the rename: an error from
+/// it removes the temp and leaves `path` as it was.
+///
+/// For a file whose fitness the bytes alone do not prove. `sbx upgrade self` installs a binary over
+/// the one running, and a binary that does not run on this machine is caught only by running it,
+/// which the temp allows and the final path would allow too late.
+pub(crate) fn write_atomic_checked(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    check: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -103,7 +118,7 @@ pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) ->
         }
         file.sync_all()
     };
-    staged().inspect_err(|_| {
+    staged().and_then(|()| check(&tmp)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     std::fs::rename(&tmp, path).inspect_err(|_| {

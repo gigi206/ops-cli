@@ -38,6 +38,9 @@ pub(super) const PAGES: &[Page] = &[
         details: "Writes the version to stdout and exits 0. `sbx --version` and `sbx -V` are\n\
             accepted spellings of the same command, so a script probing for a version finds it\n\
             under whichever one it tries.\n\n\
+            A published build adds the release it was published as, its tag and its commit:\n\
+            `sbx 0.1.0 (latest, 0a9ad1c)`. That release is the one `sbx upgrade self` follows. A\n\
+            build from source prints the version alone, and has no release to follow.\n\n\
             The version names the sbx build and nothing else. It says nothing about the engines a\n\
             launch drives: bubblewrap and nix are resolved at run time, and `sbx doctor` is what\n\
             reports the ones a given host offers.",
@@ -1840,7 +1843,7 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "sbx upgrade [all|nix|mise|distro|provision] [-a <name>] [--project <path>]",
+        synopsis: "sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             (
@@ -1862,6 +1865,10 @@ pub(super) const PAGES: &[Page] = &[
             (
                 "provision",
                 "re-run the apps' bundle install steps in-cage, regardless of their guards",
+            ),
+            (
+                "self",
+                "replace the sbx binary with what its release serves now (never part of all)",
             ),
             (
                 "-a, --app <name>",
@@ -1941,7 +1948,19 @@ pub(super) const PAGES: &[Page] = &[
             \n\
             `--project <path>` retargets every roll at another project — exactly as running the\n\
             command from that directory would, with the same trust gate, pin, and locks. The path\n\
-            must be an existing directory.",
+            must be an existing directory.\n\
+            \n\
+            `self` REPLACES THE SBX BINARY and rolls no channel. A published build knows the\n\
+            release it came from (`sbx version` names it): a rolling tag such as `latest` is\n\
+            fetched again, and a version tag follows the newest stable release, never an older\n\
+            one. The checksum published beside the binary is read first, and when it names the\n\
+            binary running now nothing is downloaded. Otherwise the new binary is downloaded with\n\
+            that digest enforced, run once with `--version`, and renamed over the old one only if\n\
+            it runs. The checksum comes from the same release, so it proves the download whole,\n\
+            not the release genuine. A build from source has no release and is refused, as is a\n\
+            binary in a directory you cannot write: replace that one the way it was installed.\n\
+            Sessions already running keep the sbx they started with until they end. `all` never\n\
+            includes `self`, and `self` takes neither `--app` nor `--project`.",
     },
     Page {
         path: &["gc"],

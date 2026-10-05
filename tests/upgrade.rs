@@ -37,6 +37,48 @@ fn upgrade_rejects_an_unknown_target() {
     );
 }
 
+/// `upgrade self` on a build from source is refused before anything is read or fetched, and a
+/// selector beside `self` is a usage error, judged earlier still. Neither needs nix, a data
+/// directory or the network: the data directory given here does not exist, and stays so.
+#[test]
+fn upgrade_self_refuses_a_build_from_source_and_a_selector() {
+    // A stamped build would go on to fetch its release and replace this very binary, which is not
+    // a test; only a release build is stamped, and it runs no integration suite.
+    if option_env!("SBX_RELEASE_TAG").is_some() {
+        skip_incapable!("skipping upgrade self refusal: this build is stamped with a release");
+        return;
+    }
+    let tmp = TmpDir::new("upgrade-self");
+    let data = tmp.path().join("data");
+    let run = |args: &[&str]| {
+        sbx()
+            .args(args)
+            .env("SBX_DATA_DIR", &data)
+            .output()
+            .expect("spawn sbx upgrade self")
+    };
+
+    let out = run(&["upgrade", "self"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(stderr.contains("built from source"), "stderr:\n{stderr}");
+    assert!(out.stdout.is_empty(), "nothing is reported as done");
+
+    for args in [
+        &["upgrade", "self", "--app", "demo-app"][..],
+        &["upgrade", "--project", ".", "self"][..],
+    ] {
+        let out = run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("takes neither --app nor --project"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(!data.exists(), "the refusals created the data directory");
+}
+
 /// The revision the per-project flake lock records for `reference`, if any. The lock lives under
 /// the single project's directory; each line is `<reference>\t<rev>\t<locked-ref>`.
 fn flake_lock_rev(data: &Path, reference: &str) -> Option<String> {

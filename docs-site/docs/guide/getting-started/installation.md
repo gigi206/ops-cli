@@ -59,6 +59,20 @@ corrupted or cut short, not a release that was tampered with: that one would car
 matching checksum. The script is also written so that a download of it cut short runs
 nothing, since everything it does is one function called on its last line.
 
+### Keeping it up to date
+
+Once installed, `sbx` replaces itself:
+
+```sh
+sbx upgrade self
+```
+
+It follows the release it was installed from, makes the same checksum check, and
+replaces the binary the same way, writing beside it and renaming over it.
+[`sbx upgrade self`](../cli/upgrade#upgrading-sbx-itself) gives the details. A binary
+whose `sbx --version` shows no release in parentheses predates the release stamp, or was
+built from source. It has nothing to follow, so the script is how to replace it, once.
+
 ## Runtime prerequisites
 
 Before `sbx` can launch anything it needs:

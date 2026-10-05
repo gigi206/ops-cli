@@ -123,7 +123,9 @@ mod catrust;
 mod fonts;
 mod gpu;
 mod guidata;
-mod lima_mac;
+// Public to the crate for the guest check only: `sbx upgrade self` names the remedy the Lima guest
+// offers when it cannot replace a binary that provisioning installed.
+pub(crate) mod lima_mac;
 mod notify_relay;
 mod notify_sink;
 mod portal;
@@ -197,6 +199,7 @@ pub(crate) use packages::mise_packages;
 /// aliases of it, so a caller matching on outcomes names the variants through this — a `use` path
 /// resolves through modules, and an alias is not one.
 pub(crate) use prebuilt::Upgrade as PrebuiltUpgrade;
+pub(crate) use prebuilt::prefetch_file;
 pub(crate) use proclearn::Granularity as ProcGranularity;
 pub(crate) use projects::{
     projects_list, projects_rm, projects_show, rm_apply as projects_rm_apply,

@@ -401,10 +401,18 @@ fn mise_help_is_sbx_page_and_points_at_mises_own_help() {
 /// The expected string is built from `CARGO_PKG_VERSION` rather than pinned, so a release bump does
 /// not turn this red for the wrong reason; the shape assertion beside it is the literal that keeps
 /// the check from following the code wherever it goes, since a binary printing an empty version
-/// would satisfy an equality built the same way it was.
+/// would satisfy an equality built the same way it was. A build stamped with a release adds its tag
+/// and commit, read here from the same variables the stamp is compiled from.
 #[test]
 fn every_spelling_of_version_prints_the_build_version() {
-    let expected = format!("sbx {}\n", env!("CARGO_PKG_VERSION"));
+    let version = env!("CARGO_PKG_VERSION");
+    let expected = match (
+        option_env!("SBX_RELEASE_TAG"),
+        option_env!("SBX_RELEASE_COMMIT"),
+    ) {
+        (Some(tag), Some(commit)) => format!("sbx {version} ({tag}, {})\n", &commit[..7]),
+        _ => format!("sbx {version}\n"),
+    };
     for spelling in [&["version"][..], &["--version"][..], &["-V"][..]] {
         let out = sbx(spelling);
         assert!(out.status.success(), "`sbx {spelling:?}` should exit 0");
@@ -412,8 +420,9 @@ fn every_spelling_of_version_prints_the_build_version() {
         assert_eq!(stdout, expected, "`sbx {spelling:?}` printed {stdout:?}");
         assert!(out.stderr.is_empty(), "the version goes to stdout alone");
     }
-    let (name, rest) = expected.trim_end().split_once(' ').expect("two fields");
-    assert_eq!(name, "sbx");
+    let mut fields = expected.split_whitespace();
+    let (name, rest) = (fields.next(), fields.next().unwrap_or_default());
+    assert_eq!(name, Some("sbx"));
     assert!(
         rest.split('.').count() >= 2 && rest.chars().all(|c| c.is_ascii_digit() || c == '.'),
         "the version should be a dotted number, got {rest:?}"

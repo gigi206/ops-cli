@@ -5,11 +5,12 @@ description: "Roll managed toolchains forward by re-resolving and rewriting thei
 # `sbx upgrade`
 
 ```
-sbx upgrade [all|nix|mise|distro|provision] [-a <name>] [--project <path>]
+sbx upgrade [all|nix|mise|distro|provision|self] [-a <name>] [--project <path>]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
-advance **only here**, never on an `sbx` binary update.
+advance **only here**, never on an `sbx` binary update. `self` is that binary update: it
+replaces `sbx` and rolls no channel.
 
 | Target | Rolls |
 |---|---|
@@ -18,6 +19,7 @@ advance **only here**, never on an `sbx` binary update.
 | `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the [task tool pool](../tasks/execution#the-task-tool-pool) |
 | `distro` | the declared [`distro`](../configuration/distro) image, re-resolved to the digest the registry serves now |
 | `provision` | re-run the apps' [bundle install steps](../configuration/bundles#the-install-step) in-cage, regardless of their guards |
+| `self` | the `sbx` binary, replaced with what its release serves now; never part of `all` (see [Upgrading sbx itself](#upgrading-sbx-itself)) |
 
 | Flag | Effect |
 |---|---|
@@ -33,7 +35,8 @@ advancing one app start with reading its profile to learn which backend it rode.
 
 What stays typable is the work **no app carries**: the nixpkgs revision, the mise engine
 with the project's tools and task pool, and the distribution image. Plus `provision`,
-which is not a backend at all but the forcing of an install step.
+which is not a backend at all but the forcing of an install step, and `self`, which is
+not a channel.
 
 See also: [Upgrading toolchains](../housekeeping/upgrade) · [Provisioning](../concepts/provisioning) · [`nixpkgs`](../configuration/nixpkgs) · [`packages`](../configuration/packages).
 
@@ -192,6 +195,49 @@ and equipped tools live in the store and lock of the project it is launched from
 rolling that project is how they advance. The host-global parts (the nixpkgs channel
 when no project pin, and the mise engine) roll the same regardless.
 
+### Upgrading sbx itself
+
+`sbx upgrade self` replaces the `sbx` binary with what the release it was published as
+serves now. A published build knows that release: [`sbx version`](version) names its tag
+and commit, as in `sbx 0.1.0 (latest, 0a9ad1c)`.
+
+- **A rolling tag is fetched again.** `latest` (and `nightly`) is republished on every
+  build, so following it means fetching the same tag.
+- **A version tag follows the newest stable release**, and never steps back: a build of
+  `v2.1.0-rc1` stays put while the newest stable release is `v2.0.0`.
+
+The checksum published beside the binary is read first, afresh each time. When it names
+the binary running now, nothing is downloaded and the command says it is up to date.
+Otherwise the new binary is downloaded through sbx's own nix with that digest enforced,
+so a download that does not match never lands. It is written beside the old one, run
+once with `--version`, and renamed over it only if that run succeeds: a binary that does
+not run on this machine never replaces one that does.
+
+```
+$ sbx upgrade self
+sbx: replaced /home/me/.local/bin/sbx: sbx 0.1.0 (latest, 4b33e68) → sbx 0.1.0 (latest, 0a9ad1c)
+```
+
+What it refuses, and what to do instead:
+
+| Case | Why | Instead |
+|---|---|---|
+| a build from source | it has no release to follow | rebuild it, or install a release with the [installation script](../getting-started/installation#install-a-released-binary) |
+| a binary in a directory you cannot write | it was installed by something else | replace it the way it was installed |
+| the Lima guest on macOS | provisioning installs, as root at each start, the release the instance was created with | `limactl stop sbx && limactl start sbx` on the Mac, which brings a rolling release such as `latest` to its newest build |
+| `--app` or `--project` beside it | the binary belongs to no app and no project | drop them |
+
+`self` is never part of `all`, nor of a bare `sbx upgrade`: rolling the project's
+channels is not a request to replace the program running them. Sessions already running
+keep the `sbx` they started with until they end, since the rename gives the path a new
+file and leaves the old one to whatever still runs it.
+
+The checksum comes from the same release as the binary. It proves the download whole,
+not the release genuine: a tampered release would carry a matching checksum. That is the
+limit the installation script states for the same check. While `latest` is being
+republished it serves neither the old build nor the new one whole, and the command then
+fails and says to try again in a few minutes.
+
 ## Examples
 
 ```sh
@@ -201,6 +247,7 @@ sbx upgrade mise                   # the mise engine + tools/packages
 sbx upgrade --app freebuff-desktop # roll one app, whatever it rides
 sbx upgrade --project ~/work/api   # roll everything for another project
 sbx upgrade distro                 # re-resolve the declared image's tag
+sbx upgrade self                   # replace sbx with what its release serves now
 ```
 
 See [Upgrading toolchains](../housekeeping/upgrade) for the lock model and the

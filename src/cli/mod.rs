@@ -25,6 +25,7 @@ pub(crate) mod task;
 pub(crate) mod test;
 pub(crate) mod trust;
 pub(crate) mod upgrade;
+pub(crate) mod upgrade_self;
 
 use crate::diag;
 use std::ffi::{OsStr, OsString};
@@ -863,12 +864,13 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // else — never invoked by a user directly, so it carries no page of its own.
         "__complete" => completion::complete_cmd(&rest),
         "completion" => completion::completion_cmd(&rest),
-        // The version of this build. `--version`/`-V` reach here too: `main` resolves both to
-        // this verb, so the three spellings are one implementation and one page.
+        // The version of this build, and the release it was published as when it was. `--version`
+        // and `-V` reach here too: `main` resolves both to this verb, so the three spellings are
+        // one implementation and one page.
         "version" => match reject_extra(&["version"], &rest) {
             Err(code) => code,
             Ok(()) => {
-                outln!("sbx {}", env!("CARGO_PKG_VERSION"));
+                outln!("{}", crate::release::version_line());
                 ExitCode::SUCCESS
             }
         },
