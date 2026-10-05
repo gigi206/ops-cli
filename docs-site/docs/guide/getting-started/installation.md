@@ -359,9 +359,8 @@ GPU behaviour above included, are verified on macOS x86_64 with Lima 2.2.1. Appl
 not verified: neither the `sbx-linux-aarch64` binary in the guest nor the window, sound and
 GPU behaviour there. [`sbx doctor`](doctor) inside the guest is what decides whether
 the boundary is there, and it is the first thing to run after `limactl start`. The
-acceptance workflow in the repository runs these checks on a Mac and requires a
-self-hosted macOS runner, which is why it reports rather than hangs when none is
-registered.
+acceptance workflow in the repository runs these checks on a Mac: GitHub's hosted Intel
+runner (`macos-15-intel`), the kind of hosted Mac that lets a job start a virtual machine.
 
 ## Development build
 

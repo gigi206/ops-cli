@@ -1,4 +1,4 @@
-# macOS — proves the cage runs in a Lima guest on a Mac, and says clearly when no Mac answered.
+# macOS — proves the cage runs in a Lima guest on a Mac, on a Mac runner GitHub hosts.
 #
 # WHAT PROBLEM THIS SOLVES. sbx rests on capability-bearing unprivileged user namespaces and
 # `doctor` hard-fails rather than emulating when they are absent, so macOS is not a host it runs
@@ -22,22 +22,14 @@
 # GPU is not asserted either, and that one is not a gap to be closed: `vz` provides no GPU to the
 # guest at all, and the scope this template commits to is CLI plus GUI.
 #
-# THIS IS THE REPOSITORY'S FIRST SELF-HOSTED RUNNER. Every other workflow here runs on labels
-# GitHub hosts, so this is the only one whose result depends on a machine someone maintains, and
-# the only one that reports nothing until such a machine is attached.
-#
-# WHY THE FIRST JOB EXISTS. `runs-on: [self-hosted, macOS]` matches nothing until someone registers
-# a runner, and GitHub leaves a job whose labels nothing answers queued rather than failing it, for
-# far longer than a CI signal is useful. A workflow that hangs instead of reporting is the silent
-# skip this repository refuses elsewhere, so the job below watches for the arm being picked up and
-# fails the run by name when it is not.
-#
-# WHY IT IS GATED ON A VARIABLE. With no runner registered, that guard turned every weekly run and
-# every push under `dist/macos/` red, and a check that is red whatever the change says nothing about
-# the change. The two jobs below therefore run only when the repository variable `MACOS_RUNNER` is
-# `true`, which is set once a runner with those labels is attached. Otherwise the `not-attached`
-# job runs instead and writes, on the run's summary and as a notice, that the Lima acceptance did
-# not run: the skip is reported, never silent.
+# WHERE IT RUNS. On a runner GitHub hosts, and on its Intel one: `macos-15-intel`. The guest is a
+# virtual machine, so the runner must let a job use the CPU's virtualization. GitHub's Apple Silicon
+# runners do not, and its Intel runners do; Lima's own CI starts its `vz` guests on Intel runners for
+# that reason. The wrapper's support is written for macOS x86_64 with Lima 2.2.1, which is the
+# version this installs, so the run measures the platform the documentation names. Apple Silicon
+# stays outside CI until a hosted runner lets a job start a virtual machine there. GitHub ends macOS
+# x86_64 support when it retires its macOS 15 image, announced for fall 2027; from then on this
+# workflow has no host to run on.
 
 name: macos
 
@@ -54,83 +46,40 @@ on:
 
 permissions:
   contents: read
-  # The guard job reads this run's own jobs to see whether the macOS arm was picked up.
-  actions: read
 
 concurrency:
   group: macos-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  not-attached:
-    name: no macOS runner is declared, so the acceptance did not run
-    if: vars.MACOS_RUNNER != 'true'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    steps:
-      - name: Say that the Lima acceptance did not run
-        run: |
-          msg="the repository variable MACOS_RUNNER is not 'true', so no macOS runner is declared and the Lima acceptance did not run; set it once a runner labelled 'self-hosted, macOS' is attached"
-          echo "::notice::$msg"
-          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
-
-  runner:
-    name: a macOS runner must answer, or this run says so
-    if: vars.MACOS_RUNNER == 'true'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 20
-    steps:
-      - name: Fail by name if the macOS arm is never picked up
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          # Polls until the acceptance job leaves `queued`, so this costs seconds when a runner
-          # exists and bounded minutes when none does. An API that does not answer is reported
-          # rather than treated as either verdict: the two causes are told apart at the end.
-          deadline=$(( $(date +%s) + 15 * 60 ))
-          seen=""
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            status=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
-              --jq '.jobs[] | select(.name | contains("Lima guest")) | .status' 2>/dev/null || true)
-            case "$status" in
-              "")
-                echo "::notice::the jobs API did not name the acceptance job yet"
-                ;;
-              queued)
-                seen="queued"
-                ;;
-              *)
-                echo "the macOS arm reached '$status': a runner answered"
-                exit 0
-                ;;
-            esac
-            sleep 30
-          done
-          if [ "$seen" = "queued" ]; then
-            echo "no runner labelled 'self-hosted, macOS' picked the acceptance job up within 15" >&2
-            echo "minutes, so it is still queued and this run would otherwise hang rather than" >&2
-            echo "report; register a macOS runner with those labels, or run this workflow only" >&2
-            echo "when one is attached" >&2
-          else
-            echo "the jobs API never reported the acceptance job's status, so whether a runner" >&2
-            echo "answered is unknown; this fails rather than passing on something it did not see" >&2
-          fi
-          exit 1
-
   acceptance:
     name: exercise the cage in a Lima guest
-    if: vars.MACOS_RUNNER == 'true'
-    runs-on: [self-hosted, macOS]
+    runs-on: macos-15-intel
     timeout-minutes: 60
     env:
-      # The wrapper reaches the instance it is told to and defaults to `sbx`, a name this run must
-      # not take from a user who registered the runner on their own Mac. Every wrapper call below
-      # reaches `sbx-ci` through this, and without it each one fails on an instance that does not
-      # exist.
+      # The wrapper reaches the instance it is told to and defaults to `sbx`. This run creates
+      # `sbx-ci`, and every wrapper call below reaches it through this; without it each one fails on
+      # an instance that does not exist.
       SBX_LIMA_INSTANCE: sbx-ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Lima 2.2.1, the version the wrapper is supported with
+        # The official archive rather than Homebrew, whose formula moves on its own schedule: the
+        # version is the one the support statement names, and the bytes are checked against the
+        # release's SHA256SUMS before anything in them runs.
+        env:
+          LIMA_VERSION: 2.2.1
+          LIMA_SHA256: 6b776e4bc41f358e6ee01fefcc78e2eb26f11635a0fcff632234af77a566c6c4
+        run: |
+          set -euo pipefail
+          tarball="lima-${LIMA_VERSION}-Darwin-x86_64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/lima-vm/lima/releases/download/v${LIMA_VERSION}/$tarball"
+          echo "${LIMA_SHA256}  $RUNNER_TEMP/$tarball" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/lima"
+          tar -C "$RUNNER_TEMP/lima" -xzf "$RUNNER_TEMP/$tarball"
+          echo "$RUNNER_TEMP/lima/bin" >> "$GITHUB_PATH"
 
       - name: Report what this host can do
         # The report is written whatever happens next, so a failing assertion below lands beside
@@ -143,6 +92,7 @@ jobs:
             echo '```'
             sw_vers 2>/dev/null || true
             echo "arch: $(uname -m)"
+            echo "kern.hv_support: $(sysctl -n kern.hv_support 2>/dev/null || echo unknown)"
             limactl --version 2>/dev/null || echo "limactl: absent"
             echo '```'
           } | tee "$HOME/summary.md"
@@ -168,7 +118,10 @@ jobs:
           # that exists.
           mkdir -p "$HOME/.local/state/sbx/lima/theme" "$HOME/.local/state/sbx/lima/notify"
           limactl delete --force sbx-ci 2>/dev/null || true
-          limactl create --tty=false --name sbx-ci --param projects=ci-projects \
+          # One CPU, as Lima's own CI gives its `vz` guests on GitHub's runners ("--cpus=1 is needed
+          # for running vz on GHA", lima-vm/lima .github/workflows/test.yml). The template sets no
+          # CPU count, so this is the only place the run departs from what a user creates.
+          limactl create --tty=false --name sbx-ci --cpus=1 --param projects=ci-projects \
             "$GITHUB_WORKSPACE/dist/macos/sbx.yaml"
           limactl start --tty=false sbx-ci
 
@@ -292,10 +245,3 @@ jobs:
         if: always()
         run: |
           cat "$HOME/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-
-      - name: Remove the guest
-        # A self-hosted runner keeps its disk between runs, so the instance is this run's to clean
-        # up rather than the next run's to discover.
-        if: always()
-        run: |
-          limactl delete --force sbx-ci 2>/dev/null || true
