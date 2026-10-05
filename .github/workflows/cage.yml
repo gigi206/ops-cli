@@ -414,16 +414,9 @@ jobs:
           rc=0
           "$sbx" doctor </dev/null >"$out/doctor.txt" 2>"$out/doctor.err" || rc=$?
           cat "$out/doctor.txt" "$out/doctor.err"
-          # Either way the refused namespace is reported with its cause and the profile.
-          grep -Eq '\[warn\] capture +sbx cannot create the cage.s network namespace' "$out/doctor.txt" \
-            || fail "doctor did not report the refused namespace"
-          grep -q 'cause: AppArmor restricts unprivileged user namespaces' "$out/doctor.txt" \
-            || fail "doctor did not name the restriction"
-          grep -Fq "profile sbx \"$sbx\" flags=(unconfined) {" "$out/doctor.txt" \
-            || fail "doctor did not print a profile for $sbx"
-          rc_probe=0; "$sbx" __net-probe 2>"$out/probe.txt" || rc_probe=$?
-          [ "$rc_probe" = 3 ] \
-            || fail "__net-probe exited $rc_probe, expected 3: $(cat "$out/probe.txt")"
+          # The probe joins the namespace the host's bwrap creates, as a launch does.
+          rc_probe=0; "$sbx" __net-probe /usr/bin/bwrap "$(command -v nft)" 2>"$out/probe.txt" \
+            || rc_probe=$?
           # The default posture of an untrusted project, which is a filtering one.
           work="$(mktemp -d)"
           probe='printf "label: "; cat /proc/self/attr/current; echo
@@ -436,25 +429,36 @@ jobs:
             || rc_run=$?
           cat "$out/launch.txt" "$out/launch.err"
           if [ "$BWRAP_PROFILED" = true ]; then
-            # The boundary is proven through the host's bwrap; the launch runs proxy-only.
+            # The boundary is proven through the host's bwrap, and the holder joins the namespace
+            # that bwrap creates rather than creating one: the restriction refuses sbx a creation,
+            # never a join, so the launch captures with no profile for sbx.
             [ "$rc" = 0 ] || fail "doctor failed although the host's bwrap is profiled"
+            grep -Eq '\[ ok \] capture ' "$out/doctor.txt" \
+              || fail "capture is not ok although the host's bwrap is profiled"
+            [ "$rc_probe" = 0 ] \
+              || fail "__net-probe exited $rc_probe, expected 0: $(cat "$out/probe.txt")"
             [ "$rc_run" = 0 ] || fail "the filtered launch exited $rc_run"
-            grep -q 'a private network namespace could not be created' "$out/launch.err" \
-              || fail "the launch did not warn about the namespace it lost"
-            grep -qx 'interfaces: lo' "$out/launch.txt" \
-              || fail "the cage's namespace is not bwrap's empty one"
+            grep -q 'network namespace could not be' "$out/launch.err" \
+              && fail "the launch lost the namespace it configures"
+            grep -qx 'interfaces: dummy0,lo' "$out/launch.txt" || fail "the holder's namespace is missing"
             grep -qx 'proxied: 200' "$out/launch.txt" || fail "the proxy did not carry the request"
-            grep -q '^direct: 200' "$out/launch.txt" \
-              && fail "a proxy-blind client reached the network"
-            echo "proxy-only launch: as expected"
+            grep -qx 'direct: 200' "$out/launch.txt" || fail "a proxy-blind client was not routed"
+            echo "capturing launch with no sbx profile: as expected"
           else
             # No bwrap may create a capability-bearing namespace: the boundary fails, the launch is
-            # refused rather than started without one, and doctor does not claim a launch runs.
+            # refused rather than started without one, doctor does not claim a launch runs, and it
+            # prints the profile that lifts the restriction for sbx.
             [ "$rc" = 1 ] || fail "doctor exited $rc, expected 1 with no profiled bwrap"
             grep -Eq '\[FAIL\] user namespaces' "$out/doctor.txt" \
               || fail "doctor did not fail the boundary"
+            grep -Fq "profile sbx \"$sbx\" flags=(unconfined) {" "$out/doctor.txt" \
+              || fail "doctor did not print a profile for $sbx"
+            grep -Eq '\[warn\] capture +sbx cannot configure the cage.s network namespace' "$out/doctor.txt" \
+              || fail "doctor did not report the namespace it cannot configure"
             grep -Eq 'a launch (still filters|runs without capture)' "$out/doctor.txt" \
               && fail "doctor claims a launch runs"
+            [ "$rc_probe" = 3 ] \
+              || fail "__net-probe exited $rc_probe, expected 3: $(cat "$out/probe.txt")"
             [ "$rc_run" = 1 ] || fail "the launch exited $rc_run, expected a refusal (1)"
             grep -q 'no capability-bearing user namespace' "$out/launch.err" \
               || fail "the launch was not refused for the boundary"
@@ -462,6 +466,10 @@ jobs:
           fi
 
       - name: With the sbx profile doctor prints
+        # doctor prints the profile under the boundary it fails, which is the image whose bwrap
+        # carries no profile of its own; where the host's bwrap is profiled nothing is refused and
+        # nothing is printed.
+        if: ${{ !matrix.bwrap_profiled }}
         run: |
           set -euo pipefail
           sbx="$GITHUB_WORKSPACE/target/debug/sbx"
@@ -478,7 +486,7 @@ jobs:
           grep -Eq '\[ ok \] sandbox ' "$out/doctor.txt" \
             || fail "the boundary is not proven with the profile loaded"
           grep -Eq '\[ ok \] capture ' "$out/doctor.txt" || fail "capture is not ok with the profile loaded"
-          "$sbx" __net-probe || fail "the namespace is still refused with the profile loaded"
+          "$sbx" __net-probe /usr/bin/bwrap || fail "the namespace is still refused with the profile loaded"
           work="$(mktemp -d)"
           probe='printf "label: "; cat /proc/self/attr/current; echo
           printf "interfaces: "; tail -n +3 /proc/net/dev | cut -d: -f1 |
@@ -488,7 +496,7 @@ jobs:
           (cd "$work" && "$sbx" run -- sh -c "$probe") >"$out/launch.txt" 2>"$out/launch.err" || rc=$?
           cat "$out/launch.txt" "$out/launch.err"
           [ "$rc" = 0 ] || fail "the launch exited $rc with the profile loaded"
-          grep -q 'a private network namespace could not be created' "$out/launch.err" \
+          grep -q 'network namespace could not be' "$out/launch.err" \
             && fail "the launch still lost its namespace with the profile loaded"
           grep -qx 'interfaces: dummy0,lo' "$out/launch.txt" || fail "the holder's namespace is missing"
           grep -qx 'direct: 200' "$out/launch.txt" || fail "a proxy-blind client was not routed"
