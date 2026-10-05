@@ -123,7 +123,11 @@ jobs:
           # CPU count, so this is the only place the run departs from what a user creates.
           limactl create --tty=false --name sbx-ci --cpus=1 --param projects=ci-projects \
             "$GITHUB_WORKSPACE/dist/macos/sbx.yaml"
-          limactl start --tty=false sbx-ci
+          # `limactl start` waits ten minutes by default for the provisioning to finish, and one
+          # CPU installing the template's packages can take longer. The deadline is the host's
+          # wait, not the guest's shape. It stays well inside the job's own limit, so a start that
+          # gives up still leaves the step below the time to read the guest.
+          limactl start --tty=false --timeout=30m sbx-ci
 
       - name: The preflight must pass inside the guest
         run: |
@@ -240,6 +244,30 @@ jobs:
             *"is not visible inside the"*) echo "/tmp refused by name, as the wrapper documents" ;;
             *) echo "the launch failed, but not with the wrapper's refusal: $out"; exit 1 ;;
           esac
+
+      - name: Show where the guest stood, when a step failed
+        # `limactl start` gives up on its own deadline while the guest keeps running, so what the
+        # provisioning was doing at that moment can still be read. Lima's logs on the host show the
+        # boot; the guest's cloud-init log carries the provisioning scripts' output; the process
+        # list and the pending systemd jobs tell a script still working from one waiting on
+        # something that will not come.
+        if: failure()
+        run: |
+          set -uo pipefail
+          for f in "$HOME"/.lima/sbx-ci/ha.stderr.log "$HOME"/.lima/sbx-ci/serial*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f"
+            tail -n 80 "$f"
+            echo "::endgroup::"
+          done
+          echo "::group::/var/log/cloud-init-output.log in the guest"
+          limactl shell --workdir / sbx-ci sudo tail -n 150 /var/log/cloud-init-output.log || true
+          echo "::endgroup::"
+          echo "::group::processes and pending jobs in the guest"
+          limactl shell --workdir / sbx-ci sh -c \
+            'ps -eo pid,etimes,args | grep -E "[a]pt|[d]pkg|[c]url|[u]nattended|[c]loud-init"; systemctl list-jobs --no-pager' \
+            || true
+          echo "::endgroup::"
 
       - name: Publish the report
         if: always()
