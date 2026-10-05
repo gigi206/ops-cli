@@ -212,13 +212,18 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
 /// holder adopts that end close-on-exec: the command, which stands where the cage's bwrap stands
 /// in a launch, holds no descriptor onto it.
 ///
-/// The tap parses what the cage writes, so it runs caged: the command reads, from outside, what the
-/// tap and each of its threads hold. Every one of them is under its filter with no new privileges
-/// and no capability, and the tap sees a mount namespace of its own, not the holder's.
+/// The tap parses what the cage writes, so it runs caged: the command reads, from outside, what
+/// each of the tap's threads holds and which mounts the tap sees. Every thread is under its filter
+/// with no new privileges and no capability, and the tap's mounts hold the egress socket its cage
+/// binds, which the holder's do not. The mounts are read from `mountinfo`, which any process may
+/// read, rather than compared through the namespace link, which takes a ptrace read access the
+/// command does not have on every host.
 ///
 /// A tap that did not start or did not come up fails this test rather than skipping it. The
 /// environment gaps the capture has say so in their own words, and still skip: a kernel that
-/// refuses the redirect rules, and one without the `dummy` module, which leaves no route.
+/// refuses the redirect rules, and one without the `dummy` module, which leaves no route. So does a
+/// holder or a cage that never ran the command. A command that ran and then failed is this test's
+/// failure: its first line says it ran.
 #[test]
 fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     let python = std::path::Path::new("/usr/bin/python3");
@@ -263,6 +268,7 @@ fn the_tap_answers_a_query_to_the_cages_resolver_over_udp() {
     }
     let query = r#"
 import os, socket, struct, sys, time
+print("ran", flush=True)
 q = struct.pack(">HHHHHH", 0x5b5b, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 1, 1)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(3)
@@ -300,7 +306,11 @@ else:
     for task in sorted(os.listdir(f"/proc/{tap}/task")):
         fields = dict(l.split(":\t", 1) for l in open(f"/proc/{tap}/task/{task}/status").read().splitlines() if ":\t" in l)
         print("thread", fields["NoNewPrivs"], fields["Seccomp_filters"], fields["CapEff"])
-    own = os.readlink(f"/proc/{tap}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
+    # The mount points each process sees, relative to its own root: the tap's cage binds the egress
+    # socket at `/egress.sock`, and the holder, become bwrap, sees the host's mounts.
+    def mounts(pid):
+        return [line.split()[4] for line in open(f"/proc/{pid}/mountinfo")]
+    own = "/egress.sock" in mounts(tap) and "/egress.sock" not in mounts(os.getppid())
     print("tap mount", "own" if own else "shared")
 held = False
 for fd in os.listdir("/proc/self/fd"):
@@ -344,28 +354,30 @@ print("report fd", "held" if held else "closed")
             "the capture tap must stand up: {stderr}"
         );
     }
-    if !out.status.success() || stderr.contains("transparent capture unavailable") {
+    // Only a holder or a cage that never ran the command is a gap of this host's. A command that
+    // ran and then failed is this test's failure, whatever it wrote.
+    if stderr.contains("transparent capture unavailable") || !stdout.starts_with("ran\n") {
         skip_incapable!(
-            "skipping tap DNS e2e: the holder, the redirect or its route did not stand up ({})",
+            "skipping tap DNS e2e: the holder, the redirect or its route did not stand up ({}{})",
+            stdout,
             stderr.trim()
         );
         return;
     }
-    if stdout.starts_with(&format!("error {} ", libc::ENETUNREACH)) {
+    assert!(
+        out.status.success(),
+        "the command ran and failed ({}): {stdout}{stderr}",
+        out.status
+    );
+    let reply = stdout.lines().nth(1).unwrap_or_default();
+    if reply.starts_with(&format!("error {} ", libc::ENETUNREACH)) {
         skip_incapable!(
             "skipping tap DNS e2e: no route to the resolver (dummy module unavailable?)"
         );
         return;
     }
     // One address, out of the tap's own range (`198.18.0.0/15`).
-    let answered = match stdout
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    let answered = match reply.split_whitespace().collect::<Vec<_>>().as_slice() {
         ["answer", "1", addr] => addr.starts_with("198.18.") || addr.starts_with("198.19."),
         _ => false,
     };
@@ -399,6 +411,6 @@ print("report fd", "held" if held else "closed")
     }
     assert!(
         stdout.lines().any(|l| l == "tap mount own"),
-        "the tap must not see the holder's mount namespace: {stdout}"
+        "the tap must see its cage's mounts, not the holder's: {stdout}"
     );
 }
