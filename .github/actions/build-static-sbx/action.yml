@@ -31,7 +31,10 @@ inputs:
       The tag the binary is published under (`latest`, `nightly`, `v1.2.3`). Stamped into the build
       with the commit and the repository, so `sbx --version` names the release and `sbx upgrade
       self` knows which one to follow; a build without the stamp is a build from source. Passed by
-      each caller because only the caller knows where it publishes.
+      each caller because only the caller knows where it publishes. A build no release serves
+      passes `unpublished` and carries no stamp, as a build from source does. GitHub does not
+      enforce `required` on an action's input (actions/runner#1070), so the first step refuses an
+      empty value: one forgotten would otherwise reach the compile as an empty tag and fail there.
     required: true
   nixpkgs-rev:
     description: >
@@ -63,6 +66,16 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Check the release tag
+      shell: bash
+      env:
+        TAG: ${{ inputs.release-tag }}
+      run: |
+        if [ -z "$TAG" ]; then
+          echo "release-tag is required: the tag the binary is published under, or \`unpublished\`" >&2
+          exit 1
+        fi
+
     - name: Install Rust (with the musl target)
       uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
       with:
@@ -179,19 +192,23 @@ runs:
 
     # The release stamp rides this step alone. The unit gate above compiles without it, as every
     # build from source does, and `src/release.rs` refuses a stamp that is partial or malformed, so
-    # a bad value fails here rather than shipping.
+    # a bad value fails here rather than shipping. An `unpublished` build exports none of the three:
+    # `option_env!` reads a variable set to the empty string as a value, not as an absence.
     - name: Build the bundled static musl binary
       shell: bash
       env:
         SBX_BUNDLED_NIX: ${{ steps.nix.outputs.path }}
         SBX_BUNDLED_BWRAP: ${{ steps.bwrap.outputs.path }}
-        SBX_RELEASE_TAG: ${{ inputs.release-tag }}
-        SBX_RELEASE_COMMIT: ${{ github.sha }}
-        SBX_RELEASE_REPO: ${{ github.repository }}
+        TAG: ${{ inputs.release-tag }}
+        COMMIT: ${{ github.sha }}
+        REPO: ${{ github.repository }}
         TARGET: ${{ inputs.target }}
         ASSET: ${{ inputs.asset }}
       run: |
         set -euo pipefail
+        if [ "$TAG" != unpublished ]; then
+          export SBX_RELEASE_TAG="$TAG" SBX_RELEASE_COMMIT="$COMMIT" SBX_RELEASE_REPO="$REPO"
+        fi
         cargo zigbuild --release --target "$TARGET" \
           --features bundled-nix,bundled-bwrap
         cp "target/$TARGET/release/sbx" "$ASSET"
@@ -217,13 +234,22 @@ runs:
         if [ -e "$knob" ]; then
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         fi
-        # The stamp must be in the binary that ships, not merely in the step that built it.
+        # The stamp must be in the binary that ships, not merely in the step that built it, and
+        # absent from one no release serves.
         version="$("./$ASSET" --version)"
         echo "$version"
-        case "$version" in
-          "sbx "*" ($TAG, ${COMMIT:0:7})") ;;
-          *) echo "the binary does not name its release ($TAG, ${COMMIT:0:7})" >&2; exit 1 ;;
-        esac
+        if [ "$TAG" = unpublished ]; then
+          case "$version" in
+            "sbx "*" ("*) echo "an unpublished build names a release: $version" >&2; exit 1 ;;
+            "sbx "*) ;;
+            *) echo "unexpected version line: $version" >&2; exit 1 ;;
+          esac
+        else
+          case "$version" in
+            "sbx "*" ($TAG, ${COMMIT:0:7})") ;;
+            *) echo "the binary does not name its release ($TAG, ${COMMIT:0:7})" >&2; exit 1 ;;
+          esac
+        fi
         data="$(mktemp -d /tmp/sbx.XXXXXX)"
         log="$RUNNER_TEMP/doctor.log"
         SBX_DATA_DIR="$data" "./$ASSET" doctor </dev/null | tee "$log"
