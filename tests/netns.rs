@@ -77,6 +77,78 @@ fn holder_dump() -> Option<(String, String)> {
     Some((dev, route.to_string()))
 }
 
+/// The holder reads bwrap's `--info-fd` report to its end before it closes the pipe.
+///
+/// bwrap writes the report in several writes: the child's pid, each namespace id, the closing
+/// brace. The pid is complete once the first namespace id follows it, and a holder that closed the
+/// pipe then left bwrap's next write facing no reader. bwrap runs with `SIGPIPE` at its default, so
+/// it died of the signal and the cage with it, before running anything — on a loaded host only,
+/// where the holder won that race. A stand-in for bwrap makes the race certain: it runs the
+/// real one, then writes its report in the same pieces with a pause after the first namespace id.
+#[test]
+fn the_holder_waits_for_the_whole_bwrap_report() {
+    let Some(bwrap) = common::bwrap_on_path() else {
+        skip_incapable!("skipping the bwrap report race: no bwrap on PATH");
+        return;
+    };
+    let dir = TmpDir::new("netns-report");
+    let report = dir.join("report");
+    let slow = dir.join("slow-bwrap");
+    let script = format!(
+        r#"#!/bin/bash
+[ "$1" = --info-fd ] && [ "$3" = --block-fd ] || exit 99
+info=$2; block=$4; shift 4
+"{bwrap}" --info-fd 9 --block-fd "$block" "$@" 9>"{report}" &
+bw=$!
+until grep -q '}}' "{report}" 2>/dev/null; do sleep 0.01; done
+whole=$(cat "{report}")
+pid_part=${{whole%%,*}}
+rest=${{whole#"$pid_part"}}
+tail_ns=${{rest#,}}; first_ns=",${{tail_ns%%,*}}"
+printf '%s' "$pid_part" >&"$info"
+printf '%s' "$first_ns" >&"$info"
+sleep 1
+printf '%s\n' "${{rest#"$first_ns"}}" >&"$info"
+eval "exec $info>&-"
+wait $bw
+"#,
+        bwrap = bwrap.display(),
+        report = report.display(),
+    );
+    std::fs::write(&slow, script).expect("write the stand-in");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+    }
+    let cmd = ["/bin/sh", "-c", "echo ran"].map(OsString::from);
+    let mut argv = holder_argv(&bwrap, &cmd);
+    argv[0] = slow.clone().into();
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["__netns-holder", "--"])
+        .args(argv)
+        .output()
+        .expect("spawn sbx __netns-holder");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("could not be joined") {
+        skip_incapable!(
+            "skipping the bwrap report race: the holder could not join the namespace ({})",
+            stderr.trim()
+        );
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "bwrap must outlive the end of its own report, not die of SIGPIPE ({}): {stderr}",
+        out.status
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "ran",
+        "{stderr}"
+    );
+}
+
 #[test]
 fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
     let Some((dev, route)) = holder_dump() else {

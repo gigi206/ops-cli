@@ -420,7 +420,7 @@ fn configure(holder: libc::pid_t, info: OwnedFd, block: OwnedFd, tap: Option<&Ta
             release(block);
         }
     };
-    drop(info);
+    finish_report(info);
     if let Err(e) = join_netns(child) {
         unconfigured(
             tap.is_some(),
@@ -582,6 +582,52 @@ fn read_child_pid(info: &OwnedFd, timeout: std::time::Duration) -> io::Result<li
                 }
             }
             n => seen.extend_from_slice(&buf[..n.unsigned_abs()]),
+        }
+    }
+}
+
+/// Read the rest of bwrap's `--info-fd` report, to its end, before the reading end is closed.
+///
+/// bwrap writes the report in several writes — the child's pid, then the ids of its namespaces,
+/// then the closing brace — and the pid is all [`read_child_pid`] waits for. A reading end closed
+/// after the first would have bwrap's next write meet a pipe with no reader, and the holder hands
+/// bwrap `SIGPIPE` at its default ([`super::memfd::default_signals_across_exec`]): bwrap, and the
+/// cage with it, would die of the signal before running anything, whenever the configurer won the
+/// race. bwrap closes its end once the report is written, so the end is near; a report that does
+/// not end within [`CHILD_PID_TIMEOUT`] leaves the reading end open for the rest of this process
+/// rather than closed under a bwrap still writing.
+fn finish_report(info: OwnedFd) {
+    let deadline = std::time::Instant::now() + CHILD_PID_TIMEOUT;
+    let mut buf = [0u8; 512];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut pfd = libc::pollfd {
+            fd: info.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: `pfd` is one live `pollfd` the call reads and writes.
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready == 0 || left.is_zero() {
+            std::mem::forget(info);
+            return;
+        }
+        if ready < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            std::mem::forget(info);
+            return;
+        }
+        // SAFETY: `buf` is a live buffer of the length passed.
+        let n = unsafe { libc::read(info.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n == 0 {
+            return;
+        }
+        if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            std::mem::forget(info);
+            return;
         }
     }
 }
@@ -755,7 +801,7 @@ pub(crate) fn run_probe(argv: &[OsString]) -> ! {
         refused(&format!("__net-probe: {e}"));
     }
     let _ = unprivileged_for(Path::new(bwrap));
-    let (mut cage, pid, block) = match throwaway_cage(Path::new(bwrap)) {
+    let (mut cage, pid, block, info) = match throwaway_cage(Path::new(bwrap)) {
         Ok(started) => started,
         Err(e) => refused(&format!(
             "bubblewrap did not start a sandbox to probe ({e})"
@@ -774,10 +820,12 @@ pub(crate) fn run_probe(argv: &[OsString]) -> ! {
         },
     };
     // Killed while it still waits on the block pipe, which is closed only after: the command it was
-    // given never runs.
+    // given never runs. The info pipe is held as long, so bwrap never writes its report to a pipe
+    // with no reader ([`finish_report`]).
     let _ = cage.kill();
     let _ = cage.wait();
     drop(block);
+    drop(info);
     match verdict {
         Ok(()) => std::process::exit(0),
         Err((code, why)) => {
@@ -788,8 +836,10 @@ pub(crate) fn run_probe(argv: &[OsString]) -> ! {
 }
 
 /// Start `bwrap` with the namespaces a cage gets and hold it before its command, returning
-/// it, its child's pid, and the block pipe's write end that holds it.
-fn throwaway_cage(bwrap: &Path) -> io::Result<(std::process::Child, libc::pid_t, OwnedFd)> {
+/// it, its child's pid, the block pipe's write end that holds it, and the info pipe's reading end.
+fn throwaway_cage(
+    bwrap: &Path,
+) -> io::Result<(std::process::Child, libc::pid_t, OwnedFd, OwnedFd)> {
     let (info_r, info_w, block_r, block_w) = sync_pipes()?;
     let argv = with_sync_fds(
         &[
@@ -818,7 +868,7 @@ fn throwaway_cage(bwrap: &Path) -> io::Result<(std::process::Child, libc::pid_t,
     drop(info_w);
     drop(block_r);
     match read_child_pid(&info_r, CHILD_PID_TIMEOUT) {
-        Ok(pid) => Ok((cage, pid, block_w)),
+        Ok(pid) => Ok((cage, pid, block_w, info_r)),
         Err(e) => {
             let _ = cage.kill();
             let said = cage
