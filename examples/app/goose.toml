@@ -11,6 +11,9 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/sigstore.toml
+#
 # Goose is a general-purpose, multi-provider AI agent written in Rust. It ships as a
 # self-contained release binary (no node, no runtime deps) distributed on GitHub releases;
 # sbx equips it fresh from upstream via mise's `aqua` backend, which selects the right asset
@@ -57,7 +60,7 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle goose`, and what the
 # launch ends up with via `sbx config show --app goose`.
 allow = [
-    # Nothing here: the Sigstore lane (`*.sigstore.dev`), which mise reaches at install time to
+    # Nothing here: the Sigstore lane (`@sigstore`), which mise reaches at install time to
     # verify the release's artifact attestations, arrives with the bundle and is unioned in at
     # resolution. The binary download itself (github.com + release-assets.githubusercontent.com)
     # rides the built-in github allow-set.

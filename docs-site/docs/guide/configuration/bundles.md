@@ -357,14 +357,14 @@ The 69 shipped bundles, and what each carries:
 | `droid` | 2 (`mise:`, `nix:`) | 10 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `freebuff` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 22 egress entries, an `appimage:` resolver | `chromium-background`, `chromium-spellcheck`, `github`, `github-api`, `google-signin-incage`, `npm-audit`, `npm-jsr`, `npm-runtime` |
-| `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
+| `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | `sigstore` |
 | `goose-desktop` | 1 (`deb:`) | 1 egress entry, 2 env vars | `chromium-spellcheck` |
 | `grok` | 1 (`binary:`) | 3 egress entries, 1 env var, a `binary:` resolver | none |
 | `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `huggingface-hub`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 22 egress entries, 1 env var, an install step | `chromium-background`, `chromium-spellcheck`, `google-signin-incage`, `huggingface-hub`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry`, `openrouter` |
 | `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
 | `junie` | 2 (`mise:`, `nix:`) | 8 egress entries, 1 env var, an install step | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
+| `kilocode` | 1 (`mise:`) | 5 egress entries | `models-catalog`, `sigstore` |
 | `kimi` | 2 (`mise:`, `nix:`) | 9 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `kiro` | 2 (`nix:`) | 34 egress entries, 2 env vars, an install step | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `kiro-desktop` | 2 (`nix:`, `tarball:`) | 32 egress entries, 1 env var, a `tarball:` resolver | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |

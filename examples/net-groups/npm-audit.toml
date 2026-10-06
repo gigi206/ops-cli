@@ -7,17 +7,19 @@
 #
 # The vulnerability lookup that follows every install: denied by the deny-by-default posture, and
 # muted so its refusals do not drown the actionable ones in `sbx net logs` (still denied, still
-# counted in `sbx net stats`). Three hosts, one lane — the registry's own advisories endpoint,
-# `api.osv.dev`, the OSV database an install lane reaches for the same answer, and
-# `api.npmjs.org`, the registry's companion API the same lane calls beside it. Refusing all three
-# is not a degraded install — the packages land either way, and what is refused is a report about
-# them.
+# counted in `sbx net stats`). Four hosts, one lane — the registry's own advisories endpoint,
+# `api.osv.dev`, the OSV database an install lane reaches for the same answer,
+# `api.npmjs.org`, the registry's companion API the same lane calls beside it, and
+# `endevco.github.io`, where the npm installer mise embeds (aube) fetches its OSV bloom filter
+# (`/osv-bloom/manifest.json`, `/osv-bloom/filter.bin`) before it asks `api.osv.dev`. Refusing
+# all four is not a degraded install — the packages land either way, and what is refused is a
+# report about them.
 #
-# The osv.dev and api.npmjs.org entries are bare hosts on purpose. `@npm-registry` opens
-# `registry.npmjs.org` and names no other host, so neither is reached by it, and a method-scoped
-# `{GET}` rule would leave the refusal standing: osv.dev's traffic is not a GET, and the shape of
-# the api.npmjs.org call is the client's to change between releases. A bare host mutes the lane
-# whatever verb it picks.
+# The osv.dev, api.npmjs.org and endevco.github.io entries are bare hosts on purpose.
+# `@npm-registry` opens `registry.npmjs.org` and names no other host, so none of the three is
+# reached by it, and a method-scoped `{GET}` rule would leave the refusal standing: osv.dev's
+# traffic is not a GET, and the shape of the other two calls is the client's to change between
+# releases. A bare host mutes the lane whatever verb it picks.
 #
 # Companion of the `npm-registry` allow group — the two are separate because a group expands into
 # the list that references it, so an allow and a mute cannot share one group. Groups are
@@ -28,4 +30,5 @@ entries = [
     "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
     "api.osv.dev",
     "api.npmjs.org",
+    "endevco.github.io",
 ]

@@ -13,6 +13,7 @@
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/sigstore.toml
 #
 # The tool is equipped fresh from upstream: mise's `github` backend pulls Kilo Code's
 # standalone release binary (`kilo-linux-x64.tar.gz`) — verified by GitHub artifact

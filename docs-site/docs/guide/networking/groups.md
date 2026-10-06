@@ -193,12 +193,13 @@ group opens what it carries, a `mute` group keeps refusals out of the default
 | `google-signin-incage` | allow | 9 entries | Signing in with Google in a browser inside the cage: the country-domain consent and cookie step, the token endpoint, the page's script client and its assets. |
 | `huggingface-hub` | allow | 2 entries | Model downloads from the Hugging Face Hub: the metadata on `huggingface.co` and the files on its Xet CDN, `GET` and `HEAD` only. |
 | `models-catalog` | allow | 2 entries | The model catalogue (`models.dev`, and the copy OpenCode reads), read only. |
-| `npm-audit` | mute | 3 entries | The vulnerability lookup npm sends after an install, kept denied and out of the default log. |
+| `npm-audit` | mute | 4 entries | The vulnerability lookup npm sends after an install, kept denied and out of the default log. |
 | `npm-jsr` | mute | 1 entry | The JSR mirror an npm install probes while it resolves a tree, kept denied and out of the default log. |
 | `npm-registry` | allow | 1 entry | The npm install lane: `registry.npmjs.org`, `GET` only. |
 | `npm-runtime` | allow | 1 entry | `registry.npmjs.org` for every verb, for the agents that pull packages at runtime. |
 | `openrouter` | allow | 1 entry | The OpenRouter API, a provider you choose; the key stays in the app's own `[secret]` block. |
 | `pypi` | allow | 2 entries | The Python install lane: the index and its file host, `GET` only. |
+| `sigstore` | allow | 1 entry | The Sigstore trust root mise reads to verify a release's artifact attestations before it installs it, `GET` only. |
 
 A group lists what the apps referencing it share, not everything they reach. When one
 app needs more than its group, it writes the extra rule beside the reference, and the

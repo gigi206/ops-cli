@@ -1,0 +1,21 @@
+# `sigstore` — a shared egress GROUP, not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list.
+#
+#   sbx net groups import examples/net-groups/sigstore.toml
+#   # then in an app's or bundle's allow list:   "@sigstore"
+#
+# The Sigstore trust root mise reads to verify a release's artifact attestations. An `aqua:` tool
+# whose registry entry declares them, or a `github:` release that publishes them, is checked
+# before it is installed, and the check starts by loading Sigstore's TUF repository from
+# `tuf-repo-cdn.sigstore.dev`. Refused, it fails the install outright (`TUF repository load failed:
+# transport error: timestamp.json not found`): the attestation is a gate, not a report.
+#
+# Read-only: `GET` on the one host the verification reaches. The attestation itself travels with
+# the release, so verifying it contacts neither the transparency log nor the certificate
+# authority. Groups are global-only (like bundles): an app's or bundle's lists may reference one,
+# a project may not define one.
+
+entries = [
+    "{GET} https://tuf-repo-cdn.sigstore.dev",
+]
