@@ -119,11 +119,11 @@ allow = [
     #"{*} https://mcp.exa.ai",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the vendor's installer and
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): the vendor's installer and
 # docs hosts — sbx owns updates here (`sbx upgrade mise`), so the self-update channel is refused on
 # purpose — and the tool backends left denied just above. A `mute` never changes the verdict (they
 # stay refused) and never hides a count (`sbx net stats` still tallies them). See everything with
-# `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a cortex`.
+# `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a cortex`.
 mute = [
     # Nothing here: the vendor installer/docs hosts and the optional tool backends are muted by
     # the bundle.

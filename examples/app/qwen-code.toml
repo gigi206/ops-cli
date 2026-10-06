@@ -128,10 +128,10 @@ allow = [
     #"{*} https://generativelanguage.googleapis.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): telemetry we
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): telemetry we
 # deliberately leave DENIED. A `mute` never changes the verdict (still refused) and never
 # hides a count (`sbx net stats` still tallies it); it only keeps the line out of the
-# default log. See it anytime with `sbx net log --all`, and edit from the CLI with
+# default log. See it anytime with `sbx net logs --all`, and edit from the CLI with
 # `sbx net mute|unmute <host> -a qwen-code`. Remove the entry here the day you allow it.
 mute = [
     # Aliyun Real User Monitoring (RUM) beacon the CLI emits in the background. Upstream

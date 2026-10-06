@@ -57,7 +57,7 @@
 # the cage) for the two most common providers; uncomment and provide the host env var
 # to enable. For any other provider, configure it in the Settings UI — the proxy will
 # name the host it blocked, and you open just that one with `sbx net allow -a odysseus
-# <url>` (watch `sbx net log -a odysseus` on first use).
+# <url>` (watch `sbx net logs -a odysseus` on first use).
 #
 # DEGRADED SERVICES (vs the full Docker stack). The compose bundles ChromaDB
 # (vector memory), SearXNG (web search), and ntfy (notifications) as separate

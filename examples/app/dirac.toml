@@ -115,11 +115,11 @@ allow = [
     #"{*} https://api.cerebras.ai",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): Dirac's telemetry proxy
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): Dirac's telemetry proxy
 # and the PostHog hosts behind it, plus npm's audit endpoint. A `mute` never changes the verdict
 # (they stay refused) and never hides a count (`sbx net stats` still tallies them); it only keeps the
 # lines out of the default log, so the refusals worth acting on stay visible. See everything with
-# `sbx net log --all`; edit this list with `sbx net mute|unmute <rule> -a dirac`.
+# `sbx net logs --all`; edit this list with `sbx net mute|unmute <rule> -a dirac`.
 mute = [
 ]
 

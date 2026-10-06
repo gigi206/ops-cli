@@ -332,7 +332,7 @@ verdict ahead of time with `sbx test net <url>` (or `--method POST`).
 
 A `mute` entry is the SELinux `dontaudit` analogue: it keeps a **denied** request's line out of the
 default log without changing the verdict and without hiding the count. The host stays denied, `sbx
-net stats` still tallies it, and `sbx net log --all` still shows it. Use it for the background
+net stats` still tallies it, and `sbx net logs --all` still shows it. Use it for the background
 telemetry a packaged app emits on every launch, not for anything whose refusal you would want to
 see.
 

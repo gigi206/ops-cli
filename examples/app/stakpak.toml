@@ -89,13 +89,13 @@ allow = [
     #"{*} https://api.openai.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the chat integrations the
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): the chat integrations the
 # binary can post to (Slack, Discord, Telegram — it reads `STAKPAK_BOT_TOKEN`, `STAKPAK_CHAT_ID`,
 # `STAKPAK_DISCORD_TOKEN` for them). They are muted because **this profile does not wire any of
 # them**; if you enable one, add its host to `allow` above AND drop its line here, or the refusal
 # will be silent and the integration will look broken for no visible reason. A `mute` never changes
 # the verdict (they stay refused) and never hides a count (`sbx net stats` still tallies them). See
-# everything with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a stakpak`.
+# everything with `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a stakpak`.
 mute = [
 ]
 

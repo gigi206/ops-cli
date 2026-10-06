@@ -28,7 +28,7 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 mute = [
-    "telemetry.jcode.sh",  # install/session/feedback events (denied); see `sbx net log --all`
+    "telemetry.jcode.sh",  # install/session/feedback events (denied); see `sbx net logs --all`
 ]
 
 [env]

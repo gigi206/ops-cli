@@ -94,10 +94,10 @@ allow = [
     #"{GET} https://static.qoder.com.cn",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint, and
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit endpoint, and
 # the vendor's download host, which serves the shell-installer channel sbx deliberately does not use
 # (`sbx upgrade mise` owns updates here). A `mute` never changes the verdict (they stay refused) and
-# never hides a count. See everything with `sbx net log --all`; edit with
+# never hides a count. See everything with `sbx net logs --all`; edit with
 # `sbx net mute|unmute <rule> -a qoder`.
 mute = [
 ]

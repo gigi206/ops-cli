@@ -110,10 +110,10 @@ allow = [
     "@github-oauth",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the telemetry and
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): the telemetry and
 # experimentation endpoints, which nothing above allows. A `mute` never changes the verdict and
 # never hides a count (`sbx net stats` still tallies it); it only keeps the lines out of the default
-# log, so the refusals worth acting on stay visible. See everything with `sbx net log --all`, and
+# log, so the refusals worth acting on stay visible. See everything with `sbx net logs --all`, and
 # edit this list from the CLI with `sbx net mute|unmute <host> -a copilot`.
 #
 # One nuance, measured rather than assumed: `copilot-telemetry.githubusercontent.com` sits under

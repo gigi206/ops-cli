@@ -250,18 +250,14 @@ allow = [
     # A DIRECT provider for the co-worked agent, rather than its own gateway, is already covered by
     # the provider hosts above (Anthropic / OpenAI / OpenRouter / DeepSeek) — configure the key in
     # that CLI's own config inside this app's isolated home.
-    # "Login with Google" for Gemini (instead of an API key) needs the Google OAuth hosts. Because the
-    # login runs in the IN-CAGE browser, use the locale-bounded accounts regex — it covers the whole
-    # cross-domain flow (accounts.google.com auth → accounts.google.<cctld>/SetSID on your country
-    # domain), works in any locale, and is anchored so a look-alike (accounts.google.com.evil.com) is
-    # refused — the same pattern claude-desktop / hermes-desktop / vibe use — plus Google's asset/avatar
-    # hosts. (accounts.youtube.com's CheckConnection is non-essential; `@chromium-background` mutes it.)
-    #'{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    #"{*} https://oauth2.googleapis.com",
-    #"{*} https://apis.google.com",
-    #"{GET} https://ssl.gstatic.com",
-    #"{GET} https://www.gstatic.com",
-    #"{GET} https://lh3.googleusercontent.com",
+    # "Login with Google" for Gemini (instead of an API key) needs the Google OAuth hosts. The login
+    # runs in the IN-CAGE browser, so it takes the shared in-cage sign-in lane the desktop profiles
+    # use: the locale-bounded, anchored accounts regex (the consent and the `/SetSID` step on your
+    # country domain, never a look-alike such as accounts.google.com.evil.com), the token endpoint
+    # and the page's assets. Import the group before uncommenting the line:
+    #     sbx net groups import examples/net-groups/google-signin-incage.toml
+    # (accounts.youtube.com's CheckConnection is non-essential; `@chromium-background` mutes it.)
+    #"@google-signin-incage",
     # A provider that uses a realtime/streaming WebSocket (some voice/live modes) needs `{WS}` on its
     # host, e.g. change its line above to `{*,WS} https://api.openai.com`.
     #

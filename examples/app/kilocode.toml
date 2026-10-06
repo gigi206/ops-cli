@@ -70,13 +70,13 @@ allow = [
   #"{*} https://openrouter.ai",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): hosts we deliberately
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): hosts we deliberately
 # leave DENIED and do NOT want to hear about. Here Kilo Code's PostHog product telemetry (POST
 # /batch/), which a live run hits periodically and whose `denied-default` lines would clutter the
 # ones worth acting on. `*.i.posthog.com` is regional (apex + subdomains muted together, spoof-safe).
 # A `mute` never changes the verdict (the telemetry is still refused) and never hides a count
 # (`sbx net stats` still tallies it); it only keeps the line out of the default log. See it
-# anytime with `sbx net log --all`, and edit this list from the CLI with `sbx net mute|unmute
+# anytime with `sbx net logs --all`, and edit this list from the CLI with `sbx net mute|unmute
 # <host> -a kilocode`. Remove the entry here the day you decide to allow the endpoint.
 #
 # Not here: `supermassive-black-hole.kiloapps.io` (Kilo's session-export / cloud-sync ingest) is

@@ -192,8 +192,8 @@ agent-browser = "mise:npm:agent-browser"
 [network]
 mode = "deny"
 # npm's audit POST fires on every install and is refused (it is not in `allow`). The verdict is
-# unchanged — this only keeps the noise out of the default `sbx net log`, SELinux `dontaudit`-style.
-# Still visible with `sbx net log --all`.
+# unchanged — this only keeps the noise out of the default `sbx net logs`, SELinux `dontaudit`-style.
+# Still visible with `sbx net logs --all`.
 mute = []
 # The agent's OWN hosts arrive with its bundle (`use` above) and are unioned into this list at
 # resolution. Check the union with `sbx config show --app hermes`.

@@ -1215,7 +1215,7 @@ pub(crate) struct EgressPolicy {
     deny: Vec<Rule>,
     /// Log-suppression rules (SELinux `dontaudit`): a **denied** request matching one of these is
     /// still refused and still counted in `sbx net stats`, but its refusal is kept out of the
-    /// default `sbx net log` view (`sbx net log --all` shows it). Consulted only at logging time via
+    /// default `sbx net logs` view (`sbx net logs --all` shows it). Consulted only at logging time via
     /// [`Self::muted`], never in [`Self::explain`] — so a mute entry can never change a verdict.
     mute: Vec<Rule>,
     default_action: DefaultAction,
@@ -1478,7 +1478,7 @@ impl EgressPolicy {
 
     /// Attach the log-suppression (`mute`) rules, returning the policy (builder style). A denied
     /// request matching one is refused as usual and counted in stats, but kept out of the default
-    /// `sbx net log` view. Purely a logging filter — never consulted by [`Self::explain`].
+    /// `sbx net logs` view. Purely a logging filter — never consulted by [`Self::explain`].
     pub(crate) fn with_mute(mut self, mute: Vec<Rule>) -> Self {
         self.mute = mute;
         self
@@ -1713,7 +1713,7 @@ impl EgressPolicy {
     /// [`Self::explain`] does). The proxy consults it at logging time, after the verdict, and still
     /// counts a muted refusal in `sbx net stats`.
     ///
-    /// It decides **two** surfaces, not one: whether the refusal enters the default `sbx net log`
+    /// It decides **two** surfaces, not one: whether the refusal enters the default `sbx net logs`
     /// view, and whether it is announced as a desktop notification. Both are gated on the same
     /// answer, at the same chokepoint, so a host quieted in the log is quieted on the desktop too.
     ///

@@ -68,7 +68,7 @@ mute = [
     "*.sentry.io",                    # page telemetry (Mistral console and auth pages)
     "static.cloudflareinsights.com",  # Cloudflare web-analytics beacon
     # NOT muted on purpose: `widget.intercom.io` (the support-chat widget, unused from the CLI). It
-    # is refused by the allowlist and hits once, so leaving it VISIBLE in `sbx net log` is more
+    # is refused by the allowlist and hits once, so leaving it VISIBLE in `sbx net logs` is more
     # useful than hiding it.
 ]
 

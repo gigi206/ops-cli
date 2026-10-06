@@ -81,8 +81,8 @@ allow = [
     "@google-signin-incage",
     # (cache.nixos.org — the nix binary cache — is already in sbx's built-in allow-set.)
 ]
-# Refusals to keep out of the default `sbx net log`. A `mute` never changes the verdict and never
-# hides a count; `sbx net log --all` shows the line, tagged `muted`.
+# Refusals to keep out of the default `sbx net logs`. A `mute` never changes the verdict and never
+# hides a count; `sbx net logs --all` shows the line, tagged `muted`.
 mute = [
     # npm's audit POST on every install of the browser driver.
     "@npm-audit",

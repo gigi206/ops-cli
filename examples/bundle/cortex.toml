@@ -29,7 +29,7 @@ allow = [
     # The vendor's own service — model traffic and account.
     "{*} https://api.cortex.foundation",
 ]
-# Refusals to keep out of the default `sbx net log`: the vendor's installer and docs hosts (sbx owns
+# Refusals to keep out of the default `sbx net logs`: the vendor's installer and docs hosts (sbx owns
 # updates here through `sbx upgrade mise`, so the self-update channel is refused on purpose), and
 # the optional tool backends the app leaves denied. A `mute` never changes the verdict.
 mute = [

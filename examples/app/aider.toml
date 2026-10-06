@@ -147,7 +147,7 @@ allow = [
     #"{*} https://generativelanguage.googleapis.com",
 ]
 # Silence the DENIED analytics: aider posts usage events to PostHog, refused by the allowlist
-# (`denied-default`). `mute` keeps those refusals out of the default `sbx net log` (still
+# (`denied-default`). `mute` keeps those refusals out of the default `sbx net logs` (still
 # denied, still counted in `sbx net stats`; see them with `--all`). Aider disables PostHog
 # automatically when the post fails, so the first-run consent question still behaves.
 mute = [

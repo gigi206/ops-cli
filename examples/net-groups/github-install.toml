@@ -6,8 +6,7 @@
 #   # then in an app's or bundle's allow list:   "@github-install"
 #
 # The GitHub GET install lane: the source/release hosts every `mise:github:` backend fetches from,
-# opened `{GET}`-only — shared by `autohand`, `command-code`, `crush`, `traycer` and
-# `traycer-desktop`. (The built-in allow-set already covers the read-only GitHub lanes; these are
+# opened `{GET}`-only. (The built-in allow-set already covers the read-only GitHub lanes; these are
 # the explicit belt-and-suspenders declarations the profiles shipped.) Groups are global-only (like
 # bundles): an app's or bundle's lists may reference one, a project may not define one.
 

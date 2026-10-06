@@ -648,7 +648,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
                 o,
                 "    {}",
                 style::dim_prose(
-                    "mute (refusals kept out of `sbx net log`; see `--all`):",
+                    "mute (refusals kept out of `sbx net logs`; see `--all`):",
                     pal
                 )
             );

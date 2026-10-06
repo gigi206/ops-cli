@@ -49,12 +49,12 @@
 # browser (`sbx app run kiro -- chat`; the token refresh hits the already-allowed `oidc.*`).
 #
 # TWO ESCAPES if a login still stalls on a blank/partial page:
-#   * A refused host. Watch `sbx net log -a kiro --all` for a `denied-*` line and add it:
+#   * A refused host. Watch `sbx net logs -a kiro --all` for a `denied-*` line and add it:
 #     `sbx net allow <host> -a kiro`. Chromium's own stderr is captured in `chromium-login.log`
 #     in the app home (path via `sbx app show kiro`) — read it to see what the page is waiting on.
 #   * `sbx app run kiro --net allow -- login …` — allow-by-default instead of the allowlist, for the
 #     login only (you keep bubblewrap + seccomp + the isolated home + the minimal /dev, AND the proxy,
-#     so `sbx net log -a kiro --all` still names every host the flow touched). The token then
+#     so `sbx net logs -a kiro --all` still names every host the flow touched). The token then
 #     persists, and daily use returns to the strict default. `--net shared` opens the same doors but
 #     drops the proxy entirely, logs and MITM CA included: last resort only.
 #
@@ -223,8 +223,8 @@ allow = [
 
 # Telemetry / metrics we deliberately leave DENIED. The mute list itself rides the `kiro` bundle
 # (`sbx bundle kiro` shows it): `mute` never changes the verdict (still refused, still counted by
-# `sbx net stats`); it only keeps the refusal out of the default `sbx net log` so the actionable
-# denials stay readable. See them with `sbx net log --all`, and edit from the CLI with
+# `sbx net stats`); it only keeps the refusal out of the default `sbx net logs` so the actionable
+# denials stay readable. See them with `sbx net logs --all`, and edit from the CLI with
 # `sbx net mute|unmute <host> -a kiro`.
 #
 # NOTE — one telemetry call canNOT be muted: kiro-cli's anonymous metrics POST to

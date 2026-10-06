@@ -2939,7 +2939,7 @@ pub(super) const PAGES: &[Page] = &[
         options: &[
             (
                 "<rule>",
-                "an egress rule, the same grammar as `allow`/`deny` (a host, `*.domain`, `host/path`, IP, `re:<regex>`, an optional `{GET,POST}` verb prefix, or `@<group>`). It matches a *denied* request whose log line should be kept out of the default `sbx net log`",
+                "an egress rule, the same grammar as `allow`/`deny` (a host, `*.domain`, `host/path`, IP, `re:<regex>`, an optional `{GET,POST}` verb prefix, or `@<group>`). It matches a *denied* request whose log line should be kept out of the default `sbx net logs`",
             ),
             ("-l, --local", "write the project .sbx.toml (the default)"),
             ("-g, --global", "write the global sbx.toml"),
@@ -2957,8 +2957,8 @@ pub(super) const PAGES: &[Page] = &[
             ),
         ],
         details: "Adds a `mute` (`dontaudit`) rule: a request matching it is still **denied** and still\n\
-            **counted** in `sbx net stats` — only its line is kept out of the default `sbx net log`\n\
-            (see it with `sbx net log --all`). It is a log filter, never a verdict: it cannot open\n\
+            **counted** in `sbx net stats` — only its line is kept out of the default `sbx net logs`\n\
+            (see it with `sbx net logs --all`). It is a log filter, never a verdict: it cannot open\n\
             egress. Use it to quiet the refusals you have deliberately left denied (telemetry, feature\n\
             flags, an optional CDN) so the actionable ones stand out.\n\
             \n\
@@ -3157,7 +3157,7 @@ pub(super) const PAGES: &[Page] = &[
         path: &["net", "logs"],
         synopsis: "sbx net logs [-a|--app <name>] [--host <h>] [--verdict <v>] \
                    [-n <N>] [--all] [--with-query] [--with-status] [--with-headers] [--with-body] \
-                   [-f|--follow] [-i|--interval <secs>] [--json]",
+                   [-f|--follow] [-i|--interval <secs>] [--json]  (alias: sbx net log)",
         summary: "the live, per-request egress log of a running session",
         options: &[
             (

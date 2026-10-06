@@ -76,7 +76,7 @@ allow = [
     "{GET} https://cli.kiro.dev",
 ]
 # Telemetry / metrics deliberately left DENIED. `mute` never changes the verdict (still refused,
-# still counted by `sbx net stats`); it only keeps the refusal out of the default `sbx net log`.
+# still counted by `sbx net stats`); it only keeps the refusal out of the default `sbx net logs`.
 # One telemetry call cannot be muted at all — the AWS SDK's absolute-form request inside the
 # CONNECT tunnel is refused by a pre-verdict security guard, which `mute` does not cover; the
 # `provision` step below disables telemetry at the source instead, which stops all of them.

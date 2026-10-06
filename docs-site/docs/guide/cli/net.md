@@ -230,6 +230,7 @@ exits this view has nothing left to read. A session that ran under
 [`[observe] record`](../configuration/observe) kept its egress record on disk, and
 [`sbx logs <id>`](logs) reads it back. A session that does not answer in full is named, and the
 listing exits 1 ([exit codes](../reference/exit-codes#a-listing-that-could-not-read-a-session-exits-1)).
+`sbx net log` is an accepted alias.
 
 | Flag | What it does |
 |---|---|

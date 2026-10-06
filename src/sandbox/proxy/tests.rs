@@ -2621,7 +2621,7 @@ fn an_ask_undecided_host_on_the_https_forward_path_is_refused_when_denied() {
 ///
 /// Masking a learned needle on the service it was learned on is load-bearing and is what
 /// `a_parked_request_masks_a_secret_riding_in_its_query` depends on. On any other host those same
-/// bytes are the leak, and a reader who greps `sbx net log` for a token that walked off to another
+/// bytes are the leak, and a reader who greps `sbx net logs` for a token that walked off to another
 /// destination must find it rather than a run of stars a cage put there.
 #[test]
 fn a_learned_needle_masks_a_logged_path_for_its_own_service_only() {

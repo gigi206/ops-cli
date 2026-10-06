@@ -41,7 +41,7 @@ mute = [
     #
     # What the mute does here was NOT observed, and the reason is worth leaving written: the egress
     # log is live only, and siGit exits as soon as it finds no ACP client on stdin, so the session
-    # is gone before `sbx net log` can be asked. What was measured is the refusal itself, on two
+    # is gone before `sbx net logs` can be asked. What was measured is the refusal itself, on two
     # clean homes, in siGit's own log — which the mute does not touch and cannot.
     "sigit.si",
 ]

@@ -69,7 +69,7 @@ allow = [
     "{GET} https://js.stripe.com",
     "{*} https://checkout.stripe.com",
 ]
-# Refusals to keep out of the default `sbx net log`. `mute` never changes the verdict (still
+# Refusals to keep out of the default `sbx net logs`. `mute` never changes the verdict (still
 # refused, still counted by `sbx net stats`); see them with `--all`.
 mute = [
     # Chrome's component CDN — not model traffic. The spellcheck dictionary on the same hosts is

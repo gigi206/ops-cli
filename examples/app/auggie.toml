@@ -102,9 +102,9 @@ allow = [
     #"{*} https://app.augmentcode.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): a `mute` never changes
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): a `mute` never changes
 # the verdict (the host is still denied) and never hides a count (`sbx net stats` still tallies it);
-# it only keeps the line out of the default log. See it anytime with `sbx net log --all`, and edit
+# it only keeps the line out of the default log. See it anytime with `sbx net logs --all`, and edit
 # this list from the CLI with `sbx net mute|unmute <host> -a auggie`. Augment's own telemetry, if
 # any, is refused by construction in `deny` mode (nothing outside `allow` gets out); add its host
 # here the day the proxy names it, to keep the log clean.

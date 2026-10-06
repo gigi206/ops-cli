@@ -34,7 +34,7 @@
 # OPENROUTER_API_KEY), xAI (`api.x.ai`, XAI_API_KEY), or another from omp's catalogue. The real
 # key is read on the HOST and injected by the egress proxy, never entering the cage. A provider
 # omp signs in to via OAuth / a coding plan has no header for the proxy to fill, so prefer a
-# header-injectable (BYOK) provider in this sandbox. If a host is refused, `sbx net log -a omp`
+# header-injectable (BYOK) provider in this sandbox. If a host is refused, `sbx net logs -a omp`
 # names it; check a URL's verdict ahead of time with `sbx test net <url>`.
 #
 # omp's /collab session relay (`my.omp.sh`) stays refused unless you opt in; uncomment its allow

@@ -13,7 +13,7 @@
 # actionable ones in `sbx net logs`.
 #
 # A mute never changes the verdict and never hides a count: these hosts stay denied, `sbx net stats`
-# still tallies them, and `sbx net log --all` still shows them.
+# still tallies them, and `sbx net logs --all` still shows them.
 #
 # This is a mute group, so it is slot-pure and cannot also carry allow entries. It is deliberately
 # limited to the hosts a Chromium embed reaches by itself: a vendor's own crash reporter or

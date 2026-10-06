@@ -66,7 +66,7 @@
 # profile): picking your provider is your call, not the profile's. Until you uncomment one in
 # `[network] allow` below, the app starts and renders but every model request — and the GUI's own
 # login step, which talks to the provider — is refused at the proxy. So: uncomment the ONE host
-# you use, then launch. `sbx net log -a goose-desktop` names anything else it wanted.
+# you use, then launch. `sbx net logs -a goose-desktop` names anything else it wanted.
 #
 # CREDENTIAL POSTURE — GUI login OR BYOK. The desktop shares its config/secrets with the `goose`
 # CLI under `~/.config/goose` in the app's persistent isolated home. Once the host is open, the

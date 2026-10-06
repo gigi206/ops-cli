@@ -141,11 +141,11 @@ allow = [
     # Kimi Code self-update / version check / binary downloads
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): telemetry
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): telemetry
 # we deliberately leave DENIED. The Kimi Code CLI posts operational logs to
 # telemetry-logs.kimi.com — a `mute` never changes the verdict (still refused) and
 # never hides a count (`sbx net stats` still tallies it); it only keeps the line out
-# of the default log. See it anytime with `sbx net log --all`, and edit from the CLI
+# of the default log. See it anytime with `sbx net logs --all`, and edit from the CLI
 # with `sbx net mute|unmute <host> -a kimi`. Remove the entry here the day you
 # decide to allow the endpoint.
 mute = []

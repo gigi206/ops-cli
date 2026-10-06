@@ -195,7 +195,7 @@ use = ["hermes"]
 # chat-platform / cloud SDKs), so every dashboard feature is available — heavier than the old curated
 # venv, but upgradeable and self-wiring. Some extras fetch runtime assets on FIRST USE — `voice`'s
 # Whisper model from Hugging Face, `edge-tts` from a Microsoft endpoint — which ARE in the allowlist
-# below (see the voice entries); a host the proxy refuses shows in `sbx net log -a hermes-web`, add
+# below (see the voice entries); a host the proxy refuses shows in `sbx net logs -a hermes-web`, add
 # it with `sbx net allow -a hermes-web <url>`.
 # The browser toolset (see `gui = "offscreen"` above). `agent-browser` is Hermes' own browser-driver
 # CLI: a self-contained Rust binary shipped in its npm tarball, so mise's `--ignore-scripts` install
@@ -213,8 +213,8 @@ mode = "deny"
 # Silence the cloud-metadata probe (169.254.169.254 / AWS IMDS) that a cloud SDK in the closure
 # fires on startup to auto-discover credentials. There is nothing to discover off-cloud, and the
 # proxy refuses link-local/metadata addresses by construction (SSRF guard) — the verdict is
-# unchanged, this only drops the noisy denied line from the default `sbx net log` (SELinux
-# dontaudit semantics). Still visible via `sbx net log --all`.
+# unchanged, this only drops the noisy denied line from the default `sbx net logs` (SELinux
+# dontaudit semantics). Still visible via `sbx net logs --all`.
 mute = [
     "169.254.169.254",
     # npm's audit POST on every install: refused anyway, just kept out of the default log.

@@ -47,7 +47,7 @@
 # openrouter.ai — the plaintext never enters the cage. For another provider, change the allowlist
 # host + the [secret] block + the env var (e.g. Anthropic: api.anthropic.com, ANTHROPIC_API_KEY,
 # header "x-api-key", type "raw"). If a request is refused the proxy names the host it blocked —
-# see `sbx net log -a hermes-webui`, or check ahead with `sbx test net <url>`.
+# see `sbx net logs -a hermes-webui`, or check ahead with `sbx test net <url>`.
 #
 # THE `has no 'source' column (older hermes-agent?)` LOG LINE IS HANDLED — see the `cmd` wrapper.
 # It is a MISDIAGNOSIS by the WebUI, not a version mismatch: verified against this exact pairing,
@@ -275,8 +275,8 @@ mode = "deny"
 # Silence the cloud-metadata probe (169.254.169.254 / AWS IMDS) that a cloud SDK in the agent's
 # closure fires on startup to auto-discover credentials. There is nothing to discover off-cloud, and
 # the proxy refuses link-local/metadata addresses by construction (SSRF guard) — the verdict is
-# unchanged; this only drops the noisy denied line from the default `sbx net log` (SELinux dontaudit
-# semantics). Still visible via `sbx net log --all`.
+# unchanged; this only drops the noisy denied line from the default `sbx net logs` (SELinux dontaudit
+# semantics). Still visible via `sbx net logs --all`.
 mute = [
     "169.254.169.254",
     # npm's audit POST on every install: refused anyway, just kept out of the default log.

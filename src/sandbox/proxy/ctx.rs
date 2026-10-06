@@ -377,7 +377,7 @@ impl ProxyCtx {
     }
 
     /// The single decision chokepoint every site in [`handle_client`](super::handle_client) calls: it both counts the
-    /// outcome for `sbx net stats` and pushes one event for the live `sbx net log`, so the two can
+    /// outcome for `sbx net stats` and pushes one event for the live `sbx net logs`, so the two can
     /// never drift and a missed site is a missed *pair*, not a silent stats/log mismatch. `method`
     /// and `path` are the inspected request's (absent for an early-CONNECT block or a raw `tcp://`
     /// splice); `reason` is the same stable category token the adjacent refusal writes (or `allowed`
@@ -539,7 +539,7 @@ impl ProxyCtx {
 
     /// The muted-aware inner of [`Self::push_log`]: when `muted` (a denied request matched a `mute`
     /// rule), the event is routed to the log's separate muted ring so it is kept out of the default
-    /// `sbx net log` view yet still recoverable via `--all` — the stat counter was already bumped by
+    /// `sbx net logs` view yet still recoverable via `--all` — the stat counter was already bumped by
     /// the caller, so a muted refusal is *collapsed*, never destroyed. All non-deny sites route here
     /// with `muted = false` via [`Self::push_log`].
     #[allow(clippy::too_many_arguments)]

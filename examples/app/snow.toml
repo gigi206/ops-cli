@@ -120,9 +120,9 @@ allow = [
     #"{*} https://api.jina.ai",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint. A
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit endpoint. A
 # `mute` never changes the verdict (it stays refused) and never hides a count. See everything with
-# `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a snow`.
+# `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a snow`.
 mute = [
 ]
 

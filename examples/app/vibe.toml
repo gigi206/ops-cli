@@ -143,16 +143,16 @@ allow = [
     # its host: add it here.
 ]
 
-# Keep Chromium's own denied telemetry out of the default `sbx net log` (still denied, still counted
+# Keep Chromium's own denied telemetry out of the default `sbx net logs` (still denied, still counted
 # in `sbx net stats`; see them with `--all`). These are the usual Chromium background hosts; watch
-# `sbx net log -a vibe` on your first sign-in and add any other host it hammers.
+# `sbx net logs -a vibe` on your first sign-in and add any other host it hammers.
 mute = [
     # Nothing here: the browser background services, the page telemetry and the analytics beacon
     # arrive with the bundle and are unioned in at resolution. One refusal is deliberately NOT
     # muted there — `widget.intercom.io`, which hits once and is more useful visible.
 ]
 # NOT muted on purpose (refused by the allowlist, but only ONE hit — not spam, so keeping it VISIBLE in
-# `sbx net log` is more useful than hiding it): `widget.intercom.io` (Intercom support-chat widget, not
+# `sbx net logs` is more useful than hiding it): `widget.intercom.io` (Intercom support-chat widget, not
 # used from the CLI). (`experiments.mistral.services` is now ALLOWED above — Mistral's first-party flags.)
 
 # API-KEY (BYOK) alternative to the SSO sign-in above. The real key is read on the HOST and injected

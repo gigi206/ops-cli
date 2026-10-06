@@ -121,12 +121,12 @@ allow = [
     # base_url in `reasonix.toml`; add its host here if you configure one.
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit POST at
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit POST at
 # install time, and Reasonix's own telemetry/upgrade gateway (`crash.reasonix.io` — a daily
 # /ping and /metrics the CLI sends only with your in-TUI consent, plus the host `reasonix
 # upgrade` resolves its release list from). Both stay DENIED and tallied (`sbx net stats` still
 # counts them); `mute` only keeps their otherwise-noisy `denied-default` lines out of the default
-# log. See them anytime with `sbx net log --all -a reasonix`.
+# log. See them anytime with `sbx net logs --all -a reasonix`.
 mute = [
 ]
 

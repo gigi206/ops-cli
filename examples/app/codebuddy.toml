@@ -100,9 +100,9 @@ allow = [
     #"{*} https://tencent.sso.codebuddy.cn",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint,
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit endpoint,
 # irrelevant to whether the install succeeds. A `mute` never changes the verdict (it stays refused)
-# and never hides a count. See it with `sbx net log --all`; edit with
+# and never hides a count. See it with `sbx net logs --all`; edit with
 # `sbx net mute|unmute <rule> -a codebuddy`.
 mute = [
 ]

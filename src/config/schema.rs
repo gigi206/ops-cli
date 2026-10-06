@@ -1993,7 +1993,7 @@ pub(crate) struct NetworkTable {
     pub(crate) deny: Vec<String>,
     /// Log-suppression entries (SELinux `dontaudit`): a **denied** request matching one is still
     /// refused and still counted in `sbx net stats`, but its refusal is kept out of the default
-    /// `sbx net log` view (`sbx net log --all` shows it). Same entry grammar as `allow`/`deny`
+    /// `sbx net logs` view (`sbx net logs --all` shows it). Same entry grammar as `allow`/`deny`
     /// (hosts, `*.domain`, exact URLs, `re:`, ports, `{VERB}` prefixes, `@group` references). A
     /// pure logging filter — it never changes a verdict. Trusted/global-only like the rest of the
     /// table.

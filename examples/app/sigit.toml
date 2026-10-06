@@ -48,7 +48,7 @@
 # UNVERIFIED (like every profile until run for real): the model download and the first inference in
 # the cage. The two rules below were measured against the shapes Hugging Face redirects to — both
 # `cdn-lfs-us-1.hf.co` and `cas-bridge.xethub.hf.co` are covered — but whether a real download stays
-# inside them is not proven; if a fetch is refused, `sbx net log -a sigit` names the host it wanted.
+# inside them is not proven; if a fetch is refused, `sbx net logs -a sigit` names the host it wanted.
 # Grounded here: the packaging (read out of the published packages), the model provider and the
 # absence of any credential (read out of the shipped binary and upstream's README).
 # The command hands siGit the cage's summary (/opt/sbx/contract-summary.md: what it may reach, which
@@ -120,8 +120,8 @@ allow = [
     #"{*} https://html.duckduckgo.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint, and
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit endpoint, and
 # the web-search backend left denied just above. A `mute` never changes the verdict and never hides
-# a count. See everything with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a sigit`.
+# a count. See everything with `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a sigit`.
 mute = [
 ]

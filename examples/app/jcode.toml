@@ -135,11 +135,11 @@ allow = [
     #"{GET} https://jcode.sh",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): jcode's telemetry
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): jcode's telemetry
 # endpoint — fire-and-forget POSTs (install/session/feedback events; no prompts or code).
 # We opt out via the `JCODE_NO_TELEMETRY` env below AND leave the host denied; a `mute`
 # never changes the verdict (still refused) and never hides a count (`sbx net stats` still
-# tallies it). See it anytime with `sbx net log --all`; edit with `sbx net mute|unmute
+# tallies it). See it anytime with `sbx net logs --all`; edit with `sbx net mute|unmute
 # telemetry.jcode.sh -a jcode`. Remove both the env var and this entry the day you decide to
 # allow telemetry.
 mute = [

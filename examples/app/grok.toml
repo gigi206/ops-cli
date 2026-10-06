@@ -104,10 +104,10 @@ allow = [
     #"{*,WS} https://cli-chat-proxy.grok.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the product-analytics
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): the product-analytics
 # sink the CLI reports to, deliberately left DENIED. A `mute` never changes the verdict (it stays
 # refused) and never hides a count (`sbx net stats` still tallies it); it only keeps the line out
-# of the default log. See it with `sbx net log --all`; edit with `sbx net mute|unmute <host> -a grok`.
+# of the default log. See it with `sbx net logs --all`; edit with `sbx net mute|unmute <host> -a grok`.
 mute = []
 
 [env]

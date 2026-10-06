@@ -119,7 +119,7 @@ pub(crate) enum EgressList {
     Allow,
     Deny,
     /// The `mute` list — a `dontaudit` log filter (a denied request's line is suppressed from the
-    /// default `sbx net log`), never a verdict. Same on-disk shape and grammar as `allow`/`deny`.
+    /// default `sbx net logs`), never a verdict. Same on-disk shape and grammar as `allow`/`deny`.
     Mute,
 }
 

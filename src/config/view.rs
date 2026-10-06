@@ -437,8 +437,8 @@ pub(crate) enum NetworkView {
         ask_notice: Option<bool>,
         allow: Vec<String>,
         deny: Vec<String>,
-        /// `mute` (`dontaudit`) rules: refusals suppressed from the default `sbx net log` view (still
-        /// counted in `sbx net stats`, shown by `sbx net log --all`). Surfaced so the suppression is
+        /// `mute` (`dontaudit`) rules: refusals suppressed from the default `sbx net logs` view (still
+        /// counted in `sbx net stats`, shown by `sbx net logs --all`). Surfaced so the suppression is
         /// never silent. Empty for a policy that mutes nothing.
         mute: Vec<String>,
         /// `http2` hosts: CONNECT targets the proxy man-in-the-middles as HTTP/2 (ALPN `h2`, for

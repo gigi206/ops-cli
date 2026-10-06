@@ -79,7 +79,7 @@ allow = [
     #"{*} https://api.openai.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): nothing grounded
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): nothing grounded
 # yet — a host the CLI reaches that is not listed returns a 403 naming `sbx net allow <host>`,
 # so add any the proxy surfaces (and mute the ones you deliberately leave denied).
 #mute = [

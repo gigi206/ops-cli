@@ -72,7 +72,7 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
 ];
 
 /// A running egress session's host-side resources: the bound proxy socket, the CA file, and the
-/// control socket a host-side `sbx net pending`/`sbx net log` reaches, with the proxy's process and
+/// control socket a host-side `sbx net pending`/`sbx net logs` reaches, with the proxy's process and
 /// what serves it. This guard stops the proxy and unlinks the artifacts when the launch ends. The
 /// control socket is deliberately not among the cage's binds (see [`start`]).
 ///
@@ -1034,7 +1034,7 @@ pub(crate) fn start(
     // decoded from these same bytes: the two copies cannot differ by anything the launch did to the
     // policy, and a copy taken earlier would miss what it did last (a destination withdrawn above).
     let judge = Arc::new(super::proxy::link::Judge::new(&bytes)?);
-    // Stand up the control socket the host-side `sbx net pending`/`sbx net log`/`sbx net allow
+    // Stand up the control socket the host-side `sbx net pending`/`sbx net logs`/`sbx net allow
     // --session` reach. It lives under the `0700` egress dir beside `<data>` and is **never** bound
     // into the cage (only the proxy socket and the CA cross in) — in Mode B the in-cage agent must not
     // answer its own asks, read its own log, or load its own rules. One pending queue + manual-rule
@@ -1121,7 +1121,7 @@ pub(crate) fn start(
         .attach(launched.supervisor.clone())
         .map_err(&unlink_socket)?;
     // Bind+listen here, before the serving thread, so the control plane is reachable the moment the
-    // launch is up: never a race with the first `sbx net pending`/`sbx net log`.
+    // launch is up: never a race with the first `sbx net pending`/`sbx net logs`.
     let control_listener = UnixListener::bind(&control_uds).map_err(&unlink_socket)?;
     // The tap's own channel, made beside the control socket and before either thread starts, so a
     // failure here has only the two paths to take back. The tap reports down it, never on the

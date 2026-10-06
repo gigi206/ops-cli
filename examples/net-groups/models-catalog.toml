@@ -5,12 +5,10 @@
 #   sbx net groups import examples/net-groups/models-catalog.toml
 #   # then in an app's or bundle's allow list:   "@models-catalog"
 #
-# The model catalogue (`models.dev`), fetched read-only by the agents that list models at
-# startup — shared by `cline`, `hermes`, `kilocode`, `kimi`, `mimo`, `opencode` and `stakpak`. OpenCode 1.18
-# fetches its own copy from `models.opencode.ai/api.json` (the default of its `OPENCODE_MODELS_URL`),
-# so the group opens that one path too. Groups are
-# global-only (like bundles): an app's or bundle's lists may reference one, a project may not
-# define one.
+# The model catalogue (`models.dev`), fetched read-only by the agents that list models at startup.
+# OpenCode 1.18 fetches its own copy from `models.opencode.ai/api.json` (the default of its
+# `OPENCODE_MODELS_URL`), so the group opens that one path too. Groups are global-only (like
+# bundles): an app's or bundle's lists may reference one, a project may not define one.
 
 entries = [
     "{GET} https://models.dev",

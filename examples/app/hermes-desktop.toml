@@ -212,9 +212,9 @@ allow = [
     # `sbx net allow -a hermes-desktop <url>`.
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`). A `mute` never changes the
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`). A `mute` never changes the
 # verdict (the request is still refused) and never hides a count (`sbx net stats` still tallies it);
-# it only keeps the line out of the default log — `sbx net log --all` shows it, tagged `muted`. Edit
+# it only keeps the line out of the default log — `sbx net logs --all` shows it, tagged `muted`. Edit
 # this list from the CLI with `sbx net mute|unmute -a hermes-desktop`.
 mute = [
     # Nothing here: the npm audit POST, the metadata-endpoint probe, the RUM/wallet telemetry,

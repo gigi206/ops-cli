@@ -115,10 +115,10 @@ allow = [
     #"{*} https://generativelanguage.googleapis.com",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint, and
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): npm's audit endpoint, and
 # the Cloudflare tunnel host the observability dashboard would reach (a feature the cage cannot run,
 # see the header). A `mute` never changes the verdict (they stay refused) and never hides a count.
-# See everything with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a nova`.
+# See everything with `sbx net logs --all`; edit with `sbx net mute|unmute <rule> -a nova`.
 mute = [
 ]
 

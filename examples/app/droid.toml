@@ -95,12 +95,12 @@ allow = [
     #"{*} https://openrouter.ai",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): hosts we deliberately
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): hosts we deliberately
 # leave DENIED — here Factory's telemetry sink (POST /api/ingest), which a live run hits every few
 # seconds and whose `denied-default` lines would drown the ones worth acting on. A `mute` never
 # changes the verdict (the telemetry is still refused) and never hides a count (`sbx net stats`
 # still tallies it); it only keeps the line out of the default log. See it anytime with
-# `sbx net log --all`, and edit this list from the CLI with `sbx net mute|unmute <host> -a droid`.
+# `sbx net logs --all`, and edit this list from the CLI with `sbx net mute|unmute <host> -a droid`.
 # Remove the entry here the day you decide to allow the endpoint (uncomment the `{POST} telemetry.factory.ai`
 # line above instead).
 mute = [

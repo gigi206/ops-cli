@@ -1174,7 +1174,7 @@ mod tests {
     /// and a host-mismatch is counted against the name the client asked for — and a row that reads
     /// back as `project=` renames the whole session to something no `sbx net stats`, no `--reset`
     /// and no fold will ever match again. That is durable audit evasion: this file is the only
-    /// persistent record of what the proxy decided (`sbx net log` is an in-memory ring).
+    /// persistent record of what the proxy decided (`sbx net logs` is an in-memory ring).
     ///
     /// Both halves are pinned, because each holds on its own: the row never reaches the file, and a
     /// file that carries one anyway still reads back with the identity its first line stated.

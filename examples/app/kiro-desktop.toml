@@ -239,8 +239,8 @@ http2 = [
     #"runtime.us-east-1.kiro.dev",
 ]
 # Telemetry / metrics we deliberately leave DENIED. `mute` never changes the verdict (still refused,
-# still counted by `sbx net stats`); it only keeps the refusal out of the default `sbx net log` so the
-# actionable denials stay readable. See them with `sbx net log --all`, and edit from the CLI with
+# still counted by `sbx net stats`); it only keeps the refusal out of the default `sbx net logs` so the
+# actionable denials stay readable. See them with `sbx net logs --all`, and edit from the CLI with
 # `sbx net mute|unmute <host> -a kiro-desktop`. (Kiro's telemetry can also be turned off IN the editor
 # — Settings → `telemetry.telemetryLevel: "off"`, VS Code-style — which stops these being called.)
 mute = [

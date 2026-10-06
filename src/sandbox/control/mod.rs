@@ -533,12 +533,12 @@ impl ManualRules {
 
 // ── The live egress event log ─────────────────────────────────────────────────────────────────
 //
-// A bounded, in-memory ring of the decisions the proxy makes, read live by `sbx net log` over the
+// A bounded, in-memory ring of the decisions the proxy makes, read live by `sbx net logs` over the
 // same per-session control socket. It is **never written to disk and never crosses into the cage**:
 // it lives in the launch process's owner-only RAM for the session's lifetime and dies with it, at
 // the same trust level as the injected secret the proxy already holds. The proxy redacts a request's
 // query against the configured secret needles *before* pushing, so even in RAM the ring never holds a
-// raw configured secret; the default `sbx net log` display drops the query entirely.
+// raw configured secret; the default `sbx net logs` display drops the query entirely.
 
 /// The default number of recent egress events a session retains for the live log.
 pub(crate) const LOG_RING_CAP: usize = 1000;
@@ -924,10 +924,10 @@ pub(crate) struct LogEvent {
     /// `None`. Ground truth from the header — never inferred from the path — so Connect *unary*
     /// (bare `application/proto`) reads as `None`. Set only at the inspected-forward sites.
     pub(crate) rpc: RpcKind,
-    /// Whether this refusal was suppressed from the default `sbx net log` view by a `mute`
+    /// Whether this refusal was suppressed from the default `sbx net logs` view by a `mute`
     /// (SELinux `dontaudit`) rule. A muted event is still counted in `sbx net stats` and lives in a
     /// **separate** ring (so a muted flood never evicts a real event); it appears only under
-    /// `sbx net log --all`, tagged. Only ever `true` for a `deny` (mute suppresses refusals, never
+    /// `sbx net logs --all`, tagged. Only ever `true` for a `deny` (mute suppresses refusals, never
     /// an allow, a security-guard `blocked`, or a downstream `error`).
     pub(crate) muted: bool,
     /// The upstream HTTP status code (200/404/…), for a **completed L7** request only — filled in by
@@ -1023,7 +1023,7 @@ pub(crate) struct LogSnapshot {
 /// A bounded ring of recent egress decisions, newest appended, oldest evicted past `cap`. Shared
 /// (via `Arc`) between the side that applies what each proxy reports (which
 /// [`push`](LogRing::push)es, see [`crate::sandbox::proxy::events`]) and the control serve thread
-/// (which [`snapshot`](LogRing::snapshot)s for `sbx net log`). Sequence numbers start at 1 and
+/// (which [`snapshot`](LogRing::snapshot)s for `sbx net logs`). Sequence numbers start at 1 and
 /// never repeat within a session, so a `--follow` cursor of 0 means "from the beginning" and can
 /// never collide with a real event.
 pub(crate) struct LogRing {
@@ -1080,7 +1080,7 @@ struct LogInner {
     events: VecDeque<LogEvent>,
     /// Muted refusals, kept out of the default view. A **separate** ring with the same cap so a
     /// chatty muted host can never evict a real event from `events`; merged in (by `seq`) only when
-    /// a reader passes `include_muted` (`sbx net log --all`). Shares `next_seq` with `events`, so the
+    /// a reader passes `include_muted` (`sbx net logs --all`). Shares `next_seq` with `events`, so the
     /// two interleave in one monotonic order.
     muted: VecDeque<LogEvent>,
 }
@@ -2014,10 +2014,10 @@ fn dispatch(
                         Some((reader.parse::<u32>().ok()?, ms.parse::<u64>().ok()?))
                     });
                 } else if token == "all" {
-                    // `sbx net log --all` — fold the muted (`dontaudit`) ring into the view.
+                    // `sbx net logs --all` — fold the muted (`dontaudit`) ring into the view.
                     include_muted = true;
                 } else if token == "capture" {
-                    // `sbx net log --with-headers/--with-body` — attach the captured traffic. Sent
+                    // `sbx net logs --with-headers/--with-body` — attach the captured traffic. Sent
                     // only when asked, so an ordinary listing never carries request/response bytes.
                     want_capture = true;
                 }
@@ -3213,7 +3213,7 @@ mod tests {
 
     /// A panic in one unrelated handler must not take the whole control plane with it.
     ///
-    /// Every lock here guards something a reader depends on — the decision ring `sbx net log` reads,
+    /// Every lock here guards something a reader depends on — the decision ring `sbx net logs` reads,
     /// the queue a parked request is answered through, the live `--session` overlay every request is
     /// decided against, the registry `sbx net live` lists — and `std`'s default is to answer `Err`
     /// from every later take once a holder has panicked. Taking that as a panic of its own is how one
@@ -4102,7 +4102,7 @@ mod tests {
     /// reachable: `sanitize` maps a control byte — an HTAB, which the tunnelled-request guard
     /// deliberately admits as an ordinary request-target byte — to exactly that space, and Unicode
     /// whitespace such as U+00A0 is not a control character and reaches the line untouched. The
-    /// stake is an allowed, credential-bearing request that leaves no row in `sbx net log` while
+    /// stake is an allowed, credential-bearing request that leaves no row in `sbx net logs` while
     /// `sbx net stats` still counts it, so the two disagree and the log reads as the broken one.
     #[test]
     fn a_cage_chosen_field_cannot_split_or_rewrite_a_token_of_its_own_event_line() {

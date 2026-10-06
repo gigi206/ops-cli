@@ -126,11 +126,11 @@ allow = [
     "@google-oauth",
 ]
 
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): hosts we deliberately
+# Refusals to keep OUT of the default `sbx net logs` (SELinux `dontaudit`): hosts we deliberately
 # leave DENIED — telemetry, feature flags, the optional Playwright browser driver — whose refusals
 # would otherwise drown the ones worth acting on. A `mute` never changes the verdict (each host is
 # still denied) and never hides a count (`sbx net stats` still tallies them); it only keeps the line
-# out of the default log. See them anytime with `sbx net log --all`, and edit this list from the CLI
+# out of the default log. See them anytime with `sbx net logs --all`, and edit this list from the CLI
 # with `sbx net mute|unmute <host> -a agy`. Remove an entry here the day you decide to `allow` it.
 mute = [
 ]
