@@ -8,12 +8,16 @@
 #
 # The npm INSTALL lane, shared by every agent that rides the npm registry (mise's npm backend
 # fetches the packument and the tarball in-cage, so the registry is subject to this policy —
-# opened read-only as a whole): one `{GET}` for the whole registry. The npm audit POST that
+# opened read-only as a whole): `GET` and `HEAD` on the whole registry. The `HEAD` is for the
+# installer mise embeds (aube), which sends `HEAD /` as a reachability probe before it installs;
+# refused, it raised a desktop notification on every npm install while the packages landed anyway.
+# A `HEAD` returns less than the `GET` the same rule already allows on every path, so it opens
+# nothing new and is allowed rather than muted. The npm audit POST that
 # follows installs is a SEPARATE group (`npm-audit`), referenced from the mute list: a group
 # expands into the list that references it, so an allow and a mute cannot share one group.
 # Groups are global-only (like bundles): an app's or bundle's lists may reference one, a
 # project may not define one.
 
 entries = [
-    "{GET} https://registry.npmjs.org",
+    "{GET,HEAD} https://registry.npmjs.org",
 ]

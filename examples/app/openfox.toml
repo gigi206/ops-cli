@@ -3,6 +3,7 @@
 #   sbx bundle import examples/bundle/openfox.toml
 #   sbx app import examples/app/openfox.toml
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
 #   sbx app run openfox
@@ -137,7 +138,7 @@ allow = [
     "tcp://localhost:8000",    # vLLM — the OPENFOX_LLM_URL default
     #"tcp://localhost:11434",  # ollama
     #"tcp://localhost:8080",   # llama.cpp
-    "{GET,HEAD} https://registry.npmjs.org",
+    "@npm-registry",
 ]
 # The rest of what the install lane reaches for: the vulnerability lookup that follows it, and
 # the JSR mirror it probes while resolving. Both are refused by the allowlist above, and both

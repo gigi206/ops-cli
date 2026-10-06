@@ -216,8 +216,8 @@ allow = [
     # First launch: Git smart-HTTP needs this POST; GitHub's read-only source/release hosts are
     # already covered by sbx's built-in allowlist.
     "{POST} https://github.com/nexu-io/open-design.git/git-upload-pack",
-    # Corepack downloads the pinned pnpm release and pnpm fetches the workspace's lockfile tarballs.
-    "{GET,HEAD} https://registry.npmjs.org",
+    # Corepack downloads the pinned pnpm release and pnpm fetches the workspace's lockfile tarballs
+    # from registry.npmjs.org: `@npm-registry`, which the opencode bundle already brings.
     # The engine's OWN reach is NOT listed here — it arrives with its bundle (`use` near the top of
     # this file) and is unioned into this list at resolution.  See what that adds with
     # `sbx bundle opencode`, and what the launch ends up with via `sbx config show --app open-design`.

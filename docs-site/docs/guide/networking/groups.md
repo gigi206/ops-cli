@@ -195,7 +195,7 @@ group opens what it carries, a `mute` group keeps refusals out of the default
 | `models-catalog` | allow | 2 entries | The model catalogue (`models.dev`, and the copy OpenCode reads), read only. |
 | `npm-audit` | mute | 4 entries | The vulnerability lookup npm sends after an install, kept denied and out of the default log. |
 | `npm-jsr` | mute | 1 entry | The JSR mirror an npm install probes while it resolves a tree, kept denied and out of the default log. |
-| `npm-registry` | allow | 1 entry | The npm install lane: `registry.npmjs.org`, `GET` only. |
+| `npm-registry` | allow | 1 entry | The npm install lane: `registry.npmjs.org`, `GET` and `HEAD` only. |
 | `npm-runtime` | allow | 1 entry | `registry.npmjs.org` for every verb, for the agents that pull packages at runtime. |
 | `openrouter` | allow | 1 entry | The OpenRouter API, a provider you choose; the key stays in the app's own `[secret]` block. |
 | `pypi` | allow | 2 entries | The Python install lane: the index and its file host, `GET` only. |
