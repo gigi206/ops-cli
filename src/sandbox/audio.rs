@@ -339,6 +339,7 @@ pub(crate) fn no_socket_warning(candidates: &[PathBuf]) -> String {
 /// of an engine rolled ahead of an app's pin. The reverse is not served: a binary that needs a
 /// newer `GLIBCXX` than the base carries, or that runs on an older glibc than the base runtime was
 /// built against.
+///
 /// The `deb:` launcher's own `makeWrapper --prefix LD_LIBRARY_PATH` prepends the app's closure ahead
 /// of these directories. It is reserved against an untrusted
 /// `[env]` (a code-load path, denylisted alongside `LD_*`); the `ALSA_*` keys are data paths (a
