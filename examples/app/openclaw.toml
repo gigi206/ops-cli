@@ -116,7 +116,7 @@ allow = [
     #"{WS} https://gateway.discord.gg",      # Discord gateway
     #"{*} https://discord.com",              # Discord REST
     #"{*} https://slack.com",                # Slack
-    #"{*} http://localhost:8080",            # Signal (via signald or similar)
+    #"tcp://localhost:8080",                 # Signal (signald or similar) on your host loopback
     #"{*} https://matrix.org",               # Matrix
 ]
 

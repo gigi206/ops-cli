@@ -29,7 +29,9 @@ app profile  ──use──▶  bundle  ──@name──▶  egress group
 ```
 
 Profiles are therefore **not self-contained, on purpose**: `sbx app import` alone is not enough.
-Import the bundle too, and any group the header lists under `REQUIRES`; every header says which.
+Import the bundle too, and every group the profile's header lists under `EGRESS GROUPS` (its
+bundle's header lists the same ones under `REQUIRES`); every header says which, and a test holds
+it to that.
 The reason is the failure this layout removes: a hand-copied set of an agent's requirements falls
 behind the agent silently, and the launch that breaks says nothing about why.
 

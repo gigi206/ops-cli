@@ -55,8 +55,8 @@
 # `--password-store=gnome-libsecret`).
 # VERIFIED live in this cage: the install (host-side now, the bundle's `tarball:resolve`) and the
 # TUI launch — it starts, initializes its server stack, loads its bundled skills, and logs its
-# expected endpoints
-# (`app.warp.dev` + `wss://rtc.app.warp.dev/graphql/v2` + `wss://sessions.app.warp.dev`), with
+# expected endpoints (`app.warp.dev` + `wss://rtc.app.warp.dev/graphql/v2` +
+# `wss://sessions.app.warp.dev`), with
 # its Sentry/RudderStack telemetry refused (403) exactly as the bundle's mutes intend. Grounded
 # here: the packaging and payload layout (read out of the downloaded
 # `warp-tui-stable-linux-x86_64.tar.gz`), the artifact endpoint + redirect (resolved live against

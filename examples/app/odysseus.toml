@@ -76,9 +76,11 @@
 # LOCAL MODELS. Cookbook can serve downloaded models via llama.cpp/vLLM, but that is
 # the heavy part and needs the model weights + a serve runtime fetched at use time —
 # open those hosts with `sbx net allow` as the proxy names them. An Ollama already
-# running on the HOST is NOT reachable: the cage is in an empty netns, so the host's
-# 127.0.0.1 is a different loopback — use a hosted OpenAI-compatible endpoint
-# instead, or run Ollama on a reachable host and set OLLAMA_BASE_URL accordingly.
+# running on the HOST sits on a different loopback (the cage is in an empty netns), so
+# it is reached through a `tcp://localhost:11434` rule in `allow`, which opens a
+# listener inside the cage and relays it to that port on your loopback, the shape the
+# `openfox` profile ships. Otherwise use a hosted OpenAI-compatible endpoint, or run
+# Ollama on a reachable host and set OLLAMA_BASE_URL accordingly.
 cmd = [
     "bash",
     "-c",
