@@ -731,7 +731,13 @@ fn a_mount_beneath_a_pin_keeps_its_effect_inside_the_cage() {
     let scratch = TmpDir::new();
     let home = scratch.path().join("home");
     let project = home.join(".config/dotfiles");
-    for dir in [".config/gh", ".config/sbx", ".config/dotfiles/.git/hooks"] {
+    for dir in [
+        ".config/gh",
+        ".config/sbx",
+        ".config/dotfiles/.git/hooks",
+        ".config/dotfiles/.git/objects",
+        ".config/dotfiles/.git/refs",
+    ] {
         std::fs::create_dir_all(home.join(dir)).unwrap();
     }
     std::fs::write(project.join(".git/config"), b"[core]\n").unwrap();

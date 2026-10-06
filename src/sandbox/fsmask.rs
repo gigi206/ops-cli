@@ -1019,6 +1019,9 @@ fn repo_carrier(
     refused: &mut Option<String>,
     looked: usize,
 ) -> Carried {
+    if let Some(reason) = unread_repository_refusal(reach, repo) {
+        refused.get_or_insert(reason);
+    }
     if let Some(reason) = absent_config_refusal(reach, repo) {
         refused.get_or_insert(reason);
     }
@@ -1037,6 +1040,9 @@ fn repo_carrier(
         // Past the ceiling the launch is refused already ([`submodule_carrier`]).
         if carried.looked > MASK_MAX {
             break;
+        }
+        if let Some(reason) = unread_repository_refusal(reach, tree) {
+            refused.get_or_insert(reason);
         }
         masks.extend(git_hook_dirs(reach, tree, warnings, refused));
         masks.extend(git_include_files(reach, tree, refused));
@@ -1587,14 +1593,22 @@ fn git_hook_dirs(
 }
 
 /// Ask the host's own git a `config` question about `repo`, returning its standard output, or
-/// `Ok(None)` when there is no trusted git on the host, when git does not read the repository's git
-/// directory as one, or when nothing matches (git's exit status 1); `Err` with the refusal when git
-/// does not answer in time.
+/// `Ok(None)` when there is no trusted git on the host, when nothing matches (git's exit status
+/// 1), or when git does not read the directory as a repository and so reads nothing of it; `Err`
+/// with the refusal when git cannot be started or waited for, does not answer in time, or fails
+/// the question in a repository it reads: a configuration it cannot parse, a path it cannot expand
+/// (`~user/` naming no user), or an option it is too old to know, git 2.18 being the first with
+/// `--type`. What it reads is then not known.
 ///
 /// `--git-dir` rather than `-C`, so a `.git` git does not recognise is not answered by a repository
 /// discovered above it. The answer is the one the host's git acts on — the global and system files
 /// and every include count — which is the point of asking git rather than reading the file. And
 /// `git config` reads configuration and runs nothing it names: no hook, no fsmonitor, no pager.
+///
+/// A status 1 means nothing matches only in a directory git reads as a repository: asked about one
+/// it sets aside, git reads the global and system files alone and ends the same way. Each
+/// repository the cage writes is checked for that first ([`unread_repository_refusal`]), so the
+/// directories answered `None` for that reason here are ones the cage cannot make readable.
 ///
 /// **Within a budget.** git opens every file the configuration includes, and a FIFO there, which
 /// the cage can plant in a repository it made, holds it until a writer comes, which is never; a
@@ -1603,36 +1617,110 @@ fn git_hook_dirs(
 /// without the answer, what the host's git reads is not known, and a launch that waited for it
 /// would wait without a word.
 fn host_git_config(repo: &GitRepo, args: &[&str]) -> Result<Option<Vec<u8>>, String> {
-    use std::io::Read as _;
     let Some(git) = crate::store::resolve_git() else {
         return Ok(None);
     };
+    let question = format!("git config {}", args.join(" "));
+    let mut command = std::process::Command::new(&git);
+    command
+        .arg("--git-dir")
+        .arg(&repo.dir)
+        .arg("config")
+        .args(args);
+    let (status, answer) = ask_host_git(command, repo, &question)?;
+    if status.success() {
+        return Ok(Some(answer));
+    }
+    if status.code() == Some(1) || !git_reads_repository(&git, repo)? {
+        return Ok(None);
+    }
+    Err(visible(&format!(
+        "the host's git could not answer `{question}` about `{}` ({status}): a configuration file \
+         it reads cannot be parsed, a path in it names a home git cannot find (`~user/`), or this \
+         git is older than the options sbx asks with (`--type`, git 2.18). Run `git -C {} config \
+         --list --show-origin` to see which, then launch again. {GIT_WRITABLE_HINT}",
+        repo.dir.display(),
+        repo.work_tree.display()
+    )))
+}
+
+/// The refusal a repository earns when the cage writes its git directory ([`Reach`]) and the host's
+/// git does not read that directory as a repository, or `None`.
+///
+/// git sets aside a git directory whose `HEAD` it cannot parse, that has no `objects` or `refs`, or
+/// that names an extension it does not know, and answers a question about it from the global and
+/// system files alone, with the status of a key that is not set ([`host_git_config`]). The cage
+/// writes `.git/HEAD`: taking that answer at its word, one session left the next launch with
+/// `core.hooksPath` and every include unprotected, then restored `HEAD` inside it, and the host's
+/// git ran the hook it wrote. What git would read there is not known, so the launch stops. A git
+/// directory the cage does not write stays as it is for the session, and is left to the checks that
+/// hold what git reads. What is left is a concurrent session in the same project changing `HEAD`
+/// between this check and the questions after it.
+fn unread_repository_refusal(reach: &Reach, repo: &GitRepo) -> Option<String> {
+    if !(reach.writes(&repo.dir) || reach.writes(&repo.common)) {
+        return None;
+    }
+    let git = crate::store::resolve_git()?;
+    match git_reads_repository(&git, repo) {
+        Ok(true) => None,
+        Ok(false) => Some(visible(&format!(
+            "the host's git does not read `{}` as a repository: its `HEAD`, `objects` or `refs` \
+             is missing or unreadable, or it names an extension this git does not know. What git \
+             would read there is not known, so nothing of it can be protected, and the cage writes \
+             it. Repair it or move it aside, then launch again. {GIT_WRITABLE_HINT}",
+            repo.dir.display()
+        ))),
+        Err(reason) => Some(reason),
+    }
+}
+
+/// Whether the host's git reads `repo`'s git directory as a repository: `git rev-parse --git-dir`
+/// run on it, which fails exactly where git sets the directory aside, within the span's budget.
+fn git_reads_repository(git: &Path, repo: &GitRepo) -> Result<bool, String> {
+    let mut command = std::process::Command::new(git);
+    command
+        .arg("--git-dir")
+        .arg(&repo.dir)
+        .args(["rev-parse", "--git-dir"]);
+    let (status, _) = ask_host_git(command, repo, "git rev-parse --git-dir")?;
+    Ok(status.success())
+}
+
+/// Run one question to the host's git about `repo` within the span's budget, returning its exit
+/// status and standard output; `Err` with the refusal when it cannot be started or waited for, or
+/// does not answer in time.
+fn ask_host_git(
+    mut command: std::process::Command,
+    repo: &GitRepo,
+    question: &str,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    use std::io::Read as _;
     let held = || {
         visible(&format!(
-            "the host's git did not answer `git config {}` about `{}` within {} s: a FIFO, or a \
+            "the host's git did not answer `{question}` about `{}` within {} s: a FIFO, or a \
              file on a slow file system, among the configuration it reads holds it. Check that \
              configuration and the files it includes, then launch again. {GIT_WRITABLE_HINT}",
-            args.join(" "),
             repo.dir.display(),
             GIT_ASK_BUDGET.as_secs()
+        ))
+    };
+    let failed = |e: std::io::Error| {
+        visible(&format!(
+            "the host's git could not be asked `{question}` about `{}`: {e}. Launch again. \
+             {GIT_WRITABLE_HINT}",
+            repo.dir.display()
         ))
     };
     let deadline = GitAsking::deadline();
     if Instant::now() >= deadline {
         return Err(held());
     }
-    let Ok(mut child) = std::process::Command::new(git)
-        .arg("--git-dir")
-        .arg(&repo.dir)
-        .arg("config")
-        .args(args)
+    let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-    else {
-        return Ok(None);
-    };
+        .map_err(failed)?;
     // Read on a thread of its own, so a long answer never fills the pipe while git is waited on.
     let reader = child.stdout.take().map(|mut out| {
         std::thread::spawn(move || {
@@ -1647,8 +1735,8 @@ fn host_git_config(repo: &GitRepo, args: &[&str]) -> Result<Option<Vec<u8>>, Str
         .unwrap_or_default();
     match waited {
         Ok((_, true)) => Err(held()),
-        Ok((status, false)) => Ok(status.success().then_some(answer)),
-        Err(_) => Ok(None),
+        Ok((status, false)) => Ok((status, answer)),
+        Err(e) => Err(failed(e)),
     }
 }
 
@@ -1664,6 +1752,14 @@ thread_local! {
     static GIT_ASK_DEADLINE: std::cell::Cell<Option<Instant>> = const {
         std::cell::Cell::new(None)
     };
+    /// The includes each configuration file names, as `git config --file` answered them in the
+    /// outermost span open on this thread ([`git_include_files`]). The answer depends on the file
+    /// alone, so the files every repository includes, the global configuration's among them, are
+    /// asked once per span rather than once per repository. Emptied when that span opens and when
+    /// it ends, so a launch and the end of its session each read the files afresh.
+    static GIT_FILE_INCLUDES: std::cell::RefCell<Vec<(PathBuf, Option<Vec<u8>>)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
 }
 
 /// The span of one expansion's, or one watch's, questions to the host's git ([`host_git_config`]):
@@ -1676,6 +1772,9 @@ impl GitAsking {
     fn open() -> Self {
         let ends = Instant::now() + GIT_ASK_BUDGET;
         let outer = GIT_ASK_DEADLINE.get();
+        if outer.is_none() {
+            GIT_FILE_INCLUDES.with_borrow_mut(Vec::clear);
+        }
         GitAsking(GIT_ASK_DEADLINE.replace(Some(outer.map_or(ends, |outer| outer.min(ends)))))
     }
 
@@ -1689,17 +1788,18 @@ impl GitAsking {
 
 impl Drop for GitAsking {
     fn drop(&mut self) {
+        if self.0.is_none() {
+            GIT_FILE_INCLUDES.with_borrow_mut(Vec::clear);
+        }
         GIT_ASK_DEADLINE.set(self.0);
     }
 }
 
-/// A path as git reads one in its configuration: `~/` against the home, a relative one against
-/// `base`, or `None` when it is relative and there is no base to read it against.
+/// A path from git's configuration, as git answered it with `--type=path`, which has already
+/// expanded `~/`, `~user/` and `%(prefix)/`: a relative one against `base`, or `None` when it is
+/// relative and there is no base to read it against.
 fn git_config_path(value: &str, base: Option<&Path>) -> Option<PathBuf> {
-    let path = match value.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
-        None => PathBuf::from(value),
-    };
+    let path = PathBuf::from(value);
     if path.is_absolute() {
         Some(path)
     } else {
@@ -1711,7 +1811,7 @@ fn git_config_path(value: &str, base: Option<&Path>) -> Option<PathBuf> {
 /// (a relative value against the top of the tree), or `None` when it is unset or cannot be asked
 /// ([`host_git_config`]).
 fn git_hooks_path(repo: &GitRepo) -> Result<Option<PathBuf>, String> {
-    let Some(out) = host_git_config(repo, &["--get", "core.hooksPath"])? else {
+    let Some(out) = host_git_config(repo, &["--type=path", "--get", "core.hooksPath"])? else {
         return Ok(None);
     };
     let Ok(value) = String::from_utf8(out) else {
@@ -1730,10 +1830,13 @@ fn git_hooks_path(repo: &GitRepo) -> Result<Option<PathBuf>, String> {
 /// `.git/config` being read-only is worth nothing if a file it includes is writable: git reads the
 /// included file as configuration, `core.hooksPath` and `core.fsmonitor` included. So every include
 /// the host's git reports is followed, from whichever file declares it (the global config among
-/// them, and an included file's own includes, each listed with its origin), and one that lands
-/// where the cage writes is protected. A conditional include is protected whether or not its
-/// condition holds today: the condition is a property of where the repository is, which the cage
-/// does not decide but a later move could change.
+/// them, each listed with its origin), and one that lands where the cage writes is protected. A
+/// conditional include is protected whether or not its condition holds today, and so are the files
+/// it includes in turn, to git's own depth of [`GIT_INCLUDE_DEPTH`]: git lists only the files it
+/// reads, so the includes of a file behind a condition that does not hold are asked of that file
+/// itself (`git config --file`). The cage decides some conditions, `onbranch:` by writing `HEAD`,
+/// and a later move of the repository changes `gitdir:` ones. Paths are asked with `--type=path`,
+/// so `~user/` and `%(prefix)/` are read where git reads them.
 ///
 /// An include naming a file where the cage writes that does not exist refuses the launch rather
 /// than being created: the cage could create it and git would read it, and a configuration file is
@@ -1742,26 +1845,120 @@ fn git_hooks_path(repo: &GitRepo) -> Result<Option<PathBuf>, String> {
 /// refuses the launch as well, wherever the link leads ([`git_link_on_the_way`]), and so does an
 /// include in sbx's data directory, present or not, which the cage writes under other names.
 fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>) -> Vec<Masked> {
-    let out = match host_git_config(
-        repo,
-        &[
-            "-z",
-            "--show-origin",
-            "--get-regexp",
-            r"^include(if\..*)?\.path$",
-        ],
-    ) {
-        Ok(Some(out)) => out,
-        Ok(None) => return Vec::new(),
-        Err(reason) => {
-            refused.get_or_insert(reason);
-            return Vec::new();
-        }
-    };
-    // `-z` records: `file:<origin>` NUL `<key>` LF `<value>` NUL.
-    let text = String::from_utf8_lossy(&out);
-    let mut fields = text.split('\0');
+    const INCLUDES: [&str; 5] = [
+        "-z",
+        "--type=path",
+        "--show-origin",
+        "--get-regexp",
+        r"^include(if\..*)?\.path$",
+    ];
     let mut masks: Vec<Masked> = Vec::new();
+    // The files whose own includes are still to be asked, each with its depth, and every file
+    // asked or queued, so a cycle of includes is asked once.
+    let mut pending: Vec<(PathBuf, usize)> = Vec::new();
+    let mut asked: Vec<PathBuf> = Vec::new();
+    let mut from: Option<(PathBuf, usize)> = None;
+    loop {
+        let answer = match &from {
+            None => host_git_config(repo, &INCLUDES),
+            Some((file, _)) => match file.to_str() {
+                Some(name) => GIT_FILE_INCLUDES
+                    .with_borrow(|known| {
+                        known
+                            .iter()
+                            .find(|(known, _)| known == file)
+                            .map(|(_, out)| out.clone())
+                    })
+                    .map_or_else(
+                        || {
+                            let answer = file_includes(repo, name, &INCLUDES);
+                            // Remembered only inside a span, whose end empties the record.
+                            if let Ok(out) = &answer
+                                && GIT_ASK_DEADLINE.get().is_some()
+                            {
+                                GIT_FILE_INCLUDES.with_borrow_mut(|known| {
+                                    known.push((file.clone(), out.clone()));
+                                });
+                            }
+                            answer
+                        },
+                        Ok,
+                    ),
+                None => Err(visible(&format!(
+                    "{GIT_CONFIG_READ}: `{}` is included as configuration, and its own includes \
+                     cannot be asked of git by a name that is not UTF-8. Rename it, then launch \
+                     again. {GIT_WRITABLE_HINT}",
+                    file.display()
+                ))),
+            },
+        };
+        let depth = from.as_ref().map_or(0, |(_, depth)| *depth);
+        match answer {
+            Ok(Some(out)) => {
+                for file in include_masks(reach, &out, &mut masks, refused) {
+                    if depth + 1 < GIT_INCLUDE_DEPTH && !asked.contains(&file) {
+                        asked.push(file.clone());
+                        pending.push((file, depth + 1));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                refused.get_or_insert(reason);
+            }
+        }
+        match pending.pop() {
+            Some(next) => from = Some(next),
+            None => return masks,
+        }
+    }
+}
+
+/// The include entries the configuration file `file` names itself, asked with `git config --file`
+/// and `args`: its standard output, `None` when it names none (exit status 1) or there is no
+/// trusted git, the refusal otherwise. Asked of the file alone, not of a repository, so the answer
+/// is the file's whichever repository included it ([`GIT_FILE_INCLUDES`]); `repo` only names, in a
+/// refusal, the repository the question was asked for.
+fn file_includes(repo: &GitRepo, file: &str, args: &[&str]) -> Result<Option<Vec<u8>>, String> {
+    let Some(git) = crate::store::resolve_git() else {
+        return Ok(None);
+    };
+    let question = format!("git config --file {file} {}", args.join(" "));
+    let mut command = std::process::Command::new(&git);
+    command
+        .arg("config")
+        .args(["--file", file, "--no-includes"])
+        .args(args);
+    let (status, answer) = ask_host_git(command, repo, &question)?;
+    match status.code() {
+        Some(0) => Ok(Some(answer)),
+        Some(1) => Ok(None),
+        _ => Err(visible(&format!(
+            "the host's git could not answer `{question}` ({status}): the file cannot be parsed, \
+             or a path in it names a home git cannot find (`~user/`), or this git is older than \
+             the options sbx asks with (`--type`, git 2.18). Fix it, then launch again. \
+             {GIT_WRITABLE_HINT}"
+        ))),
+    }
+}
+
+/// How deep git follows includes from one configuration file, its `MAX_INCLUDE_DEPTH`; past it,
+/// git refuses to read the configuration at all.
+const GIT_INCLUDE_DEPTH: usize = 10;
+
+/// The masks the include entries `out` of `git config -z --show-origin --get-regexp` name, added to
+/// `masks`, and the refusals they earn ([`git_include_files`]). Returns every included file that
+/// exists, canonical, held or not, for its own includes to be asked.
+fn include_masks(
+    reach: &Reach,
+    out: &[u8],
+    masks: &mut Vec<Masked>,
+    refused: &mut Option<String>,
+) -> Vec<PathBuf> {
+    // `-z` records: `file:<origin>` NUL `<key>` LF `<value>` NUL.
+    let text = String::from_utf8_lossy(out);
+    let mut fields = text.split('\0');
+    let mut found: Vec<PathBuf> = Vec::new();
     while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
         let Some((key, value)) = entry.split_once('\n') else {
             continue;
@@ -1828,11 +2025,14 @@ fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>
             continue;
         }
         // A directory is not a configuration file git can read; where the cage does not write,
-        // there is nothing to hold.
-        if !reach.holds(&canon) || canon.is_dir() {
+        // there is nothing to hold, though what the file includes may still be.
+        if canon.is_dir() {
             continue;
         }
-        if !masks.iter().any(|m| m.path == canon) {
+        if !found.contains(&canon) {
+            found.push(canon.clone());
+        }
+        if reach.holds(&canon) && !masks.iter().any(|m| m.path == canon) {
             masks.push(Masked {
                 path: canon,
                 is_dir: false,
@@ -1841,7 +2041,7 @@ fn git_include_files(reach: &Reach, repo: &GitRepo, refused: &mut Option<String>
             });
         }
     }
-    masks
+    found
 }
 
 /// The refusal a `commondir` in `repo`'s common directory earns where the cage writes, or `None`
@@ -2331,7 +2531,8 @@ fn absent_findings(root: &Path) -> Vec<String> {
         format!("`{}`", dot_git.display())
     } else if repository_at(root) {
         format!(
-            "a bare repository at `{}` (its `HEAD`, `objects` and `refs`)",
+            "a bare repository at `{}` (its `HEAD`, with the `objects` and `refs` git reads or a \
+             `commondir`)",
             root.display()
         )
     } else {
@@ -2444,6 +2645,15 @@ impl NestedWatch {
                 .is_some_and(|tag| tag.starts_with(CACHEDIR_SIGNATURE))
     }
 
+    /// The directory the `commondir` in `git_dir` names, where git reads that repository's
+    /// configuration and hooks, when it is another directory where the cage writes; `None` when
+    /// it is not, or the file cannot be read.
+    fn common_dir_of(&self, git_dir: &Path) -> Option<PathBuf> {
+        let named = read_git_path(&git_dir.join("commondir"), b"").ok()??;
+        let common = crate::trust::canonicalize_existing_prefix(&git_dir.join(named));
+        (common != git_dir && self.reach.holds(&common) && common.is_dir()).then_some(common)
+    }
+
     /// The files of the git directory `git_dir` that changed during the session
     /// ([`NESTED_WATCHED`]), and whether its hooks directory held more entries than were compared.
     fn changed_files(&self, git_dir: &Path, out: &mut Vec<PathBuf>) -> bool {
@@ -2533,12 +2743,14 @@ impl NestedWatch {
                     if !covered.contains(&dot_git) {
                         more = self.changed_at(&dot_git, kind, &mut changed);
                     }
-                } else if named("HEAD").is_some()
-                    && named("objects").is_some()
-                    && named("refs").is_some()
-                {
+                } else if repository_shape(|name| named(name).is_some()) {
                     bare = true;
                     more = self.changed_files(&dir, &mut changed);
+                    if named("commondir").is_some()
+                        && let Some(common) = self.common_dir_of(&dir)
+                    {
+                        more |= self.changed_files(&common, &mut changed);
+                    }
                 }
                 if !changed.is_empty() || more {
                     found.push((dir.clone(), changed, more));
@@ -2646,12 +2858,21 @@ fn file_system_now(dir: &Path) -> (i64, i64) {
     )
 }
 
-/// Whether git finds a repository at `root` itself: a `.git` of any kind, or the `HEAD`, `objects`
-/// and `refs` a bare repository keeps at its top, which git reads as one before looking in the
-/// directory above.
+/// Whether git finds a repository at `root` itself: a `.git` of any kind, or the top of a bare
+/// repository ([`repository_shape`]), which git reads as one before looking in the directory above.
 fn repository_at(root: &Path) -> bool {
     let there = |name: &str| std::fs::symlink_metadata(root.join(name)).is_ok();
-    there(".git") || (there("HEAD") && there("objects") && there("refs"))
+    there(".git") || repository_shape(there)
+}
+
+/// Whether a directory in which `there` names the entries present is a git directory to git: a
+/// `HEAD`, with the `objects` and `refs` git reads beside it, or a `commondir` naming the
+/// directory it reads them from, as a linked worktree's does. The one definition of the shape, for
+/// the root ([`repository_at`]) and the walk below it ([`NestedWatch`]) alike: one that asked for
+/// `objects` and `refs` alone missed a repository made of a `HEAD` and a `commondir`, whose
+/// configuration, and the pager it sets, live wherever the `commondir` points.
+fn repository_shape(there: impl Fn(&str) -> bool) -> bool {
+    there("HEAD") && ((there("objects") && there("refs")) || there("commondir"))
 }
 
 /// The watch of the repository the launch carried ([`RootWatch::Repo`]).
@@ -2795,8 +3016,9 @@ impl RepoWatch {
             .filter(|index| !self.submodules.unread.contains(index))
         {
             out.push(format!(
-                "`{}` cannot be read in full after the session (larger than sbx reads, split from \
-                 a shared index sbx cannot read, or of another format), so a submodule's \
+                "`{}` cannot be read in full after the session (larger than sbx reads, spelling \
+                 paths past what its size allows, split from a shared index sbx cannot read, or \
+                 of another format), so a submodule's \
                  repository added during it cannot be named, and the next launch refuses until it \
                  can. Check the gitlinks from a cage (`sbx run -- git ls-files --stage`) before \
                  running git here",
@@ -3855,6 +4077,17 @@ fn ewah_words(data: &[u8]) -> Option<(Vec<u64>, usize)> {
     Some((words, end))
 }
 
+/// The longest path an index entry is read with: Linux's `PATH_MAX`, past which no path git checks
+/// out can be opened.
+const INDEX_PATH_MAX: usize = 4096;
+
+/// How many bytes of paths an index is read with, per byte of the index. A version-4 entry may
+/// keep the whole previous path and add a byte, so its paths are otherwise bounded by the square
+/// of the index. A real one spells 0.38 of its own size for this crate's repository at version
+/// 4, and a tree of files 300 and 400 bytes deep whose names differ in their last few bytes 4.5
+/// and 5.9: sixteen leaves room for paths near a kilobyte while the memory stays linear.
+const INDEX_PATH_BYTES_PER_BYTE: usize = 16;
+
 /// The entries of a git index blob whose object names are `hash_len` bytes long, with its split
 /// index extension, or `None` when the blob is not an index this reads in full.
 ///
@@ -3863,6 +4096,9 @@ fn ewah_words(data: &[u8]) -> Option<(Vec<u64>, usize)> {
 /// writes each path as the length it strips from the previous one and the rest. A split index keeps
 /// most of its entries in a shared index of its own, which the `link` extension names
 /// ([`read_git_index`]).
+///
+/// The paths are held within [`INDEX_PATH_MAX`] each and [`INDEX_PATH_BYTES_PER_BYTE`] times the
+/// blob together: an index the cage wrote to spell more is one this does not read in full.
 fn parse_git_index_entries(data: &[u8], hash_len: usize) -> Option<IndexBlob> {
     if data.len() < 12 || &data[0..4] != b"DIRC" {
         return None;
@@ -3875,6 +4111,9 @@ fn parse_git_index_entries(data: &[u8], hash_len: usize) -> Option<IndexBlob> {
     let mut out = Vec::new();
     let mut previous: Vec<u8> = Vec::new();
     let mut pos = 12;
+    // What the paths read so far hold, against what an index of this size may spell.
+    let mut held: usize = 0;
+    let ceiling = data.len().saturating_mul(INDEX_PATH_BYTES_PER_BYTE);
     for _ in 0..count {
         let start: usize = pos;
         // Ten 4-byte fields, the fifth being the mode, then the object name, then the flags whose
@@ -3913,7 +4152,11 @@ fn parse_git_index_entries(data: &[u8], hash_len: usize) -> Option<IndexBlob> {
             pos = start + (end + 1 - start).div_ceil(8) * 8;
             data[name_at..end].to_vec()
         };
-        if pos > data.len() {
+        if pos > data.len() || path.len() > INDEX_PATH_MAX {
+            return None;
+        }
+        held = held.checked_add(path.len())?;
+        if held > ceiling {
             return None;
         }
         previous.clone_from(&path);
@@ -3971,8 +4214,9 @@ fn gitlinks(repo: &GitRepo) -> Result<Vec<PathBuf>, String> {
         Ok(entries) => entries.unwrap_or_default(),
         Err(e) if e.kind() == io::ErrorKind::InvalidData => {
             return Err(format!(
-                "`{}` is not an index sbx reads in full (larger than {} MiB, split from a shared \
-                 index sbx cannot read, or of another format), so the submodules whose \
+                "`{}` is not an index sbx reads in full (larger than {} MiB, spelling paths past \
+                 what its size allows, split from a shared index sbx cannot read, or of another \
+                 format), so the submodules whose \
                  repositories git reads cannot be found. {GIT_WRITABLE_HINT}",
                 index.display(),
                 INDEX_MAX / (1024 * 1024)
@@ -4834,6 +5078,14 @@ mod tests {
         );
     }
 
+    /// Give the git directory `dot_git` what the host's git requires to read it as a repository, a
+    /// `HEAD` and the `objects` and `refs` directories, for a fixture that writes the rest by hand.
+    fn readable_git_dir(dot_git: &Path) {
+        std::fs::create_dir_all(dot_git.join("objects")).unwrap();
+        std::fs::create_dir_all(dot_git.join("refs")).unwrap();
+        std::fs::write(dot_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
     /// A project with a git repository made by the host's own git and one commit, or `None` where
     /// there is no git to make it. The identity is passed on the command line and hooks are not
     /// run, so the developer's own configuration writes nothing into the fixture. Automatic
@@ -4946,6 +5198,152 @@ mod tests {
             ..FsPolicy::default()
         };
         assert!(expand(&root, &lifted, &[], None).refused.is_none());
+    }
+
+    /// A git directory the host's git does not read as a repository refuses the launch rather than
+    /// reading as one with nothing configured. The cage writes `.git/HEAD`, and git asked about a
+    /// directory whose `HEAD` it cannot read answers from the global files alone, with the status
+    /// of a key that is not set: taken at its word, `core.hooksPath` and every include went
+    /// unprotected for the session after, and the cage restored `HEAD` once inside it. The same
+    /// holds for a missing `objects` or `refs`, the other two things git requires there.
+    #[test]
+    fn a_git_directory_git_does_not_read_refuses_rather_than_reading_as_unconfigured() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping the unread-repository refusal: no git on this host");
+            return;
+        };
+        std::fs::create_dir_all(root.join(".husky/_")).unwrap();
+        assert!(git(&["config", "core.hooksPath", ".husky/_"]));
+        let held = |e: &Expanded| e.readonly.iter().any(|m| m.path == root.join(".husky/_"));
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert!(
+            held(&e),
+            "the control: a readable repository has its hooks held"
+        );
+
+        let dot_git = root.join(".git");
+        let head = std::fs::read(dot_git.join("HEAD")).unwrap();
+        let lifted = FsPolicy {
+            git_writable: Some(true),
+            ..FsPolicy::default()
+        };
+        for (what, break_it, mend) in [
+            (
+                "HEAD",
+                Box::new(|| std::fs::write(dot_git.join("HEAD"), "garbage\n").unwrap())
+                    as Box<dyn Fn()>,
+                Box::new(|| std::fs::write(dot_git.join("HEAD"), &head).unwrap()) as Box<dyn Fn()>,
+            ),
+            (
+                "objects",
+                Box::new(|| std::fs::rename(dot_git.join("objects"), root.join("o")).unwrap()),
+                Box::new(|| std::fs::rename(root.join("o"), dot_git.join("objects")).unwrap()),
+            ),
+            (
+                "refs",
+                Box::new(|| std::fs::rename(dot_git.join("refs"), root.join("r")).unwrap()),
+                Box::new(|| std::fs::rename(root.join("r"), dot_git.join("refs")).unwrap()),
+            ),
+        ] {
+            break_it();
+            let e = expand(&root, &FsPolicy::default(), &[], None);
+            let why = e.refused.as_deref().unwrap_or_else(|| {
+                panic!("a repository without a readable {what} was read as unconfigured")
+            });
+            assert!(why.contains("does not read"), "{what}: {why}");
+            let e = expand(&root, &lifted, &[], None);
+            assert!(
+                e.refused.is_none(),
+                "{what}: git_writable lifts it: {:?}",
+                e.refused
+            );
+            mend();
+        }
+    }
+
+    /// A path in git's configuration is read as git reads it: `~user/` against that user's home,
+    /// not as a directory named `~user` in the work tree. git runs the hooks such a `core.hooksPath`
+    /// names, so the directory is held wherever the spelling points.
+    #[test]
+    fn a_hooks_path_spelled_with_a_users_home_is_held_where_git_resolves_it() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping `~user/` in core.hooksPath: no git on this host");
+            return;
+        };
+        // SAFETY: `getpwuid` returns a pointer to static storage or null, read before any other
+        // call that could reuse it.
+        let (user, home) = unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            if pw.is_null() {
+                skip_incapable!("skipping `~user/`: this uid has no passwd entry");
+                return;
+            }
+            (
+                std::ffi::CStr::from_ptr((*pw).pw_name)
+                    .to_string_lossy()
+                    .into_owned(),
+                PathBuf::from(
+                    std::ffi::CStr::from_ptr((*pw).pw_dir)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            )
+        };
+        let Ok(below) = root.strip_prefix(&home) else {
+            skip_incapable!("skipping `~user/`: the test directory is not under the user's home");
+            return;
+        };
+        std::fs::create_dir_all(root.join("hk")).unwrap();
+        let value = format!("~{user}/{}/hk", below.display());
+        assert!(git(&["config", "core.hooksPath", &value]));
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        assert!(
+            e.readonly
+                .iter()
+                .any(|m| m.path == root.join("hk") && m.is_dir),
+            "{:?}",
+            e.readonly
+        );
+    }
+
+    /// A file included from an included file is held at every level, whether or not the condition
+    /// that leads to it holds today. git lists only what it reads, so an `includeIf.onbranch:`
+    /// whose branch is not checked out hid the includes of the file it names, and the cage, which
+    /// writes `HEAD`, could switch to that branch and have git read a file it had written.
+    #[test]
+    fn the_includes_of_an_included_file_are_held_whatever_its_condition() {
+        let tmp = TmpDir::new();
+        let Some((root, git)) = git_project(&tmp) else {
+            skip_incapable!("skipping nested includes: no git on this host");
+            return;
+        };
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("f1.cfg"), "[include]\n\tpath = f2.cfg\n").unwrap();
+        std::fs::write(root.join("f2.cfg"), "[include]\n\tpath = f3.cfg\n").unwrap();
+        std::fs::write(root.join("f3.cfg"), "").unwrap();
+        assert!(git(&[
+            "config",
+            "includeIf.onbranch:feature.path",
+            "../f1.cfg"
+        ]));
+        let e = expand(&root, &FsPolicy::default(), &[], None);
+        assert!(e.refused.is_none(), "{:?}", e.refused);
+        for file in ["f1.cfg", "f2.cfg", "f3.cfg"] {
+            assert!(
+                e.readonly.iter().any(|m| m.path == root.join(file)),
+                "{file}: {:?}",
+                e.readonly
+            );
+        }
+        std::fs::remove_file(root.join("f3.cfg")).unwrap();
+        let why = expand(&root, &FsPolicy::default(), &[], None)
+            .refused
+            .expect("a nested include the cage could create");
+        assert!(why.contains("f3.cfg"), "{why}");
     }
 
     /// A `core.hooksPath` that names a file where the cage writes refuses the launch: a file runs
@@ -5131,6 +5529,7 @@ mod tests {
         let root = project(&tmp);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+        readable_git_dir(&root.join(".git"));
         let root = root.canonicalize().unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -5192,6 +5591,7 @@ mod tests {
         let root = project(&tmp);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+        readable_git_dir(&root.join(".git"));
         let root = root.canonicalize().unwrap();
         let refused = || {
             let why = expand(&root, &FsPolicy::default(), &[], None)
@@ -6257,7 +6657,12 @@ mod tests {
             move || expand(&root, &FsPolicy::default(), &[], None).refused
         })
         .expect("a held git refuses");
-        assert!(why.contains("did not answer `git config "), "{why}");
+        // The first question is whether git reads the directory as a repository, and it reads the
+        // configuration too, includes and all.
+        assert!(
+            why.contains("did not answer `git rev-parse --git-dir`"),
+            "{why}"
+        );
         assert!(
             why.contains(&format!("{}`", root.join(".git").display())),
             "{why}"
@@ -6274,6 +6679,57 @@ mod tests {
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         file.write_all(text.as_bytes()).unwrap();
+    }
+
+    /// A directory holding only a `HEAD` and a `commondir` is a repository to git, which reads its
+    /// `objects`, `refs` and configuration from the directory the `commondir` names, and runs the
+    /// pager that configuration sets. The end of a session names one that appeared below the root,
+    /// and the configuration of the directory it names when that changed instead.
+    #[test]
+    fn the_git_watch_names_a_repository_made_of_a_head_and_a_commondir() {
+        let tmp = TmpDir::new();
+        let Some((root, _git)) = git_project(&tmp) else {
+            skip_incapable!("skipping a commondir repository: no git on this host");
+            return;
+        };
+        let common = root.join(".cache/repo");
+        for dir in ["objects", "refs"] {
+            std::fs::create_dir_all(common.join(dir)).unwrap();
+        }
+        std::fs::write(common.join("config"), "[core]\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let watch = GitWatch::start(&root, false, &[], None).expect("a carried repository");
+
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(sub.join("commondir"), "../.cache/repo\n").unwrap();
+        let read = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&sub)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(read, "git reads a HEAD and a commondir as a repository");
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains(&format!("`{}` holds a repository", sub.display()))),
+            "{found:#?}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let watch = GitWatch::start(&root, false, &[], None).expect("a carried repository");
+        assert!(watch.findings().is_empty(), "{:#?}", watch.findings());
+        append_in_place(&common.join("config"), "\tpager = planted\n");
+        let found = watch.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.contains(&format!("{}", common.join("config").display()))),
+            "{found:#?}"
+        );
     }
 
     /// Below the project's root, the end of a session names each repository the launch did not
@@ -6451,10 +6907,12 @@ mod tests {
         let git_dir = root.join(".git");
         std::fs::create_dir_all(git_dir.join("hooks")).unwrap();
         std::fs::write(git_dir.join("config"), "").unwrap();
+        readable_git_dir(&git_dir);
         let worktree = |i: usize| {
             let dir = git_dir.join(format!("worktrees/w{i}"));
             let tree = root.join(format!("wt/w{i}"));
             std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
             std::fs::create_dir_all(&tree).unwrap();
             std::fs::write(dir.join("commondir"), "../..\n").unwrap();
             let listed = format!("{}\n", tree.join(".git").display());
@@ -6938,6 +7396,7 @@ mod tests {
             let dot_git = root.join(path).join(".git");
             std::fs::create_dir_all(&dot_git).unwrap();
             std::fs::write(dot_git.join("config"), b"").unwrap();
+            readable_git_dir(&dot_git);
         }
 
         let e = expand(&root, &policy(&[], &["v/"]), &[], None);
@@ -6984,6 +7443,7 @@ mod tests {
             let dot_git = dir.join(".git");
             std::fs::create_dir_all(&dot_git).unwrap();
             std::fs::write(dot_git.join("config"), b"").unwrap();
+            readable_git_dir(&dot_git);
         }
 
         let e = expand(&root, &policy(&[], &["v/", "z/n/"]), &[], None);
@@ -7564,6 +8024,7 @@ mod tests {
         let root = project(&tmp);
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
         std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+        readable_git_dir(&root.join(".git"));
         std::fs::create_dir_all(root.join("config/sub")).unwrap();
         std::fs::write(root.join("config/sub/prod.key"), b"KEY").unwrap();
         let decoys = stage_decoys(&tmp.path().join("mask-1")).unwrap();
@@ -7842,6 +8303,44 @@ mod tests {
         bad[8..12].copy_from_slice(&1u32.to_be_bytes());
         bad.extend(entry(3, "x", 0o100644));
         assert!(parse_git_index_entries(&bad, SHA1_LEN).is_none());
+    }
+
+    /// What a version-4 index spells costs memory in proportion to the index, not to its square.
+    /// Each entry may keep the whole previous path and add a byte, so the paths of `n` entries
+    /// held `n²/2` bytes, and an index of a few MiB the cage wrote held the supervisor's memory
+    /// in GiB. A path longer than [`INDEX_PATH_MAX`], or paths together past
+    /// [`INDEX_PATH_BYTES_PER_BYTE`] times the index, read as an index this does not read in full.
+    #[test]
+    fn a_version_4_index_holds_paths_in_proportion_to_its_size() {
+        fn entry(strip: usize, suffix: &[u8]) -> Vec<u8> {
+            let mut e = vec![0u8; 60];
+            e[24..28].copy_from_slice(&0o100644u32.to_be_bytes());
+            e.extend_from_slice(&0u16.to_be_bytes());
+            assert!(strip < 0x80, "one varint byte");
+            e.push(strip as u8);
+            e.extend_from_slice(suffix);
+            e.push(0);
+            e
+        }
+        let index = |entries: Vec<Vec<u8>>| {
+            let mut v4 = b"DIRC".to_vec();
+            v4.extend_from_slice(&4u32.to_be_bytes());
+            v4.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            entries.into_iter().for_each(|e| v4.extend(e));
+            v4
+        };
+        let growing = |n: usize| index((0..n).map(|_| entry(0, b"a")).collect());
+        assert!(
+            parse_git_index_entries(&growing(100), SHA1_LEN).is_some(),
+            "the control: paths a few times the index read"
+        );
+        assert!(
+            parse_git_index_entries(&growing(3000), SHA1_LEN).is_none(),
+            "paths of n²/2 bytes are not read"
+        );
+        let long = |len: usize| index(vec![entry(0, &vec![b'p'; len])]);
+        assert!(parse_git_index_entries(&long(INDEX_PATH_MAX), SHA1_LEN).is_some());
+        assert!(parse_git_index_entries(&long(INDEX_PATH_MAX + 1), SHA1_LEN).is_none());
     }
 
     #[test]

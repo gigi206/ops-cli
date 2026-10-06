@@ -131,7 +131,10 @@ a directory the cage does not write is left alone, and with no `git` on the host
 nothing to ask and no hook to run. The questions a launch asks your `git` share a budget of
 10 seconds: past it, git is stopped and the launch **refuses**, naming the question, since a
 FIFO among the files the configuration includes, which the cage can plant in a repository it
-made, would hold git for good, and a slow file system holds it too. A hooks directory that does not exist yet is **created
+made, would hold git for good, and a slow file system holds it too. A question your `git`
+cannot answer **refuses** the launch as well, naming it: a configuration file it cannot
+parse, a `~user/` path naming no user, or a `git` older than 2.18, which lacks the `--type`
+option the questions use. A hooks directory that does not exist yet is **created
 empty at launch** and then protected, which is what `git init` makes: otherwise the cage could
 create it and fill it. It is made one component at a time, and a symbolic link found on the
 way refuses the launch rather than being followed. A `core.hooksPath` that names a **file**
@@ -141,12 +144,21 @@ it with a directory of hooks, and sbx cannot hold a directory in place of a file
 A file the configuration **includes** is configuration too: an `include.path` or
 `includeIf.<condition>.path` that names a file the cage writes (from `.git/config`, from your
 global config, or from an included file) makes that file read-only as well, whether or not the
-condition holds today. The list is the one your host's `git` reports. An include that names
+condition holds today, and so are the files it includes in turn, at every level git follows:
+the cage writes `HEAD`, so it decides an `onbranch:` condition. The list is the one your host's
+`git` reports, paths read as it reads them (`~/`, `~user/`, `%(prefix)/`). An include that names
 such a file that does not exist **refuses the launch**, naming the file: the cage could create
 it and git would read it, and sbx does not write a configuration file into your tree. Create
 it (empty is enough), remove the include, or set `git_writable`. A repository with no
 `config` of its own, where the cage writes, refuses the launch the same way: git reads one
 whenever it is there, and there is nothing to hold until it is.
+
+A git directory the cage writes that your `git` does **not read as a repository** refuses the
+launch too: a `HEAD` it cannot parse, no `objects` or `refs`, or an extension your `git` does
+not know. Asked about such a directory, git answers from your global config alone, as if the
+repository set nothing, so `core.hooksPath` and the includes it names would go unprotected; and
+`.git/HEAD` is the cage's to write, so one session could leave the next one in that state and
+mend it from inside. Repair the repository or move it aside, or set `git_writable`.
 
 The files git reads **beside** `.git/config` are configuration as well.
 `.git/config.worktree` is read-only whenever it is there. git reads it when `.git/config`
@@ -178,7 +190,8 @@ the next launch is then what catches a `.git/commondir`.
 
 A project with **no repository at its root**, a directory of a larger repository or a tree not
 yet under version control, has no git file for sbx to hold, and the cage can make it one: a
-`.git`, or the `HEAD`, `objects` and `refs` of a bare repository. A git command you run in that
+`.git`, or the `HEAD`, `objects` and `refs` of a bare repository, or a `HEAD` beside a
+`commondir` naming the directory git reads the rest from. A git command you run in that
 directory then reads the repository the cage made, its configuration and its hooks, instead of
 the one above it, and `git init` there keeps the configuration it finds. sbx names such a
 repository once the cage has exited, as it names a `.git/commondir`; nothing refuses the next
@@ -186,7 +199,8 @@ launch, since a repository you create there yourself looks the same. Run sbx fro
 the repository to have its files held.
 
 The same holds, in any project, for a **repository below the root** that is no submodule: one
-the cage leaves in a subdirectory, a `.git` or a bare repository, and one already there that the
+the cage leaves in a subdirectory, a `.git` or a bare repository (the directory a `commondir`
+names is compared with it), and one already there that the
 index does not name, an ignored clone or an untracked one. A git command run from inside that
 subdirectory reads it, and sbx holds none of its files: that would take a walk of the whole
 tree and a few mounts per repository at every launch, and a launch from a directory holding
@@ -232,8 +246,9 @@ and a repository embedded in the tree and added to the index. The submodules are
 index, which sbx reads itself, a split index together with the shared index it names. An
 index it cannot read in full refuses the launch, whether or not the repository shows
 submodules, since a gitlink needs no `.gitmodules`: one past its size bound of 64 MiB, some
-650,000 tracked files, which your git still reads, or a split index whose shared index is
-missing. So does a link where a submodule's `.git` is looked for. Holding a submodule's configuration costs what holding `.git/config` costs:
+650,000 tracked files, which your git still reads, one whose paths together spell more than
+sixteen times its size or one of them more than 4096 bytes, which a version-4 index the cage
+writes can do in a few MiB, or a split index whose shared index is missing. So does a link where a submodule's `.git` is looked for. Holding a submodule's configuration costs what holding `.git/config` costs:
 `git submodule update` rewrites the submodule's configuration every time it runs and is
 refused, as are `git submodule sync`, `git config` and `git remote add` inside a submodule, and
 `git mv` or `git rm` of a submodule's directory, which is held in place. The commits, branches

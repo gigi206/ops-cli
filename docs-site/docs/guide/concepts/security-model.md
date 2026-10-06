@@ -312,7 +312,9 @@ git reads as configuration beside it are held the same way (`.git/config.worktre
 linked worktree's `config.worktree`, `commondir` and `gitdir`), and a `.git/commondir` in the
 project's own repository, which would have git read its configuration from elsewhere, refuses
 the launch, as does a linked worktree's `commondir` that is missing or names another directory
-than the repository holding it. Such a file cannot be held before it exists, so sbx names any
+than the repository holding it, and a git directory the cage writes that your git does not
+read as a repository: asked about one, git answers as if nothing were configured, which would
+leave the hooks directory and the includes it names unprotected. Such a file cannot be held before it exists, so sbx names any
 that appeared once the cage has exited. A repository below the project's root that is no
 submodule, one the cage plants in a subdirectory or an ignored clone already there, is not held
 either: sbx names each whose configuration or hooks changed during the session, once the cage

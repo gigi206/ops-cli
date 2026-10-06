@@ -586,6 +586,10 @@ fn the_git_hooks_and_config_are_read_only_inside_a_real_cage_until_a_trusted_lay
     let root = project.path();
     std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
     std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+    // What the host's git requires to read it as a repository, which sbx checks before it asks.
+    std::fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+    std::fs::create_dir_all(root.join(".git/refs")).unwrap();
 
     let script = "(echo x >> .git/config) 2>/dev/null && echo WROTE-CONFIG || echo REFUSED-CONFIG; \
         (printf '#!/bin/sh\\n' > .git/hooks/pre-commit) 2>/dev/null \
@@ -1344,6 +1348,10 @@ fn what_appeared_in_the_projects_git_is_named_after_the_session() {
     let root = project.path();
     std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
     std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+    // What the host's git requires to read it as a repository, which sbx checks before it asks.
+    std::fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+    std::fs::create_dir_all(root.join(".git/refs")).unwrap();
     // The global config is trusted by location, so the posture applies: no proxy, no guard.
     std::fs::create_dir_all(config.path().join("sbx")).unwrap();
     std::fs::write(

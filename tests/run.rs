@@ -1088,6 +1088,8 @@ fn a_read_only_bind_under_a_read_write_home_keeps_refusing_writes_beside_the_pin
     std::fs::create_dir_all(project.join(".git/hooks")).unwrap();
     std::fs::write(project.join(".git/config"), b"[core]\n").unwrap();
     std::fs::write(project.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(project.join(".git/objects")).unwrap();
+    std::fs::create_dir_all(project.join(".git/refs")).unwrap();
     let sentinel = trust_marker(&state);
     global_binds(
         &config,

@@ -1501,6 +1501,10 @@ fn the_directories_above_a_mask_keep_their_path_inside_the_cage() {
     let root = scratch.path().join("proj");
     std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
     std::fs::write(root.join(".git/config"), b"[core]\n").unwrap();
+    // What the host's git requires to read it as a repository, which sbx checks before it asks.
+    std::fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+    std::fs::create_dir_all(root.join(".git/refs")).unwrap();
     std::fs::create_dir_all(root.join("config/sub")).unwrap();
     std::fs::write(root.join("config/sub/prod.key"), b"KEY").unwrap();
     let root = root.canonicalize().unwrap();
