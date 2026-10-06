@@ -44,13 +44,21 @@ PS=$(printf '\342\200\251')
 # The application notes are raised under, built by the installer next to this script.
 NOTIFIER="${0%/*}/sbx.app"
 
-# Raise one note through `osascript`, the title, subtitle and body passed as arguments.
+# Raise one note through `osascript`, the title, subtitle and body passed as arguments, each behind
+# a leading `x` the script strips. `osascript` reads options for as long as the arguments before are
+# options, and each `-e` here is one, so a field starting with `-` would be read as another: a
+# title of `-e` would make the subtitle a line of the script, run on the Mac. The mark keeps every
+# field an argument, whatever it starts with and however `osascript` parses.
 raise_with_osascript() {
   /usr/bin/osascript \
+    -e 'on unmark(s)' \
+    -e 'if (count of s) < 2 then return ""' \
+    -e 'return text 2 thru -1 of s' \
+    -e 'end unmark' \
     -e 'on run argv' \
-    -e 'display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)' \
+    -e 'display notification (my unmark(item 3 of argv)) with title (my unmark(item 1 of argv)) subtitle (my unmark(item 2 of argv))' \
     -e 'end run' \
-    "$1" "$2" "$3" >/dev/null 2>&1 || true
+    "x$1" "x$2" "x$3" >/dev/null 2>&1 || true
 }
 
 # Raise the note in the hand-off file $1 through `osascript`, then remove the file.

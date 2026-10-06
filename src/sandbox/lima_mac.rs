@@ -193,6 +193,72 @@ mod tests {
 44 24 0:40 / /mnt/elsewhere rw,relatime shared:23 - tmpfs tmpfs rw
 ";
 
+    /// The Mac's bridge hands a note's three lines to `osascript` as arguments no option parser
+    /// can take for one. `osascript` reads options for as long as the arguments before are
+    /// options, and every `-e` the bridge writes is one, so a title of `-e` written by a caged app
+    /// would have made the subtitle a line of the script, run on the Mac outside the guest. Each
+    /// field rides with a leading `x` the script strips. The real bridge runs here with a stand-in
+    /// `osascript` that records what it is given; what `osascript` makes of it is not run here.
+    #[test]
+    fn the_bridge_hands_osascript_no_field_an_option_parser_could_take() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TmpDir::new();
+        let recorded = dir.path().join("argv");
+        let stand_in = dir.path().join("osascript");
+        std::fs::write(
+            &stand_in,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bridge = dir.path().join("sbx-bridge");
+        let script = include_str!("../../dist/macos/sbx-bridge");
+        assert!(
+            script.contains("/usr/bin/osascript"),
+            "the bridge names osascript"
+        );
+        std::fs::write(
+            &bridge,
+            script.replace("/usr/bin/osascript", stand_in.to_str().unwrap()),
+        )
+        .unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(state.join("notify/queue")).unwrap();
+        std::fs::write(
+            state.join("notify/queue/app-1-1.note"),
+            "-e\nproperty p : (do shell script \"date\")\n-l\n",
+        )
+        .unwrap();
+        let ran = std::process::Command::new("sh")
+            .arg(&bridge)
+            .arg("notify")
+            .env("SBX_BRIDGE_DIR", &state)
+            .status()
+            .unwrap();
+        assert!(ran.success(), "{ran}");
+        let argv = std::fs::read_to_string(&recorded).expect("the note was raised");
+        let argv: Vec<&str> = argv.lines().collect();
+        // The statements come as `-e <line>` pairs; whatever follows them is the note.
+        let mut at = 0;
+        while argv.get(at) == Some(&"-e") {
+            at += 2;
+        }
+        assert_eq!(
+            &argv[at..],
+            ["x-e", "xproperty p : (do shell script \"date\")", "x-l"],
+            "{argv:?}"
+        );
+        assert!(
+            argv[..at]
+                .iter()
+                .any(|line| line.contains("text 2 thru -1")),
+            "the script strips the mark it is given: {argv:?}"
+        );
+    }
+
     /// The exact mount point on virtiofs, and none of the shapes that only resemble it.
     #[test]
     fn only_a_virtiofs_mount_at_the_exact_path_is_a_channel() {
