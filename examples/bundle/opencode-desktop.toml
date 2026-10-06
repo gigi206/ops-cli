@@ -23,6 +23,9 @@
 # `sbx upgrade` rolls forward. Both wrap the same opencode server, which is why their egress
 # is the same shape.
 #
+# This is the v1 line (`deb:github:`, which only ever sees GitHub Releases). The v2 line lives in
+# the `opencode-v2-desktop` bundle, which rides `deb:resolve` instead.
+#
 # NO PROVIDER KEY. opencode is multi-provider: the gateway path needs only the hosts below, and a
 # direct-provider (BYOK) posture is the consuming app's choice, so it opens that host and supplies
 # the key itself.

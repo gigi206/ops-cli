@@ -4,7 +4,7 @@ description: "The importable starter profiles in the repository, what each one l
 
 # Profile catalog
 
-The repository's `examples/app/` directory ships **75 importable
+The repository's `examples/app/` directory ships **76 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -13,7 +13,7 @@ sbx app import examples/app/claude-code.toml
 sbx app run claude-code
 ```
 
-**Every profile below takes two imports.** All 75 name a bundle in `use`: the bundle holds
+**Every profile below takes two imports.** All 76 name a bundle in `use`: the bundle holds
 the agent's package, environment and egress and follows upstream, the profile holds what
 you configure, and each ships as `examples/bundle/<name>.toml` beside
 `examples/app/<name>.toml`. Either order works, and nothing runs until you launch. Some
@@ -29,8 +29,8 @@ See also: [Portable profiles](profiles) · [The app framework](../apps/) · [Bun
 
 The tables below list every shipped profile, grouped by **how you interact with it**: a
 terminal agent, a desktop window, or a UI served in your host browser. The grouping is
-editorial (52 terminal agents, 17 desktop applications, 6 browser-served UIs); the
-exhaustive fact is the total, 75 profiles, each with its row below. Each profile's own
+editorial (52 terminal agents, 18 desktop applications, 6 browser-served UIs); the
+exhaustive fact is the total, 76 profiles, each with its row below. Each profile's own
 header carries its packaging specifics; how the artifacts are built and fit together, and
 the "not here yet, and why" triage, live in `examples/README.md`.
 
@@ -93,7 +93,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `warp` | `tarball:resolve` (the vendor's artifact redirect) | `app.warp.dev` + `sessions`/`rtc.app.warp.dev` WS (Warp account, device-code login; `WARP_API_KEY`) |
 | `vtcode` | `mise:github:vinhnx/VTCode` (+ `nix:ripgrep`, `nix:ast-grep`) | provider-dependent (BYOK, default OpenRouter) |
 
-## Desktop applications (17)
+## Desktop applications (18)
 
 GUI agents, most of them Electron. Each needs a [Wayland display](../configuration/gui)
 (`gui = "wayland"`), and most also enable [`gpu`](../configuration/gpu) and the in-cage
@@ -123,6 +123,7 @@ every other entry here.
 | `kiro` | `nix:kiro-cli.unwrapped` (+ `nix:chromium`) | `*.kiro.dev` (AWS/Kiro account) |
 | `kiro-desktop` | `tarball:resolve` (+ `nix:chromium`) | `app.kiro.dev` (AWS/Kiro account) |
 | `opencode-desktop` | `deb:github:anomalyco/opencode` | provider-dependent (BYOK) |
+| `opencode-v2-desktop` | `deb:resolve` (the vendor's update channel) | provider-dependent (BYOK) |
 | `openwork` | `appimage:resolve` (the public build, whose OpenCode engine ships inside the artifact as a sidecar) (+ `nix:chromium`) | provider-dependent (BYOK); an OpenWork Den account (`app.openworklabs.com`) is optional |
 | `orca-desktop` | `deb:github:stablyai/orca` (+ `nix:chromium`; interior pilot agent `opencode` via `mise:opencode`) | provider-dependent (BYOK); Orca hosts (`login.onorca.dev`, `relay.onorca.dev`) denied by default |
 | `reasonix-desktop` | `deb:resolve` | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
@@ -150,7 +151,7 @@ default (`home_scope = "global"`).
 ## Bundles: the shared pieces
 
 Beyond the app profiles, `examples/bundle/`
-ships **68 reusable tool bundles**: a named set of packages and egress rules that
+ships **69 reusable tool bundles**: a named set of packages and egress rules that
 profiles pull in with `use = [...]` instead of restating it: the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as

@@ -1,0 +1,170 @@
+# opencode v2 desktop — the Electron GUI of the opencode v2 line, sandboxed by sbx (with a Wayland
+# display).
+#
+#   sbx bundle import examples/bundle/opencode-v2-desktop.toml
+#   sbx app import examples/app/opencode-v2-desktop.toml
+#   sbx app run opencode-v2-desktop
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's package and the hosts it reaches come
+# from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/opencode-v2-desktop.toml
+#     sbx app import examples/app/opencode-v2-desktop.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-runtime.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
+#
+# This is the v2 line of the desktop app, beside the `opencode-desktop` profile (v1), and the
+# GRAPHICAL sibling of the `opencode-v2` profile (the v2 CLI/TUI). opencode ships a native desktop
+# app built with Electron; on Linux upstream distributes it only as a `.deb`/`.rpm`/AppImage, and
+# the `.deb` is what sbx packages, with the `deb:` backend.
+#
+# THE `deb:resolve` BACKEND (no third party, tracks upstream automatically). Upstream publishes v2
+# outside GitHub Releases (v2 tags carry no Release object; the binaries live on
+# `opencode.ai/files/bin`), so the `deb:github:` locator the v1 profile uses can never offer it. The
+# bundle instead carries a resolver that reads the vendor's own update channel for the current
+# `.deb` URL; sbx pins that URL with its content hash in the per-project deb lock, and builds a
+# generated derivation that unpacks the `.deb`'s data tarball and `autoPatchelfHook`s the Electron
+# binaries against a curated library set. The build is HOST-SIDE (like `nix:`), not in-cage: a
+# `.deb` runs no build script, so evaluating it host-side is safe, and the result is seeded into the
+# store and offline-reusable — no dependency on any community flake.
+#
+# FIRST LAUNCH runs the resolver (pinning URL + hash) and builds the app host-side, pulling the
+# Electron closure, over your host network (the build does NOT use the cage allowlist). Later
+# launches reuse the pinned build offline and never query the update channel.
+# `sbx app upgrade opencode-v2-desktop` re-runs the resolver and rolls the pin forward to the newest
+# release (the rebuilt app lands at the next launch). No manual version bump.
+#
+# V2 IS A NEW LINE, not a drop-in v1 bump: new plugin API, new server API contracts, and terminal
+# client config moving to a global `cli.json` (see `https://opencode.ai/v2/docs/migrate-v1`). Both
+# desktop apps read the same config locations, but each sbx app runs in its own isolated home, so
+# v1 and v2 coexist — keep `opencode-desktop` until v2 does what you need.
+#
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
+# database (`~/.pki/nssdb`), so a Chromium app would otherwise fail every HTTPS with
+# `ERR_CERT_AUTHORITY_INVALID` and its UI could not load. For a `gui = "wayland"` cage under a
+# filtering posture, sbx seeds its MITM CA into the cage's NSS db automatically (part of the GUI
+# hole, like fonts), so the app trusts the proxy and egress stays filtered — no per-profile shim
+# needed. The app only has to be told to consult that store, hence `--use-system-ca`.
+#
+# DISPLAY + GPU. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and
+# provisions fonts, so the Electron window maps on your compositor. X11 is never offered. Isolation
+# is compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose
+# screen-capture/input-injection to ordinary clients (see
+# docs-site/docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering: sbx
+# provisions mesa's drivers into its own store, grants the render node under `/dev/dri`, and
+# read-only-binds the minimal `/sys` DRM subtree the driver needs (see
+# docs-site/docs/guide/configuration/gpu.md). Without it a Chromium/Electron app on Wayland often
+# fails to produce a buffer and no window maps, so it is on by default here. mesa covers
+# Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (still renders, slower). The
+# Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp + the
+# empty netns IS the boundary (it replaces Chromium's own redundant sandbox);
+# `--ozone-platform=wayland` selects the Wayland backend; `--disable-dev-shm-usage` avoids the small
+# cage `/dev/shm`.
+#
+# DBUS. `dbus = true` gives the cage its OWN private desktop portal (a `dbus-daemon` +
+# `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER opens
+# IN-CAGE and lists the cage filesystem (the project bind + the app's isolated home). It also relays
+# desktop notifications (a host-side relay bridges the private bus to your notifications daemon)
+# and follows your host light/dark theme both at launch AND live (a relay mirrors host theme
+# switches into the cage), and is network-independent (the private bus touches no host socket).
+# Requires `gui = "wayland"` (the GTK backend renders on the compositor). The login keyring is
+# never exposed.
+cmd = [
+    "opencode-v2-desktop",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+]
+
+gui = "wayland"
+gpu = true
+dbus = true
+
+# Your host opencode config/auth, mounted read-write at its real absolute path (so the GUI shares
+# the same login/sessions as your host opencode). `binds` is a security field, honored only
+# because this profile lives in your trusted config dir. Uncommented, the bind appears at that
+# host path and not under the cage's `$HOME` (`/home/sandbox`), so the app keeps its isolated
+# home and reaches these files only by their absolute path. V2 reads the same locations as v1,
+# so a shared bind serves both lines — but converted native-v2 shapes must not be read back by
+# v1 (see the migration guide above).
+#binds = [
+#    { path = "~/.config/opencode", mode = "rw" },       # config
+#    { path = "~/.local/share/opencode", mode = "rw" },  # auth + sessions (SQLite)
+#]
+
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `opencode-v2-desktop` BUNDLE — the `.deb`, its resolver and the hosts the app
+# reaches — from one declaration shared with the bundle file itself, so this profile cannot fall
+# behind when the app's requirements change. The posture above (`gui`/`gpu`/`dbus`) stays here: a
+# bundle may never widen what the cage exposes of the host.
+#
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
+#     sbx bundle import examples/bundle/opencode-v2-desktop.toml
+# Without it the launch warns that the bundle is undeclared and the app is simply absent.
+use = ["opencode-v2-desktop"]
+
+# No `[packages]` here: the app's package comes from its bundle — see `use` above.
+
+[network]
+mode = "deny"
+# opencode desktop wraps the SAME opencode server as the CLI, so it is multi-provider and its
+# model traffic goes to the same hosts. models.dev is the read-only model catalogue; opencode.ai
+# is the gateway ("Zen") plus auth and the config/theme schemas, opened to every verb with `{*}`
+# (an app is read-by-default, and the app POSTs completions through the gateway). The same host
+# serves the app's update feed, so its update check needs no extra grant. registry.npmjs.org is the
+# plugin lane, the shared `@npm-runtime` group: what reaches npm at runtime is opencode's plugin
+# loader, installing the plugin packages your config names.
+#
+# If a request is refused, the proxy names the host — watch `sbx net logs -a opencode-v2-desktop`
+# and add it here (or check ahead with `sbx test net <url>`). For a DIRECT provider instead of the
+# gateway, add its host (`{*} https://api.anthropic.com`, `{*} https://api.openai.com`, or
+# `{*} https://openrouter.ai`) and fill the [secret] block below.
+allow = [
+    # The model catalogue, the plugin loader's npm lane and the opencode gateway arrive with the
+    # bundle (`use` above) and are unioned into this list at resolution — inspect them with
+    # `sbx bundle opencode-v2-desktop`, and see the launch's own view with
+    # `sbx config show --app opencode-v2-desktop`.
+    #
+    # /share syncs a session to opencode's servers on demand (HTTPS POST, not a WebSocket).
+    #"{*} https://opncd.ai",
+    # opencode streams completions over HTTPS (SSE), not a WebSocket, so the default posture needs
+    # no `{WS}` grant. A WebSocket is opened only by the OpenAI "Responses" transport, targeting
+    # the OpenAI provider's own base host — name it with `{WS}` if you use that (see the opencode
+    # CLI profile for the discovery recipe).
+    #"{WS} https://api.openai.com",
+    # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
+    #"{*} https://openrouter.ai",
+]
+# Silence the denied telemetry: the desktop app POSTs crash/usage envelopes to Sentry, which the
+# allowlist already refuses (`denied-default`). `mute` keeps those refusals out of the default
+# `sbx net logs` (still denied, still counted in `sbx net stats`; see them with `--all`).
+mute = []  # the Sentry refusal is muted by the bundle
+
+# The real key is read on the HOST and injected by the egress proxy — never in the cage. Provide
+# it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g.
+# sops://secrets.yaml#openrouter). The in-cage placeholder lets the app start and issue the
+# request; the proxy strips it and substitutes the real key on the wire to openrouter.ai. (For a
+# direct provider add its host to `allow` above and keep this block; for Anthropic/OpenAI change
+# the host, header, and env var instead — see the `opencode-v2` CLI profile.)
+[env]
+# The cage's summary (/opt/sbx/contract-summary.md: what it may reach, which files it protects,
+# which operations it offers) added to opencode's instructions, so a refused host or a read-only
+# file reads as the sandbox rather than as a fault to work around. The app hands its environment to
+# the opencode service it starts, which reads this inline config as its last, highest-precedence
+# layer. Your `AGENTS.md` files are discovered separately and still apply. If your own
+# `opencode.json` also sets `instructions`, whether the two lists are joined or this one wins is
+# v2's merge rule for config layers, not something sbx decides.
+OPENCODE_CONFIG_CONTENT = '{"instructions":["/opt/sbx/contract-summary.md"]}'
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
