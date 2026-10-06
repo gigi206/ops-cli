@@ -2585,11 +2585,13 @@ const MAX_RECOVERED_FIELDS: usize = 4;
 /// (`network.allow` gone is fewer hosts) and wrong for what it *restricts*. Two kinds are listed.
 /// A list or a switch whose absence is its permissive end: a `deny`, `readonly` or `scan` list
 /// falls to empty, `ssh_agent.confirm` to signing unasked, `network.websocket_secret` to relaying a
-/// secret seen leaving through a WebSocket, a task's `spawn` to no exec supervision at all; a
-/// single mistake in `proc.deny = ["sh", 5]` launched `enforce` with nothing denied. And
-/// a posture, whose absence leaves the layer below in force whatever it is: `network` and `proc`
-/// with their `mode`, `gui`, `gpu`, `audio`, `dbus` and `allow_insecure_http`; a project's
-/// `gpu = "no"` over a global `gpu = true` ran with the render node open. The mistyped value does
+/// secret seen leaving through a WebSocket, a task's `spawn` to no exec supervision at all, the
+/// task defaults' `nonce` to placeholders a command can forge; a single mistake in
+/// `proc.deny = ["sh", 5]` launched `enforce` with nothing denied. And a posture, whose absence
+/// leaves the layer below in force whatever it is: `network` and `proc` with their `mode`, `gui`,
+/// `gpu`, `audio`, `dbus`, `allow_insecure_http` and `fs.git_writable`; a project's `gpu = "no"`
+/// over a global `gpu = true` ran with the render node open, and a project's
+/// `git_writable = "no"` over a global `true` left the cage writing the hooks the host's git runs. The mistyped value does
 /// not say which side it meant, and the layer below may be the wider, as for a posture written with
 /// the right type that sbx does not recognize, which stops a launch too. Such a value costs the
 /// file instead, as two mistakes do, and a file that cannot be read stops a launch, the global
@@ -2609,6 +2611,7 @@ const WIDENING_DROPS: &[&[&str]] = &[
     &["fs", "deny"],
     &["fs", "readonly"],
     &["fs", "scan"],
+    &["fs", "git_writable"],
     &["network"],
     &["network", "mode"],
     &["network", "deny"],
@@ -2620,6 +2623,7 @@ const WIDENING_DROPS: &[&[&str]] = &[
     &["allow_insecure_http"],
     &["ssh_agent", "confirm"],
     &["task", "*", "spawn"],
+    &["task", "defaults", "nonce"],
 ];
 
 /// Whether dropping the value at `steps` would widen the layer: see [`WIDENING_DROPS`].
@@ -3172,7 +3176,7 @@ mod layer_properties {
             &["[5]", "\"AKIA\""],
             true,
         ),
-        ("git_writable", &["true", "false"], &["\"yes\""], false),
+        ("git_writable", &["true", "false"], &["\"yes\""], true),
         ("scan_max_kb", &["64"], &["\"64\""], false),
     ];
     const SSH_AGENT: &[Spec] = &[
@@ -3194,6 +3198,10 @@ mod layer_properties {
         ("network", &["[\"api.test\"]"], &["\"api.test\""], false),
         ("description", &["\"d\""], &["5"], false),
     ];
+    const TASK_DEFAULTS: &[Spec] = &[
+        ("timeout", &["\"30s\""], &["30"], false),
+        ("nonce", &["true", "false"], &["\"yes\"", "1"], true),
+    ];
     const APP: &[Spec] = &[
         ("cmd", &["[\"x\"]", "\"x\""], &["5"], false),
         ("gpu", &["true"], &["\"on\""], true),
@@ -3208,6 +3216,7 @@ mod layer_properties {
         (&["fs"], FS),
         (&["ssh_agent"], SSH_AGENT),
         (&["env"], ENV),
+        (&["task", "defaults"], TASK_DEFAULTS),
         (&["task", "t1"], TASK),
         (&["task", "t2"], TASK),
         (&["app", "a"], APP),
@@ -3215,6 +3224,7 @@ mod layer_properties {
         (&["app", "a", "network"], NETWORK),
         (&["app", "a", "fs"], FS),
         (&["app", "a", "ssh_agent"], SSH_AGENT),
+        (&["app", "a", "task", "defaults"], TASK_DEFAULTS),
         (&["app", "a", "task", "t"], TASK),
         (&["app", "b"], APP),
         (&["app", "b", "proc"], PROC),

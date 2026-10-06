@@ -155,13 +155,15 @@ silently: one warning names the value, the other names the file.
 
 A value that **restricts** is not dropped on its own, because the file without it
 would allow more than it says. `proc.deny`, `fs` and its `deny`, `readonly` and
-`scan`, `network.deny`, `network.websocket_secret`, `ssh_agent.confirm` and a task's
-`spawn`, at the top of the file or under an app, would each fall back to the
-permissive end: nothing denied, no path closed, a secret relayed out through a
-WebSocket, signing without a prompt, a task command free to run anything. A
-posture, `network` and `proc` with their `mode`, `gui`, `gpu`, `audio`, `dbus` and
-`allow_insecure_http`, would fall back to the layer below, which may be the wider:
-a project's `gpu = "no"` over a global `gpu = true` would leave the render node open.
+`scan`, `network.deny`, `network.websocket_secret`, `ssh_agent.confirm`, a task's
+`spawn` and the task defaults' `nonce`, at the top of the file or under an app, would
+each fall back to the permissive end: nothing denied, no path closed, a secret relayed
+out through a WebSocket, signing without a prompt, a task command free to run anything,
+placeholders a command could forge. A posture, `network` and `proc` with their `mode`,
+`gui`, `gpu`, `audio`, `dbus`, `allow_insecure_http` and `fs.git_writable`, would fall
+back to the layer below, which may be the wider: a project's `gpu = "no"` over a global
+`gpu = true` would leave the render node open, and its `git_writable = "no"` over a
+global `true` would leave the cage writing the hooks your git runs.
 One mistyped value in any of them costs the file, as two mistakes do, and the message
 names it. A launch is then refused until the value is fixed, whichever file it is in.
 
