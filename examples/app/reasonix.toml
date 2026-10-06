@@ -48,7 +48,7 @@
 # CONFIG + STATE — v1.8.1+ home is `~/.reasonix` (config.toml, global `.env`, sessions,
 # memory, checkpoints), kept in the app's persistent isolated home and shared across
 # projects (home_scope default). Versions move only on `sbx upgrade mise` — never on an
-# sbx binary update. 
+# sbx binary update.
 #
 # If a request is blocked, the proxy names the host — add it to `allow` (or check ahead
 # with `sbx test net <url>`).
