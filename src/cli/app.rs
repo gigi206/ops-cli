@@ -844,7 +844,7 @@ fn write_deps(plan: &DepPlan) -> Result<(), ExitCode> {
         let dest = dir.join(format!("{name}.toml"));
         if dest.exists() {
             diag::error(&format!(
-                "sbx: app import --with-deps: a {noun} '{name}' already exists at {} — nothing was \
+                "sbx: app import --with-deps: the {noun} '{name}' already exists at {} — nothing was \
                  written",
                 dest.display()
             ));

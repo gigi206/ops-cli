@@ -495,7 +495,7 @@ pub(crate) fn install_named_file(
     let dest = dir.join(format!("{name}.toml"));
     if dest.exists() && !force {
         diag::error(&format!(
-            "sbx: a {noun} '{name}' already exists at {} (use --force to overwrite)",
+            "sbx: the {noun} '{name}' already exists at {} (use --force to overwrite)",
             dest.display()
         ));
         return Err(ExitCode::FAILURE);

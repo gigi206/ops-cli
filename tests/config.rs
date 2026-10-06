@@ -4354,7 +4354,7 @@ allow = ["{*,WS} https://api.example.com"]
     let clash = fx.run(&["bundle", "import", frag.to_str().unwrap()]);
     assert!(!clash.status.success());
     assert!(
-        String::from_utf8_lossy(&clash.stderr).contains("a bundle 'demo-agent' already exists"),
+        String::from_utf8_lossy(&clash.stderr).contains("the bundle 'demo-agent' already exists"),
         "the refusal names what collided: {}",
         String::from_utf8_lossy(&clash.stderr)
     );
