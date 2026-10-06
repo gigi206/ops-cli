@@ -34,8 +34,7 @@ export MODEL_API_KEY=…
 - **Trade-off:** several of Meta's own SDKs *don't* auto-read `MODEL_API_KEY`
   (only OpenAI SDK compatibility layer): the proxy injects on the wire
   regardless of what the client sends, so the constraint above is not a
-  blocker: any client that lets you set a *base URL* only works with this
-  block.
+  blocker: any client that lets you set a *base URL* works with this block.
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): without
   it the block never matches beneath the base path.
 - **Reference:** [https://dev.meta.ai/](https://dev.meta.ai/)

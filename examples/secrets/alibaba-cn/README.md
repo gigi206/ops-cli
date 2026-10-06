@@ -23,8 +23,8 @@ export DASHSCOPE_API_KEY=…
   `/compatible-mode/v1` — the international twin `dashscope-intl.aliyuncs.com`
   is covered by the `alibaba/` page; **the key is the same**, only the
   destination differs (pick the block the reachable host needs).
-- **Variable:** `DASHSCOPE_API_KEY` — the env var the official
-  DashScope Key from the console, same key both sides (intl/CN).
+- **Variable:** `DASHSCOPE_API_KEY` — the DashScope key from the console, the
+  same key on both sides (intl/CN).
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): without
   it the block never matches beneath the base path.
 - **Reference:** <https://help.aliyun.com/zh/model-studio/> (DashScope)

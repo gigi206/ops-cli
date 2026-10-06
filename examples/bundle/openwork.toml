@@ -41,9 +41,9 @@
 # The pattern is anchored at both ends (`^openwork-linux-x86_64-<version>.AppImage$`), so a future
 # flavor cannot match it, and the command prints nothing rather than a guess when the release carries
 # no such asset or more than one — a resolver that emits no URL fails the launch instead of pinning
-# the wrong artifact. It selects an x86_64 asset explicitly, like the other resolver bundles
-# (`kiro-desktop`, `pool`, `reasonix-desktop`): on aarch64 it resolves nothing, and upstream does
-# publish an arm64 AppImage if you edit the pattern.
+# the wrong artifact. It selects an x86_64 asset explicitly, like the `kiro-desktop` and
+# `reasonix-desktop` resolvers: on aarch64 it resolves nothing, and upstream does publish an arm64
+# AppImage if you edit the pattern.
 #
 # The AppImage is EXTRACTED at BUILD time, never self-mounted at runtime: `appimage-run`/`wrapType2`/
 # the raw AppImage all need a runtime FUSE/namespace mount the cage's seccomp denylist blocks, so sbx

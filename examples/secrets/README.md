@@ -60,7 +60,7 @@ plugins are in [Resolvers](https://gigi206.github.io/ops-cli/docs/secrets/resolv
 | [Kilo](kilo/) | `api.kilo.ai/api/gateway/*` | `env://KILO_API_KEY` | `Authorization` / `bearer` |
 | [Kling AI](kling/) | `api-singapore.klingai.com/*` | `env://KLINGAI_API_KEY` | `Authorization` / `bearer` |
 | [Llama (Meta)](llama/) | `api.llama.com/compat/v1/*` | `env://LLAMA_API_KEY` | `Authorization` / `bearer` |
-| [Luma (Dream Machine)](luma/) | `api.lumalabs.ai/dream-machine/v1/*` | `env://LUMA_API_KEY` | `Authorization` / `bearer` |
+| [Luma (Dream Machine)](luma/) | `api.lumalabs.ai/*` | `env://LUMA_API_KEY` | `Authorization` / `bearer` |
 | [Meta AI](meta-ai/) | `api.meta.ai/v1/*` | `env://MODEL_API_KEY` | `Authorization` / `bearer` |
 | [MiniMax](minimax/) | `api.minimax.io/v1/*` | `env://MINIMAX_API_KEY` | `Authorization` / `bearer` |
 | [Mistral](mistral/) | `api.mistral.ai/v1/*` | `env://MISTRAL_API_KEY` | `Authorization` / `bearer` |

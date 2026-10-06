@@ -55,7 +55,7 @@ allow = [
     # The portal's static assets, which render on the sign-in page. Read-only.
     "{GET} https://web-assets.nousresearch.com",
     "{*} https://inference-api.nousresearch.com",
-    # Model catalogs (read-only, TTL-cached on disk, fail-soft if blocked).
+    # Model catalogs (TTL-cached on disk, fail-soft if blocked).
     "{*} https://hermes-agent.nousresearch.com",
     "@models-catalog",
     # Hermes' "pet" gallery: a public read-only pixel-art sprite gallery, pinned to `*.petdex.dev`

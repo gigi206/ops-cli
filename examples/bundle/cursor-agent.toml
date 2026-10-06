@@ -1,4 +1,4 @@
-# `cursor-agent` — the Cursor Agent CLI: the tooling its bootstrap install needs, plus the hosts it reaches.
+# `cursor-agent` — the Cursor Agent CLI: the agent itself, auto-upgraded, plus the hosts it reaches.
 #
 #   sbx bundle import examples/bundle/cursor-agent.toml
 #   # then in an app profile:   use = ["cursor-agent"]

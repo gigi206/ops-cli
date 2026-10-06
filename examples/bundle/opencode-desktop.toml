@@ -56,6 +56,6 @@ mute = [
 ]
 
 [packages]
-# Track the latest GitHub release's linux-amd64 `.deb` automatically — the pin is the release's
-# version-stamped asset, rolled by `sbx upgrade`.
+# Track the latest GitHub release's `.deb` for this machine's architecture automatically — the pin
+# is the release's version-stamped asset, rolled by `sbx upgrade`.
 opencode-desktop = "deb:github:anomalyco/opencode"

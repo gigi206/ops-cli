@@ -1,4 +1,4 @@
-# `trae` — ByteDance's Trae CLI: the interpreter its source install needs, plus the hosts it reaches.
+# `trae` — ByteDance's Trae CLI: the install step its source checkout needs, plus the hosts it reaches.
 #
 #   sbx bundle import examples/bundle/trae.toml
 #   # then in an app profile:   use = ["trae"]
@@ -15,13 +15,7 @@
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
 #
-# WHAT THIS BUNDLE DOES NOT GIVE YOU — read this before naming it. The agent itself is a SOURCE CHECKOUT: the profile's `cmd` clones the repo and runs
-# `uv tool install .`, which is why `[packages]` names an interpreter and a resolver rather than
-# the CLI. (`git` is already in sbx's base toolset, so it is not declared.)
-# A bundle cannot carry a `cmd`, so what is here is the FETCH TOOLING plus the hosts and
-# environment the agent needs once installed. A consuming app must reproduce the install step from
-# `examples/app/trae.toml`; naming this bundle alone equips a cage that can reach the agent's
-# service but has no agent in it.
+# `git` is already in sbx's base toolset, so the clone the `provision` below runs needs no package.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
@@ -73,6 +67,6 @@ allow = [
 ]
 
 [packages]
-# The install substrate; the CLI itself arrives through the profile's `cmd`.
+# The install substrate; the CLI itself arrives through the `provision` above.
 uv = "nix:uv"             # `uv tool install .` from the checkout
 python = "nix:python312"  # the interpreter the project requires

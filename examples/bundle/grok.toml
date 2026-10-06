@@ -13,8 +13,10 @@
 # `[network]` table — an app that declares none gets a warning instead, because inventing one could
 # move its posture.
 #
-# The two lines below are the INSTALL host (xAI's artifact bucket, path-scoped) and the BYOK API
-# host. The xAI-ACCOUNT path uses different hosts (`accounts.x.ai`, `cli-chat-proxy.grok.com`); the
+# The two lines below are xAI's artifact bucket (path-scoped) and the BYOK API host. The install no
+# longer needs the bucket — the resolver and the download run host-side — but it is the channel the
+# CLI's own updater reads, which `GROK_DISABLE_AUTOUPDATER` turns off; drop it in the consuming app
+# to make `sbx upgrade` the only path that moves the version. The xAI-ACCOUNT path uses different hosts (`accounts.x.ai`, `cli-chat-proxy.grok.com`); the
 # profile leaves them commented, so the bundle does not carry them either — an app that signs in
 # with an account adds those two itself.
 #

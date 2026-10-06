@@ -1,4 +1,4 @@
-# `prime-agent` — Prime Intellect's prime-agent: the runtime its installer needs, plus the hosts it reaches.
+# `prime-agent` — Prime Intellect's prime-agent: the install step it needs, plus the hosts it reaches.
 #
 #   sbx bundle import examples/bundle/prime-agent.toml
 #   # then in an app profile:   use = ["prime-agent"]
@@ -98,7 +98,7 @@ mute = [
 
 [packages]
 # The runtime the installer and the agent need, and the two tools the agent looks up on PATH
-# before falling back to a download. The agent itself arrives through the profile's `cmd`.
+# before falling back to a download. The agent itself arrives through the `provision` above.
 nodejs = "nix:nodejs"
 uv = "nix:uv"        # the Python kernel's resolver
 git = "nix:git"      # called directly for repository state

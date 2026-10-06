@@ -18,9 +18,9 @@
 # and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope. That split matters here — the sign-in browser
 # needs `gui = "wayland"`, `gpu = true` and `dbus = true`, which a bundle may never grant. A
-# consuming app that wants the in-cage login states those itself, and supplies the `xdg-open` shim
-# `examples/app/kiro.toml` writes; without it the CLI's `xdg-open <url>` finds nothing and the
-# browser login cannot start.
+# consuming app that wants the in-cage login states those itself, plus the `[open]` routing
+# `examples/app/kiro.toml` declares; without it the CLI's `xdg-open <url>` has no browser to open
+# and the login cannot start.
 #
 # WHY CHROMIUM IS IN HERE. `kiro-cli` is a native terminal program and never needs a browser to
 # run; the browser exists so the OAuth sign-in can COMPLETE inside the cage, and the sign-in is
@@ -197,7 +197,7 @@ shared_credential = [[
 # the symptom would be a missing path under `/usr`, not a refused namespace.
 #
 # ALL THREE BINARIES MATTER, NOT ONLY THE ENTRY POINT. `kiro-cli` delegates some verbs to
-# `kiro-cli-chat`, which it resolves by name on PATH — the install step below is one of them. A
+# `kiro-cli-chat`, which it resolves by name on PATH — the install step above is one of them. A
 # PATH carrying the wrapped form of any of the three therefore fails the same way, one level down
 # and with the same misdirected message.
 #

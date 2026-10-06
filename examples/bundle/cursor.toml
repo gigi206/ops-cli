@@ -17,9 +17,8 @@
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope. That split is load-bearing here — an Electron
 # editor needs `gui = "wayland"` and `gpu = true` to map a window at all, and the account sign-in
-# needs `dbus = true` plus the `xdg-open`/portal-handler preamble that `examples/app/cursor.toml`
-# writes. A consuming app that names this bundle and execs `cursor` with none of that gets a
-# package it cannot display.
+# needs `dbus = true` plus the `[open]` routing `examples/app/cursor.toml` declares — a consuming
+# profile without them gets a package it cannot display or log into.
 #
 # NOR the HTTP/2 designation: `[network] http2` is a transport posture, not a requirement of the
 # package, so it stays with the consuming app (Cursor's `repo42` indexing host is HTTP/2-only —
@@ -111,7 +110,7 @@ shared_credential = [["*.cursor.com", "*.cursor.sh", "api.workos.com"]]
 [packages]
 # Cursor's prebuilt `.deb`, auto-upgraded through the resolver below.
 cursor = "deb:resolve"
-# In-cage Chromium for the account sign-in flow. Drop it (and the consuming app's wrapper) if you
+# In-cage Chromium for the account sign-in flow. Drop it (and the consuming app's `[open]` table) if you
 # only ever sign in with EMAIL, which stays in the app webview and needs no external browser.
 chromium = "nix:chromium"
 

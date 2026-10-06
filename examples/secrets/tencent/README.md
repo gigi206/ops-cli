@@ -24,7 +24,7 @@ export TENCENT_CODING_PLAN_API_KEY=…
   clients, same host).
 - **Variable:** `TENCENT_CODING_PLAN_API_KEY` — the Coding Plan **dedicated**
   key, prefix `sk-sp-…`, minted on the Coding Plan page. Do **not** mix it
-  with the pay-as-you-go `sk-…` MaaS key `/tele…` on the same host — Tencent
+  with the pay-as-you-go `sk-…` MaaS key on the same host — Tencent
   refuses the cross-use.
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): without
   it the block never matches beneath the base path.

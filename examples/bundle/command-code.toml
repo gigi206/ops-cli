@@ -20,7 +20,7 @@
 #
 # The hosts below are the tool's own lanes: the first-party `api.commandcode.ai` (`taste-1`
 # sessions, auth, account — the conservative default route), the npm install lane, and GitHub
-# for taste push/pull. The PROVIDER hosts are BYOK and the profile leaves them commented
+# for taste pulls (read-only). The PROVIDER hosts are BYOK and the profile leaves them commented
 # (OpenAI, Anthropic, Gemini, xAI, DeepSeek, OpenRouter, …) — a bundle may only carry what its
 # profile declares, so the consuming app opens its OWN provider host (and supplies the key).
 #
@@ -36,7 +36,8 @@ allow = [
     # First-party Command Code API — auth, account, the `taste-1` model sessions, MCP
     # registry. The binary POSTs to `api.commandcode.ai` for every prompt.
     "{*} https://api.commandcode.ai",
-    # Taste push/pull — profiles are git repos in the GitHub registry.
+    # Taste pulls — profiles are git repos in the GitHub registry. Read-only: a push POSTs
+    # `git-receive-pack`, which an app that publishes its taste opens itself.
     "@github-install",
 ]
 mute = [

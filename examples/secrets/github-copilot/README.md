@@ -34,7 +34,7 @@ export GITHUB_COPILOT_API_TOKEN=…
   long-lived PAT in this slot gets `401`/`403` — the API does not accept it.
 - **Mandatory companion headers:** the API refuses valid sessions without
   `Copilot-Integration-Id` (plus `User-Agent`, `Editor-…` version headers, and
-  `Accept: text/event-stream` on streaming) — *403 « token not authorized*» .
+  `Accept: text/event-stream` on streaming), answering `403` ("token not authorized").
   `[secret]` sets only `Authorization`; have the **client** send those (any
   OpenAI-compatible client with extra-headers support).
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): without

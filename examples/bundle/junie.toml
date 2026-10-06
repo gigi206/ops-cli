@@ -17,11 +17,6 @@
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
 #
-# WHAT THIS BUNDLE ALONE DOES NOT GIVE YOU. The npm package is a SHIM whose `postinstall` downloads
-# the real JVM build, and mise's npm backend installs with `--ignore-scripts=true`, so a consuming
-# app that execs a bare `junie` fails with "[Junie] Shim not found at …". The cure is one `cmd`
-# wrapper running the vendor's own `postinstall.js` once — copy it from `examples/app/junie.toml`.
-#
 # NO BYOK PROVIDER HOST. Junie authenticates three ways (a JetBrains account, a Junie API key, or
 # BYOK against your own provider); only the first two reach the hosts below. A consuming app that
 # takes the BYOK path opens that provider's host itself, and supplies the key, because which

@@ -21,28 +21,28 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 # The install step mise's `--ignore-scripts` leaves undone, and the reason this bundle is complete
-# rather than a package a consuming app cannot start. OpenFox depends on two NATIVE node addons —
-# `better-sqlite3` (its session DB), whose compiled `.node` binary is placed by a package install
-# script, which mise deliberately does not run. A plain install therefore leaves it absent and the
-# agent exits at startup with "Could not locate the bindings file … better_sqlite3.node".
+# rather than a package a consuming app cannot start. OpenFox depends on two NATIVE node addons,
+# and one of them, `better-sqlite3` (its session DB), has its compiled `.node` binary placed by a
+# package install script, which mise deliberately does not run. A plain install therefore leaves it
+# absent and the agent exits at startup with "Could not locate the bindings file …
+# better_sqlite3.node".
 #
-# `npm rebuild` DOWNLOADS the prebuilt binary rather than compiling it (better-sqlite3's install
-# script is `prebuild-install || node-gyp rebuild`, and the download reaches GitHub releases, which
-# sbx's built-in set already allows), so no C++ toolchain is needed — but it does fetch, which is
-# why the npm registry is in the consuming app's reach. It runs inside the cage, under that app's
-# own posture.
+# The step DOWNLOADS the prebuilt binary rather than compiling it: better-sqlite3's install script
+# is `prebuild-install || node-gyp rebuild`, and the step runs `prebuild-install` itself, which
+# fetches the binding published on GitHub releases (sbx's built-in set already reads those), so no
+# C++ toolchain is needed. It runs inside the cage, under the consuming app's own posture.
 #
-# Only better-sqlite3 is rebuilt. `node-pty` ships `prebuilds/linux-x64/pty.node` in the tree, so
-# there is nothing to build for it — and rebuilding it FAILS by construction: its `prepare` script
-# runs `tsc -b ./src/tsconfig.json` while the published tarball carries `src/unix` and `src/win`
-# without that tsconfig, so npm aborts the whole rebuild on a TypeScript error and takes
+# Only better-sqlite3 is fetched. `node-pty` ships `prebuilds/linux-x64/pty.node` in the tree, so
+# there is nothing to fetch for it — and an `npm rebuild` of it FAILS by construction: its `prepare`
+# script runs `tsc -b ./src/tsconfig.json` while the published tarball carries `src/unix` and
+# `src/win` without that tsconfig, so npm aborts the whole rebuild on a TypeScript error and takes
 # better-sqlite3 down with it. Asking for the addon that is genuinely missing, and only that one,
 # is what keeps this step honest.
 #
 # The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
 # remember that one succeeded. Keying on the artifact also self-heals — after `sbx upgrade mise`
-# rolls openfox into a fresh install directory the marker is absent again, so the addons are rebuilt
-# for the new tree.
+# rolls openfox into a fresh install directory the marker is absent again, so the binding is fetched
+# again for the new tree.
 provision = [
     "bash",
     "-c",

@@ -25,8 +25,8 @@ export KILO_API_KEY=…
 - **Variable:** `KILO_API_KEY` — the bearer key from the Kilo dashboard (keys
   are JWTs bound to your account).
 - **BYOK caveat:** the gateway can route *your own* provider keys (encrypted
-  at rest, on Kilo's side). Whatever routing you configure, the wire-authent
-  the gateway itself is always `Authorization: Bearer $KILO_API_KEY` — the
+  at rest, on Kilo's side). Whatever routing you configure, the gateway itself
+  is always authenticated with `Authorization: Bearer $KILO_API_KEY` — the
   upstream provider keys never pass through the cage.
 - **Model listing note:** `GET /api/gateway/models` is **public** (no auth) —
   it is friendly for discovery but proves nothing about the header; only a

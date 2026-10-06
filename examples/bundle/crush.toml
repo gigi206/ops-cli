@@ -32,9 +32,10 @@ allow = [
     # Catwalk — the community-supported model registry Crush pulls on startup to refresh its
     # provider list.
     "{GET} https://catwalk.charm.land",
-    # GitHub — OAuth device flow, token exchange, the Copilot API, and `api.github.com` for
-    # the MCP server catalog. `{GET}` for the catalog and the device-code page; `{*}` for the
-    # post-flow token exchange and Copilot POSTs.
+    # GitHub — the device-code page and `api.github.com` for the MCP server catalog, read-only
+    # through `@github-install` (`{GET}`), and the Copilot API, `{*}` for its POSTs. The post-flow
+    # token exchange POSTs to `github.com/login/oauth/access_token`, which this lane does not open:
+    # an app that signs in through GitHub opens that path itself.
     "@github-install",
     "{*} https://api.githubcopilot.com",
 ]

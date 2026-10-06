@@ -29,7 +29,7 @@ allow = [
     # Login + API + artifact endpoint. The device-code login (the CLI prints a verification link
     # and a code, then polls until you approve in any browser) and the account portal both live
     # on app.warp.dev, and `app.warp.dev/download/agent-cli/artifact?os=…&arch=…` is the 302
-    # entry to the release tarballs the bootstrap wrapper resolves. `{*,WS}`: an app is
+    # entry to the release tarballs (the resolver below reads it host-side). `{*,WS}`: an app is
     # read-by-default ({GET,HEAD}), the CLI POSTs to its API, and the binary's URL table also
     # shows a WebSocket against app.warp.dev (streaming).
     "{*,WS} https://app.warp.dev",
@@ -39,9 +39,9 @@ allow = [
     # does NOT grant (a bidirectional, uninspected channel), so each is named `{WS}`.
     "{WS} https://sessions.app.warp.dev",
     "{WS} https://rtc.app.warp.dev",
-    # Release downloads: the bootstrap tarball (after the app.warp.dev 302) and the background
-    # auto-updater (`channel_versions.json` + the versioned tarballs, fetched while the CLI
-    # runs). Read-only, so `{GET,HEAD}` — least privilege.
+    # Release downloads for the background auto-updater (`channel_versions.json` + the versioned
+    # tarballs, fetched while the CLI runs); the install itself is fetched host-side. Read-only, so
+    # `{GET,HEAD}` — least privilege.
     "{GET,HEAD} https://releases.warp.dev",
 ]
 

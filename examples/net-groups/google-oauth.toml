@@ -12,8 +12,9 @@
 # (`lh3.googleusercontent.com`). `agy` names it: its consent is completed in the HOST browser from
 # a printed URL, so the cage needs the `.com` host only. A profile that completes the consent in an
 # IN-CAGE browser needs more, because Google redirects it to a country-code domain
-# (`accounts.google.fr`, …); those profiles carry their own anchored regex alongside the browser
-# hosts their Chromium needs, which is why the shipped desktop profiles do not name this group.
+# (`accounts.google.fr`, …); those profiles take [`google-signin-incage`](google-signin-incage.toml)
+# instead, which carries the anchored ccTLD regex and the consent page's assets, and is why the
+# shipped desktop profiles do not name this group.
 # The consuming agent's bundle keeps its own product/API hosts; this group is the account.
 # Groups are global-only (like bundles): an app's allow may reference one, a project may not
 # define one.

@@ -24,8 +24,8 @@
 # project, and `sbx upgrade` re-reads the index and rolls forward. The vendor also serves a
 # `.../deb/latest/chatgpt_amd64.deb` alias; it is deliberately NOT used, because a pin is a content
 # hash and a moving URL breaks the next launch with a hash mismatch the moment upstream releases.
-# ARCH: the index below is `binary-amd64` (x86_64); on arm64 point it at `.../binary-arm64/Packages`
-# instead, which that pool also publishes.
+# The architecture is not that line's to choose: sbx reads the index for the machine it runs on (see
+# `[packages]`).
 #
 # THE INDEX IS ATTESTED. The pool publishes a signed `InRelease` covering the index, so sbx verifies
 # it and pins the signing key the first time, naming the fingerprint on stderr. The first pin is
@@ -95,8 +95,8 @@ mute = [
     "statsigapi.net",
     # Segment's analytics loader.
     "cdn.segment.com",
-    # Telemetrie et tiers que l'app sollicite sans en dependre : refuses, mais sans
-    # notification. Le demarrage a ete mesure au meme taux avec et sans eux.
+    # Telemetry and third parties the app calls without depending on them: refused, and kept out
+    # of the default log. Start-up was measured at the same rate with and without them.
     "bzr.openai.com",
     "cdn.auth0.com",
     "www.gstatic.com",
