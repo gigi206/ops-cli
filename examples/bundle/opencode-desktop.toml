@@ -8,6 +8,8 @@
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-runtime.toml
 #     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # Derived from `examples/app/opencode-desktop.toml`, whose namesake profile names this bundle in
 # `use` (thin profile): the bundle is the single source of truth for the app's packages, env and

@@ -166,6 +166,46 @@ See [Egress observability](observability#persisting-rules) for the write scopes.
 
 ---
 
+## The shipped groups
+
+The repository ships the lanes that several profiles and bundles share under
+`examples/net-groups/`, one file per group. A bundle's header names the groups it
+needs, and `sbx bundle import` warns about any it references that you have not
+imported, with the file to import:
+
+```bash
+sbx net groups import examples/net-groups/chromium-spellcheck.toml
+```
+
+The **List** column is the list the shipped files reference the group from: an `allow`
+group opens what it carries, a `mute` group keeps refusals out of the default
+[`sbx net logs`](observability) without changing the verdict.
+
+| Group | List | Entries | What it carries |
+|---|---|---|---|
+| `chromium-background` | mute | 12 entries | The background services a Chromium engine reaches on its own (component and variations updaters, Safe Browsing, the autofill and leaked-password checks, page translation, the Play and YouTube identity endpoints), kept denied and out of the default log. |
+| `chromium-spellcheck` | allow | 1 entry | Chromium's spellcheck dictionary, `GET` only and limited to the dictionary path on the `*.gvt1.com` redirectors. |
+| `github` | allow | 1 entry | `github.com` for every verb, for the apps that write to GitHub at runtime (git-forge integrations). |
+| `github-api` | allow | 1 entry | `api.github.com` for every verb, for the apps that call the API at runtime. |
+| `github-install` | allow | 2 entries | `github.com` and `api.github.com`, `GET` only: the source and release hosts a `mise:github:` install reads. |
+| `github-oauth` | allow | 2 entries | Signing in with a GitHub account: the device-flow login pages (path-scoped) and the API. |
+| `google-oauth` | allow | 4 entries | Signing in with a Google account in your host browser: the sign-in host, the token endpoint, the userinfo path and the avatar host. |
+| `google-signin-incage` | allow | 9 entries | Signing in with Google in a browser inside the cage: the country-domain consent and cookie step, the token endpoint, the page's script client and its assets. |
+| `huggingface-hub` | allow | 2 entries | Model downloads from the Hugging Face Hub: the metadata on `huggingface.co` and the files on its Xet CDN, `GET` and `HEAD` only. |
+| `models-catalog` | allow | 2 entries | The model catalogue (`models.dev`, and the copy OpenCode reads), read only. |
+| `npm-audit` | mute | 3 entries | The vulnerability lookup npm sends after an install, kept denied and out of the default log. |
+| `npm-jsr` | mute | 1 entry | The JSR mirror an npm install probes while it resolves a tree, kept denied and out of the default log. |
+| `npm-registry` | allow | 1 entry | The npm install lane: `registry.npmjs.org`, `GET` only. |
+| `npm-runtime` | allow | 1 entry | `registry.npmjs.org` for every verb, for the agents that pull packages at runtime. |
+| `openrouter` | allow | 1 entry | The OpenRouter API, a provider you choose; the key stays in the app's own `[secret]` block. |
+| `pypi` | allow | 2 entries | The Python install lane: the index and its file host, `GET` only. |
+
+A group lists what the apps referencing it share, not everything they reach. When one
+app needs more than its group, it writes the extra rule beside the reference, and the
+catalogue's tests refuse a rule that only repeats what a group already carries.
+
+---
+
 ## See also
 
 - [Rule grammar](rules): what a group entry may contain, and how `@name` is

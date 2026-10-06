@@ -334,7 +334,7 @@ The 69 shipped bundles, and what each carries:
 | `atomic-agent` | 1 (`tarball:`) | 6 egress entries, 2 env vars, a `tarball:` resolver | `huggingface-hub` |
 | `aider` | 4 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
 | `amp` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `ante` | 1 (`mise:`) | 4 egress entries | `huggingface-hub` |
+| `ante` | 1 (`mise:`) | 3 egress entries | `huggingface-hub` |
 | `antigravity` | 2 (`nix:`, `tarball:`) | 21 egress entries, a `tarball:` resolver | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `auggie` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `autohand` | 2 (`mise:`, `nix:`) | 6 egress entries | `github-install`, `npm-audit`, `npm-jsr`, `npm-registry` |

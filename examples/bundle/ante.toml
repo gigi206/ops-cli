@@ -38,8 +38,8 @@ allow = [
     # Hugging Face — `/offline-mode` fetches GGUF weights to the cage's home, through the shared
     # Hub lane (read-only).
     "@huggingface-hub",
-    # GitHub — MCP server installs, slash-command marketplace fetches. `{GET}`.
-    "{GET} https://github.com",
+    # GitHub (MCP server installs, slash-command marketplace fetches) needs no entry: sbx's built-in
+    # self-equip lane already opens `{GET,HEAD}` on github.com to every cage.
 ]
 
 [packages]

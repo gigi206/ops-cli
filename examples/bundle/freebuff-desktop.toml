@@ -11,6 +11,8 @@
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #     sbx net groups import examples/net-groups/google-signin-incage.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # Derived from `examples/app/freebuff-desktop.toml`, whose namesake profile names this bundle in
 # `use` (thin profile): the bundle is the single source of truth for the app's packages, env and

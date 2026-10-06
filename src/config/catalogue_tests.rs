@@ -21,16 +21,21 @@ fn shipped_bundle(path: &std::path::Path) -> schema::RawBundle {
     super::validate_bundle(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// One shipped file, paired with the tables whose entries a validator may drop one by one.
+/// One shipped file, paired with the tables whose entries a validator may drop one by one, and with
+/// the egress lists it declares.
 ///
 /// A single walk rather than a `read_dir` per guard: the guards that follow differ only in which
-/// table they hand to which validator, so the population they read is one fact, and two copies of
-/// it drift apart the first time a directory is added to the catalogue.
+/// table or list they read, so the population they read is one fact, and two copies of it drift
+/// apart the first time a directory is added to the catalogue.
 struct ShippedTables {
     /// The file, named the way a launch's own warning names it.
     source: String,
     open: std::collections::BTreeMap<String, schema::RawOpen>,
     service: std::collections::BTreeMap<String, schema::RawService>,
+    /// Its `allow`, `mute` and `deny` lists, each under the name a guard's message gives it: a
+    /// bundle's from its top level, a profile's from its `[network]` table, and empty for a profile
+    /// that writes its posture as a bare mode.
+    egress: [(&'static str, Vec<String>); 3],
 }
 
 /// Every file of the shipped catalogue that can carry one of those tables, parsed through sbx's own
@@ -57,20 +62,93 @@ fn shipped_tables() -> Vec<ShippedTables> {
                     source,
                     open: bundle.open,
                     service: bundle.service,
+                    egress: [
+                        ("allow", bundle.allow),
+                        ("mute", bundle.mute),
+                        ("deny", bundle.deny),
+                    ],
                 }
             } else {
                 let bytes = std::fs::read(&path).expect("read the profile");
                 let app =
                     schema::parse_app(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                let egress = match app.network {
+                    Some(schema::NetworkField::Table(t)) => {
+                        [("allow", t.allow), ("mute", t.mute), ("deny", t.deny)]
+                    }
+                    _ => [
+                        ("allow", Vec::new()),
+                        ("mute", Vec::new()),
+                        ("deny", Vec::new()),
+                    ],
+                };
                 ShippedTables {
                     source,
                     open: app.open,
                     service: app.service,
+                    egress,
                 }
             });
         }
     }
     out
+}
+
+/// Every shipped egress group, by name, with its entries as `sbx net groups import` reads them.
+///
+/// Parsed with sbx's own reader, so a file this accepts is one the verb accepts: a key written where
+/// `entries` belongs names no hosts, and is refused here rather than shipped as an empty group.
+fn shipped_groups() -> std::collections::BTreeMap<String, Vec<String>> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/net-groups");
+    let mut out = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(&dir)
+        .expect("examples/net-groups/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let entries =
+            super::validate_group_file(&std::fs::read(&path).expect("read the group file"))
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        out.insert(
+            path.file_stem().unwrap().to_str().unwrap().to_string(),
+            entries,
+        );
+    }
+    out
+}
+
+/// The egress groups a file's leading comment block tells its reader to import: every
+/// `examples/net-groups/<name>.toml` it names, up to the first line that is neither blank nor a
+/// comment.
+///
+/// Only that block counts. An import instruction written further down sits beside the one rule it
+/// enables, so it promises nothing about the rest of the file.
+fn header_named_groups(text: &str) -> std::collections::BTreeSet<String> {
+    text.lines()
+        .take_while(|l| {
+            let t = l.trim_start();
+            t.is_empty() || t.starts_with('#')
+        })
+        .filter_map(|l| l.split_once("examples/net-groups/"))
+        .filter_map(|(_, rest)| rest.split_once(".toml"))
+        .map(|(group, _)| group.to_string())
+        .collect()
+}
+
+/// The row a reference table opens with `` | `name` | ``, or `None` when the page has no such row.
+fn table_row<'a>(page: &'a str, name: &str) -> Option<&'a str> {
+    page.lines()
+        .find(|line| line.starts_with(&format!("| `{name}` |")))
+}
+
+/// The trimmed cell `column` of that row, counting the row's name as cell `1`.
+fn table_cell(page: &str, name: &str, column: usize) -> Option<String> {
+    table_row(page, name)
+        .and_then(|line| line.split('|').nth(column))
+        .map(|cell| cell.trim().to_string())
 }
 
 #[test]
@@ -470,20 +548,7 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
     //      shipped fragment under `examples/net-groups/`, so a header's REQUIRES block (and an
     //      app's allow list) can never point at a fragment that does not exist.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let groups_dir = root.join("examples/net-groups");
-    let mut shipped_groups = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir(&groups_dir).expect("examples/net-groups/ dir exists") {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
-        // Parsed with sbx's own reader, so a file this test accepts is one `sbx net groups import`
-        // accepts — a key written where `entries` belongs names no hosts, and is refused here
-        // rather than shipped as an empty group.
-        super::validate_group_file(&std::fs::read(&path).expect("read the group file"))
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        shipped_groups.insert(path.file_stem().unwrap().to_str().unwrap().to_string());
-    }
+    let shipped_groups = shipped_groups();
 
     let dir = root.join("examples/bundle");
     let mut checked = 0;
@@ -560,7 +625,7 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
             for rule in list {
                 if let Some(group) = rule.strip_prefix('@') {
                     assert!(
-                        shipped_groups.contains(group),
+                        shipped_groups.contains_key(group),
                         "bundle `{name}` references @{group} in its {label} list, but \
                          `examples/net-groups/{group}.toml` does not exist — the header's REQUIRES \
                          block would import nothing"
@@ -573,7 +638,7 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
                 for rule in list {
                     if let Some(group) = rule.strip_prefix('@') {
                         assert!(
-                            shipped_groups.contains(group),
+                            shipped_groups.contains_key(group),
                             "`examples/app/{name}.toml` references @{group} in its {label} list, \
                              but `examples/net-groups/{group}.toml` does not exist"
                         );
@@ -736,10 +801,8 @@ fn every_shipped_freshness_exemption_is_named_in_the_bundles_table() {
         if declared {
             carriers += 1;
         }
-        let named = page
-            .lines()
-            .find(|line| line.starts_with(&format!("| `{name}` |")))
-            .is_some_and(|line| line.contains("freshness exemption"));
+        let named =
+            table_row(&page, &name).is_some_and(|line| line.contains("freshness exemption"));
         if declared && !named {
             wrong.push(format!(
                 "`{name}` lifts the freshness delay for one of its packages and its row does not \
@@ -797,10 +860,7 @@ fn every_shipped_install_step_is_named_in_the_bundles_table() {
         if declared {
             carriers += 1;
         }
-        let named = page
-            .lines()
-            .find(|line| line.starts_with(&format!("| `{name}` |")))
-            .is_some_and(|line| line.contains("install step"));
+        let named = table_row(&page, &name).is_some_and(|line| line.contains("install step"));
         if declared && !named {
             wrong.push(format!(
                 "`{name}` carries an install step its row does not name"
@@ -873,10 +933,7 @@ fn every_shipped_bundle_declares_the_packages_its_row_names() {
             format!("{} ({})", packages.len(), backends.join(", "))
         };
         checked += 1;
-        let Some(row) = page
-            .lines()
-            .find(|line| line.starts_with(&format!("| `{name}` |")))
-        else {
+        let Some(row) = table_row(&page, &name) else {
             wrong.push(format!("`{name}`: no row in the bundles table at all"));
             continue;
         };
@@ -947,13 +1004,7 @@ fn every_shipped_resolver_table_is_named_in_the_bundles_table() {
             ("appimage", carries_resolver(&bundle.appimage)),
             ("binary", carries_resolver(&bundle.binary)),
         ];
-        let carries = page
-            .lines()
-            .find(|line| line.starts_with(&format!("| `{name}` |")))
-            .and_then(|line| line.split('|').nth(3))
-            .map(str::trim)
-            .unwrap_or_default()
-            .to_string();
+        let carries = table_cell(&page, &name, 3).unwrap_or_default();
         for (backend, declared) in tables {
             if declared {
                 carriers += 1;
@@ -1019,13 +1070,7 @@ fn every_shipped_bundle_carries_the_counts_its_row_states() {
         let bundle = shipped_bundle(&path);
         let egress = bundle.allow.len() + bundle.mute.len() + bundle.deny.len();
         let vars = bundle.env.len();
-        let carries = page
-            .lines()
-            .find(|line| line.starts_with(&format!("| `{name}` |")))
-            .and_then(|line| line.split('|').nth(3))
-            .map(str::trim)
-            .unwrap_or_default()
-            .to_string();
+        let carries = table_cell(&page, &name, 3).unwrap_or_default();
         // The cell is a comma-separated list of clauses, each naming one thing the bundle carries.
         let clauses: Vec<&str> = carries
             .split(", ")
@@ -1085,6 +1130,56 @@ fn every_shipped_bundle_carries_the_counts_its_row_states() {
 }
 
 #[test]
+fn every_shipped_bundle_row_names_the_groups_it_references() {
+    // The last column of the bundles table is the import list a reader takes from the page before
+    // opening any file: the groups to import beside the bundle. It is derived from the bundle's own
+    // references, every list counted, sorted, and `none` when there is no reference, so a reference
+    // added to or dropped from the file has to move the row with it.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
+        .expect("the bundles page exists");
+    let mut wrong = Vec::new();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let bundle = shipped_bundle(&path);
+        let groups = super::group_refs(bundle.allow.iter().chain(&bundle.mute).chain(&bundle.deny));
+        let want = if groups.is_empty() {
+            "none".to_string()
+        } else {
+            groups
+                .iter()
+                .map(|g| format!("`{g}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let said = table_cell(&page, &name, 4).unwrap_or_default();
+        if said != want {
+            wrong.push(format!(
+                "`{name}`: the row names {said:?} where the bundle references {want:?}"
+            ));
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 36,
+        "expected the shipped bundles to be checked, saw {checked}"
+    );
+    wrong.sort();
+    assert!(
+        wrong.is_empty(),
+        "the bundles table names the wrong groups for these bundles: {wrong:#?}"
+    );
+}
+
+#[test]
 fn every_shipped_service_is_named_in_the_bundles_table() {
     // The one item of the third column that starts a PROCESS. A `[bundle.<name>.service.<svc>]`
     // declares an auxiliary daemon sbx runs in the cage beside the app for as long as the launch
@@ -1117,10 +1212,8 @@ fn every_shipped_service_is_named_in_the_bundles_table() {
         }
         // An equivalence, like the resolver guard and for its reason: a row promising a daemon the
         // bundle does not declare misleads as much as one that hides the daemon it does.
-        let named = page
-            .lines()
-            .find(|line| line.starts_with(&format!("| `{name}` |")))
-            .is_some_and(|line| line.contains("a background service"));
+        let named =
+            table_row(&page, &name).is_some_and(|line| line.contains("a background service"));
         if declared && !named {
             wrong.push(format!(
                 "`{name}` starts a process in the cage its row does not name"
@@ -1534,16 +1627,7 @@ fn every_shipped_profile_resolves_the_egress_groups_it_references() {
     // This walks `examples/app/` directly, so a profile is covered whether or not a bundle exists
     // for it.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut shipped_groups = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir(root.join("examples/net-groups"))
-        .expect("examples/net-groups/ dir exists")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            shipped_groups.insert(path.file_stem().unwrap().to_str().unwrap().to_string());
-        }
-    }
+    let shipped_groups = shipped_groups();
 
     let mut checked = 0;
     for entry in std::fs::read_dir(root.join("examples/app"))
@@ -1561,7 +1645,7 @@ fn every_shipped_profile_resolves_the_egress_groups_it_references() {
                 for rule in list {
                     if let Some(group) = rule.strip_prefix('@') {
                         assert!(
-                            shipped_groups.contains(group),
+                            shipped_groups.contains_key(group),
                             "`examples/app/{name}.toml` references @{group} in its {label} list, \
                              but `examples/net-groups/{group}.toml` does not exist — the lane it \
                              names would resolve to nothing"
@@ -1584,8 +1668,9 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
     // to import before the app runs: a reader follows it, imports what it names, and is warned at
     // import time about the group it was not told to import — the lane is then silently narrower
     // than the profile claims. Most profiles enumerate nothing, make no such claim, and are left
-    // alone here: the bundle header is where the list lives, and every shipped bundle carries a
-    // complete one. The obligation is on the profile that chooses to restate it.
+    // alone here: the bundle header is where the list lives, and
+    // `every_shipped_bundle_header_names_the_egress_groups_it_references` holds every shipped
+    // bundle to a complete one. The obligation is on the profile that chooses to restate it.
     //
     // Only the LEADING comment block counts, and that is the contract asserted rather than an
     // accident of the current tree. An import instruction written further down sits beside the
@@ -1611,17 +1696,7 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let text = std::fs::read_to_string(&path).expect("read the profile");
 
-        // The header block: everything up to the first line that is neither blank nor a comment.
-        let declared: std::collections::BTreeSet<String> = text
-            .lines()
-            .take_while(|l| {
-                let t = l.trim_start();
-                t.is_empty() || t.starts_with('#')
-            })
-            .filter_map(|l| l.split_once("examples/net-groups/"))
-            .filter_map(|(_, rest)| rest.split_once(".toml"))
-            .map(|(group, _)| group.to_string())
-            .collect();
+        let declared = header_named_groups(&text);
         if declared.is_empty() {
             continue;
         }
@@ -1632,13 +1707,9 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
         let profile = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
         let mut required: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if let Some(schema::NetworkField::Table(t)) = &profile.network {
-            for list in [&t.allow, &t.deny, &t.mute] {
-                for rule in list {
-                    if let Some(group) = rule.strip_prefix('@') {
-                        required.insert(group.to_string());
-                    }
-                }
-            }
+            required.extend(super::group_refs(
+                t.allow.iter().chain(&t.deny).chain(&t.mute),
+            ));
         }
         for used in &profile.uses {
             let bundle_path = root.join(format!("examples/bundle/{used}.toml"));
@@ -1647,13 +1718,9 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
                 "`examples/app/{name}.toml` names the bundle `{used}`, which ships no file"
             );
             let bundle = shipped_bundle(&bundle_path);
-            for list in [&bundle.allow, &bundle.deny, &bundle.mute] {
-                for rule in list {
-                    if let Some(group) = rule.strip_prefix('@') {
-                        required.insert(group.to_string());
-                    }
-                }
-            }
+            required.extend(super::group_refs(
+                bundle.allow.iter().chain(&bundle.deny).chain(&bundle.mute),
+            ));
         }
 
         for group in required.difference(&declared) {
@@ -1674,6 +1741,199 @@ fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
     assert!(
         enumerating >= 15,
         "expected the enumerating profiles to be checked, saw {enumerating}"
+    );
+}
+
+#[test]
+fn every_shipped_bundle_header_names_the_egress_groups_it_references() {
+    // A bundle's header is the list a reader follows before importing it: its REQUIRES block names
+    // the fragments to import first. A group the bundle references and the block leaves out is one
+    // that reader never imports, so the import warns that it is undefined and the lane resolves to
+    // nothing: hosts it would have admitted are refused, refusals it would have muted fill the log.
+    //
+    // Unlike a profile, a bundle has no choice to make here. Every bundle that references a group
+    // carries the block, so the obligation holds for each of them, not only for those that already
+    // enumerate.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut referencing = 0;
+    let mut missing: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let bundle = shipped_bundle(&path);
+        let required =
+            super::group_refs(bundle.allow.iter().chain(&bundle.mute).chain(&bundle.deny));
+        if required.is_empty() {
+            continue;
+        }
+        referencing += 1;
+        let declared =
+            header_named_groups(&std::fs::read_to_string(&path).expect("read the bundle"));
+        for group in required.iter().filter(|g| !declared.contains(*g)) {
+            missing.push(format!(
+                "`examples/bundle/{name}.toml` references @{group} but its header never says to \
+                 import it — add `sbx net groups import examples/net-groups/{group}.toml` to its \
+                 REQUIRES block"
+            ));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} bundle header(s) leave out a group they reference:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+    assert!(
+        referencing >= 40,
+        "expected the bundles that reference a group to be checked, saw {referencing}"
+    );
+}
+
+/// The rules a shipped file writes out although a shipped group carries them too, as
+/// `(file, rule)` pairs, each under the reason it is not taken from the group.
+///
+/// An entry that no longer matches a rule fails the guard that reads this list, so the list cannot
+/// keep an exception that is gone.
+const RESTATED_ON_PURPOSE: &[(&str, &str)] = &[
+    // The OAuth userinfo endpoint. Antigravity takes the in-cage sign-in lane, which leaves this
+    // path out on purpose (only some flows read it), and `google-oauth`, the group that carries it,
+    // is the other posture: a sign-in opened in the host browser.
+    (
+        "examples/bundle/antigravity.toml",
+        "{GET} https://www.googleapis.com/oauth2/*",
+    ),
+];
+
+#[test]
+fn no_shipped_rule_restates_an_entry_of_a_shipped_group() {
+    // A rule written into a profile or a bundle when a shipped group already carries it is a second
+    // copy of one decision, and copies drift: the spellcheck dictionary was admitted in five
+    // spellings before `chromium-spellcheck` held it once, and the Google sign-in hosts were copied
+    // entry by entry into five bundles beside the group that names them. The cure is the `@group`
+    // reference. Where taking the whole group would widen what a file reaches, the file keeps its
+    // rule and `RESTATED_ON_PURPOSE` says why.
+    //
+    // The comparison is textual, on the entry as written. It does not see a rule a wider one
+    // already covers, such as a group's `www.gstatic.com` beside a file's `*.gstatic.com`: that is
+    // the policy engine's question, and the wider rule is a choice its own comment explains.
+    let mut carriers: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (group, entries) in shipped_groups() {
+        for entry in entries {
+            carriers
+                .entry(entry.trim().to_string())
+                .or_default()
+                .push(group.clone());
+        }
+    }
+    assert!(
+        carriers.len() >= 20,
+        "the shipped groups carry only {} entries, so the scan would pass vacuously",
+        carriers.len()
+    );
+
+    let mut restated = Vec::new();
+    let mut excused = std::collections::BTreeSet::new();
+    for ShippedTables { source, egress, .. } in shipped_tables() {
+        for (label, list) in &egress {
+            for rule in list {
+                let rule = rule.trim();
+                let Some(groups) = carriers.get(rule) else {
+                    continue;
+                };
+                if RESTATED_ON_PURPOSE.contains(&(source.as_str(), rule)) {
+                    excused.insert((source.clone(), rule.to_string()));
+                    continue;
+                }
+                restated.push(format!(
+                    "`{source}` writes {rule:?} in its {label} list, which @{} already carries — \
+                     reference the group instead",
+                    groups.join(" and @")
+                ));
+            }
+        }
+    }
+    let stale: Vec<&(&str, &str)> = RESTATED_ON_PURPOSE
+        .iter()
+        .filter(|(file, rule)| !excused.contains(&(file.to_string(), rule.to_string())))
+        .collect();
+    assert!(
+        restated.is_empty(),
+        "{} rule(s) restate an entry a shipped group carries:\n{}",
+        restated.len(),
+        restated.join("\n")
+    );
+    assert!(
+        stale.is_empty(),
+        "RESTATED_ON_PURPOSE names rules no shipped file writes any more: {stale:?}"
+    );
+}
+
+#[test]
+fn every_shipped_group_has_a_row_in_the_groups_page() {
+    // The groups page is where a reader finds the shipped fragments by name, the way the catalogue
+    // lists the profiles and the bundles page the bundles. Each group needs a row, and the row's two
+    // mechanical cells are derived rather than trusted: the list the group is referenced from, read
+    // off every shipped file, and the number of entries it carries. A row naming a group that does
+    // not ship is refused too, since a reader would look for a file that is not there.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/networking/groups.md"))
+        .expect("the groups page exists");
+    let groups = shipped_groups();
+    let mut slots: std::collections::BTreeMap<String, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for ShippedTables { egress, .. } in shipped_tables() {
+        for (label, list) in egress {
+            for group in super::group_refs(list.iter()) {
+                slots.entry(group).or_default().insert(label);
+            }
+        }
+    }
+
+    let mut wrong = Vec::new();
+    for (name, entries) in &groups {
+        if table_row(&page, name).is_none() {
+            wrong.push(format!("`{name}`: no row in the groups page"));
+            continue;
+        }
+        let list = slots.get(name).map_or_else(
+            || "none".to_string(),
+            |labels| labels.iter().copied().collect::<Vec<_>>().join(", "),
+        );
+        let count = match entries.len() {
+            1 => "1 entry".to_string(),
+            n => format!("{n} entries"),
+        };
+        for (column, want) in [(2, list), (3, count)] {
+            let said = table_cell(&page, name, column).unwrap_or_default();
+            if said != want {
+                wrong.push(format!(
+                    "`{name}`: cell {column} says {said:?} where the catalogue gives {want:?}"
+                ));
+            }
+        }
+    }
+    for line in page.lines().filter(|l| l.starts_with("| `")) {
+        let named = line.split('`').nth(1).unwrap_or_default();
+        if !groups.contains_key(named) {
+            wrong.push(format!("`{named}`: a row for a group that does not ship"));
+        }
+    }
+    assert!(
+        groups.len() >= 10,
+        "expected the shipped groups to be checked, saw {}",
+        groups.len()
+    );
+    wrong.sort();
+    assert!(
+        wrong.is_empty(),
+        "the groups page describes these groups wrong: {wrong:#?}"
     );
 }
 
