@@ -7,6 +7,8 @@
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/pypi.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # Derived from `examples/app/vibe.toml`, whose namesake profile names this bundle in `use` (thin
 # profile): the bundle is the single source of truth for the agent's packages, env and egress,
@@ -27,6 +29,8 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # Account SSO + runtime. The browser sign-in spans several Mistral subdomains: the CLI drives
     # the create/poll/exchange API on console.mistral.ai, the browser is redirected through
     # auth.mistral.ai and v2.auth.mistral.ai for the login itself, and api.mistral.ai serves the
@@ -40,9 +44,10 @@ allow = [
     # CheckCookie then `/accounts/SetSID` on YOUR country domain before returning to Mistral's
     # callback: a LOAD-BEARING step, not noise. The bounded regex covers every locale in one
     # anchored rule. For email/password login these are unnecessary; for Apple/Microsoft SSO, the
-    # consuming app swaps in `appleid.apple.com` / `login.microsoftonline.com`. The token exchange
-    # is server-side on Mistral, so no googleapis.com token endpoint is needed.
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    # consuming app swaps in `appleid.apple.com` / `login.microsoftonline.com`. The shared lane
+    # below also opens Google's token endpoint, which Mistral's server-side exchange does not use;
+    # the two wildcards are wider than its static and avatar hosts.
+    "@google-signin-incage",
     "{GET} https://*.gstatic.com",
     "{GET} https://*.googleusercontent.com",
     # Install-time (mise's `uv tool install`): the Python wheels and the package index.
@@ -54,7 +59,9 @@ allow = [
 mute = [
     # The in-cage browser's own background services.
     "@chromium-background",
-    # Wider than the group: the remaining background services this browser reaches.
+    # Wider than the group: the remaining background services this browser reaches. The
+    # spellcheck dictionary under `*.gvt1.com` is admitted by `@chromium-spellcheck` above, which
+    # these mutes do not touch.
     "*.googleapis.com",
     "*.gvt1.com",
     "www.google.com",                 # omnibox / async requests seen during sign-in

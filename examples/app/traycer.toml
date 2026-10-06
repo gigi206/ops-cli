@@ -11,6 +11,7 @@
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/github-install.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #

@@ -18,6 +18,7 @@
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/pypi.toml
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
 #
 # Odysseus is a Docker-compose stack upstream (app + ChromaDB + SearXNG + ntfy),
 # but the cage cannot run Docker. This profile uses the UPSTREAM NATIVE path instead:

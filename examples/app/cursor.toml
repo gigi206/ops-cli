@@ -13,6 +13,8 @@
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # This is the Cursor **desktop editor** (the full GUI IDE). For the headless terminal agent, use
 # `examples/app/cursor-agent.toml` instead (a CLI that fits Mode-B far more cleanly). Confined by sbx,

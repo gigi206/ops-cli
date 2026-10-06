@@ -26,13 +26,11 @@
 # `www.googleapis.com/oauth2/*` — only some flows read it, so a profile that does names it itself
 # rather than every consumer inheriting a host that serves many other Google APIs.
 #
-# THREE SHIPPED BUNDLES NAME IT — `claude-desktop`, `hermes-desktop` and `kiro` — because their
-# host sets were identical. The other in-cage sign-in profiles keep their own list because theirs
-# genuinely differ: `cursor`, `kiro-desktop` and `vibe` use `*.gstatic.com` /
-# `*.googleusercontent.com` wildcards, `freebuff-desktop` adds two favicon services and omits
-# `apis.google.com`, `antigravity` adds the userinfo endpoint and omits `www.google.com`.
-# Harmonizing them would be a change to what each cage can reach, so it is left to a deliberate
-# decision rather than folded in here.
+# EIGHT SHIPPED BUNDLES NAME IT — `antigravity`, `claude-desktop`, `cursor`, `freebuff-desktop`,
+# `hermes-desktop`, `kiro`, `kiro-desktop` and `vibe`. Where a bundle needs more than the group, it
+# names the extra beside the reference rather than in it: `cursor`, `kiro-desktop` and `vibe` keep
+# their `*.gstatic.com` / `*.googleusercontent.com` wildcards, `freebuff-desktop` its favicon
+# services, `antigravity` the userinfo endpoint.
 #
 # Groups are global-only (like bundles): an app's allow may reference one, a project may not
 # define one.

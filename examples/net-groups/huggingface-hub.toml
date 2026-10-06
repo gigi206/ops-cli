@@ -1,0 +1,24 @@
+# `huggingface-hub` — a shared egress GROUP, not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list.
+#
+#   sbx net groups import examples/net-groups/huggingface-hub.toml
+#   # then in an app's or bundle's allow list:   "@huggingface-hub"
+#
+# The Hugging Face Hub download lane, for the agents that fetch model weights (GGUF files, a
+# speech-to-text model) on first use. The Hub answers the metadata on `huggingface.co` and
+# redirects the file blobs to its Xet CDN under `xethub.hf.co`, so a download needs both hosts:
+# with the first alone, the request is answered and the blob that follows is refused.
+#
+# Read-only: `GET` for the files, and `HEAD`, which the `huggingface_hub` client sends to read a
+# file's size and revision before it downloads it. Nothing is uploaded, and no account is involved —
+# a gated model needs the consuming app's own token, declared there.
+#
+# A consumer that needs more of the domain (every `huggingface.co` subdomain, or every `hf.co` CDN)
+# names that wider rule itself, beside the reference. Groups are global-only (like bundles): an
+# app's or bundle's lists may reference one, a project may not define one.
+
+entries = [
+    "{GET,HEAD} https://huggingface.co",
+    "{GET,HEAD} https://*.xethub.hf.co",
+]

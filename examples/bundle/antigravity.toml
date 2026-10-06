@@ -6,6 +6,8 @@
 #
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # Derived from `examples/app/antigravity.toml`, whose namesake profile names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
@@ -27,6 +29,8 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # Model / agent traffic — Google's Cloud Code (Gemini Code Assist) backend, the host the caged
     # agent and the native language server POST completions to. `daily-` is the same backend's
     # staging channel. All verbs (request bodies).
@@ -34,21 +38,13 @@ allow = [
     "{*} https://daily-cloudcode-pa.googleapis.com",
     # Docs / bootstrap — a read-only fetch.
     "{GET} https://antigravity.google",
-    # Google Sign-In ("Continue with Google"). Google serves the consent AND the cross-domain
-    # `/accounts/SetSID` cookie step from your COUNTRY domain, so the bounded regex covers any
-    # ccTLD; it is anchored, so a look-alike (accounts.google.com.evil.com) is REFUSED.
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    "{*} https://oauth2.googleapis.com",
-    "{*} https://apis.google.com",
+    # Google Sign-In ("Continue with Google") in the in-cage browser — the country-domain consent
+    # and `/accounts/SetSID` step, the token endpoint and the page's assets — through the shared
+    # lane.
+    "@google-signin-incage",
     # The OAuth userinfo endpoint the login reads after the token exchange, path-scoped because
     # this host serves many other Google APIs.
     "{GET} https://www.googleapis.com/oauth2/*",
-    # Sign-in page assets and the avatar the userinfo response points at.
-    "{GET} https://www.gstatic.com",
-    "{GET} https://ssl.gstatic.com",
-    "{GET} https://fonts.gstatic.com",
-    "{GET} https://fonts.googleapis.com",
-    "{GET} https://lh3.googleusercontent.com",
     # The VS Code-fork asset CDN — Antigravity fetches extension and built-in metadata here.
     "{*} https://main.vscode-cdn.net",
     # The extension MARKETPLACE (Open VSX): the gallery protocol OPTIONS-preflights and POSTs an
@@ -79,7 +75,8 @@ mute = [
     "*.sentry.io",
     # VS Code telemetry (Antigravity is a VS Code fork) — Microsoft's OneCollector endpoint.
     "*.events.data.microsoft.com",
-    # Google page chrome (favicon, account `async/folae`) — the login completes without it.
+    # Google page chrome (favicon, account `async/folae`). The sign-in lane admits its GETs; this
+    # keeps anything else it sends out of the default log.
     "www.google.com",
     # Google Tag Manager — analytics / marketing tags, not functional.
     "www.googletagmanager.com",

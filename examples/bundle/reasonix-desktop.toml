@@ -4,6 +4,9 @@
 #   sbx bundle import examples/bundle/reasonix-desktop.toml
 #   # then in an app profile:   use = ["reasonix-desktop"]
 #
+#   REQUIRES an egress group — import it once (it is shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#
 # Derived from `examples/app/reasonix-desktop.toml`, whose namesake profile names this bundle in
 # `use` (thin profile): the bundle is the single source of truth for the app's packages, env and
 # egress, while the profile keeps its own command, posture and credential choices. A test pins the
@@ -25,6 +28,8 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # The provider host the shell POSTs completions to. The `deb:resolve` command and the build both
     # run HOST-SIDE, on the host network, so neither needs an entry.
     "{*} https://api.deepseek.com",

@@ -4,6 +4,9 @@
 #   sbx bundle import examples/bundle/goose-desktop.toml
 #   # then in an app profile:   use = ["goose-desktop"]
 #
+#   REQUIRES an egress group — import it once (it is shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#
 # Derived from `examples/app/goose-desktop.toml`, whose namesake profile names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
 # while the profile keeps its own command, posture and provider choices. A test pins the two
@@ -13,10 +16,11 @@
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope. An Electron app needs `gui = "wayland"` and
 # `gpu = true` to map a window at all.
 #
-# NO EGRESS AT ALL, and that is faithful to the app. Goose is MULTI-PROVIDER: the model host is
+# NO MODEL HOST, and that is faithful to the app. Goose is MULTI-PROVIDER: the model host is
 # whichever provider you pick in the GUI, so the consuming app opens that one and supplies its key.
 # The `.deb`'s own update check and the install ride sbx's built-in github allow-set, and the two
-# environment variables below cut the rest at the source.
+# environment variables below cut the rest at the source. The one entry below is the Electron
+# engine's spellcheck dictionary, through the shared `@chromium-spellcheck` lane.
 #
 # DISTINCT FROM THE `goose` BUNDLE, which carries the CLI (`mise:`). This one carries the desktop
 # `.deb`, whose `github:` form tracks the repo's latest release so `sbx upgrade` rolls it
@@ -26,6 +30,10 @@
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
+allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
+]
 
 [packages]
 # Goose's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron plus an embedded Rust

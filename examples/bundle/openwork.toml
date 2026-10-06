@@ -6,6 +6,7 @@
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-runtime.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # Derived from `examples/app/openwork.toml`, whose namesake profile names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
@@ -82,10 +83,8 @@ allow = [
     # the `opencode-desktop` egress log, the same engine). OpenWork's own plugins ship inside the
     # AppImage and need nothing here.
     "@npm-runtime",
-    # The spellcheck dictionary Chromium fetches for the app's text fields and its embedded browser
-    # panel, served from rotating `*.gvt1.com` redirectors. OBSERVED refused on a first launch.
-    # GET-only and path-scoped to the dictionary path.
-    '{GET} re:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # The provider logos the model picker draws beside each entry: Google's favicon service, and the
     # brand-icon CDN for the ones it does not cover. OBSERVED refused when the provider list is
     # opened. Cosmetic — denying them costs icons, not function — but they are read-only and

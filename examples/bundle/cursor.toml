@@ -6,6 +6,8 @@
 #
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # Derived from `examples/app/cursor.toml`, whose namesake profile names this bundle in `use` (thin
 # profile): the bundle is the single source of truth for the app's packages, env and egress, while
@@ -33,6 +35,8 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # Cursor's agent + API + auth backends. Cursor's own network-config doc recommends the
     # `*.cursor.sh` wildcard — it covers api2 (most API), api5 + `agent.*`/regional (agent
     # requests), repo42 (indexing) and the authenticate/authenticator hosts (login). Opened to all
@@ -51,9 +55,10 @@ allow = [
     # WorkOS auth-page assets (the sign-in page CSS/logos), needed for the form to render.
     "{GET} https://cdn.workos.com",
     "{GET} https://workos.imgix.net",
-    # Google SSO chain. The bounded, anchored regex covers `accounts.google.com` AND the country
-    # domain whose `/SetSID` redirect is load-bearing; the rest are consent-page assets.
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    # Google SSO chain, through the shared in-cage sign-in lane: the country domain whose `/SetSID`
+    # redirect is load-bearing, and the consent page's assets. The two wildcards are wider than its
+    # static and avatar hosts.
+    "@google-signin-incage",
     "{GET} https://*.gstatic.com",
     "{GET} https://*.googleusercontent.com",
     # A git fetch of the `makenotion/cursor-notion-plugin` repo over smart HTTP. github.com is
@@ -67,7 +72,8 @@ allow = [
 # Refusals to keep out of the default `sbx net log`. `mute` never changes the verdict (still
 # refused, still counted by `sbx net stats`); see them with `--all`.
 mute = [
-    # Chrome's component/dictionary CDN (spellcheck `.bdic` and friends) — not model traffic.
+    # Chrome's component CDN — not model traffic. The spellcheck dictionary on the same hosts is
+    # admitted by `@chromium-spellcheck` above, which this mute does not touch.
     "*.gvt1.com",
     # The in-cage Chromium's OWN telemetry/component-update noise, shared with every other profile
     # that embeds a browser engine. None of it is the Google SSO flow, which lives on

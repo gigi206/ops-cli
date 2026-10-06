@@ -8,6 +8,7 @@
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
 #
 # Derived from `examples/app/odysseus.toml`, whose namesake profile names this bundle in `use` (thin
 # profile): the bundle is the single source of truth for what this agent needs, while the profile
@@ -142,9 +143,10 @@ allow = [
     # The wheels the venv resolves, and the npm packages the front end pulls.
     "@pypi",
     "@npm-registry",
-    # Model weights fetched on first use: metadata on Hugging Face, blobs through the Xet CDN.
+    # Model weights fetched on first use: metadata on Hugging Face, blobs through the Xet CDN, and
+    # wider than the shared lane, every `huggingface.co` subdomain.
+    "@huggingface-hub",
     "{GET,HEAD} https://*.huggingface.co",
-    "{GET,HEAD} https://*.xethub.hf.co",
 ]
 mute = [
     "@npm-audit",  # npm's audit POST during the front-end install

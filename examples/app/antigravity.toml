@@ -13,6 +13,8 @@
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # This is the GRAPHICAL IDE (a VS Code / Windsurf-class fork), distinct from the `agy` terminal CLI
 # (profiled in `agy.toml`). Google ships the v2 Linux IDE **only as a plain `.tar.gz`** from its Edge

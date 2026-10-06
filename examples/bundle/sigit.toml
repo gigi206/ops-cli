@@ -6,6 +6,7 @@
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
 #
 # Derived from `examples/app/sigit.toml`, whose namesake profile now names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the agent's packages, env and
@@ -26,7 +27,8 @@
 
 allow = [
     "@npm-registry",
-    "{GET} https://huggingface.co",
+    # Model downloads through the shared Hub lane, and wider than it, every `hf.co` CDN.
+    "@huggingface-hub",
     "{GET} https://*.hf.co",
 ]
 mute = [

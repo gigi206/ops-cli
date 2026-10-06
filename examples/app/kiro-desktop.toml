@@ -13,6 +13,8 @@
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # This is the Kiro **desktop IDE** (the full GUI editor from kiro.dev, by AWS — a Code-OSS / VS Code
 # fork). For the headless terminal agent, use `examples/app/kiro.toml` instead (`kiro-cli`, a native Rust

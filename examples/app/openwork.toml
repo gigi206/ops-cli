@@ -17,6 +17,7 @@
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # OpenWork is a free, open-source Electron desktop app: a workspace where agents run against your
 # files, with skills, MCP connections and connected services you can share with teammates or keep to
@@ -216,9 +217,6 @@ allow = [
 # The group includes Google's leaked-password check, so denying it is a feature, not a loss.
 mute = [
     "@chromium-background",
-    # Chrome's page-translation probe, in the same class as the group above but not part of it.
-    # OBSERVED refused when the sign-in page loads.
-    "translate.googleapis.com",
 ]
 # SIGNING IN WITH A THIRD-PARTY ACCOUNT. The Den sign-in page offers identity providers, and each
 # one needs its own chain opened here — the profile opens none by default, so a launch that never

@@ -3,6 +3,9 @@
 #   sbx bundle import examples/bundle/atomic-agent.toml
 #   # then in an app profile:   use = ["atomic-agent"]
 #
+#   REQUIRES an egress group — import it once (it is shared, not per-agent):
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
+#
 # Derived from `examples/app/atomic-agent.toml`, whose namesake profile names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for what this agent needs, while the
 # profile keeps its own command, posture and provider choices. A test pins the two artifacts
@@ -46,8 +49,7 @@ allow = [
     # Face serves the metadata and redirects the blobs to its Xet CDN, so both hosts are needed —
     # the second is where the gigabytes actually come from. The llama.cpp runtime that runs them is
     # a GitHub release, already covered by sbx's built-in `{GET,HEAD}` self-equip lane.
-    "{GET,HEAD} https://huggingface.co",
-    "{GET,HEAD} https://*.xethub.hf.co",
+    "@huggingface-hub",
 ]
 # Telemetry, on by default upstream and refused here — the allowlist IS the privacy switch, and
 # these entries only keep the per-turn refusals from drowning the actionable ones in

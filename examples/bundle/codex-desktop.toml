@@ -4,8 +4,9 @@
 #   sbx bundle import examples/bundle/codex-desktop.toml
 #   # then in an app profile:   use = ["codex-desktop"]
 #
-#   REQUIRES an egress group — import it once (it is shared, not per-agent):
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # Derived from `examples/app/codex-desktop.toml`, whose namesake profile names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
@@ -52,6 +53,8 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # The backend the whole app is built on — Chat, Work and Codex all talk to it — and the
     # WebSocket its responses stream over.
     "{*,WS} https://chatgpt.com",

@@ -13,6 +13,7 @@
 #
 #   EGRESS GROUP — a shared lane, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # This is the GRAPHICAL app whose **Codex** surface is the desktop sibling of the `codex` CLI
 # profile, alongside the Chat and Work surfaces, parallel threads, file inspection and a browser

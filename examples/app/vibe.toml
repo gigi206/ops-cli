@@ -14,6 +14,8 @@
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/pypi.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # Vibe (github.com/mistralai/mistral-vibe) is a Python coding agent published to PyPI as the
 # `mistral-vibe` package (it exposes the `vibe` command; requires Python >=3.12). sbx equips it via

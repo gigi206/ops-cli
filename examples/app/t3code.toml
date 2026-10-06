@@ -8,6 +8,7 @@
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/github.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # T3 Code is a free, open-source Electron desktop app: ONE interface that drives OTHER coding agents
 # — Claude Code, Codex, OpenCode, Cursor — spawning each as a CLI subprocess, switching models
@@ -239,8 +240,8 @@ allow = [
     "@github",
     #"{*} https://gitlab.com",
     #"{*} https://api.bitbucket.org",
-    # Chromium's spellcheck dictionary, fetched by the in-cage browser on first use.
-    're:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # Extra providers, if you point a sub-agent at one its own bundle does not cover.
     #"{*} https://api.openai.com",
     #"{*} https://openrouter.ai",

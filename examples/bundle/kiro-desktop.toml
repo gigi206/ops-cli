@@ -6,6 +6,8 @@
 #
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # Derived from `examples/app/kiro-desktop.toml`, whose namesake profile names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
@@ -31,6 +33,8 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # Auth / token exchange + the sign-in page (rendered in the in-cage browser). The IDE POSTs
     # back after the IdP, so all verbs.
     "{*} https://app.kiro.dev",
@@ -66,13 +70,10 @@ allow = [
 
     # Google Sign-In ("Continue with Google"): the consent AND the cross-domain cookie step render
     # in the in-cage browser, then bounce back via amazoncognito.com to app.kiro.dev. Deny SetSID
-    # and the chain never completes. The bounded regex covers any ccTLD and is anchored.
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    "{*} https://oauth2.googleapis.com",
-    "{*} https://apis.google.com",
-    "{GET} https://www.google.com",
+    # and the chain never completes. The shared lane carries the sign-in; the two wildcards are
+    # wider than its static and avatar hosts.
+    "@google-signin-incage",
     "{GET} https://*.gstatic.com",
-    "{GET} https://fonts.googleapis.com",
     "{GET} https://*.googleusercontent.com",
 ]
 # Telemetry / metrics deliberately left DENIED. `mute` never changes the verdict (still refused,
@@ -95,8 +96,6 @@ mute = [
     # shared with every other profile that embeds a browser engine. The group includes the password
     # leak-check, which stays DENIED: no passwords are sent to Google's leak service.
     "@chromium-background",
-    # Chrome's page-translation service — same class, but not every browser embed reaches it.
-    "translate.googleapis.com",
 ]
 
 # Same service split as the `kiro` bundle, with the IDE's own extra: this build treats

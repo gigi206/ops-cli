@@ -16,6 +16,7 @@
 #     sbx net groups import examples/net-groups/npm-runtime.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # This is the GRAPHICAL sibling of the `opencode` profile (the terminal CLI/TUI) and of
 # `opencode-web` (the same server in your browser). opencode ships a native desktop app built with

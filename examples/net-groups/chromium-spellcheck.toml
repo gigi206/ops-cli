@@ -1,0 +1,26 @@
+# `chromium-spellcheck` — a shared egress GROUP, not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list.
+#
+#   sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#   # then in an app's or bundle's allow list:   "@chromium-spellcheck"
+#
+# The spellcheck dictionary a Chromium engine downloads for its text fields, whatever it is
+# embedded in: an Electron app, or the in-cage browser a profile wires for its sign-in. Chromium
+# asks `redirector.gvt1.com` for the `.bdic` of the interface language, which redirects to a
+# rotating edge node of the same domain, so the entry is a regex over every `gvt1.com` subdomain.
+# Without it the dictionary is refused, the text fields lose their spellcheck, and the refusal is
+# the first line of the app's egress log.
+#
+# GET-only and path-scoped to Chromium's dictionary path, so nothing else on those hosts is
+# reachable: the component and update payloads the same redirector serves stay denied, and
+# `@chromium-background` keeps their refusals out of the default log. The two groups do not
+# overlap, because a mute does nothing to a request an allow entry has already admitted.
+#
+# This is an allow group, so it is slot-pure and cannot also carry mute entries. Groups are
+# global-only (like bundles): an app's or bundle's lists may reference one, a project may not
+# define one.
+
+entries = [
+    '{GET} re:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+]

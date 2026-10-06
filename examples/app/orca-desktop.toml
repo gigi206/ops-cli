@@ -13,6 +13,7 @@
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #     sbx app import examples/app/orca-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
@@ -149,6 +150,8 @@ mode = "deny"
 # unioned into this list at resolution. Check what that adds with `sbx bundle opencode`, and what the
 # launch ends up with via `sbx config show --app orca-desktop`.
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     "@npm-runtime",
     # Direct-OpenRouter BYOK for the pilot opencode agent: uncomment together with the [secret]
     # block below.

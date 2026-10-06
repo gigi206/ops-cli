@@ -11,6 +11,8 @@
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/openrouter.toml
 #
 # AionUi is a free, open-source Electron + React desktop app: ONE interface over 20+ AI agents. It
 # ships a built-in agent and auto-detects CLI agents installed on the machine (Claude Code, Codex,
@@ -232,7 +234,7 @@ allow = [
     "{*} https://generativelanguage.googleapis.com", # Google Gemini (API key)
     "{*} https://api.openai.com",                    # OpenAI
     "{*} https://api.anthropic.com",                 # Anthropic
-    "{*} https://openrouter.ai",                     # OpenRouter
+    "@openrouter",                                   # OpenRouter
     "{*} https://api.deepseek.com",                  # DeepSeek
     "{*} https://api-inference.modelscope.cn",       # ModelScope (Alibaba)
     # AionUi's own account: the app asks you to sign in before it starts an agent. Signing in with
@@ -264,10 +266,8 @@ allow = [
     # host, e.g. change its line above to `{*,WS} https://api.openai.com`.
     #
     # AionUi's own app traffic (discovered live via `sbx net logs -a aionui`):
-    # Chromium spellcheck: redirector.gvt1.com 302-redirects the `.bdic` to a dynamic edge node
-    # (r3---sn-*.gvt1.com), so scope by regex to the dict path across every gvt1 subdomain — tight
-    # (only /edgedl/chrome/dict/), not the whole Google CDN.
-    're:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     "@npm-runtime",                          # browser-automation Cowork: AionUi fetches the chrome-devtools-mcp package
 ]
 # Silence denied telemetry: keep refusals to Sentry out of the default `sbx net logs` (still denied,
@@ -283,9 +283,8 @@ mute = [
     "firebase.googleapis.com",
     "firebaseinstallations.googleapis.com",
     # The embedded Chromium's own background services (the leak check, the sign-in signalling, the
-    # Play logging endpoint), described once in the shared group, plus its translate language list.
+    # Play logging endpoint, the translate language list), described once in the shared group.
     "@chromium-background",
-    "translate.googleapis.com",
 ]
 
 # AUTHENTICATION — no [secret] block. AionUi stores each provider's API key locally (entered

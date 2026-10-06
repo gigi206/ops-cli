@@ -9,6 +9,8 @@
 #     sbx net groups import examples/net-groups/github.toml
 #     sbx net groups import examples/net-groups/github-api.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # Derived from `examples/app/freebuff-desktop.toml`, whose namesake profile names this bundle in
 # `use` (thin profile): the bundle is the single source of truth for the app's packages, env and
@@ -46,15 +48,8 @@ allow = [
     # allow-set, so they are always reachable; named here for clarity.
     "@github",
     "@github-api",
-    # Google OAuth (sign in with Google). The bounded regex covers any ccTLD and is anchored.
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    "{*} https://oauth2.googleapis.com",
-    "{GET} https://www.google.com",
-    "{GET} https://ssl.gstatic.com",
-    "{GET} https://www.gstatic.com",
-    "{GET} https://fonts.gstatic.com",
-    "{GET} https://fonts.googleapis.com",
-    "{GET} https://lh3.googleusercontent.com",       # Google account avatar
+    # Google OAuth (sign in with Google) in the in-cage browser, through the shared lane.
+    "@google-signin-incage",
     # Domain favicons the app shows next to links and repos. Google serves them from two endpoints:
     # the older `s2.googleusercontent.com/s2/favicons`, and `faviconV2` on the rotating `t0`–`t9`
     # gstatic shards (path-scoped regex, so only the favicon path on those shards is opened).
@@ -62,9 +57,8 @@ allow = [
     '{GET} re:^https://t[0-9]\.gstatic\.com/faviconV2',
     # DuckDuckGo's favicon service, which the app uses too.
     "{GET} https://icons.duckduckgo.com",
-    # The in-cage browser's spellcheck dictionaries, served from rotating `*.gvt1.com` redirectors.
-    # GET-only and path-scoped to the dictionary path.
-    '{GET} re:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
 ]
 # Denied noise, kept out of the default log (still denied, still counted by `sbx net stats`).
 mute = [
@@ -82,8 +76,6 @@ mute = [
     # group includes the leaked-password check, which would send password data to Google: denying
     # it is a feature, not a loss.
     "@chromium-background",
-    # Chrome's page-translation service — same class, but not every browser embed reaches it.
-    "translate.googleapis.com",
     # The orchestrator's reachability probe. It polls the Codebuff API every few seconds, and only
     # after two consecutive failures does it HEAD this endpoint, solely to label its offline banner
     # "no internet" rather than "can't reach the servers". Denied, the banner carries the second

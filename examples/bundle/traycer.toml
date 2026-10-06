@@ -8,6 +8,7 @@
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/github-install.toml
 #
 # Derived from `examples/app/traycer.toml`, whose namesake profile names this bundle in `use` (thin
 # profile): the bundle is the single source of truth for the agent's packages, env and egress, while
@@ -54,8 +55,7 @@ allow = [
     "{GET} https://app.traycer.ai",
     # Where `traycer host install` / `host update` read the released host versions and fetch the
     # `host-v*` artifact. Read-only: the CLI downloads from these, it never uploads.
-    "{GET} https://api.github.com",
-    "{GET} https://github.com",
+    "@github-install",
     "{GET} https://objects.githubusercontent.com",
 ]
 mute = [

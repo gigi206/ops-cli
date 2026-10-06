@@ -7,10 +7,10 @@
 #
 # The background services a Chromium engine reaches on its own, whatever it is embedded in: the
 # component and variations updaters, Safe Browsing, the autofill and password-leak checks, the
-# optimization-guide hints, and the Play/YouTube identity endpoints. None of them is the app's own
-# traffic, every one of them is denied by the deny-by-default posture, and each is retried on a
-# schedule the app does not control — so their refusals crowd out the actionable ones in
-# `sbx net logs`.
+# optimization-guide hints, the page-translation service, and the Play/YouTube identity endpoints.
+# None of them is the app's own traffic, every one of them is denied by the deny-by-default posture,
+# and each is retried on a schedule the app does not control — so their refusals crowd out the
+# actionable ones in `sbx net logs`.
 #
 # A mute never changes the verdict and never hides a count: these hosts stay denied, `sbx net stats`
 # still tallies them, and `sbx net log --all` still shows them.
@@ -28,7 +28,7 @@ entries = [
     "clients2.google.com",                  # component updater
     "android.clients.google.com",           # component / variations fetch
     "update.googleapis.com",                # Omaha update check
-    "redirector.gvt1.com",                  # update payload redirector
+    "redirector.gvt1.com",                  # update payloads (dictionary: @chromium-spellcheck)
     "safebrowsing.googleapis.com",          # Safe Browsing lists
     "optimizationguide-pa.googleapis.com",  # optimization hints
     "content-autofill.googleapis.com",      # autofill suggestions
@@ -36,4 +36,5 @@ entries = [
     "signaler-pa.googleapis.com",           # sign-in state signalling
     "play.google.com",                      # identity / entitlement
     "accounts.youtube.com",                 # identity cookie sync
+    "translate.googleapis.com",             # page-translation language list
 ]

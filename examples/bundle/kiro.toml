@@ -7,6 +7,7 @@
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #     sbx net groups import examples/net-groups/google-signin-incage.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # Derived from `examples/app/kiro.toml`, whose namesake profile names this bundle in `use` (thin
 # profile): the bundle is the single source of truth for the agent's packages, env and egress,
@@ -37,6 +38,8 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # Inference / chat (POST completions).
     "{*} https://runtime.us-east-1.kiro.dev",
     "{*} https://runtime.eu-central-1.kiro.dev",
@@ -96,7 +99,6 @@ mute = [
     # Chromium's own probes + Google noise during the in-cage sign-in, shared with every other
     # profile that embeds a browser engine.
     "@chromium-background",
-    "translate.googleapis.com",
 ]
 
 # Telemetry OFF by default, written once into a fresh app home.

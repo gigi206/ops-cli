@@ -4,6 +4,10 @@
 #   sbx bundle import examples/bundle/traycer-desktop.toml
 #   # then in an app profile:   use = ["traycer-desktop"]
 #
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/github-install.toml
+#
 # Derived from `examples/app/traycer-desktop.toml`, whose namesake profile names this bundle in
 # `use` (thin profile): the bundle is the single source of truth for the app's packages, env and
 # egress, while the profile keeps its own command, posture and credential choices. A test pins the
@@ -41,6 +45,8 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # Sign-in and the account, both opened to every verb: the shell POSTs the device-code request
     # and then polls for the token, and the platform host carries the account and subscription
     # state. These two are the clients' own `authnBaseUrl` and `cloudUiBaseUrl`.
@@ -52,8 +58,7 @@ allow = [
     "{GET} https://app.traycer.ai",
     # Where the bundled CLI reads the released host versions and fetches the `host-v*` artifact.
     # Read-only: it downloads from these, it never uploads.
-    "{GET} https://api.github.com",
-    "{GET} https://github.com",
+    "@github-install",
     "{GET} https://objects.githubusercontent.com",
 ]
 

@@ -17,6 +17,7 @@
 #     sbx net groups import examples/net-groups/npm-runtime.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/npm-jsr.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
 #
 # This is the v2 line of the desktop app, beside the `opencode-desktop` profile (v1), and the
 # GRAPHICAL sibling of the `opencode-v2` profile (the v2 CLI/TUI). opencode ships a native desktop

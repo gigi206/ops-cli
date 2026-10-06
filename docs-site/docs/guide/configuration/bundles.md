@@ -331,24 +331,24 @@ The 69 shipped bundles, and what each carries:
 | Bundle | Packages | Also carries | Requires groups |
 |---|---|---|---|
 | `agy` | 1 (`mise:`) | 9 egress entries | none |
-| `atomic-agent` | 1 (`tarball:`) | 7 egress entries, 2 env vars, a `tarball:` resolver | none |
+| `atomic-agent` | 1 (`tarball:`) | 6 egress entries, 2 env vars, a `tarball:` resolver | `huggingface-hub` |
 | `aider` | 4 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
 | `amp` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `ante` | 1 (`mise:`) | 4 egress entries | none |
-| `antigravity` | 2 (`nix:`, `tarball:`) | 27 egress entries, a `tarball:` resolver | `chromium-background` |
+| `ante` | 1 (`mise:`) | 4 egress entries | `huggingface-hub` |
+| `antigravity` | 2 (`nix:`, `tarball:`) | 21 egress entries, a `tarball:` resolver | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `auggie` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `autohand` | 2 (`mise:`, `nix:`) | 6 egress entries | `github-install`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `claude-code` | 1 (`mise:`) | 6 egress entries, 3 env vars | none |
-| `claude-desktop` | 2 (`deb:`, `nix:`) | 23 egress entries, 3 env vars | `chromium-background`, `google-signin-incage` |
+| `claude-desktop` | 2 (`deb:`, `nix:`) | 24 egress entries, 3 env vars | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `cline` | 3 (`mise:`, `nix:`) | 8 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `codebuddy` | 2 (`mise:`, `nix:`) | 5 egress entries, 2 env vars | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `codex` | 1 (`mise:`) | 6 egress entries | none |
-| `codex-desktop` | 4 (`deb:`, `nix:`) | 23 egress entries, 3 `deb:` library attributes | `chromium-background` |
+| `codex-desktop` | 4 (`deb:`, `nix:`) | 24 egress entries, 3 `deb:` library attributes | `chromium-background`, `chromium-spellcheck` |
 | `command-code` | 2 (`mise:`, `nix:`) | 14 egress entries | `github-install`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `copilot` | 1 (`mise:`) | 6 egress entries | none |
 | `cortex` | 2 (`mise:`, `nix:`) | 6 egress entries | none |
 | `crush` | 1 (`mise:`) | 4 egress entries, 2 env vars | `github-install` |
-| `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
+| `cursor` | 2 (`deb:`, `nix:`) | 32 egress entries, 1 env var, a `deb:` resolver | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `cursor-agent` | 1 (`tarball:`) | 4 egress entries, 1 env var, a `tarball:` resolver | none |
 | `deepagents-code` | 4 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `deepseek-harness` | 5 (`mise:`, `nix:`) | 4 egress entries, 1 env var, an install step, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
@@ -356,47 +356,47 @@ The 69 shipped bundles, and what each carries:
 | `dirac` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 10 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `freebuff` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 30 egress entries, an `appimage:` resolver | `chromium-background`, `github`, `github-api`, `npm-audit`, `npm-jsr`, `npm-runtime` |
+| `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 22 egress entries, an `appimage:` resolver | `chromium-background`, `chromium-spellcheck`, `github`, `github-api`, `google-signin-incage`, `npm-audit`, `npm-jsr`, `npm-runtime` |
 | `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
-| `goose-desktop` | 1 (`deb:`) | 2 env vars | none |
+| `goose-desktop` | 1 (`deb:`) | 1 egress entry, 2 env vars | `chromium-spellcheck` |
 | `grok` | 1 (`binary:`) | 3 egress entries, 1 env var, a `binary:` resolver | none |
-| `hermes` | 2 (`flake:`, `nix:`) | 11 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
-| `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 22 egress entries, 1 env var, an install step | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
+| `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `huggingface-hub`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
+| `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 22 egress entries, 1 env var, an install step | `chromium-background`, `chromium-spellcheck`, `google-signin-incage`, `huggingface-hub`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry`, `openrouter` |
 | `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
 | `junie` | 2 (`mise:`, `nix:`) | 8 egress entries, 1 env var, an install step | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
 | `kimi` | 2 (`mise:`, `nix:`) | 9 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
-| `kiro` | 2 (`nix:`) | 34 egress entries, 2 env vars, an install step | `chromium-background`, `google-signin-incage` |
-| `kiro-desktop` | 2 (`nix:`, `tarball:`) | 36 egress entries, 1 env var, a `tarball:` resolver | `chromium-background` |
+| `kiro` | 2 (`nix:`) | 34 egress entries, 2 env vars, an install step | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
+| `kiro-desktop` | 2 (`nix:`, `tarball:`) | 32 egress entries, 1 env var, a `tarball:` resolver | `chromium-background`, `chromium-spellcheck`, `google-signin-incage` |
 | `mimo` | 2 (`mise:`, `nix:`) | 8 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `muse` | none | 4 egress entries, 1 env var, an install step | none |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `nova` | 2 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `odysseus` | 6 (`nix:`) | 7 egress entries, 3 env vars, an install step, a background service | `npm-audit`, `npm-jsr`, `npm-registry`, `pypi` |
+| `odysseus` | 6 (`nix:`) | 7 egress entries, 3 env vars, an install step, a background service | `huggingface-hub`, `npm-audit`, `npm-jsr`, `npm-registry`, `pypi` |
 | `omp` | 1 (`mise:`) | 1 egress entry | none |
 | `openclaude` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `openclaw` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `opencode` | 1 (`mise:`) | 5 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `opencode-v2` | 1 (`tarball:`) | 5 egress entries, a `tarball:` resolver | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
-| `opencode-desktop` | 1 (`deb:`) | 6 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-runtime` |
-| `opencode-v2-desktop` | 1 (`deb:`) | 6 egress entries, a `deb:` resolver | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-runtime` |
+| `opencode-desktop` | 1 (`deb:`) | 7 egress entries | `chromium-spellcheck`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-runtime` |
+| `opencode-v2-desktop` | 1 (`deb:`) | 7 egress entries, a `deb:` resolver | `chromium-spellcheck`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-runtime` |
 | `openfox` | 2 (`mise:`, `nix:`) | an install step | none |
-| `openwork` | 1 (`appimage:`) | 14 egress entries, an `appimage:` resolver | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-runtime` |
+| `openwork` | 1 (`appimage:`) | 14 egress entries, an `appimage:` resolver | `chromium-spellcheck`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-runtime` |
 | `pi` | 1 (`mise:`) | 1 egress entry | none |
 | `pool` | 1 (`tarball:`) | 1 egress entry, a `tarball:` resolver | none |
 | `prime-agent` | 5 (`nix:`) | 6 egress entries, 1 env var, an install step | `npm-audit`, `npm-jsr`, `npm-registry`, `pypi` |
 | `qoder` | 3 (`mise:`, `nix:`) | 7 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `qwen-code` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `reasonix` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `reasonix-desktop` | 1 (`deb:`) | 2 egress entries, a `deb:` resolver | none |
+| `reasonix-desktop` | 1 (`deb:`) | 3 egress entries, a `deb:` resolver | `chromium-spellcheck` |
 | `rovo` | 1 (`nix:`) | 12 egress entries | none |
-| `sigit` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
+| `sigit` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `huggingface-hub`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `snow` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `stakpak` | 1 (`mise:`) | 5 egress entries | `models-catalog` |
 | `trae` | 2 (`nix:`) | 2 egress entries, an install step | `github`, `pypi` |
-| `traycer` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
-| `traycer-desktop` | 1 (`deb:`) | 7 egress entries, a `deb:` resolver | none |
-| `vibe` | 4 (`mise:`, `nix:`) | 12 egress entries | `chromium-background`, `pypi` |
+| `traycer` | 2 (`mise:`, `nix:`) | 8 egress entries | `github-install`, `npm-audit`, `npm-jsr`, `npm-registry` |
+| `traycer-desktop` | 1 (`deb:`) | 7 egress entries, a `deb:` resolver | `chromium-spellcheck`, `github-install` |
+| `vibe` | 4 (`mise:`, `nix:`) | 13 egress entries | `chromium-background`, `chromium-spellcheck`, `google-signin-incage`, `pypi` |
 | `vtcode` | 3 (`mise:`, `nix:`) | none | none |
 | `warp` | 1 (`tarball:`) | 6 egress entries, a `tarball:` resolver | none |
 

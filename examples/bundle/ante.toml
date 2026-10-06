@@ -3,6 +3,9 @@
 #   sbx bundle import examples/bundle/ante.toml
 #   # then in an app profile:   use = ["ante"]
 #
+#   REQUIRES an egress group — import it once (it is shared, not per-agent):
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
+#
 # Derived from `examples/app/ante.toml`, whose namesake profile now names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the agent's packages, env and
 # egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
@@ -32,8 +35,9 @@ allow = [
     # First-party Antix Console — the vendor's account / billing / team dashboard. Optional
     # (the CLI does not require an Antix account).
     "{*} https://antix.antigma.ai",
-    # Hugging Face — `/offline-mode` fetches GGUF weights to the cage's home. `{GET}`.
-    "{GET} https://huggingface.co",
+    # Hugging Face — `/offline-mode` fetches GGUF weights to the cage's home, through the shared
+    # Hub lane (read-only).
+    "@huggingface-hub",
     # GitHub — MCP server installs, slash-command marketplace fetches. `{GET}`.
     "{GET} https://github.com",
 ]

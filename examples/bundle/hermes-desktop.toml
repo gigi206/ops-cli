@@ -11,6 +11,9 @@
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #     sbx net groups import examples/net-groups/google-signin-incage.toml
+#     sbx net groups import examples/net-groups/chromium-spellcheck.toml
+#     sbx net groups import examples/net-groups/openrouter.toml
+#     sbx net groups import examples/net-groups/huggingface-hub.toml
 #
 # Derived from `examples/app/hermes-desktop.toml`, whose namesake profile names this bundle in
 # `use` (thin profile): the bundle is the single source of truth for the app's packages, env and
@@ -39,13 +42,15 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 allow = [
+    # Chromium's spellcheck dictionary, through the shared lane (GET-only, path-scoped).
+    "@chromium-spellcheck",
     # `agent-browser`, fetched from npm at launch (mise's npm backend installs in-cage, unlike the
     # host-side `flake:` build). Its audit POST is noisy and non-essential, so it is muted below.
     "@npm-registry",
     # The LLM provider. With a BYOK key that is OpenRouter; with the NousResearch account login
     # instead (the shipped default), model traffic goes to the account's own API: portal is the
     # OAuth token endpoint, inference-api serves the models.
-    "{*} https://openrouter.ai",
+    "@openrouter",
     "{*} https://portal.nousresearch.com",
     # The portal's static assets, which render on the sign-in page. Read-only.
     "{GET} https://web-assets.nousresearch.com",
@@ -58,8 +63,7 @@ allow = [
     "{GET} https://*.petdex.dev",
     # Voice STT (`/voice on`): the local faster-whisper model is fetched from Hugging Face on first
     # use — metadata on huggingface.co, the blobs through the Xet CDN. Cached in the app home after.
-    "{GET,HEAD} https://huggingface.co",
-    "{GET,HEAD} https://*.xethub.hf.co",
+    "@huggingface-hub",
     # Voice replies / read-aloud (edge-tts) over a WebSocket. `{WS}` is the explicit opt-in sbx gates
     # a WebSocket behind, and `{GET}` covers the voice-list fetch. Two things make it work under the
     # MITM: sbx sets `wss_proxy` (a WS client resolves its proxy by URL scheme, so `https_proxy`
