@@ -22,14 +22,14 @@
 # GPU is not asserted either, and that one is not a gap to be closed: `vz` provides no GPU to the
 # guest at all, and the scope this template commits to is CLI plus GUI.
 #
-# WHERE IT RUNS. On a runner GitHub hosts, and on its Intel one: `macos-15-intel`. The guest is a
+# WHERE IT RUNS. On a runner GitHub hosts, and on its Intel one: `macos-26-intel`. The guest is a
 # virtual machine, so the runner must let a job use the CPU's virtualization. GitHub's Apple Silicon
 # runners do not, and its Intel runners do; Lima's own CI starts its `vz` guests on Intel runners for
 # that reason. The wrapper's support is written for macOS x86_64 with Lima 2.2.1, which is the
 # version this installs, so the run measures the platform the documentation names. Apple Silicon
-# stays outside CI until a hosted runner lets a job start a virtual machine there. GitHub ends macOS
-# x86_64 support when it retires its macOS 15 image, announced for fall 2027; from then on this
-# workflow has no host to run on.
+# stays outside CI until a hosted runner lets a job start a virtual machine there. macOS 26 is the
+# last release Apple ships for Intel Macs, so no newer Intel image can follow this one; when GitHub
+# retires it, this workflow has no host to run on.
 
 name: macos
 
@@ -54,7 +54,7 @@ concurrency:
 jobs:
   acceptance:
     name: exercise the cage in a Lima guest
-    runs-on: macos-15-intel
+    runs-on: macos-26-intel
     timeout-minutes: 60
     env:
       # The wrapper reaches the instance it is told to and defaults to `sbx`. This run creates
