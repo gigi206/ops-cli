@@ -1,11 +1,7 @@
 # Dependabot, matched to what this branch actually contains.
 #
-# WHEN THIS TAKES EFFECT. Dependabot reads its configuration from the repository's DEFAULT branch
-# only, so this file governs nothing while `ops-v2` is not it. It is written here because the
-# configuration that is live today describes a tree this branch no longer has — a `tests.yml`, a
-# Dockerfile, hadolint and trivy — and its open pull request targets a workflow that does not exist
-# here. Leaving that in place to be inherited unchanged is how a stale config outlives the code it
-# was written for.
+# Dependabot reads this file from the repository's default branch, `ops-v2`, and opens its pull
+# requests against it.
 #
 # WHY IT MATTERS MORE THAN BEFORE. The workflows now pin every third-party action by commit hash
 # rather than by tag. A hash does not move, which is the point, and it also does not pick up the
@@ -16,14 +12,21 @@ version: 2
 updates:
   # Third-party actions, pinned by commit in `.github/workflows/` and in `.github/actions/`.
   # Dependabot reads the trailing `# vN` comment beside each hash, and rewrites both together.
+  #
+  # `/` alone covers `.github/workflows/` and an `action.yml` at the root, not the composite actions
+  # under `.github/actions/`, so those are listed as well. Without them `setup-zig`, pinned there
+  # alone, is never proposed, and an action pinned both there and in a workflow is bumped in the
+  # workflow only, leaving the two builds on different versions of it.
+  #
+  # No `labels`: Dependabot then applies `dependencies` and the ecosystem's label, and creates them
+  # when the repository lacks them. Labels named here are applied only if they already exist.
   - package-ecosystem: "github-actions"
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "ci"
     commit-message:
       prefix: "ci"
       include: "scope"
@@ -31,6 +34,10 @@ updates:
     # readable and costs one CI run instead of N.
     groups:
       github-actions:
+        patterns:
+          - "*"
+      github-actions-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -41,9 +48,6 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "rust"
     commit-message:
       prefix: "chore(deps)"
     groups:
@@ -53,3 +57,35 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      cargo-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # The documentation site's build: Docusaurus and what it pulls in, locked in
+  # `docs-site/package-lock.json`. It runs in the Docs workflow and wherever the site is served
+  # locally, never inside sbx, and what it publishes is static files. Grouped like the crate's, so a
+  # minor or patch release is routine and a major (Docusaurus, React) stays a decision.
+  #
+  # Version updates move only the dependencies `package.json` names: npm is not among the ecosystems
+  # whose indirect dependencies they can update. The lockfile's indirect ones, where nearly all of
+  # the site's advisories sit, are moved by Dependabot's security updates, enabled on the
+  # repository, and each ecosystem's `-security` group gathers those into one pull request.
+  - package-ecosystem: "npm"
+    directory: "/docs-site"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(docs)"
+    groups:
+      docs-site-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      docs-site-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
